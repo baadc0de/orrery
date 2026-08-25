@@ -23,7 +23,7 @@
 //! [`SendPacket::mode`] chooses, per message, between the session's one shared
 //! stream and a stream of its own — [`StreamMode`]. Sparse ordered traffic
 //! belongs on the shared stream; a bulk transfer belongs out of its way. The
-//! measured trade is recorded in `p4-streams-bench`.
+//! measured trade is recorded in `gates/p4-streams-bench`.
 //!
 //! # Why this is untyped
 //!

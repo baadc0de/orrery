@@ -9,7 +9,7 @@ because this box swings by up to 2x on per-flush fsync cost.
 
 **`nominal_per_s` is not load that arrived.** It is `entities × diff_hz` —
 what the world would generate if nothing throttled it — and the rig cannot
-necessarily send it. `p2-load`'s own fan-out assert allows `sessions × 160`
+necessarily send it. `gates/p2-load`'s own fan-out assert allows `sessions × 160`
 diffs/s (`check_fan_out`), so a point provisioned at exactly that has zero
 margin, and above about 99 k diffs/s this box's rig runs out regardless of
 sessions. Under-delivery is silent: `UplinkScheduler::queue` is newest-wins,

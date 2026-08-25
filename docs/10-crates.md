@@ -6,7 +6,7 @@ Normative source: [ADR-0015](adr/0015-crate-set.md), drawing on [D4](adr/0004-be
 
 ## Workspace layout
 
-One workspace, one version number, one lockfile — with the standalone tools (`p0-*`, `p1-swarm`, `p2-load`, `p2-dashboard`, `p3-island`, `p4-streams-bench`) excluded from it, each declaring its own `[workspace]` and carrying its own committed lockfile, so a harness cannot drag a dependency into the shipped graph. Server crates and client crates live together so protocol changes are atomic across both sides.
+One workspace, one version number, one lockfile — with the standalone tools (`p0-*`, `gates/p1-swarm`, `gates/p2-load`, `gates/p2-dashboard`, `gates/p3-island`, `gates/p4-streams-bench`) excluded from it, each declaring its own `[workspace]` and carrying its own committed lockfile, so a harness cannot drag a dependency into the shipped graph. Server crates and client crates live together so protocol changes are atomic across both sides.
 
 ```
 orrery/
@@ -125,7 +125,7 @@ Every serialized thing crosses this crate: `CellId`, intents, leases, attestatio
 
 **Features:** `postcard` (default encoding), `bitcode` (alternative, benchmarked per release), `u128-cells` (extended-range `CellId`, D5 — wire-incompatible, see [Edge cases](#edge-cases-and-failure-modes)). `bitcode` and `u128-cells` are declared but inert: `channels.rs` encodes with postcard unconditionally, and no `cfg` site reads `u128-cells`. A storage-side `hilbert` index (D5) is designed but declared by no manifest.
 
-The crate also carries a `metrics` module — unconditional, not a feature — whose contents are not wire types and are here on purpose: the D16 latency series names (`journal_commit_ms`, `bulk_ack_ms`, `intent_commit_ms`, `area_first_page_ms`, plus the ungated `gateway_bulk_server_ms`) and the shared histogram bucket lattice. Four processes have to agree on them — `orrery_persistd`'s journal recorder and gateway timer, the client-side histogram `p2-load` measures with, and the `p2-dashboard` gate that reconstructs percentiles from the JSONL artifact — and `orrery_protocol` is the only crate all four already depend on. It is a stepping stone toward D12's OpenTelemetry surface, not a resolution of it: when the OTel bridge lands these names become the instrument names and these boundaries the bucket hints.
+The crate also carries a `metrics` module — unconditional, not a feature — whose contents are not wire types and are here on purpose: the D16 latency series names (`journal_commit_ms`, `bulk_ack_ms`, `intent_commit_ms`, `area_first_page_ms`, plus the ungated `gateway_bulk_server_ms`) and the shared histogram bucket lattice. Four processes have to agree on them — `orrery_persistd`'s journal recorder and gateway timer, the client-side histogram `gates/p2-load` measures with, and the `gates/p2-dashboard` gate that reconstructs percentiles from the JSONL artifact — and `orrery_protocol` is the only crate all four already depend on. It is a stepping stone toward D12's OpenTelemetry surface, not a resolution of it: when the OTel bridge lands these names become the instrument names and these boundaries the bucket hints.
 
 ```rust
 /// D5: offset-binary coords (21 bits/axis), Morton-interleaved into 63 bits,

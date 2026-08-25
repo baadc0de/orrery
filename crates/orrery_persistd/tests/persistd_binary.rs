@@ -968,8 +968,8 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
 ///
 /// `scripts/p2-kill9-gate.sh` reached `prove_epoch_fork_refused` and reported
 /// that the follower held no mirrored record at all. The chain was healthy:
-/// the rig (`p2-load`) sends every `DiffUplink` with `lease_id: None` — see the
-/// comment at `p2-load/src/main.rs:1401` — while `route_session_diff` sets
+/// the rig (`gates/p2-load`) sends every `DiffUplink` with `lease_id: None` — see the
+/// comment at `gates/p2-load/src/main.rs:1401` — while `route_session_diff` sets
 /// `strict_authority: true` unconditionally (`gateway.rs:3930`), so
 /// `route_diff` substitutes the never-granted `LeaseId(0)` and `apply_fenced`
 /// rejects every uplink before the journal sees a byte. Nothing was

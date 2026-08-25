@@ -863,7 +863,7 @@ fn a_hole_that_never_fills_is_abandoned_so_the_subject_is_judged_again() {
     // judging the subject *permanently*. `repair_step` never asked again once
     // the escalation was reported, and `check_pending_claims` declines to judge
     // while a catchup is open, so the watch was finished — silently, for the
-    // life of the process. Measured in `p1-swarm --witness`, every watch
+    // life of the process. Measured in `gates/p1-swarm --witness`, every watch
     // reached that state inside about twenty-five simulated seconds and the
     // counters never moved again, which made "zero false positives over 500
     // player-hours" a statement about a witness that had stopped looking.

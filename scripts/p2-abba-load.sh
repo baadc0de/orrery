@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diagnostic ABBA runner for comparing two p2-load binaries against one
+# Diagnostic ABBA runner for comparing two gates/p2-load binaries against one
 # identical, chain-enabled persistd build. This deliberately stops before
 # promotion: it isolates the live durability/ack path and preserves every raw
 # system and journal-stage signal under the output directory.

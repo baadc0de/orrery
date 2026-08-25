@@ -36,7 +36,7 @@ DEFAULT = (pathlib.Path(__file__).resolve().parent.parent
            / "docs" / "data" / "p2-phase-baseline-2026-08-19.jsonl")
 
 # The four D16 series and their budgets (docs/16, docs/09 §; the gate reads
-# them out of `p2-dashboard`'s own thresholds, and these are here only to label
+# them out of `gates/p2-dashboard`'s own thresholds, and these are here only to label
 # the tables).
 GATED = ("journal_commit_ms", "bulk_ack_ms", "intent_commit_ms", "area_first_page_ms")
 BUDGET_MS = {"journal_commit_ms": 2, "bulk_ack_ms": 5, "intent_commit_ms": 10,

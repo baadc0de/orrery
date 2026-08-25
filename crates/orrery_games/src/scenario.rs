@@ -2,7 +2,7 @@
 //! re-execute it the way a witness would.
 //!
 //! This is the whole P4 pipeline with the network taken out — and taking the
-//! network out is the point. `p1-swarm` runs the real witness over a real
+//! network out is the point. `gates/p1-swarm` runs the real witness over a real
 //! (impaired, in-process) link and answers "does the pipeline hold up under
 //! loss"; this answers the question underneath it, "do these *rules* produce
 //! false positives, and are these *cheats* actually adjudicable", in a

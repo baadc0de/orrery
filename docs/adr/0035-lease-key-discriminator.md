@@ -72,8 +72,8 @@ Verified against current HEAD:
 - **But its central premise about scans is false as stated.** "No full-family
   range scan of either exists today" is true only of `persistd` itself. Two
   harnesses range-scan a ledger sub-span **today**: `read_receipts` in
-  `p5-dupe-gauntlet/src/main.rs:903-908` and `read_receipt_intent_ids` in
-  `p3-siblings/src/race.rs:706-718` both scan `[lr, ls)` — begin =
+  `gates/p5-dupe-gauntlet/src/main.rs:903-908` and `read_receipt_intent_ids` in
+  `gates/p3-siblings/src/race.rs:706-718` both scan `[lr, ls)` — begin =
   `ledger_receipt_key()`, exclusive end `[l, s)` (`end[1] = b's'` at
   `main.rs:905`, `race.rs:708`) — and postcard-decode every
   row in range. A lease row with `grid.0 ∈ [0x7200_0000, 0x7300_0000)` on such
@@ -83,8 +83,8 @@ Verified against current HEAD:
 - **What actually keeps this latent is grid reachability, not scan absence.**
   Every grid id written anywhere in the tree has byte 1 = 0x00:
   `GridId::ROOT = GridId(0)` (`crates/orrery_protocol/src/grid.rs:17`) is the
-  production path's and `p3-siblings`' grid (`peer.rs:329`), and the P5
-  gauntlet's `GRID = GridId(151)` (`p5-dupe-gauntlet/src/main.rs:44`) is
+  production path's and `gates/p3-siblings`' grid (`peer.rs:329`), and the P5
+  gauntlet's `GRID = GridId(151)` (`gates/p5-dupe-gauntlet/src/main.rs:44`) is
   equally far below `0x62`. **Rows at risk today: zero** — not because nothing
   reads across the boundary, but because no code path writes a colliding row:
   every `GridId` in the tree is a compile-time constant (`ROOT` = 0, the P5
@@ -185,7 +185,7 @@ Why `'e'`: it is ASCII per the discipline [ADR-0031] draws from this very
 finding ("never an id's high byte"), unused among `{b, i, r}`, and mnemonic.
 Deliberately **not** `'s'`, although `'s'` would also sort cleanly: both
 receipt scanners write their exclusive end as `[b'l', b's']`
-(`p5-dupe-gauntlet/src/main.rs:905`, `p3-siblings/src/race.rs:708`), and a
+(`gates/p5-dupe-gauntlet/src/main.rs:905`, `gates/p3-siblings/src/race.rs:708`), and a
 lease row at `ls` would make that shipped idiom read as both "one past
 receipts" and "start of leases". Boundaries that mean two things are how this
 defect class breeds.
@@ -314,7 +314,7 @@ specific to `l`.
   record's clause (c) together show what sub-discrimination costs and buys.
 - **Two harness consumers become structurally safe.** After the fix, nothing
   but receipts sorts in `[lr, ls)` — provably, by the sub-span proof of (c) —
-  so the receipt scanners in `p5-dupe-gauntlet` and `p3-siblings` can never
+  so the receipt scanners in `gates/p5-dupe-gauntlet` and `gates/p3-siblings` can never
   observe a foreign row, whatever grid ids the future mints.
 - **AGENTS.md's decision-table row is owed by whoever holds that lane** (same
   constraint [ADR-0032] recorded); the index update lives in

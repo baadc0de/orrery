@@ -83,6 +83,6 @@ instance identified by that directory.
 
 The measurement is an additive `measure` subcommand and a sibling script. The
 live `run` gauntlet, `ramp` command, their assertions, fixed ids, output schemas,
-and reported numbers are unchanged. `p2-load` and its historical
+and reported numbers are unchanged. `gates/p2-load` and its historical
 `intent_commit_ms` series are also unchanged; the two new populations have
 distinct series names.

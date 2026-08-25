@@ -34,7 +34,7 @@
 # scope. The two gates also differ in shape: that one is one gateway and one
 # harness pass, this one is two concurrently running gateways with opposite
 # postures plus a posture change applied mid-run. The *harness* is shared —
-# this gate runs the same `p5-dupe-gauntlet` binary, whose `ramp` subcommand is
+# this gate runs the same `gates/p5-dupe-gauntlet` binary, whose `ramp` subcommand is
 # additive — so nothing is duplicated but the process supervision, which is the
 # part that genuinely differs.
 #
@@ -152,7 +152,7 @@ if [[ ${1:-} == --self-test ]]; then
   while read -r path; do
     [[ -n $path ]] || continue
     leaf=${path##*.}
-    grep -Fq "\"$leaf\"" "$repo_root/p5-dupe-gauntlet/src/main.rs" \
+    grep -Fq "\"$leaf\"" "$repo_root/gates/p5-dupe-gauntlet/src/main.rs" \
       || die "self-test: gate-status.sh reads $path but the harness emits no '$leaf' key; \
 a renamed report field returns null rather than failing, so the ramp row would go blank"
   done <<<"$ramp_reader"
@@ -164,7 +164,7 @@ a renamed report field returns null rather than failing, so the ramp row would g
 fi
 
 : "${ORRERY_FDB_CLUSTER_FILE:?set ORRERY_FDB_CLUSTER_FILE to a fresh throwaway FoundationDB cluster}"
-: "${P5_DUPE_BIN:?set P5_DUPE_BIN to the p5-dupe-gauntlet binary}"
+: "${P5_DUPE_BIN:?set P5_DUPE_BIN to the gates/p5-dupe-gauntlet binary}"
 [[ ${RAMP_SHADOW_CLUSTER_IS_THROWAWAY:-0} == 1 ]] \
   || die 'set RAMP_SHADOW_CLUSTER_IS_THROWAWAY=1 to assert this cluster may receive fixed ramp rows'
 [[ -r $ORRERY_FDB_CLUSTER_FILE ]] \

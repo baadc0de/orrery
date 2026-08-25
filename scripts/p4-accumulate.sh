@@ -90,7 +90,7 @@ usage: p4-accumulate.sh [--index N] [--seconds S] [--dry-run]
                 to $P4_ACCUM_OUT/probe-<target>.json; banks nothing
 
   P4_LEDGER_FILE  ledger path, passed through to scripts/p4-ledger.sh
-  P1_SWARM_BIN    prebuilt harness; built from p1-swarm/ when unset
+  P1_SWARM_BIN    prebuilt harness; built from gates/p1-swarm/ when unset
   P4_ACCUM_OUT    evidence directory (default: target/p4-accumulate)
 USAGE
 }
@@ -249,13 +249,13 @@ ensure_bin() {
     return
   fi
   note 'building the harness (release: a simulated hour is not a debug workload)'
-  cargo build --release -q --manifest-path "$ROOT/p1-swarm/Cargo.toml" 1>&2
+  cargo build --release -q --manifest-path "$ROOT/gates/p1-swarm/Cargo.toml" 1>&2
   local candidate
-  for candidate in "$ROOT/p1-swarm/target/release/p1-swarm" \
-                   "$ROOT/p1-swarm/target/release/p1-swarm.exe"; do
+  for candidate in "$ROOT/gates/p1-swarm/target/release/p1-swarm" \
+                   "$ROOT/gates/p1-swarm/target/release/p1-swarm.exe"; do
     if [[ -x $candidate ]]; then echo "$candidate"; return; fi
   done
-  die "harness binary missing at $ROOT/p1-swarm/target/release/p1-swarm[.exe]"
+  die "harness binary missing at $ROOT/gates/p1-swarm/target/release/p1-swarm[.exe]"
 }
 
 # ── The comparability probe ──────────────────────────────────────────────────

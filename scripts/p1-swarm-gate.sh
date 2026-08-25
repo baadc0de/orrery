@@ -12,7 +12,7 @@
 # and the three clauses guarded by it are dead code without it.
 #
 # Like the P2 and P3 gates this is a *proof harness*, not a convenience script:
-# `p1-swarm` exits non-zero unless every clause holds, and this wrapper writes no
+# `gates/p1-swarm` exits non-zero unless every clause holds, and this wrapper writes no
 # success artifact unless it does. All three legs block, the witnessed one
 # included — the harness reads no clock and opens no socket, so a leg that holds
 # once holds every night until the code under it changes, which is the only
@@ -95,19 +95,19 @@ if [[ ${1:-} == --self-test ]]; then
   # about false-positive filing that shadow mode had not already decided.
   has '--witness --enforce' \
     || die 'self-test: the armed honest control is absent; "files nothing" would be shadow mode restating itself'
-  cargo run -q --manifest-path "$(dirname "$0")/../p1-swarm/Cargo.toml" -- --self-test \
+  cargo run -q --manifest-path "$(dirname "$0")/../gates/p1-swarm/Cargo.toml" -- --self-test \
     || die 'self-test: the harness no longer covers every criterion clause'
   echo "$NAME: self-test passed"
   exit 0
 fi
 
 readonly ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-readonly OUT="${P1_SWARM_OUT:-$ROOT/target/p1-swarm}"
+readonly OUT="${P1_SWARM_OUT:-$ROOT/target/gates/p1-swarm}"
 mkdir -p "$OUT"
 
 note 'building the harness (release: an hour of simulation is not a debug workload)'
-cargo build --release -q --manifest-path "$ROOT/p1-swarm/Cargo.toml"
-readonly BIN="$ROOT/p1-swarm/target/release/p1-swarm"
+cargo build --release -q --manifest-path "$ROOT/gates/p1-swarm/Cargo.toml"
+readonly BIN="$ROOT/gates/p1-swarm/target/release/p1-swarm"
 [[ -x $BIN ]] || die "harness binary missing at $BIN"
 
 # The criterion run: a clean link, because P1's demo criterion is about interest

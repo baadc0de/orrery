@@ -15,7 +15,7 @@ export AFTER_BIN=${AFTER_BIN:-$FENCED_ROOT/fenced-bins/after/persistd}
 export SEED_BIN=${SEED_BIN:-$FENCED_ROOT/fenced-bins/after/orrery-seed}
 export ORRERY_SEED_BIN="$SEED_BIN"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export P2_LOAD_BIN=${P2_LOAD_BIN:-$repo/p2-load/target/release/p2-load}
+export P2_LOAD_BIN=${P2_LOAD_BIN:-$repo/gates/p2-load/target/release/p2-load}
 export FENCED_FDB_CONTAINER=${FENCED_FDB_CONTAINER:-orrery-fdb-fenced}
 FDB_PID=${FDB_PID:-$(docker top "$FENCED_FDB_CONTAINER" | awk '/fdbserver/{print $2}' | head -1)}
 export FDB_PID

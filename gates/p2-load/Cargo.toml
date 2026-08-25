@@ -1,0 +1,44 @@
+[package]
+name = "p2-load"
+version = "0.1.0"
+edition = "2021"
+description = "P2 latency rig: gateway-colocated load generator driving calibrated diff and intent mixes across 100+ cells, emitting the four D16 latency series as JSONL"
+license = "MIT"
+
+# Standalone tool (the gates/p0-nat-test precedent): it dials the *real* gateway
+# wire surface directly over raw iroh — the persistd gateway speaks tagged
+# datagrams and stream-framed control frames on one packet lane (roadmap
+# decision C-1), and the aeronet session stack is a client-side Bevy
+# convenience the rig does not need. The bounded-memory D16 histogram, the
+# uplink scheduler and the intent queue come from `orrery_persist_client`, so
+# the rig measures with the same code the game ships.
+[workspace]
+
+[[bin]]
+name = "p2-load"
+path = "src/main.rs"
+
+[dependencies]
+orrery_protocol = { path = "../../crates/orrery_protocol" }
+orrery_persist_client = { path = "../../crates/orrery_persist_client" }
+orrery_persistd = { path = "../../crates/orrery_persistd", features = ["fdb"] }
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"] }
+# Versions mirror the root workspace's D14 pins exactly (a standalone
+# `[workspace]` cannot inherit `workspace.dependencies`).
+iroh = "1.0.3"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1.1", features = ["use-std"] }
+toml = "1"
+glam = { version = "0.32", features = ["serde"] }
+blake3 = "1.8"
+
+[dev-dependencies]
+tempfile = "3"

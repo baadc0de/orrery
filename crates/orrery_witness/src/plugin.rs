@@ -1013,7 +1013,7 @@ pub struct RepairBudget {
     /// The loop this breaks is the expensive part. An evicted repair is a hole
     /// that stays open, and a hole that stays open is re-asked — so eviction
     /// manufactures the very traffic that causes the next eviction. Measured
-    /// over `p1-swarm --peers 16 --seconds 180 --witness`, with the rest of this
+    /// over `gates/p1-swarm --peers 16 --seconds 180 --witness`, with the rest of this
     /// change in place: queue overflows fell from 3920 to 794, chain gaps from
     /// 6576 to 968, and `Stalled` escalations against honest bots — every one of
     /// them a false positive by construction — from 1004 to 92.
@@ -1162,7 +1162,7 @@ pub fn serve_repair_requests(
             //
             // A range response is bulk; the shared stream also carries lease
             // traffic and handoff acks, which are small, latency-critical, and
-            // have nothing to do with this peer's hole. `p4-streams-bench`
+            // have nothing to do with this peer's hole. `gates/p4-streams-bench`
             // measures both halves of the trade over real QUIC at 3% loss on a
             // 40 ms link, across four seeds: mixing them costs sparse control
             // 2-5x its median and 3-6x its p95, and separating them costs this

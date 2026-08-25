@@ -1,0 +1,33 @@
+[package]
+name = "p5-dupe-gauntlet"
+version = "0.1.0"
+edition = "2021"
+description = "P5 replay, forged-attestation, self-chosen-witness, and quarantine regression harness"
+license = "MIT"
+
+# Standalone proof harness. The root workspace cannot see this crate, so
+# scripts/check.sh registers it explicitly and its --self-test coverage is
+# registered beside the other phase gates.
+[workspace]
+
+[[bin]]
+name = "p5-dupe-gauntlet"
+path = "src/main.rs"
+
+[dependencies]
+orrery_protocol = { path = "../../crates/orrery_protocol" }
+orrery_persistd = { path = "../../crates/orrery_persistd", features = ["fdb"] }
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"] }
+iroh = "1.0.3"
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1.1", features = ["use-std"] }
+

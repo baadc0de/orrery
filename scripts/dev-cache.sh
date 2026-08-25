@@ -52,7 +52,7 @@ case "${1:-stats}" in
     # The nested standalone tools must inherit the repo config too — cargo
     # walks up from the working directory, so they do, but a moved or renamed
     # config would silently drop them back to uncached builds.
-    for tool in p2-load p3-island p0-nat-test p0-dashboard p2-dashboard; do
+    for tool in gates/p2-load gates/p3-island gates/p0-nat-test gates/p0-dashboard gates/p2-dashboard; do
       [[ -d "$ROOT/$tool" ]] || continue
       [[ -f "$ROOT/$tool/.cargo/config.toml" ]] \
         && note "note: $tool has its own .cargo/config.toml, which shadows the repo one"

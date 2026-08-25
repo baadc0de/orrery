@@ -2493,7 +2493,7 @@ impl GatewayReportMetrics {
 ///
 /// The guard against the two spellings drifting is not a unit test — neither
 /// crate can see the other, so any test either could write would compare a
-/// literal to itself. It is the gate: `p2-dashboard` folds by series name and
+/// literal to itself. It is the gate: `gates/p2-dashboard` folds by series name and
 /// reports anything it does not recognize under `unknown_series_names`, and
 /// `scripts/p2-kill9-gate.sh` fails the run when that list is non-empty. A
 /// typo here does not silently vanish; it fails P2.
@@ -5480,7 +5480,7 @@ impl ShardDrainHandle {
 /// here instead. When `bin/` is writable, move the drain into the reporter,
 /// delete this and its environment variable, and nothing else changes: the
 /// records emitted are byte-for-byte the `sample_batch` contract
-/// `p2-dashboard` already parses.
+/// `gates/p2-dashboard` already parses.
 pub const BOUNDARY_JSONL_ENV: &str = "ORRERY_GATEWAY_BOUNDARY_JSONL";
 
 /// How often the boundary sink drains. Short enough that a run terminated
@@ -5492,7 +5492,7 @@ const BOUNDARY_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// Not a `sample_batch`, deliberately: these are cumulative counts, not a
 /// latency population, and folding them into a histogram would invent a
-/// percentile out of a total. `p2-dashboard` ignores record kinds it does not
+/// percentile out of a total. `gates/p2-dashboard` ignores record kinds it does not
 /// know (its `Record` documents exactly that) and counts unrecognized
 /// *series* names, so a new kind is additive — it rides the same merged
 /// artifact without touching the frozen gate.

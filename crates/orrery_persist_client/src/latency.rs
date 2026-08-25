@@ -11,7 +11,7 @@
 //! The bucket boundaries and the D16 series names are **not** defined here.
 //! They live in [`orrery_protocol::metrics`], the one definition every
 //! producer and consumer of the P2 artifact shares — the journal recorder, the
-//! gateway's server-side timer, this histogram, and the `p2-dashboard` gate.
+//! gateway's server-side timer, this histogram, and the `gates/p2-dashboard` gate.
 //! This module re-exports them so a consumer whose only dependency is this
 //! crate reaches the contract without a new dependency edge.
 //!
@@ -41,8 +41,8 @@ pub use orrery_protocol::metrics::{
 // # Why these are defined here and not in `orrery_protocol::metrics`
 //
 // They belong beside [`UNGATED_SERIES`], for exactly the reason that array's
-// doc comment gives: one definition shared by the producer (`p2-load`, via
-// this crate) and the consumer (`p2-dashboard`, via this crate's re-export).
+// doc comment gives: one definition shared by the producer (`gates/p2-load`, via
+// this crate) and the consumer (`gates/p2-dashboard`, via this crate's re-export).
 // They are declared in this crate instead only because `orrery_protocol` was
 // frozen to another lane when this attribution was added. Moving them into
 // `orrery_protocol::metrics::UNGATED_SERIES` (crates/orrery_protocol/src/
@@ -119,7 +119,7 @@ pub const SERIES_CLIENT_SEND_BUFFER: &str = "client_send_buffer_bytes";
 
 /// The client-side attribution series, in canonical report order.
 ///
-/// `p2-dashboard`'s `SERIES_KEYS` is fixed-length over `GATED_SERIES.len() +
+/// `gates/p2-dashboard`'s `SERIES_KEYS` is fixed-length over `GATED_SERIES.len() +
 /// UNGATED_SERIES.len() + CLIENT_UNGATED_SERIES.len()`, so growing this array
 /// is a compile error there until the gate is taught to fold the new member —
 /// the same guard `UNGATED_SERIES` already carries.

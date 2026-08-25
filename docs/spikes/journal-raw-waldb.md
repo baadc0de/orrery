@@ -84,7 +84,7 @@ The spike landed a `Journal` under `journal-raw` with the same surface, so
 and [`scripts/p2-kill9-gate.sh`](../../scripts/p2-kill9-gate.sh) both work
 **unmodified**, and the comparison is apples-to-apples by construction rather
 than by argument. A new API instead produces another
-[`p2-journal-bench`](../../p2-journal-bench/README.md) — useful, but not a
+[`gates/p2-journal-bench`](../../gates/p2-journal-bench/README.md) — useful, but not a
 verdict on the journal. D19 subsequently flipped the manifest default to
 `journal-raw`; the snippet above remains the pre-spike seam the experiment used.
 
@@ -316,7 +316,7 @@ fixed upstream and the journal left alone.
 |---|---|---|
 | Open-loop journal rig | `crates/orrery_persistd/tests/journal_arrival_rate.rs` | Phases 1–2; no cluster, no network |
 | Full crash/recovery gate | `scripts/p2-kill9-gate.sh` | Phases 3–4 |
-| Store-level bench, 3 arms | `p2-journal-bench/` | Substrate questions; `--no-sync` and on-disk controls |
+| Store-level bench, 3 arms | `gates/p2-journal-bench/` | Substrate questions; `--no-sync` and on-disk controls |
 | Evidence reducer | `scripts/p2-baseline-extract.py` | ~1 GB gate dir → a few hundred bytes |
 | Report + self-test pattern | `scripts/p2-barrier-shape-report.py` | The shape Phase 4's report must follow |
 | Journal placement knob | `P2_GATE_DATA_DIR` | Separating evidence from journal; **not** a fix |

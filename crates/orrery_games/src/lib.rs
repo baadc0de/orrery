@@ -43,7 +43,7 @@
 //!
 //! # What this crate is not
 //!
-//! Not a Bevy plugin, not networked, and not a replacement for `p1-swarm`.
+//! Not a Bevy plugin, not networked, and not a replacement for `gates/p1-swarm`.
 //! The swarm runs the real witness over an impaired link and answers whether
 //! the *pipeline* holds up; this answers whether the *rules* are honest-safe
 //! and the cheats are adjudicable, in milliseconds, on every commit. The two

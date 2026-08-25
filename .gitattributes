@@ -25,4 +25,4 @@
 # determinism corpus and `demo.jsonl` is the dashboard's committed sample; a
 # line-ending rewrite on either is a silent test failure on one platform only.
 crates/orrery_conformance/corpus/golden.json -text -eol
-p2-dashboard/testdata/*.jsonl -text -eol
+gates/p2-dashboard/testdata/*.jsonl -text -eol

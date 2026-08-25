@@ -20,7 +20,7 @@ use orrery_protocol::metrics::{bucket_index, bucket_upper_us, NUM_LATENCY_BUCKET
 
 /// Buckets, boundaries and the reconstruction rule all come from
 /// [`orrery_protocol::metrics`] — the same definition the gateway, the client
-/// histogram and the `p2-dashboard` gate use. This module's doc used to claim
+/// histogram and the `gates/p2-dashboard` gate use. This module's doc used to claim
 /// its own table was "shared with the P2 latency artifact's D16 histogram";
 /// it was a fourth copy, and the finest one. It is now the shared table.
 const NUM_BUCKETS: usize = NUM_LATENCY_BUCKETS;

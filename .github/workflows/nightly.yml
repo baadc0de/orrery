@@ -62,7 +62,7 @@
 #
 # ── B. Needs a live FoundationDB server, but no qualified device ─────────────
 #
-# `p3-siblings`, `p5-dupe-gauntlet` and `fdb-tests`. All three were already
+# `gates/p3-siblings`, `gates/p5-dupe-gauntlet` and `fdb-tests`. All three were already
 # hosted and stay hosted, and the reason is unchanged: provisioning a throwaway
 # cluster means `sudo dpkg -i` on the server package, which the box's
 # unprivileged `ci` user could not do, and the `fdbserver` the box *does* run
@@ -83,10 +83,10 @@
 #
 # ── C. Needs neither ─────────────────────────────────────────────────────────
 #
-# `p1-swarm`, `p4-accumulate`, `p4-platform-ledger`, `determinism-soak` — and
+# `gates/p1-swarm`, `p4-accumulate`, `p4-platform-ledger`, `determinism-soak` — and
 # these are what #179 moved to `ubuntu-latest`:
 #
-#   * `p1-swarm` and both `p4-*` jobs run the `p1-swarm` harness, a headless
+#   * `gates/p1-swarm` and both `p4-*` jobs run the `gates/p1-swarm` harness, a headless
 #     in-process simulation on a simulated clock. No socket, no cluster, no
 #     fixed port, and no wall-clock assertion — its peers are coupled by an
 #     in-process router, so a slower machine costs time and changes no verdict.
@@ -99,7 +99,7 @@
 #
 # ── The exception, and why the box is still here ─────────────────────────────
 #
-# `p3-island` is in category C by every prerequisite and **still failed on
+# `gates/p3-island` is in category C by every prerequisite and **still failed on
 # `ubuntu-latest`**, so it kept the box. The long note on that job has the
 # measurement; the short version was that its P3 criterion held fine on a
 # hosted runner and the drain leg #168 added did not, for a reason no timeout
@@ -107,13 +107,13 @@
 # rather than a wall-clock bound — and #180 moved the job, which is what let
 # the final persistent runner registration be removed.
 #
-# The historical note that belongs with `p3-island` and is not a runner
+# The historical note that belongs with `gates/p3-island` and is not a runner
 # question: it failed its first run *on the box*, and the move there was not
 # why. The harness had gone deaf to the gateway's control replies when
 # `8fd8c22` put them on a reliable stream, and the same failure — `only 0/50
 # claims answered`, eight peers each reporting an unanswered hello —
 # reproduces on a developer's shell with no CI in sight. Fixed in
-# `p3-island/src/wire.rs`.
+# `gates/p3-island/src/wire.rs`.
 #
 # ── The budget every hosted job here lives inside ────────────────────────────
 #
@@ -209,7 +209,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: p1-swarm-evidence
-          path: target/p1-swarm/
+          path: target/gates/p1-swarm/
           retention-days: 14
           if-no-files-found: warn
 
@@ -250,7 +250,7 @@ jobs:
     #
     # The per-commit determinism matrix in ci.yml already proves `orrery_core`
     # replays identically on x86_64 Windows and aarch64 macOS. It does **not**
-    # build `p1-swarm`, which pulls Bevy (headless: `bevy_app`, `bevy_ecs`,
+    # build `gates/p1-swarm`, which pulls Bevy (headless: `bevy_app`, `bevy_ecs`,
     # `bevy_math`, `bevy_time`, all `default-features = false`, so no windowing
     # or audio backend is in the tree) and had only ever been built on Linux.
     # Whether it builds on the other two, and whether it produces the *same*
@@ -360,7 +360,7 @@ jobs:
       # the leg simply joins the scheme the other two already use, under its
       # own per-platform key.
       #
-      # `p1-swarm/target` stays in the path list, unlike the `ci.yml` lanes
+      # `gates/p1-swarm/target` stays in the path list, unlike the `ci.yml` lanes
       # #178 moved, and the difference is size: that argument was about a
       # 45.65 GiB workspace `target/` against a 10 GB repository-wide Actions
       # cache allowance. This is one standalone workspace, and the two hosted
@@ -372,8 +372,8 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            p1-swarm/target
-          key: nightly-p4-${{ matrix.platform }}-${{ hashFiles('p1-swarm/Cargo.lock', 'rust-toolchain.toml') }}
+            gates/p1-swarm/target
+          key: nightly-p4-${{ matrix.platform }}-${{ hashFiles('gates/p1-swarm/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: nightly-p4-${{ matrix.platform }}-
 
       # These run nowhere else: scripts/check.sh enumerates the four gate
@@ -603,7 +603,7 @@ jobs:
       # single run every peer shares one binary and one `libm`, so a run on
       # Windows proves the pipeline holds *on Windows*. It does not exercise a
       # witness on one platform re-executing a subject's log from another. That
-      # is a different experiment (p1-swarm's module docs name it) and the
+      # is a different experiment (gates/p1-swarm's module docs name it) and the
       # criterion's "across all three platforms" is not obviously the same claim.
       - name: Require every platform's probe to agree
         run: |
@@ -756,7 +756,7 @@ jobs:
         run: cargo build --release -p orrery_persistd -p orrery_coordinator
 
       - name: Build the island harness
-        working-directory: p3-island
+        working-directory: gates/p3-island
         run: cargo build --release
 
       # No FoundationDB here on purpose. Authority lives in the registrar, and
@@ -776,7 +776,7 @@ jobs:
         env:
           PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
           COORDINATOR_BIN: ${{ github.workspace }}/target/release/orrery-coordinator
-          P3_ISLAND_BIN: ${{ github.workspace }}/p3-island/target/release/p3-island
+          P3_ISLAND_BIN: ${{ github.workspace }}/gates/p3-island/target/release/p3-island
           P3_VICTIM_CLAIM_KIND: weak
         run: scripts/p3-island-gate.sh
 
@@ -793,7 +793,7 @@ jobs:
         env:
           PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
           COORDINATOR_BIN: ${{ github.workspace }}/target/release/orrery-coordinator
-          P3_ISLAND_BIN: ${{ github.workspace }}/p3-island/target/release/p3-island
+          P3_ISLAND_BIN: ${{ github.workspace }}/gates/p3-island/target/release/p3-island
           P3_VICTIM_CLAIM_KIND: strong
         run: scripts/p3-island-gate.sh
 
@@ -880,7 +880,7 @@ jobs:
           cargo build --release -p orrery_coordinator
 
       - name: Build the sibling harness
-        working-directory: p3-siblings
+        working-directory: gates/p3-siblings
         run: cargo build --release
 
       - name: Run the sibling-gateway gate
@@ -889,7 +889,7 @@ jobs:
           PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
           COORDINATOR_BIN: ${{ github.workspace }}/target/release/orrery-coordinator
           ORRERY_SEED_BIN: ${{ github.workspace }}/target/release/orrery-seed
-          P3_SIBLINGS_BIN: ${{ github.workspace }}/p3-siblings/target/release/p3-siblings
+          P3_SIBLINGS_BIN: ${{ github.workspace }}/gates/p3-siblings/target/release/p3-siblings
         run: scripts/p3-siblings-gate.sh
 
       - name: Upload the gate's evidence
@@ -947,8 +947,8 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            p5-dupe-gauntlet/target
-          key: nightly-p5-dupe-${{ hashFiles('p5-dupe-gauntlet/Cargo.lock', 'rust-toolchain.toml') }}
+            gates/p5-dupe-gauntlet/target
+          key: nightly-p5-dupe-${{ hashFiles('gates/p5-dupe-gauntlet/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: nightly-p5-dupe-
 
       - name: Install FoundationDB with a local cluster
@@ -957,14 +957,14 @@ jobs:
           server: "true"
 
       - name: Build the gauntlet
-        working-directory: p5-dupe-gauntlet
+        working-directory: gates/p5-dupe-gauntlet
         run: cargo build --release
 
       - name: Run all single-gateway arms
         env:
           ORRERY_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
           P5_DUPE_CLUSTER_IS_THROWAWAY: "1"
-          P5_DUPE_BIN: ${{ github.workspace }}/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet
+          P5_DUPE_BIN: ${{ github.workspace }}/gates/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet
         run: scripts/p5-dupe-gauntlet-gate.sh
 
       - name: Upload the gate's evidence
@@ -1025,8 +1025,8 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            p5-dupe-gauntlet/target
-          key: nightly-p5-dupe-${{ hashFiles('p5-dupe-gauntlet/Cargo.lock', 'rust-toolchain.toml') }}
+            gates/p5-dupe-gauntlet/target
+          key: nightly-p5-dupe-${{ hashFiles('gates/p5-dupe-gauntlet/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: nightly-p5-dupe-
 
       - name: Install FoundationDB with a local cluster
@@ -1035,14 +1035,14 @@ jobs:
           server: "true"
 
       - name: Build the harness
-        working-directory: p5-dupe-gauntlet
+        working-directory: gates/p5-dupe-gauntlet
         run: cargo build --release
 
       - name: Run the ramp arms
         env:
           ORRERY_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
           RAMP_SHADOW_CLUSTER_IS_THROWAWAY: "1"
-          P5_DUPE_BIN: ${{ github.workspace }}/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet
+          P5_DUPE_BIN: ${{ github.workspace }}/gates/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet
         run: scripts/ramp-shadow-gate.sh
 
       - name: Upload the gate's evidence
@@ -1281,7 +1281,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # #171's free-disk sampler, record-only — same loop as the other FDB
-      # jobs in this file; see the note on `p3-siblings`.
+      # jobs in this file; see the note on `gates/p3-siblings`.
       - name: Start the free-disk sampler
         run: |
           set -euo pipefail

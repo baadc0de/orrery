@@ -572,12 +572,12 @@ unchanged. A 77-entry renewal was 77 serial round trips.
 
 **Epoch-fenced acks (split-brain guard).** An actor may issue durable acks only while its shard-ownership epoch (§3.4) is **confirmed fresh**: it heartbeats an FDB read version roughly every **1 s** and treats its epoch as stale after a **3 s staleness bound** — deliberately below the failure-detection + re-placement time, so a partitioned former owner falls silent before a replacement can be fenced in and serving. While stale, the actor downgrades to **provisional acks**, which the client treats as unacked (kept buffered, resent to the new owner). Every `JournalRecord` carries the epoch it was appended under, so recovery replay discards records from a superseded epoch; §4.1 quantifies the residual window.
 
-**Every gateway bulk write is fenced.** `route_session_diff` sets `strict_authority: true` unconditionally, so a `DiffUplink` without a granted `(lease_id, authority_seq)` is substituted with the never-granted `LeaseId(0)` and rejected by `apply_fenced` before it reaches the journal. Two consequences bind every client of this path, the P2 load rig (`p2-load`) included:
+**Every gateway bulk write is fenced.** `route_session_diff` sets `strict_authority: true` unconditionally, so a `DiffUplink` without a granted `(lease_id, authority_seq)` is substituted with the never-granted `LeaseId(0)` and rejected by `apply_fenced` before it reaches the journal. Two consequences bind every client of this path, the P2 load rig (`gates/p2-load`) included:
 
 - **A writable entity must already exist durably.** The registrar grants a lease only when it can resolve the entity's *committed* cell and that cell is the one the claim names (`committed_entity_cell(grid, entity) == cell`). An entity that has never been journaled has no committed cell, so it cannot be claimed, so it cannot be written. Bootstrapping is a server-side or seeding concern — `orrery-seed` for a durable world, `persistd --dev-seed` for a volatile harness — never a client one.
 - **A leased writer cannot move an entity between cells.** `apply_fenced` admits a diff only where `by_cell[entity] == record.cell`, and the gateway answers a client-sent `LeaseMsg::Rekey` with an unconditional `Deny{NotEligible}`; rekey is driven by the registrar and the redistributor. A client that follows an entity across a cell boundary by simply re-addressing its diffs is fenced out at the boundary. Cross-cell coverage in a load profile therefore comes from *placement*, not from motion.
 
-`p2-load` implements exactly this: one iroh identity per session (the peer registry is `NodeId`-keyed and only a peer's newest session is current), a strong `Explicit` claim per entity before any load, a batched lease heartbeat at 3 s against the 10 s TTL, and no unleased write path at all — a denied claim or a withdrawn lease fails the run rather than degrading to writes the gateway will refuse.
+`gates/p2-load` implements exactly this: one iroh identity per session (the peer registry is `NodeId`-keyed and only a peer's newest session is current), a strong `Explicit` claim per entity before any load, a batched lease heartbeat at 3 s against the 10 s TTL, and no unleased write path at all — a denied claim or a withdrawn lease fails the run rather than degrading to writes the gateway will refuse.
 
 **Bulk-path validation.** The cell actor runs the stateless `Ruleset` invariant validators (D9/D10 — the same speed/acceleration/rate/impossible-value checks witnesses run) on inbound diffs: **mandatory** for entities in cells with fewer than N witness candidates — closing the solo-player-in-an-empty-cell hole, where no witness set exists to observe the author — and **sampled** elsewhere. Violations are rejected (NACK) or flagged to the adjudication pipeline.
 
@@ -590,7 +590,7 @@ output is one directory per point.
 
 **Read the delivered column, not the nominal one.** `offered/s` in the first
 version of this table was `entities × diff_hz` — nominal demand, a dial
-setting, not load that arrived. `p2-load`'s fan-out assert allows
+setting, not load that arrived. `gates/p2-load`'s fan-out assert allows
 `sessions × 160` diffs/s (`check_fan_out`), five of the six rate points were
 provisioned with exactly zero margin against that, and the rig drops the
 excess silently on the client (`UplinkScheduler::queue` is newest-wins). The
@@ -627,7 +627,7 @@ the after arm sheds 0.01 %, commits intents in 750 ms, and acknowledges
 essentially everything that arrives; nothing about it looks like a limit. What
 ran out was the load generator. The honest statement of the new service
 ceiling is **">= 99 k delivered records/s, not located"** — finding it needs a
-rig that can offer more than one box's `p2-load` can, which this study did not
+rig that can offer more than one box's `gates/p2-load` can, which this study did not
 have. The *old* knee is the number that moved and is measurable: 40 000
 nominal / ~33.6 k delivered before, versus at least 99 k delivered after.
 
@@ -648,7 +648,7 @@ in one session, the merged branch tip against the fixed binary:
 The arms are inside this box's own run-to-run spread at both points, and every
 route invariant held on all four runs: `mailbox_turns / applies` exactly 1.0,
 `locate_fallbacks` 0, `location_mismatches` 0, `leases_lost` 0, and
-`diff_nacks` **0** — the last being the end-to-end evidence that `p2-load`
+`diff_nacks` **0** — the last being the end-to-end evidence that `gates/p2-load`
 addresses its diffs at the cell it was granted, so the new per-connection
 probe bucket never fires on the workload. `bulk_ack_ms` p99 is the one number
 that moves visibly and is the one this box is worst at reproducing: 9–15 ms
@@ -701,7 +701,7 @@ Two-stage validation, deliberately: the hot-state `Ruleset` check is a **fast ad
 ### 2.2.1 Where the D16 intent tail actually comes from
 
 > **The configuration this section measures is no longer the rig's default
-> (2026-08-19).** `p2-load` now phases each session's lease renewal across the
+> (2026-08-19).** `gates/p2-load` now phases each session's lease renewal across the
 > period; the single-pass burst diagnosed below is reached with
 > `P2_LOAD_HEARTBEAT_PHASED=0`. Nothing here is restated, re-derived or
 > withdrawn by that change — every number below is a measurement of the
@@ -754,7 +754,7 @@ gate that can quietly stop enforcing is this section's own failure one level up.
 #### The rig, and the populations every number below is drawn from
 
 One box, `ssd-2` storage engine, 250 sessions over a 10 000-entity world on 128
-level-18 shards, 30 s per run, `p2-load` driving both bulk and intents. Three
+level-18 shards, 30 s per run, `gates/p2-load` driving both bulk and intents. Three
 legs plus one calibration run, 25 runs total:
 
 | leg | runs | what it varies | driver |
@@ -937,7 +937,7 @@ straddling a 250 ms boundary looks like. It is 8 of 9 and not 9 of 9, and the
 earlier text that said "in exactly those intervals and no other" was
 overstating a real coincidence by one interval.
 
-`LEASE_HEARTBEAT` is 3 s, and `p2-load` renewed **every session's whole entity
+`LEASE_HEARTBEAT` is 3 s, and `gates/p2-load` renewed **every session's whole entity
 set in one pass of its drive loop**: 250 sessions × 40 entities is 10 000 lease
 renewals arriving inside a few milliseconds, every three seconds.
 
@@ -990,7 +990,7 @@ only the cadence leg's pair was the previous version's error; the four-run
 range is **0.18–6.91 ms**.
 
 **The synchronized renewal pass is a property of the load generator, not of the
-workload.** Real clients are not phase-aligned with each other; `p2-load`
+workload.** Real clients are not phase-aligned with each other; `gates/p2-load`
 already phases its *bulk* flushes per session (`session_flush_phase`) and did
 not phase its heartbeat, and that asymmetry is the whole of the burst.
 
@@ -1206,7 +1206,7 @@ pass of the drive loop. `P2_LOAD_HEARTBEAT_PHASED=0` restores the burst, and
 that opt-out is load-bearing: §2.2.1 is a diagnosis *of the unphased
 configuration*, and a diagnosis that cannot be re-run is a story. Nothing else
 changed — not the cadence, not the number of renewals, not the work the gateway
-does per renewal. `p2-load` already phased its **bulk** flushes per session
+does per renewal. `gates/p2-load` already phased its **bulk** flushes per session
 (`session_flush_phase`) and did not phase its heartbeat; this removes that
 asymmetry and nothing more.
 
@@ -1411,13 +1411,13 @@ fdbcli -C /some/fdb.cluster --exec 'configure new single ssd'
 
 cargo build --release -p orrery_persistd -p orrery_seed \
   --features orrery_persistd/fdb,orrery_seed/fdb
-cargo build --release --manifest-path p2-load/Cargo.toml
-cargo build --release --manifest-path p2-dashboard/Cargo.toml
+cargo build --release --manifest-path gates/p2-load/Cargo.toml
+cargo build --release --manifest-path gates/p2-dashboard/Cargo.toml
 
 export ORRERY_FDB_CLUSTER_FILE=/some/fdb.cluster
 export PERSISTD_BIN=target/release/persistd ORRERY_SEED_BIN=target/release/orrery-seed
-export P2_LOAD_BIN=p2-load/target/release/p2-load
-export P2_DASHBOARD_BIN=p2-dashboard/target/release/p2-dashboard
+export P2_LOAD_BIN=gates/p2-load/target/release/p2-load
+export P2_DASHBOARD_BIN=gates/p2-dashboard/target/release/p2-dashboard
 
 # between runs: the primary asserts --chain-epoch 1 against a fence that only
 # ever moves forward, so a second run needs a cleared keyspace
@@ -3036,7 +3036,7 @@ python3 scripts/p2-journal-store-report.py             # every number below
 python3 scripts/p2-journal-store-report.py --self-test # and its claims
 ```
 
-**The instrument** is [`p2-journal-bench`](../p2-journal-bench/README.md), and
+**The instrument** is [`gates/p2-journal-bench`](../gates/p2-journal-bench/README.md), and
 it is deliberately not a second `Journal`. What the journal asks of a store is
 narrow — batch N keyed records, commit the batch with one WAL fsync, let the
 caller time that call — so that is the whole `Store` trait, implemented
@@ -3175,7 +3175,7 @@ versions between 2026-06-06 and 06-10.
 #### Reproducing
 
 ```sh
-cd p2-journal-bench
+cd gates/p2-journal-bench
 cargo build --release --features "rocksdb-store waldb-store"   # compiles RocksDB from C++; minutes
 ./target/release/p2-journal-bench --store fjall   --dir /mnt/nvme/f --seconds 300
 ./target/release/p2-journal-bench --store rocksdb --dir /mnt/nvme/r --seconds 300
@@ -3309,7 +3309,7 @@ Cell actors checkpoint **copy-on-update**: applying a diff to a dirty-flagged en
 
 Client enters an area → `orrery_persist_client` requests the 27-cell neighborhood (D5) over a reliable stream. The gateway partitions the cells: **live cells** (an actor holds them) are served from actor memory — authoritative, ≥ checkpoint freshness; **cold cells** are served by FDB range scans over `world/{cell_id}/…` + `chunk/{cell_id}/…` (contiguous by Morton prefix). Pages stream **nearest-first** (center cell, then face/edge/corner neighbors by distance), so the client can spawn-in against page one; target **< 50 ms to first page-in** (one actor snapshot or one in-region range scan — FDB reads are 0.1–1 ms — plus serialization and one RTT). Subsequent motion turns loads into incremental single-cell fetches at the AOI leading edge, and live diffs flow via replication (03-replication.md), not the load path. For a nested-grid area (a ship's interior, [01-spatial-model.md](01-spatial-model.md) §13) the load is one `grid/{grid_id}` frame read plus the normal 27-cell scans *in the ship's grid* — the frame row tells the client where the ship is; the contents come from the ship's own `CellId` space.
 
-**A requested cell matches stored cells by prefix, and an unmatched request is an empty page, not an error.** `read_snapshot` admits an entity when the requested cell is a prefix of the entity's stored cell, so `CellId::ROOT` is a covering scan of the whole grid while a request at `INTEREST_LEVEL` — the deepest level — matches only itself. That asymmetry is what makes a *wrong* cell indistinguishable from an *empty* one: both answer with a well-formed page carrying no entities, and only a genuinely failed read becomes an `AreaLoadError`. Any reader that proves durability per entity must therefore name the cell the write was acknowledged at, not a cell it derived independently; the P2 kill-9 verifier reads its leaves straight out of the ack log for exactly this reason (`scripts/p2-kill9-gate.sh`, `p2-load`'s `recovery_leaf_cells`). Measured 2026-08-17: a verifier that synthesised its own lattice reported 99 of 100 durable entities missing against a promoted node that held all 100, with no error anywhere in the path.
+**A requested cell matches stored cells by prefix, and an unmatched request is an empty page, not an error.** `read_snapshot` admits an entity when the requested cell is a prefix of the entity's stored cell, so `CellId::ROOT` is a covering scan of the whole grid while a request at `INTEREST_LEVEL` — the deepest level — matches only itself. That asymmetry is what makes a *wrong* cell indistinguishable from an *empty* one: both answer with a well-formed page carrying no entities, and only a genuinely failed read becomes an `AreaLoadError`. Any reader that proves durability per entity must therefore name the cell the write was acknowledged at, not a cell it derived independently; the P2 kill-9 verifier reads its leaves straight out of the ack log for exactly this reason (`scripts/p2-kill9-gate.sh`, `gates/p2-load`'s `recovery_leaf_cells`). Measured 2026-08-17: a verifier that synthesised its own lattice reported 99 of 100 durable entities missing against a promoted node that held all 100, with no error anywhere in the path.
 
 ### 9.1 Lanes, and why the gateway opens two streams
 

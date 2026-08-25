@@ -71,7 +71,7 @@ One workspace consequence rides along: lightyear's replication and prediction cr
 
 **Demo criterion — met (verified 2026-08-21, #238).** 32 synthetic peers (headless bot harness, scripted roaming across ≥64 interest cells) run for one hour: every peer's sustained upload stays ≤ 1 Mbps; interest-set membership churn is absorbed without visible proxy pops; no entity thrashes cells at a boundary; a late-joining peer receives only its 27-cell neighborhood.
 
-**Met**, by `p1-swarm` (`scripts/p1-swarm-gate.sh`), on a clean link and under P4's 3% loss / 100 ms jitter profile. Measured over the criterion's hour: worst peak upload 719 kbps against the 1 Mbps budget, 133 cells for the least-travelled peer, zero boundary flips and zero proxy pops across 75 k interest-set churn events, and a late joiner tracking only peers inside its neighbourhood. The hour is simulated — each peer's clock advances one 60 Hz tick per frame — so the run costs ~2.5 minutes and is reproducible from its seed.
+**Met**, by `gates/p1-swarm` (`scripts/p1-swarm-gate.sh`), on a clean link and under P4's 3% loss / 100 ms jitter profile. Measured over the criterion's hour: worst peak upload 719 kbps against the 1 Mbps budget, 133 cells for the least-travelled peer, zero boundary flips and zero proxy pops across 75 k interest-set churn events, and a late joiner tracking only peers inside its neighbourhood. The hour is simulated — each peer's clock advances one 60 Hz tick per frame — so the run costs ~2.5 minutes and is reproducible from its seed.
 
 The harness runs the shipping plugins; only the socket is stood in for, by an in-process router with seeded impairment (transport is P0's criterion, and P4 needs loss to be a reproducible parameter rather than a netem setup). Island *formation* is likewise installed rather than negotiated, because forming one is P3's criterion and is separately proven.
 
@@ -126,7 +126,7 @@ default-backend decision and its maturity tradeoff are in
 [ADR-0019](adr/0019-indexed-waldb-journal.md).
 
 **Historical Fjall baseline, re-measured on the phased rig (2026-08-19).**
-`p2-load` phases each session's lease renewal across the period by default
+`gates/p2-load` phases each session's lease renewal across the period by default
 ([08-persistence.md](08-persistence.md) §2.2.2), so every P2 latency figure
 published before this date describes a configuration the rig no longer runs.
 Re-baselined over **43 full kill-9 gate runs** — 28 phased, 15 unphased,
@@ -212,7 +212,7 @@ side.
 by construction a journal commit plus routing plus the wire, and
 `intent_commit_ms` contains a durable commit too, so neither can pass while
 `journal_commit_ms` fails — yet the report listed all three as independent
-`FAIL`s, which invites three debugging passes for one cause. `p2-dashboard`
+`FAIL`s, which invites three debugging passes for one cause. `gates/p2-dashboard`
 now classifies each failure as a **root** (nothing it contains is also failing)
 or a **consequence**, and names the roots first. On this run: three failing
 series, one root cause, `journal_commit_ms`. No threshold moved, no series was
@@ -342,7 +342,7 @@ and no lost entity; separately, a scripted cooperative handoff chain (player A
 grabs, throws to B's contact island) completes with zero registrar-visible
 conflicts and no visible pop.
 
-`scripts/p3-island-gate.sh` is the permanent harness, driving the `p3-island`
+`scripts/p3-island-gate.sh` is the permanent harness, driving the `gates/p3-island`
 tool against a live `orrery-coordinator` and `persistd`. Peers are real OS
 processes, so the `kill -9` is a real SIGKILL rather than a dropped task, and
 each peer obtains its interest grant from the coordinator rather than having
@@ -425,7 +425,7 @@ impairment produce zero reports (D17 risk 3). Of the three things that gate
 being able to measure it at all, two are now in place — the cross-platform
 determinism CI (`.github/workflows/ci.yml`, four targets, per commit) and the
 reference game (`orrery_games`) — and what is outstanding is the **accumulation
-of hours**: `p1-swarm --witness` runs the pipeline, and the nightly swarm gate
+of hours**: `gates/p1-swarm --witness` runs the pipeline, and the nightly swarm gate
 now runs *it* — a third leg, 32 peers for a simulated hour under the impairment
 profile, blocking on all three witnessing clauses, accruing 32 player-hours a
 night on x86_64 Linux (`scripts/p1-swarm-gate.sh`,
@@ -499,7 +499,7 @@ that moves it has found something; that run found something, and the number was
 re-baselined to the post-fix figure rather than the clause being relaxed. It has
 since been re-baselined again, to 162, for a different reason — see below.
 
-The gate runs the 3% floor nightly and `p1-swarm --loss 0.05` reproduces the
+The gate runs the 3% floor nightly and `gates/p1-swarm --loss 0.05` reproduces the
 other end on demand. The rest of what is outstanding: the other three
 determinism targets, and
 a ledger that adds the nights up. Each report is
@@ -533,14 +533,14 @@ arithmetic; do not hand-copy this figure, and note that the retired pipeline
 `ca3017478a9ec533` holds 480 distinct of 640 banked, so **no pipeline has yet
 reached 500**. A total is only meaningful
 within a *pipeline version*, so every line carries one: the git tree hashes of
-`orrery_witness`, `orrery_core`, `orrery_games` and `p1-swarm` at the run's own
+`orrery_witness`, `orrery_core`, `orrery_games` and `gates/p1-swarm` at the run's own
 commit, hashed together, and `p4-ledger.sh total` groups by it rather than
 summing across it. That is what makes the pre-#44 boundary auditable rather than
 a footnote: hours banked while the swarm played `orrery_conformance`'s corpus
 kernel ran stage 1 against an empty invariant slice and are not hours of the
 same measurement. The digest is whatever the run's own commit yields; as of
 2026-08-23 the live one is `c6d6caaaa86d649d`. The 500 are counted against it
-and reset when **any file** under those four trees changes — `p1-swarm/Cargo.lock`
+and reset when **any file** under those four trees changes — `gates/p1-swarm/Cargo.lock`
 included, since these are tree hashes rather than source hashes. Whether a
 lockfile-only change *should* reset the count is open; #306 poses it.
 
@@ -563,13 +563,13 @@ run on the other two platforms is what will settle the rest, and this record is
 written before one has happened.
 
 - **The dependency graph resolves on all three.** `cargo tree --target` on
-  `p1-swarm` yields 395 crates for `x86_64-unknown-linux-gnu`, 400 for
+  `gates/p1-swarm` yields 395 crates for `x86_64-unknown-linux-gnu`, 400 for
   `x86_64-pc-windows-msvc`, 405 for `aarch64-apple-darwin`. What the two
   non-Linux targets add is `windows`/`windows-sys`/`wmi`/`ipconfig` and
   `objc2-*`/`core-foundation`/`security-framework` — system bindings pulled by
   iroh's interface and certificate discovery. **No windowing, audio or input
   backend appears on any of them**, which is the Bevy-on-a-headless-runner
-  hazard not being there: `p1-swarm` takes `bevy_app`, `bevy_ecs`, `bevy_math`
+  hazard not being there: `gates/p1-swarm` takes `bevy_app`, `bevy_ecs`, `bevy_math`
   and `bevy_time` with `default-features = false` and nothing else of Bevy.
 - **A local cross-compile proves nothing either way, and the reason is this
   box.** `cargo check --target x86_64-pc-windows-msvc` fails in `cc-rs` with
@@ -599,8 +599,8 @@ written before one has happened.
 fixed here.* None of them needed a runner to find, and each would have failed
 the first night:
 
-1. `scripts/p4-accumulate.sh` hard-coded `p1-swarm/target/release/p1-swarm`.
-   Cargo emits `p1-swarm.exe` on Windows, so the leg would have died at
+1. `scripts/p4-accumulate.sh` hard-coded `gates/p1-swarm/target/release/p1-swarm`.
+   Cargo emits `gates/p1-swarm.exe` on Windows, so the leg would have died at
    `harness binary missing` before running a tick. Both spellings are tried now.
 2. `scripts/p4-ledger.sh` required `flock` and `sha256sum` — util-linux and GNU
    coreutils, neither of which is on a stock macOS runner or in the Git Bash a
@@ -613,7 +613,7 @@ the first night:
    with CRLF and died on the carriage return in its shebang. The Windows leg
    sets `core.autocrlf=input` before its checkout.
 
-*What is still unknown.* **Whether `p1-swarm` compiles and holds its clauses on
+*What is still unknown.* **Whether `gates/p1-swarm` compiles and holds its clauses on
 Windows and macOS is not yet known** — it has never been built there, and no CI
 run has happened on this work. The dependency graph resolving is a necessary
 condition and not a sufficient one. If a leg fails, the failure lands in that
@@ -625,7 +625,7 @@ not an hour.
 *One thing these legs do not prove, whatever they report.* Within a single run
 every peer shares one binary and one `libm`, so re-execution is bit-identical by
 construction and the cross-platform divergence false positive cannot occur
-(`p1-swarm`'s module docs say so). An hour banked on `windows-latest` is
+(`gates/p1-swarm`'s module docs say so). An hour banked on `windows-latest` is
 evidence that the witness pipeline holds **on Windows**; it is not evidence that
 a Windows witness re-executing a macOS subject's log agrees with it. That is a
 different experiment — the determinism matrix extended to exchange logs between
@@ -691,7 +691,7 @@ sustained overrun; the `--max-shed` ratchet on the nightly leg tracks the
 measured number and is now 162. `--min-cells 64` is untouched and clears by more
 than it did. `MIN_COVERAGE` did not move, and no D16 parameter moved.
 
-Turning `Ruleset::invariants()` on was the live risk in that swap — `p1-swarm`
+Turning `Ruleset::invariants()` on was the live risk in that swap — `gates/p1-swarm`
 fails the run on any false positive, and Skirmish's stage-1 checks were tuned
 against its own pilot rather than against a 20 Hz bot under 3–5% loss. They
 hold: **zero** stage-1 breaches across 64 accumulated player-hours at both ends
@@ -704,9 +704,9 @@ so a reordered pair is declined rather than accused.
 population.** Both ends of it were proven separately and neither was proven in a
 swarm — `orrery_witness`'s own tests drive a cheating authority to
 `Verdict::Confirms`, `orrery_persistd`'s carry a signed report over a real
-gateway, and `p1-swarm` had no `WitnessIdentity`, no cheat and no adjudicator:
+gateway, and `gates/p1-swarm` had no `WitnessIdentity`, no cheat and no adjudicator:
 every escalation it ever raised was counted as `escalations_unidentified` and
-nothing was filed. `p1-swarm --cheat` closes it end to end, and the nightly gate
+nothing was filed. `gates/p1-swarm --cheat` closes it end to end, and the nightly gate
 runs it as a fourth leg with an armed-but-honest control as a fifth.
 
 Measured at the population the criterion names — `--peers 8 --seconds 300
@@ -748,14 +748,14 @@ rather than a verdict, arriving from the opposite direction to the
 `DamageInflation` cheat that was written to make it.
 
 **A latent adjudication defect, found by being the first thing to adjudicate a
-swarm bundle.** `p1-swarm` anchors every watch at tick 0 and then published a
+swarm bundle.** `gates/p1-swarm` anchors every watch at tick 0 and then published a
 *second* claim at tick 0 on the first tick — same entity, head and state hash,
 different `prev_claim`, therefore a different `claim_hash`. A witness retains
 both; `AuthorityLog::assemble_bundle` takes the anchor as `t0_claim` while the
 tick-30 claim chains from the duplicate; `verify_bundle` walks
 `disputed_claims` checking `claim.prev_claim == claim_hash(previous)`, finds the
 break, and returns **`Confirms { DiscreteMismatch }` against an authority that
-did nothing wrong**. Shadow mode is why nothing saw it: no `p1-swarm` bundle had
+did nothing wrong**. Shadow mode is why nothing saw it: no `gates/p1-swarm` bundle had
 ever been adjudicated. Fixed in the harness's own chain authoring, with a test
 that fails without the fix.
 
@@ -817,7 +817,7 @@ leaving in the crate:
   was evaluating an empty slice. **That included the swarm**, for as long as it
   played `orrery_conformance`'s corpus kernel: every accumulated player-hour ran
   stage 1 against `&[]`, and the false-positive count was a statement about log
-  re-execution alone. `p1-swarm` plays Skirmish now, so the cheap checks run on
+  re-execution alone. `gates/p1-swarm` plays Skirmish now, so the cheap checks run on
   every sample every peer receives and the invariant term in that count is live.
 - It ships its own cheats, because the demo criterion is a modified client. The
   three are chosen so each is caught by a different stage: a 1.5× speed
@@ -833,7 +833,7 @@ leaving in the crate:
   miniature, found by a test rather than by a player, which is the argument for
   the crate in one sentence.
 
-It is deliberately *not* a substitute for `p1-swarm`, and the two are now
+It is deliberately *not* a substitute for `gates/p1-swarm`, and the two are now
 coupled rather than parallel: the swarm plays this game, over an impaired link,
 with the real witness, and answers whether the pipeline holds up; the battery
 here answers whether the rules are honest-safe and the cheats are adjudicable,
@@ -1036,7 +1036,7 @@ with a real-NAT cohort (R-11's standing cohort, CGNAT included) embedded in
 it.
 
 **Crates.** No new crates (the D15 set is deliberately complete here). The
-load harness lineage (`p2-load`, `p1-swarm`) grows a population driver that
+load harness lineage (`gates/p2-load`, `gates/p1-swarm`) grows a population driver that
 speaks the full client stack; ops assets — deployment automation, dashboards,
 runbooks, the relay fleet — are the deliverable surface, per the P6 upstream
 milestone's open-sourced tooling.
@@ -1117,7 +1117,7 @@ composition seams — a breaking seam change costs an ADR, so #223 must be
 designed against the freeze or argue to reopen it); `orrery_seed` (content
 diff/patch against the recorded content-version row, docs/12); the auditor as
 a journal-archive consumer — whether it is a workspace crate (a D15 amendment)
-or a standalone tool like `p2-dashboard` is a decision-to-be-made (§B5);
+or a standalone tool like `gates/p2-dashboard` is a decision-to-be-made (§B5);
 `orrery_persist_client` (client-side ruleset-version handling during the
 window).
 

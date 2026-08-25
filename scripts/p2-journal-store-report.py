@@ -6,7 +6,7 @@
 memtables are queued. It left one question open, and it is a question about a
 *second* store: is that pathology **fjall's**, or **an LSM's**?
 
-`p2-journal-bench` drives fjall and RocksDB through the same write pattern the
+`gates/p2-journal-bench` drives fjall and RocksDB through the same write pattern the
 journal produces -- same arrival process, same coalescing window and caps, same
 monotonic keys, same two column families, one WAL fsync per batch -- on two
 media and at two durations.

@@ -152,7 +152,7 @@ fn run_authority(ticks: u64, retention: Retention) -> (AuthorityLog, Executor<Ki
 }
 
 /// As [`run_authority`], but the producer signs `T0` twice before it starts —
-/// an anchor claim and then the run loop's first claim, the p1-swarm shape.
+/// an anchor claim and then the run loop's first claim, the gates/p1-swarm shape.
 fn run_authority_double_signing_t0(
     ticks: u64,
     retention: Retention,
@@ -510,14 +510,14 @@ fn the_retained_head_matches_folding_the_frames_that_were_sent() {
 
 #[test]
 fn a_tick_signed_twice_does_not_convict_the_authority_that_signed_it() {
-    // p1-swarm's own bug, seen from the store side: the anchor at T0 and the
+    // gates/p1-swarm's own bug, seen from the store side: the anchor at T0 and the
     // run loop's first claim at T0 are two signed claims at one tick, and every
     // later claim chains from the second. `assemble_bundle` used to take the
     // *first* claim it held at `window_start`, so the claim at T0+30 chained
     // from a hash the bundle never mentions, `verify_bundle` found the break,
     // and an authority that had executed the window correctly was convicted of
     // a `DiscreteMismatch` it did not commit. The producer bug is real and
-    // fixed in p1-swarm; the store must not turn it into a false conviction for
+    // fixed in gates/p1-swarm; the store must not turn it into a false conviction for
     // the next producer that makes it.
     let (log, _) = run_authority_double_signing_t0(90, Retention::default());
     let window = (Tick::new(T0), Tick::new(T0 + 60));

@@ -31,7 +31,7 @@ about.
 
 **`orrery_persistd` has no island concept at all.** Grepping `island` over
 `crates/orrery_persistd/src/` returns three hits, all prose: a comment naming
-the `p3-island` harness (`bin/persistd.rs:2050-2052`) and one doc line about a
+the `gates/p3-island` harness (`bin/persistd.rs:2050-2052`) and one doc line about a
 witness that rejoins an island (`gateway.rs:421`). There is no `IslandId` in
 the crate, no island-keyed state, and no message on the client↔gateway wire
 (`crates/orrery_protocol/src/gateway.rs:33`, `GatewayMsg`) that names one. The

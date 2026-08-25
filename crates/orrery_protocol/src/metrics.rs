@@ -2,8 +2,8 @@
 //!
 //! P2's acceptance gate is a chain of four processes — the journal recorder
 //! inside `orrery_persistd`, the gateway's server-side bulk timer, the
-//! client-side [`LatencyHistogram`] the `p2-load` rig measures with, and the
-//! `p2-dashboard` gate that reconstructs percentiles from the JSONL artifact.
+//! client-side [`LatencyHistogram`] the `gates/p2-load` rig measures with, and the
+//! `gates/p2-dashboard` gate that reconstructs percentiles from the JSONL artifact.
 //! A percentile only means the same thing at both ends of that chain if every
 //! link buckets a sample identically and spells the series the same way. This
 //! module is that one definition.
@@ -14,12 +14,12 @@
 //! lattice is not a wire type. The placement is a deliberate stretch of that
 //! charter, on two grounds. First, the D16 series names and `value_us` bucket
 //! bounds *are* a wire format: they are the field values in the JSONL artifact
-//! that `persistd` writes and `p2-dashboard` parses, and a producer and a
+//! that `persistd` writes and `gates/p2-dashboard` parses, and a producer and a
 //! consumer in different processes agreeing on an encoding is exactly what
 //! this crate exists to guarantee. Second, `orrery_protocol` is the only crate
 //! all four participants already depend on — `orrery_persistd`,
-//! `orrery_persist_client` and `p2-load` each name it directly, and
-//! `p2-dashboard` reaches it through the client crate's re-export. Any other
+//! `orrery_persist_client` and `gates/p2-load` each name it directly, and
+//! `gates/p2-dashboard` reaches it through the client crate's re-export. Any other
 //! home would mean a new dependency edge (D14), and the alternative to one
 //! shared definition was four drifting copies, which is what this replaces.
 //!
@@ -54,7 +54,7 @@ pub const SERIES_AREA_FIRST_PAGE: &str = "area_first_page_ms";
 /// `bulk_ack_ms`, so a bulk-ack regression can be attributed to server work
 /// or to the wire without re-running. It is a known series — the gate folds
 /// and reports it, and never fails on it — and naming it here is what keeps
-/// `p2-dashboard` from having to choose between silently discarding it and
+/// `gates/p2-dashboard` from having to choose between silently discarding it and
 /// calling every nightly artifact malformed.
 pub const SERIES_GATEWAY_BULK_SERVER: &str = "gateway_bulk_server_ms";
 
@@ -64,7 +64,7 @@ pub const SERIES_GATEWAY_BULK_SERVER: &str = "gateway_bulk_server_ms";
 /// The server-side half of [`SERIES_INTENT_COMMIT`], and deliberately **not**
 /// that name. The gated series is a client round trip; this span is strictly
 /// shorter, and a consumer that folds both into one histogram — which is
-/// exactly what `p2-dashboard` does, by series name and with no source field —
+/// exactly what `gates/p2-dashboard` does, by series name and with no source field —
 /// would deflate the gated p99 rather than measure anything. Separate name,
 /// separate histogram, no target.
 pub const SERIES_GATEWAY_INTENT_SERVER: &str = "gateway_intent_server_ms";
@@ -91,7 +91,7 @@ pub const GATED_SERIES: [&str; 4] = [
 ///
 /// Every member is a *server-internal* span produced by `persistd`, named so
 /// it can never be folded into the gated series it attributes. Growing this
-/// array is a deliberate cross-workspace change: `p2-dashboard`'s `SERIES_KEYS`
+/// array is a deliberate cross-workspace change: `gates/p2-dashboard`'s `SERIES_KEYS`
 /// is fixed-length over `GATED_SERIES.len() + UNGATED_SERIES.len()`, so a new
 /// member is a compile error there until the gate is taught to fold it.
 pub const UNGATED_SERIES: [&str; 3] = [
@@ -136,7 +136,7 @@ pub const SERIES_CHAIN_JOURNAL_ERRORS: &str = "chain_journal_errors_total";
 /// These are deliberately **not** in [`UNGATED_SERIES`], and
 /// [`is_known_series`] deliberately does not accept them. That predicate
 /// answers a narrower question — whether a name may appear in the P2 latency
-/// artifact `p2-dashboard` folds — and four of these are counters and one is a
+/// artifact `gates/p2-dashboard` folds — and four of these are counters and one is a
 /// byte gauge, none of which the [`LATENCY_BOUNDARIES_US`] lattice
 /// describes. Naming them here is what stops the eventual producer and the
 /// eventual consumer from inventing two spellings; promoting the latency

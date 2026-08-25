@@ -185,15 +185,15 @@ SLO / metrics table (targets from D16 where given; alert thresholds are ops defa
 
 Every row's **Source** names the process that actually produces the number
 today, or says plainly that nothing does. Three of these rows read "persistd
-gateway" for years while their only producer repo-wide was the `p2-load` rig:
+gateway" for years while their only producer repo-wide was the `gates/p2-load` rig:
 a client-observed round trip is measured at the client, and a name that
 mislocates it sends an operator to the wrong process on the worst day.
 
 | Metric | Source | Target / SLO | Alert |
 |---|---|---|---|
-| Bulk ack p99, client-observed (in-region) | client — `orrery_persist_client`'s uplink scheduler, exercised by the `p2-load` rig (`bulk_ack_ms`) | **< 5 ms** | > 10 ms for 5 min |
-| Intent commit p99 (in-region) | client — `orrery_persist_client`'s intent queue, exercised by the `p2-load` rig (`intent_commit_ms`) | **< 10 ms** | > 25 ms for 5 min |
-| Area first page-in | client — `Subscribe` → first `AreaPage`, `p2-load` rig (`area_first_page_ms`) | **< 50 ms** | p95 > 100 ms |
+| Bulk ack p99, client-observed (in-region) | client — `orrery_persist_client`'s uplink scheduler, exercised by the `gates/p2-load` rig (`bulk_ack_ms`) | **< 5 ms** | > 10 ms for 5 min |
+| Intent commit p99 (in-region) | client — `orrery_persist_client`'s intent queue, exercised by the `gates/p2-load` rig (`intent_commit_ms`) | **< 10 ms** | > 25 ms for 5 min |
+| Area first page-in | client — `Subscribe` → first `AreaPage`, `gates/p2-load` rig (`area_first_page_ms`) | **< 50 ms** | p95 > 100 ms |
 | Gateway server spans: bulk, intent, area first page | persistd gateway (`gateway_bulk_server_ms`, `gateway_intent_server_ms`, `gateway_area_first_page_server_ms`) | none — attribution, not a target | server span approaching the client target above it |
 | Report outcomes and refusals | persistd gateway (`gateway_report`) | shadow mode: refusals explained, not zero | `refused_no_adjudicator` ≠ 0 on a cluster that linked a `Ruleset` |
 | Authority: duplicate writes, handoffs, timeouts | persistd gateway (`gateway_authority`, ten counters) | `duplicate_authority` = **0** | any `duplicate_authority`; `handoff_timed_out` rising = zombie host (§10) |

@@ -288,7 +288,7 @@ if [[ ${1:-} == --self-test ]]; then
   # The evidence check. `[[ -s acks.jsonl ]]` passed on 1024 lines of
   # `IntentOutcome::Rejected` and zero durable writes: a non-empty file is not
   # evidence of a durable acknowledgement. Count the `"type":"diff"` records —
-  # p2-load writes one only for a *non-provisional* bulk ack — and require
+  # gates/p2-load writes one only for a *non-provisional* bulk ack — and require
   # more than zero. Matched with the operand attached: bare `durable_acks`
   # appears in prose and in the rig's own log line, so the shorter pattern
   # would pass on a script that had lost the assertion entirely.
@@ -333,7 +333,7 @@ if [[ ${1:-} == --self-test ]]; then
     '{"type":"sample_batch","series":"intent_commit_ms","value_us":101000,"count":100}' \
     '{"type":"sample_batch","series":"area_first_page_ms","value_us":3000,"count":100}' \
     >"$verdict_selftest_dir/miss.jsonl"
-  if cargo run --manifest-path "$repo_root/p2-dashboard/Cargo.toml" --quiet -- \
+  if cargo run --manifest-path "$repo_root/gates/p2-dashboard/Cargo.toml" --quiet -- \
       --gate --json "$verdict_selftest_dir/miss.jsonl" \
       >"$verdict_selftest_dir/miss-report.json" 2>"$verdict_selftest_dir/miss.stderr"; then
     die 'self-test: synthetic D16 miss unexpectedly passed'
@@ -354,7 +354,7 @@ if [[ ${1:-} == --self-test ]]; then
     '{"type":"sample_batch","series":"intent_commit_ms","value_us":7000,"count":100}' \
     '{"type":"sample_batch","series":"area_first_page_ms","value_us":30000,"count":100}' \
     >"$verdict_selftest_dir/pass.jsonl"
-  cargo run --manifest-path "$repo_root/p2-dashboard/Cargo.toml" --quiet -- \
+  cargo run --manifest-path "$repo_root/gates/p2-dashboard/Cargo.toml" --quiet -- \
     --gate --json "$verdict_selftest_dir/pass.jsonl" \
     >"$verdict_selftest_dir/pass-report.json" 2>"$verdict_selftest_dir/pass.stderr" \
     || die 'self-test: conforming synthetic report did not preserve a green gate'
@@ -442,8 +442,8 @@ fi
 
 : "${ORRERY_FDB_CLUSTER_FILE:?set ORRERY_FDB_CLUSTER_FILE}"
 : "${PERSISTD_BIN:?set PERSISTD_BIN to an fdb-enabled persistd binary}"
-: "${P2_LOAD_BIN:?set P2_LOAD_BIN to the p2-load binary}"
-: "${P2_DASHBOARD_BIN:?set P2_DASHBOARD_BIN to the p2-dashboard binary}"
+: "${P2_LOAD_BIN:?set P2_LOAD_BIN to the gates/p2-load binary}"
+: "${P2_DASHBOARD_BIN:?set P2_DASHBOARD_BIN to the gates/p2-dashboard binary}"
 # The seeder. Fenced writes need a claimable world and a claim needs a
 # committed cell, so this binary is now on the critical path of the durability
 # proof, not an optional convenience. Build it with
@@ -710,7 +710,7 @@ PY
 #
 # `iroh::SecretKey::public()` is plain ed25519, and `--issuer-key` wants the
 # public half in the same hex a `NodeId` parses from. No binary this job builds
-# will derive one — `p3-island` has `--print-keys`, but that is a different
+# will derive one — `gates/p3-island` has `--print-keys`, but that is a different
 # tool in a different workspace — so the derivation happens here, through
 # `openssl`, which is the one dependency both a GitHub-hosted runner and the
 # self-hosted box are certain to have.
@@ -1005,7 +1005,7 @@ if ! "$P2_LOAD_BIN" --gateway "$primary_gateway" --addr "$primary_addr" \
 fi
 # A non-empty ack log is not evidence. It was 1024 lines of rejected intents on
 # the run this check was supposed to catch. Count the durable bulk records —
-# p2-load writes a `"type":"diff"` line only for a non-provisional `BulkAck` —
+# gates/p2-load writes a `"type":"diff"` line only for a non-provisional `BulkAck` —
 # and require at least one.
 durable_acks=$(grep -c '"type":"diff"' "$out/acks.jsonl" || true)
 [[ ${durable_acks:-0} -gt 0 ]] \
@@ -1101,7 +1101,7 @@ if qualification.get('qualified'):
 else:
     if l.get('gate') != 'unqualified': raise SystemExit('latency dashboard did not withhold its verdict on an unqualified device')
     result = 'unqualified'
-# The merged artifact is written by persistd and p2-load and read by the
+# The merged artifact is written by persistd and gates/p2-load and read by the
 # dashboard, all three off one series-name definition (orrery_protocol::
 # metrics). An unrecognized name here means a producer drifted from it, which
 # used to show up as samples silently dropped and a clean report.

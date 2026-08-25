@@ -106,7 +106,7 @@ impl FdbContext {
     /// transaction on the resulting handle bounded.
     ///
     /// The signature is deliberately stable: four adapters, the persistd
-    /// binary and the `p2-load` rig all funnel through it, and they inherit
+    /// binary and the `gates/p2-load` rig all funnel through it, and they inherit
     /// the bounds without a call-site change.
     ///
     /// Opening is lazy — `Database::from_path` succeeds against a cluster

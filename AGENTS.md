@@ -149,16 +149,16 @@ CIs in one week came from that blind spot. The inventory, which is also
 | Workspace | Role in the lanes |
 |---|---|
 | `.` (root, 15 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other |
-| `p1-swarm` | `cargo test` in `gates` |
-| `p2-load` | `cargo test` in `gates` |
-| `p2-dashboard` | `cargo test` in `gates` |
-| `p4-streams-bench` | `cargo test` in `gates` |
-| `p0-nat-test` | `cargo check --all-targets` — no tests |
-| `p0-dashboard` | `cargo check --all-targets` — no tests |
-| `p3-island` | `cargo test` in `gates`; asserted by the nightly island gate |
-| `p3-siblings` | `cargo test` in `gates`; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
-| `p5-dupe-gauntlet` | `cargo test`; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB. Its `ramp` subcommand carries D32's enforcement-ramp arms too, asserted by the nightly `ramp-shadow` gate, which runs a shadow and an enforcing gateway from this one binary at the same time. Its additive measurement tests pin #153's p99 population and stage-count guards |
-| `p2-journal-bench` | `cargo check --all-targets` — no tests |
+| `gates/p1-swarm` | `cargo test` in `gates` |
+| `gates/p2-load` | `cargo test` in `gates` |
+| `gates/p2-dashboard` | `cargo test` in `gates` |
+| `gates/p4-streams-bench` | `cargo test` in `gates` |
+| `gates/p0-nat-test` | `cargo check --all-targets` — no tests |
+| `gates/p0-dashboard` | `cargo check --all-targets` — no tests |
+| `gates/p3-island` | `cargo test` in `gates`; asserted by the nightly island gate |
+| `gates/p3-siblings` | `cargo test` in `gates`; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `gates/p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
+| `gates/p5-dupe-gauntlet` | `cargo test`; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB. Its `ramp` subcommand carries D32's enforcement-ramp arms too, asserted by the nightly `ramp-shadow` gate, which runs a shadow and an enforcing gateway from this one binary at the same time. Its additive measurement tests pin #153's p99 population and stage-count guards |
+| `gates/p2-journal-bench` | `cargo check --all-targets` — no tests |
 | `clients/regolith` | `cargo test` in `gates`; the Bevy 0.19 keyboard/rendering skin over the headless Regolith intent and replay pipeline |
 
 The eight standalone test suites, and the three tools checked without tests, are the work
@@ -173,7 +173,7 @@ by construction: the table cannot match itself.
 **`fmt` is where this actually bit.** `cargo fmt --all` means "every member of
 *this* workspace", so the root-only invocation the workflow used to run reached
 zero of the 27 `.rs` files under the standalone tools. Widening it found exactly one
-dirty workspace, `p0-nat-test`. Note the flip side at the root: the three
+dirty workspace, `gates/p0-nat-test`. Note the flip side at the root: the three
 vendored crates *are* root members, so `cargo fmt --all` holds `vendor/` to
 default rustfmt even though clippy deliberately excludes it.
 
@@ -315,8 +315,8 @@ The `ci` Unix account on `orrery-hel1-1` is idle: it no longer runs GitHub
 Actions. Do not administer runner services there; the `actions.runner.*` units
 are gone.
 
-The jobs that need a FoundationDB *server* — `p2-kill9`, `p3-siblings`,
-`p5-dupe-gauntlet`, `ramp-shadow` and `fdb-tests`, all in `nightly.yml` — provision one per
+The jobs that need a FoundationDB *server* — `p2-kill9`, `gates/p3-siblings`,
+`gates/p5-dupe-gauntlet`, `ramp-shadow` and `fdb-tests`, all in `nightly.yml` — provision one per
 run through the composite action
 [`.github/actions/foundationdb`](.github/actions/foundationdb/action.yml) with
 `server: "true"`, points `ORRERY_FDB_CLUSTER_FILE` at the package-configured
@@ -324,7 +324,7 @@ run through the composite action
 discards it with the runner. There is no long-running CI cluster for a gate to
 be mis-pointed at — see [Working alongside other agents](#working-alongside-other-agents).
 
-`p3-island` contains no FoundationDB reference, binds every listener on
+`gates/p3-island` contains no FoundationDB reference, binds every listener on
 `127.0.0.1:0`, and runs persistd with `--allow-volatile-leases`; it runs on a
 GitHub-hosted runner with the other nightly jobs.
 
@@ -351,7 +351,7 @@ per-commit, alongside every other self-test in `scripts/`.
 lane runs `cargo test` in its eight test workspaces and `cargo check --all-targets`
 in its three check-only workspaces — see the inventory above, which is the table
 the lane iterates.
-`p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that
+`gates/p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that
 job installs the FoundationDB *client* on the hosted path.
 
 ### Where every gate stands: `scripts/gate-status.sh`
@@ -391,7 +391,7 @@ says so in every line of its summary; it does not say the gates passed.
 
 **Numbers come out of the gates' own reports**, never re-derived: settle times
 and disposition counts from `p3-island-*/report.json`, player-hours and
-false-positive counts from `target/p1-swarm/*.json`, latency percentiles and
+false-positive counts from `target/gates/p1-swarm/*.json`, latency percentiles and
 the recovery cutoff from `p2-kill9-*/artifact.json`, banked hours from the P4
 ledger, executed test counts from `target/fdb-tests.log`. A figure this script
 computed itself would be a second implementation of the gate, and the two would
@@ -421,7 +421,7 @@ therefore proves that the report script itself is not an unrun self-test.
 
 **Evidence is read as it is found, and that is a limitation with teeth.**
 `--inspect` and the evidence half of `--fast` tell you what a gate last said,
-not what it says about `HEAD`: a `target/p1-swarm/` left by a run three commits
+not what it says about `HEAD`: a `target/gates/p1-swarm/` left by a run three commits
 ago reads as `PASSED` with that run's numbers. Each JSONL record stamps the
 commit of the *report*, not of the evidence. Treat an evidence-derived row as a
 citation of an artifact, and re-run `--full` when the answer has to be about
@@ -454,7 +454,7 @@ worktrees run by the same user.
 | developer kache store | `~/.cache/kache` | no — local to that Unix user; it has no shared remote on this workstation |
 | CI remote | `clippy`'s `kunobi-ninja/kache-action` inputs and its job environment | yes — `s3-bucket: orrery-kache`, `s3-region: eu-central-1`, `s3-prefix: artifacts`, and a 20 GiB local cap |
 
-The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
+The standalone tools (`gates/p2-load`, `gates/p3-island`, `p0-*`) each declare their own
 `[workspace]`, so each has its own `target/`. They still inherit the repo's
 `.cargo/config.toml`, because cargo walks up from the working directory — do
 not add a per-tool `.cargo/config.toml`, which would shadow it and silently
@@ -682,7 +682,7 @@ a new worktree to create that link.
 reason `.cargo/config.toml` is committed.
 
 ```
-scripts/agent-lane.sh register --task "..." --paths crates/orrery_witness/,p1-swarm/
+scripts/agent-lane.sh register --task "..." --paths crates/orrery_witness/,gates/p1-swarm/
 scripts/agent-lane.sh list                   # who else is working, on what, where
 scripts/agent-lane.sh check <path>...        # does anyone else claim this?
 scripts/agent-lane.sh lease acquire fdb-dev  # exclusive; fails if someone holds it
@@ -721,7 +721,7 @@ know what you are doing:
 
 ```
 scripts/agent-lane.sh register --task "P4: bound witness bandwidth at 32 peers" \
-  --paths crates/orrery_witness/,p1-swarm/,docs/03-replication.md
+  --paths crates/orrery_witness/,gates/p1-swarm/,docs/03-replication.md
 ```
 
 ### Talking to another agent directly
