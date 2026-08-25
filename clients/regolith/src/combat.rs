@@ -11,7 +11,7 @@ use bevy::prelude::Resource;
 use orrery_core::Executor;
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{LockBreakReason, Outcome, ShotResult};
-use orrery_games::regolith::state::{Craft, RegolithState};
+use orrery_games::regolith::state::{Craft, LockClass, RegolithState, Rock, RockTier};
 use orrery_games::regolith::weapon::{Weapon, WeaponKind};
 use orrery_games::regolith::{in_firing_arc, LOCK_ACQUISITION_TICKS};
 use orrery_games::Regolith;
@@ -58,6 +58,8 @@ impl LockPhase {
 pub struct LockView {
     /// `Craft::lock_target`.
     pub target: Option<PersistId>,
+    /// Target-owned class confirmation.
+    pub class: Option<LockClass>,
     /// `Craft::lock_progress`.
     pub progress: u16,
     /// `Craft::locks_acquired`.
@@ -71,6 +73,7 @@ impl LockView {
     pub const fn of(craft: &Craft) -> Self {
         Self {
             target: craft.lock_target,
+            class: craft.lock_class,
             progress: craft.lock_progress,
             acquired: craft.locks_acquired,
         }
@@ -81,7 +84,9 @@ impl LockView {
     pub const fn phase(self) -> LockPhase {
         match self.target {
             None => LockPhase::Idle,
-            Some(_) if self.progress >= LOCK_ACQUISITION_TICKS => LockPhase::Locked,
+            Some(_) if self.progress >= LOCK_ACQUISITION_TICKS && self.class.is_some() => {
+                LockPhase::Locked
+            }
             Some(_) => LockPhase::Acquiring,
         }
     }
@@ -104,6 +109,9 @@ impl LockView {
     pub fn caption(self) -> String {
         match self.phase() {
             LockPhase::Idle => "no target".to_owned(),
+            LockPhase::Acquiring if self.progress >= LOCK_ACQUISITION_TICKS => {
+                "ACQUIRING — NO RETURN".to_owned()
+            }
             LockPhase::Acquiring => format!(
                 "{} / {} t · {:.2} s",
                 self.progress,
@@ -114,6 +122,15 @@ impl LockView {
                 "{LOCK_ACQUISITION_TICKS} / {LOCK_ACQUISITION_TICKS} t · lock #{}",
                 self.acquired
             ),
+        }
+    }
+
+    /// Class-specific locked label; acquisition and idle retain their shared copy.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match (self.phase(), self.class) {
+            (LockPhase::Locked, Some(LockClass::Rock)) => "MINING",
+            (phase, _) => phase.label(),
         }
     }
 }
@@ -236,22 +253,30 @@ pub struct LockBreak {
     pub reason: Option<LockBreakReason>,
     /// Ticks the banner still has to run.
     pub ticks_left: u16,
+    /// The target answered that it is not lockable.
+    pub refused: bool,
 }
 
 impl LockBreak {
     /// Raises the banner for every break the ruleset reported for `locker`.
     pub fn observe(&mut self, events: &[Outcome], locker: PersistId) {
         for event in events {
-            if let Outcome::LockBroken {
-                locker: who,
-                reason,
-                ..
-            } = event
-            {
-                if *who == locker {
+            match event {
+                Outcome::LockBroken {
+                    locker: who,
+                    reason,
+                    ..
+                } if *who == locker => {
                     self.reason = Some(*reason);
+                    self.refused = false;
                     self.ticks_left = BREAK_BANNER_TICKS;
                 }
+                Outcome::LockRefused { locker: who, .. } if *who == locker => {
+                    self.reason = None;
+                    self.refused = true;
+                    self.ticks_left = BREAK_BANNER_TICKS;
+                }
+                _ => {}
             }
         }
     }
@@ -261,16 +286,22 @@ impl LockBreak {
         self.ticks_left = self.ticks_left.saturating_sub(1);
         if self.ticks_left == 0 {
             self.reason = None;
+            self.refused = false;
         }
     }
 
     /// The banner line, empty when nothing broke recently.
     #[must_use]
     pub fn banner(&self) -> String {
-        match self.reason {
-            None => String::new(),
-            Some(LockBreakReason::RangeExceeded) => "LOCK BROKEN · RANGE EXCEEDED".to_owned(),
-            Some(LockBreakReason::TargetDestroyed) => "LOCK BROKEN · TARGET DESTROYED".to_owned(),
+        match (self.refused, self.reason) {
+            (true, _) => "LOCK REFUSED · NOT A TARGET".to_owned(),
+            (false, None) => String::new(),
+            (false, Some(LockBreakReason::RangeExceeded)) => {
+                "LOCK BROKEN · RANGE EXCEEDED".to_owned()
+            }
+            (false, Some(LockBreakReason::TargetDestroyed)) => {
+                "LOCK BROKEN · TARGET DESTROYED".to_owned()
+            }
         }
     }
 }
@@ -505,6 +536,43 @@ impl CraftView {
         match self.archetype {
             Archetype::Interceptor => "INTERCEPTOR",
             Archetype::Cruiser => "CRUISER",
+        }
+    }
+}
+
+/// One locked rock's drawable, target-owned numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RockView {
+    /// Who this is.
+    pub entity: PersistId,
+    /// Hashed rock tier.
+    pub tier: RockTier,
+    /// Current hull.
+    pub hull: i32,
+    /// Lattice position.
+    pub pos: orrery_core::QPos,
+    /// Lattice velocity.
+    pub vel: orrery_core::QVel,
+}
+
+impl RockView {
+    fn of(entity: PersistId, rock: &Rock) -> Self {
+        Self {
+            entity,
+            tier: rock.tier,
+            hull: rock.hull,
+            pos: rock.pos,
+            vel: rock.vel,
+        }
+    }
+
+    /// Tier label for the mining panel.
+    #[must_use]
+    pub const fn tier_name(self) -> &'static str {
+        match self.tier {
+            RockTier::Large => "LARGE ROCK",
+            RockTier::Medium => "MEDIUM ROCK",
+            RockTier::Small => "SMALL ROCK",
         }
     }
 }
@@ -766,6 +834,8 @@ pub struct CombatView {
     pub lock: LockView,
     /// The locked target's own state, when it is a craft this client can see.
     pub target: Option<CraftView>,
+    /// The locked target's own state when it is a rock this client can see.
+    pub rock_target: Option<RockView>,
 }
 
 impl CombatView {
@@ -780,18 +850,29 @@ impl CombatView {
         let target = lock.target.and_then(|target| {
             craft_of(executor, target).map(|craft| CraftView::of(target, craft))
         });
-        Self { own, lock, target }
+        let rock_target = lock
+            .target
+            .and_then(|target| rock_of(executor, target).map(|rock| RockView::of(target, rock)));
+        Self {
+            own,
+            lock,
+            target,
+            rock_target,
+        }
     }
 
     /// Straight-line separation to the locked target, in millimetres.
     #[must_use]
     pub fn range_mm(&self) -> Option<i64> {
         let own = self.own?;
-        let target = self.target?;
+        let target_pos = self
+            .target
+            .map(|target| target.pos)
+            .or_else(|| self.rock_target.map(|target| target.pos))?;
         let (dx, dy, dz) = (
-            i128::from(target.pos.x) - i128::from(own.pos.x),
-            i128::from(target.pos.y) - i128::from(own.pos.y),
-            i128::from(target.pos.z) - i128::from(own.pos.z),
+            i128::from(target_pos.x) - i128::from(own.pos.x),
+            i128::from(target_pos.y) - i128::from(own.pos.y),
+            i128::from(target_pos.z) - i128::from(own.pos.z),
         );
         let square = dx * dx + dy * dy + dz * dz;
         i64::try_from(integer_sqrt(square.unsigned_abs())).ok()
@@ -818,11 +899,16 @@ impl CombatView {
     #[must_use]
     pub fn hit_chance_ppm(&self) -> Option<u32> {
         let own = self.own?;
-        let target = self.target?;
+        let (target_pos, target_vel, radius) = if let Some(target) = self.target {
+            (target.pos, target.vel, target.archetype.limits().radius_mm)
+        } else {
+            let target = self.rock_target?;
+            (target.pos, target.vel, target.tier.limits().radius_mm)
+        };
         hit_chance_ppm(
-            target.pos,
-            target.vel,
-            target.archetype.limits().radius_mm,
+            target_pos,
+            target_vel,
+            radius,
             own.pos,
             own.vel,
             own.weapon_table(),
@@ -838,13 +924,17 @@ impl CombatView {
     #[must_use]
     pub fn hit_forecast(&self) -> Option<HitBand> {
         let own = self.own?;
-        let target = self.target?;
+        let (target_pos, radius) = if let Some(target) = self.target {
+            (target.pos, target.archetype.limits().radius_mm)
+        } else {
+            let target = self.rock_target?;
+            (target.pos, target.tier.limits().radius_mm)
+        };
         let weapon = own.weapon_table();
-        let radius = target.archetype.limits().radius_mm;
-        if !in_firing_arc(own.archetype, own.yaw_urad, own.pos, target.pos) {
+        if !in_firing_arc(own.archetype, own.yaw_urad, own.pos, target_pos) {
             return Some(HitBand::NoChance);
         }
-        let separation = separation_mm(own.pos, target.pos);
+        let separation = separation_mm(own.pos, target_pos);
         if separation > reach_mm(weapon, radius).max(0) as u128 {
             return Some(HitBand::NoChance);
         }
@@ -875,6 +965,13 @@ fn separation_mm(a: orrery_core::QPos, b: orrery_core::QPos) -> u128 {
 fn craft_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<&Craft> {
     match executor.state(entity)? {
         RegolithState::Craft(craft) => Some(craft),
+        _ => None,
+    }
+}
+
+fn rock_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<&Rock> {
+    match executor.state(entity)? {
+        RegolithState::Rock(rock) => Some(rock),
         _ => None,
     }
 }
@@ -919,6 +1016,7 @@ mod tests {
     fn lock_view_copies_every_acquisition_tick() {
         let mut craft = craft();
         craft.lock_target = Some(PersistId::new(2));
+        craft.lock_class = Some(LockClass::Ship);
         for progress in 0..=LOCK_ACQUISITION_TICKS + 5 {
             craft.lock_progress = progress;
             let view = LockView::of(&craft);
@@ -937,6 +1035,30 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_confirmed_rock_lock_uses_the_mining_skin() {
+        let mut craft = craft();
+        craft.lock_target = Some(PersistId::new(2));
+        craft.lock_class = Some(LockClass::Rock);
+        craft.lock_progress = LOCK_ACQUISITION_TICKS;
+        let view = LockView::of(&craft);
+        assert_eq!(view.phase(), LockPhase::Locked);
+        assert_eq!(view.label(), "MINING");
+    }
+
+    #[test]
+    fn a_target_class_refusal_uses_the_lock_feedback_family() {
+        let mut feedback = LockBreak::default();
+        feedback.observe(
+            &[Outcome::LockRefused {
+                locker: PersistId::new(1),
+                target: PersistId::new(2),
+            }],
+            PersistId::new(1),
+        );
+        assert_eq!(feedback.banner(), "LOCK REFUSED · NOT A TARGET");
     }
 
     #[test]
@@ -1344,6 +1466,7 @@ mod band_boundaries {
             own: Some(CraftView::of(PersistId::new(1), &me)),
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &them)),
+            rock_target: None,
         }
     }
 
@@ -1529,6 +1652,7 @@ mod band_boundaries {
             own: Some(CraftView::of(PersistId::new(1), &me)),
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &them)),
+            rock_target: None,
         };
         // That target is also far out of reach, and the reach guard is the
         // honest answer there: it is a fact about the geometry that needs no
@@ -1551,6 +1675,7 @@ mod band_boundaries {
             own: Some(CraftView::of(PersistId::new(1), &me)),
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &close)),
+            rock_target: None,
         };
         assert_eq!(unreadable.hit_forecast(), Some(HitBand::Unreadable));
         assert_eq!(HitBand::Unreadable.label(), "NO READ");

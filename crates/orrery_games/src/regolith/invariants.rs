@@ -194,6 +194,7 @@ fn value_range(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invari
                     && (craft.lock_target.is_none()
                         || craft.lock_progress != LOCK_ACQUISITION_TICKS))
                 || (craft.lock_target.is_none() != (craft.lock_progress == 0))
+                || (craft.lock_target.is_none() && craft.lock_class.is_some())
                 || (craft.hull > 0 && craft.respawn_in != 0)
                 || (craft.hull == 0 && craft.respawn_in == 0)
             {

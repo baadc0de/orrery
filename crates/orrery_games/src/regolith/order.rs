@@ -6,7 +6,7 @@ use orrery_protocol::PersistId;
 
 use super::{
     archetype::Archetype,
-    state::{BloomMembership, RockTier},
+    state::{BloomMembership, LockClass, RockTier},
 };
 
 /// A target-side fact that clears a lock without a live neighbour read.
@@ -127,6 +127,23 @@ pub enum Order {
     /// Acquire or sustain a lock on one target without firing.
     Lock {
         /// Target id.
+        target: PersistId,
+    },
+    /// Ask the named entity to adjudicate its own lockability.
+    LockRequested {
+        /// Craft seeking the lock.
+        locker: PersistId,
+    },
+    /// A target confirmed the current acquisition and its class.
+    LockConfirmed {
+        /// Target that answered.
+        target: PersistId,
+        /// Target-owned class.
+        class: LockClass,
+    },
+    /// A target refused the current acquisition.
+    LockRefused {
+        /// Target that answered.
         target: PersistId,
     },
     /// Fire the equipped weapon at the mature lock held in own state.
@@ -318,6 +335,19 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&from.0.to_le_bytes());
                 encode_vel(*velocity, out);
             }
+            Self::LockRequested { locker } => {
+                out.push(17);
+                out.extend_from_slice(&locker.0.to_le_bytes());
+            }
+            Self::LockConfirmed { target, class } => {
+                out.push(18);
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(class.tag());
+            }
+            Self::LockRefused { target } => {
+                out.push(19);
+                out.extend_from_slice(&target.0.to_le_bytes());
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -384,6 +414,17 @@ impl CoreCodec for Order {
             (16, 32) => Ok(Self::CollisionResolved {
                 from: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 velocity: decode_vel(&rest[8..32]),
+            }),
+            (17, 8) => Ok(Self::LockRequested {
+                locker: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
+            }),
+            (18, 9) => Ok(Self::LockConfirmed {
+                target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                class: LockClass::from_tag(rest[8])?
+                    .ok_or(CodecError("regolith order: missing lock class"))?,
+            }),
+            (19, 8) => Ok(Self::LockRefused {
+                target: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
             }),
             _ => Err(CodecError("regolith order: bad tag or length")),
         }
@@ -502,6 +543,29 @@ pub enum Outcome {
         target: PersistId,
         /// Resolver-owned reason.
         reason: LockBreakReason,
+    },
+    /// A fresh acquisition request routed to the target.
+    LockRequested {
+        /// Craft seeking the lock.
+        locker: PersistId,
+        /// Target asked to adjudicate itself.
+        target: PersistId,
+    },
+    /// A live craft or rock confirmed its target-owned class.
+    LockConfirmed {
+        /// Craft receiving the confirmation.
+        locker: PersistId,
+        /// Target that answered.
+        target: PersistId,
+        /// Target-owned class.
+        class: LockClass,
+    },
+    /// A non-lockable or dead entity refused acquisition.
+    LockRefused {
+        /// Craft receiving the refusal.
+        locker: PersistId,
+        /// Target that answered.
+        target: PersistId,
     },
     /// A target's authoritative projectile result for delivery to the shooter.
     ShotResolved {
@@ -737,6 +801,26 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 encode_vel(*target_velocity, out);
             }
+            Self::LockRequested { locker, target } => {
+                out.push(16);
+                out.extend_from_slice(&locker.0.to_le_bytes());
+                out.extend_from_slice(&target.0.to_le_bytes());
+            }
+            Self::LockConfirmed {
+                locker,
+                target,
+                class,
+            } => {
+                out.push(17);
+                out.extend_from_slice(&locker.0.to_le_bytes());
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(class.tag());
+            }
+            Self::LockRefused { locker, target } => {
+                out.push(18);
+                out.extend_from_slice(&locker.0.to_le_bytes());
+                out.extend_from_slice(&target.0.to_le_bytes());
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -835,6 +919,20 @@ impl CoreCodec for Outcome {
             (14, 9) => Ok(Self::ShotRefused {
                 attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 result: ShotResult::from_tag(rest[8])?,
+            }),
+            (16, 16) => Ok(Self::LockRequested {
+                locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+            }),
+            (17, 17) => Ok(Self::LockConfirmed {
+                locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+                class: LockClass::from_tag(rest[16])?
+                    .ok_or(CodecError("regolith outcome: missing lock class"))?,
+            }),
+            (18, 16) => Ok(Self::LockRefused {
+                locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
             }),
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }

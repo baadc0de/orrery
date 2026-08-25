@@ -65,6 +65,8 @@ pub const GAUGE_TRACK: Color = Color::srgb(0.161, 0.169, 0.192);
 pub const PANEL: Color = Color::srgba(0.086, 0.094, 0.149, 0.86);
 /// Tracer white.
 pub const TRACER: Color = Color::srgb(0.961, 0.957, 1.0);
+/// Mining lock amber, distinct from the ship-lock accent.
+pub const MINING_AMBER: Color = Color::srgb(0.95, 0.62, 0.22);
 
 /// The pool cuboid's length along its nose axis at scale one, in metres.
 pub const TRACER_MESH_LENGTH_M: f32 = 18.0;
@@ -191,6 +193,12 @@ pub struct LockBrackets;
 /// The soft disc that lands when the lock closes.
 #[derive(Component)]
 pub struct LockGlow;
+
+#[derive(Resource)]
+pub(crate) struct LockMaterials {
+    lit: Handle<StandardMaterial>,
+    glow: Handle<StandardMaterial>,
+}
 
 /// A weapon envelope ring drawn around the player's own craft.
 #[derive(Component)]
@@ -416,6 +424,10 @@ pub fn spawn_world_overlay(
         alpha_mode: AlphaMode::Blend,
         ..Default::default()
     });
+    commands.insert_resource(LockMaterials {
+        lit: lit.clone(),
+        glow: glow.clone(),
+    });
     let tracer = materials.add(StandardMaterial {
         base_color: TRACER,
         emissive: LinearRgba::WHITE * 6.0,
@@ -546,8 +558,11 @@ pub fn spawn_world_overlay(
 /// This is the stage that makes a lock visible at all: hide it, freeze it, or
 /// drive it from anything other than [`CombatView::lock`] and the player has
 /// exactly the blindness #378 reports.
-pub fn sync_lock_reticle(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sync_lock_reticle(
     view: Res<CombatView>,
+    palette: Option<Res<LockMaterials>>,
+    materials: Option<ResMut<Assets<StandardMaterial>>>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
     mut reticle: Query<(&mut Transform, &mut Visibility), With<LockReticle>>,
     mut segments: SegmentQuery,
@@ -555,6 +570,20 @@ pub fn sync_lock_reticle(
     mut glow: GlowQuery,
 ) {
     let phase = view.lock.phase();
+    let colour = if view.lock.class == Some(orrery_games::regolith::state::LockClass::Rock) {
+        MINING_AMBER
+    } else {
+        ACCENT_BRIGHT
+    };
+    if let (Some(palette), Some(mut materials)) = (palette, materials) {
+        if let Some(mut material) = materials.get_mut(&palette.lit) {
+            material.base_color = colour;
+            material.emissive = LinearRgba::from(colour) * 3.0;
+        }
+        if let Some(mut material) = materials.get_mut(&palette.glow) {
+            material.base_color = colour.with_alpha(0.10);
+        }
+    }
     let lit = view.lock.segments_lit();
     let anchor = view
         .lock
@@ -717,7 +746,11 @@ pub fn sync_gauges(view: Res<CombatView>, mut gauges: Query<(&Gauge, &mut Node)>
             }),
             Gauge::TargetHull => view
                 .target
-                .map(|target| fraction(target.hull, target.max_hull())),
+                .map(|target| fraction(target.hull, target.max_hull()))
+                .or_else(|| {
+                    view.rock_target
+                        .map(|target| fraction(target.hull, target.tier.limits().max_hull))
+                }),
             Gauge::TargetShield => view
                 .target
                 .map(|target| fraction(target.shield, target.max_shield())),
@@ -811,20 +844,40 @@ pub fn refresh_combat_hud(
                 MUTED,
             ),
             Readout::LockLabel => (
-                phase.label().to_owned(),
+                view.lock.label().to_owned(),
                 match phase {
                     LockPhase::Idle => FAINT,
                     LockPhase::Acquiring => MUTED,
+                    LockPhase::Locked
+                        if view.lock.class
+                            == Some(orrery_games::regolith::state::LockClass::Rock) =>
+                    {
+                        MINING_AMBER
+                    }
                     LockPhase::Locked => ACCENT_PALE,
                 },
             ),
             Readout::LockCaption => (view.lock.caption(), DIM),
             Readout::TargetTitle => (target_title(&view), MUTED),
             Readout::TargetHull => (
-                view.target.map_or_else(
-                    || "—".to_owned(),
-                    |target| format!("{}/{}", target.hull.max(0), target.max_hull()),
-                ),
+                view.target
+                    .map(|target| format!("{}/{}", target.hull.max(0), target.max_hull()))
+                    .or_else(|| {
+                        view.rock_target.map(|target| {
+                            format!(
+                                "{}/{} · {} point{}",
+                                target.hull.max(0),
+                                target.tier.limits().max_hull,
+                                target.tier.limits().points,
+                                if target.tier.limits().points == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            )
+                        })
+                    })
+                    .unwrap_or_else(|| "—".to_owned()),
                 MUTED,
             ),
             Readout::TargetShield => (
@@ -908,10 +961,11 @@ pub fn weapon_envelope(weapon: Weapon) -> String {
 /// client cannot see — that absence is itself worth showing.
 #[must_use]
 pub fn target_title(view: &CombatView) -> String {
-    match (view.target, view.lock.target) {
-        (Some(target), _) => format!("{} · #{}", target.chassis_name(), target.entity.0),
-        (None, Some(id)) => format!("#{:#x} · no window here", id.0),
-        (None, None) => "—".to_owned(),
+    match (view.target, view.rock_target, view.lock.target) {
+        (Some(target), _, _) => format!("{} · #{}", target.chassis_name(), target.entity.0),
+        (_, Some(target), _) => format!("{} · #{}", target.tier_name(), target.entity.0),
+        (None, None, Some(id)) => format!("#{:#x} · no window here", id.0),
+        (None, None, None) => "—".to_owned(),
     }
 }
 
@@ -1075,10 +1129,12 @@ mod tests {
                 own: Some(craft_view(ME, Archetype::Interceptor, 0.0)),
                 lock: LockView {
                     target: Some(THEM),
+                    class: Some(orrery_games::regolith::state::LockClass::Ship),
                     progress,
                     acquired: 0,
                 },
                 target: Some(craft_view(THEM, Archetype::Cruiser, 120.0)),
+                rock_target: None,
             });
             app.add_systems(Update, sync_lock_reticle);
             app.update();
@@ -1099,10 +1155,12 @@ mod tests {
             own: Some(craft_view(ME, Archetype::Interceptor, 0.0)),
             lock: LockView {
                 target: Some(THEM),
+                class: Some(orrery_games::regolith::state::LockClass::Ship),
                 progress: 30,
                 acquired: 3,
             },
             target: Some(craft_view(THEM, Archetype::Cruiser, 120.0)),
+            rock_target: None,
         });
         app.add_systems(Update, sync_lock_reticle);
         app.update();
@@ -1572,10 +1630,12 @@ mod tests {
             own: Some(craft_view(ME, Archetype::Interceptor, 0.0)),
             lock: LockView {
                 target: Some(phantom),
+                class: None,
                 progress: 30,
                 acquired: 1,
             },
             target: None,
+            rock_target: None,
         };
         let line = target_title(&view);
         assert!(line.contains("no window here"), "{line}");
@@ -1590,10 +1650,12 @@ mod tests {
             own: Some(craft_view(ME, Archetype::Interceptor, 0.0)),
             lock: LockView {
                 target: Some(THEM),
+                class: Some(orrery_games::regolith::state::LockClass::Ship),
                 progress: 30,
                 acquired: 1,
             },
             target: Some(craft_view(THEM, Archetype::Cruiser, 250.0)),
+            rock_target: None,
         };
         let line = target_relation(&view, &tracks);
         assert!(line.contains("250 m"), "{line}");
@@ -1644,6 +1706,7 @@ mod band_line {
             own: Some(CraftView::of(PersistId::new(1), &me)),
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &them)),
+            rock_target: None,
         }
     }
 

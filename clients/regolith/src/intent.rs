@@ -16,6 +16,8 @@ pub struct Controls {
     pub thrust: bool,
     /// Emit one trigger order this tick.
     pub fire: bool,
+    /// Mouse-selected target sustained through the ordinary lock order.
+    pub lock_target: Option<PersistId>,
 }
 
 /// One tick of canonical core input bytes, suitable for a session JSONL log.
@@ -76,7 +78,9 @@ impl IntentPipeline {
     /// encoding remain owned by the headless game path.
     #[must_use]
     pub fn human_orders(&self, tick: Tick, controls: Controls) -> Vec<Order> {
-        self.bot_orders(tick)
+        let mut saw_lock = false;
+        let mut orders: Vec<_> = self
+            .bot_orders(tick)
             .into_iter()
             .filter_map(|order| match order {
                 Order::Thrust {
@@ -96,9 +100,23 @@ impl IntentPipeline {
                     })
                 }
                 Order::Fire if !controls.fire => None,
+                Order::Lock { target } => {
+                    saw_lock = true;
+                    Some(Order::Lock {
+                        target: controls.lock_target.unwrap_or(target),
+                    })
+                }
                 other => Some(other),
             })
-            .collect()
+            .collect();
+        if let Some(target) = controls.lock_target.filter(|_| !saw_lock) {
+            let before_fire = orders
+                .iter()
+                .position(|order| matches!(order, Order::Fire))
+                .unwrap_or(orders.len());
+            orders.insert(before_fire, Order::Lock { target });
+        }
+        orders
     }
 
     /// Encode a human tick with the same [`CoreCodec`] used by bot logs.
@@ -214,5 +232,24 @@ mod tests {
             Some(Order::Thrust { accel_mmss: 60_000, yaw_urad, pitch_urad: 0 })
                 if *yaw_urad == -bot_yaw.abs()
         ));
+    }
+
+    #[test]
+    fn mouse_target_replaces_the_pilots_lock_without_changing_the_order_path() {
+        let pipeline = pipeline();
+        let clicked = PersistId::new(0x442);
+        let orders = pipeline.human_orders(
+            Tick::new(91),
+            Controls {
+                lock_target: Some(clicked),
+                ..Controls::default()
+            },
+        );
+        assert!(orders
+            .iter()
+            .any(|order| matches!(order, Order::Lock { target } if *target == clicked)));
+        assert!(!orders
+            .iter()
+            .any(|order| matches!(order, Order::Lock { target } if *target != clicked)));
     }
 }

@@ -4,6 +4,33 @@ use orrery_core::{CodecError, CoreCodec, QPos, QVel, Quantized};
 
 use super::{archetype::Archetype, weapon::WeaponKind};
 
+/// Target class confirmed by the target's own rules step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockClass {
+    /// A live craft.
+    Ship,
+    /// A live rock in the mining economy.
+    Rock,
+}
+
+impl LockClass {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::Ship => 1,
+            Self::Rock => 2,
+        }
+    }
+
+    pub(crate) const fn from_tag(tag: u8) -> Result<Option<Self>, CodecError> {
+        match tag {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Ship)),
+            2 => Ok(Some(Self::Rock)),
+            _ => Err(CodecError("regolith: unknown lock class")),
+        }
+    }
+}
+
 /// Full turn in micro-radians.
 pub const TAU_URAD: i32 = 6_283_185;
 /// The inherited schema limit; Regolith's pilot always supplies zero pitch.
@@ -50,6 +77,8 @@ pub struct Craft {
     pub kills: u32,
     /// Target being acquired or held; only own inputs and logged breaks change it.
     pub lock_target: Option<orrery_protocol::PersistId>,
+    /// Target-owned class confirmation for the current acquisition.
+    pub lock_class: Option<LockClass>,
     /// Monotone acquisition progress while `lock_target` remains unchanged.
     pub lock_progress: u16,
     /// Locks acquired, ever. Monotone and state-hashed.
@@ -244,7 +273,7 @@ pub enum RegolithState {
     BloomDirector(BloomDirector),
 }
 
-const CRAFT_ENCODED_LEN: usize = 131;
+const CRAFT_ENCODED_LEN: usize = 132;
 
 impl Quantized for Craft {
     fn quantize(&mut self) {
@@ -319,6 +348,7 @@ impl CoreCodec for Craft {
             }
             None => out.extend_from_slice(&[0; 9]),
         }
+        out.push(self.lock_class.map_or(0, LockClass::tag));
         out.extend_from_slice(&self.lock_progress.to_le_bytes());
         out.extend_from_slice(&self.locks_acquired.to_le_bytes());
         out.extend_from_slice(&self.lock_decay_progress.to_le_bytes());
@@ -328,7 +358,7 @@ impl CoreCodec for Craft {
         out.push(u8::from(self.arithmetic_overflowed));
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 || bytes[125] > 1 || bytes[130] > 1 {
+        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 || bytes[126] > 1 || bytes[131] > 1 {
             return Err(CodecError("regolith craft: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -364,13 +394,14 @@ impl CoreCodec for Craft {
                     bytes[107..115].try_into().unwrap(),
                 ))
             }),
-            lock_progress: u16::from_le_bytes(bytes[115..117].try_into().unwrap()),
-            locks_acquired: u32::from_le_bytes(bytes[117..121].try_into().unwrap()),
-            lock_decay_progress: u16::from_le_bytes(bytes[121..123].try_into().unwrap()),
-            cover_claim_cooldown: u16::from_le_bytes(bytes[123..125].try_into().unwrap()),
-            last_cover_occluded: bytes[125] == 1,
-            collisions: u32::from_le_bytes(bytes[126..130].try_into().unwrap()),
-            arithmetic_overflowed: bytes[130] == 1,
+            lock_class: LockClass::from_tag(bytes[115])?,
+            lock_progress: u16::from_le_bytes(bytes[116..118].try_into().unwrap()),
+            locks_acquired: u32::from_le_bytes(bytes[118..122].try_into().unwrap()),
+            lock_decay_progress: u16::from_le_bytes(bytes[122..124].try_into().unwrap()),
+            cover_claim_cooldown: u16::from_le_bytes(bytes[124..126].try_into().unwrap()),
+            last_cover_occluded: bytes[126] == 1,
+            collisions: u32::from_le_bytes(bytes[127..131].try_into().unwrap()),
+            arithmetic_overflowed: bytes[131] == 1,
         })
     }
 }
@@ -589,6 +620,7 @@ impl Craft {
             score_rock_points: 0,
             kills: 0,
             lock_target: None,
+            lock_class: None,
             lock_progress: 0,
             locks_acquired: 0,
             lock_decay_progress: 0,
