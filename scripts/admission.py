@@ -245,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     p = argparse.ArgumentParser(); p.add_argument("--control", type=Path, default=Path("/etc/orrery/campaigns.conf")); p.add_argument("--state", type=Path, default=Path("/var/lib/orrery-admission")); p.add_argument("--invite", default="orrery-invite"); p.add_argument("--ssh", default="ssh"); p.add_argument("--ssh-key", type=Path, default=Path("/var/lib/orrery-admission/campaign_ssh_key")); p.add_argument("--issuer", type=Path, default=Path("/var/lib/orrery-admission/issuer.cred")); p.add_argument("--swarm", default="p1-swarm"); p.add_argument("--listen", default="127.0.0.1:8323"); p.add_argument("--self-test", action="store_true"); a = p.parse_args()
-    if a.self_test: unittest.main(argv=[sys.argv[0]]); return
+    if a.self_test: unittest.main(argv=[sys.argv[0]] + ([os.environ["ADMISSION_TEST"]] if "ADMISSION_TEST" in os.environ else [])); return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     host, port = a.listen.rsplit(":", 1); Handler.service = Admission(a.control, a.state, a.invite, a.ssh, a.ssh_key, a.issuer, a.swarm)
     ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
@@ -274,7 +274,11 @@ class AdmissionTests(unittest.TestCase):
         except Refusal as e: self.assertEqual((e.status, e.error), (409, "campaign_busy"))
     def test_the_harness_is_pinned_to_exactly_the_admitted_session_id(self) -> None:
         answer = self.service.join("test", self.request()); sid = answer["join"]["session_id"]
-        self.assertIn("--require-session " + sid, (self.ssh.parent / "ssh.args").read_text())
+        args = self.ssh.parent / "ssh.args"
+        for _ in range(20):
+            if args.exists() and "--require-session" in args.read_text(): break
+            time.sleep(0.01)
+        self.assertIn("--require-session " + sid, args.read_text())
     def test_the_token_binds_the_presented_node_not_the_slot(self) -> None:
         token = self.service.join("test", self.request())["join"]["session_token"]
         self.assertGreater(len(token), 100, "the real signer returned a SessionTokenV1")
@@ -311,7 +315,8 @@ class AdmissionTests(unittest.TestCase):
     def test_an_uploaded_row_for_another_session_still_refuses_assembly(self) -> None:
         # Exercise the real assembler: it must reject a records file with no matching row.
         script = Path(__file__).parents[1] / "scripts" / "p4-campaign-session.sh"; sid = "018f8f4e-5c90-7abc-8123-0000000000aa"; raw = Path(self.tmp.name) / "raw.json"; records = Path(self.tmp.name) / "records.jsonl"
-        raw.write_text('{"external":{},"witnessing":true,"identity":{"target":"x","commit":"0000000000000000000000000000000000000000"}}'); records.write_text('{"session_id":"018f8f4e-5c90-7abc-8123-0000000000ab"}\n')
+        raw.write_text('{"external":{},"witnessing":true,"identity":{"target":"x","commit":"0000000000000000000000000000000000000000"}}')
+        records.write_text('{"session_id":"018f8f4e-5c90-7abc-8123-0000000000ab","actor":"human","platform_triple":"x","impairment_mismatch":false,"configured_impairment_profile":{"loss_pct":0,"jitter_p50_ms":0,"jitter_p99_ms":0},"observed_loss_pct":0,"observed_jitter_p50_ms":0,"observed_jitter_p99_ms":0}\n')
         self.assertNotEqual(subprocess.run([str(script), "assemble", str(raw), str(records), sid, str(Path(self.tmp.name) / "out.json")], env={**os.environ, "P4_PIPELINE_ID": "test"}).returncode, 0)
 
 
