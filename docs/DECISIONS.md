@@ -61,6 +61,7 @@ their linked dependencies.
 | D46 | [ADR-0046](adr/0046-message-class-semantics.md) | Six message classes with internal commands collapsed onto domain events; delivered-first composition ratified as law; emission cap binds and flags rather than failing the tick |
 | D47 | [ADR-47](adr/0047-rollback-unit.md) | Only prediction rewinds: canonical is correction-only, durable recovery-only, critical compensation-only; the unit is the per-entity predicted set with all-or-nothing restore |
 | D48 | [ADR-0048](adr/0048-canonical-witness-projection.md) | The canonical witness projection WP-1..WP-6; `projection_version` becomes a third orthogonal version axis, widening D38 clause (d)(3) |
+| D49 | [ADR-0049](adr/0049-compatibility-manifest.md) | The compatibility manifest: field set by verdict, `RulesetId.digest` gains a real scope, the seven-axis composition law, no rolling-upgrade story |
 
 ## Status and supersession
 
