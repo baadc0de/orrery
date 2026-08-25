@@ -69,6 +69,13 @@ const UNREGISTERED_RULESET: RulesetId = RulesetId {
 
 const ENTITY: PersistId = PersistId::new(4242);
 
+/// A liveness ceiling for the wire waits below that distinguish a timeout
+/// from a wrong reply, not a measured bound and not a figure anyone promised:
+/// nothing in this file asserts latency. Generous headroom over loaded-runner
+/// scheduling (a whole-test flow once took 11.29 s on CI, #358) so a slow box
+/// cannot turn a wait into a failure at all.
+const REPLY_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn thin_bundle() -> EvidenceBundle {
     let subject = support::secret(2);
     EvidenceBundle {
@@ -367,13 +374,17 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
             authority_seq: Some(seq),
         },
     });
-    assert!(
-        matches!(
-            session.conn.next_reply(Duration::from_secs(5)).await,
-            Some(GatewayReply::BulkAck { .. })
+    match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+        Some(GatewayReply::BulkAck { .. }) => {}
+        Some(other) => {
+            panic!("unexpected reply while awaiting the fenced write's acknowledgement: {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s waiting for the fenced write's BulkAck; this \
+             is a liveness failure, not evidence that the gateway shed the write",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "the fenced write must be acknowledged"
-    );
+    }
 
     // Area: one subscribe, one page.
     session
@@ -383,13 +394,17 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
             cells: vec![CellId::ROOT],
         })
         .await;
-    assert!(
-        matches!(
-            session.conn.next_reply(Duration::from_secs(5)).await,
-            Some(GatewayReply::AreaPage { .. })
+    match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+        Some(GatewayReply::AreaPage { .. }) => {}
+        Some(other) => {
+            panic!("unexpected reply while awaiting the subscribed cell's page: {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s waiting for the subscribed cell's AreaPage; \
+             this is a liveness failure, not evidence that the subscribe was dropped",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "a subscribed cell must answer with a page"
-    );
+    }
 
     // Intent: no executor is configured, so the honest answer is a rejection —
     // which is still one definitive reply, and still one measured span.
@@ -576,13 +591,15 @@ async fn a_persistd_run_emits_the_two_server_spans_and_never_a_gated_name() {
         cells: vec![CellId::ROOT],
     })
     .await;
-    assert!(
-        matches!(
-            conn.next_reply(Duration::from_secs(5)).await,
-            Some(GatewayReply::AreaPage { .. })
+    match conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+        Some(GatewayReply::AreaPage { .. }) => {}
+        Some(other) => panic!("unexpected reply while awaiting the first page: {other:?}"),
+        None => panic!(
+            "timed out after {} s waiting for the hosted root cell's AreaPage; \
+             this is a liveness failure, not evidence that the subscribe was dropped",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "the hosted root cell must answer with a page"
-    );
+    }
 
     let mut intent = Intent {
         evidence: None,

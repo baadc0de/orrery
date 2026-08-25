@@ -52,6 +52,13 @@ const ACK_LIVENESS_ROUTE_BUDGETS: u64 = 3_000;
 const ACK_LIVENESS_TIMEOUT: Duration =
     Duration::from_micros(ROUTE_BUDGET_US * ACK_LIVENESS_ROUTE_BUDGETS);
 
+/// A liveness ceiling for the two rekey-probe waits below, not a measured
+/// bound and deliberately not derived from [`ROUTE_BUDGET_US`]: the probe is
+/// answered inline in the receive loop ahead of every admission decision, so
+/// no budget under test stands between the send and its reply. Its only job
+/// is to stop a permanently stalled loop from holding a worker forever.
+const PROBE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A gateway with the downstream route valve **off**.
 ///
 /// The saturation test below holds a connection at its route cap by parking
@@ -235,15 +242,22 @@ async fn a_saturated_bulk_lane_sheds_the_excess_and_keeps_serving_the_connection
     // Under the old inline `acquire_owned().await` the loop is parked on the
     // first excess diff and this reply never comes.
     client.conn.send_state(&diff(PROBE, RecordKind::Rekey));
-    let reply = client.conn.next_reply(Duration::from_secs(10)).await;
-    match reply {
+    match client.conn.next_reply(PROBE_LIVENESS_TIMEOUT).await {
         Some(GatewayReply::BulkNack { entity, .. }) => assert_eq!(
             entity, PROBE,
             "the only reply on this connection is the probe's: a shed diff is \
              answered with silence, not with a nack that would tell the peer \
              to discard the write"
         ),
-        other => panic!("saturated connection stopped serving: {other:?}"),
+        Some(other) => {
+            panic!("unexpected reply while awaiting the probe's acknowledgement: {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s waiting for the rekey probe's BulkNack on the \
+             saturated connection; this is a liveness failure, not evidence \
+             that the receive loop stopped draining its queue",
+            PROBE_LIVENESS_TIMEOUT.as_secs(),
+        ),
     }
 
     server.shutdown().await;
@@ -316,12 +330,20 @@ async fn a_router_that_will_not_answer_is_shed_downstream_and_counted_separately
     // is answered inline before any routing, so its reply is the only one
     // this connection can produce.
     client.conn.send_state(&diff(PROBE, RecordKind::Rekey));
-    match client.conn.next_reply(Duration::from_secs(10)).await {
+    match client.conn.next_reply(PROBE_LIVENESS_TIMEOUT).await {
         Some(GatewayReply::BulkNack { entity, .. }) => assert_eq!(
             entity, PROBE,
             "a diff shed downstream is answered with silence, not with a nack"
         ),
-        other => panic!("shedding connection stopped serving: {other:?}"),
+        Some(other) => {
+            panic!("unexpected reply while awaiting the probe's acknowledgement: {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s waiting for the rekey probe's BulkNack past \
+             the downstream refusals; this is a liveness failure, not evidence \
+             that the connection stopped being served",
+            PROBE_LIVENESS_TIMEOUT.as_secs(),
+        ),
     }
 
     server.shutdown().await;

@@ -193,6 +193,10 @@ async fn connect(server: &GatewayServer, seed_byte: u8) -> Client {
     }
 }
 
+/// The liveness ceiling every `hello()` wait runs under. Named so an arm
+/// that reports a timeout can state how long it actually waited.
+const HELLO_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn hello(client: &Client, token: Vec<u8>) -> Option<GatewayReply> {
     client
         .conn
@@ -202,7 +206,7 @@ async fn hello(client: &Client, token: Vec<u8>) -> Option<GatewayReply> {
             version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
-    client.conn.next_reply(Duration::from_secs(5)).await
+    client.conn.next_reply(HELLO_LIVENESS_TIMEOUT).await
 }
 
 /// A gateway running the real accept loop over an empty journal runtime.
@@ -377,13 +381,16 @@ async fn in_shadow_the_invalidated_account_is_still_admitted_and_counted() {
 
     let client = connect(&server, 24).await;
     feed.wait_for_poll(1).await;
-    assert!(
-        matches!(
-            hello(&client, support::valid_session_token(client.node)).await,
-            Some(GatewayReply::HelloAck { .. })
+    match hello(&client, support::valid_session_token(client.node)).await {
+        Some(GatewayReply::HelloAck { .. }) => {}
+        Some(other) => panic!("shadow mode did not admit the invalidated account: {other:?}"),
+        None => panic!(
+            "timed out after {} s waiting for the shadow-mode HelloAck; this is \
+             a liveness failure, not evidence that shadow enforcement refused \
+             the account",
+            HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "shadow suppresses the refusal"
-    );
+    }
     let snapshot = server.standing_metrics().snapshot();
     assert_eq!(snapshot.shadow_hello_would_refuse, 1);
     assert_eq!(snapshot.hello_refused_standing, 0);
