@@ -208,3 +208,93 @@ detail, the boundary is stated.
    outlives the schedule run, no I/O inside canonical stages. The outside
    world enters as sealed inputs at S0 and leaves as events and frames after
    S7.
+
+### (d) Tier V — role-discovered membership replaces the typed `GATED_CRATES` list
+
+This is the record's load-bearing clause. **The epic's standing rule is its
+acceptance bar: a weaker gate that passes is worse than the current one.**
+
+The full existing clause battery — Bevy-free graph, VC-4, VC-6, VC-8,
+neighbour ban — is kept **unchanged**. What changes is who it applies to:
+
+1. **Discovery scan.** Walk workspace crates; strip `#[cfg(test)]` modules;
+   flag any crate whose library sources define `trait Ruleset` or contain an
+   `impl … Ruleset for` site, qualified paths included. Crates so flagged are
+   Tier V.
+2. **Scanned set = discovered ∪ declared.** The declared list survives as a
+   floor, not as the coverage. On this tree discovery reproduces exactly
+   `{orrery_core, orrery_games, orrery_conformance}` — including correctly
+   excluding `orrery_persistd`'s test-only macro impl inside a
+   `#[cfg(test)] mod tests` (A4 E-D1).
+3. **Two-way cross-check, two-source by construction.** An impl-bearing crate
+   absent from the scanned set fails ("undiscovered ruleset crate — add it to
+   the gate or justify"); a declared crate with no impl site fails as stale.
+   Neither side can pass by agreeing with itself — the same property
+   `check.sh --self-test` relies on for its lane table. A4 E-D2 proved both
+   directions on a synthetic `impl Ruleset` crate the typed list misses:
+   discovery catches it, removing the impl releases it, restoring returns it.
+4. **Async clause added.** Tier V crates must have no async runtime
+   (tokio/async-std) in their dependency graph — structural today
+   (`orrery_core` has none), a scan clause tomorrow (T9).
+
+**Strength accounting, carried from A4 §5.3 with its caveat intact.** The
+verdict there is that the replacement is *"equal in kind, stronger in
+coverage"* on the Bevy-free property and *"strictly stronger"* at the edges —
+and one honest caveat belongs next to that word. In *kind*, Tier H (clause
+(e)) admits `bevy_ecs` somewhere clause 1 admitted zero Bevy crates; if the
+baseline were the gate *as documented*, admitting anything is weaker. But the
+operative baseline is the gate *as behaving*: Context §1 shows the enforced
+property already excludes only what is typed into the list — the escape hatch
+exists today (530 Bevy references riding past a green gate) and is simply
+unwatched. The replacement converts that silent hole into (i) a closed hole
+for rules code — discovery — and (ii) a watched, constrained door for
+machinery — Tier H. Weaker nowhere today's gate actually bites; strictly
+stronger at the edges; new mechanical coverage of two hazard classes
+(ambiguity, storage-order dependence) that today's architecture does not even
+contain. The witness adapter's Bevy remains legal — engine calls core, never
+the reverse — but becomes a *named exception* rather than an accident of the
+list.
+
+Known residual risks, stated rather than hidden (A4 §5.2): the scanner is
+textual, so a crate could evade by constructing the trait name dynamically —
+accepted, identical in kind to every grep gate here, backstopped by symptom
+tests; item-level `#[cfg(test)]` attributes (vs module-level) would
+false-positive the current prototype stripper, and the required response is
+fail-loud-and-fix-the-scanner, never narrowing the pattern or adding
+exclusions.
+
+Sequencing: `scripts/core-gates.sh` is outside the P4 pipeline digest
+(Context, scope paragraph), so the discovery clause lands when review allows
+(a11 PR-6, gated on this record's acceptance); no hashed tree moves.
+
+### (e) Tier H — conditional host battery, armed only by a D42 trigger
+
+Tier H exists only if [D42]'s dedicated-world trigger (T1–T3) ever fires. A
+crate hosting canonical state in a `bevy_ecs::World`:
+
+1. appears on an explicit, review-required **host allowlist** — no discovery
+   here, because hosting ECS is always a decision, never an accident;
+2. may depend on `bevy_ecs` **only** — `bevy_app`, `bevy_internal`,
+   `bevy_time`, full `bevy` remain hard failures (keeps SubApp-style app
+   coupling out);
+3. inherits the full Tier V source battery over its canonical modules, plus
+   the async ban and a ban on RNG construction outside `tick_rng`;
+4. carries the ambiguity canary test (clause (c)(1)) and the projection
+   differential harness — permuted insertion orders must yield equal
+   sorted-by-`PersistId` projection hashes matching the executor-computed
+   chain, while agreement of naive query-order folds is deliberately *not*
+   asserted (their agreement would be luck, not a property) — wired into CI
+   as preconditions of admitting the host, not follow-ups;
+5. exposes single-entity step semantics to witnesses and adjudication: the
+   verdict must hold in a world of one, and "the schedule was deterministic"
+   is never a substitute for per-entity replay. The rollback unit itself
+   stays R6's (A7).
+
+**Honest accounting this record owes the reader (A4 §11.5, not dropped):**
+Tier H is *entirely conditional*. Until a trigger fires, Tier H is empty, the
+tree is exactly Tier V, and every Tier-H clause above is unused
+specification — which means most of this record's *new* enforcement is
+untested against production pressure unless and until an ECS host is
+admitted. That posture is deliberate (specify the door before anyone needs to
+walk through it), but it is a fact about how much of this record is currently
+exercised, and it belongs in the record rather than in a plan's appendix.
