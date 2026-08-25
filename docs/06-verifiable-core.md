@@ -226,6 +226,8 @@ Commentary on the load-bearing choices:
 > §5 still scans every rules crate and admits exactly one audited read site:
 > Regolith's O(1) claim predicate. Skirmish and the conformance rules remain on
 > the delivered-event discipline; adding another read site fails the gate.
+> [D43](adr/0043-determinism-envelope-and-gate-replacement.md) clause (d)'s neighbour ban was narrowed to this form by the owner on
+> 2026-08-25; that record, not this section, is normative on the gate's shape.
 
 ## 4. Determinism rules (hard requirements on core code)
 
