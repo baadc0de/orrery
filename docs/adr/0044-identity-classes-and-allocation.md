@@ -146,7 +146,7 @@ marker — "A re-spawn (id reuse across a despawn) cancels the marker"
 (`actor.rs:1320-1326`; `cancel_tombstone` at `actor.rs:104-115`, which also
 tracks the superseded row when the entity comes back in a different cell).
 The despawn lifecycle it rides on is built and discriminated:
-`RecordKind::Despawn` (`persist.rs:145-148`), the durable
+`RecordKind::Despawn` (`persist.rs:147-148`), the durable
 `TOMBSTONE_TAG ‖ postcard(Tombstone)` value with a GC deadline
 (`keyspace.rs:105-146`; `Tombstone { cell, tick, gc_deadline_ms }`,
 `actor.rs:39-48`). No named test pins the re-spawn cancellation itself; the
@@ -160,7 +160,7 @@ rotating NodeIds". What durable evidence actually carries entity identity is
 the claim/frame layer: `StateClaim.entity` and `EntitySlice.entity`
 (`verifiable.rs:148`, `:191`) — and each such artifact also carries a tick or
 tick window (`StateClaim.tick`, `verifiable.rs:195`; frames' tick base;
-`EvidenceBundle.window_start/window_end`, `verifiable.rs:216-221`;
+`EvidenceBundle.window_start/window_end`, `verifiable.rs:218-220`;
 `JournalRecord.tick`; `Tombstone.tick`). That fact is what clause (f) builds
 its obligation on. The other exposed reader is historical: any full-history
 query that follows one `PersistId` across a lifetime boundary — and that
@@ -193,3 +193,256 @@ pass), rather than inherited:
   tests FAILED, including
   `keyspace::tests::tombstone_value_roundtrips_and_is_distinct_from_live`
   (`358 passed; 2 failed`); reverted, `360 passed; 0 failed`.
+
+## Decision
+
+### (a) Three identity classes, and the set is closed
+
+Every entity in every runtime holds exactly one of three canonical names
+(A5 N-1):
+
+1. **A durable entity is a `PersistId` everywhere** — wire, store, evidence,
+   replay.
+2. **A transient entity is an `EphemeralId` everywhere it is shared** —
+   island-scoped, spawner-partitioned, minted allocator-free by local
+   increment.
+3. **An engine `bevy_ecs::Entity` names only rows of one world's local
+   storage and may appear in no encoded artifact that outlives that world.**
+   Serialized wire messages, durable rows, evidence, goldens, and hashes are
+   all "encoded artifacts" here; an in-memory, never-serialized resource
+   (such as `UplinkSeq.next: HashMap<Entity, u64>`, `feed.rs:44-48`) is not.
+
+No fourth class is admitted — in particular, no provisional durable id
+(clause (d)). This clause **ratifies what ships**: Context §2 is the
+demonstration, and the closure's value is that it converts today's incidental
+absence of a fourth class into a rule a review can point at. The one open
+corridor (opaque payload bytes, G-1) is R4's to close mechanically and is not
+re-litigated here.
+
+### (b) The `PersistId ↔ Entity` index is host-owned, rebuildable, and never canonical
+
+For any present or future world that mirrors canonical entities — including a
+triggered dedicated ECS world under [D42] clause (d) (A5 N-2):
+
+1. **One index per world, owned by the host seam.** The `SimulationHost` seam
+   ([D42] clause (b)) owns the single `PersistId ↔ Entity` index of the world
+   it drives; module code resolves through it. A second map is a bug, because
+   two maps *will* disagree during despawn/rekey races.
+2. **The index is a rebuildable projection, never an authority.** It is
+   populated from the replicated owner-written `PersistId` component
+   (exactly `feed.rs:27-34`'s shape today), reconstructible from world
+   contents alone; it is never encoded, never hashed, never persisted, and
+   never consulted by canonical rules — which receive their `PersistId` from
+   the executor directly (`StateView::entity`,
+   `crates/orrery_core/src/ruleset.rs:112-114`; store keyed by `PersistId`,
+   `executor.rs:48-51`).
+3. **Index iteration is not canonical order.** Any enumeration of entities
+   for hashing, witnessing, or golden emission sorts by `PersistId` first.
+   Today's witness hash is immune because nothing iterates a container into
+   it; the rule exists so that property survives any storage change (A5 I3/I7
+   made policy; the projection format itself is R7's).
+4. **Lookups of despawned ids miss.** A tombstoned `PersistId` resolves to no
+   `Entity`; a stale `Entity` held past despawn is convicted by its own
+   generation, which is the one job the engine handle is for.
+
+This too mostly ratifies: today's mappings (the `feed.rs` component, the
+prediction-side `PredictedBy { authority, persist_id }`,
+`crates/orrery_predict/src/wiring.rs:79-93`) already follow rules 2 and 4,
+and the canonical side needs no map at all. Rule 1 binds at the moment the
+host seam lands.
+
+### (c) Derived identifiers draw from granted ranges — G-2 is closed by composition
+
+A derived durable identifier must be a pure function of replayable inputs
+**whose range is a granted block**: the emitting entity's state carries (or
+its spawn record carried) a block-grant base, and `materialize` derives
+`base + f(replayable inputs)` within the block (A5 N-3).
+
+This keeps both properties at once — replay-stable derivation, which path 3
+requires (`ruleset.rs:210-222`: identity stays a pure function of the
+emitter's replayable inputs, never of population or creation order), and
+cluster-coordinated uniqueness, which paths 1–2 already have (every range is
+carved from `pid/{grid}/next` by atomic add). And it creates **no new
+machinery class**: a granted contiguous range is exactly what the intent
+executor and the seeder already hold process-locally (Context §3.1–.2) and
+exactly what the designed peer-side path promises. The docs/08 §6 block-grant
+vocabulary is hereby extended to cover grants held as *derivation bases* in
+entity state, not only as mint cursors.
+
+What this clause does **not** do: build anything, or schedule anything. The
+grant-carrying field, grant sizing for emitters, and the journaling shape of
+peer-side grants are implementation decisions for the PRs that first persist
+a materialized entity — which is the moment G-2 stops being latent. Until
+then nothing in the tree has to move, and the games' current small-parent-id
+derivations remain legal because their outputs never reach a `world/` row.
+
+### (d) No provisional durable identity
+
+Predicted and transient spawns use `EphemeralId`; durable identity is never
+provisional (A5 N-4).
+
+- A client that fire-and-predicts a projectile has the right tool already:
+  free minting, island-scoped, and structurally unpersistable — the ephemeral
+  path installs `IslandAuthoritative`, deliberately distinct from
+  `LocallyAuthoritative`, "so an ephemeral entity carrying this one can never
+  be persisted no matter what game code does with it"
+  (`ephemeral.rs:344-352`; enforcement re-proven by M1 and M2, Context §5).
+- A client that optimistically renders the outcome of a durable creation
+  (crafting output, loot) renders it against the intent's pending receipt and
+  **adopts the receipt's minted `PersistId` on commit**
+  (`persist.rs:653-660`, `:698-701`); it does not invent a `PersistId` and
+  renumber later. No prespawn flow exists to grandfather
+  (A5 §2.5, re-checked: `rg -i prespawn` over first-party crates finds
+  nothing).
+
+Why a provisional-then-renumbered durable id is *invalid* rather than merely
+inelegant — the argument this record exists to preserve: journal records,
+claims, and evidence address entities by `PersistId` under a single-writer,
+`(entity, tick)`-idempotent discipline (`persist.rs:201-205`). Bytes emitted
+under a provisional id are bytes the renumbered entity's history does not
+contain, so replay and adjudication of any window spanning the rename would
+be unproducible. The class set of clause (a) is closed precisely to keep this
+door shut.
+
+### (e) Cross-grid references carry `(GridId, PersistId)`
+
+`PersistId` allocation is grid-scoped — `pid/{grid}/next`
+(`keyspace.rs:1626-1640`) — so nested grids allocate from independent
+counters and the bare u64 is unique only within its grid. Any in-state or
+durable reference that may cross grids stores the pair `(GridId, PersistId)`,
+not the bare id. Every durable row already carries both
+(`JournalRecord.grid` and `.entity`, `persist.rs:214-216`); this rider makes
+the same rule bind game-state references. Within one grid the bare id remains
+sufficient, and cross-cell and cross-island references need nothing extra:
+the id is cell-free (only the storage key is cell-scoped) and island-free.
+
+### (f) `PersistId` reuse across a despawn stays legal — and durable readers must be lifetime-aware
+
+**The owner decides: reuse stays legal.** The actor's re-spawn handling
+(Context §4) is ratified, not deprecated. The owner's rationale, recorded
+verbatim: *"the same `PersistId` over time is a power not a liability when it
+identifies the same durable entity."*
+
+One tension in that rationale is named here rather than smoothed over: the
+rationale is about **identity continuity** — one durable entity keeping one
+name across despawn-shaped lifecycle events (unload, demotion, a town
+restored by rollback) — while reuse across a despawn is precisely the case
+where the id does *not* identify the same entity. Both halves hold together:
+continuity is the power being kept, reuse-for-a-different-entity is the
+narrow hazard that rides along with it, and the obligation below is what
+contains that hazard. Clause (c) already narrows it structurally — under
+granted ranges, an id can be re-derived or re-minted only by the holder of
+its original block — but narrowing is not removal, and this clause does not
+pretend otherwise.
+
+**The obligation: a bare `PersistId` is not a sufficient reference in
+anything that outlives a tick.** Concretely:
+
+1. **Schema rule (checkable).** Every durable or evidence schema that names a
+   `PersistId` must carry a tick or tick window in the same artifact, so the
+   reference is to "*the entity live at that tick*", never to the naked id.
+   Every such schema today already complies — `JournalRecord.tick`,
+   `StateClaim.tick`, `EvidenceBundle.window_start/window_end`,
+   `Tombstone.tick`, frames with a tick base (Context §4) — so this rule
+   ratifies the shipped shapes and binds new ones. No mechanical check exists
+   today for a *new* schema violating it; the check belongs with R8's
+   manifest declarations, where schemas become declared artifacts a gate can
+   inspect, and that assignment is named here so the rule is not left as an
+   unowned "should".
+2. **Reader rule.** A reader that resolves a `PersistId` from a durable
+   artifact must scope any attribution to the lifetime containing that
+   artifact's tick, and must treat a `Despawn` record or tombstone between
+   two references as an identity boundary it may not silently cross. The
+   adjudication path complies by construction — windows are per-entity,
+   bounded, end at a claim tick, and never span a `chain_epoch`
+   (`verifiable.rs:149-151`, `:218-220`). The reader this rule is really
+   for does not exist yet: the P6 journal→archive tailer and its
+   inverse-op-replay/history queries ([docs/11 §P6]). **Lifetime-awareness is
+   a design requirement on that deliverable**, stated now so it is priced in
+   before the reader is built rather than retrofitted after the first
+   misattribution.
+3. **What no rule requires:** in-memory presentation state may hold bare ids
+   freely — clause (b)'s index rules already make stale lookups miss — and
+   canonical rules may store bare `PersistId`s as data, because a step that
+   names a despawned neighbour observes `None` from `StateView::neighbor`
+   (`ruleset.rs:131-138`) and must treat every cross-entity reference as
+   possibly-dangling anyway.
+
+## Consequences
+
+- **What this record actually adds is smaller than its title**, in the manner
+  [D42]'s consequences open with. Clauses (a), (b), and most of (f) ratify
+  what ships — the class inventory, the mapping shapes, reuse legality, and
+  evidence schemas that all carry ticks already. The record's real new
+  commitments are clause (c)'s granted-range rule for derived ids, clause
+  (d)'s closure of the provisional-id door, clause (e)'s cross-grid pair, and
+  clause (f)'s lifetime-awareness obligation on the not-yet-built history
+  reader.
+- **Clause (c) makes the unbuilt grant path load-bearing for a second
+  consumer.** The peer-side journaled block grant was designed for offline
+  minting; it is now also the uniqueness mechanism for persisted derived
+  identifiers. Whoever builds either consumer builds one mechanism. Until a
+  materialized entity is first persisted, nothing must move; when one is,
+  G-2 stops being latent and clause (c) is the rule the PR is held to.
+- **Accepting reuse-legality spends nothing today but binds the P6 reader's
+  design.** The cheap half of the alternative's benefit — evidence rows never
+  ambiguous about which lifetime they mean — is bought instead by clause
+  (f)'s schema rule, which every shipped schema already satisfies. The
+  expensive half — bare ids being globally unambiguous forever — is
+  deliberately not bought, and any future tool that assumes it is wrong by
+  this record.
+- **Two review-held seams are inherited, not closed**: G-1 (an `Entity`
+  inside opaque replicated payload bytes) waits for R4, and clause (f)'s
+  schema rule waits for R8's manifests to become mechanically checkable.
+  Naming them here keeps this record honest about what is structural versus
+  held by review — the distinction A9's enforcement table made the house
+  standard.
+- The identity vocabulary the sibling records assume is now fixed: R4's
+  capability dimensions attach to state named by these classes; R6's rollback
+  unit and R7's projection enumerate by `PersistId`; R8's manifests govern
+  schema identity (`ComponentTypeId`, `SchemaVersion`) which this record
+  deliberately leaves untouched.
+
+## Alternatives considered
+
+- **Static high-bit partition of the u64 space ("minted vs derived").**
+  Rejected for G-2: a partition keeps derived ids from colliding with minted
+  ones but not with *each other* — two emitters deriving from similar
+  replayable inputs still need a per-emitter base, and the granted block
+  supplies exactly that anyway. The partition would add a second namespace
+  convention while still needing the grant; the grant alone suffices (A5
+  §2.4).
+- **Central allocation for materialized entities.** Rejected: it would make
+  derived identity a function of allocation order — precisely what
+  `Ruleset::materialize` forbids so that isolated single-entity replay
+  reproduces the same descriptions (`ruleset.rs:210-222`) — and it would put
+  a round trip inside a step.
+- **A provisional durable id class with later renumbering.** Rejected by
+  clause (d): under `(entity, tick)`-idempotent journal and claim addressing,
+  a window spanning the rename is unadjudicable. This is the strongest
+  argument in the record and the reason the class set is closed rather than
+  merely enumerated.
+- **Forbid `PersistId` reuse after despawn outright.** Rejected by the owner
+  in clause (f). Priced honestly, since [A5] left this open as a genuine
+  trade: a ban buys evidence hygiene — a bare id in any artifact would mean
+  one entity forever — at the cost of a retention-window discipline
+  (tombstones or minter bookkeeping would have to pin every id ever used for
+  as long as any artifact naming it can resurface, where today
+  `Tombstone.gc_deadline_ms` lets the marker go). The owner keeps continuity
+  as the power instead, and clause (f)'s lifetime-awareness buys the same
+  hygiene per-artifact without the perpetual bookkeeping. Note the ban's
+  classic motivation in [A5] §2.6 — strike rows — was found to be
+  misaimed during this record's verification (strikes attach to accounts,
+  Context §4), which weakens the case for the ban beyond what A5 stated.
+
+[A5]: ../plans/a5-identity-and-capabilities.md
+[A11]: ../plans/a11-adrs-and-pr-plan.md
+[D3]: 0003-transport.md
+[D31]: 0031-id-account-subspace.md
+[D33]: 0033-strike-ledger-standing.md
+[D42]: 0042-canonical-simulation-architecture.md
+[docs/08 §4]: ../08-persistence.md
+[docs/08 §6]: ../08-persistence.md
+[docs/11 §P6]: ../11-roadmap.md
+[#407]: https://github.com/baadc0de/orrery/issues/407
+[#427]: https://github.com/baadc0de/orrery/pull/427
