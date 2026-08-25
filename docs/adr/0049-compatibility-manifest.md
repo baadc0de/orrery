@@ -29,14 +29,14 @@ text" ([a8-compatibility-manifests.md](../plans/a8-compatibility-manifests.md)
 
 Out of scope, each with its owner: everything [D42]–D48 decide — the canonical
 topology and host seam ([D42]); the determinism envelope, stages, and the
-schedule digest's **content** ([D43](g): "pinned into the game manifest, whose
+schedule digest's **content** ([D43] clause (g): "pinned into the game manifest, whose
 format and storage are R8's" — this record takes the storage and only the
 storage); capability dimensions and their invalid combinations ([D45]);
-message classes and C-2's **semantics** ([D46](e) — its constants' storage
+message classes and C-2's **semantics** ([D46] clause (e) — its constants' storage
 lands here, clause (e)(3), their meaning does not); the rollback unit ([D47]);
 identity classes and allocation (D44, in flight at acceptance — cited by
 decision id, not by file); the witness projection and `projection_version`'s
-**content and bump rule** ([D48](f) — this record stores the axis, clause (c),
+**content and bump rule** ([D48] clause (f) — this record stores the axis, clause (c),
 and defines none of it). Any manifest field that would *widen* peer admission is a
 protocol decision and therefore the owner's, never this record's:
 `GatewayMsg::protocol_accepted` is exact equality (`offered == current`,
@@ -92,7 +92,7 @@ story — from an open design problem into a recorded decision to reaffirm
 ### 3. The machinery a manifest composes with already ships, and it fails closed
 
 Per-slot `(ComponentTypeId, SchemaVersion)` framing with an absent-means-v0
-bootstrap rule is live ([D38](d); `crates/orrery_protocol/src/atrest.rs:12-27`,
+bootstrap rule is live ([D38] clause (d); `crates/orrery_protocol/src/atrest.rs:12-27`,
 `SCHEMA_V0` at :82; `crates/orrery_persistd/src/schema.rs:13-30`). The
 migration path refuses an undeclared component, a future version, and a
 missing step (`crates/orrery_persistd/src/migration.rs:74-101`; liveness
@@ -140,7 +140,7 @@ any byte exists). Not a trait whose methods return fragments: the manifest
 must be readable without linking game code (registering a build means linking
 a `Ruleset`, `crates/orrery_persistd/src/bin/persistd.rs:1258-1263`, and most
 consumers must not have to), and composition-time data is the registration
-idiom [D38](c) already ruled additive.
+idiom [D38] clause (c) already ruled additive.
 
 The brief's candidate fields, verdict by verdict. Declining an axis is a
 decision with teeth — an unconsumed version number is the `classify_component`
@@ -150,14 +150,14 @@ normative center of this clause:
 | Field | Verdict | Ruling |
 |---|---|---|
 | `game_id` | **keep** | Stable string naming the rules family. `RulesetId` is only `{version, digest}`, so two games at version 8 are indistinguishable to id-only tooling. Manifest-only; no wire consumer proposed |
-| `manifest_format_version` | **add** | u32, absent == 0 by the at-rest bootstrap rule (atrest.rs:14-21 applied to this format), bumped on any change to the manifest's own framing. [D38](d)(1)'s lesson applied to the format that carries the others |
+| `manifest_format_version` | **add** | u32, absent == 0 by the at-rest bootstrap rule (atrest.rs:14-21 applied to this format), bumped on any change to the manifest's own framing. [D38] clause (d)(1)'s lesson applied to the format that carries the others |
 | `protocol_version` | **keep** | u16, exact-equality domain (Context §2). The manifest *records* it; nothing here widens it |
 | `kernel_version` | **reshape → advisory toolchain stamp** | A numeric kernel version would be meaningless: every crate is `0.1.0` (Context §3), and peers never link a kernel separately from a build — "the same build links into peers, field hosts and `persistd`" (`crates/orrery_core/src/ruleset.rs:3-4`) — so kernel identity collapses into the build digest once clause (b) is real. What survives is the seed manifest's existing idiom (rustc channel + target, manifest.rs:52-60): advisory, never an admission axis |
 | `RulesetId {version, digest}` | **keep struct; add clause (b)'s obligation** | The struct is frozen into every evidence path (Context §1). What changes is what the digest *means* |
 | `module_id → module_version` | **keep, future-facing** | Defined now so the composition root lands against a fixed shape; no module system exists yet, and under clause (i) modules are statically linked registrations. Versions monotone, never reused or gapped, mirroring `SchemaVersion` discipline |
 | `component_schema_id → schema_version` + capabilities | **keep and extend** | The table of `(ComponentTypeId, SchemaVersion)` pairs, each row carrying [D45]'s five dimensions P/R/W/N/A. One table answers the schema question and the witnessed-contents question: witnessed schemas are the rows with `W ≥ 1`; exclusions are derivable from the zeros, not enumerated |
-| `command_schema_id → schema_version` | **reject** | **Commands have no independent encoding to version — the axis would have no consumer.** External commands are logged inputs sealed into signed logs; internal commands are mechanically collapsed onto domain events ([D46](a)); durable consequences ride intent ops whose ids are kernel-reserved or game-opaque (`crates/orrery_persistd/src/intent/mod.rs:204-210`). Every command shape changes with the build — that is, under `RulesetId` — and a second number here would be a version nothing reads |
-| schedule topology | **keep as [D43](g) wrote it** | Carried verbatim as `schedule_digest` — blake3 over ordered stages, per-stage ordered system names, sorted edges, ambiguity setting, executor policy. **Content is [D43]'s; this record adds only storage (clause (c)) and equality domain (clause (f))**; wire placement stays reserved (Open questions, item 2) |
+| `command_schema_id → schema_version` | **reject** | **Commands have no independent encoding to version — the axis would have no consumer.** External commands are logged inputs sealed into signed logs; internal commands are mechanically collapsed onto domain events ([D46] clause (a)); durable consequences ride intent ops whose ids are kernel-reserved or game-opaque (`crates/orrery_persistd/src/intent/mod.rs:204-210`). Every command shape changes with the build — that is, under `RulesetId` — and a second number here would be a version nothing reads |
+| schedule topology | **keep as [D43] clause (g) wrote it** | Carried verbatim as `schedule_digest` — blake3 over ordered stages, per-stage ordered system names, sorted edges, ambiguity setting, executor policy. **Content is [D43]'s; this record adds only storage (clause (c)) and equality domain (clause (f))**; wire placement stays reserved (Open questions, item 2) |
 | canonical-configuration hash | **reject, with the architecture's own argument** | There is nothing to hash that is not already code. VC-8 bans ambient reads in gated crates — "the environment reaches a rule only as a logged input" (`scripts/core-gates.sh:100-105`) — so outcome-affecting configuration is *code by construction*, inside clause (b)'s digest. [D16] operational parameters (cadences, budgets) are deliberately non-canonical and must stay out: hashing them would assert an outcome dependency the architecture denies. A runtime-config seam, if ever wanted, needs its own determinism story and its own ADR |
 | determinism profile | **reshape → `profile_id`** | Exactly one profile exists — the [D9] envelope with [D43]'s three rings — so a free-form hash would have nothing to distinguish. An identifier whose single legal value names that envelope, so a future second profile cannot silently claim compatibility with builds it cannot replay |
 
@@ -200,23 +200,23 @@ record is permanent: unlike evidence rows it never ages out with the
 ring for every older row. Routing stays id-keyed exactly as today; the record
 answers what an id alone cannot (the schema table for tooling that does not
 link the game, and the axes below). A new keyspace family and new types enter
-through [D21]'s additive door — the same door [D38](c) ruled sufficient — and
+through [D21]'s additive door — the same door [D38] clause (c) ruled sufficient — and
 no frozen signature moves.
 
 Three fields of this record are **storage-only inheritances**, semantics
 owned elsewhere and not redefined here:
 
 1. **`schedule_digest`** — content, computation, and CI assertion are
-   [D43](g)'s; this record stores the value in the manifest and gives it an
+   [D43] clause (g)'s; this record stores the value in the manifest and gives it an
    equality domain in clause (f).
-2. **C-2's constants** — `MAX_EVENTS_PER_STEP` and companions are [D46](e)'s
-   law, owner-tunable per a11 OD-28; [D46](e)(5) assigns their storage "to
+2. **C-2's constants** — `MAX_EVENTS_PER_STEP` and companions are [D46] clause (e)'s
+   law, owner-tunable per a11 OD-28; [D46] clause (e)(5) assigns their storage "to
    R8's manifest/registry work", and they live in the clause (e) registry
    file beside the schema table. Changing one is a rules change and rides
    the same versioning discipline; the number's meaning stays [D46]'s.
-3. **`projection_version`** — the axis is [D48](f)'s: value 1 today, bumped
+3. **`projection_version`** — the axis is [D48] clause (f)'s: value 1 today, bumped
    only on WP-2/WP-3 framing change, never for a payload-schema or rules
-   change, and "carried nowhere in the tree today" — [D48](f)'s own words,
+   change, and "carried nowhere in the tree today" — [D48] clause (f)'s own words,
    which also assign this slot: "stored in the manifest beside `RulesetId`
    and the schedule digest — the manifest construct, storage and governance
    are R8's". This record supplies exactly that: the manifest slot and the
@@ -244,7 +244,7 @@ On top of it:
 Replacement discipline: `ComponentTypeId` values are **never reused**;
 evolution keeps the id and bumps the schema through the migration chain;
 cross-id transfer is explicit game code under rules-purity obligations
-([D38](e)) — migration steps are keyed `(component, from_version)`
+([D38] clause (e)) — migration steps are keyed `(component, from_version)`
 (migration.rs:58-71) and no registry machinery for cross-id transfer exists
 or is promised.
 
@@ -269,7 +269,7 @@ question, so each gets its own rule rather than one blunt equality:
 | Relationship | Must match exactly | May differ | Grounds |
 |---|---|---|---|
 | Any two communicating peers | `protocol_version` | everything not on the wire | Exact equality at the only bootstrap (Context §2, M1). This record does not reopen D29's window |
-| Evidence producer ↔ adjudicator/witness | `RulesetId`, version **and** digest | platform within the four-target matrix; [D16] operational parameters | Routing is id-keyed and refuses otherwise (adjudication.rs:388-400); discrete state is bit-exact across the matrix and continuous state compares under bands ([D43](a)), so platform is deliberately not an identity axis |
+| Evidence producer ↔ adjudicator/witness | `RulesetId`, version **and** digest | platform within the four-target matrix; [D16] operational parameters | Routing is id-keyed and refuses otherwise (adjudication.rs:388-400); discrete state is bit-exact across the matrix and continuous state compares under bands ([D43] clause (a)), so platform is deliberately not an identity axis |
 | Authority ↔ predicting client | the build behind the predicted entities' claims; corrections installable | presentation state freely | Corrections carry `ruleset` because only that build can install them (authority.rs:14-16, :32) |
 | Parties re-executing each other's logs | `RulesetId` + `schedule_digest` + `projection_version` | anything outside the projection surface | The narrowest set that makes re-execution comparable: same rules, same topology, same framing. Where the assertion happens on the wire is reserved (Open questions, item 2) |
 
@@ -310,8 +310,8 @@ another.**
 | `RulesetId.version` (u32) | game | which rules semantics produced this evidence |
 | `RulesetId.digest` (32 B, clause (b)) | content-derived | which exact build |
 | `(ComponentTypeId, SchemaVersion)` per component | game, via clause (e) | what shape these payload bytes are |
-| `projection_version` ([D48](f); value 1 today) | per [D48](f)'s bump rule | how witness bytes were framed |
-| `schedule_digest` ([D43](g)) | composition root | what execution topology ran |
+| `projection_version` ([D48] clause (f); value 1 today) | per [D48] clause (f)'s bump rule | how witness bytes were framed |
+| `schedule_digest` ([D43] clause (g)) | composition root | what execution topology ran |
 | `profile_id` (clause (a)) | workspace | which determinism envelope this build claims |
 
 A build's full identity is the tuple
@@ -323,7 +323,7 @@ automatic**: adding a component typically bumps the schema table, may bump
 states its own reason in its own review, and none is computed from another.
 
 Relationship to [D38], as that record stands on this tree: clause (d)(3)
-originally pinned the orthogonality for two axes, and [D48](g) — the one
+originally pinned the orthogonality for two axes, and [D48] clause (g) — the one
 amendment in the #395 set — has already widened it to three: on this branch
 (d)(3) now closes "The bag's version fields, the build's digest, and the
 projection version answer different questions and none of the three may ever
