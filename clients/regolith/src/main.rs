@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use orrery_predict::OrreryPredictPlugin;
 use orrery_regolith_client::{
+    admission::{resolve_admission_url, AdmissionPlugin},
     campaign::CampaignConfig,
     session::{require_campaign_consent, ConfiguredImpairment, CONSENT_NOTICE},
     RegolithSkinPlugin,
@@ -60,6 +61,7 @@ fn main() {
     let telemetry_path = flag_value(&args, "--telemetry-jsonl")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/regolith-client/session.jsonl"));
+    let admission_url = resolve_admission_url(&args, std::env::var("ORRERY_ADMISSION_URL").ok());
 
     let smoke_ticks =
         flag_value(&args, "--smoke-ticks").and_then(|value| value.parse::<u64>().ok());
@@ -75,6 +77,7 @@ fn main() {
     }))
     .add_plugins(OrreryPredictPlugin::default());
 
+    let boot_ui = campaign_input.is_none();
     let mut skin = RegolithSkinPlugin::new(telemetry_path.clone());
     if let Some(input) = campaign_input {
         // Operator-declared impairment. Shown beside the measurement in the
@@ -107,6 +110,10 @@ fn main() {
         });
     }
     app.add_plugins(skin);
+
+    if boot_ui {
+        app.add_plugins(AdmissionPlugin::new(admission_url, telemetry_path));
+    }
 
     if let Some(ticks) = smoke_ticks {
         // Headless campaign proof: join, run N joined ticks, record, exit.
