@@ -219,6 +219,96 @@ The relay fleet is **self-hosted** `iroh-relay` (D12): public IP + DNS + ACME TL
 - **The 5–10% permanently-relayed tail is a product requirement, not an edge case.** CGNAT↔CGNAT and UDP-blocked players will *never* punch (Tailscale's 28-minutes-to-99.9% number, §1); they are paying customers who experience the game at relay-hop latency and must be provisioned for. Capacity sketch: relayed peers cap at the same ≤ 1 Mbps budget, so worst-case relay throughput ≈ `relayed_peer_count × 2 Mbps` (both directions); 1,000 concurrent players at a 10% relayed tail is ≈ 200 Mbps aggregate across the fleet — small, but it must be *reserved*, and regional (a Singapore CGNAT player relays through the Asia relay, not Virginia).
 - **Ops SLIs** (`orrery_net` relay-path telemetry, D15): relayed-session fraction (alert if it drifts above ~10–12% — indicates a punch regression), relay RTT added vs direct, per-relay bandwidth headroom.
 
+### 8.1 What exists now: address inventory and ownership
+
+The fleet above is the accepted target, not the current implementation. The
+single self-hosted relay is currently a **P0 diagnostic fixture**. The product
+path still constructs endpoints from iroh's `N0` preset and defaults to
+`RelayMode::Default` (`crates/orrery_net/src/plugin.rs:42-61`); it does not
+select this relay. Thus every NAT-bound player depends on *a* relay, as §1
+shows, but the current tree does not make every player depend on this particular
+host. Closing that doc/code gap is separate from changing the diagnostic
+fixture's address.
+
+The relay hostname is load-bearing because clients construct an HTTPS
+`RelayUrl` and TLS authenticates that name (§1 and
+`gates/p0-nat-test/src/net.rs:19-30`). That requirement does not generalize to
+peers or the coordinator. `CoordinatorConfig::address` is an
+`iroh::EndpointAddr` (`crates/orrery_net/src/coordinator.rs:54-61`), and island
+peers are dialled as bare `NodeId`s for iroh discovery to resolve
+(`crates/orrery_net/src/coordinator.rs:708-725`). Per-instance A records are
+therefore not read by either path and must not be provisioned as if they were
+peer discovery.
+
+The checked-in address inventory is deliberately small:
+
+| Location | What it contains |
+|---|---|
+| `gates/p0-nat-test/relay-host:1` | The only checked-in default hostname value. |
+| `gates/p0-nat-test/src/cli.rs:9-25` | Includes that file, accepts `ORRERY_RELAY_HOST`, and derives an HTTPS URL. It contains no second hostname. |
+| `gates/p0-nat-lab/deploy-gw.sh:20-49` | Reads the same file or override and resolves it once on the gateway. It contains no checked-in relay IP. |
+| `gates/p0-nat-lab/deploy-gw.sh:96-103` | Pins the just-resolved address inside DNS-isolated peer namespaces. This is generated lab state, not another source of truth. |
+| `gates/p0-nat-test/README.md:33-35,99-102,150-155` | Refers readers to the shared file and documents the override; it does not restate the hostname. |
+
+Issue #184's original `p0-nat-test/...` and `p0-nat-lab/...` citations became
+stale when #391 moved phase tools under `gates/`. Its cited hard-coded IP is
+also gone: resolving DNS at deployment replaced the checked-in pin. The named
+test
+`cli::tests::nat_lab_and_cli_derive_the_same_default_relay`
+(`gates/p0-nat-test/src/cli.rs:113-139`) guards that the CLI and lab read the
+same host and that the CLI supplies HTTPS. `--relay` and
+`ORRERY_RELAY_HOST` remain intentional per-run overrides.
+
+Three operational choices belong to the owner, even though two have current
+answers:
+
+| Decision | Current answer | Required answer before a future move |
+|---|---|---|
+| Hosting | Owner decision in #184: keep the relay on Hetzner. | Name the provider, region, instance owner, and whether this is a diagnostic node or one member of the production fleet. |
+| Hostname | Owner decision in #184: keep the existing name, whose value is in `gates/p0-nat-test/relay-host`. | Say whether the name is retained for a DNS cutover or replaced; changing it also requires changing the canonical file and issuing a matching certificate. |
+| Certificate custody | No custodian or renewal mechanism is recorded; `docs/09-services-and-ops.md:34` says only "locally-provisioned cert." | Name who holds the private key and which service/account performs and monitors ACME renewal. If DNS-01 is chosen, also bound access to the DNS credential and record names it may change. |
+
+### 8.2 Relay migration runbook
+
+There is no pending move: the hosting and hostname decisions above keep the
+relay where it is. If either decision changes, use this cutover rather than
+editing consumers independently:
+
+1. Record all three owner decisions above. Lower the existing DNS record's TTL
+   at least one old-TTL interval before the cutover, and keep the old relay
+   available through that interval.
+2. Bring up `iroh-relay` at the destination with a public address. Provision a
+   certificate for the owner-selected hostname using the owner-selected
+   custodian and renewal mechanism; verify the full chain and hostname, not
+   merely that TCP port 443 answers.
+3. Exercise both relay roles against the destination before DNS changes: a
+   normal NAT pair must use it as punch rendezvous, and the P0 lab's
+   `udpblocked` arm must exchange traffic while remaining relay-only. An HTTPS
+   landing page alone proves neither data path.
+4. If the hostname is retained, change its DNS address. If it changes, update
+   only `gates/p0-nat-test/relay-host`; the CLI and lab derive their values from
+   it. Keep both relays and both certificates live while cached DNS and
+   already-established relay connections drain.
+5. Re-run the normal and `udpblocked` P0 arms without `ORRERY_RELAY_HOST` and
+   without a manually maintained `/etc/hosts` entry. Confirm certificate
+   renewal by forcing the selected renewer's staging/dry-run path, then restore
+   ordinary renewal.
+6. Retire the old listener only after the maximum pre-cutover TTL, the relay
+   connection drain window, and the rollback window have all elapsed. Restore
+   the old DNS answer if the forced-relay arm fails; relays are stateless, so
+   rollback has no application data to reconcile.
+
+What breaks depends on the relay map that actually exists. The P0 tool builds
+`RelayMode::Custom` from exactly one URL
+(`gates/p0-nat-test/src/net.rs:19-30`). If that relay becomes unreachable,
+already-punched direct sessions continue while their direct path remains
+valid, but new connections cannot rendezvous, in-progress punches cannot
+complete through that path, and relay-only sessions stall or disconnect. A
+later NAT rebind also has no relay fallback. The multi-relay production design
+has a smaller blast radius: §9's next-nearest-relay behavior applies only once
+the configured map really has those alternatives. DNS alone does not provide
+that failover.
+
 ## 9. Failure modes
 
 **Punch failure (per pair).** Expected for ~10% of pairs. Not an error: the session continues on the relay path indefinitely; consequences are one relay hop of added RTT and relay bandwidth. Gameplay logic is path-blind. Punch retries continue opportunistically (QNT rounds are cheap) — network changes (Wi-Fi→ethernet, VPN toggle) can make a previously unpunchable pair punchable.
