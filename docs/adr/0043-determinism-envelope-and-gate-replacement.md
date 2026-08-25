@@ -103,3 +103,108 @@ match for `profile` in the file), so both behaviours are cargo defaults —
 arithmetic that can overflow therefore diverges *by build profile* today
 (threat T12). The defect is the profile-dependence, regardless of which
 posture replaces it; clause (f) is the owner's answer.
+
+## Decision
+
+### (a) The determinism envelope — three rings, and an explicit outside
+
+What "deterministic" promises, and to whom (A4 §3.1, matching [D9]'s scoping
+and docs/06-verifiable-core.md §5):
+
+1. **Ring 1 — in-process (one binary, one machine): bit-exact.** Same inputs
+   produce the same state bytes, the same event sequence, the same hashes —
+   across runs, worker counts, executor kinds, and insertion orders. No
+   tolerance anywhere in this ring. This is what the double-run tests and the
+   nightly soak assert, and it is what makes ring 2's corpus comparable at
+   all.
+2. **Ring 2 — across the supported platform matrix: discrete bit-exact,
+   continuous within bands.** Four targets (x86_64 Linux/Windows, aarch64
+   Linux/macOS; x86_64-macOS deliberately unsupported), pinned toolchain and
+   dependencies ([D14]). Discrete state (VC-5) compares `==`; continuous
+   state (VC-6/VC-7) is libm-routed, lattice-snapped each tick, then compared
+   under [D16]'s bands (ε_pos 1 cm, ε_vel 1 cm/s).
+3. **Ring 3 — explicitly outside the envelope:** compiler versions outside
+   the pin; modified or third-party rules builds claiming an honest
+   `RulesetId` (the tamper model keeps the honest id on purpose — that is
+   what witnessing adjudicates, not a determinism failure); fast-math and
+   codegen-flag variance; any platform outside the four.
+
+A future ECS host inherits this envelope unchanged. It may not narrow ring 1
+to "stable enough per process", and it may not widen ring 2 to "all
+platforms" — that is the promise rapier scopes and avian declines.
+
+### (b) Canonical stages S0–S7
+
+A canonical tick is a fixed pipeline over a frozen input set. Under the
+current executor the pipeline is implicit in `step_entity`; under any future
+host it becomes explicit schedule structure. Either way it is:
+
+```text
+S0 SealInputs     freeze this tick's input log in VC-2 order; nothing appends
+                  after S0 begins (late arrivals join t+1)
+S1 Deliver        apply external commands + last tick's events as inputs, per
+                  entity, in log order
+S2 Step           per-entity pure step: own state + ordered inputs + TickRng;
+                  entity processing order = PersistId ascending; steps are
+                  independent (snapshot isolation), so S2 may parallelize
+                  across entities
+S3 Record         collect neighbour reads for the log (first-read order)
+S4 Quantize       snap every continuous field (VC-7) — before any hashing
+S5 Claim          compute per-entity state_hash; assemble claims
+S6 Materialize    install structural changes: emission/description order,
+                  first-writer-wins (executor.rs:144-157 semantics)
+S7 Emit           enqueue emitted events as t+1 inputs (delivery strictly
+                  next tick)
+```
+
+Two properties are **non-negotiable**, because adjudication consumes them:
+
+- **S4 ≺ S5.** Quantize before hash, always (`executor.rs:126-127`; VC-7;
+  A7's projection rule WP-4 states the same clause from the projection side).
+- **S6 applies no input visible to any S2 of the same tick.** Materialized
+  children cannot change a step that already ran; the corpus's
+  shared-vs-isolated chain-equality axis pins this mechanically.
+
+### (c) Ordering and prohibition rules attached to the stages
+
+Normative, condensed from A4 §3.3–§3.9; where a rule is another record's to
+detail, the boundary is stated.
+
+1. **System ordering.** Within a stage, systems form a total order fixed at
+   composition time. Every pair of systems with conflicting data access
+   carries an explicit ordering edge; ambiguity is *rejected at composition*
+   (error, not log), never ignored — and the rejector itself must be proven
+   awake by a canary mutant (A4 E-M2: the real schedule initializes Ok, a
+   deliberately un-ordered mutant initializes Err; both directions in CI).
+   Observed run-to-run stability of an ambiguous schedule is not evidence of
+   anything: A3's probe ran an ambiguous schedule 200/200 identical.
+2. **Deferred structural changes.** All spawn/despawn/insert in canonical
+   execution goes through deferred commands flushed at **S6 only**; flush
+   order = queue order = system order × emission order; identifier collisions
+   resolve first-writer-wins by `PersistId` — today's rule verbatim. Direct
+   world mutation inside S0–S5 is prohibited; a host exposes command queues
+   to canonical systems, not `&mut World`.
+3. **Events.** Emission order within a producer; producer total order across
+   producers; delivery at S1 of t+1, never earlier; no observers, hooks, or
+   immediate cascades in the canonical path. Dedup, replay, idempotency and
+   volume bounds are R5's (A6) — this clause fixes ordering and timing only.
+4. **Query order.** Query iteration order must never be observable in
+   anything leaving the canonical context — claim bytes, persistence rows,
+   event payloads. Any projection producing canonical output iterates sorted
+   by `PersistId` (cross-grid, `(GridId, PersistId)` — A7 WP-2). Stated
+   honestly: this is enforced mechanically where possible (the projection
+   differential harness, Tier H clause (e)(4)) and by review beyond that; a
+   grep cannot tell an observable iteration from an unobservable one.
+5. **RNG ownership.** Per-entity, per-tick stream derived by `tick_rng`
+   (rng.rs:31-43) and passed `&mut` into the step; draws are code order; no
+   mid-tick reseed; no global RNG resource in canonical stages; no draw count
+   depending on cross-entity data-dependent branches.
+6. **Floats.** VC-5/VC-6/VC-7 verbatim: integers for discrete outcomes; libm
+   routing with std transcendentals banned in both spellings; exact IEEE ops
+   (`round`/`floor`/`ceil`/`trunc`/`abs`/`mul_add`) allowed and load-bearing
+   for the lattice; quantize-before-hash; [D16] bands for ring-2 comparison.
+7. **Async.** Canonical execution is synchronous end-to-end within a tick: no
+   async runtime in the canonical graph, no task spawned during S0–S7 that
+   outlives the schedule run, no I/O inside canonical stages. The outside
+   world enters as sealed inputs at S0 and leaves as events and frames after
+   S7.
