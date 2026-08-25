@@ -15,9 +15,9 @@ Within the #395 proposal set, R7 remains the only proposal that will amend an
 accepted record; this one does not. It sits under [D42]'s canonical
 simulation architecture and consumes [D43]'s stage model S0–S7 and its
 ordering-and-delivery-timing rules as fixed constraints — A4 fixed *when*
-messages move and explicitly deferred "replay behaviour,
-deduplication/idempotency … and volume bounds" to this record's substance
-(`docs/plans/a4-deterministic-execution.md` §3.5 note at `:241-243`, §8);
+messages move and explicitly deferred the rest: "Deduplication, replay
+behaviour, idempotency keys, and volume bounds are **A6's (#402)
+territory**" (`docs/plans/a4-deterministic-execution.md:243-244`, §3.5);
 that boundary was drawn deliberately, and nothing here restates or reopens
 stage timing. Its substance is
 [a6-commands-events-transactions.md](../plans/a6-commands-events-transactions.md)
@@ -400,3 +400,44 @@ flag (Consequences below).
    is implementation's choice within clause (e)(2)'s location-and-
    distinctness law, flagged here only so nobody mistakes it for a decided
    detail.
+
+## Verification appendix — what was re-run at acceptance
+
+All on this tree (branch `docs/adr-0046-r5` at `1c725704`), 2026-08-25:
+
+| Check | Result |
+|---|---|
+| "arbitrary but fixed" composition comment | `crates/orrery_games/src/scenario.rs:210-213`, verbatim; delivered-first compose at `:214` (A6/a11 cite the span as `:209-214` — same code, one line of drift at the top edge) |
+| `MAX_OPS_PER_INTENT` current value | `= 64`, `crates/orrery_persistd/src/intent/mod.rs:189` (A6 cites the cap block as `:182-202`; the constant sits inside that span) |
+| Steps cannot fail | `step_entity` returns `Option<TickOutcome>`; "Returns `None` for an entity this executor does not hold" (`crates/orrery_core/src/executor.rs:109-115`); no error variant exists |
+| No emission cap exists today | `grep -rn "MAX_EVENTS_PER_STEP" crates/` — no matches; `StepOutput.events` is an unbounded `Vec` (`ruleset.rs:196-202`) |
+| Emission-order doc | "a `Vec`, never a set", `crates/orrery_core/src/ruleset.rs:196` |
+| Neighbour-read ban rationale | `scripts/core-gates.sh:126-139`, scan live on `RULES_SOURCES` |
+| A4's deferral to this record | `docs/plans/a4-deterministic-execution.md:243-244`; T7 wording at `:145` |
+| [D43] overflow clause and its flag placement | `docs/adr/0043-determinism-envelope-and-gate-replacement.md` clause (f), read in full; per-entity discrete field, WP-1 hash inclusion, (f)(4) reserved |
+| A7 projection rules leaned on | `docs/plans/a7-persistence-rollback-witnessing.md` §5, WP-1..WP-6 read in full |
+| P4 pipeline trees | `scripts/p4-ledger.sh:409-414`: `crates/orrery_witness`, `crates/orrery_core`, `crates/orrery_games`, `gates/p1-swarm` — verbatim |
+| `RulesetId.version` semantics | "Game-assigned monotonic rules version", `crates/orrery_protocol/src/verifiable.rs:59-63` |
+| FDB envelope bound comment | `crates/orrery_persistd/src/intent/mod.rs:184-188` ("FDB bounds at 10 MB and 5 s") |
+| Stage-1 flag machinery (the posture's namesake) | `scenario.rs:20-23` ("Stage-1 flags — the game's own invariants, run over samples"); `Flag` records carry validator names (`scenario.rs:147-158`). Noted deliberately: scenario stage-1 flags are **diagnostics outside the hash** — clause (e) borrows the *posture* (tick completes, condition reported), not the placement |
+
+Mutation run for the ratification clause (the only clause of this record
+whose enforcement could be probed — C-2 has no code to mutate, stated in
+Context §3):
+
+| # | Guarded stage broken | Named check | Observed | Reverted |
+|---|---|---|---|---|
+| M-R5-1 | Input composition reversed in the reference loop: player orders composed first, delivered inputs appended after (`scenario.rs:214` + step call site) | `cargo test -p orrery_games` → `chains_match_the_committed_golden` | FAILED at `battery.rs:239`: "skirmish/island: chain changed. If the rules changed on purpose, bump the ruleset version and regenerate; if they did not, this is drift." — `10 passed; 1 failed; 1 ignored`. Every other suite green under the mutation, i.e. the Regolith goldens are insensitive to composition order; exactly one committed scenario pins the clause | `11 passed; 0 failed; 1 ignored`; all games suites green (incl. `28 passed`); working tree clean |
+
+Findings against interest, restated rather than buried: the clause-(d)
+convention is held by one golden in one scenario family; log-order fidelity
+and routing-target correctness are golden-pinned only (A6 M-A6-2, M-A6-3);
+and the witness shown-ticks re-delivery immunity that clause (e)(4)'s
+honesty note references has **no named check** (A6 M-A6-4a). None of these
+is worsened by this record; all are inherited and named.
+
+[D38]: 0038-at-rest-schema-versioning.md
+[D42]: 0042-canonical-simulation-architecture.md
+[D43]: 0043-determinism-envelope-and-gate-replacement.md
+[D44]: ../DECISIONS.md
+[D45]: ../DECISIONS.md
