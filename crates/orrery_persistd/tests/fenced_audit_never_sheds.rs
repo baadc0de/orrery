@@ -79,15 +79,33 @@ use orrery_protocol::{
 /// is derived from it, so the audit stays six budgets slow at any value.
 const ROUTE_BUDGET_US: u64 = 200_000;
 
-/// A liveness ceiling expressed in the route budget under test. The served
-/// versus shed assertion is the reply ordering below; this merely prevents a
-/// permanently stalled test from holding a worker forever. Three thousand
-/// budgets is 30 seconds here, leaving substantial headroom over the reported
-/// 11.29-second loaded-runner delay without treating a scheduling timeout as
-/// evidence that the diagnostic shed a write.
-const ACK_LIVENESS_ROUTE_BUDGETS: u64 = 3_000;
-const ACK_LIVENESS_TIMEOUT: Duration =
-    Duration::from_micros(ROUTE_BUDGET_US * ACK_LIVENESS_ROUTE_BUDGETS);
+/// A liveness ceiling. The served-versus-shed assertion is the reply ordering
+/// below; this merely prevents a permanently stalled test from holding a
+/// worker forever.
+///
+/// It used to be written as `ROUTE_BUDGET_US * 3_000` with a doc comment
+/// saying that came to 30 seconds. It did, at the 10 ms budget in force when
+/// it was written; the budget is now 200 ms and the same expression is **600
+/// seconds**, so a hang burned ten minutes of a runner and the comment beside
+/// it was false. A ceiling that measures nothing the test measures should not
+/// be derived from a budget the test does tune — the derivation only invited
+/// that drift. It is the shared ceiling now, and the one premise that really
+/// is load-bearing is pinned below instead.
+const ACK_LIVENESS_TIMEOUT: Duration = lanes::LIVENESS_CEILING;
+
+/// The longest the *served* path can legitimately take: `within_route_budget`
+/// cancels any route that outruns its own budget, so `DIFFS` routes that are
+/// each served cannot together exceed this.
+const SERVED_PATH_CEILING_US: u64 = ROUTE_BUDGET_US * DIFFS;
+
+// A ceiling inside the served path's own bound would cut off a correct run and
+// report it as exactly the shed this test exists to catch — the inverted form
+// of the same misdiagnosis. Make that a compile error rather than a comment.
+const _: () = assert!(
+    ACK_LIVENESS_TIMEOUT.as_micros() > SERVED_PATH_CEILING_US as u128,
+    "the ack ceiling must outlast every route this test serves, or a healthy \
+     run times out and reads as the shed the test is looking for"
+);
 
 /// How long the audit's `LeaseStore::locate` takes once armed: six budgets.
 /// Any single sampled audit on the request path therefore overruns, with no
@@ -289,10 +307,7 @@ async fn an_audit_slower_than_the_route_budget_neither_sheds_the_diff_nor_vanish
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
 
     conn.send_control(&GatewayMsg::Lease {
         message: LeaseMsg::Claim {
@@ -308,13 +323,18 @@ async fn an_audit_slower_than_the_route_budget_neither_sheds_the_diff_nor_vanish
     })
     .await;
     let (lease_id, seq) = loop {
-        match conn.next_reply(Duration::from_secs(10)).await {
+        match conn.next_reply(ACK_LIVENESS_TIMEOUT).await {
             Some(GatewayReply::Lease {
                 message: LeaseMsg::Grant { lease_id, seq, .. },
             }) => break (lease_id, seq),
             Some(GatewayReply::Lease { message }) => panic!("claim was not granted: {message:?}"),
             Some(_) => continue,
-            None => panic!("no answer to the lease claim"),
+            None => panic!(
+                "timed out after {} s waiting for an answer to the lease claim; \
+                 this is a liveness failure, not evidence that the lease path \
+                 dropped the claim",
+                ACK_LIVENESS_TIMEOUT.as_secs(),
+            ),
         }
     };
 
@@ -370,9 +390,10 @@ async fn an_audit_slower_than_the_route_budget_neither_sheds_the_diff_nor_vanish
             }
             Some(other) => panic!("unexpected reply while awaiting acks: {other:?}"),
             None => panic!(
-                "timed out after {ACK_LIVENESS_ROUTE_BUDGETS} route budgets waiting for \
-                 reply {}/{}; this is a liveness failure, not evidence that the diagnostic \
-                 shed a fenced write",
+                "timed out after {} s waiting for reply {}/{}; this is a \
+                 liveness failure, not evidence that the diagnostic shed a \
+                 fenced write",
+                ACK_LIVENESS_TIMEOUT.as_secs(),
                 acked + 1,
                 DIFFS,
             ),

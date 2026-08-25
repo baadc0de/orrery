@@ -299,10 +299,7 @@ async fn stages_attribute_the_time_they_spent_and_the_gap_is_visible() {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
 
     // Claim the batch. These go through `claim_lease`, which the slow router
     // does not delay, so nothing here lands in `route_us`.

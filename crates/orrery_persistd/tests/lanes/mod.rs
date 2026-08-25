@@ -141,3 +141,51 @@ pub fn decode_reply(payload: &[u8]) -> Option<orrery_protocol::GatewayReply> {
         Channel::Control => orrery_protocol::channels::decode_stream_frame(payload),
     }
 }
+
+/// The slowest whole persistd gateway flow anyone has *observed* on a loaded
+/// CI runner, rounded up to whole seconds: #358 recorded 11.29 s for a flow
+/// that takes 0.11 s on an idle box. Not a budget and not a promise — an
+/// observation, kept here so the ceiling below can be derived from it instead
+/// of guessed.
+const OBSERVED_LOADED_FLOW_S: u64 = 12;
+
+/// The ceiling a wait runs under when the test measures *nothing* about how
+/// long the reply took.
+///
+/// Every use of this constant is a wait whose only job is to stop a
+/// permanently stalled gateway from holding a test worker forever. It is
+/// deliberately *not* derived from any budget under test: deriving it from one
+/// would imply the test is checking that budget, which is the confusion #370
+/// exists to remove. Where a wait really does bound something the test
+/// measures, derive that bound from the budget and do not use this.
+pub const LIVENESS_CEILING: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    LIVENESS_CEILING.as_secs() > OBSERVED_LOADED_FLOW_S,
+    "a liveness ceiling at or below the slowest flow already observed on a \
+     loaded runner converts runner load into a test failure — the exact defect \
+     #358 and #370 exist to remove"
+);
+
+/// Wait out a gateway handshake, keeping a refusal and a silence apart.
+///
+/// The idiom this replaces — `assert!(matches!(conn.next_reply(d).await,
+/// Some(GatewayReply::HelloAck { .. })))` — cannot tell them apart. On a
+/// timeout it prints a failed pattern match against `HelloAck`, which reads as
+/// *the gateway did not admit this session*: an admission-path correctness
+/// bug. What actually happened is that nothing arrived in time. Sending a
+/// reader hunting that bug is the whole cost this helper removes.
+pub async fn expect_hello_ack(conn: &GatewayLanes) {
+    match conn.next_reply(LIVENESS_CEILING).await {
+        Some(orrery_protocol::GatewayReply::HelloAck { .. }) => {}
+        Some(other) => {
+            panic!("the gateway did not admit the handshake; it answered {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s waiting for the handshake's HelloAck; this is \
+             a liveness failure, not evidence that the gateway refused the \
+             session or dropped the hello",
+            LIVENESS_CEILING.as_secs(),
+        ),
+    }
+}

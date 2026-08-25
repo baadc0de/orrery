@@ -57,7 +57,7 @@ const ACK_LIVENESS_TIMEOUT: Duration =
 /// answered inline in the receive loop ahead of every admission decision, so
 /// no budget under test stands between the send and its reply. Its only job
 /// is to stop a permanently stalled loop from holding a worker forever.
-const PROBE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_LIVENESS_TIMEOUT: Duration = lanes::LIVENESS_CEILING;
 
 /// A gateway with the downstream route valve **off**.
 ///
@@ -158,10 +158,7 @@ async fn dial(server: &GatewayServer) -> Client {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
     Client {
         _endpoint: endpoint,
         conn,

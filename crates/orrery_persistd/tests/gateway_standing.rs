@@ -194,8 +194,11 @@ async fn connect(server: &GatewayServer, seed_byte: u8) -> Client {
 }
 
 /// The liveness ceiling every `hello()` wait runs under. Named so an arm
-/// that reports a timeout can state how long it actually waited.
-const HELLO_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// that reports a timeout can state how long it actually waited, and shared
+/// with the rest of the suite so it cannot drift on its own. No call site
+/// below expects `hello()` to return `None`, so raising it costs a passing
+/// run nothing.
+const HELLO_LIVENESS_TIMEOUT: Duration = lanes::LIVENESS_CEILING;
 
 async fn hello(client: &Client, token: Vec<u8>) -> Option<GatewayReply> {
     client
@@ -260,13 +263,19 @@ async fn a_cooldown_or_ban_refusal_arrives_as_hello_refused_standing_not_silence
     feed.retract_all().await;
     feed.wait_for_poll(feed.polls.load(Ordering::SeqCst) + 1)
         .await;
-    assert!(matches!(
-        hello(&client, token).await,
+    match hello(&client, token).await {
         Some(GatewayReply::HelloRefused {
             reason: GatewayReply::HELLO_REFUSED_STANDING,
             ..
-        })
-    ));
+        }) => {}
+        Some(other) => panic!("expected a standing refusal, got {other:?}"),
+        None => panic!(
+            "timed out after {} s waiting for the hello's answer; this is a \
+             liveness failure, not evidence that the gateway admitted an \
+             account it should have refused",
+            HELLO_LIVENESS_TIMEOUT.as_secs(),
+        ),
+    }
 }
 
 /// The termination half, through the real maintenance loop: a session opened
@@ -287,10 +296,16 @@ async fn an_invalidation_published_mid_session_terminates_the_open_session() {
 
     let client = connect(&server, 22).await;
     let token = support::valid_session_token(client.node);
-    assert!(matches!(
-        hello(&client, token.clone()).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    match hello(&client, token.clone()).await {
+        Some(GatewayReply::HelloAck { .. }) => {}
+        Some(other) => panic!("the session must establish before it can be terminated: {other:?}"),
+        None => panic!(
+            "timed out after {} s waiting for the opening HelloAck; this is a \
+             liveness failure, not evidence that the gateway refused a session \
+             it had no reason to refuse",
+            HELLO_LIVENESS_TIMEOUT.as_secs(),
+        ),
+    }
 
     feed.publish(invalidated(AccountId::new(7), INVALIDATED_AT_MS))
         .await;
@@ -303,13 +318,19 @@ async fn an_invalidation_published_mid_session_terminates_the_open_session() {
     );
 
     // And the token that predates the watermark cannot re-establish.
-    assert!(matches!(
-        hello(&client, token).await,
+    match hello(&client, token).await {
         Some(GatewayReply::HelloRefused {
             reason: GatewayReply::HELLO_REFUSED_STANDING,
             ..
-        })
-    ));
+        }) => {}
+        Some(other) => panic!("expected a standing refusal, got {other:?}"),
+        None => panic!(
+            "timed out after {} s waiting for the hello's answer; this is a \
+             liveness failure, not evidence that the gateway admitted an \
+             account it should have refused",
+            HELLO_LIVENESS_TIMEOUT.as_secs(),
+        ),
+    }
 }
 
 /// docs/09 §8's grace rule must not become a ban escape hatch: an
@@ -333,13 +354,18 @@ async fn grace_does_not_admit_an_account_identity_has_invalidated() {
 
     let client = connect(&server, 23).await;
     let token = support::valid_session_token(client.node);
-    assert!(
-        matches!(
-            hello(&client, token.clone()).await,
-            Some(GatewayReply::HelloAck { .. })
+    match hello(&client, token.clone()).await {
+        Some(GatewayReply::HelloAck { .. }) => {}
+        Some(other) => {
+            panic!("established normally before any of this started, got {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s waiting for the opening HelloAck; this is a \
+             liveness failure, not evidence that the gateway refused a session \
+             it had no reason to refuse",
+            HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "established normally before any of this started"
-    );
+    }
 
     feed.publish(invalidated(AccountId::new(7), INVALIDATED_AT_MS))
         .await;
@@ -350,13 +376,19 @@ async fn grace_does_not_admit_an_account_identity_has_invalidated() {
     health.0.store(false, Ordering::SeqCst);
     // The token expired (900 + 60_000 < 61_500) while identity is down.
     clock.0.store(61_500, Ordering::SeqCst);
-    assert!(matches!(
-        hello(&client, token).await,
+    match hello(&client, token).await {
         Some(GatewayReply::HelloRefused {
             reason: GatewayReply::HELLO_REFUSED_STANDING,
             ..
-        })
-    ));
+        }) => {}
+        Some(other) => panic!("expected a standing refusal, got {other:?}"),
+        None => panic!(
+            "timed out after {} s waiting for the hello's answer; this is a \
+             liveness failure, not evidence that the gateway admitted an \
+             account it should have refused",
+            HELLO_LIVENESS_TIMEOUT.as_secs(),
+        ),
+    }
     assert_eq!(
         server.standing_metrics().snapshot().hello_refused_standing,
         1

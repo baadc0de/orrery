@@ -320,12 +320,15 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
             version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
-    assert!(matches!(
-        session.conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&session.conn).await;
     session
 }
+
+/// How many unrelated replies a single-answer helper will drain before it
+/// gives up. A *count*, not a deadline: exceeding it means the gateway is
+/// talking and saying the wrong thing, which is a correctness failure and is
+/// reported as one.
+const UNRELATED_REPLY_BUDGET: usize = 8;
 
 /// File `report` and read back its single answer.
 async fn file(
@@ -333,26 +336,38 @@ async fn file(
     report: Box<DiscrepancyReport>,
 ) -> (Option<Verdict>, u16) {
     conn.send_control(&GatewayMsg::Report { report }).await;
-    for _ in 0..8 {
-        if let Some(GatewayReply::ReportVerdict {
-            subject,
-            entity,
-            window_end,
-            verdict,
-            reason,
-        }) = conn.next_reply(Duration::from_secs(5)).await
-        {
-            assert_eq!(
+    for _ in 0..UNRELATED_REPLY_BUDGET {
+        match conn.next_reply(lanes::LIVENESS_CEILING).await {
+            Some(GatewayReply::ReportVerdict {
                 subject,
-                subject_key().public(),
-                "the answer names the accused"
-            );
-            assert_eq!(entity, ENTITY);
-            assert_eq!(window_end, Tick::new(T0 + SPAN));
-            return (verdict, reason);
+                entity,
+                window_end,
+                verdict,
+                reason,
+            }) => {
+                assert_eq!(
+                    subject,
+                    subject_key().public(),
+                    "the answer names the accused"
+                );
+                assert_eq!(entity, ENTITY);
+                assert_eq!(window_end, Tick::new(T0 + SPAN));
+                return (verdict, reason);
+            }
+            // Some other reply overtook the verdict on the wire; keep draining.
+            Some(_) => continue,
+            None => panic!(
+                "timed out after {} s waiting for the report's verdict; this is \
+                 a liveness failure, not evidence that the gateway answered the \
+                 report with something other than a verdict",
+                lanes::LIVENESS_CEILING.as_secs(),
+            ),
         }
     }
-    panic!("no ReportVerdict after 8 inbound replies");
+    panic!(
+        "{UNRELATED_REPLY_BUDGET} replies arrived on this connection and none was a \
+         ReportVerdict"
+    );
 }
 
 fn adjudicating_config(peer: orrery_protocol::NodeId) -> GatewayConfig {

@@ -440,10 +440,7 @@ async fn production_authority_admits_well_formed_intents_and_refuses_malformed_o
             version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
-    assert!(matches!(
-        connection.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&connection).await;
     let signed = |intent_id: u128, ops: Vec<IntentOp>| {
         let mut intent = Intent {
             evidence: None,

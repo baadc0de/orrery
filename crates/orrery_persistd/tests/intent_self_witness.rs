@@ -176,10 +176,7 @@ async fn a_self_witnessed_intent_is_refused_before_the_executor_is_reached() {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
 
     // ── Arm 1: the issuer witnesses itself ────────────────────────────────
     //

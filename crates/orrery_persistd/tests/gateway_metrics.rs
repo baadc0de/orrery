@@ -74,7 +74,13 @@ const ENTITY: PersistId = PersistId::new(4242);
 /// nothing in this file asserts latency. Generous headroom over loaded-runner
 /// scheduling (a whole-test flow once took 11.29 s on CI, #358) so a slow box
 /// cannot turn a wait into a failure at all.
-const REPLY_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLY_LIVENESS_TIMEOUT: Duration = lanes::LIVENESS_CEILING;
+
+/// How many unrelated replies a single-answer helper will drain before it
+/// gives up. A *count*, not a deadline: exceeding it means the gateway is
+/// talking and saying the wrong thing, which is a correctness failure and is
+/// reported as one.
+const UNRELATED_REPLY_BUDGET: usize = 8;
 
 fn thin_bundle() -> EvidenceBundle {
     let subject = support::secret(2);
@@ -208,10 +214,7 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
     Session {
         server,
         conn,
@@ -227,15 +230,24 @@ async fn file(
     report: Box<DiscrepancyReport>,
 ) -> (Option<Verdict>, u16) {
     conn.send_control(&GatewayMsg::Report { report }).await;
-    for _ in 0..8 {
-        if let Some(GatewayReply::ReportVerdict {
-            verdict, reason, ..
-        }) = conn.next_reply(Duration::from_secs(5)).await
-        {
-            return (verdict, reason);
+    for _ in 0..UNRELATED_REPLY_BUDGET {
+        match conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+            Some(GatewayReply::ReportVerdict {
+                verdict, reason, ..
+            }) => return (verdict, reason),
+            // Some other reply overtook the verdict on the wire; keep draining.
+            Some(_) => continue,
+            None => panic!(
+                "timed out after {} s waiting for the report's verdict; this is \
+                 a liveness failure, not evidence that the gateway answered the \
+                 report with something other than a verdict",
+                REPLY_LIVENESS_TIMEOUT.as_secs(),
+            ),
         }
     }
-    panic!("no ReportVerdict after 8 inbound replies");
+    panic!(
+        "{UNRELATED_REPLY_BUDGET} replies arrived on this connection and none was a ReportVerdict"
+    );
 }
 
 fn adjudicating_config(peer: NodeId) -> GatewayConfig {
@@ -352,13 +364,18 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
         })
         .await;
     let (lease_id, seq) = loop {
-        match session.conn.next_reply(Duration::from_secs(5)).await {
+        match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
             Some(GatewayReply::Lease {
                 message: LeaseMsg::Grant { lease_id, seq, .. },
             }) => break (lease_id, seq),
             Some(GatewayReply::Lease { message }) => panic!("claim was not granted: {message:?}"),
             Some(_) => continue,
-            None => panic!("no answer to the lease claim"),
+            None => panic!(
+                "timed out after {} s waiting for an answer to the lease claim; \
+                 this is a liveness failure, not evidence that the lease path \
+                 dropped the claim",
+                REPLY_LIVENESS_TIMEOUT.as_secs(),
+            ),
         }
     };
     session.conn.send_state(&GatewayMsg::Diff {
@@ -425,15 +442,25 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
         .conn
         .send_control(&GatewayMsg::SubmitIntent { intent })
         .await;
-    assert!(matches!(
-        session.conn.next_reply(Duration::from_secs(5)).await,
+    match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
         Some(GatewayReply::IntentAck {
             intent_id: 71,
-            outcome: IntentOutcome::Rejected {
-                reason: REASON_NO_EXECUTOR
-            },
-        })
-    ));
+            outcome:
+                IntentOutcome::Rejected {
+                    reason: REASON_NO_EXECUTOR,
+                },
+        }) => {}
+        Some(other) => panic!(
+            "an intent submitted with no executor configured must be rejected \
+             with REASON_NO_EXECUTOR, and was answered {other:?} instead"
+        ),
+        None => panic!(
+            "timed out after {} s waiting for the intent's ack; this is a \
+             liveness failure, not evidence that the intent went unanswered or \
+             was answered with the wrong outcome",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
+        ),
+    }
 
     // Report: refused, and counted.
     let (_, reason) = file(&session.conn, signed_report(&peer)).await;
@@ -581,10 +608,7 @@ async fn a_persistd_run_emits_the_two_server_spans_and_never_a_gated_name() {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
 
     conn.send_control(&GatewayMsg::Subscribe {
         grid: GridId::ROOT,
