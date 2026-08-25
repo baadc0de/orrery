@@ -379,3 +379,127 @@ vote one up.
 | 9 | Compile-time & build complexity | **4** | bevy_ecs is already in the workspace graph; kache mitigates rebuild cost; A1 found zero timing evidence either way (§11.2). Low weight, low confidence |
 | 10 | Testability & contributor ergonomics | **4** | Real but soft; folded-in residual dimension with modest expected variance |
 
+## 6. The weighted matrix
+
+Scores cite the section that earns them. ✱ marks a cell whose score rests
+partly on an **unevidenced** input; every such cell is listed in §8 and was
+allowed only the reduced weight its dimension carries.
+
+| Dimension (weight) | V1 improved | V2 shared world | V3 dedicated world | V4 bespoke | H1 hybrid |
+|---|---|---|---|---|---|
+| Witness & adjudication fit (20) | 5 — structural isolation, G5/G6 | 1 — all guarantees become policy on mixed state | 3 — clean storage, but multi-entity reads become expressible; gate bundle undelivered | 4 — same shape as V1 until queries are used | 4 — Core tier keeps structure; tiers never mix |
+| Determinism enforceability (16) | 5 — gates mutation-proven (A1 M1–M8) | 2 — new gates needed over ambient access ✱ | 4 — P5 mechanical ambiguity rejection + P2 projection pattern; delivery owned by A4 ✱ | 4 — current gates apply unchanged | 4 — core tier inherits V1's gates |
+| Migration risk & continuity (14) | 5 — no wire/persist/dep change; digest-safe sequencing possible | 2 — effectively re-hosts all canonical state at once | 2 — phased path exists (brief phases 3–6) but touches all four digest crates eventually | 2 — rewrites executor internals and both games | 3 — smallest first moves (wire classify_component; bulk classes first) |
+| Modularity & growth headroom (12) | 3 — delegation discipline; god-trait pressure unrefuted [U] | 4 — idiomatic Bevy module shape | 5 — modules register components/systems/policies explicitly | 3 — modules possible, scheduling DIY | 4 — visible tier boundary; integration modules natural |
+| Client-stack integration (10) | 5 — untouched | 5 — native, zero hop | 3 — mirror hop required by lightyear's app-world model (G13) | 4 — frames out, as the bridge does today | 4 — bulk natively replicated; core via existing claims |
+| Services & backend neutrality (8) | 5 — G10 preserved trivially | 4 — nothing forced; type-sharing gravity rises ✱ | 4 — persistd can stay clean; dependency gravity real (G9) | 5 — cleanest dependency story | 4 — adjudication stays bundle-based |
+| Unreal sidecar/embedding (6) | 3 — links anywhere; output contract ad hoc | 1 — canonical truth entangled with Bevy-world semantics | 5 — host is a library with command-in/frames-out contract | 5 — equal-best | 4 — consumes both tiers or core-only |
+| Performance & copy/mirror cost (6) | 5 — zero copies | 4 — zero copies; contention overhead unknown ✱ | 4 — mirror measured ~µs at scale (P4, indicative) | 5 — zero copies | 4 — mirrors bulk tier only |
+| Compile-time & build complexity (4) | 5 — no change | 3 — full bevy adjacent to all canonical logic | 3 — bevy_ecs enters kernel-adjacent crates | 4 — no new deps; DIY tooling tax ✱ | 3 — two storages to compile |
+| Testability & ergonomics (4) | 3 — scenario harness exists; modules blur tests (A2 §5.1) | 4 — idiomatic tooling | 4 — idiomatic tooling | 2 — bespoke tooling throughout | 3 — per-tier test strategies |
+
+**Weighted totals** (dimension weight × score, summed):
+
+| Variant | Total /500 | Δ from leader |
+|---|---|---|
+| **V1 — improved status quo** | **456** | — |
+| H1 — hybrid two-tier | 378 | −78 |
+| V4 — bespoke generalized | 372 | −84 |
+| V3 — dedicated world | 356 | −100 |
+| V2 — shared application world | 268 | −188 |
+
+### Sensitivity — what would have to be true to overturn this
+
+The result is not close between V1 and V2/V3, but it *is* evidence-sensitive
+in exactly one place: **V1's lead is concentrated in the top three weights,
+where it scores maxima.** To flip the ranking, a skeptic must show one of:
+
+1. A concrete modularity failure of the trait model at real game scale —
+   e.g., a second production game whose cross-module interactions cannot be
+   expressed through events plus delegated modules without a central-dispatch
+   mess. That is precisely experiment E-1 in §7's programme, and A10 (#406)
+   owns building it.
+2. A witness/adjudication regression in V1 under growth — none observed; the
+   pipeline's guarantees are structural and mutation-proven.
+3. Evidence that H1's tier boundary collapses (A5's policy registry replacing
+   `CoreClass` entirely), which would demote H1 toward V3's row.
+
+Conversely, the ranking survives plausible swings elsewhere: even granting
+V3 perfect scores on dimensions 8–10 and V1 floor scores there, V1 leads by
+more than 70 points; the matrix's verdict lives where the evidence is, not
+where taste is.
+
+---
+
+## 7. Recommendation
+
+**Adopted position (one sentence): keep canonical verifiable state in the
+engine-neutral per-entity executor — improve authoring now via a composition
+root behind the frozen surface; introduce the SimulationHost seam now because
+it pays for itself under every variant; reject hosting canonical state in any
+shared Bevy world outright; reject the bespoke rebuild; and admit the
+dedicated-ECS-world question only as a bounded pilot with pre-registered
+promotion criteria.**
+
+Broken down, with each element naming what it beat:
+
+1. **Unconditional, start-now work — variant-independent and therefore safe
+   under any future reversal:**
+   - **Composition root (brief phase 2) inside the existing contract.**
+     Regolith assembled from named rule modules delegating through `Ruleset`;
+     cross-module couplings get owners per A2 §5.3 (visible, ordered, owned,
+     event-composed). This adopts the brief's motivation while rejecting its
+     storage conclusion. Beats: doing nothing (leaves god-trait pressure
+     unanswered) and phase-4-first (pays migration risk for benefits phase 2
+     delivers alone).
+   - **SimulationHost seam (brief phase 3).** The field host does not exist
+     (G14); three hosts drive their own ticks; p1-swarm's bot is the de-facto
+     sketch standing in harness-side (G4). A narrow command-in/event-out host
+     API, with the existing `Ruleset` hosted through an adapter, removes the
+     triplication without moving any state. Beats: promoting harness code to
+     precedent, or skipping the seam and discovering every later variant has
+     to retrofit it.
+2. **Rejected — V2, shared application world (268/500).** It trades every
+   structural guarantee the product rests on for a mirror-hop saving that
+   measures in microseconds (P4). Witness projection, rollback scope and
+   engine-state exclusion all degrade from storage fact to review-enforced
+   convention; the brief itself lists the rollback-contamination risk
+   (`ruleset-ecs-migration-brief.md:466-468`); and it is uniquely hostile to
+   the Unreal direction. Nothing in the brief's benefit column is unavailable
+   to V3/H1 at measured cost.
+3. **Rejected — V4 as replacement (372/500).** The tree already contains the
+   defensible part of V4: a small bespoke engine-neutral core (the executor).
+   Generalizing it means rebuilding scheduling, queries and tooling ([U] costs,
+   dimension 9/10 floors) so that rules gain the one capability — structural
+   multi-entity reads — that isolated single-entity replay cannot adjudicate
+   (G5/G6). If that capability is ever truly needed for canonical logic, H1
+   provides it outside the verified tier with the boundary drawn explicitly.
+4. **Deferred behind a gated pilot — V3, dedicated canonical world (356/500),
+   and H1's bulk-tier half with it.** Not rejected: P1 shows the substrate
+   runs headless and deterministic when ordered; P5 shows bevy_ecs can enforce
+   schedule determinism mechanically; P2 shows the projection constraint is
+   satisfiable with one sort. What is missing is exactly what A4/A10 must
+   produce before any canonical byte moves:
+   - the replacement-gate bundle (ambiguity detection at Error, canonical-
+     projection differential test, neighbour-query lint equivalent) shown —
+     mutation-style — to be at least as strong as the clauses it replaces;
+     a weaker bundle fails the task's own bar and must not ship;
+   - a differential parity harness beyond goldens (G7 says goldens cannot see
+     state-invisible outcomes), per A10;
+   - capacity-scale mirror-cost numbers replacing P4's indicative bound;
+   - A5's component-policy decision, since `classify_component`'s unwired
+     hook is H1's load-bearing wall (G3).
+   Until those land, "dedicated ECS world" remains the best-evidenced
+   *destination* and an unearned *next step*. The P4 digest (G15) sequences
+   implementation after #329 regardless; the pilot is planning-track work that
+   respects that.
+
+**What would change this recommendation** is pre-registered rather than
+rhetorical: E-1 (A10) builds a second-game-scale module set against V1's
+composition root and instruments central-dispatch pressure; if V1 cannot hold
+modularity at that scale, the composition-root claim dies and the pivot is
+H1-first rather than V1-plus-pilot. Symmetrically, if the A4 gate bundle
+cannot demonstrate strength equal to the current clauses, V3/H1 stay closed
+regardless of other merits — that is the task's own standard applied to the
+recommendation itself.
+
