@@ -125,3 +125,161 @@ lines captured: `orrery_persist_client` has four populated test binaries
 an artifact of no doc-tests, not a hollow integration suite. A9's caution
 ("read and noted, not counted as coverage") was right; the specific worry
 can be closed.
+
+---
+
+## 2. The four named obligations, discharged
+
+Each obligation was handed here by a predecessor after breaking something and
+watching what did *not* fail. Each was **reproduced on this tree first**
+(§11), then given its closing fixture with a mutation-shaped acceptance
+criterion: the fixture is accepted only when re-applying the recorded
+mutation kills it *by name*, and reverting greens it.
+
+### 2.1 A7 X-A — outcomes invisible to state-hash goldens → fixture F-2
+
+**Reproduced (§11 R-1):** `Outcome::Expired { id: me }` appended to every
+Regolith step (`regolith/mod.rs:164-166` — an event-only outcome:
+`deliver` maps it to no input, `materialize` produces nothing). Result,
+exactly as A7 recorded: battery `11 passed; 0 failed` including
+`chains_match_the_committed_golden`; materialization `1 passed`; all of
+`orrery_conformance` (13) and every `orrery_witness` suite (7/25/5/5/5/12)
+green. The only kill: six hand-written event assertions in
+`tests/regolith.rs` (`22 passed; 6 failed`). **Goldens certify state chains
+and nothing else**; a differential harness reading goldens alone would
+certify parity between implementations that disagree about what happened.
+
+**Discharged by F-2 (§3): the committed outcome chain** — A7 G-1/G-2's
+format, implemented as a second golden table beside `golden.rs`'s, folded
+in-loop in the scenario harness (N-1: it must be in-loop; the retained log
+drops event content). Per tick, WP-2-ordered:
+
+```text
+tick_block(t) = concat( for id in stepped order (== PersistId ascending):
+                  id ‖ len(events) ‖ concat(CoreCodec(ev) for ev in events)   # emission order
+                  ‖ len(materialized) ‖ concat(materialized ids)              # install order
+                  ‖ len(delivered) ‖ concat((target, input) delivery pairs) ) # deliver() order
+outcome_chain(t) = blake3( outcome_chain(t-1) ‖ tick_block(t) )
+```
+
+The raw material is free: `CoreEvent: CoreCodec` is already a trait bound
+(`ruleset.rs:243-244` per A7), `TickOutcome` carries `events` and
+`materialized` (`executor.rs:136-141`), and the delivery pairs are computed
+in the loop that already calls `deliver` (`scenario.rs:237-241`). Named test
+(macro-generated, V2): `outcome_chains_match_the_committed_golden` via
+`game_test!`, per game, over the same four scenarios; committed tables
+`REGOLITH_OUTCOMES` / `SKIRMISH_OUTCOMES` under the same
+regenerate-and-bump-version rule as the state goldens (golden.rs:15-18).
+
+**Acceptance mutation:** re-apply X-A verbatim →
+`outcome_chains_match_the_committed_golden` must fail on the first tick of
+every scenario while `chains_match_the_committed_golden` stays green (the
+pair proves the two chains cover disjoint channels); revert → green. Second
+acceptance mutation, for the delivery leg specifically: flip one `deliver`
+arm to `None` (state chain unchanged until the undelivered input would have
+changed state — in `island-lossy` the first divergent tick may be late or
+never) → the outcome chain must move on the emission tick itself.
+
+**What F-2 does not repeal:** adjudication still sees only state
+(`ruleset.rs:280-284` doctrine); the outcome chain is a committed test
+fixture, never wire, never evidence — A7 §6's boundary kept verbatim.
+
+### 2.2 A7 X-C — quantize-before-hash unpinned → fixture F-3
+
+**Reproduced (§11 R-2):** the two lines at `executor.rs:126-127` swapped
+(hash before quantize). `cargo test -p orrery_core -p orrery_conformance
+-p orrery_games -p orrery_witness`: **21 result lines, all `ok`, zero
+failures — the mutation survives everything**, because every in-tree
+`CoreState` stores continuous fields as lattice integers and every step
+writes lattice points (`conformance/src/ruleset.rs:53-84`: "Idempotent:
+`step` already wrote lattice points"). VC-7's executor snap is a live no-op;
+the ordering that makes "a claim commits to exactly what replication and
+persistence saw" true is pinned by no test.
+
+**Discharged by F-3: the off-lattice pinning ruleset**, in
+`orrery_conformance` (deliberately: a gated crate — the test ruleset obeys
+VC-4/6/8 — and outside the P4 digest, V10/N-2, so it can land now). A
+minimal `Ruleset` whose `CoreState` holds a continuous field in raw
+micrometres and whose `step` deliberately writes an off-lattice value
+(e.g. `pos += 1_499` µm against the 1 mm lattice); `quantize()` snaps it
+per `quantize.rs`'s half-away-from-zero rule. Named test:
+
+- `the_claimed_hash_is_of_the_quantized_state_not_the_raw_one`: drive one
+  entity one tick through `Executor::step_entity`; compute
+  `state_hash(quantized_expected)` and `state_hash(raw_expected)`
+  independently in the test; assert the outcome's `state_hash` equals the
+  former **and differs from** the latter. The inequality half is what makes
+  the test refuse to pass vacuously: if the constructed state were
+  accidentally on-lattice, quantized == raw and the test fails itself
+  rather than silently pinning nothing (the #417 lesson applied to a
+  fixture's own construction).
+
+**Acceptance mutation:** re-apply X-C's swap → the named test dies (the
+executor now hashes the raw state); revert → green. This converts X-C from
+"survived every suite" to "killed by one named check", which is the entire
+point of the hand-off.
+
+### 2.3 A9 M3 — engine handles in replicated payloads → fixture F-9
+
+**Reproduced (§11 R-3):** `entity.to_bits()` appended to the `DiffUplink`
+payload in `feed_uplink` (`feed.rs:88-93` today). `cargo check` clean (after
+a `bytes::Bytes` construction detail, recorded honestly in §11),
+`./scripts/core-gates.sh` exit 0, `cargo test -p orrery_persist_client`:
+95/2/2/1 passed, 0 failed. A Bevy `Entity` handle rides into a replicated,
+journal-bound wire payload — the exact artifact A5's IV-7 forbids — and
+**no named check exists**. A5's G-1, confirmed live a second time.
+
+**Discharged by F-9: a compile-refusal fixture on the registration seam.**
+The mechanism is A9's to propose and the owner's to accept (A9 §3 option 1:
+a sealed `EngineHandleFree` bound on the payload-producing registration
+path; option 2: registry-time schema refusal per IV-7). *Whatever* the
+mechanism, the regression test this node owns is the same shape, because
+A9's argument is decisive: **byte-level scanning cannot work** — entity
+bits are indistinguishable from any other `u64` — so the only possible
+check refuses at compile time, where the type is still a type. F-9 is a
+`trybuild` (compile-fail) suite in the crate that hosts the registration
+seam:
+
+- `entity_in_replicated_payload_does_not_compile.rs`: a component type
+  embedding `bevy_ecs::Entity` passed to the registration API; the
+  committed `.stderr` names the unsatisfied bound.
+- Companion positive case: the same component with the handle replaced by
+  `PersistId` compiles — so the fixture cannot pass because the whole API
+  stopped compiling.
+
+**Acceptance mutation:** with the bound in place, re-apply M3's payload
+append — it must now fail to compile at the registration site (the
+mutation's kill is the compiler, and the trybuild fixture is what pins the
+bound's continued existence: deleting the bound, or adding
+`impl EngineHandleFree for Entity`, flips the compile-fail fixture to
+"unexpected success", which is a named CI failure). Until the mechanism
+lands, this gap **stays open and stays listed** — no interim byte-scanning
+test will be written, because it would be exactly the false-coverage #417
+warns about.
+
+### 2.4 A6 M-A6-4a — witness shown-ticks re-delivery immunity → fixture F-8
+
+**Reproduced (§11 R-5):** the coverage denominator's advance computation
+(`witness.rs:868-886`) mutated to charge each frame's full span
+(`last_tick - frame.first_tick + 1`) instead of the advance past
+`newest_seen` — the exact property the field doc states ("a repair
+re-delivering a range is not counted twice", `witness.rs:117-127`). Full
+`cargo test -p orrery_witness`: 7/25/5/5/5/12 passed, 0 failed.
+**The documented immunity has no named check at all.**
+
+**Discharged by F-8: `a_redelivered_range_is_not_counted_twice_in_coverage`**
+(in `orrery_witness`'s integration suites, beside `multi_entity.rs`'s
+existing duplicate-fold test at `:453` which pins the *fold* half but not
+the *counter* half — M-A6-4b died there, M-A6-4a did not). Shape: deliver a
+frame spanning ticks `[a, b]`; record `shown_ticks`; re-deliver the same
+range (the repair path); assert `shown_ticks` unchanged; then deliver
+`[b+1, c]` and assert it advanced by exactly `c - b`. The third leg keeps
+the test from passing under a mutation that stops counting entirely — a
+counter frozen at zero also "never counts twice" (the both-sides-of-the-
+equality trap from the brief, designed out).
+
+**Acceptance mutation:** re-apply M-A6-4a → the middle assertion dies (span
+double-counted); apply the inverse mutation (`advance = 0` always) → the
+third leg dies. Revert → green. Sequencing note: `orrery_witness` is inside
+the P4 digest (V10), so F-8 is temporally blocked until the #329 window
+exits — recorded in §10, not silently dropped.
