@@ -132,10 +132,7 @@ async fn dial(server: &GatewayServer) -> Client {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
     Client {
         _endpoint: endpoint,
         conn,

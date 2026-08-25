@@ -69,6 +69,19 @@ const UNREGISTERED_RULESET: RulesetId = RulesetId {
 
 const ENTITY: PersistId = PersistId::new(4242);
 
+/// A liveness ceiling for the wire waits below that distinguish a timeout
+/// from a wrong reply, not a measured bound and not a figure anyone promised:
+/// nothing in this file asserts latency. Generous headroom over loaded-runner
+/// scheduling (a whole-test flow once took 11.29 s on CI, #358) so a slow box
+/// cannot turn a wait into a failure at all.
+const REPLY_LIVENESS_TIMEOUT: Duration = lanes::LIVENESS_CEILING;
+
+/// How many unrelated replies a single-answer helper will drain before it
+/// gives up. A *count*, not a deadline: exceeding it means the gateway is
+/// talking and saying the wrong thing, which is a correctness failure and is
+/// reported as one.
+const UNRELATED_REPLY_BUDGET: usize = 8;
+
 fn thin_bundle() -> EvidenceBundle {
     let subject = support::secret(2);
     EvidenceBundle {
@@ -201,10 +214,7 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
     Session {
         server,
         conn,
@@ -220,15 +230,25 @@ async fn file(
     report: Box<DiscrepancyReport>,
 ) -> (Option<Verdict>, u16) {
     conn.send_control(&GatewayMsg::Report { report }).await;
-    for _ in 0..8 {
-        if let Some(GatewayReply::ReportVerdict {
-            verdict, reason, ..
-        }) = conn.next_reply(Duration::from_secs(5)).await
-        {
-            return (verdict, reason);
+    for _ in 0..UNRELATED_REPLY_BUDGET {
+        match conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+            Some(GatewayReply::ReportVerdict {
+                verdict, reason, ..
+            }) => return (verdict, reason),
+            // Some other reply overtook the verdict on the wire; keep draining.
+            Some(_) => continue,
+            None => panic!(
+                "timed out after {} s with no reply to the report at all. Any \
+                 wrong answer would have arrived as a reply, so this is not \
+                 evidence the report was answered wrongly; it is silence, \
+                 which a loaded runner also produces",
+                REPLY_LIVENESS_TIMEOUT.as_secs(),
+            ),
         }
     }
-    panic!("no ReportVerdict after 8 inbound replies");
+    panic!(
+        "{UNRELATED_REPLY_BUDGET} replies arrived on this connection and none was a ReportVerdict"
+    );
 }
 
 fn adjudicating_config(peer: NodeId) -> GatewayConfig {
@@ -345,13 +365,19 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
         })
         .await;
     let (lease_id, seq) = loop {
-        match session.conn.next_reply(Duration::from_secs(5)).await {
+        match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
             Some(GatewayReply::Lease {
                 message: LeaseMsg::Grant { lease_id, seq, .. },
             }) => break (lease_id, seq),
             Some(GatewayReply::Lease { message }) => panic!("claim was not granted: {message:?}"),
             Some(_) => continue,
-            None => panic!("no answer to the lease claim"),
+            None => panic!(
+                "timed out after {} s with no answer to the lease claim. A \
+                 denial would have arrived as a Lease reply, so this is not \
+                 evidence the claim was denied; a dropped claim and a loaded \
+                 runner are both silence and this cannot separate them",
+                REPLY_LIVENESS_TIMEOUT.as_secs(),
+            ),
         }
     };
     session.conn.send_state(&GatewayMsg::Diff {
@@ -367,13 +393,19 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
             authority_seq: Some(seq),
         },
     });
-    assert!(
-        matches!(
-            session.conn.next_reply(Duration::from_secs(5)).await,
-            Some(GatewayReply::BulkAck { .. })
+    match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+        Some(GatewayReply::BulkAck { .. }) => {}
+        Some(other) => {
+            panic!("unexpected reply while awaiting the fenced write's acknowledgement: {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s with no reply to the fenced write. A nack \
+             would have arrived as a BulkNack, so this is not evidence the \
+             write was refused; a shed write and a loaded runner are both \
+             silence and this cannot tell them apart",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "the fenced write must be acknowledged"
-    );
+    }
 
     // Area: one subscribe, one page.
     session
@@ -383,13 +415,18 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
             cells: vec![CellId::ROOT],
         })
         .await;
-    assert!(
-        matches!(
-            session.conn.next_reply(Duration::from_secs(5)).await,
-            Some(GatewayReply::AreaPage { .. })
+    match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+        Some(GatewayReply::AreaPage { .. }) => {}
+        Some(other) => {
+            panic!("unexpected reply while awaiting the subscribed cell's page: {other:?}")
+        }
+        None => panic!(
+            "timed out after {} s with no reply to the subscribe. A dropped \
+             subscribe and a loaded runner are both silence, so this reports \
+             only that nothing arrived — it does not establish either",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "a subscribed cell must answer with a page"
-    );
+    }
 
     // Intent: no executor is configured, so the honest answer is a rejection —
     // which is still one definitive reply, and still one measured span.
@@ -410,15 +447,26 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
         .conn
         .send_control(&GatewayMsg::SubmitIntent { intent })
         .await;
-    assert!(matches!(
-        session.conn.next_reply(Duration::from_secs(5)).await,
+    match session.conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
         Some(GatewayReply::IntentAck {
             intent_id: 71,
-            outcome: IntentOutcome::Rejected {
-                reason: REASON_NO_EXECUTOR
-            },
-        })
-    ));
+            outcome:
+                IntentOutcome::Rejected {
+                    reason: REASON_NO_EXECUTOR,
+                },
+        }) => {}
+        Some(other) => panic!(
+            "an intent submitted with no executor configured must be rejected \
+             with REASON_NO_EXECUTOR, and was answered {other:?} instead"
+        ),
+        None => panic!(
+            "timed out after {} s with no ack for the intent. A wrong outcome \
+             would have arrived as an IntentAck, so this is not evidence the \
+             intent was answered with the wrong outcome; it is silence, which \
+             a loaded runner also produces",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
+        ),
+    }
 
     // Report: refused, and counted.
     let (_, reason) = file(&session.conn, signed_report(&peer)).await;
@@ -566,23 +614,23 @@ async fn a_persistd_run_emits_the_two_server_spans_and_never_a_gated_name() {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
 
     conn.send_control(&GatewayMsg::Subscribe {
         grid: GridId::ROOT,
         cells: vec![CellId::ROOT],
     })
     .await;
-    assert!(
-        matches!(
-            conn.next_reply(Duration::from_secs(5)).await,
-            Some(GatewayReply::AreaPage { .. })
+    match conn.next_reply(REPLY_LIVENESS_TIMEOUT).await {
+        Some(GatewayReply::AreaPage { .. }) => {}
+        Some(other) => panic!("unexpected reply while awaiting the first page: {other:?}"),
+        None => panic!(
+            "timed out after {} s with no reply to the subscribe on the hosted \
+             root cell. A dropped subscribe and a loaded runner are both \
+             silence, so this reports only that nothing arrived",
+            REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
-        "the hosted root cell must answer with a page"
-    );
+    }
 
     let mut intent = Intent {
         evidence: None,

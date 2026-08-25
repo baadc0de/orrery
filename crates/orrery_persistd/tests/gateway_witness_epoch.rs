@@ -130,10 +130,7 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
         version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
-    assert!(matches!(
-        conn.next_reply(Duration::from_secs(5)).await,
-        Some(GatewayReply::HelloAck { .. })
-    ));
+    lanes::expect_hello_ack(&conn).await;
     Session {
         server,
         conn,
@@ -143,20 +140,36 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
     }
 }
 
+/// How many unrelated replies a single-answer helper will drain before it
+/// gives up. A *count*, not a deadline: exceeding it means the gateway is
+/// talking and saying the wrong thing, which is a correctness failure and is
+/// reported as one.
+const UNRELATED_REPLY_BUDGET: usize = 8;
+
 /// Present `bytes` and read back the ack.
 async fn present(conn: &lanes::GatewayLanes, bytes: Vec<u8>) -> (Option<u32>, u8) {
     conn.send_control(&GatewayMsg::WitnessEpoch {
         announcement: bytes,
     })
     .await;
-    for _ in 0..8 {
-        if let Some(GatewayReply::WitnessEpochAck { epoch, reason }) =
-            conn.next_reply(Duration::from_secs(5)).await
-        {
-            return (epoch, reason);
+    for _ in 0..UNRELATED_REPLY_BUDGET {
+        match conn.next_reply(lanes::LIVENESS_CEILING).await {
+            Some(GatewayReply::WitnessEpochAck { epoch, reason }) => return (epoch, reason),
+            // Some other reply overtook the ack on the wire; keep draining.
+            Some(_) => continue,
+            None => panic!(
+                "timed out after {} s with no reply to the announcement at \
+                 all. Any wrong answer would have arrived as a reply, so this \
+                 is not evidence the announcement was answered wrongly; it is \
+                 silence, which a loaded runner also produces",
+                lanes::LIVENESS_CEILING.as_secs(),
+            ),
         }
     }
-    panic!("no WitnessEpochAck after 8 inbound messages");
+    panic!(
+        "{UNRELATED_REPLY_BUDGET} replies arrived on this connection and none was a \
+         WitnessEpochAck"
+    );
 }
 
 #[tokio::test]
