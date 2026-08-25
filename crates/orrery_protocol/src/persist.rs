@@ -38,10 +38,13 @@ impl Tick {
 /// A stable, cluster-minted persistent entity id (D11, D15).
 ///
 /// Never a Bevy `Entity`: this is the canonical id carried into every peer's
-/// world and the storage key for `world/` rows. Minted either cluster-side
-/// inside an intent transaction (returned in the commit receipt) or peer-side
-/// from a journaled block grant (contiguous ranges, default 4096, usable
-/// offline).
+/// world and the storage key for `world/` rows. Minted today cluster-side:
+/// inside an intent transaction (returned in the commit receipt; the executor
+/// amortizes the `pid/next` counter through a process-local durable block
+/// grant) or by the offline seeder from the same counter. The *peer-side*
+/// journaled block grant — contiguous ranges, default 4096, leased per
+/// session, usable offline — is designed (docs/08-persistence.md §4, §6) but
+/// not yet built (D44).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PersistId(pub u64);
 
