@@ -122,3 +122,61 @@ A10's fixture set F-2..F-12 with formats as specified; the threshold table
 baseline-refusal rule (no differential run without a committed baseline);
 and the ordering constraint **F-2 lands before any Phase 2 composition PR**
 (outcome goldens must commit *legacy* behaviour). §5 sequences all of it.
+
+---
+
+## 3. The decisions reserved to the owner
+
+### 3.1 The brief's twenty questions, each with a disposition
+
+The source brief carries twenty "questions requiring explicit decisions"
+(`ruleset-ecs-migration-brief.md:898-921`). Every one lands here as
+**answered** (settled by evidence a node produced; the owner ratifies by
+accepting the named record), **settled** (already decided by an accepted
+ADR; nothing new to accept), **proposed** (a node produced the answer as a
+proposal; it binds only on acceptance), or **deferred** (a named condition
+must arrive first). None is withdrawn. Tally: 9 answered · 2 settled ·
+7 proposed · 2 deferred.
+
+| # | Question (brief line) | Disposition | Where settled / what decides it |
+|---|---|---|---|
+| 1 | Is `Ruleset` solving a real extensibility problem or mainly a test seam? (:902) | **Answered** | Real but narrow: the trait is the adjudication/replay seam (A1 §3, §5.2), while the feared generic infection is measured absent — four crates, erased at one boxed closure (A1 §4.4; A3 C1/C-1, both lanes). Monolith pressure at scale is unevidenced; A10's E-1-class experiment is the pre-registered test, and R1's reversal condition keys off it |
+| 2 | Which behaviours are game-defined? (:903) | **Answered** | A2 §2 rows 9–10 and the supplementary rows: gameplay components/systems, event vocabulary, invariant predicates, codecs, population budgets, boundary responses. Ratified with R1 |
+| 3 | Which behaviours stay in the kernel? (:904) | **Answered** | A2 §2 rows 1–8, 11–15: time, identity classes, authority, transaction envelope, spatial attention, persistence coordination, rollback mechanism, witness pipeline, RNG partitioning, input ordering, event transport, version identity |
+| 4 | Does canonical game state already live in a Bevy world? (:905) | **Answered** | No — factually. `Executor` maps outside every app world; every host mirrors (A3 E-1/second opinion §2; A9 E-1/E-6). The brief's framing was inverted: the dedicated topology ships |
+| 5 | Can the current Lightyear integration run against a dedicated canonical world? (:906) | **Answered** | It already does, in effect: lightyear/replicon operate on mirror components and never touch canonical state (second opinion E-4, C-2); a mirror hop is required and measured cheap (P-1/P4: µs-scale); lightyear's own per-entity authority is non-functional in 0.29 (`lightyear_replication-0.29.0/src/lib.rs:67-68`) |
+| 6 | What is the required determinism envelope? (:907) | **Proposed → R2** | A4 §3.1's three rings: in-process bit-exact; four-target matrix with discrete bit-exact and continuous under D16 bands; pinned-toolchain/tamper/fast-math explicitly outside |
+| 7 | What is the rollback unit? (:908) | **Proposed → R6** | A7 R-1: per-entity predicted set, R1-component grain, all-or-nothing at witnessed entities; world/island/cell rejected with arguments; canonical state is never rewound anywhere |
+| 8 | Which component categories are persisted, replicated, rolled back, witnessed? (:909) | **Proposed → R4** | A5 §5.4's named profiles (Core, Bulk, Cosmetic-local, Ephemeral-shared, Critical/ledger) over the five dimensions |
+| 9 | Can these policies differ independently? (:910) | **Answered** | Yes — the tree already contains the witnesses: W2∧N0 (witness channel ≠ replication), N1∧P0 (projectiles), P1∧W1∧¬W2 (bulk), P2∧R0 (ledger) (A5 §5.3). One flag cannot carry it; hence R4's five axes |
+| 10 | How are schema IDs allocated and governed? (:911) | **Proposed → R8 (X-5)** | Reviewed, permanent, per-game registry file; monotone, never reused; duplicate-refusal at composition time. Today Regolith hardcodes `ComponentTypeId(1)` with no registry |
+| 11 | How are system ordering and module dependencies validated? (:912) | **Proposed → R2 + programme F-10** | Explicit edges, ambiguity rejected at Error with a canary mutant proving the rejector awake (A4 E-M2); missing/cyclic/duplicate declarations refuse composition (A10 §7.1); schedule digest pins topology |
+| 12 | Should module composition be compile-time only? (:913) | **Settled (D21) + ratified → R8** | Yes. D21 is Accepted: link-time distribution, no WASM, no dynamic loading (docs/adr/0021:40-42). A8 §8 adds the manifest consequence (manifests describe builds, not deployments) |
+| 13 | Must games add modules without recompiling Orrery? (:914) | **Settled (D21)** | No, for 1.0. D21's reopen conditions (`:85-90`) are recorded and untouched; nothing in this tree fires them |
+| 14 | How are rules and manifests versioned in persisted universes? (:915) | **Proposed → R8** | Rows decode by their own slot statements (existing, fail-closed); the permanent build-keyed manifest record (X-2) is the decoder ring; R-1..R-6 of A8 §5 |
+| 15 | How do old replays select compatible rules? (:916) | **Answered (exists) + extended → R8** | `RulesetId` routing against `RETAINED_BUILDS = 3`; older evidence resolves `Unadjudicable(UnknownRuleset)`, never a strike (A8 I4/I10/I12). X-2 extends the id with its manifest |
+| 16 | Does the Bevy client share the canonical world or mirror it? (:917) | **Proposed → R1** | Mirror — permanently. The A3 question decided head-on, twice independently; the shared world is the rejected variant |
+| 17 | What must an Unreal client be allowed to predict locally? (:918) | **Deferred** | No Unreal code, consumer, or owner-stated latency/prediction requirement exists in-tree (A9 §0; A1 assumption 10 unverifiable). The A9 §5 observer proof deliberately predicts *nothing*; the prediction question opens when the owner supplies a concrete Unreal requirement. Named condition: that requirement document |
+| 18 | Which presentation events must be reversible after rollback? (:919) | **Answered** | None. Presentation is discarded and regenerated from corrected canonical state; overwrite semantics; no undo logic exists or is permitted (A6 §3.5, R6/L-1) |
+| 19 | How are services kept independent from ECS implementation details? (:920) | **Answered (exists) + strengthened → R2** | persistd links zero Bevy (witness engine `default-features = false`); adjudication consumes bundles, never worlds. The strengthening: today's guarantee is a typed crate list (witness carries 530 bevy refs past a green gate); Tier V discovery makes the coverage a property instead of a decision |
+| 20 | What is the smallest vertical slice that tests the entire architecture? (:921) | **Deferred (conditional)** | Under R1 the ECS vertical slice is trigger-gated, so the brief's Phase-4 slice question defers with it; its precondition package is already fixed (Tier H bundle + G-3 differential harness + A5 registry + capacity mirror numbers — A3 §7.4). The *current* architecture's smallest full-stack exercise is Phase 2 composition + host seam + the A9 §5 observer proof, each with named falsifiable acceptance |
+
+### 3.2 Decisions the nodes surfaced beyond the twenty
+
+Each was flagged by a node as the owner's and none may vanish into the
+plan. Numbered OD-21+ so the traceability table can cite them.
+
+| # | Decision | Raised by | Options priced | Blocking? |
+|---|---|---|---|---|
+| OD-21 | **F-1 disposition**: `DiffUplink.tick` is documented as the universe tick (`gateway.rs:377-378`) but the only production writer stamps a client-local per-entity sequence from 0 (`feed.rs:81-92`). Fix the writer (stamp real ticks — changes journaled bytes' meaning) or fix the doc (rename the semantic) | A7 §1.1/§9.5 | Both small; silence is the only wrong option. `orrery_persist_client` is outside the P4 digest, so either lands window-safe | Blocks any design assuming a tick-addressed journal (journal/claim alignment, §4); blocks nothing else |
+| OD-22 | **X-1 mechanism**: how `RulesetId.digest` gets computed (build script / CI artifact / lazy runtime) — the scope is decided in R8; stale artifacts are worse than honest placeholders | A8 §13.2 | Unpriced by design; choose with costing | Blocks the digest carrying information in the differential harness (until then the harness keys off version fields only, A10 §4.3) |
+| OD-23 | **Overflow policy** for canonical integer math: `overflow-checks = true` in all profiles (recommended) vs explicit `wrapping_*` | A4 §11.4 | Either works; silence splits dev/release (P-OV demonstrated the wrap/panic split on this tree) | Blocks the profile-parity matrix leg (E-M8) — the leg must land *with* the policy or it pins today's accident |
+| OD-24 | **Schedule-digest / `projection_version` session assertion**: whether log-exchanging parties assert them at session setup (wire-adjacent) or manifest-only | A4 §11.3; A8 §10.3 | Narrowest proposal in A8 §4; widening the handshake reopens nothing but adds surface | Non-blocking; out-of-band assertion suffices meanwhile |
+| OD-25 | **N-3 granted-range derivation** (closes G-2's unpartitioned u64 space) and **id-reuse-after-despawn** policy | A5 §2.4/§2.6 | N-3 vs static high-bit partition (rejected as proposal — collides across emitters); reuse-forbidden has retention costs not priced | Blocks *persisting materialized entities* (phase-5-class work); latent until then |
+| OD-26 | **G-1 mechanism**: `EngineHandleFree` sealed bound at the replicon registration seam vs registry-time schema refusal (byte-scanning ruled out — entity bits are indistinguishable from any u64) | A9 §3 | Compile-time bound is nearer-term; registry refusal is the durable form; both can land | Blocks F-9; a prerequisite before any capability registry ships (§4) |
+| OD-27 | **Event commitments entering `StateClaim`** — the only door that would close the *adjudication* gap for event-only outcomes (fixtures close the parity gap) | A7 §5.3/§12.3 | Protocol change; claim size; A6 interplay — deliberately unpriced | Non-blocking; recorded as a door, not proposed |
+| OD-28 | **C-2 constants and posture**: emission cap value; fail-loud canonical error vs stage-1-style flag | A6 §9/§12.2 | Both deterministic; the error path is new surface | Blocks only the volume-bound clause of R5 |
+| OD-29 | **X-4 quarantine override**: whether a read-and-quarantine operator tool ships at v1 | A8 §10.5 | Forensics value vs a laundering hazard; default (refuse) ships regardless | Non-blocking |
+| OD-30 | **The three unused `bevy_reflect` Cargo entries** (`orrery_spatial`, `orrery_net`, `orrery_persist_client`) — needed for vendored-replicon feature unification, or dead weight? | A5 §5.1/§11.4; A9 E-8 | One `cargo tree`/build experiment answers it; not attempted on docs-only branches | Non-blocking |
+| OD-31 | **#417's closure shape**: pin the shadowed `LocallyAuthoritative` clause with the F-7 fixture, or collapse the redundancy if `LocalGranted`-without-marker proves unreachable | #417; A5 X2; A10 §13.2 | The fixture PR carries the reachability determination | Non-blocking; window-safe |
+| OD-32 | **A10 threshold numbers** (§8.4) and baseline placement (in-repo vs release artifact) | A10 §13.1/§13.6 | Ratios proposed from the frame budget; revise at first capture | Blocks phase-exit evaluation semantics only |
