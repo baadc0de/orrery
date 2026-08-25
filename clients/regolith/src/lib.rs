@@ -45,6 +45,13 @@ pub struct CoreEntity(
     /// The core entity this body mirrors.
     pub PersistId,
 );
+/// Marks one drawn firing-arc fan and the craft it belongs to.
+#[derive(Component)]
+pub struct FiringArcFan(
+    /// The core entity whose chassis this arc marks.
+    pub PersistId,
+);
+
 #[derive(Component)]
 struct AlwaysOnStrip;
 #[derive(Component)]
@@ -325,6 +332,34 @@ fn spawn_craft_body(
         Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
         Visibility::Inherited,
     ));
+    // The arcs are children of the craft root, which is the whole point:
+    // `sync_rendered_state` already puts `heading_rotation(yaw)` on that
+    // root, so an arc authored in the ruleset's own `(cos θ, 0, sin θ)`
+    // craft-local frame lands on the ruleset's bearing without a second,
+    // independently-derivable world rotation to get wrong. #377's `Cone`
+    // trap was exactly a second derivation.
+    //
+    // They are spawned before the glTF branch below so the marking survives
+    // whichever hull the run draws.
+    let arc_archetype = archetype_of(executor, entity).unwrap_or_else(|| match seat {
+        craft::Seat::Player => Archetype::Interceptor,
+        craft::Seat::Bot => archetype_for_remote(entity),
+    });
+    let arc_radius = craft::hull_length(arc_archetype) * craft::ARC_RADIUS_HULL_LENGTHS;
+    let arc_material = materials.add(hud::firing_arc_material(seat, accent));
+    spawned.with_children(|craft_root| {
+        for arc in craft::firing_arcs(arc_archetype) {
+            craft_root.spawn((
+                Name::new(arc.name),
+                FiringArcFan(entity),
+                Mesh3d(meshes.add(craft::arc_mesh(arc, arc_radius))),
+                MeshMaterial3d(arc_material.clone()),
+                // Just off the deck, so the fan reads over the plan view
+                // instead of z-fighting the hull plate it sits under.
+                Transform::from_xyz(0.0, hud::FIRING_ARC_LIFT_M, 0.0),
+            ));
+        }
+    });
     if let Some(scene) = paths.craft_scene(asset_server) {
         // The optional glTF still wins when it is on disk: this work
         // improves the fallback, it does not replace the asset path.
@@ -337,10 +372,7 @@ fn spawn_craft_body(
     //
     // A joined session may not hold this entity's state yet; the slot's own
     // archetype derivation stands in until replication fills it in.
-    let archetype = archetype_of(executor, entity).unwrap_or_else(|| match seat {
-        craft::Seat::Player => Archetype::Interceptor,
-        craft::Seat::Bot => archetype_for_remote(entity),
-    });
+    let archetype = arc_archetype;
     spawned.with_children(|craft_root| {
         for part in craft::parts(archetype) {
             craft_root.spawn((
@@ -789,6 +821,72 @@ mod tests {
                 "yaw {yaw_urad}: the nose points {nose}, the ruleset thrusts {thrust}"
             );
         }
+    }
+
+    /// #445's arcs, checked against a ship whose heading comes from the
+    /// ruleset rather than from this test.
+    ///
+    /// The trap is #377's, one level up: `heading_rotation` is right, and an
+    /// arc could still be drawn on the wrong axis. So this spawns the real
+    /// duel, reads each craft's own `yaw_urad` out of its hashed state, and
+    /// requires every arc's world centreline to be the ruleset's own
+    /// `(cos(yaw + bearing), 0, sin(yaw + bearing))` — the same expression
+    /// `step_craft` thrusts along, evaluated at the arc's bearing.
+    ///
+    /// It also requires the whole fan to stay in the deck plane after the
+    /// world rotation, which is the assertion a `+Y` cone would fail.
+    #[test]
+    fn firing_arcs_sit_on_the_rulesets_bearings_for_a_known_heading() {
+        use bevy::render::mesh::VertexAttributeValues;
+
+        let game = Regolith::honest();
+        let mut executor = Executor::new(game, SEED);
+        executor.insert(PLAYER, game.spawn(PLAYER, 0));
+        executor.insert(OPPONENT, game.spawn(OPPONENT, 1));
+
+        let mut checked = 0usize;
+        for entity in [PLAYER, OPPONENT] {
+            let RegolithState::Craft(craft) = executor.state(entity).expect("installed") else {
+                panic!("both seats are craft");
+            };
+            // The heading is the ruleset's, not a constant this test chose.
+            let yaw_urad = craft.yaw_urad;
+            let rotation = heading_rotation(yaw_urad);
+            for arc in craft::firing_arcs(craft.archetype) {
+                let bearing = (yaw_urad as f64 + f64::from(arc.centre_urad)) / 1_000_000.0;
+                let expected = Vec3::new(bearing.cos() as f32, 0.0, bearing.sin() as f32);
+                let drawn = rotation * arc.centre_direction();
+                assert!(
+                    drawn.distance(expected) < 1e-5,
+                    "{} on {:?} at yaw {yaw_urad}: the arc points {drawn}, \
+                     the ruleset's bearing is {expected}",
+                    arc.name,
+                    craft.archetype
+                );
+
+                // And the fan itself, once rotated into the world.
+                let mesh = craft::arc_mesh(arc, 30.0);
+                let VertexAttributeValues::Float32x3(points) = mesh
+                    .attribute(Mesh::ATTRIBUTE_POSITION)
+                    .expect("the fan has positions")
+                else {
+                    panic!("arc positions are Float32x3");
+                };
+                for point in points {
+                    let world = rotation * Vec3::new(point[0], point[1], point[2]);
+                    assert!(
+                        world.y.abs() < 1e-4,
+                        "{}: world vertex {world} left the deck plane",
+                        arc.name
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 3,
+            "one interceptor front arc and two cruiser side arcs were expected"
+        );
     }
 
     /// Both spawn slots must reach a *different* chassis, or per-archetype

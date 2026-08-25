@@ -39,7 +39,7 @@ type GlowQuery<'w, 's> = Query<
 use orrery_games::regolith::order::ShotResult;
 
 use crate::combat::{
-    CombatView, CraftView, LockBreak, LockPhase, ProjectileTracks, RangeBand, ShotCue,
+    CombatView, CraftView, HitBand, LockBreak, LockPhase, ProjectileTracks, RangeBand, ShotCue,
     ShotFeedback, LOCK_RING_SEGMENTS, TRACER_POOL,
 };
 
@@ -148,6 +148,34 @@ pub fn tracer_streak(
 /// clears it.
 pub const RETICLE_RADIUS_M: f32 = 48.0;
 
+/// Height above the deck at which a firing-arc fan is drawn, craft-local
+/// metres. Enough to clear the hull plate's own lift without lifting the arc
+/// out of the plane the duel happens in.
+pub const FIRING_ARC_LIFT_M: f32 = 0.02;
+
+/// How much of the accent a firing-arc fan keeps. The arc is livery, not a
+/// readout: it has to be legible without competing with the reticle, the
+/// range rings or a tracer.
+pub const FIRING_ARC_ALPHA: f32 = 0.14;
+
+/// The flat, unlit, translucent material one firing-arc fan wears.
+#[must_use]
+pub fn firing_arc_material(seat: crate::craft::Seat, accent: Color) -> StandardMaterial {
+    let tint = match seat {
+        crate::craft::Seat::Player => accent,
+        crate::craft::Seat::Bot => MUTED,
+    }
+    .with_alpha(FIRING_ARC_ALPHA);
+    StandardMaterial {
+        base_color: tint,
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        double_sided: true,
+        ..Default::default()
+    }
+}
+
 /// Marks the reticle root, which is moved onto the locked target each frame.
 #[derive(Component)]
 pub struct LockReticle;
@@ -225,6 +253,8 @@ pub enum Readout {
     TargetShield,
     /// Range, band and time of flight.
     TargetRelation,
+    /// The qualitative hit-chance band beside the locked target.
+    HitBandLine,
     /// The lock-break banner.
     BreakBanner,
     /// The shot-result cue line: provisional impact, then hit or miss.
@@ -360,6 +390,7 @@ pub fn spawn_hud(commands: &mut Commands) {
                 gauge_row("HULL", Gauge::TargetHull, Readout::TargetHull),
                 gauge_row("SHIELD", Gauge::TargetShield, Readout::TargetShield),
                 value(Readout::TargetRelation, 11.0, MUTED),
+                value(Readout::HitBandLine, 13.0, MUTED),
                 value(Readout::BreakBanner, 12.0, Color::srgb(0.95, 0.62, 0.45)),
                 value(Readout::ShotResult, 13.0, MUTED),
             ]
@@ -804,6 +835,17 @@ pub fn refresh_combat_hud(
                 MUTED,
             ),
             Readout::TargetRelation => (target_relation(&view, &tracks), MUTED),
+            Readout::HitBandLine => {
+                let band = view.hit_forecast();
+                let tint = match band {
+                    Some(HitBand::Perfect) => ACCENT_BRIGHT,
+                    Some(HitBand::Good) => ACCENT_PALE,
+                    Some(HitBand::Fair) => MUTED,
+                    Some(HitBand::Poor) => DIM,
+                    Some(HitBand::NoChance | HitBand::Unreadable) | None => FAINT,
+                };
+                (hit_band_line(&view), tint)
+            }
             Readout::BreakBanner => (broken.banner(), Color::srgb(0.95, 0.62, 0.45)),
             Readout::ShotResult => {
                 let tint = match feedback.cue {
@@ -887,6 +929,22 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
         None => parts.push("nothing in the air".to_owned()),
     }
     parts.join(" · ")
+}
+
+/// The hit-chance band beside the locked target, and the phrase that says
+/// what it is reading.
+///
+/// Deliberately **not** a percentage: #445's owner refinement is that a
+/// number invites a precision the simulation does not have. The word comes
+/// from [`CombatView::hit_forecast`], which is the ruleset's own
+/// `hit_chance_ppm` transcribed, so the band and the adjudicator are reading
+/// the same arithmetic.
+#[must_use]
+pub fn hit_band_line(view: &CombatView) -> String {
+    match view.hit_forecast() {
+        None => "—".to_owned(),
+        Some(band) => format!("{}  ·  {}", band.label(), band.note()),
+    }
 }
 
 /// The lock lines the F3 pane appends, naming every field they came from.
@@ -1541,5 +1599,90 @@ mod tests {
             },
             tracks.tracks()[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod band_line {
+    use super::*;
+    use crate::combat::{CraftView, HitBand, LockView};
+    use orrery_core::{QPos, QVel};
+    use orrery_games::regolith::archetype::Archetype;
+    use orrery_games::regolith::state::Craft;
+    use orrery_games::regolith::weapon::WeaponKind;
+
+    fn locked_on(transverse_mms: i64) -> CombatView {
+        let mut me = Craft::spawned(Archetype::Interceptor, QPos { x: 0, y: 0, z: 0 }, 0);
+        me.lock_target = Some(PersistId::new(2));
+        me.lock_progress = LOCK_ACQUISITION_TICKS;
+        let mut them = Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: WeaponKind::Stock.weapon().optimal_mm,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        them.vel = QVel {
+            x: 0,
+            y: 0,
+            z: transverse_mms,
+        };
+        CombatView {
+            own: Some(CraftView::of(PersistId::new(1), &me)),
+            lock: LockView::of(&me),
+            target: Some(CraftView::of(PersistId::new(2), &them)),
+        }
+    }
+
+    /// #445's owner refinement, made executable: the readout is a word, and
+    /// there is no percentage anywhere in it.
+    #[test]
+    fn the_readout_is_a_band_and_never_a_percentage() {
+        for transverse in [0i64, 20_000, 60_000, 200_000, 1_000_000_000] {
+            let line = hit_band_line(&locked_on(transverse));
+            assert!(
+                !line.contains('%'),
+                "the band line printed a percentage: {line}"
+            );
+            assert!(
+                !line.chars().any(|character| character.is_ascii_digit()),
+                "the band line printed a number: {line}"
+            );
+        }
+        assert!(hit_band_line(&locked_on(0)).starts_with(HitBand::Perfect.label()));
+        assert!(hit_band_line(&locked_on(1_000_000_000)).starts_with(HitBand::NoChance.label()));
+    }
+
+    /// With no lock there is nothing to read, and the HUD says so rather than
+    /// naming a band for a target it does not have.
+    #[test]
+    fn no_target_means_no_band() {
+        let mut idle = locked_on(0);
+        idle.target = None;
+        assert_eq!(hit_band_line(&idle), "—");
+        assert_eq!(idle.hit_forecast(), None);
+    }
+
+    /// The band travels on the same refresh path as every other readout: the
+    /// whole HUD is rewritten from one `CombatView`, so it cannot go stale
+    /// against the lock beside it.
+    #[test]
+    fn the_refresh_system_writes_the_band_line() {
+        let mut app = App::new();
+        app.insert_resource(locked_on(60_000))
+            .init_resource::<ProjectileTracks>()
+            .init_resource::<LockBreak>()
+            .init_resource::<ShotFeedback>()
+            .add_systems(Update, refresh_combat_hud);
+        let line = app
+            .world_mut()
+            .spawn((Readout::HitBandLine, Text::new("—"), TextColor(MUTED)))
+            .id();
+        app.update();
+        let text = app.world().get::<Text>(line).expect("the line exists");
+        assert_eq!(**text, hit_band_line(&locked_on(60_000)));
+        assert!(**text != *"—", "the band line was never written");
     }
 }

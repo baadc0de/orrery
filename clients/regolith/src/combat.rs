@@ -518,10 +518,13 @@ impl RangeBand {
 
     /// Classifies a separation against a weapon's own published limits.
     ///
-    /// This reads the weapon table and compares two numbers. It deliberately
-    /// stops short of the hit roll: reproducing `hit_chance_ppm` in the skin
-    /// would be a second implementation of a ruleset rule, and a second
-    /// implementation is a second thing to be wrong.
+    /// This reads the weapon table and compares two numbers: it is the
+    /// *weapon envelope*, not the resolver's reach. The resolver raises
+    /// `RangeExceeded` at `optimal + falloff + target_radius_mm`
+    /// (`regolith/mod.rs`, `projectile_resolution`), which is strictly wider
+    /// than this by the target's own signature radius. [`reach_mm`] is the
+    /// resolver's number and is what [`CombatView::hit_forecast`] uses;
+    /// this stays the envelope the weapon panel prints.
     #[must_use]
     pub fn of(range_mm: i64, weapon: Weapon) -> Self {
         if range_mm <= weapon.optimal_mm {
@@ -530,6 +533,202 @@ impl RangeBand {
             Self::Falloff
         } else {
             Self::Beyond
+        }
+    }
+}
+
+/// The ruleset's fixed-point scale for a hit chance: `hit_chance_ppm` returns
+/// parts per million of this, and the roll is `uniform_below(rng, SCALE)`.
+///
+/// Mirrors `CHANCE_SCALE` in `orrery_games::regolith`, which is private.
+pub const CHANCE_SCALE: u32 = 1_000_000;
+
+/// The signature radius the ruleset's tracking term is normalised against.
+///
+/// Mirrors the private `REFERENCE_SIGNATURE_RADIUS_MM`. It is the
+/// interceptor's `radius_mm`, so an interceptor-sized target neither helps
+/// nor hurts the tracking term.
+const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
+
+/// The separation past which the resolver stops rolling and breaks the lock.
+///
+/// This is the resolver's own `reach`: `optimal + falloff + target_radius`.
+#[must_use]
+pub fn reach_mm(weapon: Weapon, target_radius_mm: i64) -> i64 {
+    weapon
+        .optimal_mm
+        .saturating_add(weapon.falloff_mm)
+        .saturating_add(target_radius_mm)
+}
+
+/// `sum_squares`, refusing rather than saturating.
+fn checked_sum_squares(values: [i128; 3]) -> Option<u128> {
+    let mut sum = 0u128;
+    for value in values {
+        let magnitude = value.unsigned_abs();
+        sum = sum.checked_add(magnitude.checked_mul(magnitude)?)?;
+    }
+    Some(sum)
+}
+
+/// The ruleset's own hit chance, in parts per million, for the geometry it
+/// would resolve against.
+///
+/// This is a transcription of `hit_chance_ppm` in
+/// `orrery_games::regolith`, which is a private function of a crate this
+/// client may read but must not change. Every step below is the same
+/// expression in the same order and the same integer types, so where both
+/// answer they answer identically.
+///
+/// The one deliberate divergence is **saturation**. The ruleset uses
+/// `saturating_mul` / `saturating_add`, so an input large enough to overflow
+/// `i128` or `u128` silently pins the intermediate at its type maximum and
+/// the ruleset goes on to produce a number that looks like a chance and is
+/// not one. D43 clause (f) has no witnessed saturation flag yet (#447 F2),
+/// so nothing downstream can tell that happened. This transcription uses
+/// checked arithmetic and returns [`None`] instead: where the ruleset would
+/// have saturated, the skin declines to name a band rather than echoing a
+/// confidently wrong one.
+///
+/// `saturating_sub` on `range_mm - optimal` is *not* one of those cases — on
+/// `u128` it is a deliberate floor at zero ("no range penalty inside
+/// optimal"), not an overflow guard, so it is transcribed verbatim.
+#[must_use]
+pub fn hit_chance_ppm(
+    target_pos: orrery_core::QPos,
+    target_vel: orrery_core::QVel,
+    target_radius_mm: i64,
+    attacker_pos: orrery_core::QPos,
+    attacker_vel: orrery_core::QVel,
+    weapon: Weapon,
+) -> Option<u32> {
+    let rx = i128::from(target_pos.x).checked_sub(i128::from(attacker_pos.x))?;
+    let ry = i128::from(target_pos.y).checked_sub(i128::from(attacker_pos.y))?;
+    let rz = i128::from(target_pos.z).checked_sub(i128::from(attacker_pos.z))?;
+    let vx = i128::from(target_vel.x).checked_sub(i128::from(attacker_vel.x))?;
+    let vy = i128::from(target_vel.y).checked_sub(i128::from(attacker_vel.y))?;
+    let vz = i128::from(target_vel.z).checked_sub(i128::from(attacker_vel.z))?;
+    let range_sq = checked_sum_squares([rx, ry, rz])?;
+    let range_mm = integer_sqrt(range_sq);
+
+    let cross = [
+        ry.checked_mul(vz)?.checked_sub(rz.checked_mul(vy)?)?,
+        rz.checked_mul(vx)?.checked_sub(rx.checked_mul(vz)?)?,
+        rx.checked_mul(vy)?.checked_sub(ry.checked_mul(vx)?)?,
+    ];
+    let cross_magnitude = integer_sqrt(checked_sum_squares(cross)?);
+    let angular_urad_per_sec = cross_magnitude
+        .checked_mul(1_000_000)?
+        .checked_div(range_sq)
+        .unwrap_or(0);
+    let scale = u128::from(CHANCE_SCALE);
+    let tracking_denominator =
+        u128::from(weapon.tracking_urad_per_sec).checked_mul(target_radius_mm.max(1) as u128)?;
+    let tracking_ratio = angular_urad_per_sec
+        .checked_mul(REFERENCE_SIGNATURE_RADIUS_MM)?
+        .checked_mul(scale)?
+        / tracking_denominator.max(1);
+
+    let optimal = weapon.optimal_mm.max(0) as u128;
+    let range_ratio =
+        range_mm.saturating_sub(optimal).checked_mul(scale)? / (weapon.falloff_mm.max(1) as u128);
+    let penalty = tracking_ratio
+        .checked_mul(tracking_ratio)?
+        .checked_add(range_ratio.checked_mul(range_ratio)?)?;
+    let denominator = scale.checked_mul(scale)?.checked_add(penalty)?;
+    let chance = scale.checked_mul(scale)?.checked_mul(scale)? / denominator.max(1);
+    Some(u32::try_from(chance.min(scale)).unwrap_or(CHANCE_SCALE))
+}
+
+/// A qualitative reading of the ruleset's hit chance.
+///
+/// The owner's decision (#445): a band, not a percentage. A number implies a
+/// resolution the adjudicator does not have — `est. 100%` followed by a miss
+/// reads as a lie even when the estimate was honest — while a band carries
+/// the two things a pilot can act on: *is my tracking holding* and *am I in
+/// reach*.
+///
+/// The boundaries are chosen where a false model would show:
+///
+/// * **`Perfect` at exactly `CHANCE_SCALE`.** The roll is
+///   `uniform_below(rng, CHANCE_SCALE) < chance`, which draws from
+///   `0..CHANCE_SCALE`, so `chance == CHANCE_SCALE` is the *only* value at
+///   which "cannot miss" is a true statement. One ppm below it there is a
+///   real miss branch, and a band claiming perfection there would be a lie
+///   the player could catch.
+/// * **`NoChance` at exactly zero, and out of reach.** `draw < 0` is never
+///   true, so zero is the only value at which "cannot hit" is true. Out past
+///   the resolver's reach the projectile is not rolled at all — it raises
+///   `RangeExceeded` and breaks the lock — so that is `NoChance` too, even
+///   though the chance *expression* evaluated there still yields a small
+///   positive number. Printing that number would be the false model.
+/// * **`Good` at half.** `chance = SCALE / (1 + u²)` where `u` is the total
+///   penalty `sqrt(tracking² + range²) / SCALE` the ruleset forms. `u = 1` —
+///   penalty exactly equal to the scale — is `chance = SCALE/2`: the point
+///   where a shot is more likely to land than not.
+/// * **`Fair` at a tenth.** `u = 3`, three times the penalty budget.
+///
+/// The two interior boundaries are round numbers *in the penalty the ruleset
+/// forms*, not in the output; the two exterior ones are exact properties of
+/// the ruleset's own comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HitBand {
+    /// The resolver cannot land this shot: zero chance, or out of reach.
+    NoChance,
+    /// Under a tenth. Tracking is losing, or the target is deep in falloff.
+    Poor,
+    /// Between a tenth and a half.
+    Fair,
+    /// Better than even.
+    Good,
+    /// Exactly `CHANCE_SCALE`: the ruleset has no miss branch here.
+    Perfect,
+    /// The inputs would have overflowed the ruleset's saturating arithmetic,
+    /// so no honest band exists. See [`hit_chance_ppm`].
+    Unreadable,
+}
+
+impl HitBand {
+    /// Classifies a chance the ruleset actually rolls.
+    #[must_use]
+    pub const fn of_chance_ppm(chance: u32) -> Self {
+        if chance == 0 {
+            Self::NoChance
+        } else if chance < CHANCE_SCALE / 10 {
+            Self::Poor
+        } else if chance < CHANCE_SCALE / 2 {
+            Self::Fair
+        } else if chance < CHANCE_SCALE {
+            Self::Good
+        } else {
+            Self::Perfect
+        }
+    }
+
+    /// The word the HUD prints.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoChance => "NO CHANCE",
+            Self::Poor => "POOR",
+            Self::Fair => "FAIR",
+            Self::Good => "GOOD",
+            Self::Perfect => "PERFECT",
+            Self::Unreadable => "NO READ",
+        }
+    }
+
+    /// The one-line reason, so the band explains itself rather than being a
+    /// second unexplained signal.
+    #[must_use]
+    pub const fn note(self) -> &'static str {
+        match self {
+            Self::NoChance => "out of reach or no tracking",
+            Self::Poor => "tracking is losing",
+            Self::Fair => "tracking is slipping",
+            Self::Good => "tracking is holding",
+            Self::Perfect => "no miss branch",
+            Self::Unreadable => "inputs out of range",
         }
     }
 }
@@ -579,6 +778,71 @@ impl CombatView {
     pub fn band(&self) -> Option<RangeBand> {
         Some(RangeBand::of(self.range_mm()?, self.own?.weapon_table()))
     }
+
+    /// The ruleset's own hit chance for a shot fired **now**, in ppm.
+    ///
+    /// It is a forecast, not a replay of an adjudicated shot. The ruleset
+    /// rolls against the attacker snapshot carried on the `Damage` order —
+    /// the shooter's position and velocity at the tick the trigger was
+    /// pulled — and the target's state at the tick the projectile arrives.
+    /// This reads both craft as they are on the current tick, which is the
+    /// question a pilot is actually asking: *if I fire now, from here.*
+    ///
+    /// [`None`] means there is nothing to read: no own craft, no visible
+    /// target craft, or inputs the ruleset's arithmetic would have saturated
+    /// on.
+    #[must_use]
+    pub fn hit_chance_ppm(&self) -> Option<u32> {
+        let own = self.own?;
+        let target = self.target?;
+        hit_chance_ppm(
+            target.pos,
+            target.vel,
+            target.archetype.limits().radius_mm,
+            own.pos,
+            own.vel,
+            own.weapon_table(),
+        )
+    }
+
+    /// The qualitative band beside the locked target.
+    ///
+    /// [`None`] only when there is no locked target craft to read. A target
+    /// past the resolver's reach is [`HitBand::NoChance`] — the resolver
+    /// breaks the lock there instead of rolling — and inputs that would have
+    /// saturated are [`HitBand::Unreadable`].
+    #[must_use]
+    pub fn hit_forecast(&self) -> Option<HitBand> {
+        let own = self.own?;
+        let target = self.target?;
+        let weapon = own.weapon_table();
+        let radius = target.archetype.limits().radius_mm;
+        let separation = separation_mm(own.pos, target.pos);
+        if separation > reach_mm(weapon, radius).max(0) as u128 {
+            return Some(HitBand::NoChance);
+        }
+        Some(
+            self.hit_chance_ppm()
+                .map_or(HitBand::Unreadable, HitBand::of_chance_ppm),
+        )
+    }
+}
+
+/// Floor of the straight-line separation between two lattice points, in
+/// millimetres, without an intermediate `i64` that a replicated coordinate
+/// pair could overflow.
+fn separation_mm(a: orrery_core::QPos, b: orrery_core::QPos) -> u128 {
+    let delta = |p: i64, q: i64| i128::from(p) - i128::from(q);
+    let (dx, dy, dz) = (
+        delta(a.x, b.x).unsigned_abs(),
+        delta(a.y, b.y).unsigned_abs(),
+        delta(a.z, b.z).unsigned_abs(),
+    );
+    integer_sqrt(
+        dx.saturating_mul(dx)
+            .saturating_add(dy.saturating_mul(dy))
+            .saturating_add(dz.saturating_mul(dz)),
+    )
 }
 
 fn craft_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<&Craft> {
@@ -988,5 +1252,562 @@ mod tests {
             let root = integer_sqrt(value);
             assert!(root * root <= value && (root + 1) * (root + 1) > value);
         }
+    }
+}
+
+#[cfg(test)]
+mod band_boundaries {
+    use super::*;
+    use orrery_core::{QPos, QVel};
+
+    fn view(own_x: i64, target_x: i64, target_vz: i64) -> CombatView {
+        let mut me = Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: own_x,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        me.lock_target = Some(PersistId::new(2));
+        me.lock_progress = LOCK_ACQUISITION_TICKS;
+        let mut them = Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: target_x,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        them.vel = QVel {
+            x: 0,
+            y: 0,
+            z: target_vz,
+        };
+        CombatView {
+            own: Some(CraftView::of(PersistId::new(1), &me)),
+            lock: LockView::of(&me),
+            target: Some(CraftView::of(PersistId::new(2), &them)),
+        }
+    }
+
+    /// Every boundary, at the ppm it claims, in both directions.
+    #[test]
+    fn the_bands_break_exactly_where_they_say_they_do() {
+        assert_eq!(HitBand::of_chance_ppm(0), HitBand::NoChance);
+        assert_eq!(HitBand::of_chance_ppm(1), HitBand::Poor);
+        assert_eq!(HitBand::of_chance_ppm(99_999), HitBand::Poor);
+        assert_eq!(HitBand::of_chance_ppm(100_000), HitBand::Fair);
+        assert_eq!(HitBand::of_chance_ppm(499_999), HitBand::Fair);
+        assert_eq!(HitBand::of_chance_ppm(500_000), HitBand::Good);
+        assert_eq!(HitBand::of_chance_ppm(999_999), HitBand::Good);
+        assert_eq!(HitBand::of_chance_ppm(1_000_000), HitBand::Perfect);
+    }
+
+    /// The interior boundaries are round numbers in the *penalty* the ruleset
+    /// forms, not in the output, so they are checked that way: `u = 1` is half
+    /// and `u = 3` is a tenth, where `chance = SCALE / (1 + u²)`.
+    #[test]
+    fn the_interior_boundaries_are_the_rulesets_penalty_landmarks() {
+        let scale = u128::from(CHANCE_SCALE);
+        let chance_at = |penalty: u128| {
+            let denominator = scale * scale + penalty;
+            u32::try_from((scale * scale * scale / denominator).min(scale)).expect("in range")
+        };
+        // u = 1: penalty == SCALE².
+        assert_eq!(chance_at(scale * scale), CHANCE_SCALE / 2);
+        assert_eq!(
+            HitBand::of_chance_ppm(chance_at(scale * scale)),
+            HitBand::Good,
+            "an even-money shot is the bottom of GOOD"
+        );
+        // u = 3: penalty == 9·SCALE².
+        assert_eq!(chance_at(9 * scale * scale), CHANCE_SCALE / 10);
+        assert_eq!(
+            HitBand::of_chance_ppm(chance_at(9 * scale * scale)),
+            HitBand::Fair,
+            "a one-in-ten shot is the bottom of FAIR"
+        );
+    }
+
+    /// Past the resolver's reach the projectile is never rolled, so the band
+    /// is NO CHANCE even though the chance expression still evaluates to a
+    /// small positive number there. Printing that number is the false model
+    /// this boundary exists to stop.
+    #[test]
+    fn out_of_reach_is_no_chance_not_a_small_number() {
+        let weapon = WeaponKind::Stock.weapon();
+        let radius = Archetype::Interceptor.limits().radius_mm;
+        let reach = reach_mm(weapon, radius);
+
+        // At reach the range term alone has eaten most of the chance, but
+        // the resolver still rolls, so the band still names a real chance.
+        let inside = view(0, reach, 0);
+        assert_eq!(inside.hit_forecast(), Some(HitBand::Fair));
+
+        let outside = view(0, reach + 1, 0);
+        assert_eq!(outside.hit_forecast(), Some(HitBand::NoChance));
+        // And the raw expression, unguarded, would have said otherwise.
+        assert!(
+            outside.hit_chance_ppm().expect("no saturation here") > 0,
+            "the guard is doing real work: the bare formula is still positive here"
+        );
+    }
+
+    /// Tracking, the term the band exists to make visible: hold range fixed,
+    /// wind up the transverse speed, and the band walks down its own ladder.
+    #[test]
+    fn the_band_walks_down_as_tracking_falls_behind() {
+        let optimal = WeaponKind::Stock.weapon().optimal_mm;
+        let mut seen = Vec::new();
+        for transverse in [0i64, 20_000, 60_000, 200_000, 1_000_000_000] {
+            seen.push(view(0, optimal, transverse).hit_forecast().expect("locked"));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                HitBand::Perfect,
+                HitBand::Good,
+                HitBand::Fair,
+                HitBand::Poor,
+                HitBand::NoChance
+            ],
+            "the ladder is not monotone in the ruleset's own tracking term"
+        );
+    }
+
+    /// The arcs are livery; the band is arithmetic. Neither may leak into the
+    /// other.
+    ///
+    /// `projectile_resolution` and `hit_chance_ppm` never read the shooter's
+    /// `yaw_urad`, and `Order::Fire` is accepted at any bearing — the ruleset
+    /// does not gate a shot on facing at all. So the band must be identical
+    /// for a target dead ahead and the same target dead astern. A band that
+    /// dimmed to NO CHANCE outside the drawn arc would look like the most
+    /// natural thing in the world and would disagree with every shot the
+    /// adjudicator lands.
+    #[test]
+    fn the_band_does_not_read_the_firing_arc() {
+        let optimal = WeaponKind::Stock.weapon().optimal_mm;
+        let ahead = view(0, optimal, 30_000);
+        let mut astern = ahead;
+        // Same geometry, shooter spun to face the other way.
+        let mut me = Craft::spawned(Archetype::Interceptor, QPos { x: 0, y: 0, z: 0 }, 3_141_592);
+        me.lock_target = Some(PersistId::new(2));
+        me.lock_progress = LOCK_ACQUISITION_TICKS;
+        astern.own = Some(CraftView::of(PersistId::new(1), &me));
+        assert_eq!(
+            ahead.hit_forecast(),
+            astern.hit_forecast(),
+            "the band moved when only the shooter's facing changed"
+        );
+        assert_eq!(ahead.hit_chance_ppm(), astern.hit_chance_ppm());
+    }
+
+    /// D43 clause (f) has no witnessed saturation flag yet (#447 F2). The
+    /// ruleset's `saturating_mul` would pin an overflowing intermediate at its
+    /// type maximum and go on to produce a number that looks like a chance;
+    /// nothing downstream could tell. The skin refuses instead.
+    #[test]
+    fn saturating_inputs_get_no_band_rather_than_a_wrong_one() {
+        let weapon = WeaponKind::Stock.weapon();
+        // Positions and velocities that stay inside `i64` but whose cross
+        // product does not stay inside `i128`.
+        let far = QPos {
+            x: i64::MAX,
+            y: i64::MAX,
+            z: 0,
+        };
+        let fast = QVel {
+            x: i64::MAX,
+            y: 0,
+            z: i64::MAX,
+        };
+        assert_eq!(
+            hit_chance_ppm(
+                far,
+                fast,
+                3_000,
+                QPos { x: 0, y: 0, z: 0 },
+                QVel { x: 0, y: 0, z: 0 },
+                weapon,
+            ),
+            None,
+            "the ruleset would have saturated here and still returned a number"
+        );
+
+        let mut me = Craft::spawned(Archetype::Interceptor, QPos { x: 0, y: 0, z: 0 }, 0);
+        me.lock_target = Some(PersistId::new(2));
+        me.lock_progress = LOCK_ACQUISITION_TICKS;
+        let mut them = Craft::spawned(Archetype::Interceptor, far, 0);
+        them.vel = fast;
+        let saturating = CombatView {
+            own: Some(CraftView::of(PersistId::new(1), &me)),
+            lock: LockView::of(&me),
+            target: Some(CraftView::of(PersistId::new(2), &them)),
+        };
+        // That target is also far out of reach, and the reach guard is the
+        // honest answer there: it is a fact about the geometry that needs no
+        // tracking arithmetic at all.
+        assert_eq!(saturating.hit_forecast(), Some(HitBand::NoChance));
+
+        // Inside reach, with only the *velocities* extreme, there is no
+        // geometric fact to fall back on and the band must decline.
+        let mut close = Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: weapon.optimal_mm,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        close.vel = fast;
+        let unreadable = CombatView {
+            own: Some(CraftView::of(PersistId::new(1), &me)),
+            lock: LockView::of(&me),
+            target: Some(CraftView::of(PersistId::new(2), &close)),
+        };
+        assert_eq!(unreadable.hit_forecast(), Some(HitBand::Unreadable));
+        assert_eq!(HitBand::Unreadable.label(), "NO READ");
+    }
+}
+
+/// The hit band, checked against the rules that adjudicate the shot.
+///
+/// Nothing in here asserts that the transcription in [`hit_chance_ppm`] is
+/// faithful. It *drives the real `Regolith` ruleset* and reads back the
+/// `ShotResolved` verdicts it emits, so a transcription that drifted from
+/// `orrery_games`'s private `hit_chance_ppm` fails here rather than shipping
+/// a HUD that teaches a false model.
+#[cfg(test)]
+mod ruleset_agreement {
+    use super::*;
+    use orrery_core::{Executor, QPos, QVel};
+    use orrery_games::regolith::archetype::Archetype;
+    use orrery_games::regolith::order::{LockBreakReason, Order, Outcome, ShotResult};
+    use orrery_games::regolith::state::{Craft, RegolithState};
+    use orrery_games::regolith::weapon::WeaponKind;
+    use orrery_games::Regolith;
+    use orrery_protocol::{Tick, UniverseSeed};
+
+    const SHOOTER: PersistId = PersistId::new(1);
+    const TARGET: PersistId = PersistId::new(2);
+    /// Every scenario shoots from the origin, standing still, at optimal
+    /// range, so the range term is zero and the tracking term is the only
+    /// thing moving.
+    const RANGE_MM: i64 = 300_000;
+    const WEAPON: WeaponKind = WeaponKind::Stock;
+
+    /// A target at `RANGE_MM` along `+X`, closing sideways at `transverse_mms`.
+    fn target_at(transverse_mms: i64) -> Craft {
+        let mut craft = Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: RANGE_MM,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        craft.vel = QVel {
+            x: 0,
+            y: 0,
+            z: transverse_mms,
+        };
+        craft
+    }
+
+    fn target_radius_mm() -> i64 {
+        Archetype::Interceptor.limits().radius_mm
+    }
+
+    /// The skin's forecast for exactly the geometry the ruleset will resolve.
+    fn client_chance(target: &Craft) -> u32 {
+        hit_chance_ppm(
+            target.pos,
+            target.vel,
+            target_radius_mm(),
+            QPos { x: 0, y: 0, z: 0 },
+            QVel { x: 0, y: 0, z: 0 },
+            WEAPON.weapon(),
+        )
+        .expect("this geometry is far inside the ruleset's saturation limits")
+    }
+
+    /// One real resolution. The target is installed with the exact state we
+    /// chose and handed a `Damage` order with one flight tick left, which is
+    /// the branch `projectile_resolution` rolls on.
+    ///
+    /// `tick_rng(seed, entity, tick)` is a function of those three alone, so
+    /// holding `(seed, tick)` fixed holds the *draw* fixed while the geometry
+    /// moves — which is what makes the sweep below a threshold measurement
+    /// rather than a sampling exercise.
+    fn resolve(seed_byte: u8, tick: u64, target: Craft) -> Vec<Outcome> {
+        let game = Regolith::honest();
+        let mut executor = Executor::new(game, UniverseSeed([seed_byte; 32]));
+        executor.insert(TARGET, RegolithState::Craft(target));
+        let order = Order::Damage {
+            amount: 1,
+            from: SHOOTER,
+            from_pos: QPos { x: 0, y: 0, z: 0 },
+            from_vel: QVel { x: 0, y: 0, z: 0 },
+            from_weapon: WEAPON,
+            flight_ticks: Some(1),
+        };
+        executor
+            .step_entity(TARGET, Tick::new(tick), &[order])
+            .expect("the target is installed")
+            .events
+    }
+
+    fn verdict(seed_byte: u8, tick: u64, target: Craft) -> Option<ShotResult> {
+        resolve(seed_byte, tick, target)
+            .iter()
+            .find_map(|event| match event {
+                Outcome::ShotResolved { result, .. } => Some(*result),
+                _ => None,
+            })
+    }
+
+    /// The exterior boundary, upper end: `PERFECT` claims the ruleset cannot
+    /// miss, and the ruleset must not miss.
+    ///
+    /// `uniform_below(rng, CHANCE_SCALE)` draws from `0..CHANCE_SCALE` and
+    /// the test is `draw < chance`, so `chance == CHANCE_SCALE` is the only
+    /// value where that is a theorem. Every draw here is a different rng
+    /// stream.
+    #[test]
+    fn perfect_never_misses_in_the_ruleset() {
+        let target = target_at(0);
+        assert_eq!(
+            client_chance(&target),
+            CHANCE_SCALE,
+            "a target with no transverse motion at optimal range is the ruleset's ceiling"
+        );
+        assert_eq!(
+            HitBand::of_chance_ppm(client_chance(&target)),
+            HitBand::Perfect
+        );
+        for seed in 0..64u8 {
+            for tick in [1u64, 7, 5_000, 1_000_000] {
+                assert_eq!(
+                    verdict(seed, tick, target_at(0)),
+                    Some(ShotResult::Hit),
+                    "seed {seed} tick {tick}: PERFECT missed"
+                );
+            }
+        }
+    }
+
+    /// The exterior boundary, lower end: `NO CHANCE` claims the ruleset
+    /// cannot hit, and it must not.
+    #[test]
+    fn no_chance_never_hits_in_the_ruleset() {
+        // Tracking ratio past 1e9 drives the penalty past CHANCE_SCALE^3.
+        let target = target_at(1_000_000_000);
+        assert_eq!(client_chance(&target), 0);
+        assert_eq!(
+            HitBand::of_chance_ppm(client_chance(&target)),
+            HitBand::NoChance
+        );
+        for seed in 0..64u8 {
+            for tick in [1u64, 7, 5_000, 1_000_000] {
+                assert_eq!(
+                    verdict(seed, tick, target_at(1_000_000_000)),
+                    Some(ShotResult::Miss),
+                    "seed {seed} tick {tick}: NO CHANCE hit"
+                );
+            }
+        }
+    }
+
+    /// The interior of the range, measured rather than sampled.
+    ///
+    /// For one fixed rng stream the draw `d` is a constant, so the ruleset
+    /// hits exactly when its own chance exceeds `d`. Bisecting the transverse
+    /// speed finds where the ruleset flips, and the skin's chance either side
+    /// of that flip brackets `d`. If the transcription were wrong by more
+    /// than the bracket width, the flip would land somewhere else.
+    ///
+    /// Four hundred streams put four hundred independent brackets across the
+    /// range, which is also what makes the two claims after the sweep
+    /// affordable.
+    #[test]
+    fn the_rulesets_flip_lands_where_the_skins_chance_says_it_will() {
+        let mut brackets = Vec::new();
+        for seed in 0..=255u8 {
+            for round in 0..2u64 {
+                let tick = 3 + u64::from(seed) * 97 + round * 1_000_003;
+                let mut hits = 0i64;
+                let mut misses = 1_000_000_000i64;
+                assert_eq!(
+                    verdict(seed, tick, target_at(hits)),
+                    Some(ShotResult::Hit),
+                    "seed {seed}: the ceiling missed, which another test already forbids"
+                );
+                assert_eq!(
+                    verdict(seed, tick, target_at(misses)),
+                    Some(ShotResult::Miss)
+                );
+                while misses - hits > 1 {
+                    let middle = hits + (misses - hits) / 2;
+                    match verdict(seed, tick, target_at(middle)) {
+                        Some(ShotResult::Hit) => hits = middle,
+                        Some(ShotResult::Miss) => misses = middle,
+                        other => panic!("seed {seed}: no verdict at {middle}: {other:?}"),
+                    }
+                }
+                let above = client_chance(&target_at(hits));
+                let below = client_chance(&target_at(misses));
+                assert!(
+                    above >= below,
+                    "seed {seed}: the skin's chance is not monotone in transverse speed"
+                );
+                // The ruleset's draw `d` sits in `below..=above`: it hit at
+                // `above` and missed at `below`, one millimetre per second of
+                // transverse speed apart.
+                let width = above - below;
+                assert!(
+                    width <= 20_000,
+                    "seed {seed}: the flip is pinned only to {width} ppm — \
+                     either the transcription drifted or the sweep is too coarse"
+                );
+                brackets.push((below, above));
+            }
+        }
+
+        // The brackets must not all sit in one corner, or a transcription
+        // that agreed near the ceiling and nowhere else would pass.
+        let lowest = brackets.iter().map(|(low, _)| *low).min().expect("a sweep");
+        let highest = brackets
+            .iter()
+            .map(|(_, high)| *high)
+            .max()
+            .expect("a sweep");
+        assert!(
+            lowest < CHANCE_SCALE / 4 && highest > CHANCE_SCALE * 3 / 4,
+            "the measured thresholds only span {lowest}..{highest} ppm"
+        );
+
+        // The upper boundary, earning its place. `PERFECT` is reserved for
+        // exactly `CHANCE_SCALE` because that is the only value at which
+        // "cannot miss" is a theorem — the roll is `draw < chance` over
+        // `draw ∈ 0..CHANCE_SCALE`. Here is the ruleset missing a shot the
+        // skin rates at better than 99%: a band that rounded that up to
+        // PERFECT would have been caught by this miss.
+        let dearest_miss = brackets.iter().map(|(low, _)| *low).max().expect("a sweep");
+        assert!(
+            dearest_miss >= 990_000,
+            "no stream drew high enough to show a near-certain shot missing; \
+             the best was {dearest_miss} ppm"
+        );
+        assert!(
+            dearest_miss < CHANCE_SCALE,
+            "a stream missed at the ceiling, which contradicts \
+             perfect_never_misses_in_the_ruleset"
+        );
+    }
+
+    /// And in aggregate: over many rng streams at a fixed geometry, the
+    /// ruleset lands the shot about as often as the skin's number says.
+    #[test]
+    fn the_observed_hit_rate_matches_the_skins_number() {
+        // A geometry near the middle of the range, so the check has room to
+        // fail in both directions.
+        let mut transverse = 0i64;
+        while client_chance(&target_at(transverse)) > CHANCE_SCALE / 2 {
+            transverse += 250;
+            assert!(transverse < 10_000_000, "never crossed half");
+        }
+        let chance = client_chance(&target_at(transverse));
+        assert!(
+            (CHANCE_SCALE / 4..=CHANCE_SCALE / 2).contains(&chance),
+            "wanted a mid-range geometry, got {chance} ppm"
+        );
+        let mut hits = 0u32;
+        let mut total = 0u32;
+        for seed in 0..64u8 {
+            for tick in 0..16u64 {
+                total += 1;
+                if verdict(seed, tick, target_at(transverse)) == Some(ShotResult::Hit) {
+                    hits += 1;
+                }
+            }
+        }
+        let observed = f64::from(hits) / f64::from(total);
+        let predicted = f64::from(chance) / f64::from(CHANCE_SCALE);
+        assert!(
+            (observed - predicted).abs() < 0.08,
+            "{total} shots landed {observed:.3} of the time against a predicted {predicted:.3}"
+        );
+    }
+
+    /// The reach boundary, which the *weapon envelope* alone gets wrong.
+    ///
+    /// `projectile_resolution` breaks the lock past
+    /// `optimal + falloff + target_radius_mm`. [`RangeBand::of`] stops at
+    /// `optimal + falloff`, so between the two the envelope says "beyond
+    /// reach" while the ruleset is still rolling. [`reach_mm`] is the
+    /// resolver's number and is the one the band uses.
+    #[test]
+    fn the_band_breaks_where_the_resolver_breaks_and_not_before() {
+        let weapon = WEAPON.weapon();
+        let radius = target_radius_mm();
+        let envelope_edge = weapon.optimal_mm + weapon.falloff_mm;
+        let reach = reach_mm(weapon, radius);
+        assert_eq!(reach, envelope_edge + radius, "reach carries the signature");
+
+        let at = |range_mm: i64| {
+            let mut craft = Craft::spawned(
+                Archetype::Interceptor,
+                QPos {
+                    x: range_mm,
+                    y: 0,
+                    z: 0,
+                },
+                0,
+            );
+            craft.vel = QVel { x: 0, y: 0, z: 0 };
+            craft
+        };
+
+        // Inside the resolver's reach but outside the weapon envelope: the
+        // ruleset still rolls, so the band must not say NO CHANCE here.
+        let events = resolve(9, 11, at(envelope_edge + 1));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Outcome::ShotResolved { .. })),
+            "the resolver still rolls one radius past the envelope"
+        );
+        assert_eq!(
+            RangeBand::of(envelope_edge + 1, weapon),
+            RangeBand::Beyond,
+            "the envelope, on its own, would have called this unreachable"
+        );
+
+        // Exactly at reach: still rolled.
+        assert!(resolve(9, 11, at(reach))
+            .iter()
+            .any(|event| matches!(event, Outcome::ShotResolved { .. })));
+
+        // One millimetre past: no roll at all, the lock breaks.
+        let past = resolve(9, 11, at(reach + 1));
+        assert!(
+            !past
+                .iter()
+                .any(|event| matches!(event, Outcome::ShotResolved { .. })),
+            "past reach the ruleset never rolls"
+        );
+        assert!(past.iter().any(|event| matches!(
+            event,
+            Outcome::LockBroken {
+                reason: LockBreakReason::RangeExceeded,
+                ..
+            }
+        )));
     }
 }

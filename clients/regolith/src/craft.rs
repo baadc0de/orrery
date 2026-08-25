@@ -666,6 +666,148 @@ pub fn mesh_for(shape: Shape) -> Mesh {
     }
 }
 
+/// One chassis's weapon arc, in the **ruleset's own bearing convention**.
+///
+/// A bearing is measured in micro-radians from the craft's nose, positive the
+/// way the ruleset's yaw runs, and the direction it names is
+/// `(cos θ, 0, sin θ)` in craft-local space — the same expression
+/// `step_craft` thrusts along. Authoring the arc in that form is what keeps
+/// it off the wrong axis: bearing zero is `+X`, which is exactly where the
+/// nose-along-`+X` models point, so an arc is a rotation of the hull's own
+/// frame and inherits [`crate::heading_rotation`] from the craft root rather
+/// than re-deriving a world rotation of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FiringArc {
+    /// Mesh name, kept so a headless test can name what it found.
+    pub name: &'static str,
+    /// Centre bearing from the nose, micro-radians.
+    pub centre_urad: i32,
+    /// Half the arc's total width, micro-radians.
+    pub half_width_urad: i32,
+}
+
+impl FiringArc {
+    /// Craft-local unit direction of a bearing relative to this craft's nose,
+    /// written the way the ruleset writes it: `(cos θ, 0, sin θ)`.
+    #[must_use]
+    pub fn direction(bearing_urad: f32) -> Vec3 {
+        let theta = bearing_urad / 1_000_000.0;
+        Vec3::new(theta.cos(), 0.0, theta.sin())
+    }
+
+    /// The arc's centreline, in craft-local space.
+    #[must_use]
+    pub fn centre_direction(self) -> Vec3 {
+        Self::direction(self.centre_urad as f32)
+    }
+
+    /// Whether a bearing relative to the nose falls inside this arc.
+    #[must_use]
+    pub fn contains_urad(self, bearing_urad: i32) -> bool {
+        let mut delta = (bearing_urad - self.centre_urad).rem_euclid(TAU_URAD_I32);
+        if delta > TAU_URAD_I32 / 2 {
+            delta -= TAU_URAD_I32;
+        }
+        delta.abs() <= self.half_width_urad
+    }
+}
+
+/// One full turn in micro-radians, matching the ruleset's `TAU_URAD`.
+const TAU_URAD_I32: i32 = 6_283_185;
+
+/// Half of 90°, in micro-radians.
+const DEG_45_URAD: i32 = 785_398;
+/// Half of 45°, in micro-radians.
+const DEG_22_5_URAD: i32 = 392_699;
+/// A quarter turn, in micro-radians.
+const DEG_90_URAD: i32 = 1_570_796;
+
+/// How far an arc is drawn, as a multiple of the chassis's hull length.
+///
+/// The arc is a **facing marking on the hull**, not a range envelope: the
+/// range envelope is already drawn, to scale, by [`crate::hud::RangeRing`].
+/// Drawing the arc out to weapon optimal (300 m against a 7.4 m hull) would
+/// swamp the plan view and would also imply the arc bounds where the weapon
+/// reaches, which it does not.
+pub const ARC_RADIUS_HULL_LENGTHS: f32 = 2.2;
+
+/// The arcs a chassis wears: **interceptor 90° front, cruiser 45° side**.
+///
+/// # What these do and do not mean
+///
+/// They are a **presentation** fact. The Regolith ruleset resolves a shot
+/// from range, relative velocity and the weapon table only —
+/// `projectile_resolution` and `hit_chance_ppm` never read the shooter's
+/// `yaw_urad`, and `Order::Fire` is accepted at any bearing. So an arc does
+/// not gate anything the adjudicator does, and nothing in the skin may make
+/// it look as though it does: the hit band beside the target
+/// ([`crate::combat::HitBand`]) is computed from the tracking maths alone and
+/// is never narrowed by whether the target sits inside an arc.
+///
+/// What the arc is honestly for is the chassis read the owner asked for —
+/// which hull is a nose-on brawler and which is a broadside — and it is drawn
+/// as hull livery for that reason.
+#[must_use]
+pub fn firing_arcs(archetype: Archetype) -> Vec<FiringArc> {
+    match archetype {
+        // 90° front: one arc, centred on the nose, ±45°.
+        Archetype::Interceptor => vec![FiringArc {
+            name: "arc_front",
+            centre_urad: 0,
+            half_width_urad: DEG_45_URAD,
+        }],
+        // 45° side: two arcs, centred on each beam, ±22.5°.
+        Archetype::Cruiser => vec![
+            FiringArc {
+                name: "arc_starboard",
+                centre_urad: DEG_90_URAD,
+                half_width_urad: DEG_22_5_URAD,
+            },
+            FiringArc {
+                name: "arc_port",
+                centre_urad: -DEG_90_URAD,
+                half_width_urad: DEG_22_5_URAD,
+            },
+        ],
+    }
+}
+
+/// Segments in one drawn arc's fan. Enough that the 45° arc's outer edge
+/// reads as a curve rather than a chord.
+const ARC_SEGMENTS: usize = 24;
+
+/// A flat triangle fan filling one arc, in the craft's own local frame.
+///
+/// Every rim vertex is [`FiringArc::direction`] of a bearing inside the arc,
+/// scaled to `radius`, so the mesh cannot end up on another axis without the
+/// bearing convention itself being wrong.
+#[must_use]
+pub fn arc_mesh(arc: FiringArc, radius: f32) -> Mesh {
+    let mut positions = vec![[0.0f32, 0.0, 0.0]];
+    let start = (arc.centre_urad - arc.half_width_urad) as f32;
+    let span = (2 * arc.half_width_urad) as f32;
+    for step in 0..=ARC_SEGMENTS {
+        let bearing = start + span * (step as f32 / ARC_SEGMENTS as f32);
+        let point = FiringArc::direction(bearing) * radius;
+        positions.push([point.x, point.y, point.z]);
+    }
+    let mut indices = Vec::with_capacity(ARC_SEGMENTS * 3);
+    for step in 0..ARC_SEGMENTS as u32 {
+        indices.extend_from_slice(&[0, step + 1, step + 2]);
+    }
+    let normals = vec![[0.0f32, 1.0, 0.0]; positions.len()];
+    let uvs = vec![[0.0f32, 0.0]; positions.len()];
+    let mut mesh = Mesh::new(
+        bevy::render::mesh::PrimitiveTopology::TriangleList,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(bevy::render::mesh::Indices::U32(indices));
+    mesh
+}
+
 /// Which seat a drawn craft flies from.
 ///
 /// This is a presentation fact and nothing more: the skin knows which entity
@@ -758,6 +900,7 @@ pub fn finish_material(finish: Finish, seat: Seat, accent: Color) -> StandardMat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::render::mesh::VertexAttributeValues;
 
     /// Any accent does for material tests: trim and glow pass it through,
     /// and the finishes under test ignore it by design.
@@ -956,6 +1099,129 @@ mod tests {
                 plated > 0,
                 "{archetype:?}: no plate means no allegiance surface to tint"
             );
+        }
+    }
+
+    /// The angles the owner asked for, read back off the data rather than the
+    /// constants that built it: **interceptor 90° front, cruiser 45° side**.
+    #[test]
+    fn each_hull_wears_the_angles_the_owner_named() {
+        let degrees = |urad: i32| urad as f64 / 1_000_000.0 * 180.0 / core::f64::consts::PI;
+
+        let front = firing_arcs(Archetype::Interceptor);
+        assert_eq!(front.len(), 1, "the interceptor's arc is one front arc");
+        assert!(
+            (degrees(2 * front[0].half_width_urad) - 90.0).abs() < 0.001,
+            "interceptor arc is {}°, not 90°",
+            degrees(2 * front[0].half_width_urad)
+        );
+        assert_eq!(front[0].centre_urad, 0, "a front arc centres on the nose");
+
+        let sides = firing_arcs(Archetype::Cruiser);
+        assert_eq!(
+            sides.len(),
+            2,
+            "a side arc is a broadside: port and starboard"
+        );
+        for arc in &sides {
+            assert!(
+                (degrees(2 * arc.half_width_urad) - 45.0).abs() < 0.001,
+                "cruiser arc {} is {}°, not 45°",
+                arc.name,
+                degrees(2 * arc.half_width_urad)
+            );
+            assert!(
+                (degrees(arc.centre_urad).abs() - 90.0).abs() < 0.001,
+                "cruiser arc {} centres {}° off the nose, not on a beam",
+                arc.name,
+                degrees(arc.centre_urad)
+            );
+        }
+        assert_ne!(
+            sides[0].centre_urad, sides[1].centre_urad,
+            "both cruiser arcs landed on the same beam"
+        );
+    }
+
+    /// The trap #377 paid for, closed at the arc.
+    ///
+    /// A bearing is `(cos θ, 0, sin θ)` — the ruleset's own expression, in the
+    /// deck plane. Bevy's `Cone` points `+Y`; an arc built on that axis would
+    /// point at the top-down camera and look entirely plausible. Every vertex
+    /// of every arc mesh must have `y == 0`, and no vertex may be the `+Y`
+    /// unit direction.
+    #[test]
+    fn every_arc_vertex_lies_in_the_deck_plane() {
+        for archetype in Archetype::ALL {
+            for arc in firing_arcs(*archetype) {
+                let mesh = arc_mesh(arc, 10.0);
+                let VertexAttributeValues::Float32x3(points) = mesh
+                    .attribute(Mesh::ATTRIBUTE_POSITION)
+                    .expect("the fan has positions")
+                else {
+                    panic!("arc positions are Float32x3");
+                };
+                assert!(points.len() > 3, "{}: a fan needs a rim", arc.name);
+                for point in points {
+                    assert_eq!(
+                        point[1], 0.0,
+                        "{}: vertex {point:?} left the deck plane — this is the +Y cone trap",
+                        arc.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The arc's rim spans exactly the arc and nothing outside it, measured in
+    /// bearings recovered from the geometry rather than from the inputs.
+    #[test]
+    fn an_arcs_rim_spans_exactly_its_own_bearings() {
+        for archetype in Archetype::ALL {
+            for arc in firing_arcs(*archetype) {
+                let radius = 40.0f32;
+                let mesh = arc_mesh(arc, radius);
+                let VertexAttributeValues::Float32x3(points) = mesh
+                    .attribute(Mesh::ATTRIBUTE_POSITION)
+                    .expect("the fan has positions")
+                else {
+                    panic!("arc positions are Float32x3");
+                };
+                let mut extremes: Vec<i32> = Vec::new();
+                for point in points.iter().skip(1) {
+                    let here = Vec3::new(point[0], point[1], point[2]);
+                    assert!(
+                        (here.length() - radius).abs() < 1e-2,
+                        "{}: rim vertex {here} is not at radius {radius}",
+                        arc.name
+                    );
+                    // Recover the bearing the way the ruleset reads one.
+                    let bearing = (here.z.atan2(here.x) * 1_000_000.0).round() as i32;
+                    assert!(
+                        arc.contains_urad(bearing),
+                        "{}: rim bearing {bearing} µrad is outside the arc",
+                        arc.name
+                    );
+                    extremes.push(bearing);
+                }
+                let widest = extremes
+                    .iter()
+                    .map(|bearing| {
+                        let mut delta = (bearing - arc.centre_urad).rem_euclid(TAU_URAD_I32);
+                        if delta > TAU_URAD_I32 / 2 {
+                            delta -= TAU_URAD_I32;
+                        }
+                        delta.abs()
+                    })
+                    .max()
+                    .expect("the rim has vertices");
+                assert!(
+                    (widest - arc.half_width_urad).abs() < 100,
+                    "{}: the rim reaches {widest} µrad of a {} µrad half-width",
+                    arc.name,
+                    arc.half_width_urad
+                );
+            }
         }
     }
 }
