@@ -291,6 +291,14 @@ lane_gates() {
     # Needs no client checkout and no display stack; well under a second.
     run scripts/client-tests.sh --self-test
 
+    # The CI path filter. It decides whether clippy, this lane and the test
+    # suite run at all on a pull request, so a wrong "documentation only" here
+    # is not a slow build — it is a PR that goes green having checked nothing.
+    # The rule cannot live inline in ci.yml because YAML cannot be tested: a
+    # condition replaced by `if false` still parses. It lives in a script so
+    # this line can exist.
+    run scripts/ci-changed-code.sh --self-test
+
     # The two P4 scripts, which until now ran their self-tests only in
     # nightly.yml. That is where the cost of an uncovered self-test was
     # actually paid: `p4-ledger.sh --self-test` counted ledger lines with `wc

@@ -827,6 +827,22 @@ for _lane in fmt clippy gates test; do
 done
 unset _lane
 
+# ci.yml's `changes` job is a path filter, not a gate: it decides whether the
+# expensive lanes have anything to check on this PR. It has no local analogue —
+# its whole input is the pull request's base sha — so it cannot run here.
+#
+# It still gets a trio, because a discovered job without one reports UNKNOWN,
+# and an UNKNOWN in the gate report is indistinguishable from a gate nobody
+# has looked at. Saying "cannot run locally, and here is why" is information;
+# UNKNOWN is not.
+gate_ci_changes_tier() { echo full; }
+gate_ci_changes_prereq() {
+  echo 'a path filter over the pull request base sha; there is no local equivalent'
+  return 1
+}
+gate_ci_changes_run() { return 0; }
+gate_ci_changes_evidence() { ev_none; }
+
 # The cross-platform determinism matrix and its verdict job. Three runners by
 # construction; one machine cannot produce the comparison, and a Linux-only
 # leg passing says nothing about the claim.

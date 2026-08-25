@@ -107,10 +107,57 @@ jobs:
       # own. scripts/check.sh holds the list.
       - run: scripts/check.sh fmt
 
+  # ── is there anything for the heavy lanes to check? ────────────────────────
+  #
+  # A documentation-only change cannot break clippy, the static gates or the
+  # test suite, and the three of them cost 239 s, 656 s and 674 s cold (#171).
+  # This job decides once whether the expensive trio has anything to do.
+  #
+  # Two properties make it safe rather than merely cheap:
+  #
+  #   * It FAILS OPEN. Anything it cannot classify — a push, a manual dispatch,
+  #     a missing base sha, a git failure — yields `code=true` and the full
+  #     lanes run. A filter that guesses wrong must run CI, not skip it.
+  #   * The rule lives in `scripts/ci-changed-code.sh`, which has a self-test
+  #     the gates lane runs on every commit. That matters more than it looks:
+  #     a filter that wrongly answers "false" skips clippy, the gates and the
+  #     whole suite, and the PR goes green having checked nothing. Inline YAML
+  #     cannot be tested — `yaml.safe_load` parses a filter whose condition has
+  #     been replaced by `if false` without complaint.
+  #
+  # The guarded jobs are SKIPPED, not path-filtered out of the workflow. A
+  # skipped job still reports its check; a workflow that never triggers reports
+  # nothing, and `rustfmt`, `clippy`, `static gates`, `workspace tests` and
+  # `determinism verdict` are all required on main — a check that never
+  # reports blocks the merge forever instead of speeding it up.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        run: |
+          code=$(scripts/ci-changed-code.sh '${{ github.event.pull_request.base.sha }}')
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [[ $code == true ]]; then
+            echo 'running the full lanes'
+          else
+            echo 'documentation only — skipping clippy, static gates and workspace tests'
+          fi
+          git diff --name-only '${{ github.event.pull_request.base.sha }}' HEAD 2>/dev/null | sed 's/^/  /' || true
+
   clippy:
     name: clippy
     # Already proven on the PR's merge commit; see the note by `concurrency`.
-    if: github.event_name != 'push'
+    # `changes` adds the second condition: a markdown-only PR has nothing
+    # here to check. Skipped still reports the required check; see `changes`.
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     # Hosted since #178. #171 measured this lane cold and cacheless on
     # `ubuntu-latest` at 239 s and 244 s over two independent samples, peaking
     # at 3.43 GiB of disk growth with 82.78 GiB still free — 24x headroom — and
@@ -396,7 +443,10 @@ jobs:
   gates:
     name: static gates
     # Already proven on the PR's merge commit; see the note by `concurrency`.
-    if: github.event_name != 'push'
+    # `changes` adds the second condition: a markdown-only PR has nothing
+    # here to check. Skipped still reports the required check; see `changes`.
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     # Hosted since #178, and the last lane to get there. It was never short of
     # headroom: #171 measured it cold and cacheless on `ubuntu-latest` at
     # **656 s**, peaking at 17.57 GiB of disk growth with **68.64 GiB still
@@ -523,7 +573,10 @@ jobs:
   test:
     name: workspace tests
     # Already proven on the PR's merge commit; see the note by `concurrency`.
-    if: github.event_name != 'push'
+    # `changes` adds the second condition: a markdown-only PR has nothing
+    # here to check. Skipped still reports the required check; see `changes`.
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     # Hosted since #178, and this is the lane whose fit was in question. #171
     # measured it cold on `ubuntu-latest` twice: 674 s and 681 s wall-clock,
     # 46.92 GiB peak disk growth, **39.29 GiB still free at the peak** — 0.84x
