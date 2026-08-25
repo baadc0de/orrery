@@ -56,6 +56,10 @@ usage() {
   cat >&2 <<'USAGE'
 usage: p4-ledger.sh append <report.json>   bank one gates/p1-swarm report
        p4-ledger.sh total                  running totals, grouped by pipeline
+       p4-ledger.sh shakedown              #329's unbanked-shakedown evidence report
+       p4-ledger.sh freeze <baseline> [candidate]
+                                            verify PIPELINE_TREES stayed frozen;
+                                            candidate defaults to HEAD
        p4-ledger.sh --self-test            structural + functional self-check
 
   P4_LEDGER_FILE   ledger path (default: target/p4-ledger/hours.jsonl)
@@ -119,6 +123,10 @@ self_test() {
     || die 'self-test: the coreutils-free digest fallback is gone; this cannot run on a macOS runner'
   has 'mkdir "$LEDGER.lock.d"' \
     || die 'self-test: the flock-free lock is gone; the append cannot be serialized off Linux'
+  has 'cmd_shakedown' \
+    || die 'self-test: #329 no longer has a shakedown report command'
+  has 'cmd_freeze' \
+    || die 'self-test: #329 no longer has a freeze-window verifier'
 
   # Functional half. The structural checks above cannot tell a clause that is
   # read from one that is read and ignored, and every case below costs
@@ -348,12 +356,88 @@ self_test() {
   (( $(st_lines) == before + 1 )) \
     || die 'self-test: one seed on two targets banked once; the measurement key lost its target'
 
+  # #329's report must name absent evidence as UNKNOWN, rather than treating a
+  # ledger with no shakedown annotations as a clean shakedown.  Conversely, an
+  # explicitly bad observation must be a named FAIL.  These are planted ledger
+  # rows: this test does not run a campaign or fabricate campaign evidence.
+  jq -n '
+    ["linux", "windows", "macos"] | to_entries | map({
+      run_key: ("shake-" + (.key | tostring)), measurement_key: ("shake-" + (.key | tostring)),
+      pipeline: "shakedown-test", actor: "human", seed: (.key + 20),
+      impairment: {loss: 0.03, jitter_ticks: 6, jitter_rate: 0.1, retransmit_ticks: 3},
+      target: (if .value == "linux" then "x86_64-unknown-linux-gnu" elif .value == "windows" then "x86_64-pc-windows-msvc" else "aarch64-apple-darwin" end),
+      player_hours: (if .key == 0 then 8 else 9 end),
+      session: {actor: "human", configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100}, observed_loss_pct: 3, observed_jitter_p50_ms: 100, observed_jitter_p99_ms: 100, impairment_mismatch: false}
+    })[]' > "$dir/shakedown.jsonl"
+  local shakedown
+  shakedown="$(P4_LEDGER_FILE="$dir/shakedown.jsonl" "$0" shakedown 2>&1 || true)"
+  grep -q 'goldens green on all three platforms: UNKNOWN' <<<"$shakedown" \
+    || die "self-test: absent golden evidence did not report UNKNOWN ('$shakedown')"
+  jq '.session.shakedown = {phase: "unbanked", golden_pass: true, client_launch_pass: true, discrepancy_reports: 0, untriaged_discrepancy_reports: 0, triaged_real_reports: 0, tolerance_band_digest: "bands-v1"}' "$dir/shakedown.jsonl" > "$dir/shakedown.next.jsonl"
+  mv "$dir/shakedown.next.jsonl" "$dir/shakedown.jsonl"
+  shakedown="$(P4_LEDGER_FILE="$dir/shakedown.jsonl" "$0" shakedown 2>&1 || true)"
+  local criterion
+  for criterion in \
+    'goldens green on all three platforms' \
+    'client launches on all three platforms' \
+    'zero discrepancy reports triaged real over those hours' \
+    'no tolerance band moved during them' \
+    'impairment verified applied in every sampled session'
+  do
+    grep -q "$criterion: PASS" <<<"$shakedown" \
+      || die "self-test: passing shakedown fixture did not pass '$criterion' ('$shakedown')"
+  done
+  cp "$dir/shakedown.jsonl" "$dir/shakedown.good.jsonl"
+  st_shakedown_fail() {
+    jq "$1" "$dir/shakedown.good.jsonl" > "$dir/shakedown.jsonl"
+    shakedown="$(P4_LEDGER_FILE="$dir/shakedown.jsonl" "$0" shakedown 2>&1 || true)"
+    grep -q "$2: FAIL" <<<"$shakedown" \
+      || die "self-test: mutation '$1' did not fail named criterion '$2' ('$shakedown')"
+  }
+  st_shakedown_fail '.session.shakedown.golden_pass = false' \
+    'goldens green on all three platforms'
+  st_shakedown_fail 'if .target | test("windows") then .session.shakedown.client_launch_pass = false else . end' \
+    'client launches on all three platforms'
+  st_shakedown_fail '.session.shakedown.triaged_real_reports = 1' \
+    'zero discrepancy reports triaged real over those hours'
+  st_shakedown_fail 'if .target | test("windows") then .session.shakedown.tolerance_band_digest = "bands-v2" else . end' \
+    'no tolerance band moved during them'
+  st_shakedown_fail '.session.impairment_mismatch = true' \
+    'impairment verified applied in every sampled session'
+
+  # Mutation proof for the guarded freeze condition.  The second commit changes
+  # a real PIPELINE_TREE, so matching the two endpoint digests would be a
+  # surviving mutation, not a passing test.
+  local freeze_repo base moved frozen
+  freeze_repo="$dir/freeze-repo"
+  mkdir -p "$freeze_repo"/{crates/orrery_witness,crates/orrery_core,crates/orrery_games,gates/p1-swarm}
+  git -C "$freeze_repo" init -q
+  git -C "$freeze_repo" config user.email self-test@invalid
+  git -C "$freeze_repo" config user.name self-test
+  touch "$freeze_repo"/{crates/orrery_witness,crates/orrery_core,crates/orrery_games,gates/p1-swarm}/kept
+  git -C "$freeze_repo" add . && git -C "$freeze_repo" commit -qm baseline
+  base=$(git -C "$freeze_repo" rev-parse HEAD)
+  printf 'changed\n' > "$freeze_repo/crates/orrery_games/mutated"
+  git -C "$freeze_repo" add . && git -C "$freeze_repo" commit -qm mutated-pipeline-tree
+  moved=$(git -C "$freeze_repo" rev-parse HEAD)
+  if P4_ROOT="$freeze_repo" P4_PIPELINE_ID=forged "$0" freeze "$base" "$moved" >"$dir/freeze.out" 2>&1; then
+    die 'self-test: a changed PIPELINE_TREE passed the freeze verifier'
+  fi
+  grep -q 'freeze window: FAIL' "$dir/freeze.out" \
+    || die 'self-test: the changed PIPELINE_TREE did not emit the named freeze failure'
+  git -C "$freeze_repo" commit --allow-empty -qm unrelated-change
+  frozen=$(git -C "$freeze_repo" rev-parse HEAD)
+  P4_ROOT="$freeze_repo" P4_PIPELINE_ID= "$0" freeze "$moved" "$frozen" >"$dir/freeze.out" 2>&1 \
+    || die 'self-test: an unchanged PIPELINE_TREE failed the freeze verifier'
+  grep -q 'freeze window: PASS' "$dir/freeze.out" \
+    || die 'self-test: unchanged endpoint digests did not emit the named freeze pass'
+
   rm -rf "$dir"
   trap - EXIT
   echo "$NAME: self-test passed"
 }
 
-readonly ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+readonly ROOT="${P4_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 readonly LEDGER="${P4_LEDGER_FILE:-$ROOT/target/p4-ledger/hours.jsonl}"
 
 need() { command -v "$1" >/dev/null || die "$1 is required and not on PATH"; }
@@ -737,10 +821,88 @@ cmd_total() {
   ' "$LEDGER"
 }
 
+# #329 is deliberately an instrument, not a campaign runner.  Its annotations
+# are not present in the current ledger schema, so every missing field below is
+# surfaced as UNKNOWN with the exact field an operator/evidence writer must add.
+# It uses `distinct` from JQ_PRELUDE: provenance re-measurements never become
+# fresh shakedown hours, and no result ever combines pipeline digests.
+cmd_shakedown() {
+  need jq
+  [[ -r $LEDGER ]] || {
+    echo 'shakedown gate: no ledger evidence — every criterion is UNKNOWN'
+    return 1
+  }
+  local report
+  report=$(jq -rs "$JQ_PRELUDE"'
+    def state($known; $bad):
+      if $known == 0 then "UNKNOWN" elif $bad then "FAIL" else "PASS" end;
+    distinct | group_by(.pipeline) | .[] | . as $rows
+    | ($rows | map(select(.session.shakedown.phase? == "unbanked"))) as $sessions
+    | "shakedown gate, pipeline \($rows[0].pipeline): \($rows | map(.player_hours) | add | hrs) distinct ledger hours (never combined with another pipeline)",
+      (if ($sessions | length) == 0 then
+         "  unbanked mixed cohort: UNKNOWN — needs session.shakedown.phase = \"unbanked\" to distinguish shakedown evidence from banked campaign rows"
+       else
+         ($sessions | map(.player_hours) | add | hrs) as $hours
+         | ($sessions | map(select(actor == "human") | .player_hours) | add // 0 | hrs) as $human
+         | ($sessions | map(.target | platform) | unique | length) as $platforms
+         | "  unbanked mixed cohort: " + (if $hours >= 25 and $human >= 8 and $platforms == 3 then "PASS" else "FAIL" end)
+           + " — \($hours) distinct hours; \($human) human; \($platforms) of 3 platforms (requires ≥25, ≥8 human, all 3)"
+       end),
+      ($sessions | map(select(.session.shakedown.golden_pass? != null))) as $goldens
+      | "  goldens green on all three platforms: " + state(($goldens | length); (($goldens | any(.session.shakedown.golden_pass != true)) or (($goldens | map(.target | platform) | unique | length) != 3)))
+        + (if ($goldens | length) == 0 then " — needs session.shakedown.golden_pass per platform" else " — \($goldens | length) sampled session(s)" end),
+      ($sessions | map(select(.session.shakedown.client_launch_pass? != null))) as $launches
+      | "  client launches on all three platforms: " + state(($launches | length); (($launches | any(.session.shakedown.client_launch_pass != true)) or (($launches | map(.target | platform) | unique | length) != 3)))
+        + (if ($launches | length) == 0 then " — needs session.shakedown.client_launch_pass per platform" else " — \($launches | length) sampled session(s)" end),
+      ($sessions | map(select(.session.shakedown.discrepancy_reports? != null and .session.shakedown.untriaged_discrepancy_reports? != null and .session.shakedown.triaged_real_reports? != null))) as $triage
+      | "  zero discrepancy reports triaged real over those hours: " + state(($triage | length); ($triage | any(.session.shakedown.triaged_real_reports != 0 or .session.shakedown.untriaged_discrepancy_reports != 0)))
+        + (if ($triage | length) == 0 then " — needs session.shakedown.discrepancy_reports, .untriaged_discrepancy_reports, and .triaged_real_reports" else " — \($triage | map(.session.shakedown.discrepancy_reports) | add) reports; \($triage | map(.session.shakedown.triaged_real_reports) | add) triaged real; \($triage | map(.session.shakedown.untriaged_discrepancy_reports) | add) untriaged" end),
+      ($sessions | map(select(.session.shakedown.tolerance_band_digest? != null))) as $bands
+      | "  no tolerance band moved during them: " + state(($bands | length); (($bands | map(.session.shakedown.tolerance_band_digest) | unique | length) != 1))
+        + (if ($bands | length) == 0 then " — needs session.shakedown.tolerance_band_digest" else " — \($bands | map(.session.shakedown.tolerance_band_digest) | unique | join(", "))" end),
+      ($sessions | map(select(.session.configured_impairment_profile? != null and .session.observed_loss_pct? != null and .session.observed_jitter_p50_ms? != null and .session.observed_jitter_p99_ms? != null and .session.impairment_mismatch? != null))) as $impairment
+      | "  impairment verified applied in every sampled session: " + state(($impairment | length); ($impairment | any(.session.impairment_mismatch != false)))
+        + (if ($impairment | length) == 0 then " — needs the existing session configured_impairment_profile, observed_* and impairment_mismatch fields" else " — \($impairment | length) sampled session(s); \($impairment | map(select(.session.impairment_mismatch == false)) | length) observed/configured matches" end)
+  ' "$LEDGER")
+  printf '%s\n' "$report"
+  grep -Eq ': (FAIL|UNKNOWN)' <<<"$report" && return 1
+}
+
+# The verifier compares a recorded baseline commit to a later commit (HEAD by
+# default).  Requiring two different commits prevents a vacuous `HEAD`/`HEAD`
+# check from declaring a window frozen.  It deliberately hashes the same four
+# trees and ordering as `pipeline_id`; scripts themselves are outside the P4
+# pipeline by the accepted definition.
+cmd_freeze() {
+  local baseline=${1:-} candidate=${2:-HEAD}
+  [[ -n $baseline ]] || die 'freeze: provide the recorded baseline commit (candidate defaults to HEAD)'
+  local before after
+  before=$(git -C "$ROOT" rev-parse --verify "$baseline^{commit}") \
+    || die "freeze: baseline '$baseline' is not a commit"
+  after=$(git -C "$ROOT" rev-parse --verify "$candidate^{commit}") \
+    || die "freeze: candidate '$candidate' is not a commit"
+  [[ $before != "$after" ]] || die 'freeze: baseline and candidate resolve to the same commit; compare two points in the window'
+  local before_digest after_digest
+  # P4_PIPELINE_ID exists only to make fixtures deterministic.  Honour it for
+  # append tests, never for a freeze decision: an override would let two moved
+  # trees compare equal and open banking on a rules change.
+  before_digest=$(P4_PIPELINE_ID= pipeline_id "$before")
+  after_digest=$(P4_PIPELINE_ID= pipeline_id "$after")
+  echo "freeze window: baseline ${before:0:12} pipeline $before_digest; candidate ${after:0:12} pipeline $after_digest"
+  if [[ $before_digest == "$after_digest" ]]; then
+    echo 'freeze window: PASS — PIPELINE_TREES digest unchanged'
+  else
+    echo 'freeze window: FAIL — PIPELINE_TREES digest moved; banking must remain closed'
+    return 1
+  fi
+}
+
 case ${1:-} in
   --self-test) self_test ;;
   append) shift; cmd_append "$@" ;;
   total) shift; cmd_total "$@" ;;
+  shakedown) shift; cmd_shakedown "$@" ;;
+  freeze) shift; cmd_freeze "$@" ;;
   -h | --help) usage ;;
   *) usage; die "unknown command '${1:-<none>}'" ;;
 esac
