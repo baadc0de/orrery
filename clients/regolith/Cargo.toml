@@ -23,3 +23,10 @@ iroh = "1.0.3"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
+
+[dev-dependencies]
+# Test-only. `ruleset_agreement` reproduces the ruleset's own per-tick draw
+# from `orrery_core::tick_rng`, which hands back a `ChaCha8Rng`; reading a
+# `u32` out of one needs `RngCore` in scope. Already in this client's lock as
+# a transitive dependency of `orrery_core`.
+rand_core = "0.9"

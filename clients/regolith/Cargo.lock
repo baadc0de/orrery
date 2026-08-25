@@ -7065,6 +7065,7 @@ dependencies = [
  "orrery_games",
  "orrery_predict",
  "orrery_protocol",
+ "rand_core 0.9.5",
  "serde",
  "serde_json",
  "tokio",
