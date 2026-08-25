@@ -177,3 +177,154 @@ doctrine restated at the boundary:
   canonical** — this is A6 R6's cyclic-dependency clause, and it is
   structurally satisfied while canonical state lives outside the app world
   (A6 §3.5 table, last row).
+
+---
+
+## 3. Closing G-1: what would enforce IV-7 at this boundary
+
+A5 named the invariant (IV-7: no capability for a schema embedding an engine
+handle) and named the gap (G-1: no mechanical guard watches replicated payload
+field types — E-11). Mutation M3 (§6) proves the gap is real at exactly the
+seam this document draws: `Entity::to_bits()` rode into a `DiffUplink` payload
+and 100 tests plus every gate passed. Proposals, in order of arrival:
+
+1. **Type-level guard at registration (near-term, mechanical).** Replicon
+   payloads are produced by registered per-component serde fns (E-8). Require
+   the registration path to bound the component type with a sealed marker
+   trait — call it `EngineHandleFree` — implemented for primitives, protocol
+   types, and std containers of same, derivable structurally, and **not**
+   implemented for `Entity`, `ComponentId`, or any `bevy_ecs` type. A
+   component embedding a handle then fails at the registration call site, at
+   compile time. This is the only guard that can work: **byte-level scanning
+   cannot** — entity bits are indistinguishable from any other `u64`, so a
+   payload scanner would be theater. The guard must live where the type is
+   still a type.
+2. **Schema-declaration refusal (the durable fix, A5 §5).** When the
+   capability/declaration registry exists, a declared `(ComponentTypeId,
+   SchemaVersion)` codec whose schema contains an engine-handle type is
+   refused at declaration time — IV-7 as written. The registry's namespace
+   governance is **A8's (#404)**, being defined now; this document proposes
+   only that IV-7 refusal be a registry acceptance criterion, and does not
+   specify manifest content.
+3. **Gate-list honesty (cheap, immediate).** Whatever crate ends up hosting
+   the registration seam should be added to a *named* scan — not assumed
+   covered. E-2 is the standing lesson: `GATED_CRATES` is the coverage.
+
+Decision ownership: adopting 1 touches `orrery_persist_client`/`orrery_spatial`
+API; adopting 2 is A8-adjacent registry design; both are proposals for the
+owner, not decisions made here.
+
+---
+
+## 4. The Unreal boundary — **[SPEC — no implementation exists]**
+
+**Standing marker for this entire section:** there is zero Unreal code in the
+tree (§0). Every sentence below is a specification against an absent
+implementation and is unevidenced by construction. Where a statement borrows
+evidence, the evidence is about the *Rust side* of the boundary, and is cited;
+nothing here says anything evidenced about Unreal itself. The brief's sketch
+(`ruleset-ecs-migration-brief.md:481-505`) is the source; this section grooms
+it against what actually ships on the Rust side.
+
+### 4.1 Commands into the runtime **[SPEC]**
+
+- Input/interaction commands, view/interest hints, and session requests enter
+  as `orrery_protocol` types (postcard-encoded, engine-free — E-14), exactly
+  the classes A6 §2 fixed. Commands join the input log at S0 seal order like
+  any other host's commands (A4 S0/S1); an Unreal-originated command is
+  indistinguishable from a Bevy-originated one past the seal. **This is the
+  demonstrable half of "same canonical rules": the rules cannot tell engines
+  apart because no engine identity survives S0.**
+- No Unreal type crosses inward. UObject identity, Actor references, and
+  Blueprint state never appear in a command; the FFI carries fixed-width
+  integers and byte buffers only (§4.4).
+
+### 4.2 Presentation frames and events out **[SPEC]**
+
+The outbound contract is §2.4's extraction contract verbatim — the sidecar
+emits what the Bevy mirror consumes today, keyed the same way:
+
+- spawn/despawn batches keyed by `PersistId` (u64 — E-14);
+- interpolated/predicted transforms from post-S4 quantized state;
+- domain events, presentation events, authority changes, persistence
+  outcomes, corrections and rollback notices (the brief's list, adopted);
+- overwrite semantics throughout; on correction, frames are regenerated and
+  the Unreal side performs no undo logic (A6 §3.5 applies unchanged — the
+  contract is engine-generic because nothing in it names an engine).
+
+### 4.3 Sidecar and embedded variants **[SPEC]**
+
+- **Sidecar (first): a headless Rust process linking the same crates** the
+  Bevy client's canonical path links, plus an IPC adapter. The transport
+  precedent exists in-tree: persistd and the coordinator already speak
+  "an admission uni-stream, then tagged datagrams" over iroh, and persistd
+  serves gRPC (`crates/orrery_persistd/src/journal/chain_grpc.rs`) — the
+  sidecar adds no novel transport class. Note honestly: the host the sidecar
+  would wrap — the `SimulationHost` seam — **does not exist yet** (E-15);
+  the sidecar is therefore two absences deep: no host seam, no Unreal
+  consumer. Both A3 lanes recommend building the seam first for reasons
+  independent of Unreal.
+- **Embedded (second): a static/dynamic library owning the same canonical
+  store behind a C ABI.** Same crates, same store, no process boundary.
+  Deferred behind the sidecar because the sidecar exercises every contract
+  the embedding needs while keeping crash and version isolation.
+- In both variants the canonical store is the executor's (E-1) — never an
+  Unreal-side structure. The sidecar/embedding is an *authority host or an
+  observer*; Unreal is a mirror consumer in exactly the sense the Bevy app
+  world is one today (§2.1).
+
+### 4.4 Stable FFI types **[SPEC]**
+
+Adopting the brief's list (`ruleset-ecs-migration-brief.md:497-503`), made
+concrete against what exists:
+
+- ids: `PersistId`/`Tick` are already `u64` newtypes (E-14) — they cross as
+  `uint64_t`;
+- opaque runtime handles for sessions/subscriptions; fixed-width integers
+  everywhere; explicit byte buffers with declared ownership and length;
+  batched commands and frames;
+- payload encoding: the declared codecs that already exist (postcard over
+  explicit wire structs; `CoreCodec` for canonical bytes — E-8/E-9). No
+  reflection-derived schema (A5 N-6).
+- versioning: a **runtime ABI version** separate from the **rules/manifest
+  version**. The manifest axes and their content are **A8's (#404)** — this
+  document cites A8 as owner and specifies nothing about manifest content
+  beyond: the FFI must carry both versions and refuse a mismatch it cannot
+  prove compatible.
+- **No `bevy_ecs` type crosses the C ABI or IPC boundary** — the brief's rule
+  (`ruleset-ecs-migration-brief.md:495`), adopted as the Unreal twin of B-1.
+  Proposed enforcement (the honest kind, learned from E-2): the adapter
+  crate's dependency graph is the guard — it should depend on
+  `orrery_protocol` and the host API only, and be added *by name* to the
+  Bevy-free scan list, because a gate not naming it does not cover it.
+
+### 4.5 Explicit exclusions **[SPEC]**
+
+**Actor replication, Iris, Mass, Chaos, UObject identity, and Blueprint state
+are not canonical truth and may never become it.** They may mirror or consume
+canonical state (the brief's rule, adopted verbatim). The reason is the same
+one that rejected the shared Bevy world (E-12), applied symmetrically: the
+moment canonical truth acquires engine-native replication semantics, every
+structural guarantee — witness projection, rollback scope, single-writer
+authority — degrades to convention inside a machine Orrery does not control.
+Chaos physics results, in particular, are presentation: a Chaos-simulated
+transform is a *visual*, and anything canonical about motion comes from the
+rules crates or it does not exist.
+
+### 4.6 "Same canonical rules" — what is demonstrated versus asserted
+
+The acceptance item asks for demonstration. What can honestly be demonstrated
+today, and what cannot:
+
+- **Demonstrated (Rust side): the same rules crates already execute under
+  three host shapes with hash equality** — a Bevy `App` (p1-swarm bot, E-6),
+  headless test harnesses, and Bevy-free persistd adjudication — and the
+  conformance corpus pins cross-platform chain equality against committed
+  goldens. The rules are host-blind because no host identity survives S0
+  (§4.1) and no engine type can compile into them (M2, §6).
+- **Not demonstrated (Unreal side): that any Unreal build will drive them.**
+  "Bevy and Unreal execute the same canonical rules" is reducible to "the
+  sidecar links the same crates and replays the committed goldens" — which is
+  a *checkable acceptance criterion of the observer proof* (§5), not a
+  current fact. Asserting it today would be asserting a property of code
+  that does not exist. This document declines to.
