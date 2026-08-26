@@ -336,6 +336,7 @@ impl Plugin for RegolithSkinPlugin {
                     .chain()
                     .after(sync_rendered_state),
             )
+            .add_systems(Update, capture_tracer_geometry.after(hud::sync_tracers))
             .add_systems(Update, write_campaign_record_on_exit)
             .add_systems(
                 Update,
@@ -741,6 +742,37 @@ fn capture_client_geometry(runtime: &campaign::CampaignRuntime, events: &[Outcom
             range_sq,
             reach_mm,
         );
+    }
+}
+
+fn capture_tracer_geometry(
+    capture: Option<Res<GeometryCapture>>,
+    session: Res<ActiveSession>,
+    tracks: Res<ProjectileTracks>,
+    tracers: Query<(&hud::Tracer, &Transform, &Visibility)>,
+) {
+    if capture.is_none() {
+        return;
+    }
+    let ActiveSession::Campaign(runtime) = &*session else {
+        return;
+    };
+    for (tracer, transform, visibility) in &tracers {
+        let Some(track) = tracks.tracks().get(tracer.0) else {
+            continue;
+        };
+        if track.presented && track.travelled() > 0.0 && *visibility == Visibility::Inherited {
+            eprintln!(
+                "tracer_capture tick={} slot={} attacker={} target={} travelled={:.3} centre={:?} scale_x={:.3} visible=true",
+                runtime.joined_ticks().saturating_sub(1),
+                tracer.0,
+                track.attacker.0,
+                track.target.0,
+                track.travelled(),
+                transform.translation,
+                transform.scale.x,
+            );
+        }
     }
 }
 
