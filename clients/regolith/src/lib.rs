@@ -357,10 +357,7 @@ fn setup_scene(
 ) {
     commands.spawn((
         Camera3d::default(),
-        Projection::from(PerspectiveProjection {
-            fov: CAMERA_FOV_Y,
-            ..Default::default()
-        }),
+        Projection::from(chase_camera_projection()),
         ChaseCamera,
         chase_camera_transform(Vec3::ZERO, CAMERA_DEFAULT_HEIGHT_M),
     ));
@@ -1161,6 +1158,39 @@ struct ChaseCamera;
 /// whatever `PerspectiveProjection::default()` happens to be this release.
 pub const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 
+/// The chase camera's far clip plane, in metres.
+///
+/// **This is not a tuning knob, it is a bug fix.** Bevy's default perspective
+/// projection clips at 1000 m. The camera looks straight down from
+/// `CameraZoom`'s height, so at any height past 1000 m the *deck plane itself*
+/// is behind the far plane and the entire world stops being drawn — and the
+/// old autozoom reached that height whenever the bodies it framed were more
+/// than ~385 m apart, which is well inside one weapon envelope. Anything
+/// beyond the plane simply vanished, with no error and nothing a test that
+/// asserts on state could see.
+///
+/// The value has to clear [`CAMERA_MAX_HEIGHT_M`] plus the depth of the
+/// deepest starfield layer plus that layer's own extent, and there is no cost
+/// to headroom here: this is a reversed-Z depth buffer, whose precision is
+/// governed by `near`, not by `far`.
+pub const CAMERA_FAR_M: f32 = 120_000.0;
+
+/// The chase camera's near clip plane, in metres. Well inside the closest the
+/// camera is allowed to fly, and the number that actually governs depth
+/// precision.
+pub const CAMERA_NEAR_M: f32 = 1.0;
+
+/// The projection the chase camera is built with.
+#[must_use]
+pub fn chase_camera_projection() -> PerspectiveProjection {
+    PerspectiveProjection {
+        fov: CAMERA_FOV_Y,
+        near: CAMERA_NEAR_M,
+        far: CAMERA_FAR_M,
+        ..Default::default()
+    }
+}
+
 /// Half the world height a top-down camera at `height_m` can see, in metres.
 ///
 /// `tan(fov/2) * height` — the camera looks straight down, so the deck plane
@@ -1790,6 +1820,24 @@ mod tests {
         assert!(
             radii[0] > radii[1] && radii[1] > radii[2],
             "the drawn size is the ruleset's own radius and must separate the tiers"
+        );
+    }
+
+    /// The camera looks straight down, so the deck plane is exactly the
+    /// camera's height away. A far plane inside the zoom range clips the whole
+    /// world away silently, which is what Bevy's 1000 m default did.
+    #[test]
+    fn the_far_plane_clears_the_whole_zoom_range() {
+        let projection = chase_camera_projection();
+        assert!(
+            projection.far > CAMERA_MAX_HEIGHT_M,
+            "the deck must stay inside the frustum at full zoom-out: far {} vs height {}",
+            projection.far,
+            CAMERA_MAX_HEIGHT_M
+        );
+        assert!(
+            projection.near < CAMERA_MIN_HEIGHT_M,
+            "the deck must stay inside the frustum at full zoom-in"
         );
     }
 
