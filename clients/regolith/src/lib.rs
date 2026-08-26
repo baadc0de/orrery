@@ -336,6 +336,7 @@ impl Plugin for RegolithSkinPlugin {
                     .chain()
                     .after(sync_rendered_state),
             )
+            .add_systems(Update, capture_tracer_geometry.after(hud::sync_tracers))
             .add_systems(Update, write_campaign_record_on_exit)
             .add_systems(
                 Update,
@@ -598,7 +599,15 @@ fn drive_core(
             }
             local.pending = delivered;
             local.tick = Tick::new(tick.0.saturating_add(1));
-            observe_skin_effects(&emitted, &[], PLAYER, &mut tracks, &mut broken, &mut shots);
+            observe_skin_effects(
+                &emitted,
+                &[],
+                PLAYER,
+                &[],
+                &mut tracks,
+                &mut broken,
+                &mut shots,
+            );
             clear_refused_selection(&emitted, &[], PLAYER, &mut selected);
         }
         ActiveSession::Campaign(runtime) => {
@@ -606,6 +615,19 @@ fn drive_core(
             // wire leg, replicated-state application, link measurement and
             // the accumulator feed.
             let report = runtime.advance(controls, &mut sink);
+            let presentation_targets: Vec<_> = report
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Outcome::DamageDealt { target, .. } => {
+                        match runtime.executor().state(*target) {
+                            Some(RegolithState::Craft(craft)) => Some((*target, craft.pos)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
             if geometry_capture.is_some() {
                 capture_rendered_geometry(runtime);
                 capture_client_geometry(runtime, &report.events);
@@ -615,6 +637,7 @@ fn drive_core(
                 &report.events,
                 &report.delivered,
                 runtime.entity(),
+                &presentation_targets,
                 &mut tracks,
                 &mut broken,
                 &mut shots,
@@ -722,6 +745,37 @@ fn capture_client_geometry(runtime: &campaign::CampaignRuntime, events: &[Outcom
     }
 }
 
+fn capture_tracer_geometry(
+    capture: Option<Res<GeometryCapture>>,
+    session: Res<ActiveSession>,
+    tracks: Res<ProjectileTracks>,
+    tracers: Query<(&hud::Tracer, &Transform, &Visibility)>,
+) {
+    if capture.is_none() {
+        return;
+    }
+    let ActiveSession::Campaign(runtime) = &*session else {
+        return;
+    };
+    for (tracer, transform, visibility) in &tracers {
+        let Some(track) = tracks.tracks().get(tracer.0) else {
+            continue;
+        };
+        if track.presented && track.travelled() > 0.0 && *visibility == Visibility::Inherited {
+            eprintln!(
+                "tracer_capture tick={} slot={} attacker={} target={} travelled={:.3} centre={:?} scale_x={:.3} visible=true",
+                runtime.joined_ticks().saturating_sub(1),
+                tracer.0,
+                track.attacker.0,
+                track.target.0,
+                track.travelled(),
+                transform.translation,
+                transform.scale.x,
+            );
+        }
+    }
+}
+
 fn clear_refused_selection(
     events: &[Outcome],
     delivered: &[DeliveredOrder],
@@ -758,6 +812,7 @@ pub fn observe_skin_effects(
     emitted: &[Outcome],
     delivered: &[DeliveredOrder],
     observer: PersistId,
+    presentation_targets: &[(PersistId, orrery_core::QPos)],
     tracks: &mut ProjectileTracks,
     broken: &mut LockBreak,
     shots: &mut ShotFeedback,
@@ -770,7 +825,9 @@ pub fn observe_skin_effects(
     // copy, not a simulation: it keeps the events this tick produced and
     // discards everything else, so a resolved shot loses its tracer on the
     // same tick the ruleset resolves it.
-    tracks.observe(emitted);
+    tracks.observe_campaign(emitted, observer, presentation_targets);
+    tracks.retire(emitted, observer);
+    tracks.retire(&delivered_feedback, observer);
     broken.age();
     broken.observe(emitted, observer);
     broken.observe(&delivered_feedback, observer);
@@ -1573,6 +1630,7 @@ mod tests {
             &[],
             &delivered,
             PLAYER,
+            &[],
             &mut tracks,
             &mut broken,
             &mut shots,
@@ -1601,7 +1659,15 @@ mod tests {
             attacker_weapon: orrery_games::regolith::weapon::WeaponKind::Stock,
             flight_ticks: None,
         }];
-        observe_skin_effects(&muzzle, &[], PLAYER, &mut tracks, &mut broken, &mut shots);
+        observe_skin_effects(
+            &muzzle,
+            &[],
+            PLAYER,
+            &[],
+            &mut tracks,
+            &mut broken,
+            &mut shots,
+        );
         assert_eq!(tracks.tracks().len(), 1, "the ruleset statement is copied");
 
         let delivered = [DeliveredOrder {
@@ -1614,6 +1680,7 @@ mod tests {
             &[],
             &delivered,
             PLAYER,
+            &[],
             &mut tracks,
             &mut broken,
             &mut shots,

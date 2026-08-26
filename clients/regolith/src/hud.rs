@@ -655,10 +655,11 @@ pub fn sync_range_rings(
 
 /// Places one tracer streak per shot the ruleset says is still in the air.
 ///
-/// Every input comes from the event: `attacker_pos` is the muzzle the
-/// ruleset stamped, and the head fraction is the ruleset's own `flight_ticks`
-/// countdown. There is no skin-side velocity integration, so a tracer cannot
-/// be somewhere the ruleset does not put it, and it cannot outlive the shot.
+/// `attacker_pos` is always the muzzle the ruleset stamped. Target-authored
+/// continuations supply their own countdown; campaign muzzle tracks use the
+/// shooter skin's presentation clock and frozen last-known target position.
+/// Neither path predicts a result, and an authoritative disposition retires
+/// the presentation track.
 ///
 /// Since #383 the tracer is a *streak*: [`tracer_streak`] stretches it back
 /// over [`TRACER_PERSISTENCE_TICKS`] of the same flight so its apparent speed
@@ -678,7 +679,14 @@ pub fn sync_tracers(
         };
         let (x, y, z) = track.origin.to_metres();
         let muzzle = Vec3::new(x as f32, y as f32, z as f32);
-        let Some(destination) = world_position(&bodies, track.target) else {
+        let destination = track.destination.map_or_else(
+            || world_position(&bodies, track.target),
+            |position| {
+                let (x, y, z) = position.to_metres();
+                Some(Vec3::new(x as f32, y as f32, z as f32))
+            },
+        );
+        let Some(destination) = destination else {
             *visibility = Visibility::Hidden;
             continue;
         };
@@ -1677,6 +1685,8 @@ mod tests {
                 remaining: 7,
                 total: 8,
                 timed: true,
+                destination: None,
+                presented: false,
             },
             tracks.tracks()[0]
         );
