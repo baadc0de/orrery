@@ -217,6 +217,12 @@ impl Plugin for AdmissionPlugin {
         .insert_resource(CampaignCatalog::default())
         .insert_resource(UiDirty(true))
         .add_systems(Startup, begin_fetch)
+        // `poll_worker` removes `JoinGate` the moment a join succeeds, and the
+        // two UI systems are chained behind it *in the same tick*. A
+        // `run_if(resource_exists)` on the chain does not help: the condition
+        // is evaluated once, before `poll_worker` deletes the resource, so all
+        // three still run. The systems therefore take the gate optionally and
+        // return when it is gone (#491).
         .add_systems(Update, (poll_worker, sync_nickname, rebuild_ui).chain())
         .add_observer(choose_campaign)
         .add_observer(retry_fetch)
@@ -307,11 +313,18 @@ fn poll_worker(
         Res<AdmissionTask>,
         ResMut<CampaignCatalog>,
     ),
-    mut gate: ResMut<JoinGate>,
-    mut dirty: ResMut<UiDirty>,
+    gate: Option<ResMut<JoinGate>>,
+    dirty: Option<ResMut<UiDirty>>,
     mut session: ResMut<ActiveSession>,
     roots: Query<Entity, With<JoinUiRoot>>,
 ) {
+    // This system removes both resources itself on a successful join, so from
+    // the very next tick they are gone and a mandatory `ResMut` would fail
+    // validation and panic. The join has already happened at that point —
+    // there is nothing left to poll (#491).
+    let (Some(mut gate), Some(mut dirty)) = (gate, dirty) else {
+        return;
+    };
     let (settings, task, mut catalog) = service;
     let reply = {
         let mut guard = task.0.lock().expect("admission task lock");
@@ -526,9 +539,14 @@ fn dismiss_dialog(
 
 fn sync_nickname(
     editors: Query<&EditableText, (With<NicknameEditor>, Changed<EditableText>)>,
-    mut gate: ResMut<JoinGate>,
-    mut dirty: ResMut<UiDirty>,
+    gate: Option<ResMut<JoinGate>>,
+    dirty: Option<ResMut<UiDirty>>,
 ) {
+    // The gate is gone once a join succeeds; this system is chained behind the
+    // system that removes it, so it must tolerate that rather than panic.
+    let (Some(mut gate), Some(mut dirty)) = (gate, dirty) else {
+        return;
+    };
     let Ok(editor) = editors.single() else {
         return;
     };
@@ -547,10 +565,13 @@ fn valid_nickname(nickname: &str) -> bool {
 
 fn rebuild_ui(
     mut commands: Commands,
-    gate: Res<JoinGate>,
-    mut dirty: ResMut<UiDirty>,
+    gate: Option<Res<JoinGate>>,
+    dirty: Option<ResMut<UiDirty>>,
     roots: Query<Entity, With<JoinUiRoot>>,
 ) {
+    let (Some(gate), Some(mut dirty)) = (gate, dirty) else {
+        return;
+    };
     if !dirty.0 {
         return;
     }
@@ -1035,6 +1056,28 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_join_gate_systems_do_not_run_once_the_gate_is_gone() {
+        // A successful join removes `JoinGate` inside `poll_worker`, and the
+        // UI systems chained behind it take `Res`/`ResMut<JoinGate>`. Without
+        // the run condition they execute in that same tick and Bevy panics
+        // with "Resource does not exist" — so the client died immediately
+        // *after* admitting, which reads as a crash on success. Observed live
+        // against the deployed service (#491).
+        let mut app = App::new();
+        // Exactly the real schedule, not a gated variant: the point is that
+        // these systems survive the tick in which `poll_worker` deletes the
+        // gate, and a run condition cannot express that because it is
+        // evaluated before the deletion happens.
+        // The post-join world for the two UI systems, which need nothing but
+        // the resources `poll_worker` deletes. `poll_worker` itself takes the
+        // same pair optionally and is exercised by running the real client
+        // against the live service — constructing an `ActiveSession` here
+        // would cost more than it proves.
+        app.add_systems(Update, (sync_nickname, rebuild_ui).chain());
+        app.update();
+    }
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()

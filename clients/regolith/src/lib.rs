@@ -239,6 +239,7 @@ impl Plugin for RegolithSkinPlugin {
                     sync_rendered_state,
                     select_clicked_body.before(sync_rendered_state),
                     recompose_craft_bodies.after(sync_rendered_state),
+                    ensure_local_body.after(sync_rendered_state),
                     ensure_focus_body.after(recompose_craft_bodies),
                     ensure_rock_bodies.after(sync_rendered_state),
                     // After `sync_rendered_state`: it frames the positions
@@ -655,6 +656,53 @@ fn ensure_rock_bodies(
 /// Spawns the remote duel body the moment a joined session learns which
 /// craft to follow. Local sessions always know both seats at startup and
 /// never trigger this.
+/// Spawns the body for the seat the player drives, and retires craft bodies
+/// whose entity the current session does not know.
+///
+/// `setup_scene` runs once at `Startup`, when the session is always
+/// `ActiveSession::Local`, so the only craft body it can spawn carries
+/// `CoreEntity(PLAYER)` — entity 1. Joining a campaign replaces the session:
+/// the player's craft becomes the slot-derived id (`slot + 1`, `campaign.rs`),
+/// and entity 1 is not in the campaign executor at all. `sync_rendered_state`
+/// then finds no state for the one body in the scene and skips it, so the ship
+/// never moves — while the HUD, which reads through `local_entity()`, shows
+/// speed changing. That is exactly the shape the bug was reported in.
+fn ensure_local_body(
+    session: Res<ActiveSession>,
+    asset_server: Res<AssetServer>,
+    paths: Res<VisualAssetPaths>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    bodies: Query<(Entity, &CoreEntity)>,
+    mut commands: Commands,
+) {
+    let local = session.local_entity();
+    let mut have_local = false;
+    for (body, core) in &bodies {
+        if core.0 == local {
+            have_local = true;
+        } else if session.executor().state(core.0).is_none() {
+            // A body the session no longer knows: the pre-join player craft
+            // after a campaign join. Left in place it is a frozen ghost.
+            commands.entity(body).despawn();
+        }
+    }
+    if have_local || session.executor().state(local).is_none() {
+        return;
+    }
+    spawn_craft_body(
+        &mut commands,
+        &asset_server,
+        &paths,
+        session.executor(),
+        local,
+        craft::Seat::Player,
+        Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
+        &mut meshes,
+        &mut materials,
+    );
+}
+
 fn ensure_focus_body(
     session: Res<ActiveSession>,
     asset_server: Res<AssetServer>,
