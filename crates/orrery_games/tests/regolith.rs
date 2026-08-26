@@ -2005,6 +2005,78 @@ fn range_exceeded_and_target_destroyed_break_logged_locks() {
     }
 }
 
+#[test]
+fn target_outrunning_in_flight_projectile_breaks_lock_for_range() {
+    let game = Regolith::honest();
+    let shooter = PersistId::new(1);
+    let target = PersistId::new(2);
+    let mut target_state = craft_at(300_000);
+    target_state.vel = QVel {
+        x: 120_000,
+        y: 0,
+        z: 0,
+    };
+    let mut executor = Executor::new(game, UniverseSeed([0x51; 32]));
+    executor.insert(shooter, RegolithState::Craft(locked_craft(target)));
+    executor.insert(target, RegolithState::Craft(target_state));
+
+    let fired = executor
+        .step_entity(shooter, Tick::new(1), &[Order::Fire])
+        .expect("shooter fires");
+    let (_, mut continuation) = game
+        .deliver(
+            fired
+                .events
+                .first()
+                .expect("locked fire emits a projectile"),
+        )
+        .expect("projectile is delivered");
+
+    let mut range_break = None;
+    for tick in 2..=100 {
+        let target_outcome = executor
+            .step_entity(target, Tick::new(tick), &[continuation])
+            .expect("target adjudicates projectile delivery");
+        if let Some(event) = target_outcome.events.iter().find(|event| {
+            matches!(
+                event,
+                Outcome::LockBroken {
+                    locker,
+                    target: broken_target,
+                    reason: LockBreakReason::RangeExceeded,
+                } if *locker == shooter && *broken_target == target
+            )
+        }) {
+            range_break = Some((tick, event.clone()));
+            break;
+        }
+        let (recipient, next) = target_outcome
+            .events
+            .iter()
+            .find_map(|event| game.deliver(event))
+            .expect("in-flight projectile continues until range breaks");
+        assert_eq!(recipient, target);
+        continuation = next;
+    }
+
+    let (break_tick, break_event) = range_break.expect("target outruns the projectile range");
+    assert!(break_tick > 2, "range break happens during flight");
+    let (recipient, break_order) = game.deliver(&break_event).expect("break is delivered");
+    assert_eq!(recipient, shooter);
+    executor
+        .step_entity(shooter, Tick::new(break_tick + 1), &[break_order])
+        .expect("shooter consumes the range break");
+    assert!(matches!(
+        executor.state(shooter),
+        Some(RegolithState::Craft(Craft {
+            lock_target: None,
+            lock_progress: 0,
+            lock_decay_progress: 0,
+            ..
+        }))
+    ));
+}
+
 fn run_contest() -> (
     [orrery_core::TickOutcome<Outcome>; 3],
     Vec<Outcome>,
