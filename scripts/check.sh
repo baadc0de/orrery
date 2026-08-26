@@ -322,6 +322,14 @@ lane_gates() {
     # than a pass that learned nothing.
     run scripts/campaign-release-preflight.sh --self-test
 
+    # #478's admission service. Its suite was never run here at all, so the
+    # thirteen tests #478 landed had never executed in CI — and when the
+    # identity binaries are absent the suite skips every one of them and still
+    # exits 0, which reads as a pass that learned nothing. Build them first so
+    # the skip cannot happen silently.
+    run cargo build --quiet -p orrery_identity --bins
+    run python3 scripts/admission.py --self-test
+
     # The two P4 scripts, which until now ran their self-tests only in
     # nightly.yml. That is where the cost of an uncovered self-test was
     # actually paid: `p4-ledger.sh --self-test` counted ledger lines with `wc

@@ -141,7 +141,14 @@ class Admission:
                 raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
             session_dir = self.state / "sessions" / sid; session_dir.mkdir(parents=True, exist_ok=True)
             remote = f"/var/tmp/orrery/{sid}"
-            command = [self.ssh, "-i", str(self.ssh_key), f"orrery@{c.host}", self.swarm, "--external-peer", "--peers", str(c.peers), "--seconds", str(c.seconds), "--min-cells", "1", "--impaired", "--witness", "--stamp-wall-clock", "--json", f"{remote}/raw.json", "--listening-file", f"{remote}/listening.txt", "--require-session", sid, "--issuer-key", f"{signed['issuer_key_id']}:{signed['issuer_public_key']}"]
+            # The harness writes its report and listening file into `remote`,
+            # which lives on the *campaign* host and does not exist there yet.
+            # Without this the harness binds, prints its node, and then dies on
+            # "cannot write the exterior listening file" — an admission that
+            # looks like a host failure but is a missing directory. Found by
+            # standing the service up on a real box (#488).
+            command = [self.ssh, "-i", str(self.ssh_key), f"orrery@{c.host}",
+                       "mkdir", "-p", remote, "&&", self.swarm, "--external-peer", "--peers", str(c.peers), "--seconds", str(c.seconds), "--min-cells", "1", "--impaired", "--witness", "--stamp-wall-clock", "--json", f"{remote}/raw.json", "--listening-file", f"{remote}/listening.txt", "--require-session", sid, "--issuer-key", f"{signed['issuer_key_id']}:{signed['issuer_public_key']}"]
             if c.client_rev: command += ["--require-client-rev", c.client_rev]
             try: child = subprocess.Popen(command, text=True)
             except OSError as e: raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
@@ -273,6 +280,26 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, ""): self.service.join("test", self.request())
         try: self.service.join("test", self.request())
         except Refusal as e: self.assertEqual((e.status, e.error), (409, "campaign_busy"))
+    def test_the_remote_session_directory_is_created_before_the_harness_runs(self) -> None:
+        # The harness writes its report and listening file into a directory on
+        # the campaign host that nothing else creates. Without the mkdir it
+        # binds, prints its node, and dies on "cannot write the exterior
+        # listening file" — which surfaces to a volunteer as host_failed and to
+        # the operator as nothing at all. Found by standing the service up on a
+        # real box, not by this suite (#488).
+        answer = self.service.join("test", self.request()); sid = answer["join"]["session_id"]
+        args = self.ssh.parent / "ssh.args"
+        for _ in range(20):
+            if args.exists() and "--require-session" in args.read_text(): break
+            time.sleep(0.01)
+        harness = next(line for line in args.read_text().splitlines() if "--require-session" in line)
+        fields = shlex.split(harness)
+        remote = f"/var/tmp/orrery/{sid}"
+        self.assertIn("mkdir", fields, f"the harness launch does not create {remote}: {harness}")
+        self.assertLess(fields.index("mkdir"), fields.index("--external-peer"),
+                        f"mkdir must precede the harness: {harness}")
+        self.assertIn(remote, fields)
+
     def test_the_harness_is_pinned_to_exactly_the_admitted_session_id(self) -> None:
         answer = self.service.join("test", self.request()); sid = answer["join"]["session_id"]
         args = self.ssh.parent / "ssh.args"
