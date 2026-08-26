@@ -346,6 +346,7 @@ struct RecoveringTransport {
     sink: Arc<JournalChainSink>,
     online: std::sync::atomic::AtomicBool,
     attempts: std::sync::atomic::AtomicUsize,
+    unavailable_attempt: tokio::sync::Notify,
 }
 
 impl RecoveringTransport {
@@ -354,12 +355,26 @@ impl RecoveringTransport {
             sink,
             online: std::sync::atomic::AtomicBool::new(false),
             attempts: std::sync::atomic::AtomicUsize::new(0),
+            unavailable_attempt: tokio::sync::Notify::new(),
         }
     }
 
     fn restore(&self) {
         self.online
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_online(&self) -> bool {
+        self.online.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn wait_for_unavailable_attempt(&self) {
+        // Construct the waiter before checking the predicate: `notify_one`
+        // retains a permit if the failed delivery lands in this gap.
+        let notified = std::pin::pin!(self.unavailable_attempt.notified());
+        if self.attempts.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            notified.await;
+        }
     }
 }
 
@@ -369,6 +384,7 @@ impl ChainTransport for RecoveringTransport {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if !self.online.load(std::sync::atomic::Ordering::Acquire) {
+            self.unavailable_attempt.notify_one();
             return Err(JournalError::Store("follower unavailable".into()));
         }
         orrery_persistd::ChainSink::append(&*self.sink, record).await
@@ -418,6 +434,11 @@ async fn follower_outage_replays_complete_primary_tail_without_new_wakeup() {
         },
     );
 
+    // Establish that the follower is unavailable before testing the primary's
+    // acknowledgements. This is condition-driven rather than a wall-clock
+    // deadline; `RecoveringTransport` cannot accept any record until restore.
+    transport.wait_for_unavailable_attempt().await;
+
     // Local durable acknowledgements continue while the follower is down.
     // No later append is made after recovery, so catch-up cannot depend on a
     // fresh broadcast message to wake the task.
@@ -430,24 +451,13 @@ async fn follower_outage_replays_complete_primary_tail_without_new_wakeup() {
                 &i.to_le_bytes(),
             ))
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), handle.committed())
-            .await
-            .expect("primary ack must not wait for follower")
-            .unwrap();
+        handle.committed().await.unwrap();
     }
+    assert!(
+        !transport.is_online(),
+        "primary commits must resolve before the follower is restored"
+    );
 
-    let failed_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while transport
-        .attempts
-        .load(std::sync::atomic::Ordering::Acquire)
-        == 0
-    {
-        assert!(
-            std::time::Instant::now() < failed_deadline,
-            "replicator never attempted the unavailable follower"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
     transport.restore();
 
     let caught_up = primary.committed();
