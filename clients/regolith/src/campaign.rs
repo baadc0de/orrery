@@ -72,18 +72,17 @@ const JOIN_DEADLINE_SECS: u64 = 30;
 
 /// Launch material for a joined campaign session.
 ///
-/// The host NodeId, the slot this process occupies, and the invite material
-/// (#387): the pre-minted session UUIDv7 and, when the host demands one, the
-/// operator-signed session token. Everything else derives from the slot
-/// exactly as it does on the harness side.
+/// The host NodeId, the slot this process occupies, the persistent client
+/// transport identity, and the invite material (#387): the pre-minted session
+/// UUIDv7 and, when the host demands one, the operator-signed session token.
 #[derive(Debug, Clone)]
 pub struct CampaignConfig {
     /// Hex node id of the hosting process, from its listening line.
     pub host_node_hex: String,
     /// Optional direct socket `<ip:port>`, for proofs without discovery.
     pub host_direct: Option<String>,
-    /// The swarm slot this client occupies. Derives its transport key and
-    /// entity id; the host refuses a mismatched identity at accept time.
+    /// The swarm slot this client occupies. It derives the entity id, but not
+    /// the durable transport identity.
     pub slot: usize,
     /// Coordinator-issued session identity for the banking row, presented to
     /// the host at join (#345 §8). For a campaign session this is the
@@ -97,6 +96,9 @@ pub struct CampaignConfig {
     /// The impairment the operator says the host injects. Compared against
     /// the measurement; never substituted for it.
     pub configured: ConfiguredImpairment,
+    /// Persistent client identity presented at admission, used for the QUIC
+    /// handshake and the finished measurement signature.
+    pub transport_secret: iroh_base::SecretKey,
 }
 
 impl CampaignConfig {
@@ -342,6 +344,7 @@ impl CampaignRuntime {
                 .as_deref()
                 .and_then(|socket| socket.parse().ok());
             let slot = config.slot;
+            let transport_secret = config.transport_secret.clone();
             let client_rev = crate::BUILD_REV.to_owned();
             let session_id = config.session_id.clone();
             // A malformed token hex is a named join failure, not a silently
@@ -356,7 +359,7 @@ impl CampaignRuntime {
                 .name("regolith-campaign-dial".to_owned())
                 .spawn(move || {
                     let joined = thread_runtime.block_on(async move {
-                        let endpoint = net::bind(net::slot_secret(slot)).await?;
+                        let endpoint = net::bind(transport_secret).await?;
                         let addr = address.to_addr(prefer);
                         let request = JoinRequest {
                             client_rev,
@@ -786,12 +789,16 @@ impl CampaignRuntime {
             return None;
         }
         self.record_written = true;
-        Some(self.campaign.finish(
+        let mut record = self.campaign.finish(
             utc_now_iso8601(),
             platform_triple(),
             crate::BUILD_REV.to_owned(),
             "unavailable-client-side".to_owned(),
-        ))
+        );
+        record
+            .sign(&self.config.transport_secret)
+            .expect("SessionRecord signing payload serializes");
+        Some(record)
     }
 
     /// End the session: goodbye marker, grace period, final row.
@@ -1018,6 +1025,7 @@ mod tests {
                 jitter_p50_ms: 100,
                 jitter_p99_ms: 100,
             },
+            transport_secret: iroh_base::SecretKey::from_bytes(&[0x49; 32]),
         };
         assert_eq!(config.actor(), Actor::Human);
     }

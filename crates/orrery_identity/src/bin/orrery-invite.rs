@@ -54,7 +54,7 @@ enum Operation {
         #[arg(long)]
         account: u64,
         /// The transport identity the token authorizes — for a campaign
-        /// external slot, the slot key the client prints
+        /// external slot, the persistent key the client prints
         /// (`orrery-regolith --print-slot-key <n>`).
         #[arg(long)]
         node: String,
@@ -68,8 +68,8 @@ enum Operation {
         /// Hosting process NodeId included in `--join-file`.
         #[arg(long)]
         host_node: Option<String>,
-        /// Client slot included in `--join-file`; it is the transport key the
-        /// token is bound to.
+        /// Client slot included in `--join-file`; the token is independently
+        /// bound to the persistent transport identity supplied by `--node`.
         #[arg(long)]
         slot: Option<usize>,
         /// Pre-minted session ID included in `--join-file`.

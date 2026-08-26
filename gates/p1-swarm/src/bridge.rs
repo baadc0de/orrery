@@ -261,7 +261,7 @@ pub async fn host_accept(
     index: usize,
     wants_anchor: bool,
     admission: &crate::exterior::Admission,
-) -> Result<(HostLink, Option<AnchorFrame>)> {
+) -> Result<(HostLink, Option<AnchorFrame>, NodeId)> {
     let incoming = endpoint
         .accept()
         .await
@@ -272,7 +272,10 @@ pub async fn host_accept(
         .await
         .context("join handshake failed")?;
     let remote = connection.remote_id();
-    if remote != expected {
+    // A token-gated campaign admits the authenticated transport identity the
+    // issuer signed, rather than re-deriving a publicly forgeable key from the
+    // slot. Open/test hosts retain the deterministic-slot restriction.
+    if admission.issuer.is_none() && remote != expected {
         bail!("a connection arrived from {remote}, but slot {index} belongs to {expected}");
     }
 
@@ -394,6 +397,7 @@ pub async fn host_accept(
             goodbye,
         },
         anchor,
+        remote,
     ))
 }
 
@@ -650,8 +654,9 @@ mod tests {
         .expect("remote join completes");
         let _keep_endpoint = remote_ep_keep;
         let (_host_ep_back, joined) = host_task.await.expect("host task");
-        let (host_link, anchor) = joined.expect("join ok");
+        let (host_link, anchor, remote) = joined.expect("join ok");
         assert!(anchor.is_some(), "witnessing runs ship their anchor");
+        assert_eq!(remote, expected);
 
         // Uplink: two combat frames and one meta report.
         for peer in [0u32, 1] {
@@ -719,6 +724,73 @@ mod tests {
             matches!(&up1, f if f.lane == Lane::Datagram && f.peer == 0),
             "first uplink frame routed: {up1:?}"
         );
+    }
+
+    /// A campaign token authenticates the presented durable identity. The
+    /// public slot-derived key is deliberately different, proving the accept
+    /// path does not reintroduce it ahead of token verification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_admission_seats_the_presented_node_not_the_public_slot_key() {
+        let slot = 3usize;
+        let public_slot_key = bot_key(slot).public();
+        let client_key = iroh_base::SecretKey::from_bytes(&[0x71; 32]);
+        assert_ne!(client_key.public(), public_slot_key);
+        let issuer = iroh_base::SecretKey::from_bytes(&[0x72; 32]);
+        let key_id = orrery_protocol::IssuerKeyId::new(409);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+        let claims = orrery_protocol::SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId(7),
+            client_key.public(),
+            orrery_protocol::UnixMillis::new(now_ms),
+            orrery_protocol::SessionTokenTtlMs(60_000),
+            orrery_protocol::SessionStanding::Good,
+            key_id,
+            true,
+        );
+        let token = orrery_protocol::SessionTokenV1::sign(claims, &issuer)
+            .expect("sign token")
+            .encode()
+            .expect("encode token");
+        let host_ep = bind(host_key()).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone()).await.expect("client endpoint");
+        let socket = host_ep.bound_sockets()[0];
+        let admission = crate::exterior::Admission {
+            require_client_rev: None,
+            require_session: None,
+            issuer: Some(orrery_protocol::IssuerKey::new(key_id, issuer.public())),
+        };
+        let host_task = {
+            let host_ep = host_ep.clone();
+            tokio::spawn(async move {
+                host_accept(&host_ep, public_slot_key, slot, false, &admission).await
+            })
+        };
+        let request = JoinRequest {
+            client_rev: "test".to_owned(),
+            session_id: None,
+            token: Some(token),
+        };
+        let _link = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &request,
+            slot,
+            None,
+        )
+        .await
+        .expect("presented client joins");
+        let (_, _, admitted_node) = host_task
+            .await
+            .expect("host task")
+            .expect("host accepts token-bound identity");
+        assert_eq!(admitted_node, client_key.public());
     }
 
     /// The admission verdict is wired to the accept, not merely computable:

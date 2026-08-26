@@ -408,12 +408,13 @@ impl HostAddress {
     }
 }
 
-/// The transport secret for campaign slot `index`.
+/// The deterministic transport secret for open-harness slot `index`.
 ///
 /// Same derivation as the harness's `bot_key`: the slot's identity is a
-/// function of the slot number alone, and the host refuses a dialler whose
-/// transport id does not match what it derived for the slot. Pinned against
-/// the harness's actual keys by `slot_keys_match_the_harness`.
+/// function of the slot number alone. Token-gated campaigns deliberately do
+/// not use this publicly derivable key; they admit the client's persistent
+/// identity. This compatibility helper is pinned against the harness's actual
+/// keys by `slot_keys_match_the_harness`.
 #[must_use]
 pub fn slot_secret(index: usize) -> iroh_base::SecretKey {
     let mut seed = [0u8; 32];
