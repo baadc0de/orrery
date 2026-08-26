@@ -221,7 +221,8 @@ path so its load and failure cannot touch simulation. Its data is *peer coverage
 not entities — the honest limitation, taken up in §7 as the strongest argument
 against this recommendation. Worked cost, so nobody mistakes bandwidth for the
 constraint: a strategic-map reply covering the 27 shard cells around the client
-(a 27.6 km cube at the 128 m edge; 110 km at the campaign's proposed 512 m) at
+(a 3×3×3 block of 1 024 m shard cells — a ~3.1 km span at the 128 m edge, ~12.3 km
+at the campaign's proposed 512 m) at
 ~10 B per cell (id delta + count) is ~270 B payload, ~330 B on the wire with the
 60 B datagram overhead (`budget.rs:48`). Refreshed at 0.1 Hz that is **~33 B/s ≈
 264 bps ≈ 0.03%** of the ≤1 Mbps peer budget (`budget.rs:1-6`) — and it rides the
