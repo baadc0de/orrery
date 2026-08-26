@@ -4,8 +4,8 @@
 //! frames that follow it, and periodic claims are one protocol, not three
 //! independently reconstructed byte streams.
 
-use crate::log::{claim_hash, fold, sign_claim, sign_frame, HeadTransition};
-use crate::{state_hash, CoreCodec};
+use crate::log::{claim_hash, fold, neighbor_record, sign_claim, sign_frame, HeadTransition};
+use crate::{state_hash, CoreCodec, NeighborFrame};
 use orrery_protocol::{
     ChainHash, EntitySlice, InputRecord, LogFrame, PersistId, RecordSource, RulesetId, StateClaim,
     Tick,
@@ -124,6 +124,28 @@ impl InputLogProducer {
                 source: source.clone(),
                 payload: bytes::Bytes::from(input.to_canonical()),
             };
+            self.head = fold(self.head, &record);
+            self.pending.push(record);
+        }
+    }
+
+    /// Append the replay inputs produced by recorded neighbour reads at `tick`.
+    ///
+    /// A rule discovers these only while it executes, so they follow the sealed
+    /// command records for the same tick. Replay separates the record classes,
+    /// installs these snapshots before stepping, and verifies the performed read
+    /// sequence against them.
+    pub fn log_neighbor_frames(&mut self, tick: u64, frames: &[NeighborFrame]) {
+        let offset = u16::try_from(tick.saturating_sub(self.frame_start))
+            .expect("a frame is cut before its tick offset exceeds u16");
+        let first_seq = self
+            .pending
+            .iter()
+            .filter(|record| record.tick_off == offset)
+            .count();
+        for (index, frame) in frames.iter().enumerate() {
+            let seq = u16::try_from(first_seq.saturating_add(index)).unwrap_or(u16::MAX);
+            let record = neighbor_record(offset, seq, frame);
             self.head = fold(self.head, &record);
             self.pending.push(record);
         }
@@ -274,6 +296,47 @@ mod tests {
         assert_eq!(records[0].source, sources[0]);
         assert_eq!(records[0].seq, 0);
         assert_eq!(records[1].source, sources[1]);
+        assert_eq!(records[1].seq, 1);
+    }
+
+    #[test]
+    fn executor_neighbor_frames_follow_commands_in_the_signed_tick() {
+        let key = iroh_base::SecretKey::from_bytes(&[9; 32]);
+        let mut producer = InputLogProducer::new(
+            key,
+            PersistId::new(1),
+            RulesetId {
+                version: 1,
+                digest: [7; 32],
+            },
+            0,
+            10,
+            1,
+        );
+        producer.log_inputs(0, &[TestState(3)]);
+        producer.log_neighbor_frames(
+            0,
+            &[NeighborFrame {
+                neighbor: PersistId::new(2),
+                observed_tick: Tick::new(0),
+                state: Some(vec![8]),
+            }],
+        );
+        producer.log_tick_hash([0; 32]);
+
+        let authored = producer.cut_frame(0).expect("one-tick frame closes");
+        let records = &authored.frame.entities[0].records;
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0].source, RecordSource::OwnPlayer { .. }));
+        assert!(matches!(
+            records[1].source,
+            RecordSource::NeighborFrame {
+                neighbor,
+                present: true,
+                observed_tick,
+            } if neighbor == PersistId::new(2) && observed_tick == Tick::new(0)
+        ));
+        assert_eq!(records[1].payload.as_ref(), &[8]);
         assert_eq!(records[1].seq, 1);
     }
 }

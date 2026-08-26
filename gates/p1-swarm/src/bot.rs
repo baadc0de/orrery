@@ -22,6 +22,7 @@
 //! actually exercises hysteresis and interest-set churn.
 
 use core::time::Duration;
+use std::collections::BTreeMap;
 
 use aeronet_iroh::stream::{IrohStreamIo, RecvMessage, StreamMode};
 use bevy_app::prelude::*;
@@ -38,7 +39,9 @@ use orrery_games::regolith::order::Order;
 use orrery_games::regolith::order::Outcome;
 use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::weapon::WeaponKind;
-use orrery_games::regolith::{distance_mm, firing_arc_measurement, Regolith, REGOLITH_RULESET};
+use orrery_games::regolith::{
+    collision_candidate, distance_mm, firing_arc_measurement, Regolith, REGOLITH_RULESET,
+};
 use orrery_net::budget::{UploadBudget, UploadMeter};
 use orrery_net::channels::{encode_replication, Channel};
 use orrery_net::peer_link::{
@@ -171,6 +174,8 @@ pub struct Bot {
     delivered_inbox: Vec<(PersistId, Order)>,
     /// This tick's `Game::deliver` products for the swarm router.
     delivered_outbox: Vec<(PersistId, Order)>,
+    /// Receipt ticks for canonical replicas installed as recorded neighbours.
+    replica_seen_at: BTreeMap<PersistId, u64>,
     /// Target-authored shot verdicts retained only for live-path regression tests.
     #[cfg(test)]
     resolved_shots: Vec<Outcome>,
@@ -597,6 +602,7 @@ impl Bot {
             honest_shadow,
             delivered_inbox: Vec::new(),
             delivered_outbox: Vec::new(),
+            replica_seen_at: BTreeMap::new(),
             #[cfg(test)]
             resolved_shots: Vec::new(),
             foreign_deliveries: 0,
@@ -682,6 +688,20 @@ impl Bot {
     /// anything — see [`Bot::first_tampered_tick`].
     pub fn step_core(&mut self, tick: u64, cell_edge_m: f32) {
         let at = Tick::new(tick);
+        let stale: Vec<_> = self
+            .replica_seen_at
+            .iter()
+            .filter_map(|(entity, seen)| {
+                (tick.saturating_sub(*seen) > REPLICA_TTL_TICKS).then_some(*entity)
+            })
+            .collect();
+        for entity in stale {
+            self.replica_seen_at.remove(&entity);
+            self.executor.take_state(entity);
+            if let Some(shadow) = &mut self.honest_shadow {
+                shadow.take_state(entity);
+            }
+        }
         let mut rng = tick_rng(self.seed, self.entity, at);
         // D46 clause (d): deliveries from prior ticks precede this tick's
         // pilot orders. This vector is also exactly what the witness logs.
@@ -694,7 +714,7 @@ impl Bot {
             .into_iter()
             .map(|(from, _)| RecordSource::InboundEvent { from })
             .collect();
-        orders.reserve(3);
+        orders.reserve(4);
         orrery_games::regolith::pilot::honest_orders(
             self.entity,
             self.slot,
@@ -702,9 +722,28 @@ impl Bot {
             &mut rng,
             &mut orders,
         );
+        if let Some(other) = self.executor.state(self.entity).and_then(|own| {
+            collision_candidate(
+                self.entity,
+                own,
+                self.executor
+                    .entities()
+                    .filter(|candidate| **candidate != self.entity)
+                    .filter_map(|candidate| {
+                        self.executor
+                            .state(*candidate)
+                            .map(|state| (*candidate, state))
+                    }),
+            )
+        }) {
+            // Detection is an untrusted input-source concern. The ruleset reads
+            // the installed snapshot as a recorded frame and alone decides
+            // whether this nomination can apply either body's force.
+            orders.push(Order::Collide { other });
+        }
         let authored = orders.len().saturating_sub(sources.len());
         sources.extend((0..authored).map(|seq| RecordSource::OwnPlayer {
-            input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
+            input_seq: (tick as u32).wrapping_mul(8).wrapping_add(seq as u32),
         }));
         let speed = self.speed_mps();
         let profile = self.profile;
@@ -741,6 +780,9 @@ impl Bot {
             .executor
             .step_entity(self.entity, at, &orders)
             .expect("entity present");
+        if let Some(chain) = &mut self.chain {
+            chain.log_neighbor_frames(tick, &outcome.neighbor_frames);
+        }
         #[cfg(test)]
         self.resolved_shots.extend(
             outcome
@@ -1129,6 +1171,34 @@ impl Bot {
         stream: Option<StreamMode>,
         payload: Bytes,
     ) {
+        if stream.is_none() {
+            let replication = orrery_net::channels::untag(&payload)
+                .filter(|(channel, _)| *channel == Channel::State)
+                .and_then(|(_, inner)| {
+                    orrery_net::channels::decode_replication::<(
+                        Vec<u8>,
+                        CellId,
+                        PersistId,
+                        u64,
+                    )>(inner)
+                });
+            if let Some((encoded, _cell, entity, observed_tick)) = replication
+            {
+                if entity == from_entity && entity != self.entity {
+                    if let Ok(state) = RegolithState::decode(&encoded) {
+                        self.executor.insert_observed(
+                            entity,
+                            state.clone(),
+                            Tick::new(observed_tick),
+                        );
+                        if let Some(shadow) = &mut self.honest_shadow {
+                            shadow.insert_observed(entity, state, Tick::new(observed_tick));
+                        }
+                        self.replica_seen_at.insert(entity, self.tick);
+                    }
+                }
+            }
+        }
         let inner = orrery_net::channels::untag(&payload)
             .filter(|(channel, _)| *channel == orrery_net::channels::Channel::Control)
             .map(|(_, inner)| inner);
@@ -1559,6 +1629,55 @@ mod tests {
             "the speed cheat must change a cruiser's state, or the conviction leg has \
              nothing to convict",
         );
+    }
+
+    #[test]
+    fn replicated_contact_submits_the_live_collision_exchange() {
+        let spec = BotSpec {
+            index: 0,
+            count: 2,
+            seed: UniverseSeed([0x51; 32]),
+            cell_edge_m: default_cell_edge_m(),
+            witnessing: false,
+            cheat: None,
+            enforcing: false,
+        };
+        let mut bot = Bot::new(spec);
+        let mut own = Craft::spawned(Archetype::Interceptor, QPos::default(), 0);
+        own.vel.x = 20_000;
+        bot.replace_craft_for_test(own);
+
+        let other_id = PersistId::new(2);
+        let mut other = Craft::spawned(
+            Archetype::Cruiser,
+            QPos {
+                x: 5_000,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        other.vel.x = -10_000;
+        let state = RegolithState::Craft(other);
+        let inner = encode_replication(&(
+            state.to_canonical(),
+            CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL).expect("origin cell"),
+            other_id,
+            1_u64,
+        ));
+        let payload = orrery_net::channels::tag(Channel::State, &inner);
+        bot.receive_inbound(bot_key(1).public(), other_id, None, Bytes::from(payload));
+
+        bot.step_core(1, spec.cell_edge_m);
+
+        assert!(bot.drain_delivered().into_iter().any(|(recipient, order)| {
+            recipient == other_id
+                && matches!(
+                    order,
+                    Order::CollisionResolved { from, .. } if from == bot.entity()
+                )
+        }));
+        assert_eq!(bot.craft().collisions, 1);
     }
 
     #[test]

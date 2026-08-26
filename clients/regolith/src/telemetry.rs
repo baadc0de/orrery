@@ -7,6 +7,8 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::intent::OrderPacket;
+use orrery_core::QVel;
+use orrery_protocol::PersistId;
 
 /// Whether a telemetry row came from a live campaign or a local-only world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -135,11 +137,68 @@ impl JsonlTelemetry {
         self.writer.write_all(b"\n")?;
         self.writer.flush()
     }
+
+    /// Append one human-readable canonical collision delivery.
+    pub fn append_collision_resolved(
+        &mut self,
+        tick: u64,
+        entity: PersistId,
+        from: PersistId,
+        velocity: QVel,
+        session_scope: SessionScope,
+    ) -> io::Result<()> {
+        serde_json::to_writer(
+            &mut self.writer,
+            &serde_json::json!({
+                "kind": "CollisionResolved",
+                "session_scope": session_scope,
+                "tick": tick,
+                "entity": entity.0,
+                "payload": {
+                    "from": from.0,
+                    "velocity": { "x": velocity.x, "y": velocity.y, "z": velocity.z },
+                },
+            }),
+        )?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collision_delivery_is_named_with_its_canonical_payload() {
+        let path = std::env::temp_dir().join(format!(
+            "orrery-regolith-collision-{}.jsonl",
+            std::process::id()
+        ));
+        let mut sink = JsonlTelemetry::open(&path).expect("open telemetry");
+        sink.append_collision_resolved(
+            17,
+            PersistId::new(33),
+            PersistId::new(32),
+            QVel { x: 4, y: 5, z: 6 },
+            SessionScope::Campaign,
+        )
+        .expect("append collision");
+        drop(sink);
+
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .expect("read telemetry")
+                .trim(),
+        )
+        .expect("parse row");
+        assert_eq!(row["kind"], "CollisionResolved");
+        assert_eq!(row["tick"], 17);
+        assert_eq!(row["entity"], 33);
+        assert_eq!(row["payload"]["from"], 32);
+        assert_eq!(row["payload"]["velocity"]["x"], 4);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn every_overlay_value_is_present_in_jsonl_when_f3_is_closed() {

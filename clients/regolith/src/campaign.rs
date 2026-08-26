@@ -48,7 +48,7 @@ use orrery_core::{CoreCodec, Executor, InputLogProducer};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState};
-use orrery_games::regolith::{campaign_spawn_pose, REGOLITH_RULESET};
+use orrery_games::regolith::{campaign_spawn_pose, collision_candidate, REGOLITH_RULESET};
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::{decode_delivered_input, decode_replication};
 use orrery_protocol::UniverseSeed;
@@ -744,13 +744,31 @@ impl CampaignRuntime {
 
         // ── Input: the exact pipeline the local session drives ────────────
         let authored = self.pipeline.human_packet(tick, controls);
-        let intents = authored.orders.len();
+        let mut intents = authored.orders.len();
         let mut report = TickReport {
             intents,
             events: Vec::new(),
             delivered: Vec::new(),
         };
-        if let Ok(authored_orders) = decode_packet(&authored) {
+        if let Ok(mut authored_orders) = decode_packet(&authored) {
+            if let Some(other) = self.executor.state(self.entity).and_then(|own| {
+                collision_candidate(
+                    self.entity,
+                    own,
+                    self.executor
+                        .entities()
+                        .filter(|candidate| **candidate != self.entity)
+                        .filter_map(|candidate| {
+                            self.executor
+                                .state(*candidate)
+                                .map(|state| (*candidate, state))
+                        }),
+                )
+            }) {
+                authored_orders.push(Order::Collide { other });
+                intents = intents.saturating_add(1);
+                report.intents = intents;
+            }
             // D46 clause (d): deliveries from prior ticks are canonical input
             // and precede this tick's player-authored orders. Record the
             // composed vector, not merely the keyboard half: replay and the
@@ -758,6 +776,19 @@ impl CampaignRuntime {
             let composed =
                 compose_delivered_first(&mut self.pending_delivered, authored_orders, tick.0);
             report.delivered = composed.delivered;
+            for delivered in &report.delivered {
+                if let Order::CollisionResolved { from, velocity } = delivered.order {
+                    if let Err(error) = sink.append_collision_resolved(
+                        tick.0,
+                        self.entity,
+                        from,
+                        velocity,
+                        crate::telemetry::SessionScope::Campaign,
+                    ) {
+                        bevy::log::error!("cannot append Regolith collision result: {error}");
+                    }
+                }
+            }
             let packet = OrderPacket {
                 tick: tick.0,
                 entity: self.entity.0,
@@ -774,6 +805,8 @@ impl CampaignRuntime {
                 .executor
                 .step_entity(self.entity, tick, &composed.orders)
             {
+                self.witness_log
+                    .log_neighbor_frames(tick.0, &outcome.neighbor_frames);
                 self.witness_log.log_tick_hash(outcome.state_hash);
                 report.events.extend(outcome.events.iter().cloned());
                 let deliveries: Vec<_> = outcome
@@ -1174,7 +1207,10 @@ fn compose_delivered_first(
     for (seq, order) in authored.into_iter().enumerate() {
         orders.push(order);
         sources.push(RecordSource::OwnPlayer {
-            input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
+            // Five authored inputs are reachable when the four-order pilot row
+            // also nominates a collision. Eight leaves each tick a disjoint,
+            // power-of-two source-id range.
+            input_seq: (tick as u32).wrapping_mul(8).wrapping_add(seq as u32),
         });
     }
     ComposedInputs {
