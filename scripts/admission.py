@@ -303,6 +303,15 @@ class AdmissionTests(unittest.TestCase):
         for lock in self.service.locks.values(): lock.close()
         self.tmp.cleanup()
     def request(self) -> dict[str, str]: return {"nickname": "ada", "node": "a" * 64, "client_rev": "rev"}
+    def recorded_harness_command(self) -> str:
+        args = self.ssh.parent / "ssh.args"
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if args.exists():
+                for line in args.read_text().splitlines():
+                    if "--require-session" in line: return line
+            time.sleep(0.001)
+        self.fail("harness command was not recorded after join returned")
     def test_a_busy_campaign_refuses_the_second_join_with_409(self) -> None:
         self.service.join("test", self.request())
         with self.assertRaisesRegex(Refusal, ""): self.service.join("test", self.request())
@@ -316,11 +325,7 @@ class AdmissionTests(unittest.TestCase):
         # the operator as nothing at all. Found by standing the service up on a
         # real box, not by this suite (#488).
         answer = self.service.join("test", self.request()); sid = answer["join"]["session_id"]
-        args = self.ssh.parent / "ssh.args"
-        for _ in range(20):
-            if args.exists() and "--require-session" in args.read_text(): break
-            time.sleep(0.01)
-        harness = next(line for line in args.read_text().splitlines() if "--require-session" in line)
+        harness = self.recorded_harness_command()
         fields = shlex.split(harness)
         remote = f"/var/tmp/orrery/{sid}"
         self.assertIn("mkdir", fields, f"the harness launch does not create {remote}: {harness}")
@@ -330,17 +335,12 @@ class AdmissionTests(unittest.TestCase):
 
     def test_the_harness_is_pinned_to_exactly_the_admitted_session_id(self) -> None:
         answer = self.service.join("test", self.request()); sid = answer["join"]["session_id"]
-        args = self.ssh.parent / "ssh.args"
-        for _ in range(20):
-            if args.exists() and "--require-session" in args.read_text(): break
-            time.sleep(0.01)
-        harness = next(line for line in args.read_text().splitlines() if "--require-session" in line)
+        harness = self.recorded_harness_command()
         fields = shlex.split(harness)
         self.assertEqual(fields[fields.index("--require-session") + 1], sid)
     def test_the_harness_uses_the_campaigns_fixed_external_port(self) -> None:
         answer = self.service.join("test", self.request())
-        args = self.ssh.parent / "ssh.args"
-        harness = next(line for line in args.read_text().splitlines() if "--external-bind" in line)
+        harness = self.recorded_harness_command()
         fields = shlex.split(harness)
         self.assertEqual(fields[fields.index("--external-bind") + 1], "0.0.0.0:52011")
         self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
