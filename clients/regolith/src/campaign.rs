@@ -252,6 +252,71 @@ pub struct TickReport {
     pub intents: usize,
     /// Events the local prediction step raised (tracers, shot feedback).
     pub events: Vec<Outcome>,
+    /// Authoritative inputs delivered to this entity and consumed this tick.
+    pub delivered: Vec<DeliveredOrder>,
+}
+
+/// One accepted cross-authority delivery, preserved for presentation readers.
+///
+/// The order is still applied through the ordinary ruleset input path. Keeping
+/// this copy in [`TickReport`] lets the skin read authoritative statements that
+/// the recipient consumes without re-emitting, without reconstructing them
+/// from player-authored intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredOrder {
+    /// Authority whose outcome produced the delivery.
+    pub from: PersistId,
+    /// Local authority the envelope addressed.
+    pub recipient: PersistId,
+    /// Canonical order accepted from the delivery envelope.
+    pub order: Order,
+}
+
+impl DeliveredOrder {
+    /// Rebuild a terminal presentation statement that the local step consumes
+    /// without re-emitting.
+    ///
+    /// The remaining delivered orders either mutate state that the skin reads
+    /// from the executor (`LockConfirmed`, credits, pickup results, visibility
+    /// and collision resolution), or are work requests whose recipient step
+    /// emits its own current outcome (`Damage`, `GrabAttempt`, `LockRequested`).
+    /// Player-authored orders have no delivered presentation meaning.
+    #[must_use]
+    pub fn feedback_outcome(&self) -> Option<Outcome> {
+        match &self.order {
+            Order::LockRefused { target } => Some(Outcome::LockRefused {
+                locker: self.recipient,
+                target: *target,
+            }),
+            Order::LockBroken { target, reason } => Some(Outcome::LockBroken {
+                locker: self.recipient,
+                target: *target,
+                reason: *reason,
+            }),
+            Order::ShotResolved { target, result } => Some(Outcome::ShotResolved {
+                attacker: self.recipient,
+                target: *target,
+                result: *result,
+            }),
+            Order::Thrust { .. }
+            | Order::Lock { .. }
+            | Order::LockRequested { .. }
+            | Order::LockConfirmed { .. }
+            | Order::Fire
+            | Order::Damage { .. }
+            | Order::Grab { .. }
+            | Order::GrabAttempt { .. }
+            | Order::PickupGranted { .. }
+            | Order::PickupDenied
+            | Order::KillCredit
+            | Order::RockCredit { .. }
+            | Order::BloomPopulationChanged { .. }
+            | Order::ClaimCover { .. }
+            | Order::LockVisibility { .. }
+            | Order::Collide { .. }
+            | Order::CollisionResolved { .. } => None,
+        }
+    }
 }
 
 /// What one dial attempt reports back to the render loop: the endpoint (kept
@@ -294,7 +359,7 @@ pub struct CampaignRuntime {
     undecodable: u64,
     delivered_unroutable: u64,
     delivered_foreign: u64,
-    pending_delivered: Vec<PendingDelivered>,
+    pending_delivered: Vec<DeliveredOrder>,
     focus: Option<PersistId>,
     latest_cell: Option<CellId>,
 
@@ -667,6 +732,7 @@ impl CampaignRuntime {
         let mut report = TickReport {
             intents,
             events: Vec::new(),
+            delivered: Vec::new(),
         };
         if let Ok(authored_orders) = decode_packet(&authored) {
             // D46 clause (d): deliveries from prior ticks are canonical input
@@ -675,6 +741,7 @@ impl CampaignRuntime {
             // witness must execute the exact same order the authority did.
             let composed =
                 compose_delivered_first(&mut self.pending_delivered, authored_orders, tick.0);
+            report.delivered = composed.delivered;
             let packet = OrderPacket {
                 tick: tick.0,
                 entity: self.entity.0,
@@ -916,8 +983,9 @@ impl CampaignRuntime {
     /// this campaign host does not yet publish a route for and remain counted.
     fn route_delivered_input(&mut self, link: &CampaignLink, recipient: PersistId, order: Order) {
         if recipient == self.entity {
-            self.pending_delivered.push(PendingDelivered {
+            self.pending_delivered.push(DeliveredOrder {
                 from: self.entity,
+                recipient,
                 order,
             });
             return;
@@ -1029,29 +1097,25 @@ enum DeliveryRefusal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingDelivered {
-    from: PersistId,
-    order: Order,
-}
-
 struct ComposedInputs {
     orders: Vec<Order>,
     sources: Vec<RecordSource>,
+    delivered: Vec<DeliveredOrder>,
 }
 
 /// D46's delivered-first composition. `pending` is already in reliable-stream
 /// arrival order; draining it before appending authored orders makes the law
 /// explicit at the authority boundary and leaves no later sort to drift.
 fn compose_delivered_first(
-    pending: &mut Vec<PendingDelivered>,
+    pending: &mut Vec<DeliveredOrder>,
     authored: Vec<Order>,
     tick: u64,
 ) -> ComposedInputs {
     let delivered = core::mem::take(pending);
     let mut orders = Vec::with_capacity(delivered.len() + authored.len());
     let mut sources = Vec::with_capacity(orders.capacity());
-    for input in delivered {
-        orders.push(input.order);
+    for input in &delivered {
+        orders.push(input.order.clone());
         sources.push(RecordSource::InboundEvent { from: input.from });
     }
     for (seq, order) in authored.into_iter().enumerate() {
@@ -1060,21 +1124,26 @@ fn compose_delivered_first(
             input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
         });
     }
-    ComposedInputs { orders, sources }
+    ComposedInputs {
+        orders,
+        sources,
+        delivered,
+    }
 }
 
 /// Admit a delivered input only at the authority named by its envelope.
 fn accept_own_delivery(
     own: PersistId,
     delivered: orrery_protocol::channels::DeliveredInput,
-    pending: &mut Vec<PendingDelivered>,
+    pending: &mut Vec<DeliveredOrder>,
 ) -> Result<(), DeliveryRefusal> {
     if delivered.recipient != own {
         return Err(DeliveryRefusal::Foreign);
     }
     let order = Order::decode(&delivered.input).map_err(|_| DeliveryRefusal::Malformed)?;
-    pending.push(PendingDelivered {
+    pending.push(DeliveredOrder {
         from: delivered.from,
+        recipient: delivered.recipient,
         order,
     });
     Ok(())
@@ -1172,8 +1241,9 @@ mod tests {
     fn authoritative_deliveries_are_composed_before_this_ticks_human_orders() {
         let target = PersistId::new(1);
         let from = PersistId::new(7);
-        let mut delivered = vec![PendingDelivered {
+        let mut delivered = vec![DeliveredOrder {
             from,
+            recipient: PersistId::new(2),
             order: Order::LockConfirmed {
                 target,
                 class: LockClass::Ship,

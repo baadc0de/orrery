@@ -984,11 +984,12 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
         }
     }
     match view.own.and_then(|own| tracks.own_shot(own.entity)) {
-        Some(shot) => parts.push(format!(
+        Some(shot) if shot.timed => parts.push(format!(
             "flight {} t · {:.2} s",
             shot.remaining,
             f64::from(shot.remaining) / f64::from(orrery_core::TICK_HZ)
         )),
+        Some(_) => parts.push("leaving muzzle".to_owned()),
         None => parts.push("nothing in the air".to_owned()),
     }
     parts.join(" · ")
@@ -1226,12 +1227,18 @@ mod tests {
         body(&mut app, THEM, 100.0, 0.0);
         app.add_systems(Update, sync_tracers);
 
-        // Muzzle only: the ruleset has not given this shot a flight time yet.
+        // Muzzle only: the ruleset says the shot exists, but has not given it
+        // a flight time. Draw the minimum streak with its head still pinned to
+        // the muzzle; the skin may not advance it.
         app.world_mut()
             .resource_mut::<ProjectileTracks>()
             .observe(&[shot(None)]);
         app.update();
-        assert!(tracer_geometry(&mut app, 0).is_none());
+        let (centre, span) = tracer_geometry(&mut app, 0).expect("the muzzle event is drawn");
+        assert!(
+            (centre.x + span / 2.0).abs() < 0.01,
+            "without flight_ticks the tracer head must remain at the muzzle"
+        );
 
         // Five ticks of flight, walked one event at a time. The whole flown
         // path fits inside one persistence window, so the tail rests on the
@@ -1669,9 +1676,15 @@ mod tests {
                 weapon: WeaponKind::Stock,
                 remaining: 7,
                 total: 8,
+                timed: true,
             },
             tracks.tracks()[0]
         );
+
+        tracks.observe(&[shot(None)]);
+        let muzzle = target_relation(&view, &tracks);
+        assert!(muzzle.contains("leaving muzzle"), "{muzzle}");
+        assert!(!muzzle.contains("flight 1 t"), "{muzzle}");
     }
 }
 

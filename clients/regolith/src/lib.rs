@@ -30,6 +30,7 @@ use assets::VisualAssetPaths;
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use bevy::window::PrimaryWindow;
+use campaign::DeliveredOrder;
 use combat::{CombatView, LockBreak, ProjectileTracks, ShotFeedback};
 use intent::{decode_packet, Controls, IntentPipeline};
 use orrery_core::{Executor, TICK_NANOS};
@@ -489,8 +490,8 @@ fn drive_core(
             }
             local.pending = delivered;
             local.tick = Tick::new(tick.0.saturating_add(1));
-            observe_skin_effects(&emitted, PLAYER, &mut tracks, &mut broken, &mut shots);
-            clear_refused_selection(&emitted, PLAYER, &mut selected);
+            observe_skin_effects(&emitted, &[], PLAYER, &mut tracks, &mut broken, &mut shots);
+            clear_refused_selection(&emitted, &[], PLAYER, &mut selected);
         }
         ActiveSession::Campaign(runtime) => {
             // The joined tick: same pipeline inside `advance`, plus the
@@ -498,42 +499,68 @@ fn drive_core(
             // the accumulator feed.
             let report = runtime.advance(controls, &mut sink);
             window.intents = window.intents.saturating_add(report.intents as u64);
-            if !report.events.is_empty() {
-                observe_skin_effects(
-                    &report.events,
-                    runtime.entity(),
-                    &mut tracks,
-                    &mut broken,
-                    &mut shots,
-                );
-                clear_refused_selection(&report.events, runtime.entity(), &mut selected);
-            }
+            observe_skin_effects(
+                &report.events,
+                &report.delivered,
+                runtime.entity(),
+                &mut tracks,
+                &mut broken,
+                &mut shots,
+            );
+            clear_refused_selection(
+                &report.events,
+                &report.delivered,
+                runtime.entity(),
+                &mut selected,
+            );
         }
     }
 }
 
-fn clear_refused_selection(events: &[Outcome], locker: PersistId, selected: &mut SelectedLock) {
-    if events.iter().any(|event| {
+fn clear_refused_selection(
+    events: &[Outcome],
+    delivered: &[DeliveredOrder],
+    locker: PersistId,
+    selected: &mut SelectedLock,
+) {
+    let local_refused = events.iter().any(|event| {
         matches!(
             event,
             Outcome::LockRefused { locker: who, target }
                 if *who == locker && Some(*target) == selected.target
         )
-    }) {
+    });
+    let delivered_refused = delivered.iter().any(|input| {
+        matches!(
+            input.feedback_outcome(),
+            Some(Outcome::LockRefused { locker: who, target })
+                if who == locker && Some(target) == selected.target
+        )
+    });
+    if local_refused || delivered_refused {
         selected.target = None;
     }
 }
 
-/// The skin's per-tick event consumption, shared by both session kinds:
-/// tracers, lock breakage and shot feedback read exactly what the ruleset
-/// raised this tick.
-fn observe_skin_effects(
+/// Copies this tick's authoritative combat statements into the skin.
+///
+/// `emitted` contains outcomes raised by the local step. `delivered` contains
+/// accepted outcomes from another authority after their canonical conversion
+/// to orders. This is a copy, not a simulation: the function keeps what those
+/// two ruleset channels said this tick and derives nothing from authored
+/// `Fire`, lock intent, or elapsed skin time.
+pub fn observe_skin_effects(
     emitted: &[Outcome],
+    delivered: &[DeliveredOrder],
     observer: PersistId,
     tracks: &mut ProjectileTracks,
     broken: &mut LockBreak,
     shots: &mut ShotFeedback,
 ) {
+    let delivered_feedback: Vec<_> = delivered
+        .iter()
+        .filter_map(DeliveredOrder::feedback_outcome)
+        .collect();
     // The skin's only source of truth for a shot in the air. `observe` is a
     // copy, not a simulation: it keeps the events this tick produced and
     // discards everything else, so a resolved shot loses its tracer on the
@@ -541,12 +568,14 @@ fn observe_skin_effects(
     tracks.observe(emitted);
     broken.age();
     broken.observe(emitted, observer);
+    broken.observe(&delivered_feedback, observer);
     // #383's two feedback layers, in event order: the provisional arrival
     // armed off this tick's last flight leg, then the target's authoritative
     // verdict — which arrives one delivery later and overrides the guess.
     shots.age();
     shots.arm_provisional(tracks, observer);
     shots.observe(emitted, observer);
+    shots.observe(&delivered_feedback, observer);
 }
 
 /// Copies this tick's combat state out of the executor for the overlay.
@@ -1251,6 +1280,78 @@ mod tests {
                 "the locked target's own window feeds the target panel"
             );
         }
+    }
+
+    #[test]
+    fn delivered_lock_break_reaches_both_skin_consumers() {
+        let mut tracks = ProjectileTracks::default();
+        let mut broken = LockBreak::default();
+        let mut shots = ShotFeedback {
+            cue: Some(combat::ShotCue::Arrival { target: OPPONENT }),
+            ticks_left: combat::SHOT_CUE_TICKS,
+        };
+        let delivered = [DeliveredOrder {
+            from: OPPONENT,
+            recipient: PLAYER,
+            order: Order::LockBroken {
+                target: OPPONENT,
+                reason: orrery_games::regolith::order::LockBreakReason::RangeExceeded,
+            },
+        }];
+
+        observe_skin_effects(
+            &[],
+            &delivered,
+            PLAYER,
+            &mut tracks,
+            &mut broken,
+            &mut shots,
+        );
+
+        assert_eq!(broken.banner(), "LOCK BROKEN · RANGE EXCEEDED");
+        assert!(
+            shots.cue.is_none(),
+            "the same delivered break must cancel a provisional shot"
+        );
+    }
+
+    #[test]
+    fn fire_without_a_ruleset_statement_invents_no_skin_feedback() {
+        let mut tracks = ProjectileTracks::default();
+        let mut broken = LockBreak::default();
+        let mut shots = ShotFeedback::default();
+        let muzzle = [Outcome::DamageDealt {
+            attacker: PLAYER,
+            target: OPPONENT,
+            amount: 7,
+            attacker_pos: orrery_core::QPos::default(),
+            attacker_vel: orrery_core::QVel::default(),
+            attacker_yaw_urad: 0,
+            attacker_archetype: Archetype::Interceptor,
+            attacker_weapon: orrery_games::regolith::weapon::WeaponKind::Stock,
+            flight_ticks: None,
+        }];
+        observe_skin_effects(&muzzle, &[], PLAYER, &mut tracks, &mut broken, &mut shots);
+        assert_eq!(tracks.tracks().len(), 1, "the ruleset statement is copied");
+
+        let delivered = [DeliveredOrder {
+            from: OPPONENT,
+            recipient: PLAYER,
+            order: Order::Fire,
+        }];
+
+        observe_skin_effects(
+            &[],
+            &delivered,
+            PLAYER,
+            &mut tracks,
+            &mut broken,
+            &mut shots,
+        );
+
+        assert!(tracks.tracks().is_empty());
+        assert!(broken.banner().is_empty());
+        assert!(shots.cue.is_none());
     }
 
     #[test]
