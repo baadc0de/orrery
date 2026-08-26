@@ -47,7 +47,7 @@ use orrery_net::plugin::Peer;
 use orrery_net::{IslandMembership, IslandSource};
 use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
 use orrery_protocol::{
-    CellId, NodeId, PersistId, StateClaim, Tick, UniverseSeed, DEFAULT_CELL_EDGE_M,
+    CellId, NodeId, PersistId, RecordSource, StateClaim, Tick, UniverseSeed, DEFAULT_CELL_EDGE_M,
 };
 use orrery_spatial::hysteresis::GridPosition;
 use orrery_spatial::interest::{HighRate, InterestSelection, Proxy};
@@ -190,14 +190,13 @@ pub struct Bot {
     /// [`BotSpec::cheat`] — would satisfy every conviction clause by producing
     /// byte-identical state and never being reported at all.
     honest_shadow: Option<Executor<Regolith>>,
-    /// Honest target-side fixture that answers the adjacent craft's lock handshake.
-    lock_resolver: Executor<Regolith>,
-    /// Requests delivered to the target on the following tick.
-    target_lock_inbox: Vec<Order>,
-    /// Target replies delivered to this authored craft on the following tick.
-    locker_lock_inbox: Vec<Order>,
-    /// Adjacent craft installed in `lock_resolver`.
-    lock_target: PersistId,
+    /// Prior-tick cross-entity inputs addressed to this authority, retained in
+    /// reliable-stream arrival order for delivered-first composition.
+    delivered_inbox: Vec<(PersistId, Order)>,
+    /// This tick's `Game::deliver` products for the swarm router.
+    delivered_outbox: Vec<(PersistId, Order)>,
+    /// Envelopes routed to this peer but naming another entity.
+    foreign_deliveries: u64,
     /// First tick at which the tampered build produced a different state hash
     /// than the shipping one would have from the same orders.
     first_tampered_tick: Option<u64>,
@@ -557,23 +556,6 @@ impl Bot {
             shadow.insert(entity, state);
             shadow
         });
-        let lock_target = if entity.0.is_multiple_of(2) {
-            PersistId::new(entity.0.saturating_sub(1))
-        } else {
-            PersistId::new(entity.0.saturating_add(1))
-        };
-        let target_slot = lock_target.0.saturating_sub(1);
-        let (target_pos, target_yaw) = spawn_pose(target_slot as usize, count);
-        let mut lock_resolver = Executor::new(Regolith::honest(), seed);
-        lock_resolver.insert(
-            lock_target,
-            RegolithState::Craft(Craft::spawned(
-                Archetype::for_slot(target_slot),
-                target_pos,
-                target_yaw,
-            )),
-        );
-
         let mut app = App::new();
         app.add_plugins(OrrerySpatialPlugin {
             config: SpatialConfig {
@@ -640,10 +622,9 @@ impl Bot {
             app,
             executor,
             honest_shadow,
-            lock_resolver,
-            target_lock_inbox: Vec::new(),
-            locker_lock_inbox: Vec::new(),
-            lock_target,
+            delivered_inbox: Vec::new(),
+            delivered_outbox: Vec::new(),
+            foreign_deliveries: 0,
             first_tampered_tick: None,
             tamper: cheat,
             entity,
@@ -726,24 +707,16 @@ impl Bot {
     /// anything — see [`Bot::first_tampered_tick`].
     pub fn step_core(&mut self, tick: u64, cell_edge_m: f32) {
         let at = Tick::new(tick);
-        let mut delivered_to_locker = core::mem::take(&mut self.locker_lock_inbox);
-        if !self.target_lock_inbox.is_empty() {
-            let target_inputs = core::mem::take(&mut self.target_lock_inbox);
-            let target_output = self
-                .lock_resolver
-                .step_entity(self.lock_target, at, &target_inputs)
-                .expect("lock target fixture remains installed");
-            for event in &target_output.events {
-                if let Some((recipient, order)) = self.lock_resolver.ruleset().deliver(event) {
-                    if recipient == self.entity {
-                        self.locker_lock_inbox.push(order);
-                    }
-                }
-            }
-        }
         let mut rng = tick_rng(self.seed, self.entity, at);
-        let mut orders = Vec::with_capacity(3);
-        orders.append(&mut delivered_to_locker);
+        // D46 clause (d): deliveries from prior ticks precede this tick's
+        // pilot orders. This vector is also exactly what the witness logs.
+        let delivered = core::mem::take(&mut self.delivered_inbox);
+        let mut orders: Vec<_> = delivered.iter().map(|(_, order)| order.clone()).collect();
+        let mut sources: Vec<_> = delivered
+            .into_iter()
+            .map(|(from, _)| RecordSource::InboundEvent { from })
+            .collect();
+        orders.reserve(3);
         orrery_games::regolith::pilot::honest_orders(
             self.entity,
             self.slot,
@@ -751,6 +724,10 @@ impl Bot {
             &mut rng,
             &mut orders,
         );
+        let authored = orders.len().saturating_sub(sources.len());
+        sources.extend((0..authored).map(|seq| RecordSource::OwnPlayer {
+            input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
+        }));
         let speed = self.speed_mps();
         let profile = self.profile;
         let turn_urad = self.turn_urad;
@@ -780,7 +757,7 @@ impl Bot {
         // close the gap a cheat lives in by construction, and then the harness
         // could not tell an honest bot from a careful one.
         if let Some(chain) = &mut self.chain {
-            chain.log_inputs(tick, &orders);
+            chain.log_inputs_with_sources(tick, &orders, &sources);
         }
         let outcome = self
             .executor
@@ -788,8 +765,10 @@ impl Bot {
             .expect("entity present");
         for event in &outcome.events {
             if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
-                if recipient == self.lock_target && matches!(order, Order::LockRequested { .. }) {
-                    self.target_lock_inbox.push(order);
+                if recipient == self.entity {
+                    self.delivered_inbox.push((self.entity, order));
+                } else {
+                    self.delivered_outbox.push((recipient, order));
                 }
             }
         }
@@ -1080,12 +1059,52 @@ impl Bot {
         outbound
     }
 
+    /// Drain ruleset deliveries in event-emission order for the authority
+    /// router. Address resolution belongs to the swarm because it owns the
+    /// entity-to-peer roster, including a token-authenticated exterior node
+    /// whose transport identity cannot be derived from its slot.
+    pub fn drain_delivered(&mut self) -> Vec<(PersistId, Order)> {
+        core::mem::take(&mut self.delivered_outbox)
+    }
+
     /// Hands one delivered message from `from` to this bot's receive buffers.
     ///
     /// The inverse of [`Self::drain_outbound`], shared for the same reason:
     /// the host's `deliver` and the external peer's receive pump must inject
     /// bytes identically or the witness lanes see different worlds.
-    pub fn receive_inbound(&mut self, from: NodeId, stream: Option<StreamMode>, payload: Bytes) {
+    pub fn receive_inbound(
+        &mut self,
+        from: NodeId,
+        from_entity: PersistId,
+        stream: Option<StreamMode>,
+        payload: Bytes,
+    ) {
+        let inner = orrery_net::channels::untag(&payload)
+            .filter(|(channel, _)| *channel == orrery_net::channels::Channel::Control)
+            .map(|(_, inner)| inner);
+        let is_delivered = inner
+            .and_then(orrery_protocol::channels::untag)
+            .is_some_and(|(channel, body)| {
+                channel == orrery_protocol::channels::Channel::Control
+                    && body.first() == Some(&orrery_protocol::channels::TAG_DELIVERED_INPUT)
+            });
+        let delivered = inner.and_then(orrery_protocol::channels::decode_delivered_input);
+        if let Some(delivered) = delivered {
+            if delivered.from != from_entity || delivered.recipient != self.entity {
+                self.foreign_deliveries += 1;
+            } else if let Ok(order) = Order::decode(&delivered.input) {
+                self.delivered_inbox.push((delivered.from, order));
+            }
+            // A delivered-input envelope is consumed at the authority seam,
+            // including malformed or foreign ones. It must never fall through
+            // into replication or witness consumers as foreign bytes.
+            return;
+        }
+        if is_delivered {
+            // A recognizable but truncated delivery is still consumed here.
+            self.foreign_deliveries += 1;
+            return;
+        }
         let world = self.app.world_mut();
         let mut query = world.query::<(
             &orrery_net::plugin::Peer,
@@ -1542,8 +1561,35 @@ mod tests {
                 enforcing: true,
                 ..spec
             });
+            let target = PersistId::new(2);
+            let game = Regolith::honest();
+            let mut target_authority = Executor::new(game, spec.seed);
+            let (target_pos, target_yaw) = spawn_pose(1, spec.count);
+            target_authority.insert(
+                target,
+                RegolithState::Craft(Craft::spawned(
+                    Archetype::for_slot(1),
+                    target_pos,
+                    target_yaw,
+                )),
+            );
             for tick in 0..=orrery_protocol::MAX_ADJUDICATION_TICKS {
                 modified.step_core(tick, spec.cell_edge_m);
+                for (recipient, order) in modified.drain_delivered() {
+                    if recipient != target {
+                        continue;
+                    }
+                    let outcome = target_authority
+                        .step_entity(target, Tick::new(tick), &[order])
+                        .expect("the test target owns its entity");
+                    for event in &outcome.events {
+                        if let Some((recipient, reply)) = game.deliver(event) {
+                            if recipient == modified.entity {
+                                modified.delivered_inbox.push((target, reply));
+                            }
+                        }
+                    }
+                }
                 if modified.first_tampered_tick().is_some() {
                     break;
                 }

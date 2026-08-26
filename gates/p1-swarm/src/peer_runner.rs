@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use orrery_protocol::{coord::PeerEntry, NodeId, UniverseSeed};
+use orrery_protocol::{coord::PeerEntry, NodeId, PersistId, UniverseSeed};
 
 use crate::bot::{
     bot_key, cell_of, default_cell_edge_m, grid_of, spawn_pose, Bot, BotSpec, TICK_HZ,
@@ -220,7 +220,12 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                     }
                 };
                 if frame.lane != crate::exterior::Lane::Meta {
-                    bot.receive_inbound(bot_key(from_slot).public(), stream, frame.payload);
+                    bot.receive_inbound(
+                        bot_key(from_slot).public(),
+                        PersistId::new(from_slot as u64 + 1),
+                        stream,
+                        frame.payload,
+                    );
                 }
             }
 

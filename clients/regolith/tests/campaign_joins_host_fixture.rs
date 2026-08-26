@@ -21,8 +21,10 @@ use tokio::io::AsyncWriteExt as _;
 
 use bytes::Bytes;
 use iroh_base::SecretKey;
-use orrery_core::CoreCodec as _;
-use orrery_games::Game;
+use orrery_core::{CoreCodec as _, Executor};
+use orrery_games::regolith::order::{Order, Outcome};
+use orrery_games::regolith::state::RegolithState;
+use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::encode_replication;
 use orrery_protocol::{CellId, ChainHash, NodeId, PersistId, StateClaim, Tick, WitnessMsg};
 use orrery_regolith_client::campaign::{CampaignConfig, CampaignRuntime, JoinState};
@@ -64,6 +66,11 @@ struct GroundTruth {
     downlink_skipped_indices: Vec<u64>,
     witness_frames_verified: u64,
     witness_claims_verified: u64,
+    inbound_records_verified: u64,
+    delivered_inputs_applied: u64,
+    lock_confirmations_sent: u64,
+    damage_inputs_applied: u64,
+    shots_resolved: u64,
 }
 
 impl GroundTruth {
@@ -220,7 +227,7 @@ async fn pump(
     // notes: accept_bi here, not open_bi.
     let (mut send, mut recv) = connection.accept_bi().await.map_err(|e| e.to_string())?;
     let request_bytes = read_message(&mut recv).await?;
-    let request = net::JoinRequest::decode(&request_bytes).expect("client spoke v2");
+    let request = net::JoinRequest::decode(&request_bytes).expect("client spoke v3");
     assert!(
         !request.client_rev.is_empty(),
         "the client names its build revision"
@@ -385,6 +392,12 @@ async fn pump(
     // Uplink: settle every sequenced datagram with a router decision, acked
     // strictly after deciding (#393's load-bearing ordering).
     let mut witness_head = ChainHash::EMPTY;
+    let game = Regolith::honest();
+    let bot_entity = PersistId::new(1);
+    let client_entity = PersistId::new(CLIENT_SLOT as u64 + 1);
+    let mut authority = Executor::new(game, crate_seed());
+    authority.insert(bot_entity, game.spawn(bot_entity, 0));
+    let mut authority_tick = 0u64;
     loop {
         let Some(frame) = read_frame(&mut uplink_recv).await else {
             break; // the client went away
@@ -424,12 +437,105 @@ async fn pump(
                 }
             }
             net::Lane::StreamShared => {
+                let delivered = orrery_protocol::channels::untag(&frame.payload)
+                    .filter(|(channel, _)| *channel == orrery_protocol::channels::Channel::Control)
+                    .and_then(|(_, inner)| {
+                        orrery_protocol::channels::decode_delivered_input(inner)
+                    });
+                if let Some(delivered) = delivered {
+                    assert_eq!(frame.peer, 0, "the client addressed the target's host slot");
+                    assert_eq!(
+                        delivered.from, client_entity,
+                        "the delivery names the authority that emitted it"
+                    );
+                    assert_eq!(
+                        delivered.recipient, bot_entity,
+                        "the host applies only its own entity's delivery"
+                    );
+                    let order = Order::decode(&delivered.input)
+                        .expect("the client sent canonical Regolith input bytes");
+                    {
+                        let mut observed = truth.lock().expect("truth lock");
+                        observed.delivered_inputs_applied += 1;
+                        observed.damage_inputs_applied +=
+                            u64::from(matches!(order, Order::Damage { .. }));
+                    }
+
+                    // A real target authority step produces the reply. Self-
+                    // addressed projectile continuations are stepped on
+                    // successive host ticks until they resolve; no target
+                    // state is guessed by the client or fixture.
+                    let mut pending = vec![order];
+                    while !pending.is_empty() {
+                        let output = authority
+                            .step_entity(bot_entity, Tick::new(authority_tick), &pending)
+                            .expect("the fixture host owns its target");
+                        authority_tick = authority_tick.saturating_add(1);
+                        pending.clear();
+                        for event in &output.events {
+                            if matches!(event, Outcome::ShotResolved { .. }) {
+                                truth.lock().expect("truth lock").shots_resolved += 1;
+                            }
+                            let Some((recipient, reply)) = authority.ruleset().deliver(event)
+                            else {
+                                continue;
+                            };
+                            if recipient == bot_entity {
+                                pending.push(reply);
+                                continue;
+                            }
+                            assert_eq!(
+                                recipient, client_entity,
+                                "the two-authority fixture has no third route"
+                            );
+                            if matches!(reply, Order::LockConfirmed { .. }) {
+                                truth.lock().expect("truth lock").lock_confirmations_sent += 1;
+                            }
+                            let inner = orrery_protocol::channels::encode_delivered_input(
+                                bot_entity,
+                                recipient,
+                                &reply.to_canonical(),
+                            );
+                            let payload = orrery_protocol::channels::tag(
+                                orrery_protocol::channels::Channel::Control,
+                                &inner,
+                            );
+                            feed_tx
+                                .send(FeedItem::Frame {
+                                    broadcast_index: None,
+                                    frame: net::Frame {
+                                        peer: 0,
+                                        lane: net::Lane::StreamShared,
+                                        payload: Bytes::from(payload),
+                                    },
+                                })
+                                .map_err(|_| "downlink writer stopped".to_string())?;
+                        }
+                    }
+                    continue;
+                }
+
                 let message =
                     orrery_protocol::channels::decode_witness::<WitnessMsg>(&frame.payload)
                         .expect("the rendered client's shared stream carries a witness message");
                 match message {
                     WitnessMsg::Frame { frame, heads } => {
                         assert_eq!(heads.len(), 1, "one authored entity per client frame");
+                        let inbound = frame
+                            .entities
+                            .iter()
+                            .flat_map(|slice| &slice.records)
+                            .filter(|record| {
+                                matches!(
+                                    record.source,
+                                    orrery_protocol::RecordSource::InboundEvent { from }
+                                        if from == bot_entity
+                                ) && matches!(
+                                    Order::decode(&record.payload),
+                                    Ok(Order::LockConfirmed { .. })
+                                )
+                            })
+                            .count() as u64;
                         let transitions = orrery_core::log::verify_frame(
                             &frame,
                             expected_client,
@@ -438,7 +544,9 @@ async fn pump(
                         .expect("the host verifies the rendered client's real log frame");
                         assert_eq!(heads[0].head, transitions[0].head);
                         witness_head = transitions[0].head;
-                        truth.lock().expect("truth lock").witness_frames_verified += 1;
+                        let mut observed = truth.lock().expect("truth lock");
+                        observed.witness_frames_verified += 1;
+                        observed.inbound_records_verified += inbound;
                     }
                     WitnessMsg::Claim(claim) => {
                         orrery_core::log::verify_claim(&claim, expected_client)
@@ -558,6 +666,101 @@ fn drive_until_joined(runtime: &mut CampaignRuntime, sink: &mut JsonlTelemetry, 
         // exercised across many wakeups.
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+#[test]
+fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
+    let fixture = HostFixture::spawn(Mode::Join);
+    let mut sink = sink_for("regolith-campaign-authority-loopback");
+    let mut runtime = CampaignRuntime::launch(fixture.config("authority-loopback"), crate_seed());
+    drive_until_joined(&mut runtime, &mut sink, 1);
+
+    let target = PersistId::new(1);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let _ = runtime.advance(
+            Controls {
+                lock_target: Some(target),
+                ..Controls::default()
+            },
+            &mut sink,
+        );
+        let ready = matches!(
+            runtime.executor().state(runtime.entity()),
+            Some(RegolithState::Craft(craft))
+                if craft.lock_target == Some(target)
+                    && craft.lock_class.is_some()
+                    && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+        );
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        matches!(
+            runtime.executor().state(runtime.entity()),
+            Some(RegolithState::Craft(craft))
+                if craft.lock_target == Some(target)
+                    && craft.lock_class.is_some()
+                    && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+        ),
+        "the host-authored LockConfirmed must mature the human's visible lock"
+    );
+
+    let fired = runtime.advance(
+        Controls {
+            fire: true,
+            lock_target: Some(target),
+            ..Controls::default()
+        },
+        &mut sink,
+    );
+    assert!(
+        fired.events.iter().any(
+            |event| matches!(event, Outcome::DamageDealt { target: hit, .. } if *hit == target)
+        ),
+        "a mature host-confirmed lock must pass the unchanged fire gate"
+    );
+    assert!(
+        !fired.events.iter().any(|event| matches!(
+            event,
+            Outcome::ShotRefused {
+                result: orrery_games::regolith::order::ShotResult::NoLock,
+                ..
+            }
+        )),
+        "the fully drawn, host-confirmed lock must not refuse NoLock"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while fixture.truth().shots_resolved == 0 && Instant::now() < deadline {
+        let _ = runtime.advance(
+            Controls {
+                lock_target: Some(target),
+                ..Controls::default()
+            },
+            &mut sink,
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let truth = fixture.truth();
+    assert!(
+        truth.lock_confirmations_sent > 0,
+        "the target authored the lock reply"
+    );
+    assert!(
+        truth.inbound_records_verified > 0,
+        "the host-authored reply entered the signed witness log as an inbound event"
+    );
+    assert!(
+        truth.damage_inputs_applied > 0,
+        "the target authority received the shot"
+    );
+    assert!(
+        truth.shots_resolved > 0,
+        "the target authority resolved the shot"
+    );
 }
 
 #[test]

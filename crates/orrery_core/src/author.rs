@@ -88,15 +88,40 @@ impl InputLogProducer {
 
     /// Log exactly the inputs that will be applied at `tick`.
     pub fn log_inputs<I: CoreCodec>(&mut self, tick: u64, inputs: &[I]) {
+        let sources: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .map(|(seq, _)| RecordSource::OwnPlayer {
+                input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
+            })
+            .collect();
+        self.log_inputs_with_sources(tick, inputs, &sources);
+    }
+
+    /// Log exactly the inputs that will be applied at `tick`, with explicit
+    /// provenance in the same total order.
+    ///
+    /// # Panics
+    /// Panics when `inputs` and `sources` differ in length; an unclassified
+    /// input or a source with no executed input would make replay ambiguous.
+    pub fn log_inputs_with_sources<I: CoreCodec>(
+        &mut self,
+        tick: u64,
+        inputs: &[I],
+        sources: &[RecordSource],
+    ) {
+        assert_eq!(
+            inputs.len(),
+            sources.len(),
+            "every logged input has exactly one source"
+        );
         let offset = u16::try_from(tick.saturating_sub(self.frame_start))
             .expect("a frame is cut before its tick offset exceeds u16");
-        for (seq, input) in inputs.iter().enumerate() {
+        for (seq, (input, source)) in inputs.iter().zip(sources).enumerate() {
             let record = InputRecord {
                 tick_off: offset,
                 seq: u16::try_from(seq).unwrap_or(u16::MAX),
-                source: RecordSource::OwnPlayer {
-                    input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
-                },
+                source: source.clone(),
                 payload: bytes::Bytes::from(input.to_canonical()),
             };
             self.head = fold(self.head, &record);
@@ -218,5 +243,37 @@ mod tests {
             .cut_claim(CLAIM_EVERY, &state)
             .expect("claim cadence reached");
         assert_eq!(next.prev_claim, claim_hash(&anchor));
+    }
+
+    #[test]
+    fn explicit_input_sources_survive_into_the_signed_frame_in_order() {
+        let key = iroh_base::SecretKey::from_bytes(&[9; 32]);
+        let mut producer = InputLogProducer::new(
+            key,
+            PersistId::new(1),
+            RulesetId {
+                version: 1,
+                digest: [7; 32],
+            },
+            0,
+            10,
+            1,
+        );
+        let inputs = [TestState(3), TestState(5)];
+        let sources = [
+            RecordSource::InboundEvent {
+                from: PersistId::new(2),
+            },
+            RecordSource::OwnPlayer { input_seq: 7 },
+        ];
+        producer.log_inputs_with_sources(0, &inputs, &sources);
+        producer.log_tick_hash([0; 32]);
+        let authored = producer.cut_frame(0).expect("one-tick frame closes");
+        let records = &authored.frame.entities[0].records;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].source, sources[0]);
+        assert_eq!(records[0].seq, 0);
+        assert_eq!(records[1].source, sources[1]);
+        assert_eq!(records[1].seq, 1);
     }
 }

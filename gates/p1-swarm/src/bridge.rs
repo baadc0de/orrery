@@ -58,7 +58,7 @@ use crate::exterior::{
 
 /// The connection's application protocol. A grammar change bumps this as well
 /// as `JoinRequest::VERSION`; both sides must refuse what they do not speak.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/2";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/3";
 
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
