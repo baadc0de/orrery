@@ -225,6 +225,24 @@ harness invocation and the client's `--expect-*` configuration; `client_rev`
 becomes `--require-client-rev`. Omitting `client_rev` omits the pin — legal,
 but the listing marks the campaign `unpinned` so the operator can see it.
 
+Before opening a campaign, run
+`scripts/campaign-release-preflight.sh --control /etc/orrery/campaigns.conf`
+on the admission box. It is deliberately a separate read-only instrument, not
+a relay probe (which is scoped to relay migration state) or an admission
+service dependency (which would alter live-listing failure behaviour). For
+each pinned campaign it requires a non-draft GitHub release whose
+`target_commitish` starts with the pin and which has a Regolith archive. It
+warns, rather than passes silently, for an unpinned campaign: that escape hatch
+is useful for debugging but unsafe for a banked campaign because it accepts
+older builds. GitHub exposes the release target, not an archive's embedded
+build revision, so the instrument reports release metadata provenance; the
+packaging workflow is the complementary control that stamps `ORRERY_BUILD_REV`
+and creates the release with `GITHUB_SHA` as its target. The two can still
+disagree if an archive is uploaded or replaced after the release target is set;
+proving that stronger fact needs a release format that carries a verifiable
+embedded revision (or downloading and inspecting every archive), neither of
+which GitHub's release listing exposes.
+
 **Read discipline: re-read on every request.** At one join per hour-long
 session the file is parsed a handful of times a day; caching it buys nothing
 and costs the operator a restart. Closing a campaign is therefore: edit the

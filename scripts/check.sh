@@ -316,6 +316,12 @@ lane_gates() {
     # unavailable probe is UNKNOWN rather than a vacuous pass.
     run scripts/relay-preflight.sh --self-test
 
+    # #486's admission-box preflight. Its synthetic releases prove a matching
+    # pin passes, an unmatched pin fails by its campaign's named verdict, and
+    # both an unavailable GitHub probe and an empty listing are UNKNOWN rather
+    # than a pass that learned nothing.
+    run scripts/campaign-release-preflight.sh --self-test
+
     # The two P4 scripts, which until now ran their self-tests only in
     # nightly.yml. That is where the cost of an uncovered self-test was
     # actually paid: `p4-ledger.sh --self-test` counted ledger lines with `wc
