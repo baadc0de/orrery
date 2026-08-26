@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod admission;
+pub mod aoi;
 pub mod assets;
 pub mod campaign;
 pub mod combat;
@@ -255,6 +256,29 @@ impl ActiveSession {
         }
     }
 
+    /// The interest cell edge this session's AOI boundary is built from, in
+    /// metres, or `None` when the session has no interest set at all.
+    ///
+    /// The offline sandbox holds both seats in one local executor: there is no
+    /// host, no replication, and therefore no boundary. Fading against an
+    /// invented one there would have the skin drawing a limit the run does not
+    /// have (#519). A campaign that has not finished dialling has not yet been
+    /// told anything either, so it is `None` until [`JoinState::Joined`].
+    ///
+    /// The value itself is the campaign runtime's own `cell_edge_m` — the same
+    /// field `committed_cell` divides by when telling the host which cell this
+    /// craft is in — so the skin cannot drift from the host's definition of
+    /// the edge the way #499 and #502 did.
+    #[must_use]
+    pub fn aoi_edge_m(&self) -> Option<f32> {
+        match self {
+            Self::Local(_) => None,
+            Self::Campaign(runtime) => {
+                matches!(runtime.state(), JoinState::Joined).then(|| runtime.cell_edge_m() as f32)
+            }
+        }
+    }
+
     fn join_state(&self) -> Option<&JoinState> {
         match self {
             Self::Local(_) => None,
@@ -361,6 +385,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<OverlayState>()
             .init_resource::<MetricWindow>()
             .init_resource::<CameraZoom>()
+            .init_resource::<aoi::AoiBoundary>()
             .init_resource::<roster::ShipRoster>()
             .init_resource::<roster::RosterTask>()
             .init_resource::<SelectedLock>()
@@ -380,6 +405,15 @@ impl Plugin for RegolithSkinPlugin {
                     ensure_local_body.after(sync_rendered_state),
                     ensure_focus_body.after(recompose_craft_bodies),
                     ensure_rock_bodies.after(sync_rendered_state),
+                    // After every body-spawning system, so a craft that
+                    // appears this frame is faded on the frame it appears
+                    // rather than flashing at full opacity first.
+                    aoi::read_aoi_boundary.after(sync_rendered_state),
+                    aoi::sync_aoi_fade
+                        .after(aoi::read_aoi_boundary)
+                        .after(ensure_rock_bodies)
+                        .after(ensure_focus_body)
+                        .after(ensure_local_body),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     follow_camera.after(sync_rendered_state),
@@ -565,12 +599,15 @@ fn spawn_craft_body(
         Visibility::Inherited,
     ));
     let arc_radius = craft::hull_length(archetype) * craft::ARC_RADIUS_HULL_LENGTHS;
-    let arc_material = materials.add(hud::firing_arc_material(seat, accent));
+    let arc_finish = hud::firing_arc_material(seat, accent);
+    let arc_fade = aoi::fadeable(entity, &arc_finish);
+    let arc_material = materials.add(arc_finish);
     spawned.with_children(|craft_root| {
         for arc in craft::firing_arcs(archetype) {
             craft_root.spawn((
                 Name::new(arc.name),
                 FiringArcFan(entity),
+                arc_fade,
                 Mesh3d(meshes.add(craft::arc_mesh(*arc, arc_radius))),
                 MeshMaterial3d(arc_material.clone()),
                 // Just off the deck, so the fan reads over the plan view
@@ -589,10 +626,13 @@ fn spawn_craft_body(
     // from the same reading the arcs above took.
     spawned.with_children(|craft_root| {
         for part in craft::parts(archetype) {
+            let finish = craft::finish_material(part.finish, seat, accent);
+            let fade = aoi::fadeable(entity, &finish);
             craft_root.spawn((
                 Name::new(part.name),
+                fade,
                 Mesh3d(meshes.add(craft::mesh_for(part.shape))),
-                MeshMaterial3d(materials.add(craft::finish_material(part.finish, seat, accent))),
+                MeshMaterial3d(materials.add(finish)),
                 Transform {
                     translation: part.translation,
                     rotation: part.rotation,
@@ -1079,16 +1119,22 @@ fn ensure_rock_bodies(
             .mesh()
             .ico(facets)
             .unwrap_or_else(|_| Sphere::new(radius_m).mesh().uv(12, 8));
+        let finish = StandardMaterial {
+            base_color: tint,
+            metallic: 0.05,
+            perceptual_roughness: 0.95,
+            ..Default::default()
+        };
+        // A rock is replicated remote state on the same interest set as a
+        // craft, so it leaves the view through the same boundary and gets the
+        // same fade (#533).
+        let fade = aoi::fadeable(entity, &finish);
         commands.spawn((
             CoreEntity(entity),
             RockBody,
+            fade,
             Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: tint,
-                metallic: 0.05,
-                perceptual_roughness: 0.95,
-                ..Default::default()
-            })),
+            MeshMaterial3d(materials.add(finish)),
             Transform::from_rotation(rock_attitude(entity)),
         ));
     }

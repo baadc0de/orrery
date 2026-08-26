@@ -655,6 +655,15 @@ impl CampaignRuntime {
         self.focus
     }
 
+    /// The interest cell edge this session commits its cell against, metres.
+    ///
+    /// Exposed so the skin's AOI fade (#533) measures against the same number
+    /// [`Self::committed_cell`] divides by, rather than a second copy.
+    #[must_use]
+    pub const fn cell_edge_m(&self) -> f64 {
+        self.cell_edge_m
+    }
+
     /// Read-only executor access for rendering and combat views.
     #[must_use]
     pub fn executor(&self) -> &Executor<Regolith> {
