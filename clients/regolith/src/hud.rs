@@ -279,7 +279,7 @@ fn label(text: &str) -> impl Bundle {
 
 fn value(readout: Readout, size: f32, color: Color) -> impl Bundle {
     (
-        Text::new("—"),
+        Text::new("-"),
         TextFont::from_font_size(size),
         TextColor(color),
         readout,
@@ -789,26 +789,26 @@ pub fn refresh_combat_hud(
         let (body, tint) = match readout {
             Readout::OwnTitle => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| own.chassis_name().to_owned()),
+                    .map_or_else(|| "-".to_owned(), |own| own.chassis_name().to_owned()),
                 ACCENT_BRIGHT,
             ),
             Readout::OwnHull => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| format!("{}/{}", own.hull.max(0), own.max_hull()),
                 ),
                 MUTED,
             ),
             Readout::OwnShield => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| format!("{}/{}", own.shield.max(0), own.max_shield()),
                 ),
                 MUTED,
             ),
             Readout::OwnVitals => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| {
                         format!(
                             "#{}  {:.0} / {:.0} m/s   score {}",
@@ -823,7 +823,7 @@ pub fn refresh_combat_hud(
             ),
             Readout::WeaponName => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| format!("{:?}", own.weapon).to_uppercase(),
                 ),
                 if view.own.is_some_and(|own| own.cooldown > 0) {
@@ -834,12 +834,12 @@ pub fn refresh_combat_hud(
             ),
             Readout::WeaponSpec => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| weapon_spec(own.weapon_table())),
+                    .map_or_else(|| "-".to_owned(), |own| weapon_spec(own.weapon_table())),
                 DIM,
             ),
             Readout::WeaponCooldown => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| format!("{} t", own.cooldown)),
+                    .map_or_else(|| "-".to_owned(), |own| format!("{} t", own.cooldown)),
                 if view.own.is_some_and(|own| own.cooldown > 0) {
                     INK
                 } else {
@@ -848,7 +848,7 @@ pub fn refresh_combat_hud(
             ),
             Readout::WeaponEnvelope => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| weapon_envelope(own.weapon_table())),
+                    .map_or_else(|| "-".to_owned(), |own| weapon_envelope(own.weapon_table())),
                 MUTED,
             ),
             Readout::LockLabel => (
@@ -873,7 +873,7 @@ pub fn refresh_combat_hud(
                     .or_else(|| {
                         view.rock_target.map(|target| {
                             format!(
-                                "{}/{} · {} point{}",
+                                "{}/{} | {} point{}",
                                 target.hull.max(0),
                                 target.tier.limits().max_hull,
                                 target.tier.limits().points,
@@ -885,12 +885,12 @@ pub fn refresh_combat_hud(
                             )
                         })
                     })
-                    .unwrap_or_else(|| "—".to_owned()),
+                    .unwrap_or_else(|| "-".to_owned()),
                 MUTED,
             ),
             Readout::TargetShield => (
                 view.target.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |target| format!("{}/{}", target.shield.max(0), target.max_shield()),
                 ),
                 MUTED,
@@ -938,7 +938,7 @@ pub fn refresh_combat_hud(
     }
 }
 
-/// `10–13 dmg × 1 roll · 20 t cycle`, from the weapon's published row.
+/// `10-13 dmg x 1 roll | 20 t cycle`, from the weapon's published row.
 #[must_use]
 pub fn weapon_spec(weapon: Weapon) -> String {
     let low = weapon.damage_base;
@@ -946,7 +946,7 @@ pub fn weapon_spec(weapon: Weapon) -> String {
         .damage_base
         .saturating_add(weapon.damage_spread.max(1).saturating_sub(1));
     format!(
-        "{low}–{high} dmg × {} roll{} · {} t cycle",
+        "{low}-{high} dmg x {} roll{} | {} t cycle",
         weapon.rolls,
         if weapon.rolls == 1 { "" } else { "s" },
         weapon.cooldown_ticks
@@ -957,7 +957,7 @@ pub fn weapon_spec(weapon: Weapon) -> String {
 #[must_use]
 pub fn weapon_envelope(weapon: Weapon) -> String {
     format!(
-        "optimal {} m · falloff +{} m\nprojectile {} m/s · tracking {} µrad/s",
+        "optimal {} m | falloff +{} m\nprojectile {} m/s | tracking {} urad/s",
         weapon.optimal_mm / 1_000,
         weapon.falloff_mm / 1_000,
         weapon.projectile_speed_mms / 1_000,
@@ -970,10 +970,10 @@ pub fn weapon_envelope(weapon: Weapon) -> String {
 #[must_use]
 pub fn target_title(view: &CombatView) -> String {
     match (view.target, view.rock_target, view.lock.target) {
-        (Some(target), _, _) => format!("{} · #{}", target.chassis_name(), target.entity.0),
-        (_, Some(target), _) => format!("{} · #{}", target.tier_name(), target.entity.0),
-        (None, None, Some(id)) => format!("#{:#x} · no window here", id.0),
-        (None, None, None) => "—".to_owned(),
+        (Some(target), _, _) => format!("{} | #{}", target.chassis_name(), target.entity.0),
+        (_, Some(target), _) => format!("{} | #{}", target.tier_name(), target.entity.0),
+        (None, None, Some(id)) => format!("#{:#x} | no window here", id.0),
+        (None, None, None) => "-".to_owned(),
     }
 }
 
@@ -993,14 +993,14 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
     }
     match view.own.and_then(|own| tracks.own_shot(own.entity)) {
         Some(shot) if shot.timed => parts.push(format!(
-            "flight {} t · {:.2} s",
+            "flight {} t ({:.2} s)",
             shot.remaining,
             f64::from(shot.remaining) / f64::from(orrery_core::TICK_HZ)
         )),
         Some(_) => parts.push("leaving muzzle".to_owned()),
         None => parts.push("nothing in the air".to_owned()),
     }
-    parts.join(" · ")
+    parts.join(" | ")
 }
 
 /// The hit-chance band beside the locked target, and the phrase that says
@@ -1014,8 +1014,8 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
 #[must_use]
 pub fn hit_band_line(view: &CombatView) -> String {
     match view.hit_forecast() {
-        None => "—".to_owned(),
-        Some(band) => format!("{}  ·  {}", band.label(), band.note()),
+        None => "-".to_owned(),
+        Some(band) => format!("{}  |  {}", band.label(), band.note()),
     }
 }
 
@@ -1040,7 +1040,7 @@ pub fn lock_debug_lines(view: &CombatView, broken: &LockBreak) -> String {
 /// The chassis a craft flies, spelled for the HUD.
 #[must_use]
 pub fn chassis_of(view: Option<CraftView>) -> &'static str {
-    view.map_or("—", |view| view.chassis_name())
+    view.map_or("-", |view| view.chassis_name())
 }
 
 #[cfg(test)]
@@ -1758,7 +1758,7 @@ mod band_line {
     fn no_target_means_no_band() {
         let mut idle = locked_on(0);
         idle.target = None;
-        assert_eq!(hit_band_line(&idle), "—");
+        assert_eq!(hit_band_line(&idle), "-");
         assert_eq!(idle.hit_forecast(), None);
     }
 
@@ -1775,11 +1775,11 @@ mod band_line {
             .add_systems(Update, refresh_combat_hud);
         let line = app
             .world_mut()
-            .spawn((Readout::HitBandLine, Text::new("—"), TextColor(MUTED)))
+            .spawn((Readout::HitBandLine, Text::new("-"), TextColor(MUTED)))
             .id();
         app.update();
         let text = app.world().get::<Text>(line).expect("the line exists");
         assert_eq!(**text, hit_band_line(&locked_on(60_000)));
-        assert!(**text != *"—", "the band line was never written");
+        assert!(**text != *"-", "the band line was never written");
     }
 }

@@ -952,7 +952,7 @@ fn a_delivered_campaign_lock_break_reaches_both_skin_consumers() {
     );
     assert_eq!(
         broken.banner(),
-        "LOCK BROKEN · TARGET DESTROYED",
+        "LOCK BROKEN - TARGET DESTROYED",
         "the delivered reason must reach the visible break indicator"
     );
     assert!(

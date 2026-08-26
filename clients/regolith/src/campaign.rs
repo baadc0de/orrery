@@ -1138,7 +1138,7 @@ impl CampaignRuntime {
     #[must_use]
     pub fn summary_line(&self) -> String {
         match &self.state {
-            JoinState::Dialing => "campaign: dialing…".to_owned(),
+            JoinState::Dialing => "campaign: dialing...".to_owned(),
             JoinState::Joined => format!(
                 "campaign: joined as slot {} (entity {}), uplink sent {} shed {}, \
                  downlink missing {}",
@@ -1148,8 +1148,8 @@ impl CampaignRuntime {
                 self.uplink_shed,
                 self.downlink.total_missing(),
             ),
-            JoinState::Refused(reason) => format!("campaign: REFUSED — {reason}"),
-            JoinState::Failed(reason) => format!("campaign: FAILED — {reason}"),
+            JoinState::Refused(reason) => format!("campaign: REFUSED - {reason}"),
+            JoinState::Failed(reason) => format!("campaign: FAILED - {reason}"),
             JoinState::Closed { host_said_goodbye } => {
                 format!("campaign: closed (host said goodbye: {host_said_goodbye})")
             }

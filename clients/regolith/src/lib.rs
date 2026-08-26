@@ -230,12 +230,12 @@ impl SessionPresentation {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Local => "LOCAL SANDBOX — NOT CONNECTED TO CAMPAIGN",
-            Self::Dialing => "LOCAL SANDBOX — CONNECTING TO CAMPAIGN…",
+            Self::Local => "LOCAL SANDBOX - NOT CONNECTED TO CAMPAIGN",
+            Self::Dialing => "LOCAL SANDBOX - CONNECTING TO CAMPAIGN...",
             Self::Live => "CAMPAIGN LIVE",
-            Self::Failed => "LOCAL SANDBOX — CAMPAIGN DIAL FAILED",
-            Self::Refused => "LOCAL SANDBOX — CAMPAIGN JOIN REFUSED",
-            Self::Disconnected => "LOCAL SANDBOX — CAMPAIGN DISCONNECTED",
+            Self::Failed => "LOCAL SANDBOX - CAMPAIGN DIAL FAILED",
+            Self::Refused => "LOCAL SANDBOX - CAMPAIGN JOIN REFUSED",
+            Self::Disconnected => "LOCAL SANDBOX - CAMPAIGN DISCONNECTED",
         }
     }
 }
@@ -1243,7 +1243,7 @@ fn refresh_f3_pane(
                 accumulator.progress().afk_capped,
             ));
         } else {
-            text.push_str("\noffline local session — not a campaign path, banks nothing");
+            text.push_str("\noffline local session - not a campaign path, banks nothing");
         }
     }
 }
@@ -1373,12 +1373,12 @@ mod tests {
     #[test]
     fn local_fallbacks_cannot_present_or_serialize_as_live_campaigns() {
         let local = SessionPresentation::from_join_state(None);
-        assert_eq!(local.label(), "LOCAL SANDBOX — NOT CONNECTED TO CAMPAIGN");
+        assert_eq!(local.label(), "LOCAL SANDBOX - NOT CONNECTED TO CAMPAIGN");
         assert_eq!(local.session_scope(), SessionScope::Local);
 
         let failed = JoinState::Failed("fixture dial failure".to_owned());
         let failed = SessionPresentation::from_join_state(Some(&failed));
-        assert_eq!(failed.label(), "LOCAL SANDBOX — CAMPAIGN DIAL FAILED");
+        assert_eq!(failed.label(), "LOCAL SANDBOX - CAMPAIGN DIAL FAILED");
         assert_eq!(failed.session_scope(), SessionScope::Local);
 
         let joined = SessionPresentation::from_join_state(Some(&JoinState::Joined));
@@ -1636,7 +1636,7 @@ mod tests {
             &mut shots,
         );
 
-        assert_eq!(broken.banner(), "LOCK BROKEN · RANGE EXCEEDED");
+        assert_eq!(broken.banner(), "LOCK BROKEN - RANGE EXCEEDED");
         assert!(
             shots.cue.is_none(),
             "the same delivered break must cancel a provisional shot"

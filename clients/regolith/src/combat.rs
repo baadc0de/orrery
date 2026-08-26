@@ -110,16 +110,16 @@ impl LockView {
         match self.phase() {
             LockPhase::Idle => "no target".to_owned(),
             LockPhase::Acquiring if self.progress >= LOCK_ACQUISITION_TICKS => {
-                "ACQUIRING — NO RETURN".to_owned()
+                "ACQUIRING - NO RETURN".to_owned()
             }
             LockPhase::Acquiring => format!(
-                "{} / {} t · {:.2} s",
+                "{} / {} t | {:.2} s",
                 self.progress,
                 LOCK_ACQUISITION_TICKS,
                 f64::from(self.progress) / f64::from(orrery_core::TICK_HZ)
             ),
             LockPhase::Locked => format!(
-                "{LOCK_ACQUISITION_TICKS} / {LOCK_ACQUISITION_TICKS} t · lock #{}",
+                "{LOCK_ACQUISITION_TICKS} / {LOCK_ACQUISITION_TICKS} t | lock #{}",
                 self.acquired
             ),
         }
@@ -403,13 +403,13 @@ impl LockBreak {
     #[must_use]
     pub fn banner(&self) -> String {
         match (self.refused, self.reason) {
-            (true, _) => "LOCK REFUSED · NOT A TARGET".to_owned(),
+            (true, _) => "LOCK REFUSED - NOT A TARGET".to_owned(),
             (false, None) => String::new(),
             (false, Some(LockBreakReason::RangeExceeded)) => {
-                "LOCK BROKEN · RANGE EXCEEDED".to_owned()
+                "LOCK BROKEN - RANGE EXCEEDED".to_owned()
             }
             (false, Some(LockBreakReason::TargetDestroyed)) => {
-                "LOCK BROKEN · TARGET DESTROYED".to_owned()
+                "LOCK BROKEN - TARGET DESTROYED".to_owned()
             }
         }
     }
@@ -548,12 +548,12 @@ impl ShotFeedback {
     pub fn banner(&self) -> String {
         match self.cue {
             None => String::new(),
-            Some(ShotCue::Arrival { .. }) => "IMPACT…".to_owned(),
+            Some(ShotCue::Arrival { .. }) => "IMPACT...".to_owned(),
             Some(ShotCue::Resolved { result, .. } | ShotCue::Refused { result }) => match result {
                 ShotResult::Hit => "HIT CONFIRMED".to_owned(),
                 ShotResult::Miss => "MISS".to_owned(),
-                ShotResult::OutOfArc => "SHOT REFUSED · OUT OF ARC".to_owned(),
-                ShotResult::NoLock => "SHOT REFUSED · NO LOCK".to_owned(),
+                ShotResult::OutOfArc => "SHOT REFUSED - OUT OF ARC".to_owned(),
+                ShotResult::NoLock => "SHOT REFUSED - NO LOCK".to_owned(),
             },
         }
     }
@@ -1167,7 +1167,7 @@ mod tests {
             }],
             PersistId::new(1),
         );
-        assert_eq!(feedback.banner(), "LOCK REFUSED · NOT A TARGET");
+        assert_eq!(feedback.banner(), "LOCK REFUSED - NOT A TARGET");
     }
 
     #[test]
@@ -1316,7 +1316,7 @@ mod tests {
                 result: ShotResult::NoLock,
             })
         );
-        assert_eq!(feedback.banner(), "SHOT REFUSED · NO LOCK");
+        assert_eq!(feedback.banner(), "SHOT REFUSED - NO LOCK");
         assert_eq!(feedback.flash_target(), None);
     }
 
@@ -1349,7 +1349,7 @@ mod tests {
             Some(PersistId::new(2)),
             "the provisional flash draws on the target"
         );
-        assert_eq!(feedback.banner(), "IMPACT…");
+        assert_eq!(feedback.banner(), "IMPACT...");
 
         // The target's verdict corrects it; a miss withdraws the flash.
         feedback.observe(&[resolved(1, ShotResult::Miss)], me);
@@ -1368,7 +1368,7 @@ mod tests {
         );
 
         feedback.observe(&[resolved(1, ShotResult::OutOfArc)], me);
-        assert_eq!(feedback.banner(), "SHOT REFUSED · OUT OF ARC");
+        assert_eq!(feedback.banner(), "SHOT REFUSED - OUT OF ARC");
         assert_eq!(feedback.flash_target(), None);
 
         // And expiry takes the whole cue with it.
