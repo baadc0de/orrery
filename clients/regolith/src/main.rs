@@ -134,6 +134,12 @@ fn main() {
     }
     app.add_plugins(skin);
 
+    if has_flag(&args, "--overlay-open") {
+        app.insert_resource(orrery_regolith_client::OverlayOpen);
+    }
+    if has_flag(&args, "--capture-zoom-sweep") {
+        app.init_resource::<orrery_regolith_client::ZoomSweep>();
+    }
     if has_flag(&args, "--capture-geometry") {
         app.insert_resource(orrery_regolith_client::GeometryCapture::auto_drive());
     }

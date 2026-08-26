@@ -93,6 +93,14 @@ struct OverlayState {
     expanded: bool,
 }
 
+/// Starts the session with the F3 diagnostics pane already open.
+///
+/// The pane carries the rock census (#524) and the roster line (#523), which
+/// are exactly the two numbers a live capture needs to read. Ordinary clients
+/// never insert the resource and press F3 like everyone else.
+#[derive(Debug, Resource)]
+pub struct OverlayOpen;
+
 #[derive(Debug, Default, Resource)]
 struct MetricWindow {
     intents: u64,
@@ -113,6 +121,62 @@ impl GeometryCapture {
     pub const fn auto_drive() -> Self {
         Self { auto_drive: true }
     }
+}
+
+/// Sweeps the camera zoom between its limits, for capturing evidence.
+///
+/// **An evidence affordance, and deliberately a thin one.** It does not set
+/// [`CameraZoom`] — it writes the same `MouseWheel` message winit writes, so
+/// the stage under observation is `zoom_camera` itself rather than a second
+/// code path that only exists for captures. The existing
+/// [`GeometryCapture::auto_drive`] is the same idea for shots.
+///
+/// Ordinary clients never insert the resource.
+#[derive(Debug, Resource)]
+pub struct ZoomSweep {
+    /// Ticks between notches. One notch every `period` frames.
+    period: u32,
+    frame: u32,
+    notches_left: i32,
+    direction: f32,
+}
+
+impl Default for ZoomSweep {
+    fn default() -> Self {
+        Self {
+            period: 6,
+            frame: 0,
+            // Enough notches to walk the documented range end to end.
+            notches_left: 24,
+            direction: -1.0,
+        }
+    }
+}
+
+/// Feeds one wheel notch at a time into the real input queue, reversing at the
+/// ends so a capture can catch both extremes.
+fn drive_zoom_sweep(
+    mut sweep: ResMut<ZoomSweep>,
+    zoom: Res<CameraZoom>,
+    mut wheel: MessageWriter<bevy::input::mouse::MouseWheel>,
+) {
+    sweep.frame = sweep.frame.saturating_add(1);
+    if !sweep.frame.is_multiple_of(sweep.period) {
+        return;
+    }
+    if sweep.notches_left <= 0 {
+        sweep.notches_left = 24;
+        sweep.direction = -sweep.direction;
+    }
+    sweep.notches_left -= 1;
+    let _ = zoom;
+    wheel.write(bevy::input::mouse::MouseWheel {
+        unit: bevy::input::mouse::MouseScrollUnit::Line,
+        x: 0.0,
+        y: sweep.direction,
+        window: Entity::PLACEHOLDER,
+        phase: bevy::input::touch::TouchPhase::Moved,
+    });
 }
 
 /// A playable local authority using only the shared headless executor.
@@ -304,7 +368,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
             .init_resource::<ShotFeedback>()
-            .add_systems(Startup, setup_scene)
+            .add_systems(Startup, (setup_scene, open_overlay_if_asked))
             .add_systems(FixedUpdate, drive_core)
             .add_systems(
                 Update,
@@ -353,6 +417,12 @@ impl Plugin for RegolithSkinPlugin {
             .add_systems(
                 Update,
                 roster::refresh_roster.run_if(on_timer(roster::ROSTER_REFRESH)),
+            )
+            .add_systems(
+                Update,
+                drive_zoom_sweep
+                    .before(zoom_camera)
+                    .run_if(resource_exists::<ZoomSweep>),
             );
     }
 }
@@ -1546,6 +1616,12 @@ fn sync_rendered_state(
 #[must_use]
 pub fn heading_rotation(yaw_urad: i32) -> Quat {
     Quat::from_rotation_y(-(yaw_urad as f32 / 1_000_000.0))
+}
+
+fn open_overlay_if_asked(asked: Option<Res<OverlayOpen>>, mut state: ResMut<OverlayState>) {
+    if asked.is_some() {
+        state.expanded = true;
+    }
 }
 
 fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<OverlayState>) {
