@@ -1594,6 +1594,28 @@ mod tests {
     }
 
     #[test]
+    fn campaign_slow_but_live_replica_never_expires() {
+        let game = Regolith::honest();
+        let own = PersistId::new(9);
+        let remote = PersistId::new(3);
+        let mut executor = Executor::new(game, UniverseSeed([0x62; 32]));
+        executor.insert(own, game.spawn(own, 8));
+        executor.insert(remote, game.spawn(remote, 2));
+        let mut freshness = BTreeMap::new();
+        let mut focus = Some(remote);
+        let _ = refresh_replica(&mut freshness, remote, 10, 10);
+
+        for tick in [70, 130, 190] {
+            expire_stale_replicas(&mut executor, own, tick, &mut freshness, &mut focus);
+            assert!(
+                executor.state(remote).is_some(),
+                "a replica refreshed at the ruleset's one-second allowance stays drawable"
+            );
+            let _ = refresh_replica(&mut freshness, remote, tick, tick);
+        }
+    }
+
+    #[test]
     fn replica_measurement_retains_the_gap_across_expiry_and_reinstall() {
         let remote = PersistId::new(3);
         let mut freshness = BTreeMap::new();
