@@ -30,6 +30,16 @@ pub const BREAK_BANNER_TICKS: u16 = 90;
 /// Ticks the shot-result cue stays up after the event that raised it.
 pub const SHOT_CUE_TICKS: u16 = 45;
 
+/// How long a confirmed-impact burst is drawn, in ruleset ticks.
+///
+/// Deliberately much shorter than [`SHOT_CUE_TICKS`]: the banner should stay
+/// readable for three quarters of a second, but a burst that hangs around that
+/// long stops reading as an impact and starts reading as a fire. 12 ticks is
+/// 0.2 s at 60 Hz — the same motion-integration window
+/// `hud::TRACER_PERSISTENCE_TICKS` uses, so the burst lasts about as long as
+/// the streak that preceded it.
+pub const IMPACT_BURST_TICKS: u16 = 12;
+
 /// The three states the design draws for a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockPhase {
@@ -528,19 +538,47 @@ impl ShotFeedback {
         }
     }
 
-    /// The target the world-space impact flash anchors on, while one should
-    /// draw: a provisional arrival, or an authoritative hit. A miss draws no
-    /// flash — that is exactly the correction the verdict makes.
+    /// The target an impact burst anchors on, and how far through its life the
+    /// burst is: `0.0` on the tick of the verdict, rising to `1.0` when it is
+    /// spent. `None` when no burst should be drawn.
+    ///
+    /// **Confirmed damage only, and that word is the whole specification.**
+    /// The only cue that yields a burst is `ShotCue::Resolved { result: Hit }`
+    /// — the target's own adjudication, transcribed. Not the tracer arriving,
+    /// not a predicted impact, and specifically *not*
+    /// [`ShotFeedback::arm_provisional`]'s cue, which claims only that "an
+    /// adjudication is due" and is deliberately never upgraded here. An orange
+    /// burst asserts that damage happened; the skin may only assert what the
+    /// ruleset has already said (#519). Before #522 this drew on the
+    /// provisional arrival too, which meant a miss was announced as a hit for
+    /// the tick it took the verdict to land.
+    ///
+    /// ## Where the burst is drawn, and why that is approximate
+    ///
+    /// The caller anchors it on the target's **last replicated position**,
+    /// because that is the best the shooter has. The shooter sees one muzzle
+    /// `DamageDealt` and then a verdict; the in-flight continuations are
+    /// target-authored and never reach it (#517 measured 81 muzzle events and
+    /// zero continuations). So the exact intersection is not knowable
+    /// client-side: the ruleset never transmits one, and the target has moved
+    /// between the tick it was struck and the tick the replica last landed.
+    /// The burst therefore marks *the thing that was hit*, not the millimetre
+    /// it was hit at, and is sized to read as a hit marker rather than as a
+    /// surveyed point.
     #[must_use]
-    pub fn flash_target(&self) -> Option<PersistId> {
-        match self.cue {
-            Some(ShotCue::Arrival { target }) => Some(target),
-            Some(ShotCue::Resolved {
-                target,
-                result: ShotResult::Hit,
-            }) => Some(target),
-            _ => None,
+    pub fn impact_burst(&self) -> Option<(PersistId, f32)> {
+        let Some(ShotCue::Resolved {
+            target,
+            result: ShotResult::Hit,
+        }) = self.cue
+        else {
+            return None;
+        };
+        let elapsed = SHOT_CUE_TICKS.saturating_sub(self.ticks_left);
+        if elapsed >= IMPACT_BURST_TICKS {
+            return None;
         }
+        Some((target, f32::from(elapsed) / f32::from(IMPACT_BURST_TICKS)))
     }
 
     /// The HUD line, empty when nothing is live.
@@ -1317,7 +1355,7 @@ mod tests {
             })
         );
         assert_eq!(feedback.banner(), "SHOT REFUSED - NO LOCK");
-        assert_eq!(feedback.flash_target(), None);
+        assert_eq!(feedback.impact_burst(), None);
     }
 
     /// The two layers of #383's owner decision, in order: a provisional cue
@@ -1345,9 +1383,9 @@ mod tests {
             })
         );
         assert_eq!(
-            feedback.flash_target(),
-            Some(PersistId::new(2)),
-            "the provisional flash draws on the target"
+            feedback.impact_burst(),
+            None,
+            "the provisional cue says an adjudication is due, never that damage happened"
         );
         assert_eq!(feedback.banner(), "IMPACT...");
 
@@ -1361,15 +1399,11 @@ mod tests {
             })
         );
         assert_eq!(feedback.banner(), "MISS");
-        assert_eq!(
-            feedback.flash_target(),
-            None,
-            "a miss must retract the provisional flash"
-        );
+        assert_eq!(feedback.impact_burst(), None, "a miss draws no burst");
 
         feedback.observe(&[resolved(1, ShotResult::OutOfArc)], me);
         assert_eq!(feedback.banner(), "SHOT REFUSED - OUT OF ARC");
-        assert_eq!(feedback.flash_target(), None);
+        assert_eq!(feedback.impact_burst(), None);
 
         // And expiry takes the whole cue with it.
         for _ in 0..SHOT_CUE_TICKS {
@@ -1385,12 +1419,94 @@ mod tests {
         feedback.observe(&[resolved(1, ShotResult::Hit)], PersistId::new(1));
         assert_eq!(feedback.banner(), "HIT CONFIRMED");
         assert_eq!(
-            feedback.flash_target(),
-            Some(PersistId::new(2)),
-            "an authoritative hit keeps the flash up"
+            feedback.impact_burst(),
+            Some((PersistId::new(2), 0.0)),
+            "an authoritative hit opens the burst on the tick of the verdict"
         );
         feedback.age();
         assert!(feedback.cue.is_some(), "one tick is not SHOT_CUE_TICKS");
+    }
+
+    /// #522: the burst is a claim that damage happened, so exactly one cue may
+    /// produce it. Every other reachable cue — including the provisional
+    /// arrival that used to draw the same mesh — must draw nothing.
+    #[test]
+    fn only_a_confirmed_hit_draws_the_impact_burst() {
+        let me = PersistId::new(1);
+        let them = PersistId::new(2);
+
+        for cue in [
+            ShotCue::Arrival { target: them },
+            ShotCue::Resolved {
+                target: them,
+                result: ShotResult::Miss,
+            },
+            ShotCue::Resolved {
+                target: them,
+                result: ShotResult::OutOfArc,
+            },
+            ShotCue::Resolved {
+                target: them,
+                result: ShotResult::NoLock,
+            },
+            ShotCue::Refused {
+                result: ShotResult::OutOfArc,
+            },
+            ShotCue::Refused {
+                result: ShotResult::NoLock,
+            },
+        ] {
+            let feedback = ShotFeedback {
+                cue: Some(cue),
+                ticks_left: SHOT_CUE_TICKS,
+            };
+            assert_eq!(
+                feedback.impact_burst(),
+                None,
+                "{cue:?} is not confirmed damage and must not burst"
+            );
+        }
+
+        // A shot whose lock breaks in flight never reaches a verdict: the
+        // break retires the provisional cue, and no burst was ever owed.
+        let mut tracks = ProjectileTracks::default();
+        tracks.observe(&[shot(1, 2, Some(1))]);
+        let mut broken = ShotFeedback::default();
+        broken.arm_provisional(&tracks, me);
+        assert_eq!(broken.impact_burst(), None);
+        broken.observe(
+            &[Outcome::LockBroken {
+                locker: me,
+                target: them,
+                reason: orrery_games::regolith::order::LockBreakReason::RangeExceeded,
+            }],
+            me,
+        );
+        assert_eq!(broken.impact_burst(), None, "a broken lock bursts nothing");
+
+        // And the one cue that does: it opens at zero, ages, and closes well
+        // before the banner does.
+        let mut hit = ShotFeedback::default();
+        hit.observe(&[resolved(1, ShotResult::Hit)], me);
+        let mut seen = Vec::new();
+        let mut banners = Vec::new();
+        for _ in 0..SHOT_CUE_TICKS {
+            seen.push(hit.impact_burst());
+            banners.push(hit.banner());
+            hit.age();
+        }
+        assert_eq!(seen[0], Some((them, 0.0)));
+        let live = seen.iter().filter(|entry| entry.is_some()).count();
+        assert_eq!(
+            live,
+            usize::from(IMPACT_BURST_TICKS),
+            "the burst runs for IMPACT_BURST_TICKS and then stops"
+        );
+        assert!(
+            seen[usize::from(IMPACT_BURST_TICKS)].is_none()
+                && !banners[usize::from(IMPACT_BURST_TICKS)].is_empty(),
+            "the banner outlives the burst"
+        );
     }
 
     #[test]

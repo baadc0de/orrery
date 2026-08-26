@@ -67,6 +67,23 @@ pub const PANEL: Color = Color::srgba(0.086, 0.094, 0.149, 0.86);
 pub const TRACER: Color = Color::srgb(0.961, 0.957, 1.0);
 /// Mining lock amber, distinct from the ship-lock accent.
 pub const MINING_AMBER: Color = Color::srgb(0.95, 0.62, 0.22);
+/// Confirmed-impact orange.
+///
+/// Hotter and redder than [`MINING_AMBER`] so the two never read as the same
+/// event: amber says "this is a rock, and mining it is a lock away", orange
+/// says "the ruleset has adjudicated damage". Both sit off the accent hue, so
+/// neither can be confused with the player's own accent furniture, and the
+/// burst is emissive-unlit rather than the reserved exhaust glow finish.
+pub const IMPACT_ORANGE: Color = Color::srgb(1.0, 0.45, 0.10);
+
+/// The burst's drawn radius at its birth and at its death, as multiples of the
+/// flash mesh's own radius.
+///
+/// It opens fast and keeps growing while fading, which is what makes a small
+/// sphere read as a burst rather than as a lamp switching on.
+pub const IMPACT_BURST_START_SCALE: f32 = 0.55;
+/// See [`IMPACT_BURST_START_SCALE`].
+pub const IMPACT_BURST_END_SCALE: f32 = 2.3;
 
 /// The pool cuboid's length along its nose axis at scale one, in metres.
 pub const TRACER_MESH_LENGTH_M: f32 = 18.0;
@@ -470,9 +487,11 @@ pub fn spawn_world_overlay(
         radius: RETICLE_RADIUS_M * 0.12,
     });
     let flash_material = materials.add(StandardMaterial {
-        base_color: TRACER,
-        emissive: LinearRgba::WHITE * 8.0,
+        base_color: IMPACT_ORANGE,
+        emissive: LinearRgba::from(IMPACT_ORANGE) * 8.0,
         unlit: true,
+        // The burst fades out over its life, which needs a blended pass.
+        alpha_mode: AlphaMode::Blend,
         ..Default::default()
     });
 
@@ -723,33 +742,56 @@ fn world_position(
         .find_map(|(core, transform)| (core.0 == entity).then(|| transform.translation()))
 }
 
-/// Draws the impact flash on the shot's target while a cue says one is live.
+/// Draws the orange impact burst on the target of a **confirmed** hit.
 ///
-/// A provisional arrival and an authoritative hit both draw; a verdict of
-/// miss retracts it — [`ShotFeedback::flash_target`] encodes that choice, so
-/// this system stays a pure placement: anchor on the target's body or hide.
+/// Placement and animation only. Every decision about *whether* a burst is
+/// owed lives in [`ShotFeedback::impact_burst`], which yields one for
+/// `ShotResolved { result: Hit }` and for nothing else — not a miss, not an
+/// out-of-arc refusal, not a shot whose lock broke in flight, and not the
+/// provisional arrival cue. This system may not widen that set.
+///
+/// The anchor is the target's last replicated position, which is the best the
+/// shooter has and is not the true intersection; see
+/// [`ShotFeedback::impact_burst`] for why, and for why the burst is drawn as a
+/// marker on the thing that was hit rather than as a surveyed point.
 pub fn sync_impact_flash(
     feedback: Res<ShotFeedback>,
     zoom: Res<crate::CameraZoom>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
-    mut flashes: Query<(&mut Transform, &mut Visibility), With<ImpactFlash>>,
+    materials: Option<ResMut<Assets<StandardMaterial>>>,
+    mut flashes: Query<
+        (
+            &mut Transform,
+            &mut Visibility,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+        ),
+        With<ImpactFlash>,
+    >,
 ) {
-    let anchor = feedback
-        .flash_target()
-        .and_then(|target| world_position(&bodies, target));
-    if let Ok((mut transform, mut visibility)) = flashes.single_mut() {
-        match anchor {
-            Some(position) => {
-                transform.translation = position;
-                // A glyph, not a measurement: it holds its apparent size
-                // across #521's zoom range instead of shrinking to nothing at
-                // 4 km. The range rings, the arc marking and the tracers
-                // deliberately do *not* do this — they mean metres, and would
-                // lie about distance if they were held to screen size.
-                transform.scale = Vec3::splat(zoom.glyph_scale());
-                *visibility = Visibility::Inherited;
-            }
-            None => *visibility = Visibility::Hidden,
+    let burst = feedback
+        .impact_burst()
+        .and_then(|(target, progress)| Some((world_position(&bodies, target)?, progress)));
+    let Ok((mut transform, mut visibility, material)) = flashes.single_mut() else {
+        return;
+    };
+    let Some((position, progress)) = burst else {
+        *visibility = Visibility::Hidden;
+        return;
+    };
+    transform.translation = position;
+    // A glyph, not a measurement: it holds its apparent size across #521's
+    // zoom range instead of shrinking to nothing at 4 km. The range rings, the
+    // arc marking and the tracers deliberately do *not* do this — they mean
+    // metres, and would lie about distance if they were held to screen size.
+    let growth =
+        IMPACT_BURST_START_SCALE + (IMPACT_BURST_END_SCALE - IMPACT_BURST_START_SCALE) * progress;
+    transform.scale = Vec3::splat(growth * zoom.glyph_scale());
+    *visibility = Visibility::Inherited;
+    if let (Some(mut materials), Some(handle)) = (materials, material) {
+        if let Some(mut material) = materials.get_mut(&handle.0) {
+            let fade = (1.0 - progress).clamp(0.0, 1.0);
+            material.base_color = IMPACT_ORANGE.with_alpha(fade);
+            material.emissive = LinearRgba::from(IMPACT_ORANGE) * (8.0 * fade);
         }
     }
 }
@@ -1475,16 +1517,18 @@ mod tests {
         let (visible, _) = flash_state(&mut app);
         assert!(!visible);
 
-        // Provisional arrival: drawn on the target's own body.
+        // Provisional arrival: the banner says an adjudication is due, and the
+        // world stays clean. Before #522 this drew the burst, which announced
+        // a hit a tick before the target had adjudicated one.
         *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
             cue: Some(ShotCue::Arrival { target: THEM }),
             ticks_left: SHOT_CUE_TICKS,
         };
         app.update();
-        let (visible, at) = flash_state(&mut app);
-        assert!(visible);
-        assert_eq!(at, Vec3::new(100.0, 0.0, -40.0));
-        // A miss verdict withdraws what the provisional layer put up.
+        let (visible, _) = flash_state(&mut app);
+        assert!(!visible, "a provisional arrival must not burst");
+
+        // A miss verdict draws nothing either.
         *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
             cue: Some(ShotCue::Resolved {
                 target: THEM,
@@ -1494,9 +1538,9 @@ mod tests {
         };
         app.update();
         let (visible, _) = flash_state(&mut app);
-        assert!(!visible, "a miss must retract the flash");
+        assert!(!visible, "a miss must draw no burst");
 
-        // A hit keeps it up.
+        // A confirmed hit bursts, on the target's own body.
         *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
             cue: Some(ShotCue::Resolved {
                 target: THEM,
@@ -1505,8 +1549,21 @@ mod tests {
             ticks_left: SHOT_CUE_TICKS,
         };
         app.update();
+        let (visible, at) = flash_state(&mut app);
+        assert!(visible, "a confirmed hit must burst");
+        assert_eq!(at, Vec3::new(100.0, 0.0, -40.0));
+
+        // And it is spent well before the banner is.
+        *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
+            cue: Some(ShotCue::Resolved {
+                target: THEM,
+                result: ShotResult::Hit,
+            }),
+            ticks_left: SHOT_CUE_TICKS - crate::combat::IMPACT_BURST_TICKS,
+        };
+        app.update();
         let (visible, _) = flash_state(&mut app);
-        assert!(visible);
+        assert!(!visible, "the burst expires after IMPACT_BURST_TICKS");
     }
 
     #[test]
