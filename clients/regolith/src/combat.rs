@@ -154,6 +154,8 @@ pub struct Track {
     pub remaining: u16,
     /// Total flight, recovered from the first event of this shot.
     pub total: u16,
+    /// Whether the ruleset supplied a target-owned flight countdown.
+    pub timed: bool,
 }
 
 impl Track {
@@ -184,10 +186,12 @@ impl ProjectileTracks {
     /// ruleset's, and a shot that resolved this tick simply has no event and
     /// so has no tracer.
     ///
-    /// A muzzle event carries `flight_ticks: None` and is skipped, because the
-    /// same shot reappears one tick later with a real remaining count and the
-    /// identical `attacker_pos`. Matching a continuation to last tick's track
-    /// by `remaining + 1` recovers `total` for the flown fraction.
+    /// A muzzle event carries `flight_ticks: None`. It is kept for this tick as
+    /// a zero-progress track: the event authoritatively says the shot exists at
+    /// its muzzle, but gives the skin no flight duration to advance. If this
+    /// authority owns the target too, the shot reappears one tick later with a
+    /// real remaining count and the identical `attacker_pos`. Matching those
+    /// continuations by `remaining + 1` recovers `total` for the flown fraction.
     pub fn observe(&mut self, events: &[Outcome]) {
         let mut carried = Vec::with_capacity(events.len());
         let mut consumed = vec![false; self.tracks.len()];
@@ -197,10 +201,22 @@ impl ProjectileTracks {
                 target,
                 attacker_pos,
                 attacker_weapon,
-                flight_ticks: Some(remaining),
+                flight_ticks,
                 ..
             } = event
             else {
+                continue;
+            };
+            let Some(remaining) = *flight_ticks else {
+                carried.push(Track {
+                    attacker: *attacker,
+                    target: *target,
+                    origin: *attacker_pos,
+                    weapon: *attacker_weapon,
+                    remaining: 1,
+                    total: 1,
+                    timed: false,
+                });
                 continue;
             };
             let prior = self.tracks.iter().enumerate().find_map(|(index, track)| {
@@ -222,8 +238,9 @@ impl ProjectileTracks {
                 target: *target,
                 origin: *attacker_pos,
                 weapon: *attacker_weapon,
-                remaining: *remaining,
+                remaining,
                 total,
+                timed: true,
             });
         }
         self.tracks = carried;
@@ -355,7 +372,7 @@ impl ShotFeedback {
     /// "an adjudication is due", which is all the skin may claim.
     pub fn arm_provisional(&mut self, tracks: &ProjectileTracks, shooter: PersistId) {
         if let Some(track) = tracks.own_shot(shooter) {
-            if track.remaining == 1 {
+            if track.timed && track.remaining == 1 {
                 self.cue = Some(ShotCue::Arrival {
                     target: track.target,
                 });
@@ -1072,13 +1089,13 @@ mod tests {
     }
 
     #[test]
-    fn a_muzzle_event_alone_draws_nothing() {
+    fn a_muzzle_event_draws_one_zero_progress_tick() {
         let mut tracks = ProjectileTracks::default();
         tracks.observe(&[shot(1, 2, None)]);
-        assert!(
-            tracks.tracks().is_empty(),
-            "the muzzle event carries no flight time; the continuation does"
-        );
+        assert_eq!(tracks.tracks().len(), 1);
+        assert_eq!(tracks.tracks()[0].travelled(), 0.0);
+        tracks.observe(&[]);
+        assert!(tracks.tracks().is_empty(), "the skin must not advance it");
     }
 
     #[test]

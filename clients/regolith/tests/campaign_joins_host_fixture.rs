@@ -28,8 +28,10 @@ use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::encode_replication;
 use orrery_protocol::{CellId, ChainHash, NodeId, PersistId, StateClaim, Tick, WitnessMsg};
 use orrery_regolith_client::campaign::{CampaignConfig, CampaignRuntime, JoinState};
+use orrery_regolith_client::combat::{LockBreak, ProjectileTracks, ShotCue, ShotFeedback};
 use orrery_regolith_client::intent::Controls;
 use orrery_regolith_client::net;
+use orrery_regolith_client::observe_skin_effects;
 use orrery_regolith_client::session::ConfiguredImpairment;
 use orrery_regolith_client::telemetry::JsonlTelemetry;
 
@@ -71,6 +73,7 @@ struct GroundTruth {
     lock_confirmations_sent: u64,
     damage_inputs_applied: u64,
     shots_resolved: u64,
+    lock_breaks_sent: u64,
 }
 
 impl GroundTruth {
@@ -189,6 +192,7 @@ impl HostFixture {
 #[derive(Clone, Copy)]
 enum Mode {
     Join,
+    TargetDestroyedBeforeDamage,
     Reject,
     WrongSlot,
 }
@@ -253,7 +257,7 @@ async fn pump(
     reply.extend_from_slice(&(assigned as u64).to_le_bytes());
     write_message(&mut send, &reply).await?;
 
-    if matches!(mode, Mode::Join) {
+    if matches!(mode, Mode::Join | Mode::TargetDestroyedBeforeDamage) {
         let claim_bytes = read_message(&mut recv).await?;
         let state_bytes = read_message(&mut recv).await?;
         let claim: StateClaim =
@@ -461,6 +465,20 @@ async fn pump(
                             u64::from(matches!(order, Order::Damage { .. }));
                     }
 
+                    if matches!(mode, Mode::TargetDestroyedBeforeDamage)
+                        && matches!(order, Order::Damage { .. })
+                    {
+                        let RegolithState::Craft(mut target) = authority
+                            .state(bot_entity)
+                            .expect("the fixture host owns its target")
+                            .clone()
+                        else {
+                            panic!("the fixture target is a craft");
+                        };
+                        target.hull = 0;
+                        authority.insert(bot_entity, RegolithState::Craft(target));
+                    }
+
                     // A real target authority step produces the reply. Self-
                     // addressed projectile continuations are stepped on
                     // successive host ticks until they resolve; no target
@@ -490,6 +508,9 @@ async fn pump(
                             );
                             if matches!(reply, Order::LockConfirmed { .. }) {
                                 truth.lock().expect("truth lock").lock_confirmations_sent += 1;
+                            }
+                            if matches!(reply, Order::LockBroken { .. }) {
+                                truth.lock().expect("truth lock").lock_breaks_sent += 1;
                             }
                             let inner = orrery_protocol::channels::encode_delivered_input(
                                 bot_entity,
@@ -708,6 +729,9 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
         "the host-authored LockConfirmed must mature the human's visible lock"
     );
 
+    let mut tracks = ProjectileTracks::default();
+    let mut broken = LockBreak::default();
+    let mut shots = ShotFeedback::default();
     let fired = runtime.advance(
         Controls {
             fire: true,
@@ -732,15 +756,41 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
         )),
         "the fully drawn, host-confirmed lock must not refuse NoLock"
     );
+    observe_skin_effects(
+        &fired.events,
+        &fired.delivered,
+        runtime.entity(),
+        &mut tracks,
+        &mut broken,
+        &mut shots,
+    );
+    assert_eq!(
+        tracks.tracks().len(),
+        1,
+        "the human fire tick's DamageDealt must leave a muzzle tracer in the skin"
+    );
+    assert_eq!(
+        tracks.tracks()[0].travelled(),
+        0.0,
+        "without target-owned flight_ticks the skin must not advance the tracer"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    while fixture.truth().shots_resolved == 0 && Instant::now() < deadline {
-        let _ = runtime.advance(
+    while !matches!(shots.cue, Some(ShotCue::Resolved { .. })) && Instant::now() < deadline {
+        let report = runtime.advance(
             Controls {
                 lock_target: Some(target),
                 ..Controls::default()
             },
             &mut sink,
+        );
+        observe_skin_effects(
+            &report.events,
+            &report.delivered,
+            runtime.entity(),
+            &mut tracks,
+            &mut broken,
+            &mut shots,
         );
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -760,6 +810,114 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
     assert!(
         truth.shots_resolved > 0,
         "the target authority resolved the shot"
+    );
+    assert!(
+        matches!(shots.cue, Some(ShotCue::Resolved { target: hit, .. }) if hit == target),
+        "the delivered target verdict must reach the skin's damage readout"
+    );
+    assert!(
+        !shots.banner().is_empty(),
+        "the authoritative shot result must remain visible to the player"
+    );
+}
+
+#[test]
+fn a_delivered_campaign_lock_break_reaches_both_skin_consumers() {
+    let fixture = HostFixture::spawn(Mode::TargetDestroyedBeforeDamage);
+    let mut sink = sink_for("regolith-campaign-delivered-lock-break");
+    let mut runtime = CampaignRuntime::launch(fixture.config("delivered-lock-break"), crate_seed());
+    drive_until_joined(&mut runtime, &mut sink, 1);
+
+    let target = PersistId::new(1);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let _ = runtime.advance(
+            Controls {
+                lock_target: Some(target),
+                ..Controls::default()
+            },
+            &mut sink,
+        );
+        if matches!(
+            runtime.executor().state(runtime.entity()),
+            Some(RegolithState::Craft(craft))
+                if craft.lock_target == Some(target)
+                    && craft.lock_class.is_some()
+                    && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+        ) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        matches!(
+            runtime.executor().state(runtime.entity()),
+            Some(RegolithState::Craft(craft))
+                if craft.lock_target == Some(target)
+                    && craft.lock_class.is_some()
+                    && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+        ),
+        "the live target must confirm the lock before the break scenario fires"
+    );
+
+    let mut tracks = ProjectileTracks::default();
+    let mut broken = LockBreak::default();
+    let mut shots = ShotFeedback::default();
+    let fired = runtime.advance(
+        Controls {
+            fire: true,
+            lock_target: Some(target),
+            ..Controls::default()
+        },
+        &mut sink,
+    );
+    observe_skin_effects(
+        &fired.events,
+        &fired.delivered,
+        runtime.entity(),
+        &mut tracks,
+        &mut broken,
+        &mut shots,
+    );
+    assert!(
+        shots.cue.is_none(),
+        "an untimed muzzle statement must not invent an arrival"
+    );
+    shots.cue = Some(ShotCue::Arrival { target });
+    shots.ticks_left = orrery_regolith_client::combat::SHOT_CUE_TICKS;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while broken.banner().is_empty() && Instant::now() < deadline {
+        let report = runtime.advance(
+            Controls {
+                lock_target: Some(target),
+                ..Controls::default()
+            },
+            &mut sink,
+        );
+        observe_skin_effects(
+            &report.events,
+            &report.delivered,
+            runtime.entity(),
+            &mut tracks,
+            &mut broken,
+            &mut shots,
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    assert!(
+        fixture.truth().lock_breaks_sent > 0,
+        "the host ruleset must author the delivered break"
+    );
+    assert_eq!(
+        broken.banner(),
+        "LOCK BROKEN · TARGET DESTROYED",
+        "the delivered reason must reach the visible break indicator"
+    );
+    assert!(
+        shots.cue.is_none(),
+        "the same delivered break must cancel the unadjudicated shot cue"
     );
 }
 
