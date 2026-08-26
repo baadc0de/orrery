@@ -373,6 +373,12 @@ fn poll_worker(
             dirty.0 = true;
         }
         WorkerReply::Joined(Ok(answer)) => {
+            // The campaign id is only knowable from the gate that asked; the
+            // join answer does not echo it, and the roster URL needs it.
+            let campaign_id = match &*gate {
+                JoinGate::Admitting { campaign, .. } => Some(campaign.id.clone()),
+                _ => None,
+            };
             let artifact = write_join_artifact(&settings.telemetry_path, &answer.join);
             match artifact {
                 Ok(path) => info!("campaign join file written to {}", path.display()),
@@ -399,6 +405,10 @@ fn poll_worker(
                     jitter_p99_ms: answer.configured.jitter_p99_ms,
                 },
                 transport_secret: settings.transport_secret.clone(),
+                // The one place a roster URL can come from: the origin this
+                // client actually joined through.
+                roster_url: campaign_id
+                    .map(|id| format!("{}/v1/campaigns/{}/roster", settings.origin, id)),
             };
             *session =
                 ActiveSession::Campaign(Box::new(CampaignRuntime::launch(config, crate::SEED)));

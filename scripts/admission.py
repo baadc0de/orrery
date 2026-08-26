@@ -58,6 +58,13 @@ class Admission:
         self.last_note: str | None = None
         self.children: dict[str, subprocess.Popen[str]] = {}
         self.locks: dict[str, Any] = {}
+        # Slot -> nickname for the sessions currently live on each campaign.
+        # Labels only (#484): never identity, never authority, never
+        # addressing, and nothing banks off them. It is deliberately in memory
+        # and deliberately not `joins.jsonl` — that file is the durable
+        # *history* of every join this service ever made, and serving it as a
+        # roster would name players who left hours ago.
+        self.rosters: dict[str, dict[int, str]] = {}
         self.state.mkdir(parents=True, exist_ok=True)
 
     def campaigns(self) -> tuple[dict[str, Campaign], str | None]:
@@ -187,6 +194,7 @@ class Admission:
                 logging.error("host returned an unusable listening address: %s", e)
                 raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
             self.children[ident] = child
+            self.rosters[ident] = {c.peers: nickname}
             threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True).start()
             return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
         finally:
@@ -194,6 +202,27 @@ class Admission:
             if ident not in self.children:
                 self.locks.pop(ident, None)
                 lock.close()
+
+    def roster(self, ident: str) -> dict[str, Any]:
+        """Slot -> nickname for whoever is playing this campaign right now.
+
+        A nickname is a label and nothing else (#484), which is exactly why it
+        is served here instead of riding with replicated craft state: it is not
+        simulation state, determinism does not depend on it, and putting
+        unbounded player-supplied text on the replication hot path would spend
+        the replication budget on decoration. A label may therefore be late,
+        stale or missing with no correctness consequence, and this endpoint is
+        allowed to answer with an empty roster whenever it does not know.
+
+        Empty is a real answer, not an error: a campaign nobody has joined has
+        no labels, and the client must draw those craft with no label rather
+        than inventing one.
+        """
+        campaigns, _ = self.campaigns()
+        if not CAMPAIGN_ID.fullmatch(ident) or ident not in campaigns:
+            raise Refusal(404, "unknown_campaign", "That campaign has ended — refresh the list.")
+        live = self.rosters.get(ident, {})
+        return {"campaign": ident, "roster": [{"slot": slot, "nickname": nickname} for slot, nickname in sorted(live.items())]}
 
     def _wait_listening(self, c: Campaign, remote: str, local: Path, child: subprocess.Popen[str]) -> str:
         destination = local / "listening.txt"
@@ -214,7 +243,9 @@ class Admission:
                 try: self.atomic_bytes(local / "raw.json", result.stdout)
                 except OSError: logging.exception("could not store raw report for %s", sid)
             else: logging.error("could not pull raw report for %s", sid)
-        finally: self.children.pop(ident, None)
+        finally:
+            self.children.pop(ident, None)
+            self.rosters.pop(ident, None)
         lock = self.locks.pop(ident, None)
         if lock is not None: lock.close()
 
@@ -269,8 +300,13 @@ class Handler(BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length", "0")); body = self.rfile.read(size)
         return json.loads(body), body
     def do_GET(self) -> None:
-        if self.path == "/v1/campaigns": self.send_json(200, self.service.listing())
-        else: self.failure(Refusal(404, "not_found", "No such endpoint."))
+        path = urlparse(self.path).path
+        roster = re.fullmatch(r"/v1/campaigns/([^/]+)/roster", path)
+        try:
+            if path == "/v1/campaigns": self.send_json(200, self.service.listing())
+            elif roster: self.send_json(200, self.service.roster(unquote(roster.group(1))))
+            else: raise Refusal(404, "not_found", "No such endpoint.")
+        except Refusal as e: self.failure(e)
     def do_POST(self) -> None:
         path = urlparse(self.path).path; match = re.fullmatch(r"/v1/campaigns/([^/]+)/join", path)
         upload = re.fullmatch(r"/v1/sessions/([^/]+)/upload", path)
@@ -379,6 +415,30 @@ class AdmissionTests(unittest.TestCase):
         r = self.request(); r["nickname"] = "a\tb"
         with self.assertRaises(Refusal) as x: self.service.join("test", r)
         self.assertEqual(x.exception.status, 422); self.assertFalse((self.state / "test" / "ledger.tsv").exists())
+    def test_the_roster_names_the_live_session_by_slot(self) -> None:
+        # The label the client draws on a ship comes from here, and the slot is
+        # the only thing that maps it to a craft (entity = slot + 1, client
+        # side). A roster keyed by anything else labels the wrong ship.
+        c = self.service.campaigns()[0]["test"]
+        self.assertEqual(self.service.roster("test")["roster"], [], "nobody has joined yet")
+        self.service.join("test", self.request())
+        self.assertEqual(self.service.roster("test")["roster"], [{"slot": c.peers, "nickname": "ada"}])
+
+    def test_the_roster_forgets_a_session_when_it_ends(self) -> None:
+        # A label that outlives its session names a player who is not there.
+        self.service.join("test", self.request())
+        self.assertEqual(len(self.service.roster("test")["roster"]), 1)
+        for child in list(self.service.children.values()):
+            child.kill()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and self.service.rosters:
+            time.sleep(0.01)
+        self.assertEqual(self.service.roster("test")["roster"], [], "the reaper must drop the label")
+
+    def test_the_roster_of_an_unknown_campaign_refuses_404(self) -> None:
+        with self.assertRaises(Refusal) as caught: self.service.roster("nope")
+        self.assertEqual((caught.exception.status, caught.exception.error), (404, "unknown_campaign"))
+
     def test_a_broken_control_file_keeps_serving_the_previous_parse(self) -> None:
         self.service.listing(); self.control.write_text("[broken\n")
         self.assertEqual(self.service.listing()["campaigns"][0]["id"], "test")

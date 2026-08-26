@@ -131,6 +131,12 @@ pub struct CampaignConfig {
     /// Persistent client identity presented at admission, used for the QUIC
     /// handshake and the finished measurement signature.
     pub transport_secret: iroh_base::SecretKey,
+    /// Where to fetch this campaign's nickname roster, when one is reachable.
+    ///
+    /// `None` for a session that never spoke to an admission service — the
+    /// join-from-file path — and every ship then stays unlabelled. A label is
+    /// only ever a label (#484), so its absence costs nothing but the label.
+    pub roster_url: Option<String>,
 }
 
 impl CampaignConfig {
@@ -1648,6 +1654,7 @@ mod tests {
                 jitter_p99_ms: 100,
             },
             transport_secret: iroh_base::SecretKey::from_bytes(&[0x49; 32]),
+            roster_url: None,
         };
         assert_eq!(config.actor(), Actor::Human);
     }

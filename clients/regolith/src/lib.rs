@@ -13,6 +13,7 @@ pub mod identity;
 pub mod intent;
 pub mod join;
 pub mod net;
+pub mod roster;
 pub mod session;
 pub mod starfield;
 pub mod telemetry;
@@ -296,6 +297,8 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<OverlayState>()
             .init_resource::<MetricWindow>()
             .init_resource::<CameraZoom>()
+            .init_resource::<roster::ShipRoster>()
+            .init_resource::<roster::RosterTask>()
             .init_resource::<SelectedLock>()
             .init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
@@ -317,6 +320,7 @@ impl Plugin for RegolithSkinPlugin {
                     // that system just wrote, not last frame's.
                     follow_camera.after(sync_rendered_state),
                     starfield::sync_starfield.after(follow_camera),
+                    sync_ship_labels.after(follow_camera),
                     zoom_camera.before(follow_camera),
                     refresh_session_banner,
                     refresh_strip,
@@ -345,6 +349,10 @@ impl Plugin for RegolithSkinPlugin {
             .add_systems(
                 Update,
                 stream_metrics.run_if(on_timer(Duration::from_secs(1))),
+            )
+            .add_systems(
+                Update,
+                roster::refresh_roster.run_if(on_timer(roster::ROSTER_REFRESH)),
             );
     }
 }
@@ -1361,6 +1369,129 @@ fn follow_camera(
     *view = chase_camera_transform(centre, zoom.height_m());
 }
 
+/// A screen-space nickname tag following one craft.
+#[derive(Component, Debug, Clone, Copy)]
+struct ShipLabel(PersistId);
+
+/// Font size of a ship's nickname tag, in pixels.
+const SHIP_LABEL_SIZE_PX: f32 = 12.0;
+/// How far under a craft's centre the tag sits, in pixels.
+const SHIP_LABEL_DROP_PX: f32 = 22.0;
+/// Rough advance width of one character at [`SHIP_LABEL_SIZE_PX`], used only
+/// to centre the tag under the ship. Bevy's layout knows the true width, but
+/// only after the frame this system runs in; being a few pixels off-centre is
+/// a better trade than a tag that lags the ship by a frame.
+const SHIP_LABEL_CHAR_PX: f32 = 0.5 * SHIP_LABEL_SIZE_PX;
+
+/// Which craft get a tag this frame, and where on screen it goes.
+///
+/// Split out from [`sync_ship_labels`] so the decision can be asserted without
+/// a render device: a craft is tagged **only** when the roster knows it and it
+/// projects onto the screen. A craft the roster has never heard of contributes
+/// nothing — not an empty string, not a placeholder — because a made-up name
+/// is worse than no name (#484, #523).
+fn ship_label_placements(
+    roster: &roster::ShipRoster,
+    projected: impl Iterator<Item = (PersistId, Option<Vec2>)>,
+) -> BTreeMap<PersistId, (String, Vec2)> {
+    projected
+        .filter_map(|(entity, screen)| {
+            let label = roster.label(entity)?;
+            Some((entity, (label.to_owned(), screen?)))
+        })
+        .collect()
+}
+
+/// Draws each craft's nickname under it, in screen space.
+///
+/// Screen space rather than world space on purpose: a label is a HUD element,
+/// so it has to stay the same readable size across #521's whole zoom range,
+/// where a world-space text mesh would be unreadable at either end.
+///
+/// **A label is only a label** (#484, and see [`roster::ShipRoster`]). This
+/// system reads a `PersistId` and asks for a string; nothing anywhere asks the
+/// other way round, and a craft the roster does not know is drawn with **no
+/// tag at all** rather than a placeholder that could be mistaken for a name.
+fn sync_ship_labels(
+    roster: Res<roster::ShipRoster>,
+    session: Res<ActiveSession>,
+    camera: Query<(&Camera, &GlobalTransform), With<ChaseCamera>>,
+    bodies: Query<(&CoreEntity, &GlobalTransform), With<CraftBodyComposition>>,
+    mut labels: Query<(
+        Entity,
+        &ShipLabel,
+        &mut Node,
+        &mut Visibility,
+        &mut Text,
+        &mut TextColor,
+    )>,
+    mut commands: Commands,
+) {
+    let Ok((camera, camera_transform)) = camera.single() else {
+        return;
+    };
+    let own = session.local_entity();
+    let wanted = ship_label_placements(
+        &roster,
+        bodies.iter().map(|(core, transform)| {
+            (
+                core.0,
+                camera
+                    .world_to_viewport(camera_transform, transform.translation())
+                    .ok(),
+            )
+        }),
+    );
+
+    let mut placed = BTreeSet::new();
+    for (entity, tag, mut node, mut visibility, mut text, mut colour) in &mut labels {
+        match wanted.get(&tag.0) {
+            Some((label, screen)) => {
+                placed.insert(tag.0);
+                if **text != *label {
+                    **text = label.clone();
+                }
+                let half = label.chars().count() as f32 * SHIP_LABEL_CHAR_PX / 2.0;
+                node.left = Val::Px(screen.x - half);
+                node.top = Val::Px(screen.y + SHIP_LABEL_DROP_PX);
+                // "This one is mine" is the accent's job everywhere else in
+                // the skin, so the player's own tag wears it and everyone
+                // else stays on the neutral ramp.
+                *colour = TextColor(if tag.0 == own {
+                    hud::ACCENT_PALE
+                } else {
+                    hud::MUTED
+                });
+                *visibility = Visibility::Inherited;
+            }
+            None => commands.entity(entity).despawn(),
+        }
+    }
+    for (entity, (label, screen)) in wanted {
+        if placed.contains(&entity) {
+            continue;
+        }
+        let half = label.chars().count() as f32 * SHIP_LABEL_CHAR_PX / 2.0;
+        commands.spawn((
+            ShipLabel(entity),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(screen.x - half),
+                top: Val::Px(screen.y + SHIP_LABEL_DROP_PX),
+                ..Default::default()
+            },
+            GlobalZIndex(60),
+            Text::new(label),
+            TextFont::from_font_size(SHIP_LABEL_SIZE_PX),
+            TextColor(if entity == own {
+                hud::ACCENT_PALE
+            } else {
+                hud::MUTED
+            }),
+        ));
+    }
+}
+
 fn sync_rendered_state(
     mut commands: Commands,
     session: Res<ActiveSession>,
@@ -1462,6 +1593,7 @@ fn refresh_f3_pane(
     tracks: Res<ProjectileTracks>,
     session: Res<ActiveSession>,
     rock_bodies: Query<(), With<RockBody>>,
+    roster: Res<roster::ShipRoster>,
     mut pane: Query<(&mut Text, &mut Node), With<F3Pane>>,
 ) {
     if let Ok((mut text, mut node)) = pane.single_mut() {
@@ -1495,6 +1627,8 @@ fn refresh_f3_pane(
         }
         text.push('\n');
         text.push_str(&rock_census(counts, rock_bodies.iter().count()));
+        text.push('\n');
+        text.push_str(&roster.summary_line());
         text.push_str(&format!(
             "\nshots in flight {} | {}",
             tracks.tracks().len(),
@@ -1845,6 +1979,53 @@ mod tests {
             projection.near < CAMERA_MIN_HEIGHT_M,
             "the deck must stay inside the frustum at full zoom-in"
         );
+    }
+
+    /// #523/#484: a label is a label. A craft the roster knows gets its name
+    /// under it; a craft it does not know gets nothing at all, and nothing
+    /// here may invent a stand-in.
+    #[test]
+    fn only_a_craft_the_roster_knows_gets_a_tag() {
+        use crate::roster::{entity_of_slot, RosterResponse, RosterRow, ShipRoster};
+
+        let mut roster = ShipRoster::default();
+        roster.accept(&RosterResponse {
+            roster: vec![RosterRow {
+                slot: 8,
+                nickname: "ada".to_owned(),
+            }],
+        });
+        let known = entity_of_slot(8);
+        let stranger = entity_of_slot(3);
+
+        let placements = ship_label_placements(
+            &roster,
+            [
+                (known, Some(Vec2::new(400.0, 300.0))),
+                (stranger, Some(Vec2::new(500.0, 300.0))),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            placements.get(&known).map(|(label, _)| label.as_str()),
+            Some("ada")
+        );
+        assert!(
+            !placements.contains_key(&stranger),
+            "a craft with no roster row must be drawn with no tag: {placements:?}"
+        );
+
+        // Off screen is not a tag either: a name floating at the edge of the
+        // window belongs to a ship the player cannot see.
+        let offscreen = ship_label_placements(&roster, [(known, None)].into_iter());
+        assert!(offscreen.is_empty(), "an unprojectable craft gets no tag");
+
+        // And an empty roster is a quiet screen, not a screen of placeholders.
+        let silent = ship_label_placements(
+            &ShipRoster::default(),
+            [(known, Some(Vec2::ZERO)), (stranger, Some(Vec2::ZERO))].into_iter(),
+        );
+        assert!(silent.is_empty(), "no roster means no tags: {silent:?}");
     }
 
     #[test]

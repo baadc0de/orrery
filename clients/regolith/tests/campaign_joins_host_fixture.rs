@@ -171,6 +171,7 @@ impl HostFixture {
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
             configured: configured(),
             transport_secret: net::slot_secret(CLIENT_SLOT),
+            roster_url: None,
         }
     }
 

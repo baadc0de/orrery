@@ -123,6 +123,9 @@ fn main() {
             wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
             configured,
             transport_secret: transport_secret.clone(),
+            // A join file carries no admission origin, so this path never
+            // labels. See `roster::ShipRoster`.
+            roster_url: None,
         });
     }
     app.add_plugins(skin);
