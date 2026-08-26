@@ -1216,6 +1216,12 @@ fn nonnegative_distance_squared(a: QPos, b: QPos) -> u128 {
     ])
 }
 
+/// Straight-line separation in millimetres, rounded down exactly as projectile flight time is.
+#[must_use]
+pub fn distance_mm(a: QPos, b: QPos) -> u128 {
+    integer_sqrt(nonnegative_distance_squared(a, b))
+}
+
 fn square_i64(value: i64) -> u128 {
     let value = value.max(0) as u128;
     value.saturating_mul(value)

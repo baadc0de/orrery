@@ -127,6 +127,10 @@ fn main() {
     }
     app.add_plugins(skin);
 
+    if has_flag(&args, "--capture-geometry") {
+        app.insert_resource(orrery_regolith_client::GeometryCapture::auto_drive());
+    }
+
     if boot_ui {
         app.add_plugins(AdmissionPlugin::new(
             admission_url,

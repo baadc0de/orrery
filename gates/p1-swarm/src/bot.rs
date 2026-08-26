@@ -38,7 +38,7 @@ use orrery_games::regolith::order::Order;
 use orrery_games::regolith::order::Outcome;
 use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::weapon::WeaponKind;
-use orrery_games::regolith::{Regolith, REGOLITH_RULESET};
+use orrery_games::regolith::{distance_mm, firing_arc_measurement, Regolith, REGOLITH_RULESET};
 use orrery_net::budget::{UploadBudget, UploadMeter};
 use orrery_net::channels::{encode_replication, Channel};
 use orrery_net::peer_link::{
@@ -687,6 +687,9 @@ impl Bot {
         // pilot orders. This vector is also exactly what the witness logs.
         let delivered = core::mem::take(&mut self.delivered_inbox);
         let mut orders: Vec<_> = delivered.iter().map(|(_, order)| order.clone()).collect();
+        if std::env::var_os("ORRERY_GEOMETRY_CAPTURE").is_some() {
+            self.capture_adjudication_geometry(tick, &orders);
+        }
         let mut sources: Vec<_> = delivered
             .into_iter()
             .map(|(from, _)| RecordSource::InboundEvent { from })
@@ -774,6 +777,51 @@ impl Bot {
             return;
         };
         position.0 = grid;
+    }
+
+    fn capture_adjudication_geometry(&self, tick: u64, orders: &[Order]) {
+        for order in orders {
+            let Order::Damage {
+                from,
+                from_pos,
+                from_yaw_urad,
+                from_archetype,
+                from_weapon,
+                flight_ticks: None,
+                ..
+            } = order
+            else {
+                continue;
+            };
+            let target = self.craft();
+            let measurement =
+                firing_arc_measurement(*from_archetype, *from_yaw_urad, *from_pos, target.pos);
+            let range_sq = target.pos.distance_squared(*from_pos);
+            let distance_mm = distance_mm(target.pos, *from_pos);
+            let reach_mm = from_weapon
+                .weapon()
+                .optimal_mm
+                .saturating_add(from_weapon.weapon().falloff_mm)
+                .saturating_add(target.archetype.limits().radius_mm);
+            eprintln!(
+                "geometry_capture side=host tick={tick} attacker={} target={} attacker_pos={:?} \
+                 target_pos={:?} attacker_yaw_urad={} archetype={:?} \
+                 world_bearing_urad={:?} relative_urad={:?} inside={} \
+                 distance_mm={} distance_sq_mm2={} reach_mm={}",
+                from.0,
+                self.entity.0,
+                from_pos,
+                target.pos,
+                from_yaw_urad,
+                from_archetype,
+                measurement.world_bearing_urad,
+                measurement.relative_urad,
+                measurement.inside,
+                distance_mm,
+                range_sq,
+                reach_mm,
+            );
+        }
     }
 
     /// Advance simulated time and run one frame of the plugin stack.

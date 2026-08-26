@@ -95,6 +95,22 @@ struct MetricWindow {
     idle_ticks: u64,
 }
 
+/// Enables the live geometry capture used to compare rendered and adjudicated shots.
+///
+/// This is an operator diagnostic: ordinary clients never insert the resource.
+#[derive(Debug, Resource)]
+pub struct GeometryCapture {
+    auto_drive: bool,
+}
+
+impl GeometryCapture {
+    /// Capture geometry and continuously select, turn, and fire at the focus craft.
+    #[must_use]
+    pub const fn auto_drive() -> Self {
+        Self { auto_drive: true }
+    }
+}
+
 /// A playable local authority using only the shared headless executor.
 ///
 /// **Offline and smoke use only — never a campaign path.** Nothing this
@@ -452,8 +468,24 @@ fn drive_core(
     mut broken: ResMut<LockBreak>,
     mut shots: ResMut<ShotFeedback>,
     mut selected: ResMut<SelectedLock>,
+    geometry_capture: Option<Res<GeometryCapture>>,
 ) {
-    let controls = controls(&keys, selected.target);
+    if geometry_capture
+        .as_ref()
+        .is_some_and(|capture| capture.auto_drive)
+    {
+        if let ActiveSession::Campaign(runtime) = &*session {
+            selected.target = runtime.focus();
+        }
+    }
+    let mut controls = controls(&keys, selected.target);
+    if geometry_capture
+        .as_ref()
+        .is_some_and(|capture| capture.auto_drive)
+    {
+        controls.right = true;
+        controls.fire = true;
+    }
     match &mut *session {
         ActiveSession::Local(local) => {
             let tick = local.tick;
@@ -498,6 +530,10 @@ fn drive_core(
             // wire leg, replicated-state application, link measurement and
             // the accumulator feed.
             let report = runtime.advance(controls, &mut sink);
+            if geometry_capture.is_some() {
+                capture_rendered_geometry(runtime);
+                capture_client_geometry(runtime, &report.events);
+            }
             window.intents = window.intents.saturating_add(report.intents as u64);
             observe_skin_effects(
                 &report.events,
@@ -514,6 +550,99 @@ fn drive_core(
                 &mut selected,
             );
         }
+    }
+}
+
+fn capture_rendered_geometry(runtime: &campaign::CampaignRuntime) {
+    use orrery_games::regolith::{distance_mm, firing_arc_measurement};
+
+    let view = CombatView::read(runtime.executor(), runtime.entity());
+    let (Some(attacker), Some(target)) = (view.own, view.target) else {
+        return;
+    };
+    let measurement = firing_arc_measurement(
+        attacker.archetype,
+        attacker.yaw_urad,
+        attacker.pos,
+        target.pos,
+    );
+    let distance_mm = distance_mm(attacker.pos, target.pos);
+    eprintln!(
+        "geometry_capture side=client_render tick={} attacker={} target={} attacker_pos={:?} \
+         target_pos={:?} attacker_yaw_urad={} archetype={:?} world_bearing_urad={:?} \
+         relative_urad={:?} inside={} distance_mm={}",
+        runtime.joined_ticks().saturating_sub(1),
+        attacker.entity.0,
+        target.entity.0,
+        attacker.pos,
+        target.pos,
+        attacker.yaw_urad,
+        attacker.archetype,
+        measurement.world_bearing_urad,
+        measurement.relative_urad,
+        measurement.inside,
+        distance_mm,
+    );
+}
+
+fn capture_client_geometry(runtime: &campaign::CampaignRuntime, events: &[Outcome]) {
+    use orrery_games::regolith::{distance_mm, firing_arc_measurement};
+
+    for event in events {
+        let Outcome::DamageDealt {
+            attacker,
+            target,
+            attacker_pos,
+            attacker_yaw_urad,
+            attacker_archetype,
+            attacker_weapon,
+            flight_ticks: None,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(RegolithState::Craft(rendered_attacker)) = runtime.executor().state(*attacker)
+        else {
+            continue;
+        };
+        let Some(RegolithState::Craft(rendered_target)) = runtime.executor().state(*target) else {
+            continue;
+        };
+        let measurement = firing_arc_measurement(
+            *attacker_archetype,
+            *attacker_yaw_urad,
+            *attacker_pos,
+            rendered_target.pos,
+        );
+        let range_sq = rendered_target.pos.distance_squared(*attacker_pos);
+        let distance_mm = distance_mm(rendered_target.pos, *attacker_pos);
+        let reach_mm = attacker_weapon
+            .weapon()
+            .optimal_mm
+            .saturating_add(attacker_weapon.weapon().falloff_mm)
+            .saturating_add(rendered_target.archetype.limits().radius_mm);
+        eprintln!(
+            "geometry_capture side=client tick={} attacker={} target={} shot_pos={:?} \
+             rendered_attacker_pos={:?} rendered_target_pos={:?} shot_yaw_urad={} \
+             rendered_yaw_urad={} archetype={:?} world_bearing_urad={:?} \
+             relative_urad={:?} inside={} distance_mm={} distance_sq_mm2={} reach_mm={}",
+            runtime.joined_ticks().saturating_sub(1),
+            attacker.0,
+            target.0,
+            attacker_pos,
+            rendered_attacker.pos,
+            rendered_target.pos,
+            attacker_yaw_urad,
+            rendered_attacker.yaw_urad,
+            attacker_archetype,
+            measurement.world_bearing_urad,
+            measurement.relative_urad,
+            measurement.inside,
+            distance_mm,
+            range_sq,
+            reach_mm,
+        );
     }
 }
 
@@ -845,11 +974,13 @@ fn frame_camera(
 }
 
 fn sync_rendered_state(
+    mut commands: Commands,
     session: Res<ActiveSession>,
-    mut rendered: Query<(&CoreEntity, &mut Transform)>,
+    mut rendered: Query<(Entity, &CoreEntity, &mut Transform)>,
 ) {
-    for (entity, mut transform) in &mut rendered {
+    for (body, entity, mut transform) in &mut rendered {
         let Some(state) = session.executor().state(entity.0) else {
+            commands.entity(body).despawn();
             continue;
         };
         // `RegolithState` became a sum when #323 added rocks: craft and rock
@@ -1097,6 +1228,26 @@ mod tests {
                 "yaw {yaw_urad}: the nose points {nose}, the ruleset thrusts {thrust}"
             );
         }
+    }
+
+    #[test]
+    fn body_despawns_when_its_replicated_state_expires() {
+        let mut local = LocalSession::default();
+        assert!(local.executor.take_state(OPPONENT).is_some());
+        let mut app = App::new();
+        app.insert_resource(ActiveSession::Local(Box::new(local)))
+            .add_systems(Update, sync_rendered_state);
+        let body = app
+            .world_mut()
+            .spawn((CoreEntity(OPPONENT), Transform::default()))
+            .id();
+
+        app.update();
+
+        assert!(
+            app.world().get_entity(body).is_err(),
+            "an expired replica must not leave its last transform on screen"
+        );
     }
 
     /// #445's arcs, checked against a ship whose heading comes from the
