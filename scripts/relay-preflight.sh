@@ -219,22 +219,31 @@ echo relay'
             "$0" --postflight 2>&1
     }
 
-    output="$(st_run good)" || status=$?
-    ((status == 0)) || die "self-test: passing fixtures returned $status ($output)"
-    grep -Fq 'PASS qad-listens-publicly ' <<<"$output" \
-        || die 'self-test: public QAD fixture did not pass qad-listens-publicly'
-    grep -Fq 'PASS cert-expiry-watch:relay-private ' <<<"$output" \
-        || die 'self-test: valid served certificate did not pass cert-expiry-watch'
+    st_good() {
+        status=0; output="$(st_run good)" || status=$?
+        ((status == 0)) || die "self-test: restored passing fixtures returned $status ($output)"
+        grep -Fq 'PASS qad-listens-publicly ' <<<"$output" \
+            || die 'self-test: public QAD fixture did not pass qad-listens-publicly'
+        grep -Fq 'PASS cert-expiry-watch:relay-private ' <<<"$output" \
+            || die 'self-test: valid served certificate did not pass cert-expiry-watch'
+    }
+
+    # Establish passing state, then restore it after every guarded mutation.
+    # A test that mutates one fixture and moves on has not proved the intended
+    # recovery path actually returns to PASS.
+    st_good
 
     status=0; output="$(st_run loopback)" || status=$?
     ((status != 0)) || die 'self-test: loopback QAD fixture passed'
     grep -Fq 'FAIL qad-listens-publicly QAD is bound to loopback' <<<"$output" \
         || die 'self-test: loopback QAD did not fail the named qad-listens-publicly check'
+    st_good
 
     status=0; output="$(st_run expiring)" || status=$?
     ((status != 0)) || die 'self-test: expiring certificate fixture passed'
     grep -Fq 'FAIL cert-expiry-watch:relay-private ' <<<"$output" \
         || die 'self-test: expiring certificate did not fail cert-expiry-watch'
+    st_good
 
     status=0
     output="$(PATH="$dir/bin:$PATH" RELAY_PREFLIGHT_SS_BIN=missing-ss \
@@ -242,8 +251,9 @@ echo relay'
     ((status != 0)) || die 'self-test: unavailable ss fixture passed'
     grep -Fq "UNKNOWN qad-listens-publicly required command 'missing-ss' is unavailable" <<<"$output" \
         || die 'self-test: unavailable probe was not reported UNKNOWN by qad-listens-publicly'
+    st_good
 
-    echo "$NAME: self-test passed (1 pass, 3 guarded mutations: loopback FAIL, expiring FAIL, unavailable UNKNOWN)"
+    echo "$NAME: self-test passed (4 passing fixtures: baseline + 3 reversions; 3 guarded mutations: loopback FAIL, expiring FAIL, unavailable UNKNOWN)"
 }
 
 die() { echo "$NAME: $*" >&2; exit 2; }
