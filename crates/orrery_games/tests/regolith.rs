@@ -43,6 +43,26 @@ fn campaign_seed_places_every_rock_tier_beside_but_not_on_the_crowd_orbit() {
     });
     assert_eq!(tiers, [1, 2, 3], "the campaign publishes every visual tier");
 
+    // This is the cross-platform commitment for scenario composition itself.
+    // Same-process equality alone cannot catch a platform-specific libm drift
+    // in the polar placement below; every determinism-matrix leg runs this
+    // committed byte comparison.
+    let mut digest = blake3::Hasher::new();
+    for seeded in &rocks {
+        digest.update(&seeded.entity.0.to_le_bytes());
+        digest.update(&seeded.owner_slot.to_le_bytes());
+        let mut encoded = Vec::new();
+        seeded.rock.encode(&mut encoded);
+        digest.update(&encoded);
+    }
+    assert_eq!(
+        *digest.finalize().as_bytes(),
+        [
+            92, 13, 156, 174, 173, 149, 167, 28, 0, 143, 167, 231, 88, 139, 225, 13, 145, 226, 126,
+            160, 130, 88, 154, 52, 63, 191, 160, 21, 198, 59, 255, 213,
+        ]
+    );
+
     let (player, _) = campaign_spawn_pose(8, 9);
     for seeded in &rocks {
         assert!(
