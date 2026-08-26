@@ -222,6 +222,7 @@ self_test() {
 case "${CAMPAIGN_RELEASE_PREFLIGHT_FIXTURE:-good}" in
   unavailable) echo "gh: API unavailable" >&2; exit 1 ;;
   empty) echo "[[]]" ;;
+  draft-only) echo "[[{\"name\":\"fixture-draft\",\"draft\":true,\"target_commitish\":\"11111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"assets\":[{\"name\":\"orrery-regolith-x86_64-linux.tar.gz\"}]}]]" ;;
   no-match) echo "[[{\"name\":\"fixture-release\",\"draft\":false,\"target_commitish\":\"aaaaaaaa11111111111111111111111111111111\",\"assets\":[{\"name\":\"orrery-regolith-x86_64-linux.tar.gz\"}]}]]" ;;
   *) echo "[[{\"name\":\"fixture-release\",\"draft\":false,\"target_commitish\":\"11111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"assets\":[{\"name\":\"orrery-regolith-x86_64-linux.tar.gz\"}]}]]" ;;
 esac'
@@ -251,6 +252,17 @@ esac'
 
     # The guarded stage must fail by the campaign's own named check, then
     # recover when the matching revision is restored.
+    # A draft release is not downloadable. Counting one as published would
+    # tell the operator a build exists that no volunteer can fetch — the same
+    # shape as the unmatched case, and it was unpinned until this fixture.
+    write_control 11111111
+    status=0; output="$(st_run draft-only)" || status=$?
+    ((status != 0)) || die 'self-test: a draft-only release satisfied a pinned revision'
+    grep -Fq 'FAIL client-release:fixture no published Regolith release targets client_rev 11111111' <<<"$output" \
+        || die 'self-test: a draft-only release did not fail the named client-release:fixture check'
+    ((mutations += 1))
+    st_good
+
     write_control deadbeef
     status=0; output="$(st_run no-match)" || status=$?
     ((status != 0)) || die 'self-test: unmatched pinned revision passed'
@@ -281,7 +293,7 @@ esac'
     ((mutations += 1))
     st_good
 
-    echo "$NAME: self-test passed ($passing passing fixtures: baseline + $((passing - 1)) reversions; $mutations guarded mutations: unmatched FAIL, erroring UNKNOWN, missing-gh UNKNOWN, empty UNKNOWN)"
+    echo "$NAME: self-test passed ($passing passing fixtures: baseline + $((passing - 1)) reversions; $mutations guarded mutations: unmatched FAIL, draft-only FAIL, erroring UNKNOWN, missing-gh UNKNOWN, empty UNKNOWN)"
 }
 
 die() { echo "$NAME: $*" >&2; exit 2; }
