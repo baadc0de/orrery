@@ -70,6 +70,13 @@ const SEND_HZ: u32 = 20;
 /// Ticks between state broadcasts (`TICK_HZ / SEND_HZ`, floored at one).
 const SEND_EVERY_TICKS: u64 = (orrery_core::TICK_HZ / SEND_HZ) as u64;
 
+/// How long a remote state remains drawable without a replication refresh.
+///
+/// This matches the headless peer's two-second replica lifetime: twice the
+/// one-hertz proxy floor, so a legal low-rate stream survives while a craft
+/// that left this client's interest set does not remain as a frozen ghost.
+const REPLICA_TTL_TICKS: u64 = 120;
+
 /// State claims are authored at the existing headless producer's 2 Hz cadence.
 const CLAIM_EVERY_TICKS: u64 = 30;
 
@@ -361,6 +368,7 @@ pub struct CampaignRuntime {
     delivered_unroutable: u64,
     delivered_foreign: u64,
     pending_delivered: Vec<DeliveredOrder>,
+    replica_seen_at: BTreeMap<PersistId, u64>,
     focus: Option<PersistId>,
     latest_cell: Option<CellId>,
 
@@ -529,6 +537,7 @@ impl CampaignRuntime {
             delivered_unroutable: 0,
             delivered_foreign: 0,
             pending_delivered: Vec::new(),
+            replica_seen_at: BTreeMap::new(),
             focus: None,
             latest_cell: None,
             record_written: false,
@@ -879,6 +888,9 @@ impl CampaignRuntime {
                             match <RegolithState as CoreCodec>::decode(&encoded) {
                                 Ok(state) => {
                                     self.executor.insert(entity, state);
+                                    if entity != self.entity {
+                                        self.replica_seen_at.insert(entity, tick.0);
+                                    }
                                     // The duel view follows the first remote
                                     // craft that arrives, and stays with it.
                                     if entity != self.entity && self.focus.is_none() {
@@ -931,6 +943,14 @@ impl CampaignRuntime {
                 }
             }
         }
+
+        expire_stale_replicas(
+            &mut self.executor,
+            self.entity,
+            tick.0,
+            &mut self.replica_seen_at,
+            &mut self.focus,
+        );
 
         if !link.is_connected() || link.host_said_goodbye() {
             self.state = JoinState::Closed {
@@ -1082,6 +1102,30 @@ impl CampaignRuntime {
             JoinState::Closed { host_said_goodbye } => {
                 format!("campaign: closed (host said goodbye: {host_said_goodbye})")
             }
+        }
+    }
+}
+
+fn expire_stale_replicas(
+    executor: &mut Executor<Regolith>,
+    own: PersistId,
+    tick: u64,
+    seen_at: &mut BTreeMap<PersistId, u64>,
+    focus: &mut Option<PersistId>,
+) {
+    let expired: Vec<_> = seen_at
+        .iter()
+        .filter_map(|(entity, seen)| {
+            (tick.saturating_sub(*seen) > REPLICA_TTL_TICKS).then_some(*entity)
+        })
+        .collect();
+    for entity in expired {
+        seen_at.remove(&entity);
+        if entity != own {
+            executor.take_state(entity);
+        }
+        if *focus == Some(entity) {
+            *focus = None;
         }
     }
 }
@@ -1382,6 +1426,44 @@ mod tests {
         assert_eq!(third_b.deviation_ms, Some(0));
         let spiky = tracker.record(1, 19, 280.0); // interval 125
         assert_eq!(spiky.deviation_ms, Some(60), "|125 − 65|");
+    }
+
+    #[test]
+    fn campaign_replica_expires_instead_of_freezing_on_screen() {
+        let game = Regolith::honest();
+        let own = PersistId::new(9);
+        let remote = PersistId::new(3);
+        let mut executor = Executor::new(game, UniverseSeed([0x61; 32]));
+        executor.insert(own, game.spawn(own, 8));
+        executor.insert(remote, game.spawn(remote, 2));
+        let mut seen_at = BTreeMap::from([(remote, 10)]);
+        let mut focus = Some(remote);
+
+        expire_stale_replicas(
+            &mut executor,
+            own,
+            10 + REPLICA_TTL_TICKS,
+            &mut seen_at,
+            &mut focus,
+        );
+        assert!(
+            executor.state(remote).is_some(),
+            "the legal one-hertz proxy grace remains drawable"
+        );
+
+        expire_stale_replicas(
+            &mut executor,
+            own,
+            11 + REPLICA_TTL_TICKS,
+            &mut seen_at,
+            &mut focus,
+        );
+        assert!(
+            executor.state(remote).is_none(),
+            "an out-of-interest replica must not freeze at its last position"
+        );
+        assert_eq!(focus, None, "the duel view must release the stale craft");
+        assert!(executor.state(own).is_some(), "own authority never expires");
     }
 
     /// The config's actor is human by construction; the session id round-trips.
