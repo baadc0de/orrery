@@ -889,7 +889,7 @@ impl Swarm {
     /// Stands in for the coordinator re-broadcasting a manifest as peers move.
     /// Without it a bot's view of its island-mates' cells freezes at tick zero
     /// and the visibility gate stops reflecting the world.
-    fn refresh_rosters(&mut self) {
+    fn refresh_rosters(&mut self, tick: u64) {
         // Pump the exterior's meta frames first, so today's roster carries the
         // cell it just reported rather than yesterday's.
         if let Some(exterior) = &mut self.exterior {
@@ -906,6 +906,17 @@ impl Swarm {
             .map(|bot| (bot.node, bot.cell().expect("committed")))
             .collect();
         if let Some(exterior) = &self.exterior {
+            let interest = exterior.cell().neighbors27();
+            for (index, (_, cell)) in roster.iter().enumerate() {
+                eprintln!(
+                    "replica_scope_capture host_tick={tick} entity={} in_scope={} \
+                     subject_cell={} receiver_cell={}",
+                    index + 1,
+                    interest.contains(cell),
+                    cell.to_bits(),
+                    exterior.cell().to_bits(),
+                );
+            }
             roster.push((exterior.node, exterior.cell()));
         }
         for bot in &mut self.bots {
@@ -1076,7 +1087,7 @@ impl Swarm {
                     let rate = self.bots[index].upload_rate_bits();
                     self.samples[index].push(rate);
                 }
-                self.refresh_rosters();
+                self.refresh_rosters(tick);
             }
 
             if self.config.late_join_tick == Some(tick) {
