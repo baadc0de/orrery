@@ -199,6 +199,7 @@ header is hard to mangle invisibly. A worked example with two campaigns:
 title       = Shakedown: 3% loss, 100ms jitter
 open        = yes
 host        = 203.0.113.7
+external_port = 52011
 peers       = 8
 seconds     = 3600
 loss_pct    = 3
@@ -209,6 +210,7 @@ client_rev  = 54a8ee81
 title       = Clean link baseline
 open        = no
 host        = 203.0.113.7
+external_port = 52012
 peers       = 8
 seconds     = 1800
 loss_pct    = 0
@@ -217,9 +219,12 @@ client_rev  = 54a8ee81
 ```
 
 The section name is the campaign id (URL-safe: `[a-z0-9-]{1,64}`, refused
-otherwise at parse). `host` is the campaign server — the ephemeral box the
-service launches the harness on over SSH (§10); campaign stand-up fills it
-in, and a join against a dead or wrong `host` fails at §3.2 step 11 as
+otherwise at parse). `host` is the campaign server's public IP — the
+ephemeral box the service launches the harness on over SSH (§10), and the
+routable half of `host_direct`. A hostname is refused because the client's
+wire shape is `SocketAddr`, not a DNS name. `external_port` is the fixed UDP
+port opened in that host's firewall; campaigns sharing a host need distinct
+ports. A join against a dead or wrong `host` fails at §3.2 step 11 as
 `host_failed`. `peers`, `seconds`, `loss_pct`, `jitter_ms` become the
 harness invocation and the client's `--expect-*` configuration; `client_rev`
 becomes `--require-client-rev`. Omitting `client_rev` omits the pin — legal,
@@ -363,6 +368,7 @@ The handler, in order (pseudocode; each refusal names its step):
 9  append {when, campaign, nickname, account, session_id, node}
       to <campaign>/joins.jsonl                               fail ⇒ 500
 10 ssh -i campaign_ssh_key orrery@<campaign.host> p1-swarm --external-peer
+      --external-bind 0.0.0.0:<campaign.external_port>
       --peers P --seconds S --min-cells 1
       --impaired --witness --stamp-wall-clock
       --json /var/tmp/orrery/<sid>/raw.json
@@ -399,9 +405,13 @@ and the two paths stay one code path:
 
 `slot` is the campaign's `peers` value — the external slot index the runbook
 already uses (`p4-campaign-session.sh:66-69`: `--peers 8 … --slot 8`).
-`host_direct` comes from `listening.txt`; the client passes it as
-`--host-direct` does today, because relays are disabled (§1) and discovery
-must not be a silent dependency. `configured` feeds the client's
+The harness's `listening.txt` proves the configured port was actually bound;
+the admission service replaces its wildcard IP with `campaign.host` before
+returning `host_direct`. The harness cannot infer a public or NAT-facing IP
+from a local wildcard socket, while the control file already owns that
+operator-supplied routing fact. The client passes the resulting numeric
+`SocketAddr` as `--host-direct` does today, because relays are disabled (§1)
+and discovery must not be a silent dependency. `configured` feeds the client's
 `ConfiguredImpairment` (`clients/regolith/src/campaign.rs:97-99`) so the
 mismatch flag compares against what the *host* declares, ending the last
 copy-paste (the `--expect-*` flags).

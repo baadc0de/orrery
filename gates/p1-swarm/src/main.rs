@@ -364,6 +364,11 @@ struct Args {
     #[arg(long)]
     listening_file: Option<String>,
 
+    /// Bind the exterior endpoint to this exact socket (`--external-peer`
+    /// only). Omit it to retain iroh's wildcard, ephemeral-port default.
+    #[arg(long, value_name = "IP:PORT")]
+    external_bind: Option<std::net::SocketAddr>,
+
     /// Refuse a join whose client build is not exactly this revision
     /// (#345 §8's version pinning; `--external-peer` only). The refusal
     /// reason tells the volunteer to download the current build.
@@ -571,7 +576,7 @@ fn main() -> Result<()> {
             .build()
             .context("tokio runtime")?;
         let (endpoint, link, anchor_bytes, joined_node) = rt.block_on(async {
-            let endpoint = bridge::bind(secret).await?;
+            let endpoint = bridge::bind(secret, args.external_bind).await?;
             eprintln!(
                 "gates/p1-swarm: exterior slot {} listening, node {}, direct {:?}",
                 config.peers,

@@ -38,6 +38,9 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
     let host_err = dir.join("host.err");
     let host_err = host_err.as_os_str().to_str().unwrap().to_owned();
     let listening_path = dir.join("listening.txt");
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve exterior port");
+    let external_bind = reservation.local_addr().expect("reserved exterior address");
+    drop(reservation);
     let debug_bridge = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
     let _ = debug_bridge;
     let mut host = Command::new(bin())
@@ -60,6 +63,8 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
         .arg(&report_path)
         .arg("--listening-file")
         .arg(&listening_path)
+        .arg("--external-bind")
+        .arg(external_bind.to_string())
         .env(
             "P1_SWARM_BRIDGE_DEBUG",
             std::env::var("P1_SWARM_BRIDGE_DEBUG").unwrap_or_default(),
@@ -86,6 +91,12 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
     let mut parts = line.split_whitespace();
     let node_hex = parts.next().expect("node id").to_owned();
     let direct = parts.next().map(|d| d.replace("0.0.0.0", "127.0.0.1"));
+    let expected_direct = external_bind.to_string();
+    assert_eq!(
+        direct.as_deref(),
+        Some(expected_direct.as_str()),
+        "the listening file reports the exact configured exterior bind"
+    );
 
     // The runner: same peers/seconds/seed/witness so both sides derive the
     // same island from the seed alone.
