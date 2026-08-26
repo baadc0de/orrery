@@ -984,11 +984,12 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
         }
     }
     match view.own.and_then(|own| tracks.own_shot(own.entity)) {
-        Some(shot) => parts.push(format!(
+        Some(shot) if shot.timed => parts.push(format!(
             "flight {} t · {:.2} s",
             shot.remaining,
             f64::from(shot.remaining) / f64::from(orrery_core::TICK_HZ)
         )),
+        Some(_) => parts.push("leaving muzzle".to_owned()),
         None => parts.push("nothing in the air".to_owned()),
     }
     parts.join(" · ")
@@ -1679,6 +1680,11 @@ mod tests {
             },
             tracks.tracks()[0]
         );
+
+        tracks.observe(&[shot(None)]);
+        let muzzle = target_relation(&view, &tracks);
+        assert!(muzzle.contains("leaving muzzle"), "{muzzle}");
+        assert!(!muzzle.contains("flight 1 t"), "{muzzle}");
     }
 }
 
