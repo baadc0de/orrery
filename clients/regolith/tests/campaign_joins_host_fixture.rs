@@ -771,6 +771,13 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
         &fired.events,
         &fired.delivered,
         runtime.entity(),
+        &[(
+            target,
+            match runtime.executor().state(target) {
+                Some(RegolithState::Craft(craft)) => craft.pos,
+                _ => panic!("the campaign target must have replicated state"),
+            },
+        )],
         &mut tracks,
         &mut broken,
         &mut shots,
@@ -780,13 +787,14 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
         1,
         "the human fire tick's DamageDealt must leave a muzzle tracer in the skin"
     );
-    assert_eq!(
-        tracks.tracks()[0].travelled(),
-        0.0,
-        "without target-owned flight_ticks the skin must not advance the tracer"
+    assert_eq!(tracks.tracks()[0].travelled(), 0.0);
+    assert!(
+        tracks.tracks()[0].presented,
+        "the live campaign muzzle must arm a presentation flight"
     );
 
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_drawable_flight = false;
     while !matches!(shots.cue, Some(ShotCue::Resolved { .. })) && Instant::now() < deadline {
         let report = runtime.advance(
             Controls {
@@ -799,12 +807,21 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
             &report.events,
             &report.delivered,
             runtime.entity(),
+            &[],
             &mut tracks,
             &mut broken,
             &mut shots,
         );
+        saw_drawable_flight |= tracks
+            .tracks()
+            .iter()
+            .any(|track| track.presented && track.travelled() > 0.0);
         std::thread::sleep(Duration::from_millis(2));
     }
+    assert!(
+        saw_drawable_flight,
+        "a campaign muzzle must advance visibly without target-owned continuations"
+    );
     let truth = fixture.truth();
     assert!(
         truth.lock_confirmations_sent > 0,
@@ -896,6 +913,7 @@ fn a_delivered_campaign_lock_break_reaches_both_skin_consumers() {
         &fired.events,
         &fired.delivered,
         runtime.entity(),
+        &[],
         &mut tracks,
         &mut broken,
         &mut shots,
@@ -920,6 +938,7 @@ fn a_delivered_campaign_lock_break_reaches_both_skin_consumers() {
             &report.events,
             &report.delivered,
             runtime.entity(),
+            &[],
             &mut tracks,
             &mut broken,
             &mut shots,

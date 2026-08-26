@@ -1,11 +1,11 @@
-//! A read-only view of the ruleset's combat state, and the tracer tracks the
-//! ruleset's own events describe.
+//! A read-only view of the ruleset's combat state and its presentation cues.
 //!
 //! Nothing in this module decides anything. `lock_progress`, `lock_target`,
-//! `hull`, `shield`, `cooldown` and a projectile's remaining `flight_ticks`
-//! are all owned by `orrery_games::regolith` and are copied here verbatim for
-//! drawing. `docs/15` §7 and #320 constraint 3 both land on the same rule: the
-//! skin displays, it never computes, and it emits no orders.
+//! `hull`, `shield`, `cooldown` and every shot disposition are owned by
+//! `orrery_games::regolith`. Campaign tracers may interpolate a ruleset-stamped
+//! muzzle toward replicated state, but that cosmetic clock never becomes an
+//! outcome. `docs/15` §7 and #320 constraint 3 land on the same rule: the skin
+//! displays and emits no ruleset orders.
 
 use bevy::prelude::Resource;
 use orrery_core::Executor;
@@ -135,11 +135,11 @@ impl LockView {
     }
 }
 
-/// One shot the ruleset says is still in the air.
+/// One shot the ruleset says exists, or its presentation-only flight.
 ///
-/// Every field is lifted straight off an [`Outcome::DamageDealt`]. The skin
-/// runs no ballistics of its own: if the ruleset stops emitting the event, the
-/// tracer stops existing on the same tick.
+/// Ruleset-timed fields are lifted straight off an [`Outcome::DamageDealt`].
+/// A shooter-owned muzzle may instead carry a presentation endpoint and clock;
+/// those fields draw motion but never feed an outcome cue or core state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Track {
     /// Who fired.
@@ -156,6 +156,10 @@ pub struct Track {
     pub total: u16,
     /// Whether the ruleset supplied a target-owned flight countdown.
     pub timed: bool,
+    /// Frozen last-known target position for a presentation-only flight.
+    pub destination: Option<orrery_core::QPos>,
+    /// Whether the shooter skin, rather than a target continuation, advances it.
+    pub presented: bool,
 }
 
 impl Track {
@@ -170,7 +174,7 @@ impl Track {
     }
 }
 
-/// The shots currently in the air, rebuilt from scratch every ruleset tick.
+/// The ruleset-timed and presentation-only shots currently in the air.
 #[derive(Debug, Default, Resource)]
 pub struct ProjectileTracks {
     tracks: Vec<Track>,
@@ -193,8 +197,40 @@ impl ProjectileTracks {
     /// real remaining count and the identical `attacker_pos`. Matching those
     /// continuations by `remaining + 1` recovers `total` for the flown fraction.
     pub fn observe(&mut self, events: &[Outcome]) {
+        self.observe_for(events, None, &[]);
+    }
+
+    /// Observe campaign events and animate shooter-owned muzzle statements.
+    ///
+    /// Own-state play does not return target-authored flight continuations to
+    /// the shooter. The muzzle statement nevertheless fixes a real projectile,
+    /// and its weapon fixes speed, so the skin may draw that statement toward
+    /// the target position it last received. This is interpolation, not a hit
+    /// prediction: the endpoint is frozen, `timed` remains false, and only a
+    /// later ruleset verdict may produce impact feedback.
+    ///
+    /// The price is visible approximation when the target moves or its replica
+    /// is stale. Sending every target continuation back would be exact, but it
+    /// would add a presentation protocol and one reliable event per projectile
+    /// per tick. Keeping that traffic out of the rules path is the smaller cost.
+    pub fn observe_campaign(
+        &mut self,
+        events: &[Outcome],
+        shooter: PersistId,
+        target_positions: &[(PersistId, orrery_core::QPos)],
+    ) {
+        self.observe_for(events, Some(shooter), target_positions);
+    }
+
+    fn observe_for(
+        &mut self,
+        events: &[Outcome],
+        shooter: Option<PersistId>,
+        target_positions: &[(PersistId, orrery_core::QPos)],
+    ) {
+        let prior_tracks = core::mem::take(&mut self.tracks);
         let mut carried = Vec::with_capacity(events.len());
-        let mut consumed = vec![false; self.tracks.len()];
+        let mut consumed = vec![false; prior_tracks.len()];
         for event in events {
             let Outcome::DamageDealt {
                 attacker,
@@ -208,18 +244,34 @@ impl ProjectileTracks {
                 continue;
             };
             let Some(remaining) = *flight_ticks else {
+                let destination = shooter
+                    .filter(|shooter| *shooter == *attacker)
+                    .and_then(|_| {
+                        target_positions
+                            .iter()
+                            .find_map(|(entity, pos)| (*entity == *target).then_some(*pos))
+                    });
+                let total = destination.map_or(1, |destination| {
+                    orrery_games::regolith::projectile_flight_ticks(
+                        u128::try_from(destination.distance_squared(*attacker_pos))
+                            .unwrap_or_default(),
+                        attacker_weapon.weapon().projectile_speed_mms,
+                    )
+                });
                 carried.push(Track {
                     attacker: *attacker,
                     target: *target,
                     origin: *attacker_pos,
                     weapon: *attacker_weapon,
-                    remaining: 1,
-                    total: 1,
+                    remaining: total,
+                    total,
                     timed: false,
+                    destination,
+                    presented: destination.is_some(),
                 });
                 continue;
             };
-            let prior = self.tracks.iter().enumerate().find_map(|(index, track)| {
+            let prior = prior_tracks.iter().enumerate().find_map(|(index, track)| {
                 (!consumed[index]
                     && track.attacker == *attacker
                     && track.target == *target
@@ -229,7 +281,7 @@ impl ProjectileTracks {
             let total = match prior {
                 Some(index) => {
                     consumed[index] = true;
-                    self.tracks[index].total
+                    prior_tracks[index].total
                 }
                 None => remaining.saturating_add(1),
             };
@@ -241,9 +293,49 @@ impl ProjectileTracks {
                 remaining,
                 total,
                 timed: true,
+                destination: prior.and_then(|index| prior_tracks[index].destination),
+                presented: false,
             });
         }
+        for (index, track) in prior_tracks.into_iter().enumerate() {
+            if !consumed[index] && track.presented && track.remaining > 1 {
+                carried.push(Track {
+                    remaining: track.remaining - 1,
+                    ..track
+                });
+            }
+        }
         self.tracks = carried;
+    }
+
+    /// Retire presentation flights when the ruleset reports their disposition.
+    pub fn retire(&mut self, events: &[Outcome], shooter: PersistId) {
+        for event in events {
+            match event {
+                Outcome::ShotResolved {
+                    attacker, target, ..
+                } if *attacker == shooter => {
+                    self.retire_one(shooter, *target);
+                }
+                Outcome::LockBroken { locker, target, .. } if *locker == shooter => {
+                    self.retire_one(shooter, *target);
+                }
+                Outcome::ShotRefused { attacker, .. } if *attacker == shooter => {
+                    self.tracks.retain(|track| track.attacker != shooter);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn retire_one(&mut self, shooter: PersistId, target: PersistId) {
+        if let Some(index) = self
+            .tracks
+            .iter()
+            .position(|track| track.attacker == shooter && track.target == target)
+        {
+            self.tracks.remove(index);
+        }
     }
 
     /// The shots in the air, in event order.
@@ -1096,6 +1188,36 @@ mod tests {
         assert_eq!(tracks.tracks()[0].travelled(), 0.0);
         tracks.observe(&[]);
         assert!(tracks.tracks().is_empty(), "the skin must not advance it");
+    }
+
+    #[test]
+    fn a_campaign_muzzle_interpolates_without_claiming_an_arrival() {
+        let shooter = PersistId::new(1);
+        let target = PersistId::new(2);
+        let mut tracks = ProjectileTracks::default();
+        tracks.observe_campaign(
+            &[shot(1, 2, None)],
+            shooter,
+            &[(target, orrery_core::QPos::from_metres(100.0, 0.0, 0.0))],
+        );
+        assert_eq!(tracks.tracks()[0].travelled(), 0.0);
+        assert!(tracks.tracks()[0].presented);
+        assert!(!tracks.tracks()[0].timed);
+
+        tracks.observe_campaign(&[], shooter, &[]);
+        assert!(
+            tracks.tracks()[0].travelled() > 0.0,
+            "the shooter skin must carry the ruleset-stamped muzzle forward"
+        );
+
+        let mut feedback = ShotFeedback::default();
+        feedback.arm_provisional(&tracks, shooter);
+        assert!(
+            feedback.cue.is_none(),
+            "a presentation clock must not claim authoritative arrival"
+        );
+        tracks.retire(&[resolved(1, ShotResult::Miss)], shooter);
+        assert!(tracks.tracks().is_empty());
     }
 
     #[test]

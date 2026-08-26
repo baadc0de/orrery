@@ -805,20 +805,6 @@ impl CampaignRuntime {
                 .executor
                 .step_entity(self.entity, tick, &composed.orders)
             {
-                for event in &outcome.events {
-                    if let Outcome::DamageDealt {
-                        attacker,
-                        target,
-                        flight_ticks,
-                        ..
-                    } = event
-                    {
-                        eprintln!(
-                            "campaign_local_damage tick={} authority={} attacker={} target={} flight_ticks={flight_ticks:?}",
-                            tick.0, self.entity.0, attacker.0, target.0,
-                        );
-                    }
-                }
                 self.witness_log
                     .log_neighbor_frames(tick.0, &outcome.neighbor_frames);
                 self.witness_log.log_tick_hash(outcome.state_hash);

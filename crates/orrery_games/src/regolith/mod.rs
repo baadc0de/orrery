@@ -1054,7 +1054,7 @@ fn projectile_resolution(
 
     match flight_ticks {
         None => {
-            let ticks = flight_ticks_for(range_sq, weapon.projectile_speed_mms);
+            let ticks = projectile_flight_ticks(range_sq, weapon.projectile_speed_mms);
             if ticks > 1 {
                 return ProjectileResolution::InFlight(ticks - 1);
             }
@@ -1230,7 +1230,12 @@ fn hit_chance_ppm(
     u32::try_from(chance.min(CHANCE_SCALE)).unwrap_or(CHANCE_SCALE as u32)
 }
 
-fn flight_ticks_for(range_sq: u128, projectile_speed_mms: i64) -> u16 {
+/// Return the ruleset's flight duration for a squared range and projectile speed.
+///
+/// Presentation may use this to show the timing the ruleset will apply without
+/// predicting the eventual shot result.
+#[must_use]
+pub fn projectile_flight_ticks(range_sq: u128, projectile_speed_mms: i64) -> u16 {
     let distance = integer_sqrt(range_sq);
     let numerator = distance.saturating_mul(u128::from(TICK_HZ));
     let speed = projectile_speed_mms.max(1) as u128;
