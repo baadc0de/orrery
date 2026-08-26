@@ -310,6 +310,12 @@ lane_gates() {
     # this line can exist.
     run scripts/ci-changed-code.sh --self-test
 
+    # #476's read-only before/after instrument for the relay migration. Its
+    # fixtures prove that the clean-start/QAD-on-loopback trap fails by its
+    # named verdict, that an expiring served certificate fails, and that an
+    # unavailable probe is UNKNOWN rather than a vacuous pass.
+    run scripts/relay-preflight.sh --self-test
+
     # The two P4 scripts, which until now ran their self-tests only in
     # nightly.yml. That is where the cost of an uncovered self-test was
     # actually paid: `p4-ledger.sh --self-test` counted ledger lines with `wc
