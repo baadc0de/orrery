@@ -1053,18 +1053,55 @@ pub fn in_firing_arc(
     attacker_pos: QPos,
     target_pos: QPos,
 ) -> bool {
+    firing_arc_measurement(
+        attacker_archetype,
+        attacker_yaw_urad,
+        attacker_pos,
+        target_pos,
+    )
+    .inside
+}
+
+/// The exact integer geometry used by firing-arc adjudication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FiringArcMeasurement {
+    /// Target bearing in world space, or `None` for coincident positions.
+    pub world_bearing_urad: Option<i32>,
+    /// Target bearing relative to the attacker, or `None` when coincident.
+    pub relative_urad: Option<i32>,
+    /// Whether at least one chassis arc accepts the relative bearing.
+    pub inside: bool,
+}
+
+/// Measures the exact geometry used by [`in_firing_arc`].
+#[must_use]
+pub fn firing_arc_measurement(
+    attacker_archetype: Archetype,
+    attacker_yaw_urad: i32,
+    attacker_pos: QPos,
+    target_pos: QPos,
+) -> FiringArcMeasurement {
     let dx = i128::from(target_pos.x) - i128::from(attacker_pos.x);
     let dz = i128::from(target_pos.z) - i128::from(attacker_pos.z);
     let Some(world_bearing) = integer_bearing_urad(dx, dz) else {
-        return true;
+        return FiringArcMeasurement {
+            world_bearing_urad: None,
+            relative_urad: None,
+            inside: true,
+        };
     };
     let relative = world_bearing
         .saturating_sub(attacker_yaw_urad)
         .rem_euclid(TAU_URAD);
-    attacker_archetype
+    let inside = attacker_archetype
         .firing_arcs()
         .iter()
-        .any(|arc| arc.contains(relative))
+        .any(|arc| arc.contains(relative));
+    FiringArcMeasurement {
+        world_bearing_urad: Some(world_bearing),
+        relative_urad: Some(relative),
+        inside,
+    }
 }
 
 fn integer_bearing_urad(mut x: i128, mut y: i128) -> Option<i32> {

@@ -1962,6 +1962,107 @@ impl SwarmReport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn campaign_projectile_keeps_the_arc_verdict_it_had_when_fired() {
+        use orrery_core::Executor;
+        use orrery_games::game::Game;
+        use orrery_games::regolith::archetype::Archetype;
+        use orrery_games::regolith::firing_arc_measurement;
+        use orrery_games::regolith::order::{Order, Outcome, ShotResult};
+        use orrery_games::regolith::state::{Craft, LockClass};
+        use orrery_games::regolith::LOCK_ACQUISITION_TICKS;
+        use orrery_games::Regolith;
+        use orrery_protocol::Tick;
+
+        let config = SwarmConfig {
+            peers: 8,
+            seconds: 0,
+            cell_edge_m: crate::bot::default_cell_edge_m(),
+            send_hz: 20,
+            impairment: Impairment::p4_profile(),
+            seed: 0x61,
+            late_join_tick: None,
+            witnessing: false,
+            cheats: None,
+            enforcing: false,
+            started_at_unix_secs: None,
+        };
+        let seed = UniverseSeed([0x61; 32]);
+        let shooter = PersistId::new(9);
+        let target = PersistId::new(3);
+        let shooter_pos = orrery_core::QPos {
+            x: 2_484_791,
+            y: 0,
+            z: 338_808,
+        };
+        let shooter_yaw = 3_079_384;
+        let mut shooter_state = Craft::spawned(Archetype::Interceptor, shooter_pos, shooter_yaw);
+        shooter_state.lock_target = Some(target);
+        shooter_state.lock_class = Some(LockClass::Ship);
+        shooter_state.lock_progress = LOCK_ACQUISITION_TICKS;
+        let mut shooter_executor = Executor::new(Regolith::honest(), seed);
+        shooter_executor.insert(shooter, RegolithState::Craft(shooter_state));
+        let mut swarm = Swarm::new(config);
+        swarm.form_island();
+        let mut phase = [0u128; 6];
+        for tick in 0..505 {
+            if tick == 282 {
+                swarm.bots[2]
+                    .inject_delivered(shooter, Order::LockRequested { locker: shooter });
+            }
+            swarm.tick_once(tick, 3, &mut phase);
+        }
+
+        let fired = shooter_executor
+            .step_entity(shooter, Tick::new(505), &[Order::Fire])
+            .expect("recorded shooter exists");
+        let damage = fired
+            .events
+            .iter()
+            .find_map(|event| shooter_executor.ruleset().deliver(event))
+            .map(|(_, order)| order)
+            .expect("the mature lock emits damage");
+        let target_pos = swarm.bots[2].craft().pos;
+        let measurement =
+            firing_arc_measurement(Archetype::Interceptor, shooter_yaw, shooter_pos, target_pos);
+        assert_eq!(
+            target_pos,
+            orrery_core::QPos {
+                x: 2_335_587,
+                y: 0,
+                z: 489_809,
+            },
+            "the campaign target geometry must stay pinned"
+        );
+        assert_eq!(measurement.world_bearing_urad, Some(2_350_207));
+        assert_eq!(measurement.relative_urad, Some(5_554_008));
+        assert!(measurement.inside, "the shot starts inside the drawn arc");
+        swarm.bots[2].inject_delivered(shooter, damage);
+
+        let mut resolution = None;
+        for tick in 505..600 {
+            swarm.tick_once(tick, 3, &mut phase);
+            resolution = swarm.bots[2]
+                .take_resolved_shots()
+                .into_iter()
+                .find_map(|event| match event {
+                    Outcome::ShotResolved {
+                        attacker,
+                        target: resolved_target,
+                        result,
+                    } if attacker == shooter && resolved_target == target => Some(result),
+                    _ => None,
+                });
+            if resolution.is_some() {
+                break;
+            }
+        }
+        assert!(
+            matches!(resolution, Some(ShotResult::Hit | ShotResult::Miss)),
+            "an accepted in-flight shot must reach the damage roll, got {resolution:?}"
+        );
+    }
+
     /// The P1 criterion as the gate's clean leg states it.
     const STRICT: Criterion = Criterion {
         budget_bits: 1_000_000,
