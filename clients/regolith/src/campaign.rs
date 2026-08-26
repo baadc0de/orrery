@@ -45,9 +45,10 @@ use bevy::prelude::*;
 use bytes::Bytes;
 
 use orrery_core::{CoreCodec, Executor, InputLogProducer};
+use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{Order, Outcome};
-use orrery_games::regolith::state::RegolithState;
-use orrery_games::regolith::REGOLITH_RULESET;
+use orrery_games::regolith::state::{Craft, RegolithState};
+use orrery_games::regolith::{campaign_spawn_pose, REGOLITH_RULESET};
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::{decode_delivered_input, decode_replication};
 use orrery_protocol::UniverseSeed;
@@ -375,13 +376,19 @@ impl CampaignRuntime {
         let game = Regolith::honest();
         let mut executor = Executor::new(game, seed);
         let entity = PersistId::new(config.slot as u64 + 1);
-        // The spawn pose comes from the game's own per-slot ring — the shared
-        // path — not from harness internals. The host initially assumes the
-        // crowd pose for the slot; its roster adopts whatever this client
-        // reports within one second of traffic (see `refresh_rosters`
-        // upstream). That transient skew is accepted until #387 mints invites
-        // that pin session geometry.
-        executor.insert(entity, game.spawn(entity, config.slot as u64));
+        // The exterior is the last participant in the host's crowd. Its
+        // signed tick-zero state must use the same campaign pose as the host's
+        // headless peers; the compact scenario ring is a different world and
+        // leaves every host-owned target kilometres outside weapon reach.
+        let (pos, yaw_urad) = campaign_spawn_pose(config.slot, config.slot.saturating_add(1));
+        executor.insert(
+            entity,
+            RegolithState::Craft(Craft::spawned(
+                Archetype::for_slot(config.slot as u64),
+                pos,
+                yaw_urad,
+            )),
+        );
         let pipeline = IntentPipeline::new(seed, entity, config.slot as u64, Vec::new());
         let mut witness_log = InputLogProducer::new(
             config.transport_secret.clone(),

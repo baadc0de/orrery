@@ -77,32 +77,6 @@ pub const TICK: Duration = Duration::from_nanos(16_666_667);
 /// Ticks per simulated second.
 pub const TICK_HZ: u64 = 60;
 
-/// Radius of the shared orbit, in metres.
-///
-/// A ~15.7 km circumference, so one lap traverses about 122 interest cells at
-/// the 128 m edge — comfortably past the criterion's 64 without needing the
-/// path to drift, and reached in roughly eight simulated minutes at cruise.
-const ORBIT_RADIUS_M: f64 = 2_500.0;
-
-/// The arc of the shared orbit the crowd is spread over, in radians.
-///
-/// 0.2 rad at this radius is ~500 m of crowd, or ~16 m between neighbours, so
-/// roughly two dozen bots fall inside any one bot's 27-cell neighbourhood. That
-/// is deliberately right at the 24-entity high-rate cap (D16): a looser crowd
-/// would never exercise the cap, and a tighter one would sit so far past it
-/// that the set never churns. At the boundary, ordinary movement pushes
-/// entities in and out of the set, which is the case the cap exists for.
-const CROWD_ARC_RAD: f64 = 0.08;
-
-/// Fractional spread of orbit radii across the crowd.
-///
-/// Every bot cruises at the same speed, so a bot on a tighter orbit sweeps a
-/// larger angle per tick (ω = v/r) and steadily overtakes the ones outside it.
-/// Without that shear the crowd is a rigid formation: relative distances never
-/// change, the interest set never reorders, and every clause about churn passes
-/// by describing a world where nothing moves relative to anything else.
-const RADIAL_SPREAD: f64 = 0.10;
-
 /// Cruising speed in metres per second — a fast ground vehicle.
 ///
 /// At a 128 m cell edge this is a crossing roughly every four simulated
@@ -484,20 +458,14 @@ pub fn apply_replicas(
 /// which `regolith/value-range` requires of every sample.
 #[must_use]
 pub fn spawn_pose(index: usize, count: usize) -> (QPos, i32) {
-    let share = index as f64 / count.max(1) as f64;
-    let radius_m = ORBIT_RADIUS_M * (1.0 + RADIAL_SPREAD * (share - 0.5));
-    let arc = CROWD_ARC_RAD * share;
-    let start = QPos::from_metres(libm::cos(arc) * radius_m, 0.0, libm::sin(arc) * radius_m);
-    let yaw_urad = ((arc + core::f64::consts::FRAC_PI_2) * 1_000_000.0) as i32;
-    (start, yaw_urad)
+    orrery_games::regolith::campaign_spawn_pose(index, count)
 }
 
 /// The orbit radius `spawn_pose`'s slot rides, for the turn-rate that keeps a
 /// bot on it.
 #[must_use]
 pub fn orbit_radius_m(index: usize, count: usize) -> f64 {
-    let share = index as f64 / count.max(1) as f64;
-    ORBIT_RADIUS_M * (1.0 + RADIAL_SPREAD * (share - 0.5))
+    orrery_games::regolith::campaign_orbit_radius_m(index, count)
 }
 
 impl Bot {

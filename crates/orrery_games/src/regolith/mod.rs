@@ -86,6 +86,9 @@ pub const MAX_NEIGHBOR_STALENESS_TICKS: u64 = TICK_HZ as u64;
 pub const OCCLUSION_MARGIN_MM: i64 = 20;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
+const CAMPAIGN_ORBIT_RADIUS_M: f64 = 2_500.0;
+const CAMPAIGN_CROWD_ARC_RAD: f64 = 0.08;
+const CAMPAIGN_RADIAL_SPREAD: f64 = 0.10;
 
 /// Regolith v13's rules identity: target-owned lock-class confirmation.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
@@ -1574,4 +1577,27 @@ fn spawn_pose(slot: u64) -> (QPos, i32) {
     );
     let yaw = i32::try_from(angle_urad).unwrap_or(0) + TAU_URAD / 4;
     (pos, yaw.rem_euclid(TAU_URAD))
+}
+
+/// The campaign swarm's shared spawn pose for one slot.
+///
+/// Campaign participants must derive their initial canonical position from
+/// the same function as the host's headless peers. A client using the compact
+/// scenario ring instead starts kilometres outside the host crowd and cannot
+/// put any target inside weapon range, even when its firing bearing is valid.
+#[must_use]
+pub fn campaign_spawn_pose(slot: usize, count: usize) -> (QPos, i32) {
+    let share = slot as f64 / count.max(1) as f64;
+    let radius_m = campaign_orbit_radius_m(slot, count);
+    let arc = CAMPAIGN_CROWD_ARC_RAD * share;
+    let pos = QPos::from_metres(libm::cos(arc) * radius_m, 0.0, libm::sin(arc) * radius_m);
+    let yaw_urad = ((arc + core::f64::consts::FRAC_PI_2) * 1_000_000.0) as i32;
+    (pos, yaw_urad)
+}
+
+/// The campaign orbit radius for one slot, in metres.
+#[must_use]
+pub fn campaign_orbit_radius_m(slot: usize, count: usize) -> f64 {
+    let share = slot as f64 / count.max(1) as f64;
+    CAMPAIGN_ORBIT_RADIUS_M * (1.0 + CAMPAIGN_RADIAL_SPREAD * (share - 0.5))
 }
