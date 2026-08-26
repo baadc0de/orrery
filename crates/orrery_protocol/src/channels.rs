@@ -29,6 +29,8 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::PersistId;
+
 /// The two logical channels the design defines (docs/02-networking.md §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -105,10 +107,10 @@ pub fn untag(payload: &[u8]) -> Option<(Channel, &[u8])> {
 
 /// Sub-tag marking a state datagram as replication traffic.
 ///
-/// The complement of [`TAG_WITNESS`]. Both kinds share `Channel::State`, so
-/// *both* have to be positively identified: tagging only one leaves the other
-/// as "everything else", and a receiver still hands foreign bytes to a decoder
-/// that reads length prefixes out of them.
+/// Replication and witness traffic share `Channel::State`, so both have to be
+/// positively identified: tagging only one leaves the other as "everything
+/// else", and a receiver still hands foreign bytes to a decoder that reads
+/// length prefixes out of them.
 pub const TAG_REPLICATION: u8 = 0xE6;
 
 /// Encode replication traffic as a state datagram.
@@ -146,10 +148,62 @@ fn decode_sub_tagged<T: DeserializeOwned>(payload: &[u8], expect: u8) -> Option<
 /// postcard reads a length prefix out of unrelated bytes before it can fail:
 /// slow at best, and an allocation the sender chooses at worst.
 ///
-/// Its complement is [`TAG_REPLICATION`]: both kinds are tagged, so a receiver
-/// never hands foreign bytes to a decoder that would read a length prefix out
-/// of them.
+/// Its state-lane sibling is [`TAG_REPLICATION`]: both kinds are tagged, so a
+/// receiver never hands foreign bytes to a decoder that would read a length
+/// prefix out of them. Reliable delivered inputs have their own control-lane
+/// [`TAG_DELIVERED_INPUT`] discriminator.
 pub const TAG_WITNESS: u8 = 0xE7;
+
+/// Sub-tag marking a reliable, addressed core input produced by
+/// `Game::deliver` from another authority's outcome.
+///
+/// The payload is `[TAG_DELIVERED_INPUT][from u64 LE][recipient u64 LE]
+/// [canonical input]`. The input bytes belong to the negotiated ruleset; this
+/// envelope owns only routing/provenance and deliberately does not invent a
+/// second command schema.
+pub const TAG_DELIVERED_INPUT: u8 = 0xE8;
+
+/// One delivered core input addressed to the authority of `recipient`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredInput {
+    /// Entity whose authoritative outcome produced the input.
+    pub from: PersistId,
+    /// Entity whose authority may apply the input.
+    pub recipient: PersistId,
+    /// The ruleset's canonical `CoreInput` bytes.
+    pub input: Vec<u8>,
+}
+
+/// Encode one addressed delivered input on the reliable control channel.
+///
+/// Cross-entity effects are canonical inputs, not replication snapshots. They
+/// therefore use the reliable shared stream and retain emission/arrival order.
+#[must_use]
+pub fn encode_delivered_input(from: PersistId, recipient: PersistId, input: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(17 + input.len());
+    payload.push(TAG_DELIVERED_INPUT);
+    payload.extend_from_slice(&from.0.to_le_bytes());
+    payload.extend_from_slice(&recipient.0.to_le_bytes());
+    payload.extend_from_slice(input);
+    tag(Channel::Control, &payload)
+}
+
+/// Decode one addressed delivered input, refusing every other channel member.
+#[must_use]
+pub fn decode_delivered_input(payload: &[u8]) -> Option<DeliveredInput> {
+    let (channel, rest) = untag(payload)?;
+    if channel != Channel::Control || rest.first() != Some(&TAG_DELIVERED_INPUT) {
+        return None;
+    }
+    let from = rest.get(1..9)?;
+    let recipient = rest.get(9..17)?;
+    let input = rest.get(17..)?;
+    Some(DeliveredInput {
+        from: PersistId::new(u64::from_le_bytes(from.try_into().ok()?)),
+        recipient: PersistId::new(u64::from_le_bytes(recipient.try_into().ok()?)),
+        input: input.to_vec(),
+    })
+}
 
 /// Encode verifiable-core traffic as a state datagram.
 pub fn encode_witness<T: Serialize>(msg: &T) -> Vec<u8> {
@@ -272,5 +326,21 @@ mod tests {
         assert_eq!(back, msg);
         // A datagram does not decode as a stream frame.
         assert!(decode_stream_frame::<crate::GatewayReply>(&encode_datagram(&msg)).is_none());
+    }
+
+    #[test]
+    fn delivered_input_roundtrips_and_is_not_replication() {
+        let delivered =
+            encode_delivered_input(PersistId::new(7), PersistId::new(42), b"canonical order");
+        assert_eq!(
+            decode_delivered_input(&delivered),
+            Some(DeliveredInput {
+                from: PersistId::new(7),
+                recipient: PersistId::new(42),
+                input: b"canonical order".to_vec(),
+            })
+        );
+        assert!(decode_replication::<Vec<u8>>(&delivered).is_none());
+        assert!(decode_delivered_input(&encode_datagram(&42u64)).is_none());
     }
 }

@@ -45,17 +45,18 @@ use bevy::prelude::*;
 use bytes::Bytes;
 
 use orrery_core::{CoreCodec, Executor, InputLogProducer};
-use orrery_games::regolith::order::Outcome;
+use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::RegolithState;
 use orrery_games::regolith::REGOLITH_RULESET;
 use orrery_games::{Game, Regolith};
-use orrery_protocol::channels::decode_replication;
+use orrery_protocol::channels::{decode_delivered_input, decode_replication};
 use orrery_protocol::UniverseSeed;
 use orrery_protocol::{
-    cell_id_from_metres, CellId, FrameHead, PersistId, Tick, WitnessMsg, DEFAULT_CELL_EDGE_M,
+    cell_id_from_metres, CellId, FrameHead, PersistId, RecordSource, Tick, WitnessMsg,
+    DEFAULT_CELL_EDGE_M,
 };
 
-use crate::intent::{decode_packet, Controls, IntentPipeline};
+use crate::intent::{decode_packet, encode_orders, Controls, IntentPipeline, OrderPacket};
 use crate::net::{
     self, CampaignLink, HostAddress, JoinRequest, Lane, UplinkAck, UplinkDatagram, UplinkOutcome,
 };
@@ -292,6 +293,8 @@ pub struct CampaignRuntime {
     downlink_arrivals: u64,
     undecodable: u64,
     delivered_unroutable: u64,
+    delivered_foreign: u64,
+    pending_delivered: Vec<PendingDelivered>,
     focus: Option<PersistId>,
     latest_cell: Option<CellId>,
 
@@ -452,6 +455,8 @@ impl CampaignRuntime {
             downlink_arrivals: 0,
             undecodable: 0,
             delivered_unroutable: 0,
+            delivered_foreign: 0,
+            pending_delivered: Vec::new(),
             focus: None,
             latest_cell: None,
             record_written: false,
@@ -657,29 +662,43 @@ impl CampaignRuntime {
             .and_then(|state| self.witness_log.cut_claim(tick.0, state));
 
         // ── Input: the exact pipeline the local session drives ────────────
-        let packet = self.pipeline.human_packet(tick, controls);
-        if let Err(error) = sink.append_orders(&packet) {
-            bevy::log::error!("cannot append Regolith order packet: {error}");
-        }
-        let intents = packet.orders.len();
+        let authored = self.pipeline.human_packet(tick, controls);
+        let intents = authored.orders.len();
         let mut report = TickReport {
             intents,
             events: Vec::new(),
         };
-        if let Ok(orders) = decode_packet(&packet) {
-            self.witness_log.log_inputs(tick.0, &orders);
-            if let Some(outcome) = self.executor.step_entity(self.entity, tick, &orders) {
+        if let Ok(authored_orders) = decode_packet(&authored) {
+            // D46 clause (d): deliveries from prior ticks are canonical input
+            // and precede this tick's player-authored orders. Record the
+            // composed vector, not merely the keyboard half: replay and the
+            // witness must execute the exact same order the authority did.
+            let composed =
+                compose_delivered_first(&mut self.pending_delivered, authored_orders, tick.0);
+            let packet = OrderPacket {
+                tick: tick.0,
+                entity: self.entity.0,
+                orders: encode_orders(&composed.orders),
+            };
+            if let Err(error) = sink.append_orders(&packet) {
+                bevy::log::error!("cannot append Regolith order packet: {error}");
+            }
+            self.witness_log
+                .log_inputs_with_sources(tick.0, &composed.orders, &composed.sources);
+            if let Some(outcome) = self
+                .executor
+                .step_entity(self.entity, tick, &composed.orders)
+            {
                 self.witness_log.log_tick_hash(outcome.state_hash);
                 report.events.extend(outcome.events.iter().cloned());
-                // Damage delivery targets entities whose authority lives
-                // elsewhere; applying it locally would fork their state. It
-                // is counted, not guessed at, until slice 3's authority
-                // loopback exists.
-                self.delivered_unroutable += outcome
+                let deliveries: Vec<_> = outcome
                     .events
                     .iter()
-                    .filter(|event| matches!(event, Outcome::DamageDealt { .. }))
-                    .count() as u64;
+                    .filter_map(|event| self.executor.ruleset().deliver(event))
+                    .collect();
+                for (recipient, order) in deliveries {
+                    self.route_delivered_input(&link, recipient, order);
+                }
             }
         }
         let authored = self.witness_log.cut_frame(tick.0);
@@ -807,11 +826,34 @@ impl CampaignRuntime {
                         }
                     }
                 }
-                Lane::StreamShared | Lane::StreamBulk => {
-                    // Witness log frames and repairs ride the reliable lanes.
-                    // This client authors its own stream, but does not act as
-                    // a watcher for other subjects, so inbound witness data
-                    // is dropped.
+                Lane::StreamShared => {
+                    // The peer stack contributes the outer Control tag and
+                    // the delivery envelope contributes the inner one, just
+                    // as replication is double-tagged on the state lane.
+                    let delivered = orrery_protocol::channels::untag(&frame.payload)
+                        .filter(|(channel, _)| {
+                            *channel == orrery_protocol::channels::Channel::Control
+                        })
+                        .and_then(|(_, inner)| decode_delivered_input(inner));
+                    match delivered {
+                        Some(delivered) => match accept_own_delivery(
+                            self.entity,
+                            delivered,
+                            &mut self.pending_delivered,
+                        ) {
+                            Ok(()) => {}
+                            Err(DeliveryRefusal::Foreign) => self.delivered_foreign += 1,
+                            Err(DeliveryRefusal::Malformed) => self.undecodable += 1,
+                        },
+                        None => {
+                            // Witness log frames and repairs also ride the
+                            // reliable lane. This client authors its own
+                            // stream but is not a watcher for other subjects.
+                        }
+                    }
+                }
+                Lane::StreamBulk => {
+                    // Bulk witness repairs are not consumed by this client.
                 }
             }
         }
@@ -865,6 +907,48 @@ impl CampaignRuntime {
             {
                 self.uplink_shed += 1;
             }
+        }
+    }
+
+    /// Route a ruleset-produced delivery without ever applying foreign state
+    /// locally. The exterior participant owns the last slot, so every lower
+    /// participant slot is host-side; other ids name materialized authorities
+    /// this campaign host does not yet publish a route for and remain counted.
+    fn route_delivered_input(&mut self, link: &CampaignLink, recipient: PersistId, order: Order) {
+        if recipient == self.entity {
+            self.pending_delivered.push(PendingDelivered {
+                from: self.entity,
+                order,
+            });
+            return;
+        }
+        let Some(slot) = recipient
+            .0
+            .checked_sub(1)
+            .and_then(|slot| u32::try_from(slot).ok())
+            .filter(|slot| (*slot as usize) < self.config.slot)
+        else {
+            self.delivered_unroutable += 1;
+            return;
+        };
+        let inner = orrery_protocol::channels::encode_delivered_input(
+            self.entity,
+            recipient,
+            &order.to_canonical(),
+        );
+        let payload = Bytes::from(orrery_protocol::channels::tag(
+            orrery_protocol::channels::Channel::Control,
+            &inner,
+        ));
+        if link
+            .try_uplink(net::Frame {
+                peer: slot,
+                lane: Lane::StreamShared,
+                payload,
+            })
+            .is_err()
+        {
+            self.uplink_shed += 1;
         }
     }
 
@@ -936,6 +1020,64 @@ impl Drop for CampaignRuntime {
             self.shutdown();
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryRefusal {
+    Foreign,
+    Malformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDelivered {
+    from: PersistId,
+    order: Order,
+}
+
+struct ComposedInputs {
+    orders: Vec<Order>,
+    sources: Vec<RecordSource>,
+}
+
+/// D46's delivered-first composition. `pending` is already in reliable-stream
+/// arrival order; draining it before appending authored orders makes the law
+/// explicit at the authority boundary and leaves no later sort to drift.
+fn compose_delivered_first(
+    pending: &mut Vec<PendingDelivered>,
+    authored: Vec<Order>,
+    tick: u64,
+) -> ComposedInputs {
+    let delivered = core::mem::take(pending);
+    let mut orders = Vec::with_capacity(delivered.len() + authored.len());
+    let mut sources = Vec::with_capacity(orders.capacity());
+    for input in delivered {
+        orders.push(input.order);
+        sources.push(RecordSource::InboundEvent { from: input.from });
+    }
+    for (seq, order) in authored.into_iter().enumerate() {
+        orders.push(order);
+        sources.push(RecordSource::OwnPlayer {
+            input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
+        });
+    }
+    ComposedInputs { orders, sources }
+}
+
+/// Admit a delivered input only at the authority named by its envelope.
+fn accept_own_delivery(
+    own: PersistId,
+    delivered: orrery_protocol::channels::DeliveredInput,
+    pending: &mut Vec<PendingDelivered>,
+) -> Result<(), DeliveryRefusal> {
+    if delivered.recipient != own {
+        return Err(DeliveryRefusal::Foreign);
+    }
+    let order = Order::decode(&delivered.input).map_err(|_| DeliveryRefusal::Malformed)?;
+    pending.push(PendingDelivered {
+        from: delivered.from,
+        order,
+    });
+    Ok(())
 }
 
 fn encode_state_broadcast(
@@ -1024,6 +1166,70 @@ fn platform_triple() -> String {
 mod tests {
     use super::*;
     use crate::session::{Actor, ConfiguredImpairment};
+    use orrery_games::regolith::state::LockClass;
+
+    #[test]
+    fn authoritative_deliveries_are_composed_before_this_ticks_human_orders() {
+        let target = PersistId::new(1);
+        let from = PersistId::new(7);
+        let mut delivered = vec![PendingDelivered {
+            from,
+            order: Order::LockConfirmed {
+                target,
+                class: LockClass::Ship,
+            },
+        }];
+        let composed = compose_delivered_first(
+            &mut delivered,
+            vec![Order::Lock { target }, Order::Fire],
+            11,
+        );
+        assert_eq!(
+            composed.orders,
+            [
+                Order::LockConfirmed {
+                    target,
+                    class: LockClass::Ship,
+                },
+                Order::Lock { target },
+                Order::Fire,
+            ],
+            "D46 fixes prior-tick deliveries before this tick's authored orders"
+        );
+        assert!(matches!(
+            composed.sources.as_slice(),
+            [
+                RecordSource::InboundEvent { from: source },
+                RecordSource::OwnPlayer { .. },
+                RecordSource::OwnPlayer { .. },
+            ] if *source == from
+        ));
+        assert!(delivered.is_empty(), "each delivery is consumed once");
+    }
+
+    #[test]
+    fn foreign_addressed_delivery_is_refused_before_local_step() {
+        let own = PersistId::new(2);
+        let target = PersistId::new(1);
+        let delivered = orrery_protocol::channels::DeliveredInput {
+            from: target,
+            recipient: PersistId::new(99),
+            input: Order::LockConfirmed {
+                target,
+                class: LockClass::Ship,
+            }
+            .to_canonical(),
+        };
+        let mut pending = Vec::new();
+        assert_eq!(
+            accept_own_delivery(own, delivered, &mut pending),
+            Err(DeliveryRefusal::Foreign)
+        );
+        assert!(
+            pending.is_empty(),
+            "a foreign order must never enter this authority's input vector"
+        );
+    }
 
     /// Stride is learned from the first delta; afterwards every stride-
     /// sized advance is clean and every double-stride gap is one loss.

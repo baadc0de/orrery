@@ -6,6 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::Serialize;
 
+use orrery_core::CoreCodec;
 use orrery_games::game::Tamper;
 use orrery_games::regolith::state::RegolithState;
 use orrery_games::regolith::{pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
@@ -971,6 +972,42 @@ impl Swarm {
         }
     }
 
+    /// Route every `Game::deliver` product through the same reliable router as
+    /// other peer traffic. The swarm owns the authority roster, so it is the
+    /// only layer that can resolve an entity to a token-authenticated exterior
+    /// node without guessing its transport identity from a slot.
+    fn collect_delivered_inputs(&mut self, tick: u64) {
+        for from in 0..self.bots.len() {
+            let sender = self.bots[from].node;
+            for (recipient, order) in self.bots[from].drain_delivered() {
+                let target = self
+                    .bots
+                    .iter()
+                    .position(|bot| bot.entity() == recipient)
+                    .or_else(|| {
+                        self.exterior
+                            .as_ref()
+                            .filter(|exterior| exterior.entity == recipient)
+                            .map(|exterior| exterior.index)
+                    });
+                let Some(target) = target else {
+                    continue;
+                };
+                let inner = orrery_protocol::channels::encode_delivered_input(
+                    self.bots[from].entity(),
+                    recipient,
+                    &order.to_canonical(),
+                );
+                let payload = Bytes::from(orrery_protocol::channels::tag(
+                    orrery_protocol::channels::Channel::Control,
+                    &inner,
+                ));
+                self.router
+                    .accept_stream(tick, sender, target, StreamMode::Shared, payload);
+            }
+        }
+    }
+
     /// Hand every due packet to its recipient's buffer, on the lane it came in on.
     fn deliver(&mut self, tick: u64) {
         for delivery in self.router.deliver_due(tick) {
@@ -986,8 +1023,21 @@ impl Swarm {
                 }
             }
             // The router already carries the sender's identity verbatim.
+            let from_entity = self
+                .index_of
+                .get(&delivery.from)
+                .and_then(|index| self.bots.get(*index))
+                .map(Bot::entity)
+                .or_else(|| {
+                    self.exterior
+                        .as_ref()
+                        .filter(|exterior| exterior.node == delivery.from)
+                        .map(|exterior| exterior.entity)
+                })
+                .unwrap_or(PersistId::new(0));
             self.bots[delivery.to].receive_inbound(
                 delivery.from,
+                from_entity,
                 delivery.stream,
                 delivery.payload,
             );
@@ -1134,6 +1184,7 @@ impl Swarm {
         }
         phase[3] += mark.elapsed().as_nanos();
         mark = std::time::Instant::now();
+        self.collect_delivered_inputs(tick);
         self.collect_sends(tick);
         phase[4] += mark.elapsed().as_nanos();
         mark = std::time::Instant::now();
@@ -2575,5 +2626,76 @@ mod tests {
         } else {
             panic!("the exterior slot was attached");
         }
+    }
+
+    #[test]
+    fn host_authoritative_lock_reply_routes_back_to_the_external_authority() {
+        use crate::bot::bot_key;
+        use crate::exterior::link_pair;
+        use orrery_games::regolith::order::Order;
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 1,
+            seconds: 1,
+            witnessing: false,
+            ..SwarmConfig::default()
+        });
+        let exterior_index = 1;
+        let exterior_node = bot_key(exterior_index).public();
+        let exterior_entity = PersistId::new(2);
+        let target = swarm.bots[0].entity();
+        let (host_link, remote_link) = link_pair();
+        swarm = swarm.with_external(exterior_node, None, host_link);
+        swarm.form_island();
+
+        let inner = orrery_protocol::channels::encode_delivered_input(
+            exterior_entity,
+            target,
+            &Order::LockRequested {
+                locker: exterior_entity,
+            }
+            .to_canonical(),
+        );
+        let payload = Bytes::from(orrery_protocol::channels::tag(
+            orrery_protocol::channels::Channel::Control,
+            &inner,
+        ));
+        swarm.bots[0].receive_inbound(
+            exterior_node,
+            exterior_entity,
+            Some(StreamMode::Shared),
+            payload,
+        );
+
+        let mut phase = [0u128; 6];
+        swarm.tick_once(0, 20, &mut phase);
+        swarm.tick_once(1, 20, &mut phase);
+
+        let mut saw_confirmation = false;
+        while let Ok(frame) = remote_link
+            .downlink
+            .lock()
+            .expect("downlink lock")
+            .try_recv()
+        {
+            let delivered = orrery_protocol::channels::untag(&frame.payload)
+                .and_then(|(_, inner)| orrery_protocol::channels::decode_delivered_input(inner));
+            let Some(delivered) = delivered else {
+                continue;
+            };
+            saw_confirmation |= delivered.from == target
+                && delivered.recipient == exterior_entity
+                && matches!(
+                    Order::decode(&delivered.input),
+                    Ok(Order::LockConfirmed {
+                        target: confirmed,
+                        ..
+                    }) if confirmed == target
+                );
+        }
+        assert!(
+            saw_confirmation,
+            "the host target's authoritative step must route its reply to the exterior entity"
+        );
     }
 }

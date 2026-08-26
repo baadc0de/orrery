@@ -34,7 +34,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 /// The connection's application protocol. Must match `gates/p1-swarm`'s
 /// `bridge::EXTERIOR_ALPN`; a grammar change bumps it there and here together.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/2";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/3";
 
 /// Longest frame the wire will carry or accept (`exterior::MAX_FRAME_BYTES`).
 pub const MAX_FRAME_BYTES: u32 = 64 * 1_024;
@@ -188,13 +188,13 @@ impl UplinkAck {
 }
 
 /// The handshake a dialling peer sends before any combat traffic
-/// (`exterior::JoinRequest`, version 2, with #387's identity tail).
+/// (`exterior::JoinRequest`, version 3).
 ///
 /// The tail carries the invite-bound session identity and the operator-signed
 /// session token the host verifies at join (#345 §8). It rides after the
-/// revision at the same wire version, because the version-2 decoder always
-/// stopped reading at the revision: an old host ignores the tail, and a
-/// tail-less request decodes here with both fields `None`.
+/// revision in version 2, because that decoder always stopped reading at the
+/// revision. Version 3 adds reliable addressed delivered inputs to the data
+/// path, so an older participant is refused before combat traffic begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// Build revision of the joining process, for the report and for pinning.
@@ -207,7 +207,7 @@ pub struct JoinRequest {
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 2;
+    const VERSION: u16 = 3;
 
     /// A plain, identity-less join.
     #[must_use]
@@ -786,8 +786,8 @@ fn spawn_writer(
 mod tests {
     use super::*;
 
-    /// The exact bytes slice 1's host reads. `exterior::JoinRequest` v2 is
-    /// `[ORRX][02 00][rev len][rev]`; if this vector and `gates/p1-swarm` ever
+    /// The exact bytes slice 1's host reads. `exterior::JoinRequest` v3 is
+    /// `[ORRX][03 00][rev len][rev]`; if this vector and `gates/p1-swarm` ever
     /// disagree, one side changed the grammar and both must move together.
     #[test]
     fn join_request_bytes_match_slice_1() {
@@ -796,7 +796,7 @@ mod tests {
             request.encode(),
             vec![
                 b'O', b'R', b'R', b'X', // magic
-                0x02, 0x00, // version 2, LE
+                0x03, 0x00, // version 3, LE
                 7,    // revision length
                 b'a', b'b', b'c', b'1', b'2', b'3', b'4',
             ]
@@ -840,7 +840,7 @@ mod tests {
             request.encode(),
             vec![
                 b'O', b'R', b'R', b'X', // magic
-                0x02, 0x00, // version 2, LE
+                0x03, 0x00, // version 3, LE
                 2, b'a', b'b', // revision
                 2, b'c', b'd', // session id
                 0x02, 0x00, // token length, LE

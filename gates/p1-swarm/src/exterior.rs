@@ -343,7 +343,9 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
 /// the operator-signed `SessionTokenV1` authorizing this transport identity.
 ///
 /// The identity fields ride as an optional tail after the revision, still at
-/// version 2: the version-2 decoder always stopped reading at the revision,
+/// version 3. Version 2 added the optional identity tail; version 3 adds
+/// reliable addressed delivered inputs to the data path. The version-2
+/// decoder always stopped reading at the revision,
 /// so a request with the tail is readable by an old host (which ignores it)
 /// and a request without it is readable here (both fields decode to `None`).
 /// A host *requiring* them refuses their absence at admission, not at parse.
@@ -361,7 +363,7 @@ pub struct JoinRequest {
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 2;
+    const VERSION: u16 = 3;
 
     /// A plain, identity-less join — what the headless bot runner sends.
     #[must_use]
