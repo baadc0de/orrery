@@ -1585,6 +1585,7 @@ fn refresh_strip(metrics: Res<OverlayMetrics>, mut strip: Query<&mut Text, With<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_f3_pane(
     state: Res<OverlayState>,
     metrics: Res<OverlayMetrics>,

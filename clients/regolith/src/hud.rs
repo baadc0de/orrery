@@ -28,6 +28,18 @@ type BracketQuery<'w, 's> = Query<
     (&'static mut Transform, &'static mut Visibility),
     (With<LockBrackets>, Without<LockReticle>, Without<LockGlow>),
 >;
+/// The impact burst's own transform, visibility and material handle. Named
+/// because the tuple is past clippy's complexity bar inline.
+type FlashQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Transform,
+        &'static mut Visibility,
+        Option<&'static MeshMaterial3d<StandardMaterial>>,
+    ),
+    With<ImpactFlash>,
+>;
 /// The glow disc, likewise disjoint.
 type GlowQuery<'w, 's> = Query<
     'w,
@@ -759,14 +771,7 @@ pub fn sync_impact_flash(
     zoom: Res<crate::CameraZoom>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
-    mut flashes: Query<
-        (
-            &mut Transform,
-            &mut Visibility,
-            Option<&MeshMaterial3d<StandardMaterial>>,
-        ),
-        With<ImpactFlash>,
-    >,
+    mut flashes: FlashQuery,
 ) {
     let burst = feedback
         .impact_burst()
