@@ -34,6 +34,8 @@ use orrery_core::{tick_rng, CoreCodec, Executor, InputLogProducer, QPos};
 use orrery_games::game::{Game, Tamper};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::Order;
+#[cfg(test)]
+use orrery_games::regolith::order::Outcome;
 use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::weapon::WeaponKind;
 use orrery_games::regolith::{Regolith, REGOLITH_RULESET};
@@ -169,6 +171,9 @@ pub struct Bot {
     delivered_inbox: Vec<(PersistId, Order)>,
     /// This tick's `Game::deliver` products for the swarm router.
     delivered_outbox: Vec<(PersistId, Order)>,
+    /// Target-authored shot verdicts retained only for live-path regression tests.
+    #[cfg(test)]
+    resolved_shots: Vec<Outcome>,
     /// Envelopes routed to this peer but naming another entity.
     foreign_deliveries: u64,
     /// First tick at which the tampered build produced a different state hash
@@ -592,6 +597,8 @@ impl Bot {
             honest_shadow,
             delivered_inbox: Vec::new(),
             delivered_outbox: Vec::new(),
+            #[cfg(test)]
+            resolved_shots: Vec::new(),
             foreign_deliveries: 0,
             first_tampered_tick: None,
             tamper: cheat,
@@ -731,6 +738,14 @@ impl Bot {
             .executor
             .step_entity(self.entity, at, &orders)
             .expect("entity present");
+        #[cfg(test)]
+        self.resolved_shots.extend(
+            outcome
+                .events
+                .iter()
+                .filter(|event| matches!(event, Outcome::ShotResolved { .. }))
+                .cloned(),
+        );
         for event in &outcome.events {
             if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
                 if recipient == self.entity {
@@ -1033,6 +1048,25 @@ impl Bot {
     /// whose transport identity cannot be derived from its slot.
     pub fn drain_delivered(&mut self) -> Vec<(PersistId, Order)> {
         core::mem::take(&mut self.delivered_outbox)
+    }
+
+    #[cfg(test)]
+    /// Replaces the authored craft with a captured live-state fixture.
+    pub fn replace_craft_for_test(&mut self, craft: Craft) {
+        self.executor
+            .insert(self.entity, RegolithState::Craft(craft));
+    }
+
+    #[cfg(test)]
+    /// Injects one prior-tick delivery without bypassing delivered-first composition.
+    pub fn inject_delivered(&mut self, from: PersistId, order: Order) {
+        self.delivered_inbox.push((from, order));
+    }
+
+    #[cfg(test)]
+    /// Drains target-authored shot verdicts observed at the real step boundary.
+    pub fn take_resolved_shots(&mut self) -> Vec<Outcome> {
+        core::mem::take(&mut self.resolved_shots)
     }
 
     /// Hands one delivered message from `from` to this bot's receive buffers.
