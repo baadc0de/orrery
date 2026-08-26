@@ -30,7 +30,7 @@ use assets::VisualAssetPaths;
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use bevy::window::PrimaryWindow;
-use campaign::DeliveredOrder;
+use campaign::{DeliveredOrder, JoinState};
 use combat::{CombatView, LockBreak, ProjectileTracks, ShotFeedback};
 use intent::{decode_packet, Controls, IntentPipeline};
 use orrery_core::{Executor, TICK_NANOS};
@@ -41,7 +41,7 @@ use orrery_games::{
     Game, Regolith,
 };
 use orrery_protocol::{CellId, PersistId, Tick, UniverseSeed};
-use telemetry::{JsonlTelemetry, OverlayMetrics};
+use telemetry::{JsonlTelemetry, OverlayMetrics, SessionScope};
 
 const PLAYER: PersistId = PersistId::new(1);
 const OPPONENT: PersistId = PersistId::new(2);
@@ -81,6 +81,8 @@ struct SelectedLock {
 
 #[derive(Component)]
 struct AlwaysOnStrip;
+#[derive(Component)]
+struct SessionBanner;
 #[derive(Component)]
 struct F3Pane;
 
@@ -186,6 +188,56 @@ impl ActiveSession {
             Self::Campaign(runtime) => runtime.focus(),
         }
     }
+
+    fn join_state(&self) -> Option<&JoinState> {
+        match self {
+            Self::Local(_) => None,
+            Self::Campaign(runtime) => Some(runtime.state()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPresentation {
+    Local,
+    Dialing,
+    Live,
+    Failed,
+    Refused,
+    Disconnected,
+}
+
+impl SessionPresentation {
+    fn from_join_state(state: Option<&JoinState>) -> Self {
+        match state {
+            None => Self::Local,
+            Some(JoinState::Dialing) => Self::Dialing,
+            Some(JoinState::Joined) => Self::Live,
+            Some(JoinState::Failed(_)) => Self::Failed,
+            Some(JoinState::Refused(_)) => Self::Refused,
+            Some(JoinState::Closed { .. }) => Self::Disconnected,
+        }
+    }
+
+    const fn session_scope(self) -> SessionScope {
+        match self {
+            Self::Live => SessionScope::Campaign,
+            Self::Local | Self::Dialing | Self::Failed | Self::Refused | Self::Disconnected => {
+                SessionScope::Local
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Local => "LOCAL SANDBOX — NOT CONNECTED TO CAMPAIGN",
+            Self::Dialing => "LOCAL SANDBOX — CONNECTING TO CAMPAIGN…",
+            Self::Live => "CAMPAIGN LIVE",
+            Self::Failed => "LOCAL SANDBOX — CAMPAIGN DIAL FAILED",
+            Self::Refused => "LOCAL SANDBOX — CAMPAIGN JOIN REFUSED",
+            Self::Disconnected => "LOCAL SANDBOX — CAMPAIGN DISCONNECTED",
+        }
+    }
 }
 
 /// Installs the thin skin after Bevy's [`DefaultPlugins`].
@@ -262,6 +314,7 @@ impl Plugin for RegolithSkinPlugin {
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     frame_camera.after(sync_rendered_state),
+                    refresh_session_banner,
                     refresh_strip,
                     refresh_f3_pane,
                 ),
@@ -331,6 +384,29 @@ fn setup_scene(
     }
     hud::spawn_hud(&mut commands);
     hud::spawn_world_overlay(&mut commands, &mut meshes, &mut materials);
+    let presentation = SessionPresentation::from_join_state(session.join_state());
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(8.0),
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::Center,
+            ..Default::default()
+        },
+        GlobalZIndex(100),
+        children![(
+            Text::new(presentation.label()),
+            TextFont::from_font_size(14.0),
+            TextColor(Color::WHITE),
+            Node {
+                padding: UiRect::axes(Val::Px(14.0), Val::Px(7.0)),
+                border_radius: BorderRadius::all(Val::Px(8.0)),
+                ..Default::default()
+            },
+            BackgroundColor(session_banner_color(presentation)),
+            SessionBanner,
+        )],
+    ));
     commands.spawn((
         Text::new("intents/s 0 | rollbacks/min 0 | discrepancies 0"),
         Node {
@@ -496,7 +572,7 @@ fn drive_core(
             let mut human = local.pending.remove(&PLAYER).unwrap_or_default();
             human.extend(decode_packet(&packet).expect("the local codec produced valid orders"));
             window.intents = window.intents.saturating_add(packet.orders.len() as u64);
-            if let Err(error) = sink.append_orders(&packet) {
+            if let Err(error) = sink.append_orders(&packet, SessionScope::Local) {
                 error!("cannot append Regolith order packet: {error}");
             }
             if controls == Controls::default() {
@@ -1035,6 +1111,28 @@ fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<OverlayStat
     }
 }
 
+fn session_banner_color(presentation: SessionPresentation) -> Color {
+    match presentation {
+        SessionPresentation::Live => Color::srgb(0.08, 0.42, 0.28),
+        SessionPresentation::Dialing => Color::srgb(0.35, 0.27, 0.08),
+        SessionPresentation::Local
+        | SessionPresentation::Failed
+        | SessionPresentation::Refused
+        | SessionPresentation::Disconnected => Color::srgb(0.62, 0.19, 0.10),
+    }
+}
+
+fn refresh_session_banner(
+    session: Res<ActiveSession>,
+    mut banner: Query<(&mut Text, &mut BackgroundColor), With<SessionBanner>>,
+) {
+    let presentation = SessionPresentation::from_join_state(session.join_state());
+    if let Ok((mut text, mut background)) = banner.single_mut() {
+        **text = presentation.label().to_owned();
+        background.0 = session_banner_color(presentation);
+    }
+}
+
 fn refresh_strip(metrics: Res<OverlayMetrics>, mut strip: Query<&mut Text, With<AlwaysOnStrip>>) {
     if let Ok(mut text) = strip.single_mut() {
         **text = format!(
@@ -1100,6 +1198,8 @@ fn stream_metrics(
     session: Res<ActiveSession>,
 ) {
     metrics.intents_per_second = std::mem::take(&mut window.intents);
+    metrics.session_scope =
+        SessionPresentation::from_join_state(session.join_state()).session_scope();
     match &*session {
         ActiveSession::Local(_) => {
             metrics.idle_minutes = window.idle_ticks as f64 / (orrery_core::TICK_HZ as f64 * 60.0);
@@ -1208,6 +1308,25 @@ mod tests {
             .trim()
             .to_owned();
         assert_eq!(BUILD_REV, expected, "the binary stamp must be this commit");
+    }
+
+    /// A row is campaign evidence only while the transport state machine says
+    /// it is joined. In particular, failed dials must remain visibly and
+    /// mechanically local even though they still occupy the campaign runtime.
+    #[test]
+    fn local_fallbacks_cannot_present_or_serialize_as_live_campaigns() {
+        let local = SessionPresentation::from_join_state(None);
+        assert_eq!(local.label(), "LOCAL SANDBOX — NOT CONNECTED TO CAMPAIGN");
+        assert_eq!(local.session_scope(), SessionScope::Local);
+
+        let failed = JoinState::Failed("fixture dial failure".to_owned());
+        let failed = SessionPresentation::from_join_state(Some(&failed));
+        assert_eq!(failed.label(), "LOCAL SANDBOX — CAMPAIGN DIAL FAILED");
+        assert_eq!(failed.session_scope(), SessionScope::Local);
+
+        let joined = SessionPresentation::from_join_state(Some(&JoinState::Joined));
+        assert_eq!(joined.label(), "CAMPAIGN LIVE");
+        assert_eq!(joined.session_scope(), SessionScope::Campaign);
     }
 
     /// #377's fix, restated for the models that replaced its `Cone`.

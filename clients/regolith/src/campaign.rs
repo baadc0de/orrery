@@ -763,7 +763,9 @@ impl CampaignRuntime {
                 entity: self.entity.0,
                 orders: encode_orders(&composed.orders),
             };
-            if let Err(error) = sink.append_orders(&packet) {
+            if let Err(error) =
+                sink.append_orders(&packet, crate::telemetry::SessionScope::Campaign)
+            {
                 bevy::log::error!("cannot append Regolith order packet: {error}");
             }
             self.witness_log
