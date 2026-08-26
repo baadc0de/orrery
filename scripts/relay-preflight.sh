@@ -203,6 +203,7 @@ self_test() {
 case "$RELAY_PREFLIGHT_FIXTURE" in
   loopback) printf "udp UNCONN 0 0 127.0.0.1:7842 0.0.0.0:*\\n" ;;
   empty) : ;;
+  erroring) echo "ss: permission denied" >&2; exit 1 ;;
   *) printf "udp UNCONN 0 0 62.238.59.131:7842 0.0.0.0:*\\n" ;;
 esac'
     apply_fixture openssl '#!/usr/bin/env bash
@@ -245,6 +246,17 @@ echo relay'
         || die 'self-test: expiring certificate did not fail cert-expiry-watch'
     st_good
 
+    # A present-but-failing probe is a different branch from a missing binary:
+    # `ss` exists, runs, and exits non-zero (permission denied, an unexpected
+    # kernel). Downgrading that branch to PASS was invisible to this self-test
+    # until this case existed, so the operator would have been told the relay
+    # was fine by a check that had learned nothing.
+    status=0; output="$(st_run erroring)" || status=$?
+    ((status != 0)) || die 'self-test: an erroring ss fixture passed'
+    grep -Fq 'UNKNOWN qad-listens-publicly ss could not inspect UDP 7842' <<<"$output" \
+        || die 'self-test: an erroring probe was not reported UNKNOWN by qad-listens-publicly'
+    st_good
+
     status=0
     output="$(PATH="$dir/bin:$PATH" RELAY_PREFLIGHT_SS_BIN=missing-ss \
         RELAY_PREFLIGHT_OPENSSL_BIN=openssl RELAY_PREFLIGHT_CURL_BIN=curl "$0" --postflight 2>&1)" || status=$?
@@ -253,7 +265,7 @@ echo relay'
         || die 'self-test: unavailable probe was not reported UNKNOWN by qad-listens-publicly'
     st_good
 
-    echo "$NAME: self-test passed (4 passing fixtures: baseline + 3 reversions; 3 guarded mutations: loopback FAIL, expiring FAIL, unavailable UNKNOWN)"
+    echo "$NAME: self-test passed (5 passing fixtures: baseline + 4 reversions; 4 guarded mutations: loopback FAIL, expiring FAIL, erroring UNKNOWN, unavailable UNKNOWN)"
 }
 
 die() { echo "$NAME: $*" >&2; exit 2; }
