@@ -217,7 +217,17 @@ impl Plugin for AdmissionPlugin {
         .insert_resource(CampaignCatalog::default())
         .insert_resource(UiDirty(true))
         .add_systems(Startup, begin_fetch)
-        .add_systems(Update, (poll_worker, sync_nickname, rebuild_ui).chain())
+        // `poll_worker` removes `JoinGate` the moment a join succeeds, and the
+        // two UI systems chained behind it take `Res`/`ResMut<JoinGate>`. Without
+        // this run condition they execute in that same tick against a resource
+        // that no longer exists and Bevy panics — so every *successful* join
+        // killed the client immediately after admitting it (#491).
+        .add_systems(
+            Update,
+            (poll_worker, sync_nickname, rebuild_ui)
+                .chain()
+                .run_if(resource_exists::<JoinGate>),
+        )
         .add_observer(choose_campaign)
         .add_observer(retry_fetch)
         .add_observer(go_back)
@@ -1035,6 +1045,25 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_join_gate_systems_do_not_run_once_the_gate_is_gone() {
+        // A successful join removes `JoinGate` inside `poll_worker`, and the
+        // UI systems chained behind it take `Res`/`ResMut<JoinGate>`. Without
+        // the run condition they execute in that same tick and Bevy panics
+        // with "Resource does not exist" — so the client died immediately
+        // *after* admitting, which reads as a crash on success. Observed live
+        // against the deployed service (#491).
+        let mut app = App::new();
+        app.add_systems(
+            Update,
+            (sync_nickname, rebuild_ui)
+                .chain()
+                .run_if(resource_exists::<JoinGate>),
+        );
+        // No `JoinGate` inserted: this is the post-join world.
+        app.update();
+    }
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
