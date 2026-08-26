@@ -172,6 +172,58 @@ fn two_ships_striking_each_other_resolve_once_by_stable_id() {
 }
 
 #[test]
+fn delivered_collision_force_precedes_the_authored_collision_force() {
+    let resolver = PersistId::new(30);
+    let other = PersistId::new(31);
+    let run = |orders: &[Order]| {
+        let mut own = craft_at(0);
+        own.vel.x = 20_000;
+        let mut target = Craft::spawned(
+            Archetype::Cruiser,
+            QPos {
+                x: 5_000,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        target.vel.x = -10_000;
+        let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xC7; 32]));
+        executor.insert(resolver, RegolithState::Craft(own));
+        executor.insert(other, RegolithState::Craft(target));
+        let output = executor
+            .step_entity(resolver, Tick::new(4), orders)
+            .expect("resolver exists");
+        let RegolithState::Craft(state) = executor.state(resolver).expect("resolver remains")
+        else {
+            unreachable!("resolver remains a craft")
+        };
+        (state.vel.x, output.events)
+    };
+    let delivered = Order::CollisionResolved {
+        from: PersistId::new(29),
+        velocity: QVel {
+            x: 40_000,
+            y: 0,
+            z: 0,
+        },
+    };
+    let authored = Order::Collide { other };
+
+    let (delivered_first, events) = run(&[delivered.clone(), authored.clone()]);
+    let (authored_first, _) = run(&[authored, delivered]);
+
+    assert!(delivered_first < 0, "the later authored contact wins");
+    assert!(authored_first > 0, "the later delivered force wins");
+    assert_ne!(delivered_first, authored_first);
+    assert!(matches!(
+        events.as_slice(),
+        [Outcome::Collision { collider, target, .. }]
+            if *collider == resolver && *target == other
+    ));
+}
+
+#[test]
 fn collision_beyond_contact_range_is_rejected() {
     let ship_id = PersistId::new(20);
     let rock_id = PersistId::new(21);
@@ -219,8 +271,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v14_projectile_arc_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 14);
+fn v15_collision_order_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 15);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);

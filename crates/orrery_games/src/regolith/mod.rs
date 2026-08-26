@@ -90,9 +90,9 @@ const CAMPAIGN_ORBIT_RADIUS_M: f64 = 2_500.0;
 const CAMPAIGN_CROWD_ARC_RAD: f64 = 0.08;
 const CAMPAIGN_RADIAL_SPREAD: f64 = 0.10;
 
-/// Regolith v14's rules identity: firing arcs are decided once per projectile.
+/// Regolith v15's rules identity: collision forces compose in sealed input order.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 14,
+    version: 15,
     digest: [0x66; 32],
 };
 
@@ -107,6 +107,21 @@ pub mod components {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Regolith {
     tamper: Option<Tamper>,
+}
+
+/// Nominate the nearest contact that is worth submitting as [`Order::Collide`].
+///
+/// This is the deliberately untrusted broad phase shared by live input sources.
+/// It reads replicated snapshots outside the canonical step and grants no state
+/// change: [`visibility::verify_claims`] repeats the integer predicate against a
+/// recorded neighbour frame before the rules apply either body's force.
+#[must_use]
+pub fn collision_candidate<'a>(
+    entity: PersistId,
+    own: &RegolithState,
+    neighbors: impl IntoIterator<Item = (PersistId, &'a RegolithState)>,
+) -> Option<PersistId> {
+    visibility::broad_phase_collision_candidate(entity, own, neighbors)
 }
 
 impl Regolith {
@@ -172,7 +187,7 @@ impl Ruleset for Regolith {
         let claims = visibility::verify_claims(view, inputs);
         let (mut state, mut events) = match view.own().clone() {
             RegolithState::Craft(craft) => {
-                let (craft, events) = self.step_craft(me, craft, inputs, rng);
+                let (craft, events) = self.step_craft(me, craft, inputs, claims.collision, rng);
                 (RegolithState::Craft(craft), events)
             }
             RegolithState::Rock(rock) => {
@@ -192,17 +207,6 @@ impl Ruleset for Regolith {
             (&claims.visibility, &mut state)
         {
             craft.last_cover_occluded = *occluded;
-        }
-        if let Some(collision) = claims.collision {
-            if let RegolithState::Craft(craft) = &mut state {
-                craft.vel = collision.own_velocity;
-                craft.collisions = craft.collisions.saturating_add(1);
-                events.push(Outcome::Collision {
-                    collider: me,
-                    target: collision.other,
-                    target_velocity: collision.target_velocity,
-                });
-            }
         }
         if claims.arithmetic_overflowed {
             match &mut state {
@@ -276,6 +280,7 @@ impl Regolith {
         me: PersistId,
         own: Craft,
         inputs: &OrderedInputs<'_, Order>,
+        collision: Option<visibility::CollisionResolution>,
         rng: &mut TickRng,
     ) -> (Craft, Vec<Outcome>) {
         let mut events = Vec::new();
@@ -568,6 +573,27 @@ impl Regolith {
                         vz = velocity.z as f64 / 1_000.0;
                         collisions = collisions.saturating_add(1);
                     }
+                }
+                Order::Collide { other }
+                    if collision.is_some_and(|resolution| resolution.other == *other) =>
+                {
+                    let resolution = collision.expect("guarded by the matching resolution");
+                    // One exchange is adjudicated twice, but its force is computed
+                    // once: this step applies the resolver's own velocity and the
+                    // event carries its counterparty's. Keeping this arm in the
+                    // sealed-order loop is the physical meaning of D46(d). A
+                    // prior-tick CollisionResolved is delivered first and applies
+                    // before this authored contact; reversing host composition
+                    // reverses which mutually applied force is observed last.
+                    vx = resolution.own_velocity.x as f64 / 1_000.0;
+                    vy = resolution.own_velocity.y as f64 / 1_000.0;
+                    vz = resolution.own_velocity.z as f64 / 1_000.0;
+                    collisions = collisions.saturating_add(1);
+                    events.push(Outcome::Collision {
+                        collider: me,
+                        target: resolution.other,
+                        target_velocity: resolution.target_velocity,
+                    });
                 }
                 Order::ClaimCover { .. } => {
                     if cover_claim_cooldown == 0 {

@@ -64,6 +64,44 @@ impl Body {
     }
 }
 
+pub(crate) fn broad_phase_collision_candidate<'a>(
+    me: PersistId,
+    own_state: &RegolithState,
+    neighbors: impl IntoIterator<Item = (PersistId, &'a RegolithState)>,
+) -> Option<PersistId> {
+    let own = Body::from_state(own_state)?;
+    if !own.craft || !own.alive {
+        return None;
+    }
+    neighbors
+        .into_iter()
+        .filter_map(|(other_id, other_state)| {
+            let other = Body::from_state(other_state)?;
+            if !other.alive || (other.craft && me >= other_id) {
+                return None;
+            }
+            let normal = checked_sub_components(
+                [other.pos.x, other.pos.y, other.pos.z],
+                [own.pos.x, own.pos.y, own.pos.z],
+            );
+            let mut overflowed = false;
+            let distance_sq = checked_sum_squares(normal, &mut overflowed)?;
+            let radius = own.radius_mm.checked_add(other.radius_mm)?;
+            let radius_sq = i128::from(radius).checked_mul(i128::from(radius))?;
+            if distance_sq == 0 || distance_sq > radius_sq {
+                return None;
+            }
+            let relative_velocity = checked_sub_components(
+                [other.vel.x, other.vel.y, other.vel.z],
+                [own.vel.x, own.vel.y, own.vel.z],
+            );
+            (checked_dot(relative_velocity, normal, &mut overflowed)? < 0)
+                .then_some((distance_sq, other_id))
+        })
+        .min_by_key(|candidate| *candidate)
+        .map(|(_, entity)| entity)
+}
+
 /// Verify rate-eligible visibility and collision claims against recorded frames.
 ///
 /// The expensive broad phase stays outside the core. This function performs
@@ -321,4 +359,43 @@ fn checked_dot(a: [i128; 3], b: [i128; 3], overflowed: &mut bool) -> Option<i128
                 None
             })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::regolith::{archetype::Archetype, state::Craft};
+
+    #[test]
+    fn one_collision_applies_equal_and_opposite_momentum_changes() {
+        let me = PersistId::new(1);
+        let other_id = PersistId::new(2);
+        let mut own = Craft::spawned(Archetype::Interceptor, QPos::default(), 0);
+        own.vel.x = 20_000;
+        let mut other = Craft::spawned(
+            Archetype::Cruiser,
+            QPos {
+                x: 5_000,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        other.vel.x = -10_000;
+        let own_state = RegolithState::Craft(own.clone());
+        let other_state = RegolithState::Craft(other.clone());
+        let mut overflowed = false;
+
+        let resolution = verify_collision(me, &own_state, other_id, &other_state, &mut overflowed)
+            .expect("the overlapping approaching pair resolves");
+        let own_change = resolution.own_velocity.x - own.vel.x;
+        let other_change = resolution.target_velocity.x - other.vel.x;
+
+        assert_eq!(
+            own_change * own.archetype.limits().mass_units,
+            -(other_change * other.archetype.limits().mass_units),
+            "one computation must carry equal and opposite momentum changes to both own-state steps",
+        );
+        assert!(!overflowed);
+    }
 }
