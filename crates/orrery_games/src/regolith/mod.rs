@@ -1013,6 +1013,10 @@ fn projectile_resolution(
         return ProjectileResolution::OutOfArc;
     }
     let weapon = weapon_kind.weapon();
+    // Range deliberately stays live for target-authored continuations. The
+    // target's current position is compared with the attacker's firing-time
+    // origin so that escaping beyond weapon reach breaks the lock before the
+    // projectile resolves; that mixed-time frame is the outrunning mechanic.
     let range_sq = nonnegative_distance_squared(target_pos, attacker_pos);
     let reach = weapon
         .optimal_mm
