@@ -28,6 +28,18 @@ type BracketQuery<'w, 's> = Query<
     (&'static mut Transform, &'static mut Visibility),
     (With<LockBrackets>, Without<LockReticle>, Without<LockGlow>),
 >;
+/// The impact burst's own transform, visibility and material handle. Named
+/// because the tuple is past clippy's complexity bar inline.
+type FlashQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Transform,
+        &'static mut Visibility,
+        Option<&'static MeshMaterial3d<StandardMaterial>>,
+    ),
+    With<ImpactFlash>,
+>;
 /// The glow disc, likewise disjoint.
 type GlowQuery<'w, 's> = Query<
     'w,
@@ -67,6 +79,23 @@ pub const PANEL: Color = Color::srgba(0.086, 0.094, 0.149, 0.86);
 pub const TRACER: Color = Color::srgb(0.961, 0.957, 1.0);
 /// Mining lock amber, distinct from the ship-lock accent.
 pub const MINING_AMBER: Color = Color::srgb(0.95, 0.62, 0.22);
+/// Confirmed-impact orange.
+///
+/// Hotter and redder than [`MINING_AMBER`] so the two never read as the same
+/// event: amber says "this is a rock, and mining it is a lock away", orange
+/// says "the ruleset has adjudicated damage". Both sit off the accent hue, so
+/// neither can be confused with the player's own accent furniture, and the
+/// burst is emissive-unlit rather than the reserved exhaust glow finish.
+pub const IMPACT_ORANGE: Color = Color::srgb(1.0, 0.45, 0.10);
+
+/// The burst's drawn radius at its birth and at its death, as multiples of the
+/// flash mesh's own radius.
+///
+/// It opens fast and keeps growing while fading, which is what makes a small
+/// sphere read as a burst rather than as a lamp switching on.
+pub const IMPACT_BURST_START_SCALE: f32 = 0.55;
+/// See [`IMPACT_BURST_START_SCALE`].
+pub const IMPACT_BURST_END_SCALE: f32 = 2.3;
 
 /// The pool cuboid's length along its nose axis at scale one, in metres.
 pub const TRACER_MESH_LENGTH_M: f32 = 18.0;
@@ -279,7 +308,7 @@ fn label(text: &str) -> impl Bundle {
 
 fn value(readout: Readout, size: f32, color: Color) -> impl Bundle {
     (
-        Text::new("—"),
+        Text::new("-"),
         TextFont::from_font_size(size),
         TextColor(color),
         readout,
@@ -470,9 +499,11 @@ pub fn spawn_world_overlay(
         radius: RETICLE_RADIUS_M * 0.12,
     });
     let flash_material = materials.add(StandardMaterial {
-        base_color: TRACER,
-        emissive: LinearRgba::WHITE * 8.0,
+        base_color: IMPACT_ORANGE,
+        emissive: LinearRgba::from(IMPACT_ORANGE) * 8.0,
         unlit: true,
+        // The burst fades out over its life, which needs a blended pass.
+        alpha_mode: AlphaMode::Blend,
         ..Default::default()
     });
 
@@ -561,6 +592,7 @@ pub fn spawn_world_overlay(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_lock_reticle(
     view: Res<CombatView>,
+    zoom: Res<crate::CameraZoom>,
     palette: Option<Res<LockMaterials>>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
@@ -594,6 +626,12 @@ pub(crate) fn sync_lock_reticle(
         match anchor {
             Some(position) => {
                 transform.translation = position;
+                // A glyph, not a measurement: it holds its apparent size
+                // across #521's zoom range instead of shrinking to nothing at
+                // 4 km. The range rings, the arc marking and the tracers
+                // deliberately do *not* do this — they mean metres, and would
+                // lie about distance if they were held to screen size.
+                transform.scale = Vec3::splat(zoom.glyph_scale());
                 *visibility = Visibility::Inherited;
             }
             None => *visibility = Visibility::Hidden,
@@ -716,26 +754,49 @@ fn world_position(
         .find_map(|(core, transform)| (core.0 == entity).then(|| transform.translation()))
 }
 
-/// Draws the impact flash on the shot's target while a cue says one is live.
+/// Draws the orange impact burst on the target of a **confirmed** hit.
 ///
-/// A provisional arrival and an authoritative hit both draw; a verdict of
-/// miss retracts it — [`ShotFeedback::flash_target`] encodes that choice, so
-/// this system stays a pure placement: anchor on the target's body or hide.
+/// Placement and animation only. Every decision about *whether* a burst is
+/// owed lives in [`ShotFeedback::impact_burst`], which yields one for
+/// `ShotResolved { result: Hit }` and for nothing else — not a miss, not an
+/// out-of-arc refusal, not a shot whose lock broke in flight, and not the
+/// provisional arrival cue. This system may not widen that set.
+///
+/// The anchor is the target's last replicated position, which is the best the
+/// shooter has and is not the true intersection; see
+/// [`ShotFeedback::impact_burst`] for why, and for why the burst is drawn as a
+/// marker on the thing that was hit rather than as a surveyed point.
 pub fn sync_impact_flash(
     feedback: Res<ShotFeedback>,
+    zoom: Res<crate::CameraZoom>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
-    mut flashes: Query<(&mut Transform, &mut Visibility), With<ImpactFlash>>,
+    materials: Option<ResMut<Assets<StandardMaterial>>>,
+    mut flashes: FlashQuery,
 ) {
-    let anchor = feedback
-        .flash_target()
-        .and_then(|target| world_position(&bodies, target));
-    if let Ok((mut transform, mut visibility)) = flashes.single_mut() {
-        match anchor {
-            Some(position) => {
-                transform.translation = position;
-                *visibility = Visibility::Inherited;
-            }
-            None => *visibility = Visibility::Hidden,
+    let burst = feedback
+        .impact_burst()
+        .and_then(|(target, progress)| Some((world_position(&bodies, target)?, progress)));
+    let Ok((mut transform, mut visibility, material)) = flashes.single_mut() else {
+        return;
+    };
+    let Some((position, progress)) = burst else {
+        *visibility = Visibility::Hidden;
+        return;
+    };
+    transform.translation = position;
+    // A glyph, not a measurement: it holds its apparent size across #521's
+    // zoom range instead of shrinking to nothing at 4 km. The range rings, the
+    // arc marking and the tracers deliberately do *not* do this — they mean
+    // metres, and would lie about distance if they were held to screen size.
+    let growth =
+        IMPACT_BURST_START_SCALE + (IMPACT_BURST_END_SCALE - IMPACT_BURST_START_SCALE) * progress;
+    transform.scale = Vec3::splat(growth * zoom.glyph_scale());
+    *visibility = Visibility::Inherited;
+    if let (Some(mut materials), Some(handle)) = (materials, material) {
+        if let Some(mut material) = materials.get_mut(&handle.0) {
+            let fade = (1.0 - progress).clamp(0.0, 1.0);
+            material.base_color = IMPACT_ORANGE.with_alpha(fade);
+            material.emissive = LinearRgba::from(IMPACT_ORANGE) * (8.0 * fade);
         }
     }
 }
@@ -789,26 +850,26 @@ pub fn refresh_combat_hud(
         let (body, tint) = match readout {
             Readout::OwnTitle => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| own.chassis_name().to_owned()),
+                    .map_or_else(|| "-".to_owned(), |own| own.chassis_name().to_owned()),
                 ACCENT_BRIGHT,
             ),
             Readout::OwnHull => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| format!("{}/{}", own.hull.max(0), own.max_hull()),
                 ),
                 MUTED,
             ),
             Readout::OwnShield => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| format!("{}/{}", own.shield.max(0), own.max_shield()),
                 ),
                 MUTED,
             ),
             Readout::OwnVitals => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| {
                         format!(
                             "#{}  {:.0} / {:.0} m/s   score {}",
@@ -823,7 +884,7 @@ pub fn refresh_combat_hud(
             ),
             Readout::WeaponName => (
                 view.own.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |own| format!("{:?}", own.weapon).to_uppercase(),
                 ),
                 if view.own.is_some_and(|own| own.cooldown > 0) {
@@ -834,12 +895,12 @@ pub fn refresh_combat_hud(
             ),
             Readout::WeaponSpec => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| weapon_spec(own.weapon_table())),
+                    .map_or_else(|| "-".to_owned(), |own| weapon_spec(own.weapon_table())),
                 DIM,
             ),
             Readout::WeaponCooldown => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| format!("{} t", own.cooldown)),
+                    .map_or_else(|| "-".to_owned(), |own| format!("{} t", own.cooldown)),
                 if view.own.is_some_and(|own| own.cooldown > 0) {
                     INK
                 } else {
@@ -848,7 +909,7 @@ pub fn refresh_combat_hud(
             ),
             Readout::WeaponEnvelope => (
                 view.own
-                    .map_or_else(|| "—".to_owned(), |own| weapon_envelope(own.weapon_table())),
+                    .map_or_else(|| "-".to_owned(), |own| weapon_envelope(own.weapon_table())),
                 MUTED,
             ),
             Readout::LockLabel => (
@@ -873,7 +934,7 @@ pub fn refresh_combat_hud(
                     .or_else(|| {
                         view.rock_target.map(|target| {
                             format!(
-                                "{}/{} · {} point{}",
+                                "{}/{} | {} point{}",
                                 target.hull.max(0),
                                 target.tier.limits().max_hull,
                                 target.tier.limits().points,
@@ -885,12 +946,12 @@ pub fn refresh_combat_hud(
                             )
                         })
                     })
-                    .unwrap_or_else(|| "—".to_owned()),
+                    .unwrap_or_else(|| "-".to_owned()),
                 MUTED,
             ),
             Readout::TargetShield => (
                 view.target.map_or_else(
-                    || "—".to_owned(),
+                    || "-".to_owned(),
                     |target| format!("{}/{}", target.shield.max(0), target.max_shield()),
                 ),
                 MUTED,
@@ -938,7 +999,7 @@ pub fn refresh_combat_hud(
     }
 }
 
-/// `10–13 dmg × 1 roll · 20 t cycle`, from the weapon's published row.
+/// `10-13 dmg x 1 roll | 20 t cycle`, from the weapon's published row.
 #[must_use]
 pub fn weapon_spec(weapon: Weapon) -> String {
     let low = weapon.damage_base;
@@ -946,7 +1007,7 @@ pub fn weapon_spec(weapon: Weapon) -> String {
         .damage_base
         .saturating_add(weapon.damage_spread.max(1).saturating_sub(1));
     format!(
-        "{low}–{high} dmg × {} roll{} · {} t cycle",
+        "{low}-{high} dmg x {} roll{} | {} t cycle",
         weapon.rolls,
         if weapon.rolls == 1 { "" } else { "s" },
         weapon.cooldown_ticks
@@ -957,7 +1018,7 @@ pub fn weapon_spec(weapon: Weapon) -> String {
 #[must_use]
 pub fn weapon_envelope(weapon: Weapon) -> String {
     format!(
-        "optimal {} m · falloff +{} m\nprojectile {} m/s · tracking {} µrad/s",
+        "optimal {} m | falloff +{} m\nprojectile {} m/s | tracking {} urad/s",
         weapon.optimal_mm / 1_000,
         weapon.falloff_mm / 1_000,
         weapon.projectile_speed_mms / 1_000,
@@ -970,10 +1031,10 @@ pub fn weapon_envelope(weapon: Weapon) -> String {
 #[must_use]
 pub fn target_title(view: &CombatView) -> String {
     match (view.target, view.rock_target, view.lock.target) {
-        (Some(target), _, _) => format!("{} · #{}", target.chassis_name(), target.entity.0),
-        (_, Some(target), _) => format!("{} · #{}", target.tier_name(), target.entity.0),
-        (None, None, Some(id)) => format!("#{:#x} · no window here", id.0),
-        (None, None, None) => "—".to_owned(),
+        (Some(target), _, _) => format!("{} | #{}", target.chassis_name(), target.entity.0),
+        (_, Some(target), _) => format!("{} | #{}", target.tier_name(), target.entity.0),
+        (None, None, Some(id)) => format!("#{:#x} | no window here", id.0),
+        (None, None, None) => "-".to_owned(),
     }
 }
 
@@ -993,14 +1054,14 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
     }
     match view.own.and_then(|own| tracks.own_shot(own.entity)) {
         Some(shot) if shot.timed => parts.push(format!(
-            "flight {} t · {:.2} s",
+            "flight {} t ({:.2} s)",
             shot.remaining,
             f64::from(shot.remaining) / f64::from(orrery_core::TICK_HZ)
         )),
         Some(_) => parts.push("leaving muzzle".to_owned()),
         None => parts.push("nothing in the air".to_owned()),
     }
-    parts.join(" · ")
+    parts.join(" | ")
 }
 
 /// The hit-chance band beside the locked target, and the phrase that says
@@ -1014,8 +1075,8 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
 #[must_use]
 pub fn hit_band_line(view: &CombatView) -> String {
     match view.hit_forecast() {
-        None => "—".to_owned(),
-        Some(band) => format!("{}  ·  {}", band.label(), band.note()),
+        None => "-".to_owned(),
+        Some(band) => format!("{}  |  {}", band.label(), band.note()),
     }
 }
 
@@ -1040,7 +1101,7 @@ pub fn lock_debug_lines(view: &CombatView, broken: &LockBreak) -> String {
 /// The chassis a craft flies, spelled for the HUD.
 #[must_use]
 pub fn chassis_of(view: Option<CraftView>) -> &'static str {
-    view.map_or("—", |view| view.chassis_name())
+    view.map_or("-", |view| view.chassis_name())
 }
 
 #[cfg(test)]
@@ -1073,6 +1134,7 @@ mod tests {
         app.init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
+            .init_resource::<crate::CameraZoom>()
             .init_resource::<ShotFeedback>();
         let world = app.world_mut();
         world.spawn((LockReticle, Transform::default(), Visibility::Hidden));
@@ -1460,16 +1522,18 @@ mod tests {
         let (visible, _) = flash_state(&mut app);
         assert!(!visible);
 
-        // Provisional arrival: drawn on the target's own body.
+        // Provisional arrival: the banner says an adjudication is due, and the
+        // world stays clean. Before #522 this drew the burst, which announced
+        // a hit a tick before the target had adjudicated one.
         *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
             cue: Some(ShotCue::Arrival { target: THEM }),
             ticks_left: SHOT_CUE_TICKS,
         };
         app.update();
-        let (visible, at) = flash_state(&mut app);
-        assert!(visible);
-        assert_eq!(at, Vec3::new(100.0, 0.0, -40.0));
-        // A miss verdict withdraws what the provisional layer put up.
+        let (visible, _) = flash_state(&mut app);
+        assert!(!visible, "a provisional arrival must not burst");
+
+        // A miss verdict draws nothing either.
         *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
             cue: Some(ShotCue::Resolved {
                 target: THEM,
@@ -1479,9 +1543,9 @@ mod tests {
         };
         app.update();
         let (visible, _) = flash_state(&mut app);
-        assert!(!visible, "a miss must retract the flash");
+        assert!(!visible, "a miss must draw no burst");
 
-        // A hit keeps it up.
+        // A confirmed hit bursts, on the target's own body.
         *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
             cue: Some(ShotCue::Resolved {
                 target: THEM,
@@ -1490,8 +1554,21 @@ mod tests {
             ticks_left: SHOT_CUE_TICKS,
         };
         app.update();
+        let (visible, at) = flash_state(&mut app);
+        assert!(visible, "a confirmed hit must burst");
+        assert_eq!(at, Vec3::new(100.0, 0.0, -40.0));
+
+        // And it is spent well before the banner is.
+        *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
+            cue: Some(ShotCue::Resolved {
+                target: THEM,
+                result: ShotResult::Hit,
+            }),
+            ticks_left: SHOT_CUE_TICKS - crate::combat::IMPACT_BURST_TICKS,
+        };
+        app.update();
         let (visible, _) = flash_state(&mut app);
-        assert!(visible);
+        assert!(!visible, "the burst expires after IMPACT_BURST_TICKS");
     }
 
     #[test]
@@ -1758,7 +1835,7 @@ mod band_line {
     fn no_target_means_no_band() {
         let mut idle = locked_on(0);
         idle.target = None;
-        assert_eq!(hit_band_line(&idle), "—");
+        assert_eq!(hit_band_line(&idle), "-");
         assert_eq!(idle.hit_forecast(), None);
     }
 
@@ -1775,11 +1852,11 @@ mod band_line {
             .add_systems(Update, refresh_combat_hud);
         let line = app
             .world_mut()
-            .spawn((Readout::HitBandLine, Text::new("—"), TextColor(MUTED)))
+            .spawn((Readout::HitBandLine, Text::new("-"), TextColor(MUTED)))
             .id();
         app.update();
         let text = app.world().get::<Text>(line).expect("the line exists");
         assert_eq!(**text, hit_band_line(&locked_on(60_000)));
-        assert!(**text != *"—", "the band line was never written");
+        assert!(**text != *"-", "the band line was never written");
     }
 }

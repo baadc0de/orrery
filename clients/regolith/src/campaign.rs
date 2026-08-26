@@ -131,6 +131,12 @@ pub struct CampaignConfig {
     /// Persistent client identity presented at admission, used for the QUIC
     /// handshake and the finished measurement signature.
     pub transport_secret: iroh_base::SecretKey,
+    /// Where to fetch this campaign's nickname roster, when one is reachable.
+    ///
+    /// `None` for a session that never spoke to an admission service — the
+    /// join-from-file path — and every ship then stays unlabelled. A label is
+    /// only ever a label (#484), so its absence costs nothing but the label.
+    pub roster_url: Option<String>,
 }
 
 impl CampaignConfig {
@@ -590,8 +596,14 @@ impl CampaignRuntime {
                         .strip_prefix("the host refused the join: ")
                         .unwrap_or(&reason)
                         .to_owned();
+                    bevy::log::warn!("campaign: the host refused the join: {why}");
                     self.state = JoinState::Refused(why);
                 } else {
+                    // Until now this reason existed only inside the F3 pane, so
+                    // a dial that failed in the field left nothing in the log
+                    // and nothing in the telemetry — the operator saw a client
+                    // that silently stayed offline. Say it once, out loud.
+                    bevy::log::error!("campaign: the dial failed: {reason}");
                     self.state = JoinState::Failed(reason);
                 }
                 // Release the guard: nothing will ever hold a connection.
@@ -1138,7 +1150,7 @@ impl CampaignRuntime {
     #[must_use]
     pub fn summary_line(&self) -> String {
         match &self.state {
-            JoinState::Dialing => "campaign: dialing…".to_owned(),
+            JoinState::Dialing => "campaign: dialing...".to_owned(),
             JoinState::Joined => format!(
                 "campaign: joined as slot {} (entity {}), uplink sent {} shed {}, \
                  downlink missing {}",
@@ -1148,8 +1160,8 @@ impl CampaignRuntime {
                 self.uplink_shed,
                 self.downlink.total_missing(),
             ),
-            JoinState::Refused(reason) => format!("campaign: REFUSED — {reason}"),
-            JoinState::Failed(reason) => format!("campaign: FAILED — {reason}"),
+            JoinState::Refused(reason) => format!("campaign: REFUSED - {reason}"),
+            JoinState::Failed(reason) => format!("campaign: FAILED - {reason}"),
             JoinState::Closed { host_said_goodbye } => {
                 format!("campaign: closed (host said goodbye: {host_said_goodbye})")
             }
@@ -1648,6 +1660,7 @@ mod tests {
                 jitter_p99_ms: 100,
             },
             transport_secret: iroh_base::SecretKey::from_bytes(&[0x49; 32]),
+            roster_url: None,
         };
         assert_eq!(config.actor(), Actor::Human);
     }

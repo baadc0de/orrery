@@ -373,6 +373,12 @@ fn poll_worker(
             dirty.0 = true;
         }
         WorkerReply::Joined(Ok(answer)) => {
+            // The campaign id is only knowable from the gate that asked; the
+            // join answer does not echo it, and the roster URL needs it.
+            let campaign_id = match &*gate {
+                JoinGate::Admitting { campaign, .. } => Some(campaign.id.clone()),
+                _ => None,
+            };
             let artifact = write_join_artifact(&settings.telemetry_path, &answer.join);
             match artifact {
                 Ok(path) => info!("campaign join file written to {}", path.display()),
@@ -399,6 +405,10 @@ fn poll_worker(
                     jitter_p99_ms: answer.configured.jitter_p99_ms,
                 },
                 transport_secret: settings.transport_secret.clone(),
+                // The one place a roster URL can come from: the origin this
+                // client actually joined through.
+                roster_url: campaign_id
+                    .map(|id| format!("{}/v1/campaigns/{}/roster", settings.origin, id)),
             };
             *session =
                 ActiveSession::Campaign(Box::new(CampaignRuntime::launch(config, crate::SEED)));
@@ -618,12 +628,12 @@ fn render_gate(panel: &mut ChildSpawnerCommands, gate: &JoinGate) {
     spawn_text(panel, "ORRERY CAMPAIGNS", 28.0, Color::WHITE);
     match gate {
         JoinGate::FetchingCampaigns => {
-            spawn_text(panel, "Finding current campaigns…", 18.0, DIM);
+            spawn_text(panel, "Finding current campaigns...", 18.0, DIM);
         }
         JoinGate::Unreachable { detail } => {
             spawn_text(
                 panel,
-                &format!("Can't reach the campaign service — {detail}"),
+                &format!("Can't reach the campaign service - {detail}"),
                 18.0,
                 Color::srgb(1.0, 0.55, 0.42),
             );
@@ -644,7 +654,7 @@ fn render_gate(panel: &mut ChildSpawnerCommands, gate: &JoinGate) {
             if campaigns.is_empty() {
                 spawn_text(
                     panel,
-                    "No campaigns right now — check back later.",
+                    "No campaigns right now - check back later.",
                     19.0,
                     Color::WHITE,
                 );
@@ -671,7 +681,7 @@ fn render_gate(panel: &mut ChildSpawnerCommands, gate: &JoinGate) {
                         spawn_button(
                             list,
                             &format!(
-                                "{}\n{}% loss · {} ms jitter · {state}",
+                                "{}\n{}% loss | {} ms jitter | {state}",
                                 campaign.title, campaign.loss_pct, campaign.jitter_ms
                             ),
                             CampaignChoice(campaign.clone()),
@@ -690,7 +700,7 @@ fn render_gate(panel: &mut ChildSpawnerCommands, gate: &JoinGate) {
             consented,
         } => {
             spawn_text(panel, &campaign.title, 21.0, Color::WHITE);
-            spawn_text(panel, "Nickname (1–32 characters)", 14.0, DIM);
+            spawn_text(panel, "Nickname (1-32 characters)", 14.0, DIM);
             panel.spawn((
                 NicknameEditor,
                 EditableText::new(nickname.clone()),
@@ -735,7 +745,7 @@ fn render_gate(panel: &mut ChildSpawnerCommands, gate: &JoinGate) {
             spawn_button(panel, "Back", Back, true);
         }
         JoinGate::Admitting { .. } => {
-            spawn_text(panel, "Starting your session…", 20.0, Color::WHITE);
+            spawn_text(panel, "Starting your session...", 20.0, Color::WHITE);
             spawn_text(
                 panel,
                 "The host can take up to 30 seconds to bind.",
@@ -753,13 +763,13 @@ fn campaign_state_line(campaign: &CampaignListing) -> String {
         .or(campaign.client_rev.as_ref());
     if required_rev.is_some_and(|revision| revision != BUILD_REV) {
         return format!(
-            "needs build {} — download the current build",
+            "needs build {} - download the current build",
             required_rev.expect("checked as some")
         );
     }
     match campaign.state.as_str() {
-        "busy" => format!("busy — try again in ~{} min", campaign.seconds.div_ceil(60)),
-        "paused" => "admissions paused — not your fault; try again later".to_owned(),
+        "busy" => format!("busy - try again in ~{} min", campaign.seconds.div_ceil(60)),
+        "paused" => "admissions paused - not your fault; try again later".to_owned(),
         "closed" => "closed".to_owned(),
         other => other.to_owned(),
     }
@@ -1209,7 +1219,7 @@ mod tests {
         assert_eq!(response.campaigns[0].server_rev.as_deref(), Some(BUILD_REV));
         assert_eq!(
             campaign_state_line(&response.campaigns[0]),
-            "busy — try again in ~40 min"
+            "busy - try again in ~40 min"
         );
     }
 
@@ -1235,7 +1245,7 @@ mod tests {
     #[test]
     fn ruleset_version_mismatch_reason_reaches_the_admission_dialog() {
         let reason = format!(
-            "This campaign needs ruleset v{} — download the current build.",
+            "This campaign needs ruleset v{} - download the current build.",
             REGOLITH_RULESET.version + 1
         );
         let response = format!(r#"{{"error":"ruleset_version_mismatch","detail":"{reason}"}}"#);

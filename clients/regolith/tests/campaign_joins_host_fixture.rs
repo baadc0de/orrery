@@ -171,6 +171,7 @@ impl HostFixture {
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
             configured: configured(),
             transport_secret: net::slot_secret(CLIENT_SLOT),
+            roster_url: None,
         }
     }
 
@@ -952,7 +953,7 @@ fn a_delivered_campaign_lock_break_reaches_both_skin_consumers() {
     );
     assert_eq!(
         broken.banner(),
-        "LOCK BROKEN · TARGET DESTROYED",
+        "LOCK BROKEN - TARGET DESTROYED",
         "the delivered reason must reach the visible break indicator"
     );
     assert!(

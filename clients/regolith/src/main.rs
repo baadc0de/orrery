@@ -123,10 +123,23 @@ fn main() {
             wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
             configured,
             transport_secret: transport_secret.clone(),
+            // A join file names a host, not a campaign, so this path cannot
+            // work out on its own which roster to ask for. `--roster-campaign`
+            // supplies the id when the operator knows it; without it every
+            // ship stays unlabelled, which is the correct answer rather than a
+            // degraded one. See `roster::ShipRoster`.
+            roster_url: flag_value(&args, "--roster-campaign")
+                .map(|id| format!("{admission_url}/v1/campaigns/{id}/roster")),
         });
     }
     app.add_plugins(skin);
 
+    if has_flag(&args, "--overlay-open") {
+        app.insert_resource(orrery_regolith_client::OverlayOpen);
+    }
+    if has_flag(&args, "--capture-zoom-sweep") {
+        app.init_resource::<orrery_regolith_client::ZoomSweep>();
+    }
     if has_flag(&args, "--capture-geometry") {
         app.insert_resource(orrery_regolith_client::GeometryCapture::auto_drive());
     }

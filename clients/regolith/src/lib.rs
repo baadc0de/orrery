@@ -13,7 +13,9 @@ pub mod identity;
 pub mod intent;
 pub mod join;
 pub mod net;
+pub mod roster;
 pub mod session;
+pub mod starfield;
 pub mod telemetry;
 
 /// Commit revision embedded in this client binary at build time.
@@ -37,7 +39,7 @@ use orrery_core::{Executor, TICK_NANOS};
 use orrery_games::{
     regolith::archetype::Archetype,
     regolith::order::{Order, Outcome},
-    regolith::state::RegolithState,
+    regolith::state::{RegolithState, RockTier},
     Game, Regolith,
 };
 use orrery_protocol::{CellId, PersistId, Tick, UniverseSeed};
@@ -91,6 +93,14 @@ struct OverlayState {
     expanded: bool,
 }
 
+/// Starts the session with the F3 diagnostics pane already open.
+///
+/// The pane carries the rock census (#524) and the roster line (#523), which
+/// are exactly the two numbers a live capture needs to read. Ordinary clients
+/// never insert the resource and press F3 like everyone else.
+#[derive(Debug, Resource)]
+pub struct OverlayOpen;
+
 #[derive(Debug, Default, Resource)]
 struct MetricWindow {
     intents: u64,
@@ -111,6 +121,62 @@ impl GeometryCapture {
     pub const fn auto_drive() -> Self {
         Self { auto_drive: true }
     }
+}
+
+/// Sweeps the camera zoom between its limits, for capturing evidence.
+///
+/// **An evidence affordance, and deliberately a thin one.** It does not set
+/// [`CameraZoom`] — it writes the same `MouseWheel` message winit writes, so
+/// the stage under observation is `zoom_camera` itself rather than a second
+/// code path that only exists for captures. The existing
+/// [`GeometryCapture::auto_drive`] is the same idea for shots.
+///
+/// Ordinary clients never insert the resource.
+#[derive(Debug, Resource)]
+pub struct ZoomSweep {
+    /// Ticks between notches. One notch every `period` frames.
+    period: u32,
+    frame: u32,
+    notches_left: i32,
+    direction: f32,
+}
+
+impl Default for ZoomSweep {
+    fn default() -> Self {
+        Self {
+            period: 6,
+            frame: 0,
+            // Enough notches to walk the documented range end to end.
+            notches_left: 24,
+            direction: -1.0,
+        }
+    }
+}
+
+/// Feeds one wheel notch at a time into the real input queue, reversing at the
+/// ends so a capture can catch both extremes.
+fn drive_zoom_sweep(
+    mut sweep: ResMut<ZoomSweep>,
+    zoom: Res<CameraZoom>,
+    mut wheel: MessageWriter<bevy::input::mouse::MouseWheel>,
+) {
+    sweep.frame = sweep.frame.saturating_add(1);
+    if !sweep.frame.is_multiple_of(sweep.period) {
+        return;
+    }
+    if sweep.notches_left <= 0 {
+        sweep.notches_left = 24;
+        sweep.direction = -sweep.direction;
+    }
+    sweep.notches_left -= 1;
+    let _ = zoom;
+    wheel.write(bevy::input::mouse::MouseWheel {
+        unit: bevy::input::mouse::MouseScrollUnit::Line,
+        x: 0.0,
+        y: sweep.direction,
+        window: Entity::PLACEHOLDER,
+        phase: bevy::input::touch::TouchPhase::Moved,
+    });
 }
 
 /// A playable local authority using only the shared headless executor.
@@ -230,12 +296,12 @@ impl SessionPresentation {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Local => "LOCAL SANDBOX — NOT CONNECTED TO CAMPAIGN",
-            Self::Dialing => "LOCAL SANDBOX — CONNECTING TO CAMPAIGN…",
+            Self::Local => "LOCAL SANDBOX - NOT CONNECTED TO CAMPAIGN",
+            Self::Dialing => "LOCAL SANDBOX - CONNECTING TO CAMPAIGN...",
             Self::Live => "CAMPAIGN LIVE",
-            Self::Failed => "LOCAL SANDBOX — CAMPAIGN DIAL FAILED",
-            Self::Refused => "LOCAL SANDBOX — CAMPAIGN JOIN REFUSED",
-            Self::Disconnected => "LOCAL SANDBOX — CAMPAIGN DISCONNECTED",
+            Self::Failed => "LOCAL SANDBOX - CAMPAIGN DIAL FAILED",
+            Self::Refused => "LOCAL SANDBOX - CAMPAIGN JOIN REFUSED",
+            Self::Disconnected => "LOCAL SANDBOX - CAMPAIGN DISCONNECTED",
         }
     }
 }
@@ -294,12 +360,15 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<VisualAssetPaths>()
             .init_resource::<OverlayState>()
             .init_resource::<MetricWindow>()
+            .init_resource::<CameraZoom>()
+            .init_resource::<roster::ShipRoster>()
+            .init_resource::<roster::RosterTask>()
             .init_resource::<SelectedLock>()
             .init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
             .init_resource::<ShotFeedback>()
-            .add_systems(Startup, setup_scene)
+            .add_systems(Startup, (setup_scene, open_overlay_if_asked))
             .add_systems(FixedUpdate, drive_core)
             .add_systems(
                 Update,
@@ -313,7 +382,10 @@ impl Plugin for RegolithSkinPlugin {
                     ensure_rock_bodies.after(sync_rendered_state),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
-                    frame_camera.after(sync_rendered_state),
+                    follow_camera.after(sync_rendered_state),
+                    starfield::sync_starfield.after(follow_camera),
+                    sync_ship_labels.after(follow_camera),
+                    zoom_camera.before(follow_camera),
                     refresh_session_banner,
                     refresh_strip,
                     refresh_f3_pane,
@@ -341,6 +413,16 @@ impl Plugin for RegolithSkinPlugin {
             .add_systems(
                 Update,
                 stream_metrics.run_if(on_timer(Duration::from_secs(1))),
+            )
+            .add_systems(
+                Update,
+                roster::refresh_roster.run_if(on_timer(roster::ROSTER_REFRESH)),
+            )
+            .add_systems(
+                Update,
+                drive_zoom_sweep
+                    .before(zoom_camera)
+                    .run_if(resource_exists::<ZoomSweep>),
             );
     }
 }
@@ -355,8 +437,9 @@ fn setup_scene(
 ) {
     commands.spawn((
         Camera3d::default(),
+        Projection::from(chase_camera_projection()),
         ChaseCamera,
-        Transform::from_xyz(0.0, 500.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
+        chase_camera_transform(Vec3::ZERO, CAMERA_DEFAULT_HEIGHT_M),
     ));
     commands.spawn((
         DirectionalLight::default(),
@@ -385,6 +468,7 @@ fn setup_scene(
     }
     hud::spawn_hud(&mut commands);
     hud::spawn_world_overlay(&mut commands, &mut meshes, &mut materials);
+    starfield::spawn_starfield(&mut commands, &mut meshes, &mut materials);
     let presentation = SessionPresentation::from_join_state(session.join_state());
     commands.spawn((
         Node {
@@ -903,6 +987,65 @@ fn nearest_clicked(
         .map(|(entity, _)| entity)
 }
 
+/// The finish one rock tier wears: base tint and how faceted its shell is.
+///
+/// **Presentation only.** Size comes from the ruleset's own
+/// `RockTier::limits().radius_mm`, which is the same number collision and
+/// tracking read, so the drawn body is the ruleset's rock rather than a
+/// decorative stand-in. Everything else here is a look, and drawing a rock
+/// claims nothing whatsoever about mining, ownership or hull (#519) — a rock
+/// the player can see is a rock the player may or may not be allowed to touch,
+/// and only the ruleset says which.
+///
+/// ## Why the ramp runs the way it does
+///
+/// The tiers are 40 m, 20 m and 8 m in radius, so size alone separates them —
+/// but a small rock is also the one that is hardest to notice, and the camera
+/// now reaches 4 km (#521). So lightness runs *against* size: the small tier
+/// is the brightest and the large tier the darkest, which keeps every tier
+/// legible instead of making the already-faint one fainter. Facet count runs
+/// *with* size, because a 40 m body has the screen area to show facets and an
+/// 8 m one reads better as a single chunk.
+///
+/// The tints stay on a warm neutral ramp rather than taking
+/// [`hud::MINING_AMBER`]: that amber is the mining *lock* colour, and a rock
+/// wearing it unlocked would say the player has a mining lock they do not
+/// have.
+const fn rock_finish(tier: RockTier) -> (Color, u32) {
+    match tier {
+        RockTier::Large => (Color::srgb(0.40, 0.37, 0.34), 2),
+        RockTier::Medium => (Color::srgb(0.55, 0.51, 0.46), 1),
+        RockTier::Small => (Color::srgb(0.72, 0.67, 0.60), 0),
+    }
+}
+
+/// A rock's resting attitude, derived from its own id.
+///
+/// Every rock body is an icosphere, so without this they all face the same way
+/// and a field of them reads as a shop display. The id is the only stable
+/// per-rock number the skin has, and turning it into a rotation is pure
+/// presentation: nothing downstream reads a rock's drawn rotation, and
+/// `sync_rendered_state` deliberately leaves non-craft rotations alone.
+fn rock_attitude(entity: PersistId) -> Quat {
+    let bits = entity.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let angle = |shift: u32| {
+        let slice = ((bits >> shift) & 0xFFFF) as f32 / 65_536.0;
+        slice * std::f32::consts::TAU
+    };
+    Quat::from_euler(EulerRot::XYZ, angle(0), angle(16), angle(32))
+}
+
+/// Spawns and retires the rendered body for every rock the session knows.
+///
+/// #524: rocks were fully simulated — lockable, mineable, collidable, named in
+/// the HUD as `LARGE ROCK` and friends — and nothing put one on screen, so the
+/// HUD talked about objects the player could not see.
+///
+/// Rocks are replicated remote state and follow the same replica lifecycle as
+/// craft. This system owns no lifetime of its own: a body exists exactly while
+/// `executor().state(entity)` still yields a live `Rock`, so the staleness
+/// expiry (#505) removing a replica removes the body on the same frame, and a
+/// rock that leaves the interest set stops being drawn rather than freezing.
 fn ensure_rock_bodies(
     session: Res<ActiveSession>,
     existing: Query<(Entity, &CoreEntity), With<RockBody>>,
@@ -929,19 +1072,41 @@ fn ensure_rock_bodies(
             continue;
         }
         let radius_m = rock.tier.limits().radius_mm as f32 / 1_000.0;
+        let (tint, facets) = rock_finish(rock.tier);
+        // `ico` only fails on a subdivision count far past anything here; the
+        // uv sphere is a shape fallback, never a silent absence of a body.
+        let mesh = Sphere::new(radius_m)
+            .mesh()
+            .ico(facets)
+            .unwrap_or_else(|_| Sphere::new(radius_m).mesh().uv(12, 8));
         commands.spawn((
             CoreEntity(entity),
             RockBody,
-            Mesh3d(meshes.add(Sphere::new(radius_m))),
+            Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: hud::MINING_AMBER.with_alpha(0.72),
-                metallic: 0.18,
-                perceptual_roughness: 0.92,
+                base_color: tint,
+                metallic: 0.05,
+                perceptual_roughness: 0.95,
                 ..Default::default()
             })),
-            Transform::default(),
+            Transform::from_rotation(rock_attitude(entity)),
         ));
     }
+}
+
+/// `rocks 3 L / 5 M / 2 S in state | 10 drawn`, for the F3 pane.
+///
+/// This exists because #524's failure mode was invisible to the test suite:
+/// rocks were fully simulated and simply never drawn, and no assertion about
+/// state could tell the difference. `drawn` is counted from the `RockBody`
+/// entities themselves, so the two halves of the line come from different
+/// places and disagreeing is the signal.
+#[must_use]
+fn rock_census(counts: [usize; 3], drawn: usize) -> String {
+    format!(
+        "rocks {} L / {} M / {} S in state | {} drawn",
+        counts[0], counts[1], counts[2], drawn
+    )
 }
 
 /// Spawns the remote duel body the moment a joined session learns which
@@ -1063,47 +1228,338 @@ fn recompose_craft_bodies(
     }
 }
 
-/// Marks the one camera the framing system drives.
+/// Marks the one camera the follow system drives.
+///
+/// Public only so `starfield` can name it in a query filter; nothing outside
+/// the skin has any reason to spawn one.
 #[derive(Component)]
-struct ChaseCamera;
+pub struct ChaseCamera;
 
-/// Keeps every rendered body on screen.
+/// The vertical field of view the chase camera is built with, in radians.
 ///
-/// The camera was fixed above the origin, so anything that drifted left the
-/// frame and never came back — a craft that thrusts away is simply gone, with
-/// no way to tell where. This frames the bodies that exist: centre on their
-/// midpoint, and raise the camera until the furthest one fits, with a floor so
-/// a duel at close quarters does not slam the view into the deck.
+/// Spelled out rather than left to Bevy's default so the arithmetic in
+/// [`CameraZoom`]'s documentation is a property of this file rather than of
+/// whatever `PerspectiveProjection::default()` happens to be this release.
+pub const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
+
+/// The chase camera's far clip plane, in metres.
 ///
-/// Framing only. It reads rendered `Transform`s, which are already a pure
+/// **This is not a tuning knob, it is a bug fix.** Bevy's default perspective
+/// projection clips at 1000 m. The camera looks straight down from
+/// `CameraZoom`'s height, so at any height past 1000 m the *deck plane itself*
+/// is behind the far plane and the entire world stops being drawn — and the
+/// old autozoom reached that height whenever the bodies it framed were more
+/// than ~385 m apart, which is well inside one weapon envelope. Anything
+/// beyond the plane simply vanished, with no error and nothing a test that
+/// asserts on state could see.
+///
+/// The value has to clear [`CAMERA_MAX_HEIGHT_M`] plus the depth of the
+/// deepest starfield layer plus that layer's own extent, and there is no cost
+/// to headroom here: this is a reversed-Z depth buffer, whose precision is
+/// governed by `near`, not by `far`.
+pub const CAMERA_FAR_M: f32 = 120_000.0;
+
+/// The chase camera's near clip plane, in metres. Well inside the closest the
+/// camera is allowed to fly, and the number that actually governs depth
+/// precision.
+pub const CAMERA_NEAR_M: f32 = 1.0;
+
+/// The projection the chase camera is built with.
+#[must_use]
+pub fn chase_camera_projection() -> PerspectiveProjection {
+    PerspectiveProjection {
+        fov: CAMERA_FOV_Y,
+        near: CAMERA_NEAR_M,
+        far: CAMERA_FAR_M,
+        ..Default::default()
+    }
+}
+
+/// Half the world height a top-down camera at `height_m` can see, in metres.
+///
+/// `tan(fov/2) * height` — the camera looks straight down, so the deck plane
+/// sits exactly `height_m` away along the view axis.
+#[must_use]
+pub fn visible_half_height_m(height_m: f32) -> f32 {
+    (CAMERA_FOV_Y / 2.0).tan() * height_m
+}
+
+/// How high the chase camera flies, in metres above the deck plane.
+///
+/// **Presentation only.** Nothing downstream of this resource reaches the
+/// intent pipeline, the executor or any range/arc arithmetic: the ruleset's
+/// numbers are in millimetres of lattice and are computed from replicated
+/// state, never from a transform. Zooming changes what the player can see and
+/// nothing about what the player can do (#519).
+///
+/// ## Why these limits
+///
+/// The reference length is the weapon envelope the rings draw: optimal is
+/// 300 m with falloff past it, and a chassis hull is ~7 m (`craft::hull_length`
+/// times [`craft::CRAFT_DISPLAY_SCALE`], so ~22 m on screen). With a
+/// [`CAMERA_FOV_Y`] of 45 degrees the visible half-height is `0.414 * height`:
+///
+/// * [`CAMERA_MIN_HEIGHT_M`] = 150 m shows +/- 62 m — a 22 m hull is about a
+///   sixth of the screen height, close enough to read facing and the arc
+///   marking, and the closest useful framing before the ship fills the view.
+/// * [`CAMERA_DEFAULT_HEIGHT_M`] = 900 m shows +/- 373 m, so the 300 m optimal
+///   ring fits with margin. This is the framing the weapon is fought at.
+/// * [`CAMERA_MAX_HEIGHT_M`] = 4000 m shows +/- 1657 m, enough to hold the
+///   ~2.5 km campaign crowd orbit in view. Past that a 22 m hull is under two
+///   pixels on a 1080-line window and the view stops being usable.
+///
+/// [`CAMERA_ZOOM_STEP`] is multiplicative rather than additive because a fixed
+/// metre step is a huge jump at the near end and imperceptible at the far end.
+/// At 1.15 per wheel notch the whole 150..4000 range is 24 notches, which is a
+/// comfortable flick of a wheel rather than a grind.
+#[derive(Debug, Clone, Copy, Resource, PartialEq)]
+pub struct CameraZoom {
+    height_m: f32,
+}
+
+/// The closest the chase camera is allowed to fly. See [`CameraZoom`].
+pub const CAMERA_MIN_HEIGHT_M: f32 = 150.0;
+/// The furthest the chase camera is allowed to fly. See [`CameraZoom`].
+pub const CAMERA_MAX_HEIGHT_M: f32 = 4_000.0;
+/// Where the chase camera starts. See [`CameraZoom`].
+pub const CAMERA_DEFAULT_HEIGHT_M: f32 = 900.0;
+/// Multiplicative zoom per wheel notch. See [`CameraZoom`].
+pub const CAMERA_ZOOM_STEP: f32 = 1.15;
+/// Pixels of a pixel-unit scroll event that count as one notch.
+///
+/// Trackpads and some mice report `MouseScrollUnit::Pixel`; 50 px per notch is
+/// the conventional line height those devices are calibrated against.
+pub const CAMERA_ZOOM_PIXELS_PER_NOTCH: f32 = 50.0;
+
+impl Default for CameraZoom {
+    fn default() -> Self {
+        Self {
+            height_m: CAMERA_DEFAULT_HEIGHT_M,
+        }
+    }
+}
+
+impl CameraZoom {
+    /// The current camera height above the deck, in metres.
+    #[must_use]
+    pub fn height_m(self) -> f32 {
+        self.height_m
+    }
+
+    /// The zoom after `notches` of wheel travel, clamped to the limits.
+    ///
+    /// Positive notches (wheel away from the player) zoom **in**, which is the
+    /// convention every map and every other game uses.
+    #[must_use]
+    pub fn zoomed(self, notches: f32) -> Self {
+        if !notches.is_finite() || notches == 0.0 {
+            return self;
+        }
+        let height = self.height_m * CAMERA_ZOOM_STEP.powf(-notches);
+        Self {
+            height_m: height.clamp(CAMERA_MIN_HEIGHT_M, CAMERA_MAX_HEIGHT_M),
+        }
+    }
+
+    /// How much a screen-anchored HUD glyph must be scaled to keep its
+    /// apparent size at this zoom.
+    ///
+    /// World measurements — the range rings, the arc marking, the tracers —
+    /// must **not** use this: they mean metres and have to shrink with
+    /// everything else or they would lie about distance. The lock reticle is
+    /// the one overlay that is a glyph rather than a measurement, so it is the
+    /// one thing that holds its apparent size.
+    #[must_use]
+    pub fn glyph_scale(self) -> f32 {
+        self.height_m / CAMERA_DEFAULT_HEIGHT_M
+    }
+}
+
+/// Turns wheel events into zoom. Presentation only; see [`CameraZoom`].
+fn zoom_camera(
+    mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    mut zoom: ResMut<CameraZoom>,
+) {
+    use bevy::input::mouse::MouseScrollUnit;
+    let mut notches = 0.0f32;
+    for event in wheel.read() {
+        notches += match event.unit {
+            MouseScrollUnit::Line => event.y,
+            MouseScrollUnit::Pixel => event.y / CAMERA_ZOOM_PIXELS_PER_NOTCH,
+        };
+    }
+    let next = zoom.zoomed(notches);
+    if next != *zoom {
+        *zoom = next;
+    }
+}
+
+/// Where the chase camera sits and what it looks at, for a given centre.
+///
+/// A free function so the framing rule can be asserted without standing up a
+/// window: the camera hangs straight above `centre` at `height_m` and looks
+/// down, with `-Z` up the screen so world `+X` runs right.
+#[must_use]
+pub fn chase_camera_transform(centre: Vec3, height_m: f32) -> Transform {
+    let eye = Vec3::new(centre.x, centre.y + height_m, centre.z);
+    Transform::from_translation(eye).looking_at(centre, Vec3::NEG_Z)
+}
+
+/// Keeps the player's own craft in the centre of the screen, at the height the
+/// player chose.
+///
+/// The previous behaviour framed *every* body — centre on their midpoint and
+/// rise until the furthest one fit. In live play that meant the world scale
+/// changed while the player was manoeuvring: the ship appeared to drift as the
+/// midpoint moved, and distances stopped being readable as a contact entered
+/// or left the set. #521 replaced it with a fixed centre and a player-owned
+/// zoom, because a predictable view is worth more than optimal framing when
+/// you are holding an arc on a target.
+///
+/// Following only. It reads rendered `Transform`s, which are already a pure
 /// function of core state, and writes nothing back — constraint 3 forbids the
 /// skin deciding anything the ruleset should.
-fn frame_camera(
-    bodies: Query<&Transform, (With<CoreEntity>, Without<ChaseCamera>)>,
+fn follow_camera(
+    session: Res<ActiveSession>,
+    zoom: Res<CameraZoom>,
+    bodies: Query<(&CoreEntity, &Transform), Without<ChaseCamera>>,
     mut camera: Query<&mut Transform, With<ChaseCamera>>,
 ) {
     let Ok(mut view) = camera.single_mut() else {
         return;
     };
-    let mut count = 0.0f32;
-    let mut centre = Vec3::ZERO;
-    for body in &bodies {
-        centre += body.translation;
-        count += 1.0;
-    }
-    if count == 0.0 {
+    let own = session.local_entity();
+    // Before the player's own body exists — the first frames of a campaign
+    // join, where nothing has replicated yet — hold the last centre rather
+    // than snapping to the origin, which would read as the ship teleporting.
+    let centre = bodies
+        .iter()
+        .find_map(|(core, transform)| (core.0 == own).then_some(transform.translation))
+        .unwrap_or(Vec3::new(view.translation.x, 0.0, view.translation.z));
+    *view = chase_camera_transform(centre, zoom.height_m());
+}
+
+/// A screen-space nickname tag following one craft.
+#[derive(Component, Debug, Clone, Copy)]
+struct ShipLabel(PersistId);
+
+/// Font size of a ship's nickname tag, in pixels.
+const SHIP_LABEL_SIZE_PX: f32 = 12.0;
+/// How far under a craft's centre the tag sits, in pixels.
+const SHIP_LABEL_DROP_PX: f32 = 22.0;
+/// Rough advance width of one character at [`SHIP_LABEL_SIZE_PX`], used only
+/// to centre the tag under the ship. Bevy's layout knows the true width, but
+/// only after the frame this system runs in; being a few pixels off-centre is
+/// a better trade than a tag that lags the ship by a frame.
+const SHIP_LABEL_CHAR_PX: f32 = 0.5 * SHIP_LABEL_SIZE_PX;
+
+/// Which craft get a tag this frame, and where on screen it goes.
+///
+/// Split out from [`sync_ship_labels`] so the decision can be asserted without
+/// a render device: a craft is tagged **only** when the roster knows it and it
+/// projects onto the screen. A craft the roster has never heard of contributes
+/// nothing — not an empty string, not a placeholder — because a made-up name
+/// is worse than no name (#484, #523).
+fn ship_label_placements(
+    roster: &roster::ShipRoster,
+    projected: impl Iterator<Item = (PersistId, Option<Vec2>)>,
+) -> BTreeMap<PersistId, (String, Vec2)> {
+    projected
+        .filter_map(|(entity, screen)| {
+            let label = roster.label(entity)?;
+            Some((entity, (label.to_owned(), screen?)))
+        })
+        .collect()
+}
+
+/// Draws each craft's nickname under it, in screen space.
+///
+/// Screen space rather than world space on purpose: a label is a HUD element,
+/// so it has to stay the same readable size across #521's whole zoom range,
+/// where a world-space text mesh would be unreadable at either end.
+///
+/// **A label is only a label** (#484, and see [`roster::ShipRoster`]). This
+/// system reads a `PersistId` and asks for a string; nothing anywhere asks the
+/// other way round, and a craft the roster does not know is drawn with **no
+/// tag at all** rather than a placeholder that could be mistaken for a name.
+fn sync_ship_labels(
+    roster: Res<roster::ShipRoster>,
+    session: Res<ActiveSession>,
+    camera: Query<(&Camera, &GlobalTransform), With<ChaseCamera>>,
+    bodies: Query<(&CoreEntity, &GlobalTransform), With<CraftBodyComposition>>,
+    mut labels: Query<(
+        Entity,
+        &ShipLabel,
+        &mut Node,
+        &mut Visibility,
+        &mut Text,
+        &mut TextColor,
+    )>,
+    mut commands: Commands,
+) {
+    let Ok((camera, camera_transform)) = camera.single() else {
         return;
+    };
+    let own = session.local_entity();
+    let wanted = ship_label_placements(
+        &roster,
+        bodies.iter().map(|(core, transform)| {
+            (
+                core.0,
+                camera
+                    .world_to_viewport(camera_transform, transform.translation())
+                    .ok(),
+            )
+        }),
+    );
+
+    let mut placed = BTreeSet::new();
+    for (entity, tag, mut node, mut visibility, mut text, mut colour) in &mut labels {
+        match wanted.get(&tag.0) {
+            Some((label, screen)) => {
+                placed.insert(tag.0);
+                if **text != *label {
+                    **text = label.clone();
+                }
+                let half = label.chars().count() as f32 * SHIP_LABEL_CHAR_PX / 2.0;
+                node.left = Val::Px(screen.x - half);
+                node.top = Val::Px(screen.y + SHIP_LABEL_DROP_PX);
+                // "This one is mine" is the accent's job everywhere else in
+                // the skin, so the player's own tag wears it and everyone
+                // else stays on the neutral ramp.
+                *colour = TextColor(if tag.0 == own {
+                    hud::ACCENT_PALE
+                } else {
+                    hud::MUTED
+                });
+                *visibility = Visibility::Inherited;
+            }
+            None => commands.entity(entity).despawn(),
+        }
     }
-    centre /= count;
-    let mut spread: f32 = 0.0;
-    for body in &bodies {
-        spread = spread.max(body.translation.distance(centre));
+    for (entity, (label, screen)) in wanted {
+        if placed.contains(&entity) {
+            continue;
+        }
+        let half = label.chars().count() as f32 * SHIP_LABEL_CHAR_PX / 2.0;
+        commands.spawn((
+            ShipLabel(entity),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(screen.x - half),
+                top: Val::Px(screen.y + SHIP_LABEL_DROP_PX),
+                ..Default::default()
+            },
+            GlobalZIndex(60),
+            Text::new(label),
+            TextFont::from_font_size(SHIP_LABEL_SIZE_PX),
+            TextColor(if entity == own {
+                hud::ACCENT_PALE
+            } else {
+                hud::MUTED
+            }),
+        ));
     }
-    // 2.6 is empirical headroom: enough that a body at the spread radius sits
-    // inside the frame rather than on its edge.
-    let height = (spread * 2.6).max(500.0);
-    view.translation = Vec3::new(centre.x, height, centre.z);
-    *view = view.looking_at(centre, Vec3::NEG_Z);
 }
 
 fn sync_rendered_state(
@@ -1162,6 +1618,12 @@ pub fn heading_rotation(yaw_urad: i32) -> Quat {
     Quat::from_rotation_y(-(yaw_urad as f32 / 1_000_000.0))
 }
 
+fn open_overlay_if_asked(asked: Option<Res<OverlayOpen>>, mut state: ResMut<OverlayState>) {
+    if asked.is_some() {
+        state.expanded = true;
+    }
+}
+
 fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<OverlayState>) {
     if keys.just_pressed(KeyCode::F3) {
         state.expanded = !state.expanded;
@@ -1199,6 +1661,7 @@ fn refresh_strip(metrics: Res<OverlayMetrics>, mut strip: Query<&mut Text, With<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_f3_pane(
     state: Res<OverlayState>,
     metrics: Res<OverlayMetrics>,
@@ -1206,6 +1669,8 @@ fn refresh_f3_pane(
     broken: Res<LockBreak>,
     tracks: Res<ProjectileTracks>,
     session: Res<ActiveSession>,
+    rock_bodies: Query<(), With<RockBody>>,
+    roster: Res<roster::ShipRoster>,
     mut pane: Query<(&mut Text, &mut Node), With<F3Pane>>,
 ) {
     if let Ok((mut text, mut node)) = pane.single_mut() {
@@ -1225,6 +1690,22 @@ fn refresh_f3_pane(
         );
         text.push('\n');
         text.push_str(&hud::lock_debug_lines(&view, &broken));
+        let mut counts = [0usize; 3];
+        for entity in session.executor().entities().copied() {
+            if let Some(RegolithState::Rock(rock)) = session.executor().state(entity) {
+                if rock.hull > 0 {
+                    counts[match rock.tier {
+                        RockTier::Large => 0,
+                        RockTier::Medium => 1,
+                        RockTier::Small => 2,
+                    }] += 1;
+                }
+            }
+        }
+        text.push('\n');
+        text.push_str(&rock_census(counts, rock_bodies.iter().count()));
+        text.push('\n');
+        text.push_str(&roster.summary_line());
         text.push_str(&format!(
             "\nshots in flight {} | {}",
             tracks.tracks().len(),
@@ -1243,7 +1724,7 @@ fn refresh_f3_pane(
                 accumulator.progress().afk_capped,
             ));
         } else {
-            text.push_str("\noffline local session — not a campaign path, banks nothing");
+            text.push_str("\noffline local session - not a campaign path, banks nothing");
         }
     }
 }
@@ -1353,6 +1834,277 @@ mod tests {
     use orrery_core::state_hash;
     use orrery_games::scenario::{Entry, Play, Scenario, TickRecord};
 
+    /// #521: the camera is centred on the player, and nothing else in the
+    /// world may move it. The old `frame_camera` averaged every body and rose
+    /// until the furthest fit, so a distant contact rescaled the world under a
+    /// manoeuvring player. The second body here is the one that used to do it.
+    #[test]
+    fn the_camera_centres_on_the_players_own_craft_and_ignores_every_other_body() {
+        let mut app = App::new();
+        app.insert_resource(ActiveSession::Local(Box::<LocalSession>::default()));
+        app.init_resource::<CameraZoom>();
+        let own = app.world().resource::<ActiveSession>().local_entity();
+        let elsewhere = PersistId::new(own.0 + 7);
+
+        app.world_mut()
+            .spawn((CoreEntity(own), Transform::from_xyz(400.0, 0.0, -250.0)));
+        app.world_mut().spawn((
+            CoreEntity(elsewhere),
+            Transform::from_xyz(9_000.0, 0.0, 9_000.0),
+        ));
+        let camera = app
+            .world_mut()
+            .spawn((ChaseCamera, Transform::default()))
+            .id();
+
+        app.add_systems(Update, follow_camera);
+        app.update();
+
+        let view = *app
+            .world()
+            .entity(camera)
+            .get::<Transform>()
+            .expect("camera");
+        assert!(
+            (view.translation.x - 400.0).abs() < 1e-3 && (view.translation.z + 250.0).abs() < 1e-3,
+            "the camera must sit over the player's own craft, not over {:?}",
+            view.translation
+        );
+        assert!(
+            (view.translation.y - CAMERA_DEFAULT_HEIGHT_M).abs() < 1e-3,
+            "a distant contact must not change the zoom: height was {}",
+            view.translation.y
+        );
+    }
+
+    /// #521: the wheel owns the zoom, and it stops where the documentation
+    /// says it stops.
+    #[test]
+    fn the_wheel_zoom_moves_by_one_step_and_clamps_to_its_documented_limits() {
+        let start = CameraZoom::default();
+        assert!(
+            (start.zoomed(1.0).height_m() - CAMERA_DEFAULT_HEIGHT_M / CAMERA_ZOOM_STEP).abs()
+                < 1e-3,
+            "one notch away from the player must be exactly one step closer in"
+        );
+        assert!(
+            start.zoomed(-1.0).height_m() > start.height_m(),
+            "one notch towards the player must zoom out"
+        );
+
+        let mut deep = start;
+        for _ in 0..200 {
+            deep = deep.zoomed(1.0);
+        }
+        assert!(
+            (deep.height_m() - CAMERA_MIN_HEIGHT_M).abs() < 1e-3,
+            "zooming in without end must stop at the near limit, got {}",
+            deep.height_m()
+        );
+
+        let mut far = start;
+        for _ in 0..200 {
+            far = far.zoomed(-1.0);
+        }
+        assert!(
+            (far.height_m() - CAMERA_MAX_HEIGHT_M).abs() < 1e-3,
+            "zooming out without end must stop at the far limit, got {}",
+            far.height_m()
+        );
+    }
+
+    /// The default framing has to show the envelope the weapon is fought in,
+    /// or the rings the HUD draws are off screen at the framing the player
+    /// spends most of the session at. Optimal is 300 m.
+    #[test]
+    fn the_default_framing_holds_the_weapons_optimal_ring() {
+        assert!(
+            visible_half_height_m(CAMERA_DEFAULT_HEIGHT_M) > 300.0,
+            "the 300 m optimal ring must fit at the default zoom, half-height was {}",
+            visible_half_height_m(CAMERA_DEFAULT_HEIGHT_M)
+        );
+        assert!(
+            visible_half_height_m(CAMERA_MIN_HEIGHT_M) > 30.0,
+            "a 22 m hull must still fit at full zoom-in"
+        );
+    }
+
+    /// #524: rocks were adjudicated, lockable, mineable and collidable, and
+    /// nothing ever put a body on screen. This asserts on the bodies, because
+    /// asserting on state is exactly what could not see the bug.
+    #[test]
+    fn every_live_rock_gets_a_body_sized_and_tinted_by_its_tier() {
+        use orrery_core::{QPos, QVel};
+        use orrery_games::regolith::state::Rock;
+
+        let mut local = LocalSession::default();
+        let tiers = [
+            (PersistId::new(50), RockTier::Large),
+            (PersistId::new(51), RockTier::Medium),
+            (PersistId::new(52), RockTier::Small),
+        ];
+        for (index, (entity, tier)) in tiers.iter().enumerate() {
+            local.executor.insert(
+                *entity,
+                RegolithState::Rock(Rock::spawned(
+                    *tier,
+                    0,
+                    QPos::from_metres(120.0 * index as f64, 0.0, 0.0),
+                    QVel::default(),
+                )),
+            );
+        }
+
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(ActiveSession::Local(Box::new(local)))
+            .add_systems(Update, ensure_rock_bodies);
+        app.update();
+
+        let drawn: Vec<PersistId> = app
+            .world_mut()
+            .query_filtered::<&CoreEntity, With<RockBody>>()
+            .iter(app.world())
+            .map(|core| core.0)
+            .collect();
+        for (entity, _) in tiers {
+            assert!(
+                drawn.contains(&entity),
+                "rock {entity:?} is in state and must have a body; drawn: {drawn:?}"
+            );
+        }
+        assert_eq!(drawn.len(), 3, "one body per live rock, no more");
+
+        // Idempotent: a second frame must not spawn a duplicate shell.
+        app.update();
+        let again = app
+            .world_mut()
+            .query_filtered::<&CoreEntity, With<RockBody>>()
+            .iter(app.world())
+            .count();
+        assert_eq!(again, 3, "rock bodies must not accumulate per frame");
+
+        // A rock that leaves the session's state stops being drawn rather
+        // than freezing — the replica lifecycle, not a lifetime of our own.
+        {
+            let ActiveSession::Local(local) = &mut *app.world_mut().resource_mut::<ActiveSession>()
+            else {
+                unreachable!("the fixture session is local")
+            };
+            local.executor.take_state(PersistId::new(51));
+        }
+        app.update();
+        let survivors: Vec<PersistId> = app
+            .world_mut()
+            .query_filtered::<&CoreEntity, With<RockBody>>()
+            .iter(app.world())
+            .map(|core| core.0)
+            .collect();
+        assert!(
+            !survivors.contains(&PersistId::new(51)) && survivors.len() == 2,
+            "an expired replica must take its body with it; left {survivors:?}"
+        );
+    }
+
+    /// The three tiers must not be confusable at a glance, and the ramp runs
+    /// against size on purpose: the smallest rock is the hardest to see.
+    #[test]
+    fn the_rock_tiers_are_distinguishable_by_more_than_size() {
+        let finishes = [
+            rock_finish(RockTier::Large),
+            rock_finish(RockTier::Medium),
+            rock_finish(RockTier::Small),
+        ];
+        let luma = |colour: Color| {
+            let rgba = colour.to_linear();
+            rgba.red + rgba.green + rgba.blue
+        };
+        assert!(
+            luma(finishes[0].0) < luma(finishes[1].0) && luma(finishes[1].0) < luma(finishes[2].0),
+            "lightness must run against size so the smallest tier stays visible"
+        );
+        assert!(
+            finishes[0].1 > finishes[1].1 && finishes[1].1 > finishes[2].1,
+            "facet count must run with size"
+        );
+        let radii = [
+            RockTier::Large.limits().radius_mm,
+            RockTier::Medium.limits().radius_mm,
+            RockTier::Small.limits().radius_mm,
+        ];
+        assert!(
+            radii[0] > radii[1] && radii[1] > radii[2],
+            "the drawn size is the ruleset's own radius and must separate the tiers"
+        );
+    }
+
+    /// The camera looks straight down, so the deck plane is exactly the
+    /// camera's height away. A far plane inside the zoom range clips the whole
+    /// world away silently, which is what Bevy's 1000 m default did.
+    #[test]
+    fn the_far_plane_clears_the_whole_zoom_range() {
+        let projection = chase_camera_projection();
+        assert!(
+            projection.far > CAMERA_MAX_HEIGHT_M,
+            "the deck must stay inside the frustum at full zoom-out: far {} vs height {}",
+            projection.far,
+            CAMERA_MAX_HEIGHT_M
+        );
+        assert!(
+            projection.near < CAMERA_MIN_HEIGHT_M,
+            "the deck must stay inside the frustum at full zoom-in"
+        );
+    }
+
+    /// #523/#484: a label is a label. A craft the roster knows gets its name
+    /// under it; a craft it does not know gets nothing at all, and nothing
+    /// here may invent a stand-in.
+    #[test]
+    fn only_a_craft_the_roster_knows_gets_a_tag() {
+        use crate::roster::{entity_of_slot, RosterResponse, RosterRow, ShipRoster};
+
+        let mut roster = ShipRoster::default();
+        roster.accept(&RosterResponse {
+            roster: vec![RosterRow {
+                slot: 8,
+                nickname: "ada".to_owned(),
+            }],
+        });
+        let known = entity_of_slot(8);
+        let stranger = entity_of_slot(3);
+
+        let placements = ship_label_placements(
+            &roster,
+            [
+                (known, Some(Vec2::new(400.0, 300.0))),
+                (stranger, Some(Vec2::new(500.0, 300.0))),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            placements.get(&known).map(|(label, _)| label.as_str()),
+            Some("ada")
+        );
+        assert!(
+            !placements.contains_key(&stranger),
+            "a craft with no roster row must be drawn with no tag: {placements:?}"
+        );
+
+        // Off screen is not a tag either: a name floating at the edge of the
+        // window belongs to a ship the player cannot see.
+        let offscreen = ship_label_placements(&roster, [(known, None)].into_iter());
+        assert!(offscreen.is_empty(), "an unprojectable craft gets no tag");
+
+        // And an empty roster is a quiet screen, not a screen of placeholders.
+        let silent = ship_label_placements(
+            &ShipRoster::default(),
+            [(known, Some(Vec2::ZERO)), (stranger, Some(Vec2::ZERO))].into_iter(),
+        );
+        assert!(silent.is_empty(), "no roster means no tags: {silent:?}");
+    }
+
     #[test]
     fn build_revision_tracks_the_checkout_commit() {
         let output = std::process::Command::new("git")
@@ -1373,12 +2125,12 @@ mod tests {
     #[test]
     fn local_fallbacks_cannot_present_or_serialize_as_live_campaigns() {
         let local = SessionPresentation::from_join_state(None);
-        assert_eq!(local.label(), "LOCAL SANDBOX — NOT CONNECTED TO CAMPAIGN");
+        assert_eq!(local.label(), "LOCAL SANDBOX - NOT CONNECTED TO CAMPAIGN");
         assert_eq!(local.session_scope(), SessionScope::Local);
 
         let failed = JoinState::Failed("fixture dial failure".to_owned());
         let failed = SessionPresentation::from_join_state(Some(&failed));
-        assert_eq!(failed.label(), "LOCAL SANDBOX — CAMPAIGN DIAL FAILED");
+        assert_eq!(failed.label(), "LOCAL SANDBOX - CAMPAIGN DIAL FAILED");
         assert_eq!(failed.session_scope(), SessionScope::Local);
 
         let joined = SessionPresentation::from_join_state(Some(&JoinState::Joined));
@@ -1636,7 +2388,7 @@ mod tests {
             &mut shots,
         );
 
-        assert_eq!(broken.banner(), "LOCK BROKEN · RANGE EXCEEDED");
+        assert_eq!(broken.banner(), "LOCK BROKEN - RANGE EXCEEDED");
         assert!(
             shots.cue.is_none(),
             "the same delivered break must cancel a provisional shot"
