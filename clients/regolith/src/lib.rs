@@ -14,6 +14,7 @@ pub mod intent;
 pub mod join;
 pub mod net;
 pub mod session;
+pub mod starfield;
 pub mod telemetry;
 
 /// Commit revision embedded in this client binary at build time.
@@ -315,6 +316,7 @@ impl Plugin for RegolithSkinPlugin {
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     follow_camera.after(sync_rendered_state),
+                    starfield::sync_starfield.after(follow_camera),
                     zoom_camera.before(follow_camera),
                     refresh_session_banner,
                     refresh_strip,
@@ -388,6 +390,7 @@ fn setup_scene(
     }
     hud::spawn_hud(&mut commands);
     hud::spawn_world_overlay(&mut commands, &mut meshes, &mut materials);
+    starfield::spawn_starfield(&mut commands, &mut meshes, &mut materials);
     let presentation = SessionPresentation::from_join_state(session.join_state());
     commands.spawn((
         Node {
@@ -1148,8 +1151,11 @@ fn recompose_craft_bodies(
 }
 
 /// Marks the one camera the follow system drives.
+///
+/// Public only so `starfield` can name it in a query filter; nothing outside
+/// the skin has any reason to spawn one.
 #[derive(Component)]
-struct ChaseCamera;
+pub struct ChaseCamera;
 
 /// The vertical field of view the chase camera is built with, in radians.
 ///
