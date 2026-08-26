@@ -77,6 +77,16 @@ const SEND_EVERY_TICKS: u64 = (orrery_core::TICK_HZ / SEND_HZ) as u64;
 /// that left this client's interest set does not remain as a frozen ghost.
 const REPLICA_TTL_TICKS: u64 = 120;
 
+/// One remote craft's receive-side lifetime and measurement history.
+///
+/// `installed` becomes false on expiry, but the last refresh is deliberately
+/// retained so an eventual re-install can report the whole silent interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplicaFreshness {
+    last_refresh_tick: u64,
+    installed: bool,
+}
+
 /// State claims are authored at the existing headless producer's 2 Hz cadence.
 const CLAIM_EVERY_TICKS: u64 = 30;
 
@@ -368,7 +378,7 @@ pub struct CampaignRuntime {
     delivered_unroutable: u64,
     delivered_foreign: u64,
     pending_delivered: Vec<DeliveredOrder>,
-    replica_seen_at: BTreeMap<PersistId, u64>,
+    replica_freshness: BTreeMap<PersistId, ReplicaFreshness>,
     focus: Option<PersistId>,
     latest_cell: Option<CellId>,
 
@@ -537,7 +547,7 @@ impl CampaignRuntime {
             delivered_unroutable: 0,
             delivered_foreign: 0,
             pending_delivered: Vec::new(),
-            replica_seen_at: BTreeMap::new(),
+            replica_freshness: BTreeMap::new(),
             focus: None,
             latest_cell: None,
             record_written: false,
@@ -922,10 +932,15 @@ impl CampaignRuntime {
                         Some((encoded, _cell, entity, at)) => {
                             match <RegolithState as CoreCodec>::decode(&encoded) {
                                 Ok(state) => {
-                                    self.executor.insert(entity, state);
                                     if entity != self.entity {
-                                        self.replica_seen_at.insert(entity, tick.0);
+                                        let _ = refresh_replica(
+                                            &mut self.replica_freshness,
+                                            entity,
+                                            tick.0,
+                                            at,
+                                        );
                                     }
+                                    self.executor.insert(entity, state);
                                     // The duel view follows the first remote
                                     // craft that arrives, and stays with it.
                                     if entity != self.entity && self.focus.is_none() {
@@ -983,7 +998,7 @@ impl CampaignRuntime {
             &mut self.executor,
             self.entity,
             tick.0,
-            &mut self.replica_seen_at,
+            &mut self.replica_freshness,
             &mut self.focus,
         );
 
@@ -1145,23 +1160,82 @@ fn expire_stale_replicas(
     executor: &mut Executor<Regolith>,
     own: PersistId,
     tick: u64,
-    seen_at: &mut BTreeMap<PersistId, u64>,
+    freshness: &mut BTreeMap<PersistId, ReplicaFreshness>,
     focus: &mut Option<PersistId>,
 ) {
-    let expired: Vec<_> = seen_at
+    let expired: Vec<_> = freshness
         .iter()
-        .filter_map(|(entity, seen)| {
-            (tick.saturating_sub(*seen) > REPLICA_TTL_TICKS).then_some(*entity)
+        .filter_map(|(entity, replica)| {
+            (replica.installed
+                && tick.saturating_sub(replica.last_refresh_tick) > REPLICA_TTL_TICKS)
+                .then_some((*entity, replica.last_refresh_tick))
         })
         .collect();
-    for entity in expired {
-        seen_at.remove(&entity);
+    for (entity, last_refresh_tick) in expired {
+        freshness
+            .get_mut(&entity)
+            .expect("expired replica came from the freshness map")
+            .installed = false;
+        capture_replica_event(
+            "expiry",
+            entity,
+            tick,
+            None,
+            Some(tick.saturating_sub(last_refresh_tick)),
+        );
         if entity != own {
             executor.take_state(entity);
         }
         if *focus == Some(entity) {
             *focus = None;
         }
+    }
+}
+
+fn refresh_replica(
+    freshness: &mut BTreeMap<PersistId, ReplicaFreshness>,
+    entity: PersistId,
+    client_tick: u64,
+    authoritative_tick: u64,
+) -> (&'static str, Option<u64>) {
+    let previous = freshness.insert(
+        entity,
+        ReplicaFreshness {
+            last_refresh_tick: client_tick,
+            installed: true,
+        },
+    );
+    let event = if previous.is_some_and(|replica| replica.installed) {
+        "refresh"
+    } else {
+        "install"
+    };
+    let gap_ticks = previous.map(|replica| client_tick.saturating_sub(replica.last_refresh_tick));
+    capture_replica_event(
+        event,
+        entity,
+        client_tick,
+        Some(authoritative_tick),
+        gap_ticks,
+    );
+    (event, gap_ticks)
+}
+
+fn capture_replica_event(
+    event: &str,
+    entity: PersistId,
+    client_tick: u64,
+    authoritative_tick: Option<u64>,
+    gap_ticks: Option<u64>,
+) {
+    if std::env::var_os("ORRERY_REPLICA_CAPTURE").is_some() {
+        eprintln!(
+            "replica_capture event={event} entity={} client_tick={client_tick} \
+             authoritative_tick={} gap_ticks={}",
+            entity.0,
+            authoritative_tick.map_or_else(|| "none".to_owned(), |tick| tick.to_string()),
+            gap_ticks.map_or_else(|| "none".to_owned(), |gap| gap.to_string()),
+        );
     }
 }
 
@@ -1474,14 +1548,20 @@ mod tests {
         let mut executor = Executor::new(game, UniverseSeed([0x61; 32]));
         executor.insert(own, game.spawn(own, 8));
         executor.insert(remote, game.spawn(remote, 2));
-        let mut seen_at = BTreeMap::from([(remote, 10)]);
+        let mut freshness = BTreeMap::from([(
+            remote,
+            ReplicaFreshness {
+                last_refresh_tick: 10,
+                installed: true,
+            },
+        )]);
         let mut focus = Some(remote);
 
         expire_stale_replicas(
             &mut executor,
             own,
             10 + REPLICA_TTL_TICKS,
-            &mut seen_at,
+            &mut freshness,
             &mut focus,
         );
         assert!(
@@ -1493,7 +1573,7 @@ mod tests {
             &mut executor,
             own,
             11 + REPLICA_TTL_TICKS,
-            &mut seen_at,
+            &mut freshness,
             &mut focus,
         );
         assert!(
@@ -1502,6 +1582,22 @@ mod tests {
         );
         assert_eq!(focus, None, "the duel view must release the stale craft");
         assert!(executor.state(own).is_some(), "own authority never expires");
+    }
+
+    #[test]
+    fn replica_measurement_retains_the_gap_across_expiry_and_reinstall() {
+        let remote = PersistId::new(3);
+        let mut freshness = BTreeMap::new();
+
+        let _ = refresh_replica(&mut freshness, remote, 10, 9);
+        freshness.get_mut(&remote).expect("installed").installed = false;
+        let measurement = refresh_replica(&mut freshness, remote, 211, 210);
+
+        assert_eq!(
+            measurement,
+            ("install", Some(201)),
+            "a re-install reports the whole gap from its pre-expiry refresh"
+        );
     }
 
     /// The config's actor is human by construction; the session id round-trips.
