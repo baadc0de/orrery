@@ -63,19 +63,24 @@ pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/2";
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Binds an endpoint for the exterior role.
+/// Binds an endpoint for the exterior role, optionally at one exact socket.
 ///
 /// Relays are disabled: the loopback proof needs no relay, and turning one on
 /// is an operator decision about where cohort traffic may travel (#375), not a
-/// harness default.
-pub async fn bind(secret: iroh::SecretKey) -> Result<Endpoint> {
-    let endpoint = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
+/// harness default. `None` deliberately leaves iroh's wildcard, ephemeral-port
+/// preset untouched for existing harness and test callers.
+pub async fn bind(secret: iroh::SecretKey, bind_addr: Option<SocketAddr>) -> Result<Endpoint> {
+    let mut builder = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
         .alpns(vec![EXTERIOR_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
-        .secret_key(secret)
-        .bind()
-        .await
-        .context("bind exterior endpoint")?;
+        .secret_key(secret);
+    if let Some(bind_addr) = bind_addr {
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr(bind_addr)
+            .context("configure exterior bind address")?;
+    }
+    let endpoint = builder.bind().await.context("bind exterior endpoint")?;
     Ok(endpoint)
 }
 
@@ -650,6 +655,53 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_exterior_bind_uses_the_requested_address_and_port() {
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve UDP port");
+        let requested = reservation.local_addr().expect("reserved address");
+        drop(reservation);
+
+        let endpoint = bind(
+            iroh_base::SecretKey::from_bytes(&[0xA1; 32]),
+            Some(requested),
+        )
+        .await
+        .expect("configured endpoint binds");
+        assert_eq!(
+            endpoint.bound_sockets(),
+            vec![requested],
+            "the configured bind must replace iroh's preset sockets"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_exterior_bind_keeps_irohs_wildcard_ephemeral_default() {
+        let first = bind(iroh_base::SecretKey::from_bytes(&[0xA2; 32]), None)
+            .await
+            .expect("first default endpoint");
+        let second = bind(iroh_base::SecretKey::from_bytes(&[0xA3; 32]), None)
+            .await
+            .expect("second default endpoint");
+        let first_v4 = first
+            .bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .expect("iroh preset binds IPv4");
+        let second_v4 = second
+            .bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .expect("iroh preset binds IPv4");
+
+        assert!(first_v4.ip().is_unspecified(), "default remains wildcard");
+        assert_ne!(first_v4.port(), 0, "the OS assigns the ephemeral port");
+        assert_ne!(
+            first_v4.port(),
+            second_v4.port(),
+            "simultaneous default binds receive distinct ephemeral ports"
+        );
+    }
+
     /// The whole bridge over loopback iroh: real endpoints, the real
     /// handshake with an anchor, then frames pushed through both queue pairs.
     /// This is the seam #385's two-process proof rides on; if frames can lose
@@ -660,8 +712,8 @@ mod tests {
         let slot = 2usize;
         let expected = bot_key(slot).public();
 
-        let host_ep = bind(host_key()).await.expect("host endpoint");
-        let remote_ep = bind(bot_key(slot)).await.expect("remote endpoint");
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot), None).await.expect("remote endpoint");
         let socket = host_ep.bound_sockets()[0];
         let address = HostAddress {
             node: host_ep.id(),
@@ -780,8 +832,10 @@ mod tests {
     async fn a_verified_join_anchor_seats_the_real_exterior_slot_anchored() {
         let slot = 1usize;
         let client_key = bot_key(slot);
-        let host_ep = bind(host_key()).await.expect("host endpoint");
-        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone(), None)
+            .await
+            .expect("remote endpoint");
         let socket = host_ep.bound_sockets()[0];
         let host_task = {
             let host_ep = host_ep.clone();
@@ -831,8 +885,10 @@ mod tests {
     async fn host_accept_refuses_an_anchor_signed_by_a_different_key() {
         let slot = 1usize;
         let client_key = bot_key(slot);
-        let host_ep = bind(host_key()).await.expect("host endpoint");
-        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone(), None)
+            .await
+            .expect("remote endpoint");
         let socket = host_ep.bound_sockets()[0];
         let host_task = {
             let host_ep = host_ep.clone();
@@ -879,8 +935,10 @@ mod tests {
         let mut anchor = valid_anchor(slot, &client_key);
         let other = Regolith::honest().spawn(PersistId::new(slot as u64 + 1), 99);
         anchor.state = other.to_canonical();
-        let host_ep = bind(host_key()).await.expect("host endpoint");
-        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone(), None)
+            .await
+            .expect("remote endpoint");
         let socket = host_ep.bound_sockets()[0];
         let host_task = {
             let host_ep = host_ep.clone();
@@ -923,8 +981,10 @@ mod tests {
     async fn an_explicit_empty_anchor_still_seats_unanchored() {
         let slot = 1usize;
         let client_key = bot_key(slot);
-        let host_ep = bind(host_key()).await.expect("host endpoint");
-        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone(), None)
+            .await
+            .expect("remote endpoint");
         let socket = host_ep.bound_sockets()[0];
         let host_task = {
             let host_ep = host_ep.clone();
@@ -996,8 +1056,10 @@ mod tests {
             .expect("sign token")
             .encode()
             .expect("encode token");
-        let host_ep = bind(host_key()).await.expect("host endpoint");
-        let remote_ep = bind(client_key.clone()).await.expect("client endpoint");
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone(), None)
+            .await
+            .expect("client endpoint");
         let socket = host_ep.bound_sockets()[0];
         let admission = crate::exterior::Admission {
             require_client_rev: None,
@@ -1042,8 +1104,8 @@ mod tests {
     async fn a_pinned_host_rejects_a_stale_client_at_join() {
         let slot = 3usize;
         let expected = bot_key(slot).public();
-        let host_ep = bind(host_key()).await.expect("host endpoint");
-        let remote_ep = bind(bot_key(slot)).await.expect("remote endpoint");
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot), None).await.expect("remote endpoint");
         let socket = host_ep.bound_sockets()[0];
 
         let host_task = {

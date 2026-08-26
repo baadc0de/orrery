@@ -63,6 +63,7 @@ read_campaigns() {
     # the bash boundary.
     "$PYTHON_BIN" - "$CONTROL" <<'PY'
 import configparser
+import ipaddress
 import json
 import re
 import sys
@@ -79,7 +80,10 @@ try:
         section = parser[ident]
         # These accesses deliberately mirror scripts/admission.py:73-75.
         section["title"]
-        section["host"]
+        ipaddress.ip_address(section["host"])
+        external_port = section.getint("external_port")
+        if not 1 <= external_port <= 65535:
+            raise ValueError("external_port must be 1..65535")
         section.getint("peers")
         section.getint("seconds")
         section.getint("loss_pct")
@@ -228,7 +232,8 @@ case "${CAMPAIGN_RELEASE_PREFLIGHT_FIXTURE:-good}" in
 esac'
     write_control() {
         local revision=$1
-        printf '%s\n' "[fixture]" "title = Fixture" "open = yes" "host = fixture" \
+        printf '%s\n' "[fixture]" "title = Fixture" "open = yes" "host = 203.0.113.7" \
+            "external_port = 52011" \
             "peers = 8" "seconds = 60" "loss_pct = 3" "jitter_ms = 100" "client_rev = $revision" > "$dir/campaigns.conf"
     }
     st_run() {

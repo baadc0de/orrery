@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import fcntl
+import ipaddress
 import json
 import logging
 import os
@@ -44,7 +45,7 @@ class Refusal(Exception):
 @dataclass(frozen=True)
 class Campaign:
     ident: str; title: str; open: bool; host: str; peers: int; seconds: int
-    loss_pct: int; jitter_ms: int; client_rev: str | None
+    loss_pct: int; jitter_ms: int; external_port: int; client_rev: str | None
 
 
 class Admission:
@@ -70,9 +71,12 @@ class Admission:
             for ident in parser.sections():
                 if not CAMPAIGN_ID.fullmatch(ident): raise ValueError(f"invalid campaign id {ident!r}")
                 s = parser[ident]
-                got[ident] = Campaign(ident, s["title"], s.get("open", "").lower() == "yes", s["host"],
+                host = str(ipaddress.ip_address(s["host"]))
+                external_port = s.getint("external_port")
+                if not 1 <= external_port <= 65535: raise ValueError("external_port must be 1..65535")
+                got[ident] = Campaign(ident, s["title"], s.get("open", "").lower() == "yes", host,
                     s.getint("peers"), s.getint("seconds"), s.getint("loss_pct"), s.getint("jitter_ms"),
-                    s.get("client_rev") or None)
+                    external_port, s.get("client_rev") or None)
             self.last_good, self.last_note = got, None
             return got, None
         except (OSError, ValueError, configparser.Error, KeyError) as e:
@@ -108,6 +112,26 @@ class Admission:
         p = self.state / campaign.ident; p.mkdir(parents=True, exist_ok=True)
         with (p / "joins.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
+
+    @staticmethod
+    def socket_address(host: str, port: int) -> str:
+        return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+    @classmethod
+    def harness_bind(cls, campaign: Campaign) -> str:
+        wildcard = "::" if ":" in campaign.host else "0.0.0.0"
+        return cls.socket_address(wildcard, campaign.external_port)
+
+    @classmethod
+    def dialable_listening(cls, campaign: Campaign, listening: str) -> tuple[str, str]:
+        host_node, direct = listening.split(None, 1)
+        try:
+            port = int(direct.rsplit(":", 1)[1])
+        except (IndexError, ValueError) as error:
+            raise ValueError("harness listening address has no numeric port") from error
+        if port != campaign.external_port:
+            raise ValueError(f"harness reported UDP port {port}, expected {campaign.external_port}")
+        return host_node, cls.socket_address(campaign.host, port)
 
     def join(self, ident: str, request: dict[str, Any]) -> dict[str, Any]:
         # Steps 1--5 intentionally precede the lock and every subprocess.
@@ -148,14 +172,18 @@ class Admission:
             # looks like a host failure but is a missing directory. Found by
             # standing the service up on a real box (#488).
             command = [self.ssh, "-i", str(self.ssh_key), f"orrery@{c.host}",
-                       "mkdir", "-p", remote, "&&", self.swarm, "--external-peer", "--peers", str(c.peers), "--seconds", str(c.seconds), "--min-cells", "1", "--impaired", "--witness", "--stamp-wall-clock", "--json", f"{remote}/raw.json", "--listening-file", f"{remote}/listening.txt", "--require-session", sid, "--issuer-key", f"{signed['issuer_key_id']}:{signed['issuer_public_key']}"]
+                       "mkdir", "-p", remote, "&&", self.swarm, "--external-peer", "--external-bind", self.harness_bind(c), "--peers", str(c.peers), "--seconds", str(c.seconds), "--min-cells", "1", "--impaired", "--witness", "--stamp-wall-clock", "--json", f"{remote}/raw.json", "--listening-file", f"{remote}/listening.txt", "--require-session", sid, "--issuer-key", f"{signed['issuer_key_id']}:{signed['issuer_public_key']}"]
             if c.client_rev: command += ["--require-client-rev", c.client_rev]
             try: child = subprocess.Popen(command, text=True)
             except OSError as e: raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
             listening = self._wait_listening(c, remote, session_dir, child)
+            try: host_node, host_direct = self.dialable_listening(c, listening)
+            except ValueError as e:
+                child.kill(); child.wait()
+                logging.error("host returned an unusable listening address: %s", e)
+                raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
             self.children[ident] = child
             threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True).start()
-            host_node, host_direct = listening.split(None, 1)
             return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
         finally:
             # The flock stays held by the child/reaper, not the request.  It is released there.
@@ -262,11 +290,11 @@ def main() -> None:
 class AdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(); root = Path(self.tmp.name); self.state, self.control = root / "state", root / "campaigns.conf"
-        self.control.write_text("[test]\ntitle = Test\nopen = yes\nhost = test\npeers = 8\nseconds = 60\nloss_pct = 3\njitter_ms = 100\nclient_rev = rev\n")
+        self.control.write_text("[test]\ntitle = Test\nopen = yes\nhost = 203.0.113.7\nexternal_port = 52011\npeers = 8\nseconds = 60\nloss_pct = 3\njitter_ms = 100\nclient_rev = rev\n")
         repo = Path(__file__).parents[1]; self.invite = repo / "target/debug/orrery-invite"; issuer_key = repo / "target/debug/orrery-issuer-key"
         if not self.invite.exists() or not issuer_key.exists(): self.skipTest("build orrery-invite and orrery-issuer-key before self-test")
         self.issuer = root / "issuer"; subprocess.run([str(issuer_key), "generate", "--key-id", "476", "--output", str(self.issuer)], check=True, capture_output=True)
-        self.ssh = root / "ssh"; self.ssh.write_text("#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/ssh.args\"\ncase \" $* \" in *' cat '*listening.txt*) echo 'f2a1 127.0.0.1:52011';; *' cat '*raw.json*) echo '{}';; *) sleep 60;; esac\n"); self.ssh.chmod(0o755)
+        self.ssh = root / "ssh"; self.ssh.write_text("#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/ssh.args\"\ncase \" $* \" in *' cat '*listening.txt*) echo 'f2a1 0.0.0.0:52011';; *' cat '*raw.json*) echo '{}';; *) sleep 60;; esac\n"); self.ssh.chmod(0o755)
         self.service = Admission(self.control, self.state, str(self.invite), str(self.ssh), root / "key", self.issuer, "swarm", lambda _: type("V", (), {"f_bavail": 20 * 1024**3, "f_frsize": 1})())
     def tearDown(self) -> None:
         for child in self.service.children.values():
@@ -309,6 +337,13 @@ class AdmissionTests(unittest.TestCase):
         harness = next(line for line in args.read_text().splitlines() if "--require-session" in line)
         fields = shlex.split(harness)
         self.assertEqual(fields[fields.index("--require-session") + 1], sid)
+    def test_the_harness_uses_the_campaigns_fixed_external_port(self) -> None:
+        answer = self.service.join("test", self.request())
+        args = self.ssh.parent / "ssh.args"
+        harness = next(line for line in args.read_text().splitlines() if "--external-bind" in line)
+        fields = shlex.split(harness)
+        self.assertEqual(fields[fields.index("--external-bind") + 1], "0.0.0.0:52011")
+        self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
     def test_the_token_binds_the_presented_node_not_the_slot(self) -> None:
         token = self.service.join("test", self.request())["join"]["session_token"]
         self.assertGreater(len(token), 100, "the real signer returned a SessionTokenV1")
