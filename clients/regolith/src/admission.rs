@@ -11,6 +11,7 @@ use bevy::prelude::*;
 use bevy::text::{EditableText, TextCursorStyle};
 use bevy::ui::InteractionDisabled;
 use bevy::ui_widgets::{Activate, Button, ScrollArea};
+use orrery_games::regolith::REGOLITH_RULESET;
 use orrery_protocol::CampaignJoinFileV1;
 use serde::{Deserialize, Serialize};
 
@@ -291,6 +292,7 @@ fn post_join(url: &str, nickname: &str, node: &str) -> Result<JoinResponse, Stri
             "nickname": nickname,
             "node": node,
             "client_rev": BUILD_REV,
+            "ruleset_version": REGOLITH_RULESET.version,
         }))
         .send()
         .map_err(|error| error.to_string())?;
@@ -1056,6 +1058,58 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc::Receiver;
+
+    fn join_test_server(status: &str, body: &str) -> (String, Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test service");
+        let address = listener.local_addr().expect("test service address");
+        let (sent, received) = mpsc::channel();
+        let status = status.to_owned();
+        let body = body.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let body_end = loop {
+                let count = stream.read(&mut buffer).expect("read client request");
+                assert_ne!(count, 0, "client closed request before its headers");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..body_end]).expect("ASCII headers");
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim())
+                    })
+                })
+                .expect("content length")
+                .parse::<usize>()
+                .expect("numeric content length");
+            while request.len() < body_end + length {
+                let count = stream.read(&mut buffer).expect("read client body");
+                assert_ne!(count, 0, "client closed request before its body");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            sent.send(request).expect("return captured request");
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("respond to client");
+        });
+        (format!("http://{address}/v1/campaigns/test/join"), received)
+    }
 
     #[test]
     fn the_join_gate_systems_do_not_run_once_the_gate_is_gone() {
@@ -1157,5 +1211,52 @@ mod tests {
             campaign_state_line(&response.campaigns[0]),
             "busy — try again in ~40 min"
         );
+    }
+
+    #[test]
+    fn join_post_sends_the_current_regolith_ruleset_version() {
+        let accepted = r#"{"join":{"host_node":"node","slot":1,"session_id":"session","session_token":"token"},"host_direct":"127.0.0.1:1","configured":{"loss_pct":0.0,"jitter_p50_ms":0,"jitter_p99_ms":0}}"#;
+        let (url, request) = join_test_server("200 OK", accepted);
+
+        post_join(&url, "ada", "node").expect("current ruleset is admitted");
+
+        let request = request.recv().expect("captured join request");
+        let body_start = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("request headers")
+            + 4;
+        let body: serde_json::Value =
+            serde_json::from_slice(&request[body_start..]).expect("join JSON");
+        assert_eq!(body["client_rev"], BUILD_REV);
+        assert_eq!(body["ruleset_version"], REGOLITH_RULESET.version);
+    }
+
+    #[test]
+    fn ruleset_version_mismatch_reason_reaches_the_admission_dialog() {
+        let reason = format!(
+            "This campaign needs ruleset v{} — download the current build.",
+            REGOLITH_RULESET.version + 1
+        );
+        let response = format!(r#"{{"error":"ruleset_version_mismatch","detail":"{reason}"}}"#);
+        let (url, request) = join_test_server("403 Forbidden", &response);
+
+        let refusal = match post_join(&url, "ada", "node") {
+            Ok(_) => panic!("stale ruleset is refused"),
+            Err(refusal) => refusal,
+        };
+        assert!(!request.recv().expect("captured join request").is_empty());
+        let gate = JoinGate::Browsing {
+            campaigns: Vec::new(),
+            operator_note: None,
+            dialog: Some(refusal),
+        };
+        assert!(matches!(
+            gate,
+            JoinGate::Browsing {
+                dialog: Some(refusal),
+                ..
+            } if refusal == reason
+        ));
     }
 }
