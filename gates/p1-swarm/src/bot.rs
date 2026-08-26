@@ -1564,6 +1564,12 @@ pub fn default_cell_edge_m() -> f32 {
     DEFAULT_CELL_EDGE_M as f32
 }
 
+/// Regolith's campaign cell edge, kept separate from the P1 gate default.
+#[must_use]
+pub fn campaign_cell_edge_m() -> f32 {
+    orrery_games::regolith::CAMPAIGN_CELL_EDGE_M as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
