@@ -906,18 +906,16 @@ impl Swarm {
             .map(|bot| (bot.node, bot.cell().expect("committed")))
             .collect();
         if let Some(exterior) = &self.exterior {
-            if std::env::var_os("ORRERY_REPLICA_CAPTURE").is_some() {
-                let interest = exterior.cell().neighbors27();
-                for (index, (_, cell)) in roster.iter().enumerate() {
-                    eprintln!(
-                        "replica_scope_capture host_tick={tick} entity={} in_scope={} \
-                         subject_cell={} receiver_cell={}",
-                        index + 1,
-                        interest.contains(cell),
-                        cell.to_bits(),
-                        exterior.cell().to_bits(),
-                    );
-                }
+            let interest = exterior.cell().neighbors27();
+            for (index, (_, cell)) in roster.iter().enumerate() {
+                eprintln!(
+                    "replica_scope_capture host_tick={tick} entity={} in_scope={} \
+                     subject_cell={} receiver_cell={}",
+                    index + 1,
+                    interest.contains(cell),
+                    cell.to_bits(),
+                    exterior.cell().to_bits(),
+                );
             }
             roster.push((exterior.node, exterior.cell()));
         }
