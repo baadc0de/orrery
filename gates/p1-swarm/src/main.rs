@@ -457,6 +457,14 @@ fn parse_issuer_key(spec: &str) -> Result<orrery_protocol::IssuerKey> {
     ))
 }
 
+fn cell_edge_m_for_session(external: bool, external_peer: bool) -> f32 {
+    if external || external_peer {
+        bot::campaign_cell_edge_m()
+    } else {
+        bot::default_cell_edge_m()
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -479,7 +487,7 @@ fn main() -> Result<()> {
     let config = SwarmConfig {
         peers: args.peers,
         seconds: args.seconds,
-        cell_edge_m: bot::default_cell_edge_m(),
+        cell_edge_m: cell_edge_m_for_session(args.external, args.external_peer),
         send_hz: 20,
         impairment: if args.impaired {
             args.loss
@@ -892,4 +900,26 @@ fn self_test() -> Result<()> {
         "gates/p1-swarm: self-test passed — every criterion clause present, real stack wired"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod session_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn exterior_campaigns_use_regoliths_interaction_sized_cells() {
+        assert_eq!(
+            cell_edge_m_for_session(false, true),
+            orrery_games::regolith::CAMPAIGN_CELL_EDGE_M as f32
+        );
+        assert_eq!(
+            cell_edge_m_for_session(true, false),
+            orrery_games::regolith::CAMPAIGN_CELL_EDGE_M as f32
+        );
+        assert_eq!(
+            cell_edge_m_for_session(false, false),
+            orrery_protocol::DEFAULT_CELL_EDGE_M as f32,
+            "the P1 gate continues to exercise the framework default"
+        );
+    }
 }

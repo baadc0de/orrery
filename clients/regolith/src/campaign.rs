@@ -48,13 +48,14 @@ use orrery_core::{CoreCodec, Executor, InputLogProducer};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState};
-use orrery_games::regolith::{campaign_spawn_pose, collision_candidate, REGOLITH_RULESET};
+use orrery_games::regolith::{
+    campaign_spawn_pose, collision_candidate, CAMPAIGN_CELL_EDGE_M, REGOLITH_RULESET,
+};
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::{decode_delivered_input, decode_replication};
 use orrery_protocol::UniverseSeed;
 use orrery_protocol::{
     cell_id_from_metres, CellId, FrameHead, PersistId, RecordSource, Tick, WitnessMsg,
-    DEFAULT_CELL_EDGE_M,
 };
 
 use crate::intent::{decode_packet, encode_orders, Controls, IntentPipeline, OrderPacket};
@@ -540,7 +541,7 @@ impl CampaignRuntime {
             link: None,
             net: None,
             launched_at,
-            cell_edge_m: DEFAULT_CELL_EDGE_M,
+            cell_edge_m: CAMPAIGN_CELL_EDGE_M,
             tick: Tick::new(0),
             started_at: Instant::now(),
             uplink_sequence: 0,

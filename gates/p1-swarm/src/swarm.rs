@@ -2744,6 +2744,72 @@ mod tests {
         }
     }
 
+    /// A rendered campaign starts with the exterior craft and the host crowd in
+    /// one local encounter. Holding the player's craft still must not turn that
+    /// encounter into a four-second fly-by merely because the P1 gate's bots
+    /// normally roam across cells for an hour.
+    #[test]
+    fn stationary_campaign_player_keeps_initial_contacts_in_scope() {
+        use crate::bot::bot_key;
+        use crate::exterior::link_pair;
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 8,
+            seconds: 45,
+            cell_edge_m: crate::bot::campaign_cell_edge_m(),
+            witnessing: false,
+            ..SwarmConfig::default()
+        });
+        let (host_link, _remote_link) = link_pair();
+        swarm = swarm.with_external(bot_key(8).public(), None, host_link);
+        swarm.form_island();
+
+        let receiver_cell = swarm.exterior.as_ref().expect("external slot").cell();
+        let interest = receiver_cell.neighbors27();
+        let initially_visible: Vec<PersistId> = swarm
+            .bots
+            .iter_mut()
+            .filter_map(|bot| {
+                interest
+                    .contains(&bot.cell().expect("committed"))
+                    .then(|| bot.entity())
+            })
+            .collect();
+        assert!(
+            !initially_visible.is_empty(),
+            "the campaign fixture must begin with a visible contact"
+        );
+
+        const STOCK_REACH_MM: u128 = 406_000;
+        let mut phase = [0u128; 6];
+        let (receiver_pos, _) = crate::bot::spawn_pose(8, 9);
+        let mut saw_far_departure = false;
+        for tick in 0..45 * TICK_HZ {
+            swarm.tick_once(tick, 3, &mut phase);
+            if tick % TICK_HZ == TICK_HZ - 1 {
+                swarm.refresh_rosters(tick);
+                for bot in &mut swarm.bots {
+                    let in_scope = interest.contains(&bot.cell().expect("committed"));
+                    let distance =
+                        orrery_games::regolith::distance_mm(bot.craft().pos, receiver_pos);
+                    if distance <= STOCK_REACH_MM {
+                        assert!(
+                            in_scope,
+                            "contact {} left scope at tick {tick}, only {distance} mm from the stationary player",
+                            bot.entity().0,
+                        );
+                    } else if !in_scope {
+                        saw_far_departure = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_far_departure,
+            "the test must still exercise a genuine AOI departure after interaction range"
+        );
+    }
+
     #[test]
     fn host_authoritative_lock_reply_routes_back_to_the_external_authority() {
         use crate::bot::bot_key;

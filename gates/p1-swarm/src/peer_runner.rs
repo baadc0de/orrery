@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use orrery_protocol::{coord::PeerEntry, NodeId, PersistId, UniverseSeed};
 
 use crate::bot::{
-    bot_key, cell_of, default_cell_edge_m, grid_of, spawn_pose, Bot, BotSpec, TICK_HZ,
+    bot_key, campaign_cell_edge_m, cell_of, grid_of, spawn_pose, Bot, BotSpec, TICK_HZ,
 };
 use crate::bridge::{self, HostAddress};
 
@@ -59,7 +59,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
         index,
         count,
         seed: universe_seed,
-        cell_edge_m: default_cell_edge_m(),
+        cell_edge_m: campaign_cell_edge_m(),
         witnessing: run.witnessing,
         cheat: None,
         enforcing: false,
@@ -78,7 +78,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
     for sibling in 0..run.peers {
         let node = bot_key(sibling).public();
         let (pos, _) = spawn_pose(sibling, count);
-        let cell = cell_of(grid_of(&pos, default_cell_edge_m()));
+        let cell = cell_of(grid_of(&pos, campaign_cell_edge_m()));
         index_of.insert(node, sibling);
         links.push(node);
         siblings.push(PeerEntry {
@@ -144,7 +144,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                 // Before the tick runs: a claim commits to pre-step state.
                 bot.publish_claim(tick);
             }
-            bot.step_core(tick, default_cell_edge_m());
+            bot.step_core(tick, campaign_cell_edge_m());
             if tick % send_every == send_every - 1 {
                 bot.broadcast_state(tick);
             }

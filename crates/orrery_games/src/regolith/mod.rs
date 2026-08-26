@@ -89,6 +89,15 @@ const CHANCE_SCALE: u128 = 1_000_000;
 const CAMPAIGN_ORBIT_RADIUS_M: f64 = 2_500.0;
 const CAMPAIGN_CROWD_ARC_RAD: f64 = 0.08;
 const CAMPAIGN_RADIAL_SPREAD: f64 = 0.10;
+/// Campaign interest-cell edge, sized for Regolith's stock engagement reach.
+///
+/// The framework default is 128 m, but a 27-cell AOI at that edge can drop a
+/// craft only 172 m from the observer. Every campaign craft starts with a
+/// stock weapon whose 400 m reach is still live there. A 512 m edge preserves
+/// the 10% commitment margin and keeps the whole stock interaction radius in
+/// the coarse AOI without changing the 27-cell topology or the P1 gate's
+/// framework-default exercise.
+pub const CAMPAIGN_CELL_EDGE_M: f64 = 512.0;
 
 /// Regolith v15's rules identity: collision forces compose in sealed input order.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
