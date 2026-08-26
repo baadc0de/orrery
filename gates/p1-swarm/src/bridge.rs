@@ -46,7 +46,10 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
-use orrery_protocol::NodeId;
+use orrery_core::CoreCodec;
+use orrery_games::regolith::state::RegolithState;
+use orrery_games::regolith::REGOLITH_RULESET;
+use orrery_protocol::{NodeId, PersistId, StateClaim, Tick};
 
 use crate::exterior::{
     encode_frame, AnchorFrame, Frame, HostLink, JoinReply, JoinRequest, Lane, RemoteLink,
@@ -320,19 +323,23 @@ pub async fn host_accept(
         let claim = read_message(&mut recv).await?;
         let state = read_message(&mut recv).await?;
         // An empty claim is the joiner saying, explicitly, that it authors no
-        // witness log (#387: the rendered client — witnessing authoring
-        // stayed out of #386's scope). The slot is seated unanchored, the
+        // witness log. The slot is seated unanchored, the
         // already-supported `with_external(…, None, …)` path; the run's
         // witnessed clauses then cover the bot cohort, and the report shows
         // nothing was shown or judged for this subject rather than
         // pretending it was.
         if claim.is_empty() {
+            if !state.is_empty() {
+                bail!("empty witness anchor claim carried a non-empty state");
+            }
             None
         } else {
-            Some(AnchorFrame {
+            let frame = AnchorFrame {
                 claim_json: claim,
                 state,
-            })
+            };
+            verify_join_anchor(&frame, remote, index)?;
+            Some(frame)
         }
     } else {
         None
@@ -401,6 +408,34 @@ pub async fn host_accept(
     ))
 }
 
+/// Verify the signed commitment before the caller can seat the exterior slot.
+fn verify_join_anchor(anchor: &AnchorFrame, subject: NodeId, index: usize) -> Result<()> {
+    let claim: StateClaim = serde_json::from_slice(&anchor.claim_json)
+        .context("witness anchor claim did not decode")?;
+    let state =
+        RegolithState::decode(&anchor.state).context("witness anchor state did not decode")?;
+    let expected_entity = PersistId::new(index as u64 + 1);
+    if claim.entity != expected_entity {
+        bail!(
+            "witness anchor names entity {:?}, but slot {index} owns {:?}",
+            claim.entity,
+            expected_entity
+        );
+    }
+    if claim.tick != Tick::new(0) || claim.chain_epoch != 0 {
+        bail!("witness anchor is not the slot's tick-zero epoch-zero claim");
+    }
+    if claim.ruleset != REGOLITH_RULESET {
+        bail!("witness anchor names a different ruleset");
+    }
+    orrery_core::log::verify_claim(&claim, subject)
+        .context("witness anchor signature does not verify for the joined node")?;
+    if orrery_core::state_hash(&state) != claim.state_hash {
+        bail!("witness anchor state does not match its signed tick-zero hash");
+    }
+    Ok(())
+}
+
 /// Remote side: dials the host and runs the client half of the handshake.
 ///
 /// Returns the mirror queues. The assigned slot comes back verified against
@@ -433,12 +468,14 @@ pub async fn remote_join(
         }
         JoinReply::Reject { reason } => bail!("the host refused the join: {reason}"),
     }
-    if let Some(anchor) = &anchor {
-        // Two length-prefixed messages, mirroring the host's reads: claim
-        // first, then the state it commits to. See host_accept's note.
-        write_message(&mut send, &anchor.claim_json).await?;
-        write_message(&mut send, &anchor.state).await?;
-    }
+    // Two length-prefixed messages, mirroring the host's reads: claim first,
+    // then the state it commits to. An absent log is the explicit empty pair,
+    // preserving the unanchored compatibility path.
+    let (claim, state) = anchor.as_ref().map_or((&[][..], &[][..]), |anchor| {
+        (anchor.claim_json.as_slice(), anchor.state.as_slice())
+    });
+    let _ = write_message(&mut send, claim).await;
+    let _ = write_message(&mut send, state).await;
 
     // Data path mirrors the host's: uplink on a uni stream this side opens
     // and announces, downlink on the uni stream the host opened and
@@ -598,6 +635,20 @@ mod tests {
     use super::*;
     use crate::bot::{bot_key, host_key};
     use crate::exterior::{Frame, JoinRequest, Lane};
+    use orrery_games::{Game, Regolith};
+
+    fn valid_anchor(slot: usize, key: &iroh_base::SecretKey) -> AnchorFrame {
+        let entity = PersistId::new(slot as u64 + 1);
+        let game = Regolith::honest();
+        let state = game.spawn(entity, slot as u64);
+        let mut producer =
+            orrery_core::InputLogProducer::new(key.clone(), entity, REGOLITH_RULESET, 0, 30, 10);
+        let claim = producer.anchor(0, &state);
+        AnchorFrame {
+            claim_json: serde_json::to_vec(&claim).expect("claim serializes"),
+            state: state.to_canonical(),
+        }
+    }
 
     /// The whole bridge over loopback iroh: real endpoints, the real
     /// handshake with an anchor, then frames pushed through both queue pairs.
@@ -634,10 +685,7 @@ mod tests {
                 (host_ep, link_and_anchor)
             })
         };
-        let anchor_frame = AnchorFrame {
-            claim_json: br#"{"entity":3}"#.to_vec(),
-            state: vec![9, 9],
-        };
+        let anchor_frame = valid_anchor(slot, &bot_key(slot));
         let remote_ep_keep = remote_ep.clone();
         let remote_link = remote_join(
             &remote_ep,
@@ -724,6 +772,200 @@ mod tests {
             matches!(&up1, f if f.lane == Lane::Datagram && f.peer == 0),
             "first uplink frame routed: {up1:?}"
         );
+    }
+
+    /// The socket accept and `with_external` call are the production seating
+    /// seam used by `main`; no fixture substitutes for either half.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verified_join_anchor_seats_the_real_exterior_slot_anchored() {
+        let slot = 1usize;
+        let client_key = bot_key(slot);
+        let host_ep = bind(host_key()).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+        let host_task = {
+            let host_ep = host_ep.clone();
+            let expected = client_key.public();
+            tokio::spawn(async move {
+                host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    true,
+                    &crate::exterior::Admission::open(),
+                )
+                .await
+            })
+        };
+        let remote_link = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &JoinRequest::plain("test".into()),
+            slot,
+            Some(valid_anchor(slot, &client_key)),
+        )
+        .await
+        .expect("client joins");
+        let (host_link, anchor, node) = host_task
+            .await
+            .expect("accept task")
+            .expect("host verifies anchor");
+        let anchor = anchor.expect("verified anchor returned for seating");
+        let claim = serde_json::from_slice(&anchor.claim_json).expect("claim decodes");
+        let state = RegolithState::decode(&anchor.state).expect("state decodes");
+        let swarm = crate::swarm::Swarm::new(crate::swarm::SwarmConfig {
+            peers: slot,
+            witnessing: true,
+            ..crate::swarm::SwarmConfig::default()
+        })
+        .with_external(node, Some((claim, state)), host_link);
+        assert_eq!(swarm.exterior_witness_anchored(), Some(true));
+        drop(remote_link);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_accept_refuses_an_anchor_signed_by_a_different_key() {
+        let slot = 1usize;
+        let client_key = bot_key(slot);
+        let host_ep = bind(host_key()).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+        let host_task = {
+            let host_ep = host_ep.clone();
+            let expected = client_key.public();
+            tokio::spawn(async move {
+                host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    true,
+                    &crate::exterior::Admission::open(),
+                )
+                .await
+            })
+        };
+        let impostor = iroh_base::SecretKey::from_bytes(&[0x99; 32]);
+        let _remote = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &JoinRequest::plain("test".into()),
+            slot,
+            Some(valid_anchor(slot, &impostor)),
+        )
+        .await;
+        let error = host_task
+            .await
+            .expect("accept task")
+            .expect_err("an invalid signature must not seat")
+            .to_string();
+        assert!(
+            error.contains("witness anchor signature does not verify"),
+            "named signature refusal, got: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_accept_refuses_state_that_does_not_match_the_tick_zero_claim() {
+        let slot = 1usize;
+        let client_key = bot_key(slot);
+        let mut anchor = valid_anchor(slot, &client_key);
+        let other = Regolith::honest().spawn(PersistId::new(slot as u64 + 1), 99);
+        anchor.state = other.to_canonical();
+        let host_ep = bind(host_key()).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+        let host_task = {
+            let host_ep = host_ep.clone();
+            let expected = client_key.public();
+            tokio::spawn(async move {
+                host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    true,
+                    &crate::exterior::Admission::open(),
+                )
+                .await
+            })
+        };
+        let _remote = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &JoinRequest::plain("test".into()),
+            slot,
+            Some(anchor),
+        )
+        .await;
+        let error = host_task
+            .await
+            .expect("accept task")
+            .expect_err("mismatched tick-zero state must not seat")
+            .to_string();
+        assert!(
+            error.contains("state does not match its signed tick-zero hash"),
+            "named state-hash refusal, got: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_empty_anchor_still_seats_unanchored() {
+        let slot = 1usize;
+        let client_key = bot_key(slot);
+        let host_ep = bind(host_key()).await.expect("host endpoint");
+        let remote_ep = bind(client_key.clone()).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+        let host_task = {
+            let host_ep = host_ep.clone();
+            let expected = client_key.public();
+            tokio::spawn(async move {
+                host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    true,
+                    &crate::exterior::Admission::open(),
+                )
+                .await
+            })
+        };
+        let remote_link = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &JoinRequest::plain("test".into()),
+            slot,
+            None,
+        )
+        .await
+        .expect("empty-anchor client joins");
+        let (host_link, anchor, node) = host_task
+            .await
+            .expect("accept task")
+            .expect("host retains the explicit compatibility path");
+        assert!(anchor.is_none());
+        let swarm = crate::swarm::Swarm::new(crate::swarm::SwarmConfig {
+            peers: slot,
+            witnessing: true,
+            ..crate::swarm::SwarmConfig::default()
+        })
+        .with_external(node, None, host_link);
+        assert_eq!(swarm.exterior_witness_anchored(), Some(false));
+        drop(remote_link);
     }
 
     /// A campaign token authenticates the presented durable identity. The

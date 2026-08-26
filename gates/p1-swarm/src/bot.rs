@@ -30,7 +30,7 @@ use bevy_math::Vec3;
 use bevy_time::{Real, Time};
 use bytes::Bytes;
 
-use orrery_core::{tick_rng, CoreCodec, Executor, QPos};
+use orrery_core::{tick_rng, CoreCodec, Executor, InputLogProducer, QPos};
 use orrery_games::game::{Game, Tamper};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::Order;
@@ -59,8 +59,18 @@ use orrery_witness::plugin::{
 };
 use orrery_witness::{Watch, Witness, WitnessConfig, WitnessPlugin, WitnessSignal, Witnessed};
 
-use crate::chain::Chain;
 use crate::profile::Profile;
+
+/// Tick-zero claims repeat at 2 Hz (docs/06 §6).
+const CLAIM_EVERY: u64 = 30;
+
+/// Frame cadence derived from the witness lane's D16 budget.
+const FRAME_TICKS: u16 = orrery_witness::plugin::frame_interval_ticks(
+    1_000_000,
+    orrery_witness::plugin::MAX_WITNESS_LINKS,
+    TICK_HZ,
+    CLAIM_EVERY,
+);
 
 /// The fixed simulation tick (VC-1).
 pub const TICK: Duration = Duration::from_nanos(16_666_667);
@@ -243,7 +253,7 @@ pub struct Bot {
     /// This bot's behavioural profile.
     pub profile: Profile,
     /// The signed log this bot authors, when witnessing is on.
-    pub chain: Option<Chain>,
+    pub chain: Option<InputLogProducer>,
     /// Witness signals raised against island-mates, by kind.
     pub signals: SignalTally,
     /// The peers the harness modified, so a signal against one of them is not
@@ -669,7 +679,16 @@ impl Bot {
             // claim is what a witness holds it to. A cheat that announced
             // itself would be routed to no adjudicable build and resolve as
             // `UnknownRuleset` — never a strike.
-            chain: witnessing.then(|| Chain::new(secret.clone(), entity, REGOLITH_RULESET, 0)),
+            chain: witnessing.then(|| {
+                InputLogProducer::new(
+                    secret.clone(),
+                    entity,
+                    REGOLITH_RULESET,
+                    0,
+                    CLAIM_EVERY,
+                    FRAME_TICKS,
+                )
+            }),
             signals: SignalTally::default(),
             tampered_subjects: Vec::new(),
             last_high_rate: Vec::new(),

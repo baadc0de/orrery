@@ -187,7 +187,6 @@
 mod adjudicate;
 mod bot;
 mod bridge;
-mod chain;
 mod exterior;
 mod peer_runner;
 mod profile;

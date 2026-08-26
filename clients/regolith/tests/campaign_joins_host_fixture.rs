@@ -24,7 +24,7 @@ use iroh_base::SecretKey;
 use orrery_core::CoreCodec as _;
 use orrery_games::Game;
 use orrery_protocol::channels::encode_replication;
-use orrery_protocol::{CellId, NodeId, PersistId};
+use orrery_protocol::{CellId, ChainHash, NodeId, PersistId, StateClaim, Tick, WitnessMsg};
 use orrery_regolith_client::campaign::{CampaignConfig, CampaignRuntime, JoinState};
 use orrery_regolith_client::intent::Controls;
 use orrery_regolith_client::net;
@@ -62,6 +62,8 @@ struct GroundTruth {
     downlink_last_queued: u64,
     downlink_last_written: u64,
     downlink_skipped_indices: Vec<u64>,
+    witness_frames_verified: u64,
+    witness_claims_verified: u64,
 }
 
 impl GroundTruth {
@@ -244,6 +246,24 @@ async fn pump(
     reply.extend_from_slice(&(assigned as u64).to_le_bytes());
     write_message(&mut send, &reply).await?;
 
+    if matches!(mode, Mode::Join) {
+        let claim_bytes = read_message(&mut recv).await?;
+        let state_bytes = read_message(&mut recv).await?;
+        let claim: StateClaim =
+            serde_json::from_slice(&claim_bytes).map_err(|error| error.to_string())?;
+        let state = orrery_games::regolith::state::RegolithState::decode(&state_bytes)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(claim.entity, PersistId::new(CLIENT_SLOT as u64 + 1));
+        assert_eq!(claim.tick, Tick::new(0));
+        orrery_core::log::verify_claim(&claim, expected_client)
+            .expect("the rendered client signs its anchor with its transport identity");
+        assert_eq!(
+            orrery_core::state_hash(&state),
+            claim.state_hash,
+            "the rendered client's tick-zero state matches its signed claim"
+        );
+    }
+
     // Data path mirrors the host side: downlink opened and announced before
     // accepting the client's announced uplink (#385).
     drop(send);
@@ -364,6 +384,7 @@ async fn pump(
 
     // Uplink: settle every sequenced datagram with a router decision, acked
     // strictly after deciding (#393's load-bearing ordering).
+    let mut witness_head = ChainHash::EMPTY;
     loop {
         let Some(frame) = read_frame(&mut uplink_recv).await else {
             break; // the client went away
@@ -402,7 +423,32 @@ async fn pump(
                     break;
                 }
             }
-            net::Lane::StreamShared | net::Lane::StreamBulk => {}
+            net::Lane::StreamShared => {
+                let message =
+                    orrery_protocol::channels::decode_witness::<WitnessMsg>(&frame.payload)
+                        .expect("the rendered client's shared stream carries a witness message");
+                match message {
+                    WitnessMsg::Frame { frame, heads } => {
+                        assert_eq!(heads.len(), 1, "one authored entity per client frame");
+                        let transitions = orrery_core::log::verify_frame(
+                            &frame,
+                            expected_client,
+                            &[witness_head],
+                        )
+                        .expect("the host verifies the rendered client's real log frame");
+                        assert_eq!(heads[0].head, transitions[0].head);
+                        witness_head = transitions[0].head;
+                        truth.lock().expect("truth lock").witness_frames_verified += 1;
+                    }
+                    WitnessMsg::Claim(claim) => {
+                        orrery_core::log::verify_claim(&claim, expected_client)
+                            .expect("the host verifies the rendered client's periodic claim");
+                        truth.lock().expect("truth lock").witness_claims_verified += 1;
+                    }
+                    other => panic!("unexpected client-authored witness message: {other:?}"),
+                }
+            }
+            net::Lane::StreamBulk => {}
         }
     }
     Ok(())
@@ -500,7 +546,13 @@ fn drive_until_joined(runtime: &mut CampaignRuntime, sink: &mut JsonlTelemetry, 
         "the client must reach Joined against a live fixture"
     );
     while runtime.joined_ticks() < wanted && Instant::now() < deadline {
-        let report = runtime.advance(Controls::default(), sink);
+        let report = runtime.advance(
+            Controls {
+                thrust: true,
+                ..Controls::default()
+            },
+            sink,
+        );
         let _ = report;
         // Faster than the sim rate for CI, slow enough that the pumps are
         // exercised across many wakeups.
@@ -550,6 +602,14 @@ fn a_client_joins_measures_and_applies_replicated_state() {
         truth.downlink_last_written,
     );
     assert!(truth.uplink_total() > 10, "the fixture saw real traffic");
+    assert!(
+        truth.witness_frames_verified > 0,
+        "the real client producer shipped frames the host verified"
+    );
+    assert!(
+        truth.witness_claims_verified > 0,
+        "the real client producer shipped periodic claims the host verified"
+    );
     assert_eq!(
         runtime.uplink_sent(),
         truth.uplink_total(),

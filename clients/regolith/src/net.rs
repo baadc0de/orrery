@@ -316,6 +316,15 @@ pub enum JoinReply {
     },
 }
 
+/// The signed tick-zero claim and canonical state sent after join acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorFrame {
+    /// JSON-encoded [`orrery_protocol::StateClaim`].
+    pub claim_json: Vec<u8>,
+    /// Canonical ruleset state committed by the claim.
+    pub state: Vec<u8>,
+}
+
 impl JoinReply {
     /// Decodes a reply.
     ///
@@ -515,10 +524,11 @@ impl CampaignLink {
 
 /// Dials the host and runs the client half of slice 1's handshake.
 ///
-/// No anchor is shipped: witnessing authoring stays out of #386's scope, so
-/// this joins hosts run without their witnessed clause. The assigned slot is
-/// verified against `expected_slot` — a host assigning a different slot is a
-/// misconfiguration to refuse, exactly as the runner refuses one.
+/// `anchor` is the caller-authored tick-zero commitment. `None` retains #387's
+/// explicit empty-anchor convention for clients that legitimately have no log.
+/// The assigned slot is verified against `expected_slot` — a host assigning a
+/// different slot is a misconfiguration to refuse, exactly as the runner
+/// refuses one.
 ///
 /// The returned link's pumps run on the caller's tokio runtime, which must
 /// outlive the link.
@@ -531,6 +541,7 @@ pub async fn remote_join(
     address: iroh::EndpointAddr,
     request: &JoinRequest,
     expected_slot: usize,
+    anchor: Option<AnchorFrame>,
 ) -> Result<CampaignLink, String> {
     const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
     let debug = std::env::var_os("REGOLITH_NET_DEBUG").is_some();
@@ -577,18 +588,22 @@ pub async fn remote_join(
         Err(reason) => return Err(format!("the host's reply did not decode: {reason}")),
     }
 
-    // The empty anchor pair (#387). A witnessing host reads a tick-zero
-    // anchor — claim, then state — after its Accept, because the headless
-    // runner authors a witness chain and ships one. This client authors no
-    // witness log (#386 kept witnessing authoring out of the client), so it
-    // says so explicitly: two zero-length messages, which the host reads as
-    // "this slot joins unanchored". A host that is not witnessing never
-    // reads them, and the handshake stream is dropped right after on both
-    // sides, so the bytes are harmless there; the sends are best-effort for
-    // exactly that case.
-    step("empty anchor pair");
-    let _ = write_message(&mut send, &[]).await;
-    let _ = write_message(&mut send, &[]).await;
+    // Two separately framed messages, exactly as the headless producer ships:
+    // signed claim first, then the canonical state it commits to. The empty
+    // pair remains an explicit, supported unanchored join.
+    let (claim, state) = anchor.as_ref().map_or((&[][..], &[][..]), |anchor| {
+        (anchor.claim_json.as_slice(), anchor.state.as_slice())
+    });
+    step(if anchor.is_some() {
+        "tick-zero witness anchor"
+    } else {
+        "empty anchor pair"
+    });
+    // A non-witnessing host drops this stream without reading the pair. Keep
+    // both writes best-effort for that supported mode; a witnessing host whose
+    // read fails cannot return a seat.
+    let _ = write_message(&mut send, claim).await;
+    let _ = write_message(&mut send, state).await;
 
     // Data path mirrors the host's (#385): uplink on a uni stream this side
     // opens and announces, downlink on the uni stream the host opened and
