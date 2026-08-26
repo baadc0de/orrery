@@ -561,6 +561,7 @@ pub fn spawn_world_overlay(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_lock_reticle(
     view: Res<CombatView>,
+    zoom: Res<crate::CameraZoom>,
     palette: Option<Res<LockMaterials>>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
@@ -594,6 +595,12 @@ pub(crate) fn sync_lock_reticle(
         match anchor {
             Some(position) => {
                 transform.translation = position;
+                // A glyph, not a measurement: it holds its apparent size
+                // across #521's zoom range instead of shrinking to nothing at
+                // 4 km. The range rings, the arc marking and the tracers
+                // deliberately do *not* do this — they mean metres, and would
+                // lie about distance if they were held to screen size.
+                transform.scale = Vec3::splat(zoom.glyph_scale());
                 *visibility = Visibility::Inherited;
             }
             None => *visibility = Visibility::Hidden,
@@ -723,6 +730,7 @@ fn world_position(
 /// this system stays a pure placement: anchor on the target's body or hide.
 pub fn sync_impact_flash(
     feedback: Res<ShotFeedback>,
+    zoom: Res<crate::CameraZoom>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
     mut flashes: Query<(&mut Transform, &mut Visibility), With<ImpactFlash>>,
 ) {
@@ -733,6 +741,12 @@ pub fn sync_impact_flash(
         match anchor {
             Some(position) => {
                 transform.translation = position;
+                // A glyph, not a measurement: it holds its apparent size
+                // across #521's zoom range instead of shrinking to nothing at
+                // 4 km. The range rings, the arc marking and the tracers
+                // deliberately do *not* do this — they mean metres, and would
+                // lie about distance if they were held to screen size.
+                transform.scale = Vec3::splat(zoom.glyph_scale());
                 *visibility = Visibility::Inherited;
             }
             None => *visibility = Visibility::Hidden,
@@ -1073,6 +1087,7 @@ mod tests {
         app.init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
+            .init_resource::<crate::CameraZoom>()
             .init_resource::<ShotFeedback>();
         let world = app.world_mut();
         world.spawn((LockReticle, Transform::default(), Visibility::Hidden));

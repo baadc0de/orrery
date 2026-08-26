@@ -763,9 +763,10 @@ impl Seat {
     /// that choice is deliberate:
     ///
     /// * The plate is the one finish with enough area to read at all. The
-    ///   camera frames the duel from ~500 m up (`frame_camera`'s floor), where
-    ///   a trim stripe is a few pixels and the dark panel and canopy glass are
-    ///   near-black; only the light hull plate shows hue across a whole ship.
+    ///   camera frames the duel from 900 m up by default and up to 4 km at
+    ///   full zoom-out (`CameraZoom`), where a trim stripe is a few pixels and
+    ///   the dark panel and canopy glass are near-black; only the light hull
+    ///   plate shows hue across a whole ship.
     /// * Panel, glass, trim and glow keep the design's roles untouched. Trim
     ///   and glow stay on the shared accent scheme ("this one is mine"), so
     ///   the per-archetype silhouettes remain the primary read and the accent

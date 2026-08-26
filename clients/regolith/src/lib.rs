@@ -294,6 +294,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<VisualAssetPaths>()
             .init_resource::<OverlayState>()
             .init_resource::<MetricWindow>()
+            .init_resource::<CameraZoom>()
             .init_resource::<SelectedLock>()
             .init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
@@ -313,7 +314,8 @@ impl Plugin for RegolithSkinPlugin {
                     ensure_rock_bodies.after(sync_rendered_state),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
-                    frame_camera.after(sync_rendered_state),
+                    follow_camera.after(sync_rendered_state),
+                    zoom_camera.before(follow_camera),
                     refresh_session_banner,
                     refresh_strip,
                     refresh_f3_pane,
@@ -355,8 +357,12 @@ fn setup_scene(
 ) {
     commands.spawn((
         Camera3d::default(),
+        Projection::from(PerspectiveProjection {
+            fov: CAMERA_FOV_Y,
+            ..Default::default()
+        }),
         ChaseCamera,
-        Transform::from_xyz(0.0, 500.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
+        chase_camera_transform(Vec3::ZERO, CAMERA_DEFAULT_HEIGHT_M),
     ));
     commands.spawn((
         DirectionalLight::default(),
@@ -1063,47 +1069,179 @@ fn recompose_craft_bodies(
     }
 }
 
-/// Marks the one camera the framing system drives.
+/// Marks the one camera the follow system drives.
 #[derive(Component)]
 struct ChaseCamera;
 
-/// Keeps every rendered body on screen.
+/// The vertical field of view the chase camera is built with, in radians.
 ///
-/// The camera was fixed above the origin, so anything that drifted left the
-/// frame and never came back — a craft that thrusts away is simply gone, with
-/// no way to tell where. This frames the bodies that exist: centre on their
-/// midpoint, and raise the camera until the furthest one fits, with a floor so
-/// a duel at close quarters does not slam the view into the deck.
+/// Spelled out rather than left to Bevy's default so the arithmetic in
+/// [`CameraZoom`]'s documentation is a property of this file rather than of
+/// whatever `PerspectiveProjection::default()` happens to be this release.
+pub const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
+
+/// Half the world height a top-down camera at `height_m` can see, in metres.
 ///
-/// Framing only. It reads rendered `Transform`s, which are already a pure
+/// `tan(fov/2) * height` — the camera looks straight down, so the deck plane
+/// sits exactly `height_m` away along the view axis.
+#[must_use]
+pub fn visible_half_height_m(height_m: f32) -> f32 {
+    (CAMERA_FOV_Y / 2.0).tan() * height_m
+}
+
+/// How high the chase camera flies, in metres above the deck plane.
+///
+/// **Presentation only.** Nothing downstream of this resource reaches the
+/// intent pipeline, the executor or any range/arc arithmetic: the ruleset's
+/// numbers are in millimetres of lattice and are computed from replicated
+/// state, never from a transform. Zooming changes what the player can see and
+/// nothing about what the player can do (#519).
+///
+/// ## Why these limits
+///
+/// The reference length is the weapon envelope the rings draw: optimal is
+/// 300 m with falloff past it, and a chassis hull is ~7 m (`craft::hull_length`
+/// times [`craft::CRAFT_DISPLAY_SCALE`], so ~22 m on screen). With a
+/// [`CAMERA_FOV_Y`] of 45 degrees the visible half-height is `0.414 * height`:
+///
+/// * [`CAMERA_MIN_HEIGHT_M`] = 150 m shows +/- 62 m — a 22 m hull is about a
+///   sixth of the screen height, close enough to read facing and the arc
+///   marking, and the closest useful framing before the ship fills the view.
+/// * [`CAMERA_DEFAULT_HEIGHT_M`] = 900 m shows +/- 373 m, so the 300 m optimal
+///   ring fits with margin. This is the framing the weapon is fought at.
+/// * [`CAMERA_MAX_HEIGHT_M`] = 4000 m shows +/- 1657 m, enough to hold the
+///   ~2.5 km campaign crowd orbit in view. Past that a 22 m hull is under two
+///   pixels on a 1080-line window and the view stops being usable.
+///
+/// [`CAMERA_ZOOM_STEP`] is multiplicative rather than additive because a fixed
+/// metre step is a huge jump at the near end and imperceptible at the far end.
+/// At 1.15 per wheel notch the whole 150..4000 range is 24 notches, which is a
+/// comfortable flick of a wheel rather than a grind.
+#[derive(Debug, Clone, Copy, Resource, PartialEq)]
+pub struct CameraZoom {
+    height_m: f32,
+}
+
+/// The closest the chase camera is allowed to fly. See [`CameraZoom`].
+pub const CAMERA_MIN_HEIGHT_M: f32 = 150.0;
+/// The furthest the chase camera is allowed to fly. See [`CameraZoom`].
+pub const CAMERA_MAX_HEIGHT_M: f32 = 4_000.0;
+/// Where the chase camera starts. See [`CameraZoom`].
+pub const CAMERA_DEFAULT_HEIGHT_M: f32 = 900.0;
+/// Multiplicative zoom per wheel notch. See [`CameraZoom`].
+pub const CAMERA_ZOOM_STEP: f32 = 1.15;
+/// Pixels of a pixel-unit scroll event that count as one notch.
+///
+/// Trackpads and some mice report `MouseScrollUnit::Pixel`; 50 px per notch is
+/// the conventional line height those devices are calibrated against.
+pub const CAMERA_ZOOM_PIXELS_PER_NOTCH: f32 = 50.0;
+
+impl Default for CameraZoom {
+    fn default() -> Self {
+        Self {
+            height_m: CAMERA_DEFAULT_HEIGHT_M,
+        }
+    }
+}
+
+impl CameraZoom {
+    /// The current camera height above the deck, in metres.
+    #[must_use]
+    pub fn height_m(self) -> f32 {
+        self.height_m
+    }
+
+    /// The zoom after `notches` of wheel travel, clamped to the limits.
+    ///
+    /// Positive notches (wheel away from the player) zoom **in**, which is the
+    /// convention every map and every other game uses.
+    #[must_use]
+    pub fn zoomed(self, notches: f32) -> Self {
+        if !notches.is_finite() || notches == 0.0 {
+            return self;
+        }
+        let height = self.height_m * CAMERA_ZOOM_STEP.powf(-notches);
+        Self {
+            height_m: height.clamp(CAMERA_MIN_HEIGHT_M, CAMERA_MAX_HEIGHT_M),
+        }
+    }
+
+    /// How much a screen-anchored HUD glyph must be scaled to keep its
+    /// apparent size at this zoom.
+    ///
+    /// World measurements — the range rings, the arc marking, the tracers —
+    /// must **not** use this: they mean metres and have to shrink with
+    /// everything else or they would lie about distance. The lock reticle is
+    /// the one overlay that is a glyph rather than a measurement, so it is the
+    /// one thing that holds its apparent size.
+    #[must_use]
+    pub fn glyph_scale(self) -> f32 {
+        self.height_m / CAMERA_DEFAULT_HEIGHT_M
+    }
+}
+
+/// Turns wheel events into zoom. Presentation only; see [`CameraZoom`].
+fn zoom_camera(
+    mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    mut zoom: ResMut<CameraZoom>,
+) {
+    use bevy::input::mouse::MouseScrollUnit;
+    let mut notches = 0.0f32;
+    for event in wheel.read() {
+        notches += match event.unit {
+            MouseScrollUnit::Line => event.y,
+            MouseScrollUnit::Pixel => event.y / CAMERA_ZOOM_PIXELS_PER_NOTCH,
+        };
+    }
+    let next = zoom.zoomed(notches);
+    if next != *zoom {
+        *zoom = next;
+    }
+}
+
+/// Where the chase camera sits and what it looks at, for a given centre.
+///
+/// A free function so the framing rule can be asserted without standing up a
+/// window: the camera hangs straight above `centre` at `height_m` and looks
+/// down, with `-Z` up the screen so world `+X` runs right.
+#[must_use]
+pub fn chase_camera_transform(centre: Vec3, height_m: f32) -> Transform {
+    let eye = Vec3::new(centre.x, centre.y + height_m, centre.z);
+    Transform::from_translation(eye).looking_at(centre, Vec3::NEG_Z)
+}
+
+/// Keeps the player's own craft in the centre of the screen, at the height the
+/// player chose.
+///
+/// The previous behaviour framed *every* body — centre on their midpoint and
+/// rise until the furthest one fit. In live play that meant the world scale
+/// changed while the player was manoeuvring: the ship appeared to drift as the
+/// midpoint moved, and distances stopped being readable as a contact entered
+/// or left the set. #521 replaced it with a fixed centre and a player-owned
+/// zoom, because a predictable view is worth more than optimal framing when
+/// you are holding an arc on a target.
+///
+/// Following only. It reads rendered `Transform`s, which are already a pure
 /// function of core state, and writes nothing back — constraint 3 forbids the
 /// skin deciding anything the ruleset should.
-fn frame_camera(
-    bodies: Query<&Transform, (With<CoreEntity>, Without<ChaseCamera>)>,
+fn follow_camera(
+    session: Res<ActiveSession>,
+    zoom: Res<CameraZoom>,
+    bodies: Query<(&CoreEntity, &Transform), Without<ChaseCamera>>,
     mut camera: Query<&mut Transform, With<ChaseCamera>>,
 ) {
     let Ok(mut view) = camera.single_mut() else {
         return;
     };
-    let mut count = 0.0f32;
-    let mut centre = Vec3::ZERO;
-    for body in &bodies {
-        centre += body.translation;
-        count += 1.0;
-    }
-    if count == 0.0 {
-        return;
-    }
-    centre /= count;
-    let mut spread: f32 = 0.0;
-    for body in &bodies {
-        spread = spread.max(body.translation.distance(centre));
-    }
-    // 2.6 is empirical headroom: enough that a body at the spread radius sits
-    // inside the frame rather than on its edge.
-    let height = (spread * 2.6).max(500.0);
-    view.translation = Vec3::new(centre.x, height, centre.z);
-    *view = view.looking_at(centre, Vec3::NEG_Z);
+    let own = session.local_entity();
+    // Before the player's own body exists — the first frames of a campaign
+    // join, where nothing has replicated yet — hold the last centre rather
+    // than snapping to the origin, which would read as the ship teleporting.
+    let centre = bodies
+        .iter()
+        .find_map(|(core, transform)| (core.0 == own).then_some(transform.translation))
+        .unwrap_or(Vec3::new(view.translation.x, 0.0, view.translation.z));
+    *view = chase_camera_transform(centre, zoom.height_m());
 }
 
 fn sync_rendered_state(
@@ -1352,6 +1490,101 @@ mod tests {
     use bevy::asset::AssetPlugin;
     use orrery_core::state_hash;
     use orrery_games::scenario::{Entry, Play, Scenario, TickRecord};
+
+    /// #521: the camera is centred on the player, and nothing else in the
+    /// world may move it. The old `frame_camera` averaged every body and rose
+    /// until the furthest fit, so a distant contact rescaled the world under a
+    /// manoeuvring player. The second body here is the one that used to do it.
+    #[test]
+    fn the_camera_centres_on_the_players_own_craft_and_ignores_every_other_body() {
+        let mut app = App::new();
+        app.insert_resource(ActiveSession::Local(Box::<LocalSession>::default()));
+        app.init_resource::<CameraZoom>();
+        let own = app.world().resource::<ActiveSession>().local_entity();
+        let elsewhere = PersistId::new(own.0 + 7);
+
+        app.world_mut()
+            .spawn((CoreEntity(own), Transform::from_xyz(400.0, 0.0, -250.0)));
+        app.world_mut().spawn((
+            CoreEntity(elsewhere),
+            Transform::from_xyz(9_000.0, 0.0, 9_000.0),
+        ));
+        let camera = app
+            .world_mut()
+            .spawn((ChaseCamera, Transform::default()))
+            .id();
+
+        app.add_systems(Update, follow_camera);
+        app.update();
+
+        let view = *app
+            .world()
+            .entity(camera)
+            .get::<Transform>()
+            .expect("camera");
+        assert!(
+            (view.translation.x - 400.0).abs() < 1e-3 && (view.translation.z + 250.0).abs() < 1e-3,
+            "the camera must sit over the player's own craft, not over {:?}",
+            view.translation
+        );
+        assert!(
+            (view.translation.y - CAMERA_DEFAULT_HEIGHT_M).abs() < 1e-3,
+            "a distant contact must not change the zoom: height was {}",
+            view.translation.y
+        );
+    }
+
+    /// #521: the wheel owns the zoom, and it stops where the documentation
+    /// says it stops.
+    #[test]
+    fn the_wheel_zoom_moves_by_one_step_and_clamps_to_its_documented_limits() {
+        let start = CameraZoom::default();
+        assert!(
+            (start.zoomed(1.0).height_m() - CAMERA_DEFAULT_HEIGHT_M / CAMERA_ZOOM_STEP).abs()
+                < 1e-3,
+            "one notch away from the player must be exactly one step closer in"
+        );
+        assert!(
+            start.zoomed(-1.0).height_m() > start.height_m(),
+            "one notch towards the player must zoom out"
+        );
+
+        let mut deep = start;
+        for _ in 0..200 {
+            deep = deep.zoomed(1.0);
+        }
+        assert!(
+            (deep.height_m() - CAMERA_MIN_HEIGHT_M).abs() < 1e-3,
+            "zooming in without end must stop at the near limit, got {}",
+            deep.height_m()
+        );
+
+        let mut far = start;
+        for _ in 0..200 {
+            far = far.zoomed(-1.0);
+        }
+        assert!(
+            (far.height_m() - CAMERA_MAX_HEIGHT_M).abs() < 1e-3,
+            "zooming out without end must stop at the far limit, got {}",
+            far.height_m()
+        );
+    }
+
+    /// The default framing has to show the envelope the weapon is fought in,
+    /// or the rings the HUD draws are off screen at the framing the player
+    /// spends most of the session at. Optimal is 300 m.
+    #[test]
+    fn the_default_framing_holds_the_weapons_optimal_ring() {
+        assert!(
+            visible_half_height_m(CAMERA_DEFAULT_HEIGHT_M) > 300.0,
+            "the 300 m optimal ring must fit at the default zoom, half-height was {}",
+            visible_half_height_m(CAMERA_DEFAULT_HEIGHT_M)
+        );
+        assert!(
+            visible_half_height_m(CAMERA_MIN_HEIGHT_M) > 30.0,
+            "a 22 m hull must still fit at full zoom-in"
+        );
+    }
 
     #[test]
     fn build_revision_tracks_the_checkout_commit() {
