@@ -596,8 +596,14 @@ impl CampaignRuntime {
                         .strip_prefix("the host refused the join: ")
                         .unwrap_or(&reason)
                         .to_owned();
+                    bevy::log::warn!("campaign: the host refused the join: {why}");
                     self.state = JoinState::Refused(why);
                 } else {
+                    // Until now this reason existed only inside the F3 pane, so
+                    // a dial that failed in the field left nothing in the log
+                    // and nothing in the telemetry — the operator saw a client
+                    // that silently stayed offline. Say it once, out loud.
+                    bevy::log::error!("campaign: the dial failed: {reason}");
                     self.state = JoinState::Failed(reason);
                 }
                 // Release the guard: nothing will ever hold a connection.
