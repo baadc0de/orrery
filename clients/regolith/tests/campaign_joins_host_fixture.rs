@@ -22,8 +22,10 @@ use tokio::io::AsyncWriteExt as _;
 use bytes::Bytes;
 use iroh_base::SecretKey;
 use orrery_core::{CoreCodec as _, Executor};
+use orrery_games::regolith::archetype::Archetype;
+use orrery_games::regolith::campaign_spawn_pose;
 use orrery_games::regolith::order::{Order, Outcome};
-use orrery_games::regolith::state::RegolithState;
+use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::encode_replication;
 use orrery_protocol::{CellId, ChainHash, NodeId, PersistId, StateClaim, Tick, WitnessMsg};
@@ -323,9 +325,8 @@ async fn pump(
         let truth_cloned = Arc::clone(&truth);
         let feed = feed_tx.clone();
         tokio::spawn(async move {
-            let game = orrery_games::Regolith::honest();
             let bot_entity = PersistId::new(1); // slot 0's entity id
-            let state = game.spawn(bot_entity, 0);
+            let state = campaign_craft(0, CLIENT_SLOT + 1);
             let cell = CellId::from_coords(bevy::math::IVec3::ONE, orrery_protocol::INTEREST_LEVEL)
                 .expect("representable cell");
             let mut broadcast_index = 0u64;
@@ -400,7 +401,7 @@ async fn pump(
     let bot_entity = PersistId::new(1);
     let client_entity = PersistId::new(CLIENT_SLOT as u64 + 1);
     let mut authority = Executor::new(game, crate_seed());
-    authority.insert(bot_entity, game.spawn(bot_entity, 0));
+    authority.insert(bot_entity, campaign_craft(0, CLIENT_SLOT + 1));
     let mut authority_tick = 0u64;
     loop {
         let Some(frame) = read_frame(&mut uplink_recv).await else {
@@ -653,6 +654,15 @@ fn crate_seed() -> orrery_protocol::UniverseSeed {
     orrery_protocol::UniverseSeed([0x61; 32])
 }
 
+fn campaign_craft(slot: usize, count: usize) -> RegolithState {
+    let (pos, yaw_urad) = campaign_spawn_pose(slot, count);
+    RegolithState::Craft(Craft::spawned(
+        Archetype::for_slot(slot as u64),
+        pos,
+        yaw_urad,
+    ))
+}
+
 fn sink_for(name: &str) -> JsonlTelemetry {
     let path = std::env::temp_dir().join(format!("{name}-{}.jsonl", std::process::id()));
     JsonlTelemetry::open(&path).expect("telemetry sink")
@@ -702,6 +712,7 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
         let _ = runtime.advance(
             Controls {
                 lock_target: Some(target),
+                right: true,
                 ..Controls::default()
             },
             &mut sink,
@@ -814,6 +825,16 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
     assert!(
         matches!(shots.cue, Some(ShotCue::Resolved { target: hit, .. }) if hit == target),
         "the delivered target verdict must reach the skin's damage readout"
+    );
+    assert!(
+        !matches!(
+            shots.cue,
+            Some(ShotCue::Resolved {
+                result: orrery_games::regolith::order::ShotResult::OutOfArc,
+                ..
+            })
+        ),
+        "an in-arc campaign shot must not be refused by the target"
     );
     assert!(
         !shots.banner().is_empty(),

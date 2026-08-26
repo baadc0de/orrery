@@ -1107,8 +1107,10 @@ fn fire_through_executor(archetype: Archetype, target_pos: QPos) -> (Craft, Craf
     let damage = fired
         .events
         .iter()
-        .find_map(|event| game.deliver(event))
+        .map(|event| Outcome::decode(&event.to_canonical()).expect("outcome crosses the wire"))
+        .find_map(|event| game.deliver(&event))
         .map(|(_, order)| order)
+        .map(|order| Order::decode(&order.to_canonical()).expect("delivery crosses the wire"))
         .expect("a locked, cooled-down shooter emits its shot");
     let resolved = executor
         .step_entity(target, Tick::new(2), &[damage])
@@ -1187,7 +1189,7 @@ fn cruiser_cannot_fire_forward_through_real_executor() {
 }
 
 #[test]
-fn each_hulls_in_arc_shot_resolves_as_before() {
+fn craft_target_inside_drawn_arc_hits_through_emission_and_delivery() {
     for (archetype, target_pos) in [
         (
             Archetype::Interceptor,
@@ -1218,6 +1220,88 @@ fn each_hulls_in_arc_shot_resolves_as_before() {
             "{archetype:?}'s in-arc shot did not resolve through the existing hit path"
         );
     }
+}
+
+fn fire_at_rock_through_executor(target_pos: QPos) -> (Craft, Rock, Outcome) {
+    let game = Regolith::honest();
+    let attacker = PersistId::new(1);
+    let target = PersistId::new(2);
+    let mut shooter = Craft::spawned(Archetype::Interceptor, QPos::default(), 0);
+    shooter.lock_target = Some(target);
+    shooter.lock_class = Some(LockClass::Rock);
+    shooter.lock_progress = LOCK_ACQUISITION_TICKS;
+    shooter.locks_acquired = 1;
+    let rock = Rock::spawned(RockTier::Small, 0, target_pos, QVel::default());
+    let mut executor = Executor::new(game, UniverseSeed([0xA5; 32]));
+    executor.insert(attacker, RegolithState::Craft(shooter));
+    executor.insert(target, RegolithState::Rock(rock));
+
+    let fired = executor
+        .step_entity(attacker, Tick::new(1), &[Order::Fire])
+        .expect("the rock-locked shooter exists");
+    let damage = fired
+        .events
+        .iter()
+        .map(|event| Outcome::decode(&event.to_canonical()).expect("outcome crosses the wire"))
+        .find_map(|event| game.deliver(&event))
+        .map(|(_, order)| order)
+        .map(|order| Order::decode(&order.to_canonical()).expect("delivery crosses the wire"))
+        .expect("a locked, cooled-down shooter emits its rock shot");
+    let resolved = executor
+        .step_entity(target, Tick::new(2), &[damage])
+        .expect("the rock resolves the delivered shot");
+    let resolution = resolved
+        .events
+        .iter()
+        .find(|event| matches!(event, Outcome::ShotResolved { .. }))
+        .cloned()
+        .expect("the rock emits a named resolution");
+    let RegolithState::Craft(shooter) = executor.state(attacker).expect("shooter remains") else {
+        panic!("shooter remains a craft")
+    };
+    let RegolithState::Rock(rock) = executor.state(target).expect("rock remains") else {
+        panic!("target remains a rock")
+    };
+    (shooter.clone(), rock.clone(), resolution)
+}
+
+#[test]
+fn rock_target_inside_drawn_arc_hits_through_emission_and_delivery() {
+    let target = PersistId::new(2);
+    let (shooter, rock, resolution) = fire_at_rock_through_executor(QPos {
+        x: 1_000,
+        y: 0,
+        z: 0,
+    });
+    assert_eq!(
+        resolution,
+        Outcome::ShotResolved {
+            attacker: PersistId::new(1),
+            target,
+            result: ShotResult::Hit,
+        }
+    );
+    assert_eq!(shooter.shots, 1);
+    assert!(rock.hull < rock.tier.limits().max_hull);
+}
+
+#[test]
+fn rock_target_outside_drawn_arc_refuses_through_emission_and_delivery() {
+    let target = PersistId::new(2);
+    let (_, rock, resolution) = fire_at_rock_through_executor(QPos {
+        x: 0,
+        y: 0,
+        z: 1_000,
+    });
+    assert_eq!(
+        resolution,
+        Outcome::ShotResolved {
+            attacker: PersistId::new(1),
+            target,
+            result: ShotResult::OutOfArc,
+        }
+    );
+    assert_eq!(rock.hull, rock.tier.limits().max_hull);
 }
 
 #[test]
