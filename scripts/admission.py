@@ -45,7 +45,7 @@ class Refusal(Exception):
 @dataclass(frozen=True)
 class Campaign:
     ident: str; title: str; open: bool; host: str; peers: int; seconds: int
-    loss_pct: int; jitter_ms: int; external_port: int; client_rev: str | None
+    loss_pct: int; jitter_ms: int; external_port: int; client_rev: str | None; ruleset_version: int | None
 
 
 class Admission:
@@ -74,9 +74,12 @@ class Admission:
                 host = str(ipaddress.ip_address(s["host"]))
                 external_port = s.getint("external_port")
                 if not 1 <= external_port <= 65535: raise ValueError("external_port must be 1..65535")
+                ruleset_version = s.getint("ruleset_version", fallback=None)
+                if ruleset_version is not None and not 0 <= ruleset_version <= 0xffffffff:
+                    raise ValueError("ruleset_version must be a u32")
                 got[ident] = Campaign(ident, s["title"], s.get("open", "").lower() == "yes", host,
                     s.getint("peers"), s.getint("seconds"), s.getint("loss_pct"), s.getint("jitter_ms"),
-                    external_port, s.get("client_rev") or None)
+                    external_port, s.get("client_rev") or None, ruleset_version)
             self.last_good, self.last_note = got, None
             return got, None
         except (OSError, ValueError, configparser.Error, KeyError) as e:
@@ -99,7 +102,7 @@ class Admission:
             state = "paused" if c.open and paused else ("busy" if c.ident in self.children else ("open" if c.open else "closed"))
             rows.append({"id": c.ident, "title": c.title, "state": state, "peers": c.peers, "seconds": c.seconds,
                          "loss_pct": c.loss_pct, "jitter_ms": c.jitter_ms, "client_rev": c.client_rev,
-                         "server_rev": c.client_rev})
+                         "server_rev": c.client_rev, "ruleset_version": c.ruleset_version})
         return {"campaigns": rows, "operator_note": note}
 
     @staticmethod
@@ -134,11 +137,12 @@ class Admission:
         return host_node, cls.socket_address(campaign.host, port)
 
     def join(self, ident: str, request: dict[str, Any]) -> dict[str, Any]:
-        # Steps 1--5 intentionally precede the lock and every subprocess.
+        # The ordered campaign guards intentionally precede the lock and every subprocess.
         campaigns, _ = self.campaigns()
         if not CAMPAIGN_ID.fullmatch(ident) or ident not in campaigns: raise Refusal(404, "unknown_campaign", "That campaign has ended — refresh the list.")
         c = campaigns[ident]
         if c.client_rev and request.get("client_rev") != c.client_rev: raise Refusal(403, "client_rev_mismatch", f"This campaign needs build {c.client_rev} — download the current build.")
+        if c.ruleset_version is not None and (not isinstance(request.get("ruleset_version"), int) or isinstance(request.get("ruleset_version"), bool) or request["ruleset_version"] != c.ruleset_version): raise Refusal(403, "ruleset_version_mismatch", f"This campaign needs ruleset v{c.ruleset_version} — download the current build.")
         if not c.open: raise Refusal(403, "campaign_closed", "This campaign is closed; pick another.")
         free = self.free_bytes()
         if free < MINT_FLOOR_BYTES:
@@ -290,7 +294,7 @@ def main() -> None:
 class AdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(); root = Path(self.tmp.name); self.state, self.control = root / "state", root / "campaigns.conf"
-        self.control.write_text("[test]\ntitle = Test\nopen = yes\nhost = 203.0.113.7\nexternal_port = 52011\npeers = 8\nseconds = 60\nloss_pct = 3\njitter_ms = 100\nclient_rev = rev\n")
+        self.control.write_text("[test]\ntitle = Test\nopen = yes\nhost = 203.0.113.7\nexternal_port = 52011\npeers = 8\nseconds = 60\nloss_pct = 3\njitter_ms = 100\nclient_rev = rev\nruleset_version = 14\n")
         repo = Path(__file__).parents[1]; self.invite = repo / "target/debug/orrery-invite"; issuer_key = repo / "target/debug/orrery-issuer-key"
         if not self.invite.exists() or not issuer_key.exists(): self.skipTest("build orrery-invite and orrery-issuer-key before self-test")
         self.issuer = root / "issuer"; subprocess.run([str(issuer_key), "generate", "--key-id", "476", "--output", str(self.issuer)], check=True, capture_output=True)
@@ -302,7 +306,7 @@ class AdmissionTests(unittest.TestCase):
         time.sleep(0.02)
         for lock in self.service.locks.values(): lock.close()
         self.tmp.cleanup()
-    def request(self) -> dict[str, str]: return {"nickname": "ada", "node": "a" * 64, "client_rev": "rev"}
+    def request(self) -> dict[str, Any]: return {"nickname": "ada", "node": "a" * 64, "client_rev": "rev", "ruleset_version": 14}
     def recorded_harness_command(self) -> str:
         args = self.ssh.parent / "ssh.args"
         deadline = time.monotonic() + 1
@@ -354,7 +358,24 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(Refusal): self.service.join("../x", self.request())
         with self.assertRaises(Refusal): self.service.upload("../x", b"{}")
         self.assertFalse((self.state.parent / "x").exists())
-    def test_a_tab_bearing_nickname_refuses_422_before_minting(self) -> None:
+    def test_client_and_ruleset_mismatches_refuse_before_minting(self) -> None:
+        client_mismatch = self.request(); client_mismatch["client_rev"] = "old"
+        with self.assertRaises(Refusal) as x: self.service.join("test", client_mismatch)
+        self.assertEqual(x.exception.error, "client_rev_mismatch")
+        ruleset_mismatch = self.request(); ruleset_mismatch["ruleset_version"] = 13
+        with self.assertRaises(Refusal) as x: self.service.join("test", ruleset_mismatch)
+        self.assertEqual(x.exception.error, "ruleset_version_mismatch")
+        # The new compatibility guard stays before campaign availability guards.
+        self.control.write_text(self.control.read_text().replace("open = yes", "open = no"))
+        with self.assertRaises(Refusal) as x: self.service.join("test", ruleset_mismatch)
+        self.assertEqual(x.exception.error, "ruleset_version_mismatch")
+        self.control.write_text(self.control.read_text().replace("open = no", "open = yes"))
+        self.service.statvfs = lambda _: type("V", (), {"f_bavail": 0, "f_frsize": 1})()
+        with self.assertRaises(Refusal) as x: self.service.join("test", ruleset_mismatch)
+        self.assertEqual(x.exception.error, "ruleset_version_mismatch")
+        self.assertFalse((self.state / "test" / "ledger.tsv").exists())
+
+        self.service.statvfs = lambda _: type("V", (), {"f_bavail": 20 * 1024**3, "f_frsize": 1})()
         r = self.request(); r["nickname"] = "a\tb"
         with self.assertRaises(Refusal) as x: self.service.join("test", r)
         self.assertEqual(x.exception.status, 422); self.assertFalse((self.state / "test" / "ledger.tsv").exists())
