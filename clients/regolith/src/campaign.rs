@@ -84,6 +84,7 @@ const REPLICA_TTL_TICKS: u64 = 120;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReplicaFreshness {
     last_refresh_tick: u64,
+    last_authoritative_tick: u64,
     installed: bool,
 }
 
@@ -1182,6 +1183,7 @@ fn expire_stale_replicas(
             tick,
             None,
             Some(tick.saturating_sub(last_refresh_tick)),
+            None,
         );
         if entity != own {
             executor.take_state(entity);
@@ -1197,11 +1199,12 @@ fn refresh_replica(
     entity: PersistId,
     client_tick: u64,
     authoritative_tick: u64,
-) -> (&'static str, Option<u64>) {
+) -> (&'static str, Option<u64>, Option<u64>) {
     let previous = freshness.insert(
         entity,
         ReplicaFreshness {
             last_refresh_tick: client_tick,
+            last_authoritative_tick: authoritative_tick,
             installed: true,
         },
     );
@@ -1211,14 +1214,17 @@ fn refresh_replica(
         "install"
     };
     let gap_ticks = previous.map(|replica| client_tick.saturating_sub(replica.last_refresh_tick));
+    let authoritative_gap_ticks =
+        previous.map(|replica| authoritative_tick.saturating_sub(replica.last_authoritative_tick));
     capture_replica_event(
         event,
         entity,
         client_tick,
         Some(authoritative_tick),
         gap_ticks,
+        authoritative_gap_ticks,
     );
-    (event, gap_ticks)
+    (event, gap_ticks, authoritative_gap_ticks)
 }
 
 fn capture_replica_event(
@@ -1227,14 +1233,16 @@ fn capture_replica_event(
     client_tick: u64,
     authoritative_tick: Option<u64>,
     gap_ticks: Option<u64>,
+    authoritative_gap_ticks: Option<u64>,
 ) {
     if std::env::var_os("ORRERY_REPLICA_CAPTURE").is_some() {
         eprintln!(
             "replica_capture event={event} entity={} client_tick={client_tick} \
-             authoritative_tick={} gap_ticks={}",
+             authoritative_tick={} gap_ticks={} authoritative_gap_ticks={}",
             entity.0,
             authoritative_tick.map_or_else(|| "none".to_owned(), |tick| tick.to_string()),
             gap_ticks.map_or_else(|| "none".to_owned(), |gap| gap.to_string()),
+            authoritative_gap_ticks.map_or_else(|| "none".to_owned(), |gap| gap.to_string()),
         );
     }
 }
@@ -1552,6 +1560,7 @@ mod tests {
             remote,
             ReplicaFreshness {
                 last_refresh_tick: 10,
+                last_authoritative_tick: 9,
                 installed: true,
             },
         )]);
@@ -1595,7 +1604,7 @@ mod tests {
 
         assert_eq!(
             measurement,
-            ("install", Some(201)),
+            ("install", Some(201), Some(201)),
             "a re-install reports the whole gap from its pre-expiry refresh"
         );
     }
