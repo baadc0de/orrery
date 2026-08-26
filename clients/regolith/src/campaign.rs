@@ -44,13 +44,16 @@ use bevy::math::{DVec3, IVec3};
 use bevy::prelude::*;
 use bytes::Bytes;
 
-use orrery_core::{CoreCodec, Executor};
+use orrery_core::{CoreCodec, Executor, InputLogProducer};
 use orrery_games::regolith::order::Outcome;
 use orrery_games::regolith::state::RegolithState;
+use orrery_games::regolith::REGOLITH_RULESET;
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::decode_replication;
 use orrery_protocol::UniverseSeed;
-use orrery_protocol::{cell_id_from_metres, CellId, PersistId, Tick, DEFAULT_CELL_EDGE_M};
+use orrery_protocol::{
+    cell_id_from_metres, CellId, FrameHead, PersistId, Tick, WitnessMsg, DEFAULT_CELL_EDGE_M,
+};
 
 use crate::intent::{decode_packet, Controls, IntentPipeline};
 use crate::net::{
@@ -64,6 +67,15 @@ const SEND_HZ: u32 = 20;
 
 /// Ticks between state broadcasts (`TICK_HZ / SEND_HZ`, floored at one).
 const SEND_EVERY_TICKS: u64 = (orrery_core::TICK_HZ / SEND_HZ) as u64;
+
+/// State claims are authored at the existing headless producer's 2 Hz cadence.
+const CLAIM_EVERY_TICKS: u64 = 30;
+
+/// Frames use the headless producer's D16-derived 10-tick cadence.
+const WITNESS_FRAME_TICKS: u16 = 10;
+
+/// P4's bounded witness fan-out (the same ring width as the host).
+const MAX_WITNESS_LINKS: usize = 7;
 
 /// How long the dial may take before the join attempt is declared failed.
 /// The handshake itself bounds each read at ten seconds; this adds dial and
@@ -265,6 +277,7 @@ pub struct CampaignRuntime {
 
     executor: Executor<Regolith>,
     pipeline: IntentPipeline,
+    witness_log: InputLogProducer,
     entity: PersistId,
     cell_edge_m: f64,
 
@@ -302,6 +315,20 @@ impl CampaignRuntime {
         // that pin session geometry.
         executor.insert(entity, game.spawn(entity, config.slot as u64));
         let pipeline = IntentPipeline::new(seed, entity, config.slot as u64, Vec::new());
+        let mut witness_log = InputLogProducer::new(
+            config.transport_secret.clone(),
+            entity,
+            REGOLITH_RULESET,
+            0,
+            CLAIM_EVERY_TICKS,
+            WITNESS_FRAME_TICKS,
+        );
+        let anchor_state = executor.state(entity).expect("spawn inserted").clone();
+        let anchor_claim = witness_log.anchor(0, &anchor_state);
+        let anchor = net::AnchorFrame {
+            claim_json: serde_json::to_vec(&anchor_claim).expect("StateClaim serializes"),
+            state: anchor_state.to_canonical(),
+        };
         let campaign = CampaignSession::new(
             config.session_id.clone(),
             config.wall_start_utc.clone(),
@@ -347,6 +374,7 @@ impl CampaignRuntime {
             let transport_secret = config.transport_secret.clone();
             let client_rev = crate::BUILD_REV.to_owned();
             let session_id = config.session_id.clone();
+            let anchor = anchor.clone();
             // A malformed token hex is a named join failure, not a silently
             // tokenless join the host would refuse with a confusing reason.
             let token = match config.session_token_hex.as_deref().map(decode_hex) {
@@ -369,7 +397,7 @@ impl CampaignRuntime {
                         let deadline = std::time::Duration::from_secs(JOIN_DEADLINE_SECS);
                         let link = tokio::time::timeout(
                             deadline,
-                            net::remote_join(&endpoint, addr, &request, slot),
+                            net::remote_join(&endpoint, addr, &request, slot, Some(anchor)),
                         )
                         .await
                         .map_err(|_| format!("the join did not complete within {deadline:?}"))??;
@@ -383,6 +411,7 @@ impl CampaignRuntime {
             config,
             executor,
             pipeline,
+            witness_log,
             entity,
             campaign,
             pending_join,
@@ -400,6 +429,7 @@ impl CampaignRuntime {
         config: CampaignConfig,
         executor: Executor<Regolith>,
         pipeline: IntentPipeline,
+        witness_log: InputLogProducer,
         entity: PersistId,
         campaign: CampaignSession,
         pending_join: PendingJoin,
@@ -428,6 +458,7 @@ impl CampaignRuntime {
             config,
             executor,
             pipeline,
+            witness_log,
             entity,
             campaign,
             pending_join,
@@ -617,6 +648,14 @@ impl CampaignRuntime {
         }
         let tick = self.tick;
 
+        // The existing headless producer's order is load-bearing: a claim at
+        // T commits to pre-step state, while T's inputs and resulting hash land
+        // in the frame cut after the step.
+        let claim = self
+            .executor
+            .state(self.entity)
+            .and_then(|state| self.witness_log.cut_claim(tick.0, state));
+
         // ── Input: the exact pipeline the local session drives ────────────
         let packet = self.pipeline.human_packet(tick, controls);
         if let Err(error) = sink.append_orders(&packet) {
@@ -628,7 +667,9 @@ impl CampaignRuntime {
             events: Vec::new(),
         };
         if let Ok(orders) = decode_packet(&packet) {
+            self.witness_log.log_inputs(tick.0, &orders);
             if let Some(outcome) = self.executor.step_entity(self.entity, tick, &orders) {
+                self.witness_log.log_tick_hash(outcome.state_hash);
                 report.events.extend(outcome.events.iter().cloned());
                 // Damage delivery targets entities whose authority lives
                 // elsewhere; applying it locally would fork their state. It
@@ -640,6 +681,36 @@ impl CampaignRuntime {
                     .filter(|event| matches!(event, Outcome::DamageDealt { .. }))
                     .count() as u64;
             }
+        }
+        let authored = self.witness_log.cut_frame(tick.0);
+
+        // The exterior slot is last in the host's deterministic witness ring;
+        // its next peers wrap to slots 0..K. StreamShared matches the headless
+        // plugin's reliable shared stream and is not subject to datagram loss.
+        let witness_count = self.config.slot.min(MAX_WITNESS_LINKS);
+        if let Some(claim) = claim {
+            let payload = Bytes::from(orrery_protocol::channels::encode_witness(
+                &WitnessMsg::Claim(claim),
+            ));
+            self.publish_witness_payload(&link, witness_count, payload);
+        }
+        if let Some(authored) = authored {
+            let heads = authored
+                .transitions
+                .iter()
+                .map(|transition| FrameHead {
+                    entity: transition.entity,
+                    prev_head: transition.prev_head,
+                    head: transition.head,
+                })
+                .collect();
+            let payload = Bytes::from(orrery_protocol::channels::encode_witness(
+                &WitnessMsg::Frame {
+                    frame: authored.frame,
+                    heads,
+                },
+            ));
+            self.publish_witness_payload(&link, witness_count, payload);
         }
 
         // ── Outbound: canonical state to every island-mate ────────────────
@@ -738,8 +809,9 @@ impl CampaignRuntime {
                 }
                 Lane::StreamShared | Lane::StreamBulk => {
                     // Witness log frames and repairs ride the reliable lanes.
-                    // Consuming them is witnessing authoring — deliberately
-                    // out of #386's scope — so they are counted and dropped.
+                    // This client authors its own stream, but does not act as
+                    // a watcher for other subjects, so inbound witness data
+                    // is dropped.
                 }
             }
         }
@@ -774,6 +846,26 @@ impl CampaignRuntime {
             CellId::from_coords(IVec3::ZERO, orrery_protocol::INTEREST_LEVEL)
                 .expect("origin is representable")
         })
+    }
+
+    fn publish_witness_payload(
+        &mut self,
+        link: &CampaignLink,
+        witness_count: usize,
+        payload: Bytes,
+    ) {
+        for recipient in 0..witness_count {
+            if link
+                .try_uplink(net::Frame {
+                    peer: recipient as u32,
+                    lane: Lane::StreamShared,
+                    payload: payload.clone(),
+                })
+                .is_err()
+            {
+                self.uplink_shed += 1;
+            }
+        }
     }
 
     /// Finish the banking row. Idempotent: the row is written once.

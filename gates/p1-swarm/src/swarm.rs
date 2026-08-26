@@ -811,6 +811,13 @@ impl Swarm {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn exterior_witness_anchored(&self) -> Option<bool> {
+        self.exterior
+            .as_ref()
+            .map(|exterior| exterior.witness_anchored)
+    }
+
     /// A slot index's transport identity, bots and external alike.
     fn node_of(&self, index: usize) -> NodeId {
         match &self.exterior {
@@ -1188,14 +1195,14 @@ impl Swarm {
             match exterior.anchor.take() {
                 Some((claim, state)) => anchors.push((entity, node, claim, state)),
                 None => {
-                    // A rendered client (#387) authors no witness log and
-                    // says so with an empty anchor at join. The slot seats
+                    // A joiner with no witness log says so with an empty
+                    // anchor at join. The slot seats
                     // unanchored: no watcher is armed against it, nothing of
                     // it is shown or judged, and the report carries
                     // `witness_anchored: false` so a human hour cannot be
                     // mistaken for an independently witnessed one. The
-                    // headless runner still ships a real anchor and keeps
-                    // the armed path.
+                    // rendered and headless producers ship a real anchor and
+                    // take the armed path.
                     eprintln!(
                         "gates/p1-swarm: exterior slot {index} joined without a witness anchor;                          its own input stream is not independently witnessed this run"
                     );
