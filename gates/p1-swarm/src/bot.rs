@@ -1175,15 +1175,11 @@ impl Bot {
             let replication = orrery_net::channels::untag(&payload)
                 .filter(|(channel, _)| *channel == Channel::State)
                 .and_then(|(_, inner)| {
-                    orrery_net::channels::decode_replication::<(
-                        Vec<u8>,
-                        CellId,
-                        PersistId,
-                        u64,
-                    )>(inner)
+                    orrery_net::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(
+                        inner,
+                    )
                 });
-            if let Some((encoded, _cell, entity, observed_tick)) = replication
-            {
+            if let Some((encoded, _cell, entity, observed_tick)) = replication {
                 if entity == from_entity && entity != self.entity {
                     if let Ok(state) = RegolithState::decode(&encoded) {
                         self.executor.insert_observed(
@@ -1638,7 +1634,7 @@ mod tests {
             count: 2,
             seed: UniverseSeed([0x51; 32]),
             cell_edge_m: default_cell_edge_m(),
-            witnessing: false,
+            witnessing: true,
             cheat: None,
             enforcing: false,
         };
@@ -1670,6 +1666,18 @@ mod tests {
 
         bot.step_core(1, spec.cell_edge_m);
 
+        let authored = bot
+            .chain
+            .as_mut()
+            .expect("witnessing installed the live producer")
+            .cut_frame(u64::from(FRAME_TICKS) - 1)
+            .expect("the frame interval closes");
+        assert!(authored.frame.entities[0].records.iter().any(|record| {
+            matches!(
+                record.source,
+                RecordSource::NeighborFrame { neighbor, .. } if neighbor == other_id
+            )
+        }));
         assert!(bot.drain_delivered().into_iter().any(|(recipient, order)| {
             recipient == other_id
                 && matches!(
