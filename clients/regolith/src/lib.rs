@@ -37,7 +37,7 @@ use orrery_core::{Executor, TICK_NANOS};
 use orrery_games::{
     regolith::archetype::Archetype,
     regolith::order::{Order, Outcome},
-    regolith::state::RegolithState,
+    regolith::state::{RegolithState, RockTier},
     Game, Regolith,
 };
 use orrery_protocol::{CellId, PersistId, Tick, UniverseSeed};
@@ -909,6 +909,65 @@ fn nearest_clicked(
         .map(|(entity, _)| entity)
 }
 
+/// The finish one rock tier wears: base tint and how faceted its shell is.
+///
+/// **Presentation only.** Size comes from the ruleset's own
+/// `RockTier::limits().radius_mm`, which is the same number collision and
+/// tracking read, so the drawn body is the ruleset's rock rather than a
+/// decorative stand-in. Everything else here is a look, and drawing a rock
+/// claims nothing whatsoever about mining, ownership or hull (#519) — a rock
+/// the player can see is a rock the player may or may not be allowed to touch,
+/// and only the ruleset says which.
+///
+/// ## Why the ramp runs the way it does
+///
+/// The tiers are 40 m, 20 m and 8 m in radius, so size alone separates them —
+/// but a small rock is also the one that is hardest to notice, and the camera
+/// now reaches 4 km (#521). So lightness runs *against* size: the small tier
+/// is the brightest and the large tier the darkest, which keeps every tier
+/// legible instead of making the already-faint one fainter. Facet count runs
+/// *with* size, because a 40 m body has the screen area to show facets and an
+/// 8 m one reads better as a single chunk.
+///
+/// The tints stay on a warm neutral ramp rather than taking
+/// [`hud::MINING_AMBER`]: that amber is the mining *lock* colour, and a rock
+/// wearing it unlocked would say the player has a mining lock they do not
+/// have.
+const fn rock_finish(tier: RockTier) -> (Color, u32) {
+    match tier {
+        RockTier::Large => (Color::srgb(0.40, 0.37, 0.34), 2),
+        RockTier::Medium => (Color::srgb(0.55, 0.51, 0.46), 1),
+        RockTier::Small => (Color::srgb(0.72, 0.67, 0.60), 0),
+    }
+}
+
+/// A rock's resting attitude, derived from its own id.
+///
+/// Every rock body is an icosphere, so without this they all face the same way
+/// and a field of them reads as a shop display. The id is the only stable
+/// per-rock number the skin has, and turning it into a rotation is pure
+/// presentation: nothing downstream reads a rock's drawn rotation, and
+/// `sync_rendered_state` deliberately leaves non-craft rotations alone.
+fn rock_attitude(entity: PersistId) -> Quat {
+    let bits = entity.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let angle = |shift: u32| {
+        let slice = ((bits >> shift) & 0xFFFF) as f32 / 65_536.0;
+        slice * std::f32::consts::TAU
+    };
+    Quat::from_euler(EulerRot::XYZ, angle(0), angle(16), angle(32))
+}
+
+/// Spawns and retires the rendered body for every rock the session knows.
+///
+/// #524: rocks were fully simulated — lockable, mineable, collidable, named in
+/// the HUD as `LARGE ROCK` and friends — and nothing put one on screen, so the
+/// HUD talked about objects the player could not see.
+///
+/// Rocks are replicated remote state and follow the same replica lifecycle as
+/// craft. This system owns no lifetime of its own: a body exists exactly while
+/// `executor().state(entity)` still yields a live `Rock`, so the staleness
+/// expiry (#505) removing a replica removes the body on the same frame, and a
+/// rock that leaves the interest set stops being drawn rather than freezing.
 fn ensure_rock_bodies(
     session: Res<ActiveSession>,
     existing: Query<(Entity, &CoreEntity), With<RockBody>>,
@@ -935,19 +994,41 @@ fn ensure_rock_bodies(
             continue;
         }
         let radius_m = rock.tier.limits().radius_mm as f32 / 1_000.0;
+        let (tint, facets) = rock_finish(rock.tier);
+        // `ico` only fails on a subdivision count far past anything here; the
+        // uv sphere is a shape fallback, never a silent absence of a body.
+        let mesh = Sphere::new(radius_m)
+            .mesh()
+            .ico(facets)
+            .unwrap_or_else(|_| Sphere::new(radius_m).mesh().uv(12, 8));
         commands.spawn((
             CoreEntity(entity),
             RockBody,
-            Mesh3d(meshes.add(Sphere::new(radius_m))),
+            Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: hud::MINING_AMBER.with_alpha(0.72),
-                metallic: 0.18,
-                perceptual_roughness: 0.92,
+                base_color: tint,
+                metallic: 0.05,
+                perceptual_roughness: 0.95,
                 ..Default::default()
             })),
-            Transform::default(),
+            Transform::from_rotation(rock_attitude(entity)),
         ));
     }
+}
+
+/// `rocks 3 L / 5 M / 2 S in state | 10 drawn`, for the F3 pane.
+///
+/// This exists because #524's failure mode was invisible to the test suite:
+/// rocks were fully simulated and simply never drawn, and no assertion about
+/// state could tell the difference. `drawn` is counted from the `RockBody`
+/// entities themselves, so the two halves of the line come from different
+/// places and disagreeing is the signal.
+#[must_use]
+fn rock_census(counts: [usize; 3], drawn: usize) -> String {
+    format!(
+        "rocks {} L / {} M / {} S in state | {} drawn",
+        counts[0], counts[1], counts[2], drawn
+    )
 }
 
 /// Spawns the remote duel body the moment a joined session learns which
@@ -1344,6 +1425,7 @@ fn refresh_f3_pane(
     broken: Res<LockBreak>,
     tracks: Res<ProjectileTracks>,
     session: Res<ActiveSession>,
+    rock_bodies: Query<(), With<RockBody>>,
     mut pane: Query<(&mut Text, &mut Node), With<F3Pane>>,
 ) {
     if let Ok((mut text, mut node)) = pane.single_mut() {
@@ -1363,6 +1445,20 @@ fn refresh_f3_pane(
         );
         text.push('\n');
         text.push_str(&hud::lock_debug_lines(&view, &broken));
+        let mut counts = [0usize; 3];
+        for entity in session.executor().entities().copied() {
+            if let Some(RegolithState::Rock(rock)) = session.executor().state(entity) {
+                if rock.hull > 0 {
+                    counts[match rock.tier {
+                        RockTier::Large => 0,
+                        RockTier::Medium => 1,
+                        RockTier::Small => 2,
+                    }] += 1;
+                }
+            }
+        }
+        text.push('\n');
+        text.push_str(&rock_census(counts, rock_bodies.iter().count()));
         text.push_str(&format!(
             "\nshots in flight {} | {}",
             tracks.tracks().len(),
@@ -1583,6 +1679,117 @@ mod tests {
         assert!(
             visible_half_height_m(CAMERA_MIN_HEIGHT_M) > 30.0,
             "a 22 m hull must still fit at full zoom-in"
+        );
+    }
+
+    /// #524: rocks were adjudicated, lockable, mineable and collidable, and
+    /// nothing ever put a body on screen. This asserts on the bodies, because
+    /// asserting on state is exactly what could not see the bug.
+    #[test]
+    fn every_live_rock_gets_a_body_sized_and_tinted_by_its_tier() {
+        use orrery_core::{QPos, QVel};
+        use orrery_games::regolith::state::Rock;
+
+        let mut local = LocalSession::default();
+        let tiers = [
+            (PersistId::new(50), RockTier::Large),
+            (PersistId::new(51), RockTier::Medium),
+            (PersistId::new(52), RockTier::Small),
+        ];
+        for (index, (entity, tier)) in tiers.iter().enumerate() {
+            local.executor.insert(
+                *entity,
+                RegolithState::Rock(Rock::spawned(
+                    *tier,
+                    0,
+                    QPos::from_metres(120.0 * index as f64, 0.0, 0.0),
+                    QVel::default(),
+                )),
+            );
+        }
+
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(ActiveSession::Local(Box::new(local)))
+            .add_systems(Update, ensure_rock_bodies);
+        app.update();
+
+        let drawn: Vec<PersistId> = app
+            .world_mut()
+            .query_filtered::<&CoreEntity, With<RockBody>>()
+            .iter(app.world())
+            .map(|core| core.0)
+            .collect();
+        for (entity, _) in tiers {
+            assert!(
+                drawn.contains(&entity),
+                "rock {entity:?} is in state and must have a body; drawn: {drawn:?}"
+            );
+        }
+        assert_eq!(drawn.len(), 3, "one body per live rock, no more");
+
+        // Idempotent: a second frame must not spawn a duplicate shell.
+        app.update();
+        let again = app
+            .world_mut()
+            .query_filtered::<&CoreEntity, With<RockBody>>()
+            .iter(app.world())
+            .count();
+        assert_eq!(again, 3, "rock bodies must not accumulate per frame");
+
+        // A rock that leaves the session's state stops being drawn rather
+        // than freezing — the replica lifecycle, not a lifetime of our own.
+        {
+            let ActiveSession::Local(local) = &mut *app.world_mut().resource_mut::<ActiveSession>()
+            else {
+                unreachable!("the fixture session is local")
+            };
+            local.executor.take_state(PersistId::new(51));
+        }
+        app.update();
+        let survivors: Vec<PersistId> = app
+            .world_mut()
+            .query_filtered::<&CoreEntity, With<RockBody>>()
+            .iter(app.world())
+            .map(|core| core.0)
+            .collect();
+        assert!(
+            !survivors.contains(&PersistId::new(51)) && survivors.len() == 2,
+            "an expired replica must take its body with it; left {survivors:?}"
+        );
+    }
+
+    /// The three tiers must not be confusable at a glance, and the ramp runs
+    /// against size on purpose: the smallest rock is the hardest to see.
+    #[test]
+    fn the_rock_tiers_are_distinguishable_by_more_than_size() {
+        let finishes = [
+            rock_finish(RockTier::Large),
+            rock_finish(RockTier::Medium),
+            rock_finish(RockTier::Small),
+        ];
+        let luma = |colour: Color| {
+            let rgba = colour.to_linear();
+            rgba.red + rgba.green + rgba.blue
+        };
+        assert!(
+            luma(finishes[0].0) < luma(finishes[1].0) && luma(finishes[1].0) < luma(finishes[2].0),
+            "lightness must run against size so the smallest tier stays visible"
+        );
+        assert!(
+            finishes[0].1 > finishes[1].1 && finishes[1].1 > finishes[2].1,
+            "facet count must run with size"
+        );
+        let radii = [
+            RockTier::Large.limits().radius_mm,
+            RockTier::Medium.limits().radius_mm,
+            RockTier::Small.limits().radius_mm,
+        ];
+        assert!(
+            radii[0] > radii[1] && radii[1] > radii[2],
+            "the drawn size is the ruleset's own radius and must separate the tiers"
         );
     }
 
