@@ -1051,11 +1051,20 @@ impl Bot {
     }
 
     #[cfg(test)]
+    /// Replaces the authored craft with a captured live-state fixture.
+    pub fn replace_craft_for_test(&mut self, craft: Craft) {
+        self.executor
+            .insert(self.entity, RegolithState::Craft(craft));
+    }
+
+    #[cfg(test)]
+    /// Injects one prior-tick delivery without bypassing delivered-first composition.
     pub fn inject_delivered(&mut self, from: PersistId, order: Order) {
         self.delivered_inbox.push((from, order));
     }
 
     #[cfg(test)]
+    /// Drains target-authored shot verdicts observed at the real step boundary.
     pub fn take_resolved_shots(&mut self) -> Vec<Outcome> {
         core::mem::take(&mut self.resolved_shots)
     }

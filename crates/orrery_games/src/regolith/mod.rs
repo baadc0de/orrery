@@ -90,9 +90,9 @@ const CAMPAIGN_ORBIT_RADIUS_M: f64 = 2_500.0;
 const CAMPAIGN_CROWD_ARC_RAD: f64 = 0.08;
 const CAMPAIGN_RADIAL_SPREAD: f64 = 0.10;
 
-/// Regolith v13's rules identity: target-owned lock-class confirmation.
+/// Regolith v14's rules identity: firing arcs are decided once per projectile.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 13,
+    version: 14,
     digest: [0x66; 32],
 };
 
@@ -998,12 +998,18 @@ fn projectile_resolution(
     if !target_alive {
         return ProjectileResolution::Break(LockBreakReason::TargetDestroyed);
     }
-    if !in_firing_arc(
-        attacker_archetype,
-        attacker_yaw_urad,
-        attacker_pos,
-        target_pos,
-    ) {
+    // The initial delivery decides the firing-time fact. `Some` is a
+    // target-authored continuation of that accepted projectile; rechecking
+    // against the target's later position turns movement during flight into
+    // a retroactive OutOfArc refusal before the hit roll.
+    if flight_ticks.is_none()
+        && !in_firing_arc(
+            attacker_archetype,
+            attacker_yaw_urad,
+            attacker_pos,
+            target_pos,
+        )
+    {
         return ProjectileResolution::OutOfArc;
     }
     let weapon = weapon_kind.weapon();

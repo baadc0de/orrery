@@ -1974,20 +1974,9 @@ mod tests {
         use orrery_games::Regolith;
         use orrery_protocol::Tick;
 
-        let config = SwarmConfig {
-            peers: 8,
-            seconds: 0,
-            cell_edge_m: crate::bot::default_cell_edge_m(),
-            send_hz: 20,
-            impairment: Impairment::p4_profile(),
-            seed: 0x61,
-            late_join_tick: None,
-            witnessing: false,
-            cheats: None,
-            enforcing: false,
-            started_at_unix_secs: None,
-        };
-        let seed = UniverseSeed([0x61; 32]);
+        let mut universe = [0u8; 32];
+        universe[..8].copy_from_slice(&0x61_u64.to_le_bytes());
+        let seed = UniverseSeed(universe);
         let shooter = PersistId::new(9);
         let target = PersistId::new(3);
         let shooter_pos = orrery_core::QPos {
@@ -2002,16 +1991,30 @@ mod tests {
         shooter_state.lock_progress = LOCK_ACQUISITION_TICKS;
         let mut shooter_executor = Executor::new(Regolith::honest(), seed);
         shooter_executor.insert(shooter, RegolithState::Craft(shooter_state));
-        let mut swarm = Swarm::new(config);
-        swarm.form_island();
-        let mut phase = [0u128; 6];
-        for tick in 0..505 {
-            if tick == 282 {
-                swarm.bots[2]
-                    .inject_delivered(shooter, Order::LockRequested { locker: shooter });
-            }
-            swarm.tick_once(tick, 3, &mut phase);
-        }
+        let mut target_bot = Bot::new(BotSpec {
+            index: 2,
+            count: 8,
+            seed,
+            cell_edge_m: crate::bot::default_cell_edge_m(),
+            witnessing: false,
+            cheat: None,
+            enforcing: false,
+        });
+        let mut target_state = Craft::spawned(
+            Archetype::Interceptor,
+            orrery_core::QPos {
+                x: 2_335_587,
+                y: 0,
+                z: 489_809,
+            },
+            2_391_612,
+        );
+        target_state.vel = orrery_core::QVel {
+            x: -13_623,
+            y: 0,
+            z: 50_517,
+        };
+        target_bot.replace_craft_for_test(target_state);
 
         let fired = shooter_executor
             .step_entity(shooter, Tick::new(505), &[Order::Fire])
@@ -2022,7 +2025,7 @@ mod tests {
             .find_map(|event| shooter_executor.ruleset().deliver(event))
             .map(|(_, order)| order)
             .expect("the mature lock emits damage");
-        let target_pos = swarm.bots[2].craft().pos;
+        let target_pos = target_bot.craft().pos;
         let measurement =
             firing_arc_measurement(Archetype::Interceptor, shooter_yaw, shooter_pos, target_pos);
         assert_eq!(
@@ -2037,22 +2040,23 @@ mod tests {
         assert_eq!(measurement.world_bearing_urad, Some(2_350_207));
         assert_eq!(measurement.relative_urad, Some(5_554_008));
         assert!(measurement.inside, "the shot starts inside the drawn arc");
-        swarm.bots[2].inject_delivered(shooter, damage);
+        target_bot.inject_delivered(shooter, damage);
 
         let mut resolution = None;
         for tick in 505..600 {
-            swarm.tick_once(tick, 3, &mut phase);
-            resolution = swarm.bots[2]
-                .take_resolved_shots()
-                .into_iter()
-                .find_map(|event| match event {
-                    Outcome::ShotResolved {
-                        attacker,
-                        target: resolved_target,
-                        result,
-                    } if attacker == shooter && resolved_target == target => Some(result),
-                    _ => None,
-                });
+            target_bot.step_core(tick, crate::bot::default_cell_edge_m());
+            resolution =
+                target_bot
+                    .take_resolved_shots()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        Outcome::ShotResolved {
+                            attacker,
+                            target: resolved_target,
+                            result,
+                        } if attacker == shooter && resolved_target == target => Some(result),
+                        _ => None,
+                    });
             if resolution.is_some() {
                 break;
             }
