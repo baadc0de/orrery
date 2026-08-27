@@ -246,7 +246,7 @@ pub fn read_aoi_boundary(session: Res<crate::ActiveSession>, mut boundary: ResMu
 /// What the fade actually did this frame, and the darkest it has ever gone.
 ///
 /// **An evidence affordance, and deliberately a thin one**, in the same spirit
-/// as [`crate::rock_census`]. #533 is a claim about what the player sees, and
+/// as the rock census. #533 is a claim about what the player sees, and
 /// the failure mode every presentation bug in this client has had (#517, #524,
 /// #514) is a correct number that never reaches a pixel — so this is recorded
 /// *inside* [`sync_aoi_fade`], from the opacity that was written to the
