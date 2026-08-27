@@ -464,6 +464,32 @@ pub const AREA_LOAD_ERR_COLD: u8 = 2;
 /// tinguishable from a cell that genuinely holds nothing, and a node owning no
 /// shard over the cell is not entitled to make that claim.
 pub const AREA_LOAD_ERR_WRONG_OWNER: u8 = 3;
+/// [`GatewayReply::AreaLoadError`] kind: the cell lies outside the subtrees
+/// the coordinator granted this peer, so the gateway will not read it.
+///
+/// The read path is where an interest grant's expiry and extent are enforced
+/// (D25 rule 3), and a subscribe is a read: a peer that may not claim a cell
+/// may not page it in either. Distinct from [`AREA_LOAD_ERR_WRONG_OWNER`]
+/// because the address is fine and the *asker* is not — the remedy is a fresh
+/// grant from the coordinator, not another node.
+pub const AREA_LOAD_ERR_NOT_GRANTED: u8 = 4;
+/// [`GatewayReply::AreaLoadError`] kind: the subscribe named more cells than
+/// [`MAX_SUBSCRIBE_CELLS`], and the whole request was refused.
+///
+/// Reported once, against the first cell named, because the point of the bound
+/// is that the gateway does not walk a list this long — not even to answer it.
+pub const AREA_LOAD_ERR_TOO_MANY_CELLS: u8 = 5;
+
+/// The most cells one [`GatewayMsg::Subscribe`] may name.
+///
+/// The same bound a signed interest grant carries
+/// ([`MAX_INTEREST_GRANT_CELLS`](crate::MAX_INTEREST_GRANT_CELLS)), and for
+/// the same reason: the 27-cell neighbourhood is the interest set (D5), the
+/// allowance over it lets a boundary crossing span two, and a finite cap is
+/// what stops one request from naming an unbounded amount of work. A subscribe
+/// cannot be answered for more cells than a grant can cover, so a larger bound
+/// here would only buy an attacker a longer walk.
+pub const MAX_SUBSCRIBE_CELLS: usize = crate::MAX_INTEREST_GRANT_CELLS;
 
 /// [`GatewayReply::BulkNack`] reason: the journal refused or dropped the
 /// append, or the lease store could not be written.

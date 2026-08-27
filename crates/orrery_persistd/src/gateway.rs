@@ -1035,6 +1035,105 @@ impl CoveringPeers {
 /// Shared coordinator-interest authority injected into a gateway.
 pub type SharedInterestAuthority = Arc<dyn InterestAuthority>;
 
+/// Whether a gateway scopes area reads to the caller's coordinator interest.
+///
+/// This is not one of D32 clause (c)'s five ramped controls and gets no
+/// `ramp/` row. Like D29's annulment-on-expiry (D32 clause (h)) it convicts
+/// nobody: it refuses a request, strikes no account, and has no
+/// false-positive cohort to protect — so it is fail-closed machinery, live
+/// from the day it lands, not a control to ramp.
+///
+/// What the two arms actually distinguish is whether the deployment has any
+/// evidence of interest *at all*. A gateway started without `--coordinator-key`
+/// holds a [`DenyAllInterestAuthority`]: no peer can ever prove interest to it,
+/// so enforcing there would refuse every area load in the cluster rather than
+/// the ungranted ones. That is a missing input, not a policy. `Unscoped`
+/// therefore still runs the whole predicate and counts every cell it would
+/// have refused ([`GatewayAreaSnapshot::unscoped_cells`]) — D32 clause (b)'s
+/// first shadow obligation, adopted voluntarily — so the gap is measurable
+/// before it is closed, and closing it is one flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AreaInterestScoping {
+    /// Refuse every cell outside the caller's coordinator grant.
+    #[default]
+    Enforced,
+    /// Serve them, and count them. For a deployment with no coordinator key,
+    /// where no grant can exist to be checked against.
+    Unscoped,
+}
+
+impl AreaInterestScoping {
+    /// Stable CLI spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforced => "enforced",
+            Self::Unscoped => "unscoped",
+        }
+    }
+
+    /// Whether an ungranted cell is refused rather than merely counted.
+    #[must_use]
+    pub const fn enforces(self) -> bool {
+        matches!(self, Self::Enforced)
+    }
+}
+
+impl core::str::FromStr for AreaInterestScoping {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "enforced" => Ok(Self::Enforced),
+            "unscoped" => Ok(Self::Unscoped),
+            _ => Err("expected enforced or unscoped"),
+        }
+    }
+}
+
+impl core::fmt::Display for AreaInterestScoping {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Whether `cell` lies inside a subtree the coordinator currently grants
+/// `peer` in `grid` — the read path's interest test.
+///
+/// Deliberately **not** [`InterestAuthority::allows`], and the difference is
+/// the point rather than an oversight. `allows` is exact membership because it
+/// answers claim admission and `Expire` fan-out, where the question is "does
+/// this peer hold authority over *this* cell" and an ancestor is not an
+/// answer. A read asks something weaker and hierarchical: a grant names
+/// subtrees (D5 — a `CellId` *is* its subtree, [`CellId::is_prefix_of`]), and
+/// a peer granted a cell may page in anything under it.
+///
+/// The level floor falls out of that rather than being a second rule.
+/// `is_prefix_of` is false for every cell **coarser** than a granted one, so a
+/// peer granted its 27-cell neighbourhood cannot name their parent, and cannot
+/// name [`CellId::ROOT`] — whose subtree is every `world/` key in the grid
+/// (see the `keyspace` module), one request demanding an unbounded range scan.
+/// Only a coordinator that granted the root can ask for the root, and that is
+/// a coordinator decision rather than a client one.
+#[must_use]
+pub fn interest_covers_read(
+    interest: &dyn InterestAuthority,
+    peer: NodeId,
+    grid: GridId,
+    cell: CellId,
+    now_ms: u64,
+) -> bool {
+    interest.snapshot_for(peer).is_some_and(|snapshot| {
+        snapshot.peer == peer
+            && snapshot.grid == grid
+            && snapshot.valid_until_ms > now_ms
+            && snapshot
+                .covered_cells
+                .iter()
+                .any(|granted| granted.is_prefix_of(cell))
+    })
+}
+
 /// The most peers whose interest a gateway retains at once.
 ///
 /// Sized against the peer registry: a grant is only useful while its peer has
@@ -2301,6 +2400,27 @@ pub struct GatewayAreaSnapshot {
     pub first_page_us_sum: u64,
     /// Largest receipt-through-first-page server span, microseconds.
     pub first_page_us_max: u64,
+    /// Subscribes dropped before any cell was looked at because the
+    /// connection has no session: nothing had passed admission, so there was
+    /// no peer whose interest could be tested.
+    pub refused_no_session: u64,
+    /// Subscribes refused whole for naming more than
+    /// [`MAX_SUBSCRIBE_CELLS`](orrery_protocol::MAX_SUBSCRIBE_CELLS) cells.
+    ///
+    /// Counted per *request*, not per cell — the list is never walked.
+    pub refused_over_cap: u64,
+    /// Cells refused because they lie outside the subtrees the coordinator
+    /// granted the caller. Counted per cell: one subscribe can be refused for
+    /// some of its cells and served for the rest.
+    pub refused_ungranted_cells: u64,
+    /// Cells an [`AreaInterestScoping::Unscoped`] gateway served that a scoped
+    /// one would have refused.
+    ///
+    /// The shadow count, and the reason `Unscoped` is a posture rather than an
+    /// absent check: a deployment with no coordinator key can still read how
+    /// much of its area traffic is unproven, which is what makes the flag
+    /// worth turning on.
+    pub unscoped_cells: u64,
 }
 
 /// Always-on area-load telemetry: the receipt-through-first-page server span
@@ -2317,6 +2437,10 @@ pub struct GatewayAreaMetrics {
     cell_read_errors: AtomicU64,
     first_page_us_sum: AtomicU64,
     first_page_us_max: AtomicU64,
+    refused_no_session: AtomicU64,
+    refused_over_cap: AtomicU64,
+    refused_ungranted_cells: AtomicU64,
+    unscoped_cells: AtomicU64,
     latency: GatewayServerLatency,
 }
 
@@ -2332,6 +2456,10 @@ impl GatewayAreaMetrics {
             cell_read_errors: load(&self.cell_read_errors),
             first_page_us_sum: load(&self.first_page_us_sum),
             first_page_us_max: load(&self.first_page_us_max),
+            refused_no_session: load(&self.refused_no_session),
+            refused_over_cap: load(&self.refused_over_cap),
+            refused_ungranted_cells: load(&self.refused_ungranted_cells),
+            unscoped_cells: load(&self.unscoped_cells),
         }
     }
 
@@ -2351,6 +2479,23 @@ impl GatewayAreaMetrics {
 
     fn record_cell_read_error(&self) {
         self.cell_read_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refused_no_session(&self) {
+        self.refused_no_session.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refused_over_cap(&self) {
+        self.refused_over_cap.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refused_ungranted_cells(&self, cells: u64) {
+        self.refused_ungranted_cells
+            .fetch_add(cells, Ordering::Relaxed);
+    }
+
+    fn record_unscoped_cells(&self, cells: u64) {
+        self.unscoped_cells.fetch_add(cells, Ordering::Relaxed);
     }
 
     fn record_first_page(&self, server_us: u64) {
@@ -3025,6 +3170,17 @@ pub struct GatewayConfig {
     /// plausibility checks. The default denies every peer until coordinator
     /// transport injects a snapshot authority.
     pub interest_authority: SharedInterestAuthority,
+    /// Whether `Subscribe` refuses cells outside the caller's coordinator
+    /// grant, or serves them and counts them.
+    ///
+    /// Defaults to [`AreaInterestScoping::Enforced`]: an area read is a read
+    /// of the world, and the grant is what says which part of the world a peer
+    /// is entitled to see. `persistd` demotes it to
+    /// [`AreaInterestScoping::Unscoped`] when it is started with no
+    /// `--coordinator-key`, because the default
+    /// [`DenyAllInterestAuthority`] can never say yes and enforcing against it
+    /// would refuse every page-in in the cluster.
+    pub area_interest_scoping: AreaInterestScoping,
     /// The verified cache of coordinator witness-set announcements
     /// (D28 clause (f)), and the holder of each live cell-epoch's `draw_key`
     /// (D27 clause (d)).
@@ -3151,6 +3307,7 @@ impl Default for GatewayConfig {
             validator: Arc::new(PermissiveValidator),
             bulk_ack_admission: Arc::new(FreshBulkAckAdmission),
             interest_authority: Arc::new(DenyAllInterestAuthority),
+            area_interest_scoping: AreaInterestScoping::default(),
             witness_epochs: None,
             authorizer: Arc::new(DenyAllGatewayAuthorizer),
             identity_clock: Arc::new(SystemGatewayClock),
@@ -5224,6 +5381,7 @@ impl GatewayServer {
         let validator = config.validator;
         let bulk_ack_admission = config.bulk_ack_admission;
         let interest_authority = config.interest_authority;
+        let area_interest_scoping = config.area_interest_scoping;
         let witness_epochs = config.witness_epochs;
         // C5's consumption half. A feed plus its posture move together (see
         // [`GatewayConfig::strikes_posture`]); with no feed the consumer state
@@ -5284,6 +5442,7 @@ impl GatewayServer {
             validator,
             bulk_ack_admission,
             Arc::clone(&interest_authority),
+            area_interest_scoping,
             witness_epochs.clone(),
             admission,
             standing_feed,
@@ -5871,6 +6030,7 @@ async fn accept_loop(
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
     interest_authority: SharedInterestAuthority,
+    area_interest_scoping: AreaInterestScoping,
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     admission: GatewayAdmission,
     standing_feed: Option<SharedStandingInvalidationFeed>,
@@ -6011,6 +6171,7 @@ async fn accept_loop(
                     validator,
                     bulk_ack_admission,
                     interest_authority,
+                    area_interest_scoping,
                     witness_epochs,
                     admission,
                     authority_correction_signer,
@@ -6047,6 +6208,7 @@ async fn handle_connection(
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
     interest_authority: SharedInterestAuthority,
+    area_interest_scoping: AreaInterestScoping,
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     admission: GatewayAdmission,
     authority_correction_signer: iroh::SecretKey,
@@ -6537,6 +6699,99 @@ async fn handle_connection(
                 let received_at = Instant::now();
                 // Pages answer on the area lane, not the control lane.
                 let send = Arc::clone(&send_area);
+                // Keep identity/interest/admission checks at the edge, the
+                // same rule the intent arm below states, and for a stronger
+                // reason on this lane: an area read is the only message a
+                // client can send that makes the gateway *emit* world state.
+                // Every check here is arithmetic on already-decoded fields —
+                // no lock, no await, no permit — so a refused subscribe never
+                // occupies one of this connection's control slots, and the
+                // refusals are counted rather than queued
+                // (docs/08-persistence.md §2.1: only destroying work drains a
+                // standing queue).
+                //
+                // Order is load-bearing. The cap runs first because it is the
+                // only check that does not walk the list, and everything after
+                // it is therefore bounded at MAX_SUBSCRIBE_CELLS replies.
+                if cells.len() > orrery_protocol::MAX_SUBSCRIBE_CELLS {
+                    metrics.area.record_refused_over_cap();
+                    warn!(
+                        %remote,
+                        %grid,
+                        named = cells.len(),
+                        cap = orrery_protocol::MAX_SUBSCRIBE_CELLS,
+                        "gateway: refused a subscribe naming more cells than one request may carry"
+                    );
+                    // One reply, against the first cell named: answering per
+                    // cell would be the walk this bound exists to refuse. The
+                    // list cannot be empty here — it is longer than the cap.
+                    if let Some(first) = cells.first().copied() {
+                        send(Bytes::from(encode_stream_frame(
+                            &GatewayReply::AreaLoadError {
+                                cell: first,
+                                kind: orrery_protocol::AREA_LOAD_ERR_TOO_MANY_CELLS,
+                            },
+                        )));
+                    }
+                    continue;
+                }
+                // Silent, like the `InterestGrant` and `WitnessEpoch` arms
+                // above and for their reason: a connection that has not passed
+                // admission has no verified identity, so there is no peer whose
+                // interest could be tested and nothing this gateway owes it an
+                // explanation about.
+                if session.as_ref().is_none() {
+                    metrics.area.record_refused_no_session();
+                    debug!(%remote, %grid, "gateway: subscribe before Hello");
+                    continue;
+                }
+                let now_ms = registrar_now_ms();
+                let (cells, ungranted): (Vec<CellId>, Vec<CellId>) =
+                    cells.into_iter().partition(|cell| {
+                        interest_covers_read(
+                            interest_authority.as_ref(),
+                            remote,
+                            grid,
+                            *cell,
+                            now_ms,
+                        )
+                    });
+                let (cells, ungranted) = if area_interest_scoping.enforces() {
+                    (cells, ungranted)
+                } else {
+                    // Unscoped: the predicate still ran, and what it would have
+                    // refused is counted before the cell is served anyway.
+                    metrics.area.record_unscoped_cells(ungranted.len() as u64);
+                    let mut served = cells;
+                    served.extend(ungranted);
+                    (served, Vec::new())
+                };
+                if !ungranted.is_empty() {
+                    metrics
+                        .area
+                        .record_refused_ungranted_cells(ungranted.len() as u64);
+                    warn!(
+                        %remote,
+                        %grid,
+                        refused = ungranted.len(),
+                        "gateway: refused subscribe cells outside the caller's interest grant"
+                    );
+                    // Per cell, because every requested cell gets a reply
+                    // (docs/08-persistence.md §9) and a client that heard
+                    // nothing back for a cell would resubscribe forever. The
+                    // count is bounded by the cap above.
+                    for cell in ungranted {
+                        send(Bytes::from(encode_stream_frame(
+                            &GatewayReply::AreaLoadError {
+                                cell,
+                                kind: orrery_protocol::AREA_LOAD_ERR_NOT_GRANTED,
+                            },
+                        )));
+                    }
+                }
+                if cells.is_empty() {
+                    continue;
+                }
                 let router = Arc::clone(&router);
                 let metrics = Arc::clone(&metrics);
                 let permit = Arc::clone(&inflight_control).acquire_owned().await;
@@ -11716,6 +11971,89 @@ mod tests {
         )]);
         assert!(!covered.allows(peer, GridId::new(7), cell, 100));
         assert!(!covered.allows(peer, grid, CellId::ROOT.children()[0], 100));
+    }
+
+    /// The read predicate follows the grant *down* the tree and never up
+    /// (#544).
+    ///
+    /// Both halves matter and they are separate claims. Downward: a grant
+    /// names subtrees, so a peer granted a cell may page anything inside it,
+    /// and requiring exact membership would refuse the ordinary AOI read.
+    /// Upward: a peer granted a leaf may not name its parent, and may not name
+    /// [`CellId::ROOT`] — whose subtree is the entire grid.
+    #[test]
+    fn the_read_predicate_covers_a_granted_subtree_and_nothing_above_it() {
+        let peer = iroh::SecretKey::from_bytes(&[11; 32]).public();
+        let grid = GridId::new(8);
+        let branch = CellId::ROOT.children()[3];
+        let inside = branch.children()[5];
+        let deeper = inside.children()[1];
+        let sibling = CellId::ROOT.children()[4];
+        let authority = SnapshotInterestAuthority::from_snapshots([interest_snapshot(
+            peer,
+            1,
+            grid,
+            vec![branch],
+            200,
+        )]);
+
+        // Down: the granted cell, and everything under it.
+        assert!(interest_covers_read(&authority, peer, grid, branch, 100));
+        assert!(interest_covers_read(&authority, peer, grid, inside, 100));
+        assert!(interest_covers_read(&authority, peer, grid, deeper, 100));
+
+        // Up and across: the parent of the grant, and a sibling subtree.
+        assert!(!interest_covers_read(
+            &authority,
+            peer,
+            grid,
+            CellId::ROOT,
+            100
+        ));
+        assert!(!interest_covers_read(&authority, peer, grid, sibling, 100));
+
+        // The same three fences `allows` carries: peer, grid, and expiry. A
+        // read is not a weaker place to enforce a grant's lifetime — it is the
+        // only place a lapsed grant is enforced at all (D25 rule 3).
+        let other_peer = iroh::SecretKey::from_bytes(&[12; 32]).public();
+        assert!(!interest_covers_read(
+            &authority, other_peer, grid, inside, 100
+        ));
+        assert!(!interest_covers_read(
+            &authority,
+            peer,
+            GridId::new(9),
+            inside,
+            100
+        ));
+        assert!(!interest_covers_read(&authority, peer, grid, inside, 200));
+        assert!(!interest_covers_read(
+            &DenyAllInterestAuthority,
+            peer,
+            grid,
+            inside,
+            100
+        ));
+    }
+
+    /// The scoping posture defaults to enforcing, and round-trips its CLI
+    /// spelling.
+    ///
+    /// The default is the whole point: a `GatewayConfig` built without naming
+    /// this field is one that scopes area reads, so a new embedder inherits
+    /// the closed door rather than the open one.
+    #[test]
+    fn area_interest_scoping_defaults_to_enforced() {
+        assert_eq!(
+            GatewayConfig::default().area_interest_scoping,
+            AreaInterestScoping::Enforced
+        );
+        assert!(AreaInterestScoping::default().enforces());
+        assert!(!AreaInterestScoping::Unscoped.enforces());
+        for posture in [AreaInterestScoping::Enforced, AreaInterestScoping::Unscoped] {
+            assert_eq!(posture.as_str().parse::<AreaInterestScoping>(), Ok(posture));
+        }
+        assert!("live".parse::<AreaInterestScoping>().is_err());
     }
 
     #[tokio::test]
