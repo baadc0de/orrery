@@ -10,6 +10,7 @@ use orrery_protocol::UniverseSeed;
 use orrery_regolith_client::campaign::{CampaignConfig, CampaignRuntime, JoinState};
 use orrery_regolith_client::intent::Controls;
 use orrery_regolith_client::net;
+use orrery_regolith_client::roster::{entity_of_slot, RosterResponse, ShipRoster};
 use orrery_regolith_client::session::ConfiguredImpairment;
 use orrery_regolith_client::telemetry::JsonlTelemetry;
 use serde::Deserialize;
@@ -62,6 +63,41 @@ fn deployed_campaign_routes_a_materialised_rock_and_returns_credit() {
         "campaign admission refused ({status}); do not retry or fight for the slot: {body}"
     );
     let admitted: AdmissionJoin = serde_json::from_str(&body).expect("decode join response");
+    let roster_url = format!(
+        "{}/v1/campaigns/shakedown/roster",
+        origin.trim_end_matches('/')
+    );
+    let roster_response = reqwest::blocking::get(&roster_url)
+        .expect("reach live campaign roster")
+        .error_for_status()
+        .expect("live campaign roster succeeds")
+        .json::<RosterResponse>()
+        .expect("decode live campaign roster");
+    let mut roster = ShipRoster::default();
+    roster.accept(&roster_response);
+    assert_eq!(
+        roster.len(),
+        admitted.join.slot + 1,
+        "the live roster must name every harness craft and the exterior craft"
+    );
+    for slot in 0..admitted.join.slot {
+        assert!(
+            roster.label(entity_of_slot(slot)).is_some(),
+            "live opponent slot {slot} must resolve to a display label"
+        );
+    }
+    assert_eq!(
+        roster.label(entity_of_slot(admitted.join.slot + 1)),
+        None,
+        "a craft absent from the live roster must not acquire a fake label"
+    );
+    println!(
+        "LIVE_ROSTER session={} labelled={} opponent_0={:?} absent_next={:?}",
+        admitted.join.session_id,
+        roster.len(),
+        roster.label(entity_of_slot(0)),
+        roster.label(entity_of_slot(admitted.join.slot + 1)),
+    );
     let configured = ConfiguredImpairment {
         loss_pct: admitted.configured.loss_pct,
         jitter_p50_ms: admitted.configured.jitter_p50_ms,
@@ -76,7 +112,7 @@ fn deployed_campaign_routes_a_materialised_rock_and_returns_credit() {
         wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
         configured,
         transport_secret: secret,
-        roster_url: None,
+        roster_url: Some(roster_url),
     };
     let telemetry = std::env::temp_dir().join(format!(
         "orrery-cx-538-live-{}.jsonl",
