@@ -8,19 +8,22 @@ use orrery_core::{
 use orrery_games::game::Game;
 use orrery_games::regolith::{
     archetype::Archetype,
-    campaign_rock_seeds, campaign_spawn_pose, distance_mm,
+    campaign_engagement_budget_m, campaign_guaranteed_aoi_radius_m, campaign_rock_seeds,
+    campaign_spawn_pose, distance_mm,
     invariants::INVARIANTS,
     order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult},
     pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
+    projectile_flight_ticks,
     state::{
         BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
     },
-    weapon::WeaponKind,
+    weapon::{WeaponKind, MAX_WEAPON_REACH_MM},
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
-    CAMPAIGN_ROCK_COUNT, ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET,
-    ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS,
-    LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET,
-    RESPAWN_TICKS,
+    CAMPAIGN_CELL_EDGE_M, CAMPAIGN_MIN_CELL_EDGE_M, CAMPAIGN_ROCK_COUNT, ISLAND_CRAFT_BUDGET,
+    ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET,
+    KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK,
+    MAX_ENGAGEMENT_RANGE_MM, MAX_TARGET_RADIUS_MM, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS,
+    REGOLITH_RULESET, RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -325,22 +328,114 @@ fn sample<'a>(
     }
 }
 
+/// #545, and the class #520 settled only for the weapon that existed then.
+///
+/// A weapon out-ranging the AOI is a target that can be shot at while the
+/// host is not obliged to replicate it. The bound is not the cell edge:
+/// commitment is hysteretic and *both* bodies latch their own, so the
+/// campaign budgets `edge - 2m` - 409.6 m at the 512 m edge.
+///
+/// The edge does not move to accommodate a weapon. A block wide enough to
+/// hold the whole encounter would delete the interest-churn surface the
+/// campaign exists to shake down, so this reads as a bound on the **weapon
+/// table**: widen any weapon's `optimal_mm` or `falloff_mm` past the budget
+/// and this fails, with `CAMPAIGN_MIN_CELL_EDGE_M` naming the edge that
+/// weapon would have cost.
+///
+/// It asserts the relationship, not the constants - the derived minimum moves
+/// with the table while the declared edge stays where it is put.
 #[test]
-fn v15_collision_order_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 15);
+fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
+    let guaranteed_m = campaign_guaranteed_aoi_radius_m(CAMPAIGN_CELL_EDGE_M);
+    let budget_m = campaign_engagement_budget_m(CAMPAIGN_CELL_EDGE_M);
+
+    assert!(
+        budget_m < guaranteed_m,
+        "the engagement budget must sit inside the guarantee, not on it: \
+         {budget_m} m against {guaranteed_m} m"
+    );
+
+    for kind in WeaponKind::ALL {
+        let envelope_mm = kind.weapon().reach_mm() + MAX_TARGET_RADIUS_MM;
+        let envelope_m = envelope_mm as f64 / 1_000.0;
+        assert!(
+            envelope_m <= budget_m,
+            "{kind:?} reaches {envelope_m} m against a {budget_m} m engagement \
+             budget at the {CAMPAIGN_CELL_EDGE_M} m campaign edge - shorten the \
+             weapon. Fitting it would cost a {CAMPAIGN_MIN_CELL_EDGE_M} m edge, \
+             which is not the trade the campaign wants"
+        );
+    }
+
+    // The declared edge is held; what must follow the table is the derived
+    // minimum, and it may not overtake what is declared.
+    let required_m = campaign_engagement_budget_m(CAMPAIGN_MIN_CELL_EDGE_M);
+    assert!(
+        budget_m >= required_m,
+        "the weapon table now needs a {CAMPAIGN_MIN_CELL_EDGE_M} m edge, past the \
+         declared {CAMPAIGN_CELL_EDGE_M} m - the table has outgrown the campaign"
+    );
+
+    // The derivation is the tightest edge that covers the table, not a slack
+    // constant that happens to be large enough: one framework cell less would
+    // not cover it.
+    assert!(
+        campaign_engagement_budget_m(CAMPAIGN_MIN_CELL_EDGE_M - 128.0)
+            < MAX_ENGAGEMENT_RANGE_MM as f64 / 1_000.0,
+        "CAMPAIGN_MIN_CELL_EDGE_M is not the smallest edge that covers the table"
+    );
+
+    // Heavy is the pickup a kill drops. It must still read as an upgrade, so
+    // it stays the longest reach in the table - cutting it to fit is not
+    // licence to make it just another gun.
+    let heavy = WeaponKind::Heavy.weapon().reach_mm();
+    for kind in WeaponKind::ALL {
+        if kind != WeaponKind::Heavy {
+            assert!(
+                kind.weapon().reach_mm() < heavy,
+                "{kind:?} now reaches as far as Heavy, which is the long gun"
+            );
+        }
+    }
+
+    // The longest reach is read from the table, not restated beside it.
+    assert_eq!(
+        MAX_WEAPON_REACH_MM,
+        WeaponKind::ALL
+            .into_iter()
+            .map(|kind| kind.weapon().reach_mm())
+            .max()
+            .expect("the weapon table is not empty")
+    );
+    assert_eq!(
+        MAX_ENGAGEMENT_RANGE_MM,
+        MAX_WEAPON_REACH_MM + MAX_TARGET_RADIUS_MM
+    );
+}
+
+#[test]
+fn v16_collision_order_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 16);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
-    assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
+    assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 240_000);
     assert_eq!(WeaponKind::Volley.weapon().tracking_urad_per_sec, 300_000);
-    assert_eq!(WeaponKind::Heavy.weapon().falloff_mm, 200_000);
+    assert_eq!(WeaponKind::Heavy.weapon().falloff_mm, 60_000);
     assert_eq!(WeaponKind::Heavy.weapon().projectile_speed_mms, 180_000);
     assert_eq!(
         [WeaponKind::Stock, WeaponKind::Volley, WeaponKind::Heavy].map(|kind| {
             let weapon = kind.weapon();
             weapon.optimal_mm + weapon.falloff_mm
         }),
-        [400_000, 300_000, 900_000]
+        [320_000, 300_000, 360_000]
     );
+    assert_eq!(
+        MAX_TARGET_RADIUS_MM, 40_000,
+        "a Large rock is the widest target"
+    );
+    assert_eq!(MAX_ENGAGEMENT_RANGE_MM, 400_000);
+    assert_eq!(CAMPAIGN_MIN_CELL_EDGE_M, 512.0);
+    assert_eq!(CAMPAIGN_CELL_EDGE_M, 512.0);
     assert_eq!(ISLAND_CRAFT_BUDGET, 8);
     assert_eq!(ISLAND_ROCK_BUDGET, 24);
     assert_eq!(ISLAND_PICKUP_BUDGET, 4);
@@ -1083,16 +1178,20 @@ fn signature_radius_and_accuracy_falloff_are_live_inputs() {
         WeaponKind::Stock,
         SAMPLES,
     );
+    // Both probes are the weapon's own band, not literals that were its band
+    // when this was written: #545 moved Stock and these silently stopped
+    // being the optimal edge and the falloff edge.
+    let stock = WeaponKind::Stock.weapon();
     let optimal = resolved_hits(
         Archetype::Interceptor,
-        300_000,
+        stock.optimal_mm,
         QVel::default(),
         WeaponKind::Stock,
         SAMPLES,
     );
     let edge_of_falloff = resolved_hits(
         Archetype::Interceptor,
-        400_000,
+        stock.reach_mm(),
         QVel::default(),
         WeaponKind::Stock,
         SAMPLES,
@@ -1105,7 +1204,9 @@ fn signature_radius_and_accuracy_falloff_are_live_inputs() {
 fn fly_one_stock_shot(seed_byte: u8, evade: bool) -> (u64, bool, Outcome) {
     let target = PersistId::new(2);
     let game = Regolith::honest();
-    let mut craft = craft_at(300_000);
+    // At Stock's optimal range: this fixture is about evasion during flight,
+    // so it must not pick up a range penalty that would blur the result.
+    let mut craft = craft_at(WeaponKind::Stock.weapon().optimal_mm);
     craft.yaw_urad = orrery_games::regolith::state::TAU_URAD / 4;
     let full_shield = craft.shield;
     let mut executor = Executor::new(game, UniverseSeed([seed_byte; 32]));
@@ -1160,8 +1261,16 @@ fn course_change_after_fire_avoids_a_fixed_seed_projectile() {
     let stationary = fly_one_stock_shot(0x6A, false);
     let evasive = fly_one_stock_shot(0x6A, true);
     println!("fixed seed 0x6a time-of-flight: stationary={stationary:?}, evasive={evasive:?}");
-    assert_eq!((stationary.0, stationary.1), (60, true));
-    assert_eq!((evasive.0, evasive.1), (60, false));
+    // The flight time is the ruleset's own, for the range the fixture fires
+    // at -- 48 ticks at Stock's 240 m optimal and 300 m/s projectile. Both
+    // shots take exactly as long; only the evasion changes the verdict.
+    let stock = WeaponKind::Stock.weapon();
+    let flight = u64::from(projectile_flight_ticks(
+        (stock.optimal_mm as u128).pow(2),
+        stock.projectile_speed_mms,
+    ));
+    assert_eq!((stationary.0, stationary.1), (flight, true));
+    assert_eq!((evasive.0, evasive.1), (flight, false));
 }
 
 #[test]

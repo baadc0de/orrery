@@ -1818,16 +1818,18 @@ pub const MIN_LEGIBLE_DIAMETER_PX: f32 = 4.0;
 ///
 /// ## Why these limits
 ///
-/// The reference length is the weapon envelope the rings draw: optimal is
-/// 300 m with falloff past it, and a chassis hull is ~7 m (`craft::hull_length`
+/// The reference length is the weapon envelope the rings draw: the widest
+/// optimal in the table is Heavy's 300 m, with 60 m of falloff past it
+/// (Stock is 240 + 80 since #545), and a chassis hull is ~7 m (`craft::hull_length`
 /// times [`craft::CRAFT_DISPLAY_SCALE`], so ~22 m on screen). With a
 /// [`CAMERA_FOV_Y`] of 45 degrees the visible half-height is `0.414 * height`:
 ///
 /// * [`CAMERA_MIN_HEIGHT_M`] = 150 m shows +/- 62 m — a 22 m hull is about a
 ///   sixth of the screen height, close enough to read facing and the arc
 ///   marking, and the closest useful framing before the ship fills the view.
-/// * [`CAMERA_DEFAULT_HEIGHT_M`] = 900 m shows +/- 373 m, so the 300 m optimal
-///   ring fits with margin. This is the framing the weapon is fought at.
+/// * [`CAMERA_DEFAULT_HEIGHT_M`] = 900 m shows +/- 373 m, so the widest ring
+///   the table draws — Heavy's 360 m envelope — fits. This is the framing the
+///   weapon is fought at.
 /// * [`CAMERA_MAX_HEIGHT_M`] = 4000 m shows +/- 1657 m, enough to hold the
 ///   ~2.5 km campaign crowd orbit in view. Past that a 22 m hull is under two
 ///   pixels on a 1080-line window and the view stops being usable.

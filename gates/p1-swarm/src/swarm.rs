@@ -2968,7 +2968,15 @@ mod tests {
             "the campaign fixture must begin with a visible contact"
         );
 
-        const STOCK_REACH_MM: u128 = 406_000;
+        // Stock's own envelope against an interceptor, read off the ruleset
+        // table rather than restated: #545 cut Stock from 400 m to 320 m and a
+        // hand-copied 406_000 would have quietly stopped meaning "stock reach".
+        let stock_reach_mm = (orrery_games::regolith::weapon::WeaponKind::Stock
+            .weapon()
+            .reach_mm()
+            + orrery_games::regolith::archetype::Archetype::Interceptor
+                .limits()
+                .radius_mm) as u128;
         let mut phase = [0u128; 6];
         let (receiver_pos, _) = crate::bot::spawn_pose(8, 9);
         let mut saw_far_departure = false;
@@ -2980,7 +2988,7 @@ mod tests {
                     let in_scope = interest.contains(&bot.cell().expect("committed"));
                     let distance =
                         orrery_games::regolith::distance_mm(bot.craft().pos, receiver_pos);
-                    if distance <= STOCK_REACH_MM {
+                    if distance <= stock_reach_mm {
                         assert!(
                             in_scope,
                             "contact {} left scope at tick {tick}, only {distance} mm from the stationary player",

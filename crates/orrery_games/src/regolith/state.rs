@@ -123,6 +123,12 @@ pub struct RockLimits {
 }
 
 impl RockTier {
+    /// Every tier, largest first.
+    ///
+    /// The campaign's AOI sizing iterates this to find the widest body a
+    /// weapon can be locked onto, so a new tier cannot go unaccounted.
+    pub const ALL: [Self; 3] = [Self::Large, Self::Medium, Self::Small];
+
     /// Published limits for this tier.
     #[must_use]
     pub const fn limits(self) -> RockLimits {

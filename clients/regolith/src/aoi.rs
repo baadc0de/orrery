@@ -30,7 +30,10 @@
 //! It is derived from the same two facts the host uses, not invented here:
 //!
 //! * the interest cell edge — `orrery_games::regolith::CAMPAIGN_CELL_EDGE_M`,
-//!   512 m since #532 (`crates/orrery_games/src/regolith/mod.rs:100`), the
+//!   512 m since #532 and deliberately still 512 m after #545, which cut the
+//!   weapon table to fit this edge rather than widening the edge to fit a
+//!   long gun — a block that swallowed the encounter would delete the
+//!   interest churn this fade exists to make legible. It is the
 //!   same constant `CampaignRuntime::committed_cell` divides by when it tells
 //!   the host which cell this craft is in (`campaign.rs:544`, `campaign.rs:1045`);
 //! * the 27-cell topology — the AOI is the committed cell plus its 26
@@ -349,7 +352,9 @@ pub fn sync_aoi_fade(
 mod tests {
     use super::*;
 
-    const EDGE: f32 = 512.0;
+    /// The campaign's own edge, read rather than restated: #545 moved it and
+    /// a hand-copied literal here would have silently stopped being it.
+    const EDGE: f32 = orrery_games::regolith::CAMPAIGN_CELL_EDGE_M as f32;
 
     /// The block is 3×3×3 cells of the campaign's own edge, so its faces are
     /// where the host's interest set actually ends — not at a radius the skin
@@ -361,14 +366,20 @@ mod tests {
             (EDGE - orrery_games::regolith::CAMPAIGN_CELL_EDGE_M as f32).abs() < f32::EPSILON,
             "the fixture edge must be the campaign's own"
         );
-        // Observer at the origin: cell 0 spans [0, 512), the block spans
-        // [-512, 1024) on every axis.
+        // Observer at the origin: cell 0 spans [0, EDGE), the block spans
+        // [-EDGE, 2·EDGE) on every axis.
         let observer = Vec3::ZERO;
         let depth = |x: f32| depth_inside_aoi(observer, Vec3::new(x, 0.0, 0.0), EDGE);
-        assert!((depth(0.0) - 512.0).abs() < 0.5, "{}", depth(0.0));
-        assert!(depth(-512.0).abs() < 0.5, "the low face sits at -512 m");
-        assert!(depth(1024.0).abs() < 0.5, "the high face sits at +1024 m");
-        assert!(depth(1100.0) < 0.0, "past the face is outside the block");
+        assert!((depth(0.0) - EDGE).abs() < 0.5, "{}", depth(0.0));
+        assert!(depth(-EDGE).abs() < 0.5, "the low face sits at -EDGE");
+        assert!(
+            depth(2.0 * EDGE).abs() < 0.5,
+            "the high face sits at +2·EDGE"
+        );
+        assert!(
+            depth(2.0 * EDGE + 76.0) < 0.0,
+            "past the face is outside the block"
+        );
     }
 
     /// The fade must never touch the craft the player is flying. This is a
@@ -378,7 +389,15 @@ mod tests {
     #[test]
     fn the_observers_own_craft_never_fades() {
         let band = fade_band_m(EDGE);
-        for offset in [0.0f32, 1.0, 255.9, 511.9, -0.1, -511.9, 4_096.3] {
+        for offset in [
+            0.0f32,
+            1.0,
+            EDGE * 0.5,
+            EDGE - 0.1,
+            -0.1,
+            -(EDGE - 0.1),
+            4_096.3,
+        ] {
             let observer = Vec3::splat(offset);
             let depth = depth_inside_aoi(observer, observer, EDGE);
             assert!(
@@ -443,7 +462,8 @@ mod tests {
         let inland = PersistId::new(50);
         let at_edge = PersistId::new(51);
         let mut local = crate::LocalSession::default();
-        for (entity, x) in [(inland, 0.0), (at_edge, 1_000.0)] {
+        // 24 m inside the block's high face, wherever that face now is.
+        for (entity, x) in [(inland, 0.0), (at_edge, (2.0 * EDGE - 24.0) as f64)] {
             local.executor.insert(
                 entity,
                 orrery_games::regolith::state::RegolithState::Rock(Rock::spawned(
@@ -460,9 +480,9 @@ mod tests {
             .init_asset::<Mesh>()
             .init_asset::<StandardMaterial>()
             .insert_resource(crate::ActiveSession::Local(Box::new(local)))
-            // Observer at the origin: its cell spans [0, 512), so the 27-cell
-            // block spans [-512, 1024). The body at 1000 m is 24 m inside the
-            // high face, a fifth of the way through the 120 m band.
+            // Observer at the origin: its cell spans [0, EDGE), so the
+            // 27-cell block spans [-EDGE, 2·EDGE). The far body is 24 m
+            // inside the high face, a fifth of the way through the 120 m band.
             .insert_resource(AoiBoundary(Some(AoiFrame {
                 edge_m: EDGE,
                 observer: Vec3::ZERO,
@@ -570,14 +590,17 @@ mod tests {
     /// corner fades on whichever axis runs out first.
     #[test]
     fn the_nearest_face_on_any_axis_decides_the_fade() {
+        // The observer's cell spans [0, EDGE), so the block's low faces sit
+        // at -EDGE and its high faces at 2·EDGE. Each probe is 12 m inside
+        // one of them and deep inland on every other axis.
         let observer = Vec3::new(100.0, 0.0, 100.0);
-        let near_x = Vec3::new(-500.0, 0.0, 100.0);
-        let near_z = Vec3::new(100.0, 0.0, -500.0);
+        let near_x = Vec3::new(-EDGE + 12.0, 0.0, 100.0);
+        let near_z = Vec3::new(100.0, 0.0, -EDGE + 12.0);
         assert!(depth_inside_aoi(observer, near_x, EDGE) < 20.0);
         assert!(depth_inside_aoi(observer, near_z, EDGE) < 20.0);
         // y is measured too: a body lifted out of the deck plane leaves the
         // block through its top face like any other.
-        let high_y = Vec3::new(100.0, 1_020.0, 100.0);
+        let high_y = Vec3::new(100.0, 2.0 * EDGE - 4.0, 100.0);
         assert!(depth_inside_aoi(observer, high_y, EDGE) < 20.0);
     }
 }

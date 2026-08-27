@@ -34,7 +34,45 @@ pub struct Weapon {
     pub tracking_urad_per_sec: u32,
 }
 
+/// The longest reach any weapon in the table can resolve a hit at, in
+/// millimetres.
+///
+/// Derived from the table rather than restated, so a weapon added below moves
+/// this figure with it. `projectile_resolution` breaks the lock beyond
+/// `optimal_mm + falloff_mm` (plus the target's own radius), so `falloff_mm`
+/// genuinely extends reach — it does not merely scale damage.
+pub const MAX_WEAPON_REACH_MM: i64 = {
+    let mut longest = 0;
+    let mut index = 0;
+    while index < WeaponKind::ALL.len() {
+        let reach = WeaponKind::ALL[index].weapon().reach_mm();
+        if reach > longest {
+            longest = reach;
+        }
+        index += 1;
+    }
+    longest
+};
+
+impl Weapon {
+    /// The greatest range at which this weapon can still resolve a hit,
+    /// before the target's own signature radius is added.
+    ///
+    /// This is the figure `projectile_resolution` compares the live range
+    /// against before it breaks the lock with `RangeExceeded`.
+    #[must_use]
+    pub const fn reach_mm(&self) -> i64 {
+        self.optimal_mm.saturating_add(self.falloff_mm)
+    }
+}
+
 impl WeaponKind {
+    /// Every weapon in the table, in wire-tag order.
+    ///
+    /// The AOI sizing and the reach guard iterate this rather than a
+    /// hand-kept list, so a weapon added to the table cannot go unaccounted.
+    pub const ALL: [Self; 3] = [Self::Stock, Self::Volley, Self::Heavy];
+
     /// This kind's table entry.
     #[must_use]
     pub const fn weapon(self) -> Weapon {
@@ -44,8 +82,11 @@ impl WeaponKind {
                 damage_spread: 4,
                 rolls: 1,
                 cooldown_ticks: 20,
-                optimal_mm: 300_000,
-                falloff_mm: 100_000,
+                // #545: the original 300/100 shape, scaled by 0.8 to bring
+                // the baseline weapon inside the campaign's engagement
+                // budget with real margin rather than the 20.8 m it had.
+                optimal_mm: 240_000,
+                falloff_mm: 80_000,
                 projectile_speed_mms: 300_000,
                 tracking_urad_per_sec: 180_000,
             },
@@ -64,8 +105,14 @@ impl WeaponKind {
                 damage_spread: 12,
                 rolls: 1,
                 cooldown_ticks: 90,
-                optimal_mm: 700_000,
-                falloff_mm: 200_000,
+                // #545: 900 m out-ranged the campaign AOI's guarantee by
+                // roughly 2x. The cut comes almost entirely out of the
+                // falloff tail rather than the optimal band: inside
+                // `optimal_mm` Heavy still shoots flat further than anything
+                // else in the table, and the 200 m tail it loses was the
+                // part a 60_000 urad/s turret could rarely convert anyway.
+                optimal_mm: 300_000,
+                falloff_mm: 60_000,
                 projectile_speed_mms: 180_000,
                 tracking_urad_per_sec: 60_000,
             },
