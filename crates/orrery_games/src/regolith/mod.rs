@@ -153,7 +153,7 @@ pub const CAMPAIGN_HYSTERESIS_PER_MILLE: i64 = 100;
 /// accounts for **one** hysteretic commitment: the observer's. Interest
 /// membership compares two *committed* cells, though, and
 /// `orrery_spatial::hysteresis` latches each entity's commitment
-/// independently — "the committed [`Cell`] lags the geometric cell by at most
+/// independently — "the committed `Cell` lags the geometric cell by at most
 /// the hysteresis margin", per entity. So the target can sit a full margin
 /// inside the observer's block geometrically while still being committed to
 /// the cell outside it, and the two lags compose adversarially.
