@@ -262,6 +262,12 @@ requests are cents.
   3.380 GB = 2,636 GB, minus the 100 GB free tier, at \$0.09 = **\$228/month**
   (\$256 at 29/day).
 
+The 100 GB free tier is **per account, not per lane**, so the three monthly
+figures in § 1 cannot all claim it — `clippy` already consumes it. Charged
+against `gates` on top of `clippy`'s existing traffic the figure is
+2,636 × \$0.09 = **\$237/month**, and the comparison in § 1 is generous to this
+lane rather than to the argument against it.
+
 So the rate is `clippy`-like and the absolute bill is the largest of the three
 lanes — larger than the ~\$200/month that helped remove `test`'s. Both readings
 are true and they are not in conflict: `gates` buys far more time than `test`
