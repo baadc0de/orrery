@@ -596,6 +596,37 @@ mod tests {
         assert_ne!(crate::AREA_LOAD_ERR_WRONG_OWNER, crate::AREA_LOAD_ERR_COLD);
     }
 
+    /// The two subscribe-refusal kinds are distinct, stable, and above every
+    /// kind a V−1 gateway emits.
+    ///
+    /// A client that classified a refusal as a *read failure* would retry the
+    /// same ungranted cell forever, which is exactly the standing queue the
+    /// bound exists to destroy — so these must never collide with the three
+    /// codes above, and must not move once a client keys on them.
+    #[test]
+    fn the_subscribe_refusal_kinds_do_not_collide_with_the_read_failure_kinds() {
+        use crate::{
+            AREA_LOAD_ERR_COLD, AREA_LOAD_ERR_LIVE, AREA_LOAD_ERR_NOT_GRANTED,
+            AREA_LOAD_ERR_TOO_MANY_CELLS, AREA_LOAD_ERR_WRONG_OWNER, MAX_INTEREST_GRANT_CELLS,
+            MAX_SUBSCRIBE_CELLS,
+        };
+        assert_eq!(
+            (AREA_LOAD_ERR_NOT_GRANTED, AREA_LOAD_ERR_TOO_MANY_CELLS),
+            (4, 5)
+        );
+        for served in [
+            AREA_LOAD_ERR_LIVE,
+            AREA_LOAD_ERR_COLD,
+            AREA_LOAD_ERR_WRONG_OWNER,
+        ] {
+            assert_ne!(AREA_LOAD_ERR_NOT_GRANTED, served);
+            assert_ne!(AREA_LOAD_ERR_TOO_MANY_CELLS, served);
+        }
+        // A request may not name more cells than a grant could ever cover:
+        // the two bounds are one bound, so they may not drift apart.
+        assert_eq!(MAX_SUBSCRIBE_CELLS, MAX_INTEREST_GRANT_CELLS);
+    }
+
     #[test]
     fn correlated_claim_reply_roundtrips_and_rejects_truncation() {
         let message = LeaseMsg::Deny {

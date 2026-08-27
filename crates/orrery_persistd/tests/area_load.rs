@@ -139,6 +139,355 @@ async fn dial(server: &GatewayServer) -> Client {
     }
 }
 
+/// Dial `server` and stop at the transport handshake: admitted by QUIC, with
+/// no `Hello` and therefore no session.
+///
+/// The distinction this exists to make is the one #544 turned on — reaching
+/// the gateway's receive loop is not the same as having passed admission.
+async fn dial_without_hello(server: &GatewayServer) -> Client {
+    let endpoint = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
+        .alpns(vec![GATEWAY_ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .secret_key(support::secret(7))
+        .bind()
+        .await
+        .unwrap();
+    let conn = endpoint.connect(server.addr(), GATEWAY_ALPN).await.unwrap();
+    let mut admission = conn.accept_uni().await.unwrap();
+    let msg = admission.read_to_end(16).await.unwrap();
+    assert_eq!(msg, vec![0u8]);
+    Client {
+        _endpoint: endpoint,
+        conn: lanes::GatewayLanes::attach(conn),
+    }
+}
+
+/// A router that answers every cell with one entity and records every read it
+/// was asked to start.
+///
+/// Every #544 test needs the same two things: a cell that would visibly return
+/// rows if it were served, and a record of whether the read happened at all.
+/// The second is what makes these tests about the *guarded stage* — a refusal
+/// that still scanned the cell would satisfy an assertion about the reply and
+/// leave both halves of the defect (disclosure and cost) in place.
+struct AnswerEverythingRouter {
+    started: Mutex<Vec<CellId>>,
+}
+
+impl AnswerEverythingRouter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn page() -> SnapshotPage {
+        let mut entities = HashMap::new();
+        entities.insert(
+            PersistId::new(1),
+            EntityRecord {
+                schema_floor: 0,
+                components: Bytes::from_static(b"secret"),
+                dirty: false,
+            },
+        );
+        SnapshotPage { entities }
+    }
+}
+
+#[async_trait::async_trait]
+impl Router for AnswerEverythingRouter {
+    async fn apply(&self, _record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
+        Ok(AppendHandle::completed(Lsn::new(1, 0)))
+    }
+
+    async fn read(&self, _grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
+        self.started.lock().await.push(cell);
+        Ok(Self::page())
+    }
+
+    async fn read_cold(&self, _grid: GridId, cell: CellId) -> Result<Option<SnapshotPage>, Reject> {
+        self.started.lock().await.push(cell);
+        Ok(Some(Self::page()))
+    }
+
+    async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+        true
+    }
+}
+
+/// Collect the next `count` area replies (pages and load errors), in order.
+async fn area_replies(conn: &mut lanes::GatewayLanes, count: usize) -> Vec<GatewayReply> {
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        match conn.next_reply(Duration::from_secs(5)).await {
+            Some(reply @ (GatewayReply::AreaPage { .. } | GatewayReply::AreaLoadError { .. })) => {
+                out.push(reply)
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    out
+}
+
+/// A cell outside the caller's interest grant is refused by name, and its
+/// contents are never read (#544).
+///
+/// The refusal is the disclosure half of the defect. The unread cell is the
+/// cost half: `CellId::ROOT`'s subtree is every `world/` key in the grid
+/// (`keyspace.rs`), so a check that refused *after* scanning would leave the
+/// unbounded range scan exactly where it was.
+#[tokio::test]
+async fn an_ungranted_cell_is_refused_by_name_and_never_read() {
+    let granted = cell(0, 0, 0);
+    let ungranted = cell(5, 5, 5);
+    let router = AnswerEverythingRouter::new();
+    let server = GatewayServer::spawn(
+        support::authority_config(node(7), GridId::ROOT, vec![granted]),
+        router.clone(),
+    )
+    .await
+    .unwrap();
+    let mut client = dial(&server).await;
+
+    send_stream(
+        &client.conn,
+        &GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells: vec![granted, ungranted],
+        },
+    )
+    .await;
+
+    let replies = area_replies(&mut client.conn, 2).await;
+    assert!(
+        replies.iter().any(|reply| matches!(
+            reply,
+            GatewayReply::AreaLoadError { cell, kind }
+                if *cell == ungranted && *kind == orrery_protocol::AREA_LOAD_ERR_NOT_GRANTED
+        )),
+        "the ungranted cell must be refused by name, got {replies:?}"
+    );
+    assert!(
+        replies.iter().any(|reply| matches!(
+            reply,
+            GatewayReply::AreaPage { cell, .. } if *cell == granted
+        )),
+        "the granted cell must still page, or the refusal is a total outage: {replies:?}"
+    );
+    assert!(
+        !replies.iter().any(|reply| matches!(
+            reply,
+            GatewayReply::AreaPage { cell, .. } if *cell == ungranted
+        )),
+        "an ungranted cell must not return rows: {replies:?}"
+    );
+    assert_eq!(
+        *router.started.lock().await,
+        vec![granted],
+        "the ungranted cell must never be read at all"
+    );
+
+    let area = server.metrics().area.snapshot();
+    assert_eq!(area.refused_ungranted_cells, 1);
+    assert_eq!(area.unscoped_cells, 0);
+    server.shutdown().await;
+}
+
+/// A peer granted its neighbourhood cannot name the root, and the root is the
+/// whole grid (#544's cost half).
+#[tokio::test]
+async fn the_root_cell_is_refused_to_a_peer_granted_only_its_neighbourhood() {
+    let centre = cell(0, 0, 0);
+    let router = AnswerEverythingRouter::new();
+    let server = GatewayServer::spawn(
+        support::authority_config(node(7), GridId::ROOT, centre.neighbors27()),
+        router.clone(),
+    )
+    .await
+    .unwrap();
+    let mut client = dial(&server).await;
+
+    send_stream(
+        &client.conn,
+        &GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells: vec![CellId::ROOT],
+        },
+    )
+    .await;
+
+    let replies = area_replies(&mut client.conn, 1).await;
+    assert!(
+        matches!(
+            replies.first(),
+            Some(GatewayReply::AreaLoadError { cell, kind })
+                if *cell == CellId::ROOT && *kind == orrery_protocol::AREA_LOAD_ERR_NOT_GRANTED
+        ),
+        "the root must be refused to a peer granted only leaves, got {replies:?}"
+    );
+    assert!(
+        router.started.lock().await.is_empty(),
+        "the covering scan must never start"
+    );
+
+    // The control: a cell the peer *was* granted still pages, so the refusal
+    // above is about the level, not about the path being dead.
+    send_stream(
+        &client.conn,
+        &GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells: vec![centre],
+        },
+    )
+    .await;
+    let replies = area_replies(&mut client.conn, 1).await;
+    assert!(
+        matches!(
+            replies.first(),
+            Some(GatewayReply::AreaPage { cell, .. }) if *cell == centre
+        ),
+        "a granted cell must still page, got {replies:?}"
+    );
+    server.shutdown().await;
+}
+
+/// A subscribe naming more cells than the cap is refused whole, once, and no
+/// cell in it is read (#544).
+#[tokio::test]
+async fn a_subscribe_over_the_cell_cap_is_refused_whole() {
+    // Granted at the root, so the cap is the only thing that can refuse this.
+    let router = AnswerEverythingRouter::new();
+    let server = GatewayServer::spawn(
+        support::authority_config(node(7), GridId::ROOT, vec![CellId::ROOT]),
+        router.clone(),
+    )
+    .await
+    .unwrap();
+    let mut client = dial(&server).await;
+
+    let cells: Vec<CellId> = (0..=orrery_protocol::MAX_SUBSCRIBE_CELLS)
+        .map(|i| cell(i as i32, 0, 0))
+        .collect();
+    assert_eq!(cells.len(), orrery_protocol::MAX_SUBSCRIBE_CELLS + 1);
+    let first = cells[0];
+    send_stream(
+        &client.conn,
+        &GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells,
+        },
+    )
+    .await;
+
+    let replies = area_replies(&mut client.conn, 1).await;
+    assert!(
+        matches!(
+            replies.first(),
+            Some(GatewayReply::AreaLoadError { cell, kind })
+                if *cell == first && *kind == orrery_protocol::AREA_LOAD_ERR_TOO_MANY_CELLS
+        ),
+        "an over-cap subscribe is refused once, against the first cell: {replies:?}"
+    );
+    assert!(
+        router.started.lock().await.is_empty(),
+        "an over-cap subscribe must not read any of the cells it named"
+    );
+    let area = server.metrics().area.snapshot();
+    assert_eq!(area.refused_over_cap, 1);
+    assert_eq!(
+        area.subscribes, 0,
+        "a refused request never reaches the routed stage"
+    );
+    server.shutdown().await;
+}
+
+/// A subscribe on a connection that never said `Hello` is dropped (#544).
+///
+/// Silently, like every other arm that requires a session: there is no
+/// verified identity to answer, and no interest that could be tested.
+#[tokio::test]
+async fn a_subscribe_before_hello_is_dropped() {
+    let centre = cell(0, 0, 0);
+    let router = AnswerEverythingRouter::new();
+    let server = GatewayServer::spawn(
+        support::authority_config(node(7), GridId::ROOT, vec![CellId::ROOT]),
+        router.clone(),
+    )
+    .await
+    .unwrap();
+    let mut client = dial_without_hello(&server).await;
+
+    send_stream(
+        &client.conn,
+        &GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells: vec![centre],
+        },
+    )
+    .await;
+
+    assert!(
+        area_replies(&mut client.conn, 1).await.is_empty(),
+        "an unadmitted connection must be answered with nothing"
+    );
+    assert!(
+        router.started.lock().await.is_empty(),
+        "an unadmitted connection must not cause a read"
+    );
+    assert_eq!(server.metrics().area.snapshot().refused_no_session, 1);
+    server.shutdown().await;
+}
+
+/// An unscoped gateway serves the ungranted cell and counts it (#544).
+///
+/// This is the arm a deployment with no `--coordinator-key` runs, and the
+/// count is what keeps it honest: the predicate still runs, so the gap is a
+/// number an operator can read rather than an absence.
+#[tokio::test]
+async fn an_unscoped_gateway_serves_the_ungranted_cell_and_counts_it() {
+    let granted = cell(0, 0, 0);
+    let ungranted = cell(5, 5, 5);
+    let router = AnswerEverythingRouter::new();
+    let server = GatewayServer::spawn(
+        GatewayConfig {
+            area_interest_scoping: orrery_persistd::AreaInterestScoping::Unscoped,
+            ..support::authority_config(node(7), GridId::ROOT, vec![granted])
+        },
+        router.clone(),
+    )
+    .await
+    .unwrap();
+    let mut client = dial(&server).await;
+
+    send_stream(
+        &client.conn,
+        &GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells: vec![granted, ungranted],
+        },
+    )
+    .await;
+
+    let replies = area_replies(&mut client.conn, 2).await;
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|reply| matches!(reply, GatewayReply::AreaPage { .. }))
+            .count(),
+        2,
+        "an unscoped gateway serves both cells: {replies:?}"
+    );
+    let area = server.metrics().area.snapshot();
+    assert_eq!(area.unscoped_cells, 1);
+    assert_eq!(
+        area.refused_ungranted_cells, 0,
+        "unscoped counts, it does not refuse"
+    );
+    server.shutdown().await;
+}
+
 /// Send a [`GatewayMsg`] on the reliable control lane.
 async fn send_stream(conn: &lanes::GatewayLanes, msg: &GatewayMsg) {
     conn.send_control(msg).await;

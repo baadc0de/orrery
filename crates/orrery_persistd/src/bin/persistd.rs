@@ -60,10 +60,10 @@ use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
-    ActivationOutcome, AuthorityCorrectionEnforcement, AuthorityCorrectionPosture,
-    AuthorityMetrics, CellRuntime, CheckpointScheduler, CoordinatorHandoutAuthority,
-    DurableChainId, FenceFreshnessConfig, FenceFreshnessMonitor, FenceRow, FenceStore,
-    GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
+    ActivationOutcome, AreaInterestScoping, AuthorityCorrectionEnforcement,
+    AuthorityCorrectionPosture, AuthorityMetrics, CellRuntime, CheckpointScheduler,
+    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceFreshnessMonitor,
+    FenceRow, FenceStore, GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
     GatewayServerLatencySnapshot, GrpcChainTransport, IntentExecutor, JournalConfig,
     MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
@@ -668,6 +668,10 @@ fn write_gateway_area(
             "cell_read_errors": snapshot.cell_read_errors,
             "first_page_us_sum": snapshot.first_page_us_sum,
             "first_page_us_max": snapshot.first_page_us_max,
+            "refused_no_session": snapshot.refused_no_session,
+            "refused_over_cap": snapshot.refused_over_cap,
+            "refused_ungranted_cells": snapshot.refused_ungranted_cells,
+            "unscoped_cells": snapshot.unscoped_cells,
         }),
     )
     .map_err(std::io::Error::other)?;
@@ -2196,6 +2200,22 @@ where
             ))
         };
 
+    // #544: area reads are scoped to the caller's grant wherever a grant can
+    // exist. Deny-all is not a policy a read path can enforce against — it can
+    // never say yes, so enforcing would refuse every page-in — so a gateway
+    // with no coordinator key runs the predicate and counts what it would have
+    // refused (`unscoped_cells`) instead of acting on it. The WARN is the
+    // point: an operator reading it can see the gap and close it with the same
+    // flag that makes weak claims provable.
+    let area_interest_scoping = if cli.coordinator_key.is_empty() {
+        tracing::warn!(
+            "no --coordinator-key: area reads are unscoped, so a client may page in any              cell this node serves; gateway_area.unscoped_cells counts how many"
+        );
+        AreaInterestScoping::Unscoped
+    } else {
+        AreaInterestScoping::Enforced
+    };
+
     // D32 clause (c)'s control C1, from CLI default to a validator that can
     // actually see it. Everything below this comment is the second half of
     // #217: the arm existed in the library and no deployment could reach it,
@@ -2241,6 +2261,7 @@ where
             cli.issuer_key.iter().map(|key| key.0.clone()),
         )),
         interest_authority,
+        area_interest_scoping,
         // The deployed admission filter. Not the library's
         // `PermissiveValidator` (which admits everything, and is a bring-up
         // default), and no longer a blanket refusal: it enforces the intent

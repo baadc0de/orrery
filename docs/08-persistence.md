@@ -3322,6 +3322,60 @@ The split exists because the two have incompatible shapes. A 27-cell page-in is 
 
 **Pages are still chunked, for a different reason.** The `page_seq`/`chunk_index`/`total_chunks` coordinates predate the reliable lane, where they existed so an unordered datagram could be placed in its page. They are retained because the readers on both sides refuse a length prefix larger than the message cap *before* allocating for it — a peer-chosen length is otherwise a peer-chosen allocation — and because a client holding partial pages for 27 cells wants each chunk's footprint knowable in advance. The frame budget is therefore no longer an MTU figure: it is 64 KiB, an order of magnitude under the 1 MiB message cap, which against the old 1100-byte datagram budget cuts a large cell's chunk count and its per-chunk header tax by roughly 60×.
 
+### 9.2 What a subscribe is allowed to ask for
+
+A `Subscribe` is the only client message that makes the gateway *emit* world
+state, and until #544 it named its own cells: the arm passed the client's list
+straight to the router with no grant, level or count check, while its
+neighbour `SubmitIntent` opened by stating the rule — "keep
+signature/identity/admission checks at the edge". Three bounds now run in that
+arm, before any permit is taken and before any cell is looked at, because a
+bound that shed work after the scan would leave both halves of the defect in
+place.
+
+**Count.** More than `MAX_SUBSCRIBE_CELLS` (64) cells refuses the whole
+request with one `AreaLoadError{AREA_LOAD_ERR_TOO_MANY_CELLS}` against the
+first cell named. One reply, not 65: answering per cell would be the walk the
+bound exists to refuse. 64 is the bound a signed interest grant already
+carries (`MAX_INTEREST_GRANT_CELLS`) — a request cannot be answerable for more
+cells than a grant can cover — and independently the figure `gates/p2-load`
+had already chosen for its own recovery reader, for the reply-side working set.
+
+**Grant, and the level floor inside it.** Every named cell must lie inside a
+subtree the coordinator currently grants the caller (`interest_covers_read`),
+tested against the same peer/grid/expiry fences a claim passes. The read path
+is where a grant's expiry is enforced and nowhere else (D25 rule 3), so a
+lapsed grant stops paging in at the same moment it stops being believed.
+Containment is by subtree rather than exact membership, because a grant names
+subtrees and an AOI read of a leaf under a granted cell is the ordinary case —
+and the level floor falls out of the same test rather than being a second
+rule: no cell **coarser** than a granted one is inside it, so a peer granted
+its 27-cell neighbourhood can name neither their parent nor `CellId::ROOT`,
+whose subtree is every `world/` key in the grid (§9 above: the root is a
+covering scan). Only a coordinator that granted the root can ask for the root.
+Refused cells are answered by name with
+`AreaLoadError{AREA_LOAD_ERR_NOT_GRANTED}` — every requested cell still gets a
+reply — and the rest of the request is served.
+
+**Session.** A subscribe on a connection that has not passed admission is
+dropped in silence, as `InterestGrant` and `WitnessEpoch` already are: there is
+no verified identity to answer and no interest that could be tested.
+
+All three refuse and count (`gateway_area`'s `refused_over_cap`,
+`refused_ungranted_cells`, `refused_no_session`) rather than queue, per §2.1:
+at ~100 % utilisation only destroying work drains a standing queue.
+
+**The one posture, and why it is not a ramped control.** A gateway started
+without `--coordinator-key` holds the deny-all authority, which can never say
+yes — enforcing against it would refuse every page-in in the cluster rather
+than the ungranted ones. That is a missing input, not a policy, so such a
+gateway runs the predicate anyway and counts what it would have refused
+(`unscoped_cells`) while serving it. Scoping is not one of D32 clause (c)'s
+five ramped controls and takes no `ramp/` row: like annulment-on-expiry (D32
+clause (h)) it convicts nobody, strikes no account, and has no false-positive
+cohort a shadow period would protect — it is fail-closed machinery, on by
+default wherever a grant can exist.
+
 ## 10. Terrain and bulk edits
 
 Terrain is chunk-oriented and cell-aligned (one chunk = one interest cell subdivided into sections). Edits are **bulk-class**: a `TerrainDelta{cell, section, op}` journal record on the standard bulk ack path (§2.1). Every delta is **attributed to and fenced by the editing player's own `PLAYER_BOUND` lease** — the record's author must hold that lease, so edits are attributable per account and a peer cannot edit as someone else. The cell actor invariant-checks each delta before applying: **reach** (the edit lies within interaction range of the editor's committed position), **rate** (per-account edit-rate caps), **tool** (the `Ruleset` confirms the editor holds the claimed capability); violations are rejected or flagged (§2.1). **Destructive or high-value edits** (`Ruleset`-classified — structure demolition, protected-region changes) are not bulk at all: they route through the witness-attested intent path (§2.2). Live edits replicate peer-to-peer on the reliable per-cell stream ordered by `(cell, tick)`, with late joiners fetching compacted chunks from the gateway — the replication side is specified in [03-replication.md](03-replication.md) (terrain delta replication). The actor holds `base + delta list` per chunk; compaction (on checkpoint cadence, or when deltas exceed 25% of base size) folds deltas into a new base and rewrites `chunk/{cell_id}/{n}` snapshot rows, each ≤ 100 KB to respect the value limit. **Sparse elision** is mandatory: empty/homogeneous sections are not stored — the [Minecraft chunk format](https://minecraft.wiki/w/Chunk_format) precedent (empty sections elided; [region files](https://minecraft.wiki/w/Region_file_format) bundling nearby chunks is exactly our Morton-prefix locality, done with files). Untouched procedural terrain costs zero rows: absence of `chunk/` keys means "regenerate from seed".
