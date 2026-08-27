@@ -180,6 +180,119 @@ fn drive_zoom_sweep(
     });
 }
 
+/// Writes a PNG of the rendered frame at each end of the zoom range.
+///
+/// **The fallback, not the first move.** A measurement is reproducible in CI
+/// and a screenshot is not, so anything a number can settle is settled by
+/// [`RockCensus`] and by the tests that pin the pixel arithmetic. What a
+/// number cannot settle is whether a lit body reads against the field behind
+/// it — a rock's tint is a *ceiling* on how bright it renders, and only the
+/// frame the GPU produced says what came off it. So this exists for #530 and
+/// #531, and it captures at the two zoom extremes those issues name.
+///
+/// The frame comes from Bevy's own screenshot path — the swapchain texture the
+/// renderer just presented — rather than from an X grab of the window, so it
+/// is the pixels the GPU wrote and needs no compositor to be readable.
+///
+/// Ordinary clients never insert the resource; pair it with [`ZoomSweep`],
+/// which is what walks the camera to the ends.
+#[derive(Debug, Resource)]
+pub struct FrameCapture {
+    dir: PathBuf,
+    taken: BTreeSet<&'static str>,
+}
+
+impl FrameCapture {
+    /// Capture into `dir`, creating it if it does not exist.
+    ///
+    /// # Errors
+    /// A rendered string when the directory cannot be created.
+    pub fn into_dir(dir: PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        Ok(Self {
+            dir,
+            taken: BTreeSet::new(),
+        })
+    }
+}
+
+/// How far from a zoom limit still counts as "at that extreme" for a frame
+/// that also has to catch a passing event.
+///
+/// The bare zoom frames are taken exactly at the clamp. An impact burst lives
+/// for [`combat::IMPACT_BURST_TICKS`] and cannot be summoned, so waiting for
+/// one to coincide with the exact clamp is waiting for two independent things;
+/// a tenth of the range either side is still unambiguously "zoomed out" or
+/// "zoomed in", and the captured line prints the height it actually had.
+const ZOOM_EXTREME_TOLERANCE: f32 = 0.10;
+
+/// Saves one frame the first time the camera reaches each end of its range,
+/// and one at each end while a confirmed hit is bursting.
+///
+/// The census line is printed beside the path, from the same frame, so the
+/// picture and the numbers can never be quoted against each other by mistake.
+///
+/// The `hit-` frames are #531's acceptance: the impact cue seen at both zoom
+/// extremes. They are gated on [`ShotFeedback::impact_burst`] and therefore on
+/// an adjudicated `Hit` — the skin may not manufacture one to be photographed.
+#[allow(clippy::too_many_arguments)]
+fn capture_zoom_extreme_frames(
+    mut capture: ResMut<FrameCapture>,
+    zoom: Res<CameraZoom>,
+    session: Res<ActiveSession>,
+    feedback: Res<ShotFeedback>,
+    rock_bodies: RockBodyQuery,
+    meshes: Res<Assets<Mesh>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut commands: Commands,
+) {
+    use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+
+    let height_m = zoom.height_m();
+    // Every label this frame satisfies, rarest first. A bursting frame at an
+    // extreme is the thing that cannot be waited for, so it is claimed before
+    // the bare one, which any later frame at the same extreme can still take.
+    let mut labels: Vec<&'static str> = Vec::new();
+    if feedback.impact_burst().is_some() {
+        if height_m <= CAMERA_MIN_HEIGHT_M * (1.0 + ZOOM_EXTREME_TOLERANCE) {
+            labels.push("hit-zoom-min");
+        } else if height_m >= CAMERA_MAX_HEIGHT_M * (1.0 - ZOOM_EXTREME_TOLERANCE) {
+            labels.push("hit-zoom-max");
+        }
+    }
+    // Exact equality is what the clamp actually produces at either end, but a
+    // hair of tolerance keeps this from depending on that.
+    if height_m <= CAMERA_MIN_HEIGHT_M * 1.001 {
+        labels.push("zoom-min");
+    } else if height_m >= CAMERA_MAX_HEIGHT_M * 0.999 {
+        labels.push("zoom-max");
+    }
+    let Some(label) = labels
+        .into_iter()
+        .find(|label| !capture.taken.contains(label))
+    else {
+        return;
+    };
+    capture.taken.insert(label);
+    let path = capture.dir.join(format!("{label}.png"));
+    let census = gather_rock_census(
+        &session,
+        &rock_bodies,
+        &meshes,
+        height_m,
+        viewport_height_px(&windows),
+    );
+    println!(
+        "frame_capture {label} {} | {}",
+        path.display(),
+        census.line()
+    );
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(path));
+}
+
 /// A playable local authority using only the shared headless executor.
 ///
 /// **Offline and smoke use only — never a campaign path.** Nothing this
@@ -441,9 +554,23 @@ impl Plugin for RegolithSkinPlugin {
                     hud::refresh_combat_hud,
                 )
                     .chain()
-                    .after(sync_rendered_state),
+                    .after(sync_rendered_state)
+                    // The glyph-sized overlays -- the lock reticle and the
+                    // impact marker ring -- are scaled from `CameraZoom`, so
+                    // they have to be placed against *this* frame's zoom the
+                    // way `follow_camera` is. Without this the ring is sized
+                    // from the previous frame's height during a zoom, which a
+                    // live capture reads as a ring that is not quite holding
+                    // its apparent size.
+                    .after(zoom_camera),
             )
             .add_systems(Update, capture_tracer_geometry.after(hud::sync_tracers))
+            .add_systems(
+                Update,
+                capture_impact_geometry
+                    .after(hud::sync_impact_flash)
+                    .run_if(resource_exists::<GeometryCapture>),
+            )
             .add_systems(
                 Update,
                 (capture_aoi_census, capture_ship_label_census)
@@ -466,6 +593,12 @@ impl Plugin for RegolithSkinPlugin {
                 drive_zoom_sweep
                     .before(zoom_camera)
                     .run_if(resource_exists::<ZoomSweep>),
+            )
+            .add_systems(
+                Update,
+                capture_zoom_extreme_frames
+                    .after(zoom_camera)
+                    .run_if(resource_exists::<FrameCapture>),
             );
     }
 }
@@ -928,29 +1061,77 @@ fn capture_tracer_geometry(
 fn capture_aoi_census(
     session: Res<ActiveSession>,
     census: Res<aoi::AoiFadeCensus>,
-    rock_bodies: Query<(), With<RockBody>>,
+    rock_bodies: RockBodyQuery,
+    meshes: Res<Assets<Mesh>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     zoom: Res<CameraZoom>,
 ) {
-    let mut counts = [0usize; 3];
-    for entity in session.executor().entities().copied() {
-        if let Some(RegolithState::Rock(rock)) = session.executor().state(entity) {
-            if rock.hull > 0 {
-                counts[match rock.tier {
-                    RockTier::Large => 0,
-                    RockTier::Medium => 1,
-                    RockTier::Small => 2,
-                }] += 1;
-            }
-        }
-    }
     // The rock line rides along because #530 is judged at both zoom extremes
     // and there is no way to read a tint out of a running window; the camera
-    // height says which extreme the frame was at.
+    // height says which extreme the frame was at, and the pixel figures say
+    // what the tint was carried on.
+    let rocks = gather_rock_census(
+        &session,
+        &rock_bodies,
+        &meshes,
+        zoom.height_m(),
+        viewport_height_px(&windows),
+    );
     println!(
         "aoi_census {} | camera {:.0} m | {}",
         census.line(session.aoi_edge_m()),
         zoom.height_m(),
-        rock_census(counts, rock_bodies.iter().count()),
+        rocks.line(),
+    );
+}
+
+/// Prints the impact cue's drawn size, in world metres and in pixels.
+///
+/// #531 asks whether an adjudicated hit is legible at both ends of the zoom
+/// range, and the argument it was raised with was arithmetic about constants.
+/// This reads the transforms [`hud::sync_impact_flash`] actually wrote — the
+/// burst sphere's scale against its authored mesh radius, and the marker ring's
+/// scale, which is its world radius outright — so the number is the one the
+/// renderer used rather than one recomputed beside it.
+///
+/// One line per frame a burst is live, which is at most
+/// [`combat::IMPACT_BURST_TICKS`] frames per confirmed hit.
+fn capture_impact_geometry(
+    feedback: Res<ShotFeedback>,
+    zoom: Res<CameraZoom>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    flashes: hud::FlashReadQuery,
+    markers: hud::MarkerReadQuery,
+) {
+    let Some((target, progress)) = feedback.impact_burst() else {
+        return;
+    };
+    let height_m = zoom.height_m();
+    let viewport_px = viewport_height_px(&windows);
+    let drawn = |query_result: Option<(&Transform, &Visibility)>, mesh_radius_m: f32| {
+        query_result.map_or((0.0, 0.0, false), |(transform, visibility)| {
+            let radius_m = transform.scale.x * mesh_radius_m;
+            (
+                radius_m,
+                apparent_diameter_px(radius_m, height_m, viewport_px),
+                *visibility != Visibility::Hidden,
+            )
+        })
+    };
+    let (burst_m, burst_px, burst_shown) =
+        drawn(flashes.iter().next(), hud::IMPACT_FLASH_MESH_RADIUS_M);
+    // The marker's mesh is a unit torus, so its scale *is* its world radius.
+    let (marker_m, marker_px, marker_shown) = drawn(markers.iter().next(), 1.0);
+    println!(
+        "impact_capture target={} progress={progress:.2} | burst {burst_m:.2} m = {burst_px:.1} px \
+         shown={burst_shown} | marker {marker_m:.2} m = {marker_px:.1} px shown={marker_shown} | \
+         cue {:.1} px | camera {height_m:.0} m / {viewport_px:.0} px",
+        target.0,
+        if marker_shown {
+            marker_px.max(burst_px)
+        } else {
+            burst_px
+        },
     );
 }
 
@@ -1257,19 +1438,153 @@ fn ensure_rock_bodies(
     }
 }
 
-/// `rocks 3 L / 5 M / 2 S in state | 10 drawn`, for the F3 pane.
+/// Every `RockBody` the render world holds, with what the renderer knows.
+type RockBodyQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static CoreEntity,
+        &'static Mesh3d,
+        Option<&'static ViewVisibility>,
+    ),
+    With<RockBody>,
+>;
+
+/// What the rock census counted, stage by stage.
 ///
-/// This exists because #524's failure mode was invisible to the test suite:
-/// rocks were fully simulated and simply never drawn, and no assertion about
-/// state could tell the difference. `drawn` is counted from the `RockBody`
-/// entities themselves, so the two halves of the line come from different
-/// places and disagreeing is the signal.
-#[must_use]
-fn rock_census(counts: [usize; 3], drawn: usize) -> String {
-    format!(
-        "rocks {} L / {} M / {} S in state | {} drawn",
-        counts[0], counts[1], counts[2], drawn
-    )
+/// #524 has been misdiagnosed three times because "rocks are not on screen"
+/// is not one question. It is a chain — seeded, replicated into the client's
+/// world, given a body, kept by the renderer's visibility pass, and finally
+/// large enough to see — and each link fails differently. Every field here is
+/// read from a *different* place, so the line says which link broke instead of
+/// leaving the reader to guess:
+///
+/// * `in_state` comes from the session's executor,
+/// * `drawn` from the `RockBody` entities themselves,
+/// * `in_view` from Bevy's own [`ViewVisibility`], the value the render pass
+///   used,
+/// * `smallest_px` from the drawn body's own mesh geometry, projected through
+///   the live camera height and the live window.
+///
+/// Two of those agreeing proves nothing; the point is that they can disagree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RockCensus {
+    /// Live rocks in the session's state: Large, Medium, Small.
+    in_state: [usize; 3],
+    /// `RockBody` entities in the render world.
+    drawn: usize,
+    /// How many of those the renderer's visibility pass kept for the view.
+    ///
+    /// Zero in an app that runs no visibility pass, which is every headless
+    /// test — the number means something only in a rendered run.
+    in_view: usize,
+    /// Chase-camera height when the census was taken, in metres.
+    camera_height_m: f32,
+    /// Window height the pixel figures are against, in physical pixels.
+    viewport_px: f32,
+    /// The smallest drawn body's diameter, in pixels.
+    smallest_px: Option<f32>,
+}
+
+impl RockCensus {
+    /// `rocks 1 L / 2 M / 3 S in state | 6 drawn | 6 in view | ...`.
+    ///
+    /// ASCII only: this is drawn in the F3 pane, and Bevy renders anything
+    /// else as an empty box.
+    fn line(&self) -> String {
+        let tier_px = |radius_mm: i64| {
+            apparent_diameter_px(
+                radius_mm as f32 / 1_000.0,
+                self.camera_height_m,
+                self.viewport_px,
+            )
+        };
+        let smallest = match self.smallest_px {
+            Some(px) if px < MIN_LEGIBLE_DIAMETER_PX => {
+                format!("{px:.1} px BELOW THE {MIN_LEGIBLE_DIAMETER_PX:.0} px FLOOR")
+            }
+            Some(px) => format!("{px:.1} px"),
+            None => "none".to_owned(),
+        };
+        format!(
+            "rocks {} L / {} M / {} S in state | {} drawn | {} in view | \
+             tier px L {:.1} / M {:.1} / S {:.1} | smallest drawn {} | camera {:.0} m / {:.0} px",
+            self.in_state[0],
+            self.in_state[1],
+            self.in_state[2],
+            self.drawn,
+            self.in_view,
+            tier_px(RockTier::Large.limits().radius_mm),
+            tier_px(RockTier::Medium.limits().radius_mm),
+            tier_px(RockTier::Small.limits().radius_mm),
+            smallest,
+            self.camera_height_m,
+            self.viewport_px,
+        )
+    }
+}
+
+/// Counts the rock census from the session, the render world and the meshes.
+///
+/// See [`RockCensus`] for why each number is read from its own place.
+fn gather_rock_census(
+    session: &ActiveSession,
+    bodies: &RockBodyQuery,
+    meshes: &Assets<Mesh>,
+    camera_height_m: f32,
+    viewport_px: f32,
+) -> RockCensus {
+    let mut in_state = [0usize; 3];
+    for entity in session.executor().entities().copied() {
+        if let Some(RegolithState::Rock(rock)) = session.executor().state(entity) {
+            if rock.hull > 0 {
+                in_state[match rock.tier {
+                    RockTier::Large => 0,
+                    RockTier::Medium => 1,
+                    RockTier::Small => 2,
+                }] += 1;
+            }
+        }
+    }
+    let mut drawn = 0usize;
+    let mut in_view = 0usize;
+    let mut smallest_px: Option<f32> = None;
+    for (_, mesh, visibility) in bodies.iter() {
+        drawn += 1;
+        if visibility.is_some_and(|seen| seen.get()) {
+            in_view += 1;
+        }
+        // The mesh the renderer was handed, not the radius the spawn path
+        // meant to use: a body scaled or meshed wrong has to be able to show
+        // up here as a different number.
+        let Some(aabb) = meshes
+            .get(mesh)
+            .and_then(bevy::camera::primitives::MeshAabb::compute_aabb)
+        else {
+            continue;
+        };
+        let radius_m = aabb.half_extents.max_element();
+        let px = apparent_diameter_px(radius_m, camera_height_m, viewport_px);
+        smallest_px = Some(smallest_px.map_or(px, |seen: f32| seen.min(px)));
+    }
+    RockCensus {
+        in_state,
+        drawn,
+        in_view,
+        camera_height_m,
+        viewport_px,
+        smallest_px,
+    }
+}
+
+/// The primary window's height in physical pixels, or the reference height.
+fn viewport_height_px(windows: &Query<&Window, With<PrimaryWindow>>) -> f32 {
+    windows
+        .single()
+        .map_or(REFERENCE_VIEWPORT_PX, |window| {
+            window.resolution.physical_height() as f32
+        })
+        .max(1.0)
 }
 
 /// Spawns the remote duel body the moment a joined session learns which
@@ -1446,6 +1761,52 @@ pub fn chase_camera_projection() -> PerspectiveProjection {
 pub fn visible_half_height_m(height_m: f32) -> f32 {
     (CAMERA_FOV_Y / 2.0).tan() * height_m
 }
+
+/// The window height every published pixel figure is quoted against.
+///
+/// A pixel measurement is meaningless without the window it was taken in, and
+/// a live capture reads the real window instead. This is only the number the
+/// documented figures and the tests are stated at.
+pub const REFERENCE_VIEWPORT_PX: f32 = 1080.0;
+
+/// How many pixels one world metre spans on the deck plane.
+///
+/// The camera looks straight down, so the deck plane is exactly `height_m`
+/// away and the whole visible world height is `2 * visible_half_height_m`.
+/// Everything on that plane therefore shares one scale, which is what makes a
+/// single number meaningful:
+///
+/// ```text
+/// pixels_per_metre = viewport_px / (2 * tan(fov/2) * height_m)
+/// ```
+///
+/// **This is the arithmetic #517, #524 and #536 kept getting caught by.** A
+/// body can carry the right colour, the right opacity and the right position
+/// and still be a fraction of a pixel across, which no assertion about state
+/// can see. Measuring the extent is what makes that case fail loudly.
+#[must_use]
+pub fn pixels_per_metre(height_m: f32, viewport_px: f32) -> f32 {
+    let visible_m = 2.0 * visible_half_height_m(height_m);
+    if visible_m <= 0.0 {
+        return 0.0;
+    }
+    viewport_px / visible_m
+}
+
+/// The on-screen diameter, in pixels, of a body of `radius_m` on the deck.
+#[must_use]
+pub fn apparent_diameter_px(radius_m: f32, height_m: f32, viewport_px: f32) -> f32 {
+    2.0 * radius_m * pixels_per_metre(height_m, viewport_px)
+}
+
+/// The smallest drawn diameter that still reads as an object on screen.
+///
+/// Four pixels is deliberately a floor on *legibility*, not on rendering: one
+/// pixel renders and cannot be recognised, and #536's marker ring nearly
+/// shipped at a sub-pixel tube — correct colour, correct position, nothing a
+/// player could see. Anything the skin draws as a body the player is expected
+/// to notice must clear this at the far end of the zoom range.
+pub const MIN_LEGIBLE_DIAMETER_PX: f32 = 4.0;
 
 /// How high the chase camera flies, in metres above the deck plane.
 ///
@@ -1832,7 +2193,10 @@ fn refresh_f3_pane(
     broken: Res<LockBreak>,
     tracks: Res<ProjectileTracks>,
     session: Res<ActiveSession>,
-    rock_bodies: Query<(), With<RockBody>>,
+    rock_bodies: RockBodyQuery,
+    meshes: Res<Assets<Mesh>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    zoom: Res<CameraZoom>,
     roster: Res<roster::ShipRoster>,
     fade_census: Res<aoi::AoiFadeCensus>,
     mut pane: Query<(&mut Text, &mut Node), With<F3Pane>>,
@@ -1854,20 +2218,15 @@ fn refresh_f3_pane(
         );
         text.push('\n');
         text.push_str(&hud::lock_debug_lines(&view, &broken));
-        let mut counts = [0usize; 3];
-        for entity in session.executor().entities().copied() {
-            if let Some(RegolithState::Rock(rock)) = session.executor().state(entity) {
-                if rock.hull > 0 {
-                    counts[match rock.tier {
-                        RockTier::Large => 0,
-                        RockTier::Medium => 1,
-                        RockTier::Small => 2,
-                    }] += 1;
-                }
-            }
-        }
+        let rocks = gather_rock_census(
+            &session,
+            &rock_bodies,
+            &meshes,
+            zoom.height_m(),
+            viewport_height_px(&windows),
+        );
         text.push('\n');
-        text.push_str(&rock_census(counts, rock_bodies.iter().count()));
+        text.push_str(&rocks.line());
         text.push('\n');
         text.push_str(&fade_census.line(session.aoi_edge_m()));
         text.push('\n');
@@ -2241,6 +2600,277 @@ mod tests {
             radii[0] > radii[1] && radii[1] > radii[2],
             "the drawn size is the ruleset's own radius and must separate the tiers"
         );
+    }
+
+    /// #524, the last stage of it: a rock that is seeded, replicated, in the
+    /// client's world and given a body can still be invisible, because a body
+    /// can be a fraction of a pixel across.
+    ///
+    /// So this measures the mesh the spawn path actually handed the renderer,
+    /// not the radius it meant to use, and converts it to pixels through the
+    /// same arithmetic the live census uses. The three earlier misdiagnoses of
+    /// #524 were all "the value is right" claims; the value being right is
+    /// exactly what none of them could distinguish.
+    ///
+    /// Measured live on 2026-08-27 in a joined campaign session, 1280x720
+    /// window: `rocks 1 L / 2 M / 3 S in state | 6 drawn | 6 in view |
+    /// tier px L 17.4 / M 8.7 / S 3.5` at 4000 m, and `L 463.5` at 150 m.
+    #[test]
+    fn every_rock_tier_clears_the_legibility_floor_at_full_zoom_out() {
+        use bevy::camera::primitives::MeshAabb;
+        use orrery_core::{QPos, QVel};
+        use orrery_games::regolith::state::Rock;
+
+        let tiers = [RockTier::Large, RockTier::Medium, RockTier::Small];
+        let mut local = LocalSession::default();
+        for (index, tier) in tiers.iter().enumerate() {
+            local.executor.insert(
+                PersistId::new(70 + index as u64),
+                RegolithState::Rock(Rock::spawned(
+                    *tier,
+                    0,
+                    QPos::from_metres(400.0 * index as f64, 0.0, 0.0),
+                    QVel::default(),
+                )),
+            );
+        }
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(ActiveSession::Local(Box::new(local)))
+            .add_systems(Update, ensure_rock_bodies);
+        app.update();
+
+        // The drawn radius, taken from the mesh the renderer was handed.
+        let handles: Vec<(PersistId, Mesh3d)> = app
+            .world_mut()
+            .query_filtered::<(&CoreEntity, &Mesh3d), With<RockBody>>()
+            .iter(app.world())
+            .map(|(core, mesh)| (core.0, mesh.clone()))
+            .collect();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let mut drawn: Vec<(PersistId, f32)> = handles
+            .iter()
+            .map(|(entity, mesh)| {
+                let aabb = meshes
+                    .get(mesh)
+                    .and_then(MeshAabb::compute_aabb)
+                    .expect("a rock body carries a mesh with vertices");
+                (*entity, aabb.half_extents.max_element())
+            })
+            .collect();
+        drawn.sort_by_key(|(entity, _)| entity.0);
+        assert_eq!(drawn.len(), 3, "one body per tier: {drawn:?}");
+
+        for (index, (entity, radius_m)) in drawn.iter().enumerate() {
+            let ruleset_m = tiers[index].limits().radius_mm as f32 / 1_000.0;
+            assert!(
+                (radius_m - ruleset_m).abs() < 0.5,
+                "rock {entity:?} is drawn at {radius_m} m against the ruleset's {ruleset_m} m: \
+                 the skin may not restate the size the ruleset published"
+            );
+        }
+
+        // Full zoom-out, the case the tiers have to survive.
+        let far_px: Vec<f32> = drawn
+            .iter()
+            .map(|(_, radius_m)| {
+                apparent_diameter_px(*radius_m, CAMERA_MAX_HEIGHT_M, REFERENCE_VIEWPORT_PX)
+            })
+            .collect();
+        for (tier, px) in tiers.iter().zip(&far_px) {
+            assert!(
+                *px >= MIN_LEGIBLE_DIAMETER_PX,
+                "the {tier:?} tier is {px} px across at {CAMERA_MAX_HEIGHT_M} m of camera \
+                 height on a {REFERENCE_VIEWPORT_PX}-line window, under the \
+                 {MIN_LEGIBLE_DIAMETER_PX} px floor"
+            );
+        }
+        // Size is what carries the tier at the zoom where colour cannot, so
+        // the tiers have to separate by more than antialiasing.
+        assert!(
+            far_px[0] >= far_px[1] * 1.8 && far_px[1] >= far_px[2] * 1.8,
+            "the tiers must stay distinguishable by size alone: {far_px:?} px"
+        );
+
+        // Full zoom-in: the largest rock must still fit in the frame, or a
+        // player flying into one sees an untextured wall instead of a rock.
+        let near_px = apparent_diameter_px(drawn[0].1, CAMERA_MIN_HEIGHT_M, REFERENCE_VIEWPORT_PX);
+        assert!(
+            near_px > REFERENCE_VIEWPORT_PX * 0.25 && near_px < REFERENCE_VIEWPORT_PX,
+            "a 40 m rock is {near_px} px across at {CAMERA_MIN_HEIGHT_M} m: it must read as a \
+             body, and it must not fill the window"
+        );
+
+        // The window height below which the smallest tier stops clearing the
+        // floor at full zoom-out. A live 1280x720 capture sits under it, at
+        // 3.5 px, which is why the census says so out loud rather than
+        // leaving the reader to work it out.
+        let smallest_radius_m = drawn[2].1;
+        let floor_lines =
+            MIN_LEGIBLE_DIAMETER_PX * 2.0 * visible_half_height_m(CAMERA_MAX_HEIGHT_M)
+                / (2.0 * smallest_radius_m);
+        assert!(
+            (820.0..=840.0).contains(&floor_lines),
+            "the smallest tier clears {MIN_LEGIBLE_DIAMETER_PX} px only above {floor_lines} \
+             lines of window at full zoom-out"
+        );
+    }
+
+    /// The census has to be able to say *which* stage lost the rocks, and it
+    /// has to say it in ASCII, because Bevy draws anything else as a box.
+    ///
+    /// #524 was diagnosed wrongly three times off a line that could only count
+    /// state and bodies. This asserts the two numbers a body cannot fake: the
+    /// renderer's own visibility verdict, and the drawn extent in pixels,
+    /// including the floor warning that fires when a body is on screen and too
+    /// small to see.
+    #[test]
+    fn the_rock_census_names_the_stage_and_stays_ascii() {
+        use orrery_core::{QPos, QVel};
+        use orrery_games::regolith::state::Rock;
+
+        #[derive(Resource, Default)]
+        struct Captured(String);
+
+        fn capture(
+            session: Res<ActiveSession>,
+            bodies: RockBodyQuery,
+            meshes: Res<Assets<Mesh>>,
+            mut out: ResMut<Captured>,
+        ) {
+            out.0 = gather_rock_census(
+                &session,
+                &bodies,
+                &meshes,
+                CAMERA_MAX_HEIGHT_M,
+                REFERENCE_VIEWPORT_PX,
+            )
+            .line();
+        }
+
+        let mut local = LocalSession::default();
+        local.executor.insert(
+            PersistId::new(80),
+            RegolithState::Rock(Rock::spawned(
+                RockTier::Small,
+                0,
+                QPos::from_metres(0.0, 0.0, 0.0),
+                QVel::default(),
+            )),
+        );
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .init_resource::<Captured>()
+            .insert_resource(ActiveSession::Local(Box::new(local)))
+            .add_systems(Update, (ensure_rock_bodies, capture).chain());
+        app.update();
+
+        let line = app.world().resource::<Captured>().0.clone();
+        assert!(line.is_ascii(), "the F3 pane is ASCII only: {line:?}");
+        assert!(
+            line.contains("0 L / 0 M / 1 S in state | 1 drawn"),
+            "the census must count state and bodies separately: {line}"
+        );
+        assert!(
+            line.contains("| 0 in view"),
+            "a world with no visibility pass has drawn a body nothing has seen: {line}"
+        );
+        assert!(
+            line.contains("smallest drawn 5.2 px"),
+            "the census must measure the drawn body, not restate the tier: {line}"
+        );
+
+        // The same body on a window too short to carry it has to say so.
+        let cramped = RockCensus {
+            in_state: [0, 0, 1],
+            drawn: 1,
+            in_view: 1,
+            camera_height_m: CAMERA_MAX_HEIGHT_M,
+            viewport_px: 720.0,
+            smallest_px: Some(3.5),
+        };
+        assert!(
+            cramped.line().contains("BELOW THE 4 px FLOOR"),
+            "a body under the legibility floor must be named, not merely counted: {}",
+            cramped.line()
+        );
+    }
+
+    /// #530: the tier you most need to see early is the 40 m one, because a
+    /// collision now applies real mutual force (#514) — and the ramp made it
+    /// the darkest thing in the scene.
+    ///
+    /// The tilt survives, so the largest tier still has the lowest *tint*.
+    /// What this pins is that the tilt cannot make it the least noticeable
+    /// body, because noticing is contrast times area and the ramp is a nuance
+    /// while the size difference is a factor of five.
+    ///
+    /// Measured live on 2026-08-27 out of a captured frame at 4000 m of camera
+    /// height: the Large tier rendered at 8.28:1 against the field over 208
+    /// px2, the Medium at 8.85:1 over 49 px2, the Small at 4.76:1 over 9 px2.
+    /// The rendered numbers are the ones that matter — a rock is lit, so its
+    /// tint is only a ceiling — and they run the right way.
+    #[test]
+    fn no_rock_tier_is_the_least_noticeable_body_in_the_scene() {
+        // WCAG relative luminance and contrast ratio, so the figures here are
+        // comparable with the ones measured out of a captured frame.
+        let luminance = |colour: Color| {
+            let rgba = colour.to_linear();
+            0.2126 * rgba.red + 0.7152 * rgba.green + 0.0722 * rgba.blue
+        };
+        let contrast = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
+
+        let tiers = [RockTier::Large, RockTier::Medium, RockTier::Small];
+        // The deck has no fill of its own: what a rock is seen against is the
+        // near-black clear colour, sparsely stippled with the starfield.
+        let field = 0.0_f32;
+
+        let mut weight = Vec::new();
+        for tier in tiers {
+            let (tint, _) = rock_finish(tier);
+            let ratio = contrast(luminance(tint), field);
+            assert!(
+                ratio >= 4.5,
+                "the {tier:?} tier renders at {ratio}:1 against the field, under the 4.5:1 \
+                 floor a body the player must not fly into has to clear"
+            );
+            let diameter_px = apparent_diameter_px(
+                tier.limits().radius_mm as f32 / 1_000.0,
+                CAMERA_MAX_HEIGHT_M,
+                REFERENCE_VIEWPORT_PX,
+            );
+            // Area times contrast: how much of the frame is arguing for this
+            // body's presence at the zoom where it is hardest to see.
+            weight.push((tier, ratio, diameter_px * diameter_px * ratio));
+        }
+
+        assert!(
+            weight[0].2 > weight[1].2 && weight[1].2 > weight[2].2,
+            "noticeability must run with size at full zoom-out, or the tier that can kill \
+             you is the one you see last: {weight:?}"
+        );
+        // And the ramp itself stays a nuance rather than a hierarchy: no tier
+        // may be more than this much better lit than another.
+        let spread = weight[2].1 / weight[0].1;
+        assert!(
+            spread <= 1.5,
+            "the contrast ramp runs {spread}:1 across the tiers, which is a hierarchy again"
+        );
+
+        // The starfield is drawn unlit, so its greys are a floor a lit rock's
+        // tint has to clear before the scene light takes anything off it.
+        let deepest_star = starfield::STAR_LAYERS[starfield::STAR_LAYERS.len() - 1].grey;
+        for tier in tiers {
+            let (tint, _) = rock_finish(tier);
+            assert!(
+                luminance(tint) > luminance(Color::srgb(deepest_star, deepest_star, deepest_star)),
+                "the {tier:?} tier must start lighter than the deepest starfield layer"
+            );
+        }
     }
 
     /// The camera looks straight down, so the deck plane is exactly the
