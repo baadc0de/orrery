@@ -65,12 +65,25 @@ LinkEntry { from_slot, to_slot, lane, delivered, dropped, delayed, bytes }
 `identity.target` in an `AttemptReport` is the **host** target and is preserved
 verbatim as `attempt.host_target` on every derived row. See §5.
 
-**Compatibility.** `exteriors` is the contract. A report carrying today's
-singular `external` block (`ExteriorReport`, `gates/p1-swarm/src/swarm.rs:260`)
-is read as a one-element cohort, so this contract can be exercised against real
-host output before #571 replaces `Option<ExteriorSlot>` with slot-indexed
-exteriors. A report carrying both must name the same slot in both, or it is two
-accounts of one attempt and is refused.
+**Compatibility.** `exteriors` is the contract, and three spellings are read:
+`exteriors`; `external` as a **list**, which is what `gates/p1-swarm` emits
+since #571 landed as #579 and made `SwarmReport.external` a
+`Vec<ExteriorReport>` ordered by swarm slot; and `external` as a single
+**object**, the pre-#579 spelling, kept readable so an archived report still
+derives. A report carrying both field names must name the same slots in both, or
+it is two accounts of one attempt and is refused.
+
+**What the host records, and what it does not.** `ExteriorReport` after #579
+carries `index`, `node`, `connected_ticks`, the frame counters, `said_goodbye`,
+`connected` and `witness_anchored` — and **no `session_id`**. So `exteriors`'s
+`session_id` is this contract's field and not yet a host-emitted one, and the
+seat identity a real report supplies is the QUIC-authenticated `node`, which the
+client signs into its own row and which #579 also made unique per seat. The
+binding is therefore by seated invite id when a report carries one and by
+admitted node when it does not; when a seat carries an id, the row that lands on
+it by node must name that same id, or the host's copy and the client's copy
+disagree and the row is refused. `connected_ticks` is likewise real per seat
+now, so §4's non-constant denominator is bounded by a number the host measured.
 
 ## 3. The contribution arithmetic
 
@@ -118,7 +131,12 @@ binding = { attempt_id, slot, session_id, node, connected_ticks, close }
 with all four of these holding:
 
 1. `session_id` is seated in `attempt.exteriors` — an unseated row is not a
-   participant of this attempt.
+   participant of this attempt. On a report whose seats carry no invite id, which
+   is every report `gates/p1-swarm` writes (§2), the seat is instead the one
+   whose admitted `node` this row is signed by, and a row whose node the attempt
+   admitted nowhere is refused the same way. Where a seat *does* carry an id, it
+   wins: a row landing on it by node while naming a different id is the host's
+   copy and the client's copy disagreeing, and is refused rather than bound.
 2. `slot >= B` — a human row bound to a bot seat is refused even though the slot
    number is valid.
 3. `row.measurement_node == exterior.node`, and the row's Ed25519 signature
@@ -126,7 +144,11 @@ with all four of these holding:
    `scripts/verify-campaign-measurement.py`. The session token authenticates the
    connected NodeId but does not by itself reserve a seat
    (`gates/p1-swarm/src/exterior.rs`, the judge's token check), so the match
-   against the seat is what makes the row this seat's row.
+   against the seat is what makes the row this seat's row. #579 added the other
+   half of that: the node must name **exactly one** seat of the attempt, because
+   a seat map listing one node twice is ambiguous and a row bound into it is
+   bound to nobody in particular. Both `scripts/p4-campaign-session.sh` and
+   `scripts/p4-ledger.sh` check it.
 4. `close ∈ {goodbye, attempt_end, disconnected}`. A `queue_overflow` close
    means the host counted downlink frames it could not deliver on that leg, so
    that human's observed link is the pump's backlog rather than the declared
@@ -257,7 +279,9 @@ honestly flagged mismatching row is flagged evidence, not a refusal.
 
 ## 7. Fixtures
 
-`scripts/p4-attempt-accounting.py --self-test` runs 29 named fixtures per commit.
+`scripts/p4-attempt-accounting.py --self-test` runs 34 named fixtures per commit
+(29 at #572; #576 added five for the host's own array spelling and the
+node-bound seat).
 The two failure modes this contract exists to prevent are named directly:
 
 **Duplicated cohort hours**
@@ -298,13 +322,18 @@ per-leg impairment band, and the one-slot compatibility spelling.
 - It does not implement multi-exterior routing. `Option<ExteriorSlot>` and the
   routes that branch on it are #571.
 - It does not change admission, the flock, or the reservation allocator (#573).
-- It does not modify `scripts/p4-campaign-session.sh` or `scripts/p4-ledger.sh`.
-  The single-human assembler and the ledger's own repair are #563's piece 7,
-  which consumes this contract rather than restating it. Until then the derived
-  rows are produced by `p4-attempt-accounting.py derive` and appended with the
-  existing `p4-ledger.sh append`, which is exactly what the fixtures do.
-- It does not carry the `binding` into the ledger *line*. `p4-ledger.sh` copies a
-  named field list into each line and the binding lives in the derived report
-  beside it; putting it in the line is piece 7's, along with the rest of the
-  ledger repair.
+- It does not itself modify `scripts/p4-campaign-session.sh` or
+  `scripts/p4-ledger.sh`. That is #563's piece 7 (#576), which consumes this
+  contract rather than restating it, and which has since landed: `assemble`
+  derives through `p4-attempt-accounting.py derive` instead of copying the
+  attempt's own `player_hours` onto one client row, and the ledger checks the
+  binding, cross-checks `player_hours == banked_minutes / 60`, and refuses a
+  second claim on a seat across appends. The fixtures here still drive `derive`
+  and the real `append` directly, which is what keeps them a check on *this*
+  contract rather than on the seam above it.
+- It does not itself carry the `binding` into the ledger *line* — #576 does.
+  `p4-ledger.sh` copies a named field list into each line, and it now includes
+  `attempt_id`, `slot`, `binding`, `attempt`, `contribution` and
+  `link_impairment`, so reconciling which seat of which attempt an hour came
+  from is an audit of the ledger rather than of a directory beside it.
 - It changes no ruleset. `REGOLITH_RULESET.version` is 16 and stays there.
