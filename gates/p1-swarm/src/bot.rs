@@ -698,9 +698,9 @@ impl Bot {
         // The current producer cannot cut an empty-input frame. Autonomous
         // rocks would therefore accumulate tick hashes until their first mined
         // input, then publish them under one ten-tick frame. Do not manufacture
-        // invalid evidence: stage 1 still observes their replicated state, and
-        // the missing multi-entity producer/dynamic-anchor seam remains
-        // explicit at this boundary.
+        // invalid evidence. These entities remain canonical and replicated,
+        // but are not independently witnessed until the craft-shaped stage-1
+        // adapter and producer gain a multi-entity/dynamic-anchor seam.
         self.hosted.insert(entity);
         self.hosted_inbox.insert(entity, Vec::new());
     }
