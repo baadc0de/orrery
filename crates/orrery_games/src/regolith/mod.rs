@@ -89,6 +89,19 @@ const CHANCE_SCALE: u128 = 1_000_000;
 const CAMPAIGN_ORBIT_RADIUS_M: f64 = 2_500.0;
 const CAMPAIGN_CROWD_ARC_RAD: f64 = 0.08;
 const CAMPAIGN_RADIAL_SPREAD: f64 = 0.10;
+/// Rocks present at campaign start: one Large, two Medium and three Small.
+pub const CAMPAIGN_ROCK_COUNT: usize = 6;
+const CAMPAIGN_ROCK_RADII_MM: [i64; CAMPAIGN_ROCK_COUNT] = [
+    2_710_000, 2_790_000, 2_320_000, 2_840_000, 2_260_000, 2_890_000,
+];
+const CAMPAIGN_ROCK_TIERS: [RockTier; CAMPAIGN_ROCK_COUNT] = [
+    RockTier::Large,
+    RockTier::Medium,
+    RockTier::Medium,
+    RockTier::Small,
+    RockTier::Small,
+    RockTier::Small,
+];
 /// Campaign interest-cell edge, sized for Regolith's stock engagement reach.
 ///
 /// The framework default is 128 m, but a 27-cell AOI at that edge can drop a
@@ -104,6 +117,75 @@ pub const REGOLITH_RULESET: RulesetId = RulesetId {
     version: 15,
     digest: [0x66; 32],
 };
+
+/// One canonical rock installed by the campaign composition root.
+///
+/// `owner_slot` is content, not a transport guess: it gives every seeded
+/// entity exactly one initial authority while allowing a peer to host more
+/// than its player craft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignRockSeed {
+    /// Stable persistent identity derived from the universe seed and slot.
+    pub entity: PersistId,
+    /// Headless host slot holding the rock's initial authority.
+    pub owner_slot: usize,
+    /// Complete canonical starting state.
+    pub rock: Rock,
+}
+
+/// Build the rocks present at campaign start.
+///
+/// This is deliberately a direct seed, not a bloom director. The stock
+/// director waits sixty seconds and draws sites inside 250 m of the origin;
+/// the campaign crowd orbits at roughly 2.5 km, so that faithful bloom would
+/// still be content nobody sees. Six rocks make every published tier present
+/// without turning the crowd's orbit into a collision gauntlet: they sit in a
+/// radial pocket just inside and outside the outer crowd, 110--340 m from its
+/// player slot, but off every bot's initial flight line. A player can see,
+/// lock and deliberately fly into the pocket; orbiting bots do not begin in it.
+///
+/// Identity, the small angular/radial variation, tier and owner are pure
+/// functions of `(universe seed, campaign-rock slot, host peer count)`. No
+/// clock, process RNG or other ambient input can enter replay.
+#[must_use]
+pub fn campaign_rock_seeds(
+    seed: orrery_protocol::UniverseSeed,
+    host_peer_count: usize,
+) -> [CampaignRockSeed; CAMPAIGN_ROCK_COUNT] {
+    core::array::from_fn(|slot| {
+        let mut preimage = [0u8; 24];
+        preimage[..20].copy_from_slice(b"regolith-campaign-v1");
+        preimage[20..].copy_from_slice(&(slot as u32).to_le_bytes());
+        let digest = blake3::keyed_hash(&seed.0, &preimage);
+        let bytes = digest.as_bytes();
+
+        // Keep the whole pocket close to the exterior slot for every seed;
+        // variation makes the universe seed real content without allowing a
+        // draw to move the rocks back to the empty central bloom region.
+        let angular_jitter_urad =
+            i64::from(u16::from_le_bytes([bytes[0], bytes[1]])) % 6_001 - 3_000;
+        let radial_jitter_mm =
+            (i64::from(u16::from_le_bytes([bytes[2], bytes[3]])) % 10_001) - 5_000;
+        let angle = (68_000 + angular_jitter_urad) as f64 / 1_000_000.0;
+        let radius_mm = CAMPAIGN_ROCK_RADII_MM[slot].saturating_add(radial_jitter_mm);
+        let pos = QPos {
+            x: (radius_mm as f64 * libm::cos(angle)) as i64,
+            y: 0,
+            z: (radius_mm as f64 * libm::sin(angle)) as i64,
+        };
+
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&bytes[8..16]);
+        let entity = PersistId::new(
+            0xC524_0000_0000_0000 | (u64::from_le_bytes(id_bytes) & 0x0000_FFFF_FFFF_FFFF),
+        );
+        CampaignRockSeed {
+            entity,
+            owner_slot: slot % host_peer_count.max(1),
+            rock: Rock::spawned(CAMPAIGN_ROCK_TIERS[slot], 0, pos, QVel::default()),
+        }
+    })
+}
 
 /// Component classifications.
 pub mod components {

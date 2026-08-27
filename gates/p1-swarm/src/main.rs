@@ -496,6 +496,7 @@ fn main() -> Result<()> {
             Impairment::default()
         },
         seed: args.seed,
+        campaign: args.external_peer,
         late_join_tick,
         // `--cheat` implies `--witness`: a modified client in a swarm with no
         // witness is a peer nobody is re-executing, and every conviction clause

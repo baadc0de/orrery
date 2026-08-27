@@ -22,7 +22,7 @@
 //! actually exercises hysteresis and interest-set churn.
 
 use core::time::Duration;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aeronet_iroh::stream::{IrohStreamIo, RecvMessage, StreamMode};
 use bevy_app::prelude::*;
@@ -172,10 +172,16 @@ pub struct Bot {
     /// Prior-tick cross-entity inputs addressed to this authority, retained in
     /// reliable-stream arrival order for delivered-first composition.
     delivered_inbox: Vec<(PersistId, Order)>,
-    /// This tick's `Game::deliver` products for the swarm router.
-    delivered_outbox: Vec<(PersistId, Order)>,
+    /// Prior-tick inputs for additional canonical entities this peer hosts.
+    hosted_inbox: BTreeMap<PersistId, Vec<(PersistId, Order)>>,
+    /// Additional per-entity authorities held by this transport peer.
+    hosted: BTreeSet<PersistId>,
+    /// This tick's `(author, recipient, order)` products for the swarm router.
+    delivered_outbox: Vec<(PersistId, PersistId, Order)>,
     /// Receipt ticks for canonical replicas installed as recorded neighbours.
     replica_seen_at: BTreeMap<PersistId, u64>,
+    /// First authenticated transport identity seen authoring each replica.
+    replica_authorities: BTreeMap<PersistId, NodeId>,
     /// Target-authored shot verdicts retained only for live-path regression tests.
     #[cfg(test)]
     resolved_shots: Vec<Outcome>,
@@ -601,8 +607,11 @@ impl Bot {
             executor,
             honest_shadow,
             delivered_inbox: Vec::new(),
+            hosted_inbox: BTreeMap::new(),
+            hosted: BTreeSet::new(),
             delivered_outbox: Vec::new(),
             replica_seen_at: BTreeMap::new(),
+            replica_authorities: BTreeMap::new(),
             #[cfg(test)]
             resolved_shots: Vec::new(),
             foreign_deliveries: 0,
@@ -668,6 +677,49 @@ impl Bot {
         craft
     }
 
+    /// Install another canonical entity under this peer's authority.
+    ///
+    /// A transport identity is not an entity identity: D2 permits one peer to
+    /// hold several single-writer authorities. Campaign rocks exercise that
+    /// ordinary shape instead of pretending every world entity is a player.
+    pub fn host_entity(&mut self, entity: PersistId, state: RegolithState) {
+        assert_ne!(
+            entity, self.entity,
+            "the player authority is already installed"
+        );
+        assert!(
+            !self.hosted.contains(&entity),
+            "one peer cannot install an authority twice"
+        );
+        self.executor.insert(entity, state.clone());
+        if let Some(shadow) = &mut self.honest_shadow {
+            shadow.insert(entity, state);
+        }
+        // The current producer cannot cut an empty-input frame. Autonomous
+        // rocks would therefore accumulate tick hashes until their first mined
+        // input, then publish them under one ten-tick frame. Do not manufacture
+        // invalid evidence. These entities remain canonical and replicated,
+        // but are not independently witnessed until the craft-shaped stage-1
+        // adapter and producer gain a multi-entity/dynamic-anchor seam.
+        self.hosted.insert(entity);
+        self.hosted_inbox.insert(entity, Vec::new());
+    }
+
+    /// Whether this peer currently holds the named entity's authority.
+    #[must_use]
+    pub fn authors(&self, entity: PersistId) -> bool {
+        entity == self.entity || self.hosted.contains(&entity)
+    }
+
+    /// Every entity this peer currently authors, in canonical id order after
+    /// the player craft.
+    #[must_use]
+    pub fn authored_entities(&self) -> Vec<PersistId> {
+        core::iter::once(self.entity)
+            .chain(self.hosted.iter().copied())
+            .collect()
+    }
+
     /// The bot's current speed in metres per second.
     #[must_use]
     pub fn speed_mps(&self) -> f64 {
@@ -697,11 +749,25 @@ impl Bot {
             .collect();
         for entity in stale {
             self.replica_seen_at.remove(&entity);
+            self.replica_authorities.remove(&entity);
             self.executor.take_state(entity);
             if let Some(shadow) = &mut self.honest_shadow {
                 shadow.take_state(entity);
             }
         }
+        // Freeze every authored inbox at the tick boundary. An event emitted by
+        // the player authority below is delivered to a hosted rock on the next
+        // tick, even though both happen to share one process and executor.
+        let hosted_at_boundary: Vec<PersistId> = self.hosted.iter().copied().collect();
+        let mut hosted_delivered: BTreeMap<PersistId, Vec<(PersistId, Order)>> = hosted_at_boundary
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    self.hosted_inbox.remove(entity).unwrap_or_default(),
+                )
+            })
+            .collect();
         let mut rng = tick_rng(self.seed, self.entity, at);
         // D46 clause (d): deliveries from prior ticks precede this tick's
         // pilot orders. This vector is also exactly what the witness logs.
@@ -795,8 +861,13 @@ impl Bot {
             if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
                 if recipient == self.entity {
                     self.delivered_inbox.push((self.entity, order));
+                } else if self.hosted.contains(&recipient) {
+                    self.hosted_inbox
+                        .entry(recipient)
+                        .or_default()
+                        .push((self.entity, order));
                 } else {
-                    self.delivered_outbox.push((recipient, order));
+                    self.delivered_outbox.push((self.entity, recipient, order));
                 }
             }
         }
@@ -810,6 +881,46 @@ impl Bot {
         }
         if let Some(chain) = &mut self.chain {
             chain.log_tick_hash(outcome.state_hash);
+        }
+
+        // Scenario content is canonical state, not decoration. Step every
+        // additional authority after the player craft from the population at
+        // this tick boundary; materialized children begin on the next tick,
+        // matching the reference scenario loop.
+        let mut materialized = Vec::new();
+        for entity in hosted_at_boundary {
+            let delivered = hosted_delivered.remove(&entity).unwrap_or_default();
+            let orders: Vec<Order> = delivered.iter().map(|(_, order)| order.clone()).collect();
+            let outcome = self
+                .executor
+                .step_entity(entity, at, &orders)
+                .expect("hosted campaign authority remains installed");
+            for event in &outcome.events {
+                if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
+                    if recipient == self.entity {
+                        self.delivered_inbox.push((entity, order));
+                    } else if self.hosted.contains(&recipient) {
+                        self.hosted_inbox
+                            .entry(recipient)
+                            .or_default()
+                            .push((entity, order));
+                    } else {
+                        self.delivered_outbox.push((entity, recipient, order));
+                    }
+                }
+            }
+            materialized.extend(outcome.materialized);
+            self.hosted_inbox.entry(entity).or_default();
+        }
+        for entity in materialized {
+            if !self.authors(entity) {
+                let state = self
+                    .executor
+                    .state(entity)
+                    .expect("materialization installed its canonical state")
+                    .clone();
+                self.host_entity(entity, state);
+            }
         }
 
         let grid = grid_of(&self.craft().pos, cell_edge_m);
@@ -1023,8 +1134,8 @@ impl Bot {
         };
     }
 
-    /// Broadcasts this bot's own state to the island-mates whose interest
-    /// cells contain this bot's committed cell.
+    /// Broadcasts every state this peer authors to island-mates whose interest
+    /// cells contain that entity.
     ///
     /// Shared by the swarm loop and the external-peer runner (#385): both must
     /// replicate from the same function or the human path would send bytes no
@@ -1040,34 +1151,49 @@ impl Bot {
     /// identity — and without them a receiver holds bytes it cannot attribute
     /// to a subject or line up against a claim.
     pub fn broadcast_state(&mut self, tick: u64) {
-        let (node, cell, payload) = {
-            let cell = self.cell().expect("committed");
-            let entity = self.entity();
-            let state = self.state();
-            (
-                self.node,
-                cell,
-                encode_replication(&(state.to_canonical(), cell, entity, tick + 1)),
-            )
-        };
-        let peers: Vec<NodeId> = self
-            .app
-            .world()
-            .resource::<orrery_net::IslandMembership>()
-            .peers
-            .iter()
-            .filter(|entry| entry.node != node && entry.cells.contains(&cell))
-            .map(|entry| entry.node)
+        let player_cell = self.cell().expect("committed");
+        let cell_edge_m = self.app.world().resource::<CellEdge>().0;
+        let node = self.node;
+        let authored: Vec<_> = self
+            .authored_entities()
+            .into_iter()
+            .filter_map(|entity| {
+                let state = self.executor.state(entity)?.clone();
+                let cell = if entity == self.entity {
+                    player_cell
+                } else {
+                    let pos = match &state {
+                        RegolithState::Craft(craft) => craft.pos,
+                        RegolithState::Rock(rock) => rock.pos,
+                        RegolithState::Pickup(pickup) => pickup.pos,
+                        RegolithState::BloomDirector(_) => QPos::default(),
+                    };
+                    cell_of(grid_of(&pos, cell_edge_m))
+                };
+                Some((entity, state, cell))
+            })
+            .collect();
+        let membership = self.app.world().resource::<orrery_net::IslandMembership>();
+        let sends: Vec<_> = authored
+            .into_iter()
+            .flat_map(|(entity, state, cell)| {
+                let payload = encode_replication(&(state.to_canonical(), cell, entity, tick + 1));
+                membership
+                    .peers
+                    .iter()
+                    .filter(move |entry| entry.node != node && entry.cells.contains(&cell))
+                    .map(move |entry| (entry.node, payload.clone()))
+            })
             .collect();
         let mut messages = self
             .app
             .world_mut()
             .resource_mut::<bevy_ecs::message::Messages<SendPacket>>();
-        for peer in peers {
+        for (peer, payload) in sends {
             messages.write(SendPacket {
                 to: peer,
                 channel: Channel::State,
-                payload: Bytes::from(payload.clone()),
+                payload: Bytes::from(payload),
                 mode: StreamMode::Shared,
             });
         }
@@ -1136,7 +1262,7 @@ impl Bot {
     /// router. Address resolution belongs to the swarm because it owns the
     /// entity-to-peer roster, including a token-authenticated exterior node
     /// whose transport identity cannot be derived from its slot.
-    pub fn drain_delivered(&mut self) -> Vec<(PersistId, Order)> {
+    pub fn drain_delivered(&mut self) -> Vec<(PersistId, PersistId, Order)> {
         core::mem::take(&mut self.delivered_outbox)
     }
 
@@ -1180,8 +1306,13 @@ impl Bot {
                     )
                 });
             if let Some((encoded, _cell, entity, observed_tick)) = replication {
-                if entity == from_entity && entity != self.entity {
+                let authority_matches = self
+                    .replica_authorities
+                    .get(&entity)
+                    .is_none_or(|authority| *authority == from);
+                if entity != self.entity && !self.authors(entity) && authority_matches {
                     if let Ok(state) = RegolithState::decode(&encoded) {
+                        self.replica_authorities.entry(entity).or_insert(from);
                         self.executor.insert_observed(
                             entity,
                             state.clone(),
@@ -1206,10 +1337,19 @@ impl Bot {
             });
         let delivered = inner.and_then(orrery_protocol::channels::decode_delivered_input);
         if let Some(delivered) = delivered {
-            if delivered.from != from_entity || delivered.recipient != self.entity {
+            let sender_matches = delivered.from == from_entity
+                || self.replica_authorities.get(&delivered.from) == Some(&from);
+            if !sender_matches || !self.authors(delivered.recipient) {
                 self.foreign_deliveries += 1;
             } else if let Ok(order) = Order::decode(&delivered.input) {
-                self.delivered_inbox.push((delivered.from, order));
+                if delivered.recipient == self.entity {
+                    self.delivered_inbox.push((delivered.from, order));
+                } else {
+                    self.hosted_inbox
+                        .entry(delivered.recipient)
+                        .or_default()
+                        .push((delivered.from, order));
+                }
             }
             // A delivered-input envelope is consumed at the authority seam,
             // including malformed or foreign ones. It must never fall through
@@ -1684,13 +1824,16 @@ mod tests {
                 RecordSource::NeighborFrame { neighbor, .. } if neighbor == other_id
             )
         }));
-        assert!(bot.drain_delivered().into_iter().any(|(recipient, order)| {
-            recipient == other_id
-                && matches!(
-                    order,
-                    Order::CollisionResolved { from, .. } if from == bot.entity()
-                )
-        }));
+        assert!(bot
+            .drain_delivered()
+            .into_iter()
+            .any(|(_, recipient, order)| {
+                recipient == other_id
+                    && matches!(
+                        order,
+                        Order::CollisionResolved { from, .. } if from == bot.entity()
+                    )
+            }));
         assert_eq!(bot.craft().collisions, 1);
     }
 
@@ -1758,7 +1901,7 @@ mod tests {
             );
             for tick in 0..=orrery_protocol::MAX_ADJUDICATION_TICKS {
                 modified.step_core(tick, spec.cell_edge_m);
-                for (recipient, order) in modified.drain_delivered() {
+                for (_, recipient, order) in modified.drain_delivered() {
                     if recipient != target {
                         continue;
                     }

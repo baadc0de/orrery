@@ -8,6 +8,7 @@ use orrery_core::{
 use orrery_games::game::Game;
 use orrery_games::regolith::{
     archetype::Archetype,
+    campaign_rock_seeds, campaign_spawn_pose, distance_mm,
     invariants::INVARIANTS,
     order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult},
     pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
@@ -16,15 +17,69 @@ use orrery_games::regolith::{
     },
     weapon::WeaponKind,
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
-    ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
-    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS,
-    LOCK_DECAY_PER_TICK, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
+    CAMPAIGN_ROCK_COUNT, ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET,
+    ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS,
+    LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET,
+    RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
 
 fn craft_at(x: i64) -> Craft {
     Craft::spawned(Archetype::Interceptor, QPos { x, y: 0, z: 0 }, 0)
+}
+
+#[test]
+fn campaign_seed_places_every_rock_tier_beside_but_not_on_the_crowd_orbit() {
+    let seed = UniverseSeed([0x52; 32]);
+    let rocks = campaign_rock_seeds(seed, 8);
+    assert_eq!(rocks.len(), CAMPAIGN_ROCK_COUNT);
+    assert_eq!(rocks, campaign_rock_seeds(seed, 8));
+    assert_ne!(rocks, campaign_rock_seeds(UniverseSeed([0x53; 32]), 8));
+
+    let tiers = rocks.iter().fold([0usize; 3], |mut counts, seeded| {
+        counts[seeded.rock.tier.tag() as usize] += 1;
+        counts
+    });
+    assert_eq!(tiers, [1, 2, 3], "the campaign publishes every visual tier");
+
+    // This is the cross-platform commitment for scenario composition itself.
+    // Same-process equality alone cannot catch a platform-specific libm drift
+    // in the polar placement below; every determinism-matrix leg runs this
+    // committed byte comparison.
+    let mut digest = blake3::Hasher::new();
+    for seeded in &rocks {
+        digest.update(&seeded.entity.0.to_le_bytes());
+        digest.update(&seeded.owner_slot.to_le_bytes());
+        let mut encoded = Vec::new();
+        seeded.rock.encode(&mut encoded);
+        digest.update(&encoded);
+    }
+    assert_eq!(
+        *digest.finalize().as_bytes(),
+        [
+            92, 13, 156, 174, 173, 149, 167, 28, 0, 143, 167, 231, 88, 139, 225, 13, 145, 226, 126,
+            160, 130, 88, 154, 52, 63, 191, 160, 21, 198, 59, 255, 213,
+        ]
+    );
+
+    let (player, _) = campaign_spawn_pose(8, 9);
+    for seeded in &rocks {
+        assert!(
+            distance_mm(player, seeded.rock.pos) <= 350_000,
+            "rock {} must start inside the player's stock encounter",
+            seeded.entity.0,
+        );
+        for slot in 0..8 {
+            let (craft, _) = campaign_spawn_pose(slot, 8);
+            assert!(
+                distance_mm(craft, seeded.rock.pos)
+                    > u128::try_from(seeded.rock.tier.limits().radius_mm + 50_000).unwrap(),
+                "rock {} must not seed a collision under bot slot {slot}",
+                seeded.entity.0,
+            );
+        }
+    }
 }
 
 #[test]

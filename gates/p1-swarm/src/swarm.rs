@@ -9,7 +9,7 @@ use serde::Serialize;
 use orrery_core::CoreCodec;
 use orrery_games::game::Tamper;
 use orrery_games::regolith::state::RegolithState;
-use orrery_games::regolith::{pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
+use orrery_games::regolith::{campaign_rock_seeds, pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
 use orrery_net::peer_link::StreamMode;
 use orrery_protocol::coord::PeerEntry;
 use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_TICKS};
@@ -49,6 +49,8 @@ pub struct SwarmConfig {
     pub impairment: Impairment,
     /// Seed for impairment and the universe.
     pub seed: u64,
+    /// Install Regolith's authored campaign content beside the player crowd.
+    pub campaign: bool,
     /// Tick at which a late joiner appears, if any.
     pub late_join_tick: Option<u64>,
     /// Run the witness pipeline: every peer watches its witness set's entities
@@ -86,6 +88,7 @@ impl Default for SwarmConfig {
             send_hz: 20,
             impairment: Impairment::default(),
             seed: 1,
+            campaign: false,
             late_join_tick: None,
             witnessing: false,
             cheats: None,
@@ -730,7 +733,7 @@ impl Swarm {
             .map(|cheats| tampered_indices(config.peers, cheats.count))
             .unwrap_or_default();
 
-        let bots: Vec<Bot> = (0..config.peers)
+        let mut bots: Vec<Bot> = (0..config.peers)
             .map(|index| {
                 Bot::new(BotSpec {
                     index,
@@ -750,6 +753,12 @@ impl Swarm {
                 })
             })
             .collect();
+        if config.campaign && !bots.is_empty() {
+            for seeded in campaign_rock_seeds(seed, bots.len()) {
+                bots[seeded.owner_slot]
+                    .host_entity(seeded.entity, RegolithState::Rock(seeded.rock));
+            }
+        }
         let index_of = bots
             .iter()
             .map(|bot| (bot.node, bot.index))
@@ -990,11 +999,11 @@ impl Swarm {
     fn collect_delivered_inputs(&mut self, tick: u64) {
         for from in 0..self.bots.len() {
             let sender = self.bots[from].node;
-            for (recipient, order) in self.bots[from].drain_delivered() {
+            for (author, recipient, order) in self.bots[from].drain_delivered() {
                 let target = self
                     .bots
                     .iter()
-                    .position(|bot| bot.entity() == recipient)
+                    .position(|bot| bot.authors(recipient))
                     .or_else(|| {
                         self.exterior
                             .as_ref()
@@ -1005,7 +1014,7 @@ impl Swarm {
                     continue;
                 };
                 let inner = orrery_protocol::channels::encode_delivered_input(
-                    self.bots[from].entity(),
+                    author,
                     recipient,
                     &order.to_canonical(),
                 );
@@ -1245,7 +1254,7 @@ impl Swarm {
                 let anchor = self.bots[index]
                     .chain
                     .as_mut()
-                    .expect("witnessing")
+                    .expect("witnessing enabled")
                     .anchor(0, &state);
                 (entity, node, anchor, state)
             })
@@ -1286,7 +1295,6 @@ impl Swarm {
             }
             self.bots[index].set_witness_set(members);
             // Each of those peers watches this one.
-            let (entity, node, anchor, state) = anchors[index].clone();
             for watcher in witnesses {
                 if Some(*watcher) == exterior_index {
                     // A bot cannot be armed by a remote subject's anchor here —
@@ -1295,7 +1303,8 @@ impl Swarm {
                     // rendered client lands (#386).
                     continue;
                 }
-                self.bots[*watcher].watch(entity, node, anchor.clone(), state.clone());
+                let (entity, node, anchor, state) = anchors[index].clone();
+                self.bots[*watcher].watch(entity, node, anchor, state);
             }
         }
     }
@@ -2744,6 +2753,184 @@ mod tests {
         }
     }
 
+    /// The live-client census reads canonical replication, so this assertion
+    /// crosses the same host routing seam rather than merely inspecting seeds.
+    #[test]
+    fn campaign_broadcasts_seeded_rocks_to_the_exterior_slot() {
+        use crate::bot::bot_key;
+        use crate::exterior::link_pair;
+        use orrery_games::regolith::state::RockTier;
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 8,
+            seconds: 1,
+            cell_edge_m: crate::bot::campaign_cell_edge_m(),
+            campaign: true,
+            witnessing: false,
+            ..SwarmConfig::default()
+        });
+        let (host_link, remote_link) = link_pair();
+        swarm = swarm.with_external(bot_key(8).public(), None, host_link);
+        swarm.form_island();
+
+        let mut phase = [0u128; 6];
+        swarm.tick_once(0, 1, &mut phase);
+
+        let mut tiers = [0usize; 3];
+        while let Ok(frame) = remote_link
+            .downlink
+            .lock()
+            .expect("downlink lock")
+            .try_recv()
+        {
+            if frame.lane != Lane::Datagram {
+                continue;
+            }
+            let Some((_, inner)) = orrery_protocol::channels::untag(&frame.payload) else {
+                continue;
+            };
+            let Some((encoded, _, _, _)) =
+                orrery_protocol::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(
+                    inner,
+                )
+            else {
+                continue;
+            };
+            let Ok(RegolithState::Rock(rock)) = RegolithState::decode(&encoded) else {
+                continue;
+            };
+            tiers[match rock.tier {
+                RockTier::Large => 0,
+                RockTier::Medium => 1,
+                RockTier::Small => 2,
+            }] += 1;
+        }
+        assert_eq!(
+            tiers,
+            [1, 2, 3],
+            "the exterior state census must receive every seeded rock tier"
+        );
+    }
+
+    #[test]
+    fn campaign_rock_authority_accepts_collision_and_routes_lock_reply() {
+        use crate::bot::bot_key;
+        use crate::exterior::link_pair;
+        use orrery_core::QVel;
+        use orrery_games::regolith::campaign_rock_seeds;
+        use orrery_games::regolith::order::Order;
+        use orrery_games::regolith::state::Rock;
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 8,
+            seconds: 1,
+            cell_edge_m: crate::bot::campaign_cell_edge_m(),
+            campaign: true,
+            witnessing: false,
+            ..SwarmConfig::default()
+        });
+        let exterior_entity = PersistId::new(9);
+        let exterior_node = bot_key(8).public();
+        let mut universe = [0u8; 32];
+        universe[..8].copy_from_slice(&1u64.to_le_bytes());
+        let target = campaign_rock_seeds(UniverseSeed(universe), 8)[0].clone();
+        let (host_link, remote_link) = link_pair();
+        swarm = swarm.with_external(exterior_node, None, host_link);
+        swarm.form_island();
+
+        for order in [
+            Order::LockRequested {
+                locker: exterior_entity,
+            },
+            Order::CollisionResolved {
+                from: exterior_entity,
+                velocity: QVel {
+                    x: 1_000,
+                    y: 0,
+                    z: 0,
+                },
+            },
+        ] {
+            let inner = orrery_protocol::channels::encode_delivered_input(
+                exterior_entity,
+                target.entity,
+                &order.to_canonical(),
+            );
+            let payload = Bytes::from(orrery_protocol::channels::tag(
+                orrery_protocol::channels::Channel::Control,
+                &inner,
+            ));
+            swarm.bots[target.owner_slot].receive_inbound(
+                exterior_node,
+                exterior_entity,
+                Some(StreamMode::Shared),
+                payload,
+            );
+        }
+
+        let mut phase = [0u128; 6];
+        swarm.tick_once(0, 1, &mut phase);
+        swarm.tick_once(1, 1, &mut phase);
+
+        let mut confirmed = false;
+        let mut collided: Option<Rock> = None;
+        while let Ok(frame) = remote_link
+            .downlink
+            .lock()
+            .expect("downlink lock")
+            .try_recv()
+        {
+            match frame.lane {
+                Lane::StreamShared => {
+                    let delivered =
+                        orrery_protocol::channels::untag(&frame.payload).and_then(|(_, inner)| {
+                            orrery_protocol::channels::decode_delivered_input(inner)
+                        });
+                    confirmed |= delivered.is_some_and(|delivered| {
+                        delivered.from == target.entity
+                            && delivered.recipient == exterior_entity
+                            && matches!(
+                                Order::decode(&delivered.input),
+                                Ok(Order::LockConfirmed { target: locked, .. })
+                                    if locked == target.entity
+                            )
+                    });
+                }
+                Lane::Datagram => {
+                    let state = orrery_protocol::channels::untag(&frame.payload)
+                        .and_then(|(_, inner)| {
+                            orrery_protocol::channels::decode_replication::<(
+                                Vec<u8>,
+                                CellId,
+                                PersistId,
+                                u64,
+                            )>(inner)
+                        })
+                        .and_then(|(encoded, _, entity, _)| {
+                            (entity == target.entity)
+                                .then(|| RegolithState::decode(&encoded).ok())
+                                .flatten()
+                        });
+                    if let Some(RegolithState::Rock(rock)) = state {
+                        collided = Some(rock);
+                    }
+                }
+                Lane::StreamBulk | Lane::Meta => {}
+            }
+        }
+        assert!(confirmed, "the rock authority answers the exterior lock");
+        let collided = collided.expect("the changed rock state was replicated");
+        assert_eq!(collided.collisions, 1);
+        assert_eq!(
+            collided.vel,
+            QVel {
+                x: 1_000,
+                y: 0,
+                z: 0
+            }
+        );
+    }
+
     /// A rendered campaign starts with the exterior craft and the host crowd in
     /// one local encounter. Holding the player's craft still must not turn that
     /// encounter into a four-second fly-by merely because the P1 gate's bots
@@ -2757,6 +2944,7 @@ mod tests {
             peers: 8,
             seconds: 45,
             cell_edge_m: crate::bot::campaign_cell_edge_m(),
+            campaign: true,
             witnessing: false,
             ..SwarmConfig::default()
         });
