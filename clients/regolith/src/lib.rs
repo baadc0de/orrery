@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod admission;
+pub mod aoi;
 pub mod assets;
 pub mod campaign;
 pub mod combat;
@@ -255,6 +256,29 @@ impl ActiveSession {
         }
     }
 
+    /// The interest cell edge this session's AOI boundary is built from, in
+    /// metres, or `None` when the session has no interest set at all.
+    ///
+    /// The offline sandbox holds both seats in one local executor: there is no
+    /// host, no replication, and therefore no boundary. Fading against an
+    /// invented one there would have the skin drawing a limit the run does not
+    /// have (#519). A campaign that has not finished dialling has not yet been
+    /// told anything either, so it is `None` until [`JoinState::Joined`].
+    ///
+    /// The value itself is the campaign runtime's own `cell_edge_m` — the same
+    /// field `committed_cell` divides by when telling the host which cell this
+    /// craft is in — so the skin cannot drift from the host's definition of
+    /// the edge the way #499 and #502 did.
+    #[must_use]
+    pub fn aoi_edge_m(&self) -> Option<f32> {
+        match self {
+            Self::Local(_) => None,
+            Self::Campaign(runtime) => {
+                matches!(runtime.state(), JoinState::Joined).then(|| runtime.cell_edge_m() as f32)
+            }
+        }
+    }
+
     fn join_state(&self) -> Option<&JoinState> {
         match self {
             Self::Local(_) => None,
@@ -361,6 +385,8 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<OverlayState>()
             .init_resource::<MetricWindow>()
             .init_resource::<CameraZoom>()
+            .init_resource::<aoi::AoiBoundary>()
+            .init_resource::<aoi::AoiFadeCensus>()
             .init_resource::<roster::ShipRoster>()
             .init_resource::<roster::RosterTask>()
             .init_resource::<SelectedLock>()
@@ -380,6 +406,15 @@ impl Plugin for RegolithSkinPlugin {
                     ensure_local_body.after(sync_rendered_state),
                     ensure_focus_body.after(recompose_craft_bodies),
                     ensure_rock_bodies.after(sync_rendered_state),
+                    // After every body-spawning system, so a craft that
+                    // appears this frame is faded on the frame it appears
+                    // rather than flashing at full opacity first.
+                    aoi::read_aoi_boundary.after(sync_rendered_state),
+                    aoi::sync_aoi_fade
+                        .after(aoi::read_aoi_boundary)
+                        .after(ensure_rock_bodies)
+                        .after(ensure_focus_body)
+                        .after(ensure_local_body),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     follow_camera.after(sync_rendered_state),
@@ -409,6 +444,13 @@ impl Plugin for RegolithSkinPlugin {
                     .after(sync_rendered_state),
             )
             .add_systems(Update, capture_tracer_geometry.after(hud::sync_tracers))
+            .add_systems(
+                Update,
+                capture_aoi_census
+                    .after(aoi::sync_aoi_fade)
+                    .run_if(resource_exists::<GeometryCapture>)
+                    .run_if(on_timer(Duration::from_secs(1))),
+            )
             .add_systems(Update, write_campaign_record_on_exit)
             .add_systems(
                 Update,
@@ -565,12 +607,15 @@ fn spawn_craft_body(
         Visibility::Inherited,
     ));
     let arc_radius = craft::hull_length(archetype) * craft::ARC_RADIUS_HULL_LENGTHS;
-    let arc_material = materials.add(hud::firing_arc_material(seat, accent));
+    let arc_finish = hud::firing_arc_material(seat, accent);
+    let arc_fade = aoi::fadeable(entity, &arc_finish);
+    let arc_material = materials.add(arc_finish);
     spawned.with_children(|craft_root| {
         for arc in craft::firing_arcs(archetype) {
             craft_root.spawn((
                 Name::new(arc.name),
                 FiringArcFan(entity),
+                arc_fade,
                 Mesh3d(meshes.add(craft::arc_mesh(*arc, arc_radius))),
                 MeshMaterial3d(arc_material.clone()),
                 // Just off the deck, so the fan reads over the plan view
@@ -582,6 +627,16 @@ fn spawn_craft_body(
     if let Some(scene) = paths.craft_scene(asset_server) {
         // The optional glTF still wins when it is on disk: this work
         // improves the fallback, it does not replace the asset path.
+        //
+        // **Known limit of #533's fade on this branch.** The scene's own
+        // materials are owned by the glTF loader and are shared across every
+        // body that loads the same asset, so tagging them `AoiFadeable` here
+        // would fade every craft together the moment one of them neared the
+        // boundary. Only the firing-arc fans above carry the tag on this
+        // path, so a glTF hull fades its arc marking and not its plate. No
+        // asset ships in this checkout, so no run today takes this branch;
+        // doing it properly needs per-body material instances, which is a
+        // change to the asset path rather than to the fade.
         spawned.insert(WorldAssetRoot(scene));
         return;
     }
@@ -589,10 +644,13 @@ fn spawn_craft_body(
     // from the same reading the arcs above took.
     spawned.with_children(|craft_root| {
         for part in craft::parts(archetype) {
+            let finish = craft::finish_material(part.finish, seat, accent);
+            let fade = aoi::fadeable(entity, &finish);
             craft_root.spawn((
                 Name::new(part.name),
+                fade,
                 Mesh3d(meshes.add(craft::mesh_for(part.shape))),
-                MeshMaterial3d(materials.add(craft::finish_material(part.finish, seat, accent))),
+                MeshMaterial3d(materials.add(finish)),
                 Transform {
                     translation: part.translation,
                     rotation: part.rotation,
@@ -860,6 +918,41 @@ fn capture_tracer_geometry(
     }
 }
 
+/// Prints the interest-fade census once a second under `--capture-geometry`.
+///
+/// The evidence #533 needs is not "the arithmetic is right" — the unit tests
+/// hold that — but "the fade reached a material in a live campaign, against
+/// the host's own boundary". This prints what
+/// [`aoi::sync_aoi_fade`] actually wrote.
+fn capture_aoi_census(
+    session: Res<ActiveSession>,
+    census: Res<aoi::AoiFadeCensus>,
+    rock_bodies: Query<(), With<RockBody>>,
+    zoom: Res<CameraZoom>,
+) {
+    let mut counts = [0usize; 3];
+    for entity in session.executor().entities().copied() {
+        if let Some(RegolithState::Rock(rock)) = session.executor().state(entity) {
+            if rock.hull > 0 {
+                counts[match rock.tier {
+                    RockTier::Large => 0,
+                    RockTier::Medium => 1,
+                    RockTier::Small => 2,
+                }] += 1;
+            }
+        }
+    }
+    // The rock line rides along because #530 is judged at both zoom extremes
+    // and there is no way to read a tint out of a running window; the camera
+    // height says which extreme the frame was at.
+    println!(
+        "aoi_census {} | camera {:.0} m | {}",
+        census.line(session.aoi_edge_m()),
+        zoom.height_m(),
+        rock_census(counts, rock_bodies.iter().count()),
+    );
+}
+
 fn clear_refused_selection(
     events: &[Outcome],
     delivered: &[DeliveredOrder],
@@ -999,25 +1092,59 @@ fn nearest_clicked(
 ///
 /// ## Why the ramp runs the way it does
 ///
-/// The tiers are 40 m, 20 m and 8 m in radius, so size alone separates them —
-/// but a small rock is also the one that is hardest to notice, and the camera
-/// now reaches 4 km (#521). So lightness runs *against* size: the small tier
-/// is the brightest and the large tier the darkest, which keeps every tier
-/// legible instead of making the already-faint one fainter. Facet count runs
-/// *with* size, because a 40 m body has the screen area to show facets and an
-/// 8 m one reads better as a single chunk.
+/// The tiers are 40 m, 20 m and 8 m in radius, so **size is the primary tier
+/// cue and it is the ruleset's own number** — nothing here has to carry that
+/// job. Facet count runs *with* size, because a 40 m body has the screen area
+/// to show facets and an 8 m one reads better as a single chunk.
+///
+/// Lightness still tilts *against* size, for the reason #528 gave: the small
+/// tier is the one hardest to notice, so it gets the most help. What #530
+/// corrected is the **magnitude** of that tilt. It used to run from 0.40 to
+/// 0.72 in sRGB, which made the 40 m tier the darkest object in the scene —
+/// and a 40 m rock is the one you most need to see early, because collisions
+/// apply real mutual force since #514. So the tilt survives and the ramp does
+/// not invert; instead every tier is lifted onto a **contrast floor that does
+/// not depend on tier at all** ([`ROCK_MIN_TINT_LUMA`]), and the whole ramp is
+/// compressed to a nuance rather than a hierarchy
+/// ([`ROCK_MAX_TINT_LUMA_RATIO`]).
+///
+/// The floor is set against the thing rocks are actually seen against. The
+/// starfield (#525) draws `unlit` quads at up to 0.62 grey, while a rock is a
+/// **lit** body: its rendered brightness is its tint multiplied by whatever
+/// the one directional light gives it, so its tint is a ceiling on how light
+/// it can ever appear. A tint below the star layers meant the largest rock
+/// could render darker than the background it sat in front of and read as a
+/// hole rather than an object.
 ///
 /// The tints stay on a warm neutral ramp rather than taking
 /// [`hud::MINING_AMBER`]: that amber is the mining *lock* colour, and a rock
 /// wearing it unlocked would say the player has a mining lock they do not
-/// have.
+/// have. The remaining per-tier separation is temperature — the large tier
+/// warmest, the small tier closest to neutral — which reads at the zoom where
+/// a rock fills enough pixels to have a colour at all, while size carries the
+/// tier at the zoom where it does not.
 const fn rock_finish(tier: RockTier) -> (Color, u32) {
     match tier {
-        RockTier::Large => (Color::srgb(0.40, 0.37, 0.34), 2),
-        RockTier::Medium => (Color::srgb(0.55, 0.51, 0.46), 1),
-        RockTier::Small => (Color::srgb(0.72, 0.67, 0.60), 0),
+        RockTier::Large => (Color::srgb(0.66, 0.61, 0.53), 2),
+        RockTier::Medium => (Color::srgb(0.70, 0.66, 0.59), 1),
+        RockTier::Small => (Color::srgb(0.74, 0.72, 0.70), 0),
     }
 }
+
+/// The lightness no rock tint may fall below, as linear Rec. 709 luma.
+///
+/// Set at the middle starfield layer's own grey (0.42 sRGB), so the dimmest
+/// rock in the game still has a lighter surface than most of the field behind
+/// it before the scene light has taken anything off it. See
+/// [`rock_finish`].
+pub const ROCK_MIN_TINT_LUMA: f32 = 0.144;
+
+/// How much lighter the lightest tier may be than the darkest.
+///
+/// The old ramp ran 3.6:1, which is a hierarchy — it said "large rocks are
+/// background". At 1.6:1 the tilt is still there and still helps the small
+/// tier, but no tier is *the dark one*. See [`rock_finish`].
+pub const ROCK_MAX_TINT_LUMA_RATIO: f32 = 1.6;
 
 /// A rock's resting attitude, derived from its own id.
 ///
@@ -1079,16 +1206,22 @@ fn ensure_rock_bodies(
             .mesh()
             .ico(facets)
             .unwrap_or_else(|_| Sphere::new(radius_m).mesh().uv(12, 8));
+        let finish = StandardMaterial {
+            base_color: tint,
+            metallic: 0.05,
+            perceptual_roughness: 0.95,
+            ..Default::default()
+        };
+        // A rock is replicated remote state on the same interest set as a
+        // craft, so it leaves the view through the same boundary and gets the
+        // same fade (#533).
+        let fade = aoi::fadeable(entity, &finish);
         commands.spawn((
             CoreEntity(entity),
             RockBody,
+            fade,
             Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: tint,
-                metallic: 0.05,
-                perceptual_roughness: 0.95,
-                ..Default::default()
-            })),
+            MeshMaterial3d(materials.add(finish)),
             Transform::from_rotation(rock_attitude(entity)),
         ));
     }
@@ -1671,6 +1804,7 @@ fn refresh_f3_pane(
     session: Res<ActiveSession>,
     rock_bodies: Query<(), With<RockBody>>,
     roster: Res<roster::ShipRoster>,
+    fade_census: Res<aoi::AoiFadeCensus>,
     mut pane: Query<(&mut Text, &mut Node), With<F3Pane>>,
 ) {
     if let Ok((mut text, mut node)) = pane.single_mut() {
@@ -1704,6 +1838,8 @@ fn refresh_f3_pane(
         }
         text.push('\n');
         text.push_str(&rock_census(counts, rock_bodies.iter().count()));
+        text.push('\n');
+        text.push_str(&fade_census.line(session.aoi_edge_m()));
         text.push('\n');
         text.push_str(&roster.summary_line());
         text.push_str(&format!(
@@ -2008,8 +2144,14 @@ mod tests {
         );
     }
 
-    /// The three tiers must not be confusable at a glance, and the ramp runs
-    /// against size on purpose: the smallest rock is the hardest to see.
+    /// The three tiers must not be confusable at a glance — and, since #530,
+    /// no tier may be *the dark one*.
+    ///
+    /// The old ramp ran from 0.40 to 0.72 sRGB against size, which handed the
+    /// 40 m tier the lowest contrast in the scene. That tier is the one you
+    /// most need to see early, because a collision now applies real mutual
+    /// force (#514). The tilt survives; the floor and the compression are what
+    /// this pins.
     #[test]
     fn the_rock_tiers_are_distinguishable_by_more_than_size() {
         let finishes = [
@@ -2017,13 +2159,44 @@ mod tests {
             rock_finish(RockTier::Medium),
             rock_finish(RockTier::Small),
         ];
+        // Rec. 709 luma over linear components: how light the surface is
+        // before the scene light takes anything off it.
         let luma = |colour: Color| {
             let rgba = colour.to_linear();
-            rgba.red + rgba.green + rgba.blue
+            0.2126 * rgba.red + 0.7152 * rgba.green + 0.0722 * rgba.blue
         };
+        let lumas = finishes.map(|(colour, _)| luma(colour));
+
+        // The floor is what #530 is about, and it is tier-independent.
+        for (tier, luma) in ["large", "medium", "small"].iter().zip(lumas) {
+            assert!(
+                luma >= ROCK_MIN_TINT_LUMA,
+                "the {tier} tier must clear the contrast floor; {luma} < {ROCK_MIN_TINT_LUMA}"
+            );
+        }
+        // A rock is a lit body, so its tint is a ceiling on how bright it can
+        // ever render. Every tier must start above the starfield greys it is
+        // seen against, or the largest rock reads as a hole in the field.
+        let brightest_star = Color::srgb(
+            starfield::STAR_LAYERS[0].grey,
+            starfield::STAR_LAYERS[0].grey,
+            starfield::STAR_LAYERS[0].grey,
+        );
         assert!(
-            luma(finishes[0].0) < luma(finishes[1].0) && luma(finishes[1].0) < luma(finishes[2].0),
-            "lightness must run against size so the smallest tier stays visible"
+            ROCK_MIN_TINT_LUMA < luma(brightest_star),
+            "the floor is set below the brightest star layer on purpose; \
+             a rock is lit and a star is not"
+        );
+
+        // The ramp is a nuance, not a hierarchy.
+        let ratio = lumas[2] / lumas[0];
+        assert!(
+            ratio <= ROCK_MAX_TINT_LUMA_RATIO,
+            "the tier ramp must stay inside {ROCK_MAX_TINT_LUMA_RATIO}:1; got {ratio}"
+        );
+        assert!(
+            lumas[0] < lumas[1] && lumas[1] < lumas[2],
+            "the tilt still favours the smallest tier, which is the hardest to notice"
         );
         assert!(
             finishes[0].1 > finishes[1].1 && finishes[1].1 > finishes[2].1,

@@ -40,6 +40,13 @@ type FlashQuery<'w, 's> = Query<
     ),
     With<ImpactFlash>,
 >;
+/// The impact marker ring, disjoint from the burst it points at.
+type MarkerQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Transform, &'static mut Visibility),
+    (With<ImpactMarker>, Without<ImpactFlash>),
+>;
 /// The glow disc, likewise disjoint.
 type GlowQuery<'w, 's> = Query<
     'w,
@@ -89,13 +96,85 @@ pub const MINING_AMBER: Color = Color::srgb(0.95, 0.62, 0.22);
 pub const IMPACT_ORANGE: Color = Color::srgb(1.0, 0.45, 0.10);
 
 /// The burst's drawn radius at its birth and at its death, as multiples of the
-/// flash mesh's own radius.
+/// **target's own ruleset radius**.
 ///
 /// It opens fast and keeps growing while fading, which is what makes a small
-/// sphere read as a burst rather than as a lamp switching on.
+/// sphere read as a burst rather than as a lamp switching on. The multiplicand
+/// changed in #531: it used to be the flash mesh's own radius scaled to hold a
+/// constant *apparent* size, which meant the same adjudicated hit was drawn 27
+/// times larger in world terms at 4 km than at 150 m. Camera height is a fact
+/// about the observer, not about the event.
 pub const IMPACT_BURST_START_SCALE: f32 = 0.55;
 /// See [`IMPACT_BURST_START_SCALE`].
 pub const IMPACT_BURST_END_SCALE: f32 = 2.3;
+
+/// The flash mesh's authored radius in metres, at scale one.
+pub const IMPACT_FLASH_MESH_RADIUS_M: f32 = RETICLE_RADIUS_M * 0.12;
+
+/// The impact marker ring's radius in metres at the default zoom.
+///
+/// The ring is the one part of the impact that holds a constant *apparent*
+/// size, the way the lock reticle does, because it is a pointer rather than a
+/// measurement — see [`sync_impact_flash`]. Sized to about what the old burst
+/// occupied at the default zoom, so the event is no harder to spot than it was
+/// before #531.
+pub const IMPACT_MARKER_RADIUS_M: f32 = RETICLE_RADIUS_M * 0.30;
+
+/// The marker ring's tube radius as a fraction of its own radius.
+///
+/// The camera's vertical field of view is [`crate::CAMERA_FOV_Y`], so on a
+/// 1080-line window the visible world height is `2·h·tan(FOV/2)` metres for a
+/// camera height `h`, and the ring's own radius is
+/// `IMPACT_MARKER_RADIUS_M · h / CAMERA_DEFAULT_HEIGHT_M`. Both are linear in
+/// `h`, so the ring's apparent thickness is the same at every zoom — about two
+/// and a half pixels at this ratio, which is a hairline that renders rather
+/// than a hairline that does not.
+pub const IMPACT_MARKER_TUBE_RATIO: f32 = 0.06;
+
+/// The radius the burst falls back to when the target's state is already gone.
+///
+/// A hit that destroyed its target retires the replica, so the ruleset radius
+/// is no longer readable. The smallest chassis in the game is the most
+/// conservative thing left to claim.
+#[must_use]
+pub fn fallback_target_radius_m() -> f32 {
+    orrery_games::regolith::archetype::Archetype::Interceptor
+        .limits()
+        .radius_mm as f32
+        / 1_000.0
+}
+
+/// The target's own radius in metres, as the ruleset states it.
+///
+/// This is the same `radius_mm` `projectile_resolution` adds to the weapon's
+/// reach when it decides whether a shot connects
+/// (`crates/orrery_games/src/regolith/mod.rs:1055`), so the drawn burst spans
+/// the ruleset's own target rather than a size the skin picked.
+#[must_use]
+pub fn target_radius_m(
+    executor: &orrery_core::Executor<orrery_games::Regolith>,
+    entity: crate::PersistId,
+) -> f32 {
+    use orrery_games::regolith::state::RegolithState;
+    let radius_mm = match executor.state(entity) {
+        Some(RegolithState::Craft(craft)) => craft.archetype.limits().radius_mm,
+        Some(RegolithState::Rock(rock)) => rock.tier.limits().radius_mm,
+        _ => return fallback_target_radius_m(),
+    };
+    radius_mm as f32 / 1_000.0
+}
+
+/// Whether the constant-apparent-size marker ring is drawn, and how big.
+///
+/// Returns the ring's world radius, or `None` when the burst itself is already
+/// at least as large on screen as the ring would be — at that point the
+/// pointer is redundant and drawing it would just add a second circle around
+/// an event you can already see.
+#[must_use]
+pub fn impact_marker_radius_m(burst_radius_m: f32, glyph_scale: f32) -> Option<f32> {
+    let marker = IMPACT_MARKER_RADIUS_M * glyph_scale;
+    (marker > burst_radius_m).then_some(marker)
+}
 
 /// The pool cuboid's length along its nose axis at scale one, in metres.
 pub const TRACER_MESH_LENGTH_M: f32 = 18.0;
@@ -243,6 +322,10 @@ pub struct Tracer(pub usize);
 /// The world-space burst drawn on a shot's target while an arrival cue lives.
 #[derive(Component)]
 pub struct ImpactFlash;
+
+/// The constant-apparent-size ring that points at a confirmed impact.
+#[derive(Component)]
+pub struct ImpactMarker;
 
 /// A gauge's filled bar. The system sets its width.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
@@ -496,7 +579,17 @@ pub fn spawn_world_overlay(
     });
     let tracer_mesh = meshes.add(Cuboid::new(TRACER_MESH_LENGTH_M, 0.5, 0.5));
     let flash_mesh = meshes.add(Sphere {
-        radius: RETICLE_RADIUS_M * 0.12,
+        radius: IMPACT_FLASH_MESH_RADIUS_M,
+    });
+    // The marker needs its own torus rather than the range rings'. Theirs is
+    // scaled to hundreds of metres, so a 0.0035 minor radius is a couple of
+    // pixels of tube; scaled to the marker's ~15 m it would be 0.05 m, which
+    // is well under a pixel at every zoom and would not render at all.
+    // `IMPACT_MARKER_TUBE_RATIO` is chosen so the ring is about two and a half
+    // pixels thick across the whole range instead.
+    let marker_mesh = meshes.add(Torus {
+        major_radius: 1.0,
+        minor_radius: IMPACT_MARKER_TUBE_RATIO,
     });
     let flash_material = materials.add(StandardMaterial {
         base_color: IMPACT_ORANGE,
@@ -577,6 +670,16 @@ pub fn spawn_world_overlay(
     commands.spawn((
         ImpactFlash,
         Mesh3d(flash_mesh),
+        MeshMaterial3d(flash_material.clone()),
+        Transform::default(),
+        Visibility::Hidden,
+    ));
+    // The same unit torus the range rings use, so the marker is a hairline
+    // circle rather than a disc: a ring has no interior and therefore claims
+    // no volume of fire.
+    commands.spawn((
+        ImpactMarker,
+        Mesh3d(marker_mesh),
         MeshMaterial3d(flash_material),
         Transform::default(),
         Visibility::Hidden,
@@ -766,32 +869,69 @@ fn world_position(
 /// shooter has and is not the true intersection; see
 /// [`ShotFeedback::impact_burst`] for why, and for why the burst is drawn as a
 /// marker on the thing that was hit rather than as a surveyed point.
+///
+/// # Why the impact is two things (#531)
+///
+/// It used to be one filled sphere held to a constant *apparent* size across
+/// #521's zoom range. That kept it legible at 4 km and quietly re-created the
+/// honesty problem the doc comment above disclaims: the same adjudicated hit
+/// was drawn spanning 4 m of world at 150 m of camera height and 118 m at
+/// 4 km. Nothing about the event changed between those two frames; only the
+/// observer moved. A filled, growing, emissive sphere is a picture of *how
+/// much space the impact filled*, so scaling it with the camera is the skin
+/// stating a size it does not know.
+///
+/// So the two jobs are split and each done honestly:
+///
+/// * **The burst** — the filled sphere — is drawn in world metres, sized from
+///   the target's own ruleset radius ([`target_radius_m`]), the same number
+///   the ruleset adds to weapon reach when deciding whether the shot
+///   connected. It shrinks with distance exactly like the range rings and the
+///   tracers do, because like them it means metres.
+/// * **The marker** — a hairline ring — holds a constant apparent size, the
+///   way the lock reticle does. It is a pointer: it says "the ruleset
+///   adjudicated damage here", which is a true statement at any zoom, and its
+///   empty interior claims no extent. It is suppressed entirely once the burst
+///   is the larger of the two on screen ([`impact_marker_radius_m`]), so at
+///   close range the impact is just the burst, as before.
 pub fn sync_impact_flash(
     feedback: Res<ShotFeedback>,
+    session: Res<crate::ActiveSession>,
     zoom: Res<crate::CameraZoom>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
     mut flashes: FlashQuery,
+    mut markers: MarkerQuery,
 ) {
     let burst = feedback
         .impact_burst()
-        .and_then(|(target, progress)| Some((world_position(&bodies, target)?, progress)));
+        .and_then(|(target, progress)| Some((target, world_position(&bodies, target)?, progress)));
     let Ok((mut transform, mut visibility, material)) = flashes.single_mut() else {
         return;
     };
-    let Some((position, progress)) = burst else {
+    let Some((target, position, progress)) = burst else {
         *visibility = Visibility::Hidden;
+        if let Ok((_, mut marker_visibility)) = markers.single_mut() {
+            *marker_visibility = Visibility::Hidden;
+        }
         return;
     };
     transform.translation = position;
-    // A glyph, not a measurement: it holds its apparent size across #521's
-    // zoom range instead of shrinking to nothing at 4 km. The range rings, the
-    // arc marking and the tracers deliberately do *not* do this — they mean
-    // metres, and would lie about distance if they were held to screen size.
     let growth =
         IMPACT_BURST_START_SCALE + (IMPACT_BURST_END_SCALE - IMPACT_BURST_START_SCALE) * progress;
-    transform.scale = Vec3::splat(growth * zoom.glyph_scale());
+    let burst_radius_m = target_radius_m(session.executor(), target) * growth;
+    transform.scale = Vec3::splat(burst_radius_m / IMPACT_FLASH_MESH_RADIUS_M);
     *visibility = Visibility::Inherited;
+    if let Ok((mut marker_transform, mut marker_visibility)) = markers.single_mut() {
+        match impact_marker_radius_m(burst_radius_m, zoom.glyph_scale()) {
+            Some(radius_m) => {
+                marker_transform.translation = position;
+                marker_transform.scale = Vec3::splat(radius_m);
+                *marker_visibility = Visibility::Inherited;
+            }
+            None => *marker_visibility = Visibility::Hidden,
+        }
+    }
     if let (Some(mut materials), Some(handle)) = (materials, material) {
         if let Some(mut material) = materials.get_mut(&handle.0) {
             let fade = (1.0 - progress).clamp(0.0, 1.0);
@@ -1135,12 +1275,14 @@ mod tests {
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
             .init_resource::<crate::CameraZoom>()
-            .init_resource::<ShotFeedback>();
+            .init_resource::<ShotFeedback>()
+            .insert_resource(crate::ActiveSession::Local(Box::default()));
         let world = app.world_mut();
         world.spawn((LockReticle, Transform::default(), Visibility::Hidden));
         world.spawn((LockBrackets, Transform::default(), Visibility::Inherited));
         world.spawn((LockGlow, Transform::default(), Visibility::Hidden));
         world.spawn((ImpactFlash, Transform::default(), Visibility::Hidden));
+        world.spawn((ImpactMarker, Transform::default(), Visibility::Hidden));
         for index in 0..LOCK_RING_SEGMENTS {
             world.spawn((LockSegment(index), Transform::default(), Visibility::Hidden));
         }
@@ -1493,6 +1635,133 @@ mod tests {
         assert!(tracer_geometry(&mut app, 0).is_some());
         assert!(tracer_geometry(&mut app, 1).is_some());
         assert!(tracer_geometry(&mut app, 2).is_none());
+    }
+
+    /// The marker only does its job if it is actually drawn. Reusing the
+    /// range rings' torus — authored for radii in the hundreds of metres —
+    /// would have put a 0.05 m tube on a 15 m ring, which is well under a
+    /// pixel at every zoom: a correct opacity, a correct position, and
+    /// nothing on screen. That is the shape of #517, #524 and #514.
+    #[test]
+    fn the_marker_ring_renders_as_a_hairline_at_every_zoom() {
+        const LINES: f32 = 1080.0;
+        for height_m in [
+            crate::CAMERA_MIN_HEIGHT_M,
+            crate::CAMERA_DEFAULT_HEIGHT_M,
+            crate::CAMERA_MAX_HEIGHT_M,
+        ] {
+            let metres_per_pixel = 2.0 * crate::visible_half_height_m(height_m) / LINES;
+            let glyph = height_m / crate::CAMERA_DEFAULT_HEIGHT_M;
+            let radius_m = IMPACT_MARKER_RADIUS_M * glyph;
+            let tube_px = 2.0 * IMPACT_MARKER_TUBE_RATIO * radius_m / metres_per_pixel;
+            assert!(
+                (1.5_f32..=6.0).contains(&tube_px),
+                "the ring is {tube_px} px thick at {height_m} m of camera height"
+            );
+            let diameter_px = 2.0 * radius_m / metres_per_pixel;
+            assert!(
+                (24.0..=96.0).contains(&diameter_px),
+                "the ring is {diameter_px} px across at {height_m} m of camera height"
+            );
+        }
+    }
+
+    /// #531: the same adjudicated hit must be drawn at the same size in the
+    /// world no matter where the camera is, because camera height is a fact
+    /// about the observer. The burst's world radius is therefore pinned to the
+    /// ruleset's own target radius, and the only thing that tracks the zoom is
+    /// the marker ring — which is a pointer with an empty interior, not a
+    /// picture of an extent.
+    #[test]
+    fn the_burst_holds_its_world_size_across_the_zoom_range() {
+        let mut app = overlay_app();
+        body(&mut app, ME, 0.0, 0.0);
+        body(&mut app, THEM, 100.0, -40.0);
+        app.add_systems(Update, sync_impact_flash);
+        *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
+            cue: Some(ShotCue::Resolved {
+                target: THEM,
+                result: ShotResult::Hit,
+            }),
+            ticks_left: SHOT_CUE_TICKS,
+        };
+
+        let read = |app: &mut App| {
+            let burst = app
+                .world_mut()
+                .query_filtered::<&Transform, With<ImpactFlash>>()
+                .iter(app.world())
+                .next()
+                .expect("the flash exists")
+                .scale
+                .x
+                * IMPACT_FLASH_MESH_RADIUS_M;
+            let marker = app
+                .world_mut()
+                .query_filtered::<(&Transform, &Visibility), With<ImpactMarker>>()
+                .iter(app.world())
+                .map(|(transform, visibility)| {
+                    (*visibility != Visibility::Hidden).then_some(transform.scale.x)
+                })
+                .next()
+                .expect("the marker exists");
+            (burst, marker)
+        };
+
+        // Fully zoomed out, then fully zoomed in. `zoomed` clamps, so the
+        // large notch counts land exactly on the documented limits.
+        *app.world_mut().resource_mut::<crate::CameraZoom>() =
+            crate::CameraZoom::default().zoomed(-100.0);
+        app.update();
+        let (far_burst, far_marker) = read(&mut app);
+
+        *app.world_mut().resource_mut::<crate::CameraZoom>() =
+            crate::CameraZoom::default().zoomed(100.0);
+        app.update();
+        let (near_burst, near_marker) = read(&mut app);
+
+        assert!(
+            (far_burst - near_burst).abs() < 1e-3,
+            "the burst is a world measurement: {far_burst} m at 4 km vs {near_burst} m at 150 m"
+        );
+        let session_radius = {
+            let session = app.world().resource::<crate::ActiveSession>();
+            target_radius_m(session.executor(), THEM)
+        };
+        assert!(
+            (far_burst - session_radius * IMPACT_BURST_START_SCALE).abs() < 1e-3,
+            "the burst spans the ruleset's own target radius; {far_burst} m against \
+             {session_radius} m of target"
+        );
+        // The pre-#531 drawing held a constant apparent size, which put the
+        // burst at 58.9 m of world radius at the far end of the zoom range.
+        assert!(
+            far_burst < 20.0,
+            "a burst spanning {far_burst} m of world claims a precision the \
+             anchor does not have"
+        );
+
+        let far_marker = far_marker.expect("zoomed out, the burst needs a pointer");
+        assert!(
+            far_marker > far_burst,
+            "the marker only exists while it is the larger of the two"
+        );
+        assert!(
+            near_marker.is_none_or(|marker| marker <= near_burst),
+            "zoomed in, the burst is its own marker and the ring is redundant"
+        );
+        // The suppression itself, independent of where the zoom limits happen
+        // to land: a burst already larger than the pointer gets no pointer.
+        assert_eq!(
+            impact_marker_radius_m(400.0, 1.0),
+            None,
+            "a burst wider than the ring must not also wear the ring"
+        );
+        assert_eq!(
+            impact_marker_radius_m(1.0, 1.0),
+            Some(IMPACT_MARKER_RADIUS_M),
+            "a burst smaller than the ring keeps its pointer at apparent size"
+        );
     }
 
     /// The flash is a picture of the cue and nothing else: provisional or
