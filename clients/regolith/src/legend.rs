@@ -129,6 +129,15 @@ pub const HEADING: &str = "CONTROLS";
 /// screen says so.
 pub const NOTE: &str = "To mine: click a rock, then hold Space.";
 
+/// How to collect a pickup, which has no key at all.
+///
+/// #568's answer is proximity, not a binding: the skin emits the grab when the
+/// craft is inside the ruleset's own reach. So this is a *statement* of the
+/// mechanism and not a row — there is no key to name. It is
+/// [`crate::grab::PICKUP_STATEMENT`], the same string the own-craft panel
+/// shows, so the two cannot say different things.
+pub const PICKUP_NOTE: &str = crate::grab::PICKUP_STATEMENT;
+
 /// Font size of a legend row, in pixels.
 pub const ROW_FONT_PX: f32 = 12.0;
 /// Font size of the heading, in pixels.
@@ -193,9 +202,9 @@ pub fn action_column_px() -> f32 {
 /// Heading, every row, then the mining note, with `ROW_GAP_PX` between each.
 #[must_use]
 pub fn height_px() -> f32 {
-    let lines = 2.0 + ROWS.len() as f32;
-    let text =
-        (HEADING_FONT_PX + NOTE_FONT_PX + ROWS.len() as f32 * ROW_FONT_PX) * LINE_HEIGHT_RATIO;
+    let lines = 3.0 + ROWS.len() as f32;
+    let text = (HEADING_FONT_PX + 2.0 * NOTE_FONT_PX + ROWS.len() as f32 * ROW_FONT_PX)
+        * LINE_HEIGHT_RATIO;
     text + (lines - 1.0) * ROW_GAP_PX + 2.0 * PADDING_PX
 }
 
@@ -340,6 +349,11 @@ pub fn spawn_legend(commands: &mut Commands) {
         }
         panel.spawn((
             Text::new(NOTE),
+            TextFont::from_font_size(NOTE_FONT_PX),
+            TextColor(DIM),
+        ));
+        panel.spawn((
+            Text::new(PICKUP_NOTE),
             TextFont::from_font_size(NOTE_FONT_PX),
             TextColor(DIM),
         ));
@@ -513,7 +527,7 @@ mod tests {
 
     #[test]
     fn legend_text_is_ascii_only() {
-        let mut strings = vec![HEADING, NOTE];
+        let mut strings = vec![HEADING, NOTE, PICKUP_NOTE];
         for row in ROWS {
             strings.push(row.keys);
             strings.push(row.action);
@@ -572,12 +586,14 @@ mod tests {
             "heading measures {heading:.1} px inside {:.1} px",
             content_width_px()
         );
-        let note = text_width_px(NOTE, NOTE_FONT_PX);
-        assert!(
-            note <= content_width_px(),
-            "the mining note measures {note:.1} px inside {:.1} px",
-            content_width_px()
-        );
+        for (what, note) in [("mining", NOTE), ("pickup", PICKUP_NOTE)] {
+            let width = text_width_px(note, NOTE_FONT_PX);
+            assert!(
+                width <= content_width_px(),
+                "the {what} note measures {width:.1} px inside {:.1} px",
+                content_width_px()
+            );
+        }
 
         let left_edge = WINDOW_W - MARGIN_PX - WIDTH_PX;
         assert!(

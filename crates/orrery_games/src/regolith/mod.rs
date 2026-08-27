@@ -1131,7 +1131,7 @@ impl Regolith {
                 Order::GrabAttempt { ship, ship_pos } => {
                     let eligible = pickup.claimed_by.is_none()
                         && !pickup.expired
-                        && pickup.pos.distance_squared(*ship_pos) <= reach_sq(GRAB_RADIUS_MM);
+                        && within_grab_reach(pickup.pos, *ship_pos);
                     if eligible {
                         pickup.claimed_by = Some(*ship);
                         pickup.claimed_at =
@@ -1717,6 +1717,19 @@ fn pickup_id(rock: PersistId) -> PersistId {
 }
 const fn reach_sq(range_mm: i64) -> i128 {
     (range_mm as i128) * (range_mm as i128)
+}
+
+/// Whether a ship at `ship_pos` is inside the pickup reach this ruleset
+/// adjudicates a grab with.
+///
+/// [`Regolith::step_pickup`] calls exactly this, so a skin that wants to know
+/// whether a grab would be granted can ask the ruleset instead of re-deriving
+/// a "near enough" of its own. That divergence — client and host disagreeing
+/// about a threshold both think they read from the table — is the #499/#505
+/// failure mode; there is one expression here and both sides call it.
+#[must_use]
+pub fn within_grab_reach(pickup_pos: QPos, ship_pos: QPos) -> bool {
+    pickup_pos.distance_squared(ship_pos) <= reach_sq(GRAB_RADIUS_MM)
 }
 
 impl Game for Regolith {

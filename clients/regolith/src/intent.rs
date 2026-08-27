@@ -18,6 +18,12 @@ pub struct Controls {
     pub fire: bool,
     /// Mouse-selected target sustained through the ordinary lock order.
     pub lock_target: Option<PersistId>,
+    /// The pickup the skin's proximity emitter claims this tick, if any.
+    ///
+    /// There is no grab key (#568): `crate::grab` reads the ruleset's own
+    /// reach against replicated pickup state and latches one order per pickup
+    /// per approach. `None` on every other tick.
+    pub grab: Option<PersistId>,
 }
 
 /// One tick of canonical core input bytes, suitable for a session JSONL log.
@@ -100,6 +106,12 @@ impl IntentPipeline {
                     })
                 }
                 Order::Fire if !controls.fire => None,
+                // The pilot's schedule reaches `PilotScenario::ContestedGrab`
+                // on a function of *tick*, at a pickup of its own choosing.
+                // Passing that through would have the player's craft grab
+                // unbidden, at a target no input of theirs selected (#568).
+                // A human craft grabs only from `controls.grab`, below.
+                Order::Grab { .. } => None,
                 Order::Lock { target } => {
                     saw_lock = true;
                     Some(Order::Lock {
@@ -115,6 +127,16 @@ impl IntentPipeline {
                 .position(|order| matches!(order, Order::Fire))
                 .unwrap_or(orders.len());
             orders.insert(before_fire, Order::Lock { target });
+        }
+        if let Some(pickup) = controls.grab {
+            // `Grab` and not `GrabAttempt`: `Grab { pickup }` is the ship-side
+            // order, which the craft's own step turns into
+            // `Outcome::GrabAttempted` carrying the ruleset's own stamp of the
+            // ship position. `GrabAttempt { ship, ship_pos }` is what
+            // `Regolith::deliver` then hands the pickup — an order a client
+            // has no business authoring, since authoring it would let the skin
+            // state a position the ruleset never stamped.
+            orders.push(Order::Grab { pickup });
         }
         orders
     }
@@ -232,6 +254,92 @@ mod tests {
             Some(Order::Thrust { accel_mmss: 60_000, yaw_urad, pitch_urad: 0 })
                 if *yaw_urad == -bot_yaw.abs()
         ));
+    }
+
+    /// A tick the pilot's schedule spends in `ContestedGrab`, which is when
+    /// it emits `Order::Grab` at a pickup of its own choosing.
+    fn contested_grab_tick() -> Tick {
+        use orrery_games::regolith::pilot::{scenario_at, PilotScenario, SCENARIO_TICKS};
+        let tick = Tick::new(SCENARIO_TICKS * PILOT_CONTESTED_GRAB_INDEX + 7);
+        assert_eq!(
+            scenario_at(tick),
+            PilotScenario::ContestedGrab,
+            "the schedule moved; this fixture must follow it"
+        );
+        tick
+    }
+
+    /// Index of `ContestedGrab` in `PILOT_SCENARIOS`.
+    const PILOT_CONTESTED_GRAB_INDEX: u64 = 2;
+
+    #[test]
+    fn the_pilots_scheduled_grab_never_reaches_a_human_craft() {
+        let pipeline = pipeline();
+        let tick = contested_grab_tick();
+        assert!(
+            pipeline
+                .bot_orders(tick)
+                .iter()
+                .any(|order| matches!(order, Order::Grab { .. })),
+            "fixture is wrong: the pilot did not schedule a grab on this tick"
+        );
+        for controls in [
+            Controls::default(),
+            Controls {
+                left: true,
+                thrust: true,
+                fire: true,
+                lock_target: Some(PersistId::new(0x442)),
+                ..Controls::default()
+            },
+        ] {
+            let orders = pipeline.human_orders(tick, controls);
+            assert!(
+                !orders
+                    .iter()
+                    .any(|order| matches!(order, Order::Grab { .. })),
+                "the craft grabbed unbidden, at a pickup the player never chose"
+            );
+        }
+    }
+
+    #[test]
+    fn the_proximity_emitter_grabs_the_pickup_the_skin_selected() {
+        let pipeline = pipeline();
+        let chosen = PersistId::new(0x91cc);
+        let orders = pipeline.human_orders(
+            contested_grab_tick(),
+            Controls {
+                grab: Some(chosen),
+                ..Controls::default()
+            },
+        );
+        let grabs: Vec<_> = orders
+            .iter()
+            .filter_map(|order| match order {
+                Order::Grab { pickup } => Some(*pickup),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grabs,
+            vec![chosen],
+            "exactly one grab, at the skin's own pickup"
+        );
+    }
+
+    #[test]
+    fn no_grab_is_emitted_without_one_selected() {
+        let pipeline = pipeline();
+        for raw_tick in 0..(4 * 180) {
+            let orders = pipeline.human_orders(Tick::new(raw_tick), Controls::default());
+            assert!(
+                !orders
+                    .iter()
+                    .any(|order| matches!(order, Order::Grab { .. })),
+                "tick {raw_tick} emitted a grab from no intent"
+            );
+        }
     }
 
     #[test]

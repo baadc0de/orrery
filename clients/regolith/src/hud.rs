@@ -329,6 +329,23 @@ pub struct RangeRing {
     pub optimal: bool,
 }
 
+/// The ruleset's pickup reach, drawn around the player's own craft.
+///
+/// True scale, in metres, like the weapon envelope rings and unlike the lock
+/// reticle: it *means* 25 m, so holding it to an apparent screen size would
+/// state a reach the ruleset does not have. What keeps reach legible at the
+/// 4 km zoom extreme, where 25 m is under a pixel, is the panel's own
+/// [`Readout::PickupReach`] line, which prints both numbers.
+#[derive(Component)]
+pub struct GrabReachRing;
+
+/// The reach ring's own material, so its tint can follow the ruleset's
+/// claimability predicate without touching any other overlay.
+#[derive(Resource)]
+pub(crate) struct GrabMaterials {
+    ring: Handle<StandardMaterial>,
+}
+
 /// One slot in the tracer pool.
 #[derive(Component)]
 pub struct Tracer(pub usize);
@@ -393,6 +410,9 @@ pub enum Readout {
     BreakBanner,
     /// The shot-result cue line: provisional impact, then hit, miss, or refusal.
     ShotResult,
+    /// The nearest live pickup's separation against the ruleset's reach, or
+    /// the statement of how pickups are collected when none is in view.
+    PickupReach,
 }
 
 fn label(text: &str) -> impl Bundle {
@@ -500,6 +520,7 @@ pub fn spawn_hud(commands: &mut Commands) {
                     gauge_row("HULL", Gauge::OwnHull, Readout::OwnHull),
                     gauge_row("SHIELD", Gauge::OwnShield, Readout::OwnShield),
                     value(Readout::OwnVitals, 11.0, DIM),
+                    value(Readout::PickupReach, 11.0, MUTED),
                 ]
             ),
         ],
@@ -661,6 +682,26 @@ pub fn spawn_world_overlay(
                 });
         });
 
+    // The pickup reach ring. It uses the impact marker's fatter tube rather
+    // than the range rings' hairline: scaled to 25 m, a 0.0035 minor radius is
+    // under a tenth of a millimetre of tube and would not render at all.
+    let reach_material = materials.add(StandardMaterial {
+        base_color: MINING_AMBER.with_alpha(0.45),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..Default::default()
+    });
+    commands.insert_resource(GrabMaterials {
+        ring: reach_material.clone(),
+    });
+    commands.spawn((
+        GrabReachRing,
+        Mesh3d(marker_mesh.clone()),
+        MeshMaterial3d(reach_material),
+        Transform::default(),
+        Visibility::Hidden,
+    ));
+
     for (optimal, material) in [(true, ring_optimal), (false, ring_falloff)] {
         commands.spawn((
             RangeRing { optimal },
@@ -805,6 +846,50 @@ pub fn sync_range_rings(
         transform.translation = centre;
         transform.scale = Vec3::splat(radius_mm as f32 / 1_000.0);
         *visibility = Visibility::Inherited;
+    }
+}
+
+/// Draws the ruleset's grab reach around the player's craft while a pickup is
+/// worth reaching for, and tints it by the ruleset's own claimability answer.
+///
+/// The radius is [`crate::grab::GRAB_RADIUS_M`], derived from
+/// `GRAB_RADIUS_MM`; nothing here invents a distance. The ring is hidden when
+/// no live pickup is in view, so the ordinary picture is unchanged, and it
+/// never implies a grant: a lit ring says "the ruleset's reach predicate holds
+/// for that pickup right now", which is exactly what the pickup's own step
+/// will re-evaluate against its own state.
+pub(crate) fn sync_grab_reach_ring(
+    view: Res<CombatView>,
+    reach: Res<crate::grab::ReachView>,
+    palette: Option<Res<GrabMaterials>>,
+    materials: Option<ResMut<Assets<StandardMaterial>>>,
+    bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
+    mut rings: Query<(&mut Transform, &mut Visibility), With<GrabReachRing>>,
+) {
+    let Ok((mut transform, mut visibility)) = rings.single_mut() else {
+        return;
+    };
+    let nearest = reach.nearest();
+    let centre = view
+        .own
+        .and_then(|own| world_position(&bodies, own.entity))
+        .filter(|_| nearest.is_some());
+    let Some(centre) = centre else {
+        *visibility = Visibility::Hidden;
+        return;
+    };
+    transform.translation = centre;
+    transform.scale = Vec3::splat(crate::grab::GRAB_RADIUS_M);
+    *visibility = Visibility::Inherited;
+    if let (Some(palette), Some(mut materials)) = (palette, materials) {
+        if let Some(mut material) = materials.get_mut(&palette.ring) {
+            let alpha = if nearest.is_some_and(|pickup| pickup.claimable) {
+                0.95
+            } else {
+                0.35
+            };
+            material.base_color = MINING_AMBER.with_alpha(alpha);
+        }
     }
 }
 
@@ -994,6 +1079,7 @@ pub fn fraction(current: i32, ceiling: i32) -> f32 {
 /// Rewrites every HUD line from the current view.
 pub fn refresh_combat_hud(
     view: Res<CombatView>,
+    reach: Res<crate::grab::ReachView>,
     tracks: Res<ProjectileTracks>,
     broken: Res<LockBreak>,
     feedback: Res<ShotFeedback>,
@@ -1078,6 +1164,14 @@ pub fn refresh_combat_hud(
                         MINING_AMBER
                     }
                     LockPhase::Locked => ACCENT_PALE,
+                },
+            ),
+            Readout::PickupReach => (
+                crate::grab::caption(&reach),
+                if reach.nearest().is_some_and(|pickup| pickup.claimable) {
+                    MINING_AMBER
+                } else {
+                    DIM
                 },
             ),
             Readout::LockCaption => (view.lock.caption(), DIM),
@@ -1963,6 +2057,55 @@ mod tests {
         assert!(!visible, "the burst expires after IMPACT_BURST_TICKS");
     }
 
+    /// The reach ring is the ruleset's own 25 m, in world metres, and it only
+    /// appears when there is a live pickup to reach for.
+    #[test]
+    fn the_reach_ring_is_the_rulesets_radius_and_only_shows_with_a_pickup_in_view() {
+        use crate::grab::{PickupReach, ReachView, GRAB_RADIUS_M};
+        use orrery_games::regolith::GRAB_RADIUS_MM;
+
+        let mut app = overlay_app();
+        app.init_resource::<ReachView>();
+        body(&mut app, ME, 40.0, 0.0);
+        app.world_mut()
+            .spawn((GrabReachRing, Transform::default(), Visibility::Hidden));
+        app.insert_resource(CombatView {
+            own: Some(craft_view(ME, Archetype::Interceptor, 40.0)),
+            ..CombatView::default()
+        });
+        app.add_systems(Update, sync_grab_reach_ring);
+
+        // No pickup in view: nothing is drawn.
+        app.update();
+        let mut query = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Visibility), With<GrabReachRing>>();
+        let (_, visibility) = query.single(app.world()).expect("the ring exists");
+        assert_eq!(*visibility, Visibility::Hidden);
+
+        // A live pickup 100 m out: the ring appears at the ruleset's radius,
+        // centred on the player's own craft.
+        app.insert_resource(ReachView {
+            live: vec![PickupReach {
+                entity: PersistId::new(77),
+                range_mm: 100_000,
+                claimable: false,
+            }],
+            ..ReachView::default()
+        });
+        app.update();
+        let mut query = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Visibility), With<GrabReachRing>>();
+        let (transform, visibility) = query.single(app.world()).expect("the ring exists");
+        assert_ne!(*visibility, Visibility::Hidden);
+        assert_eq!(transform.translation, Vec3::new(40.0, 0.0, 0.0));
+        assert_eq!(transform.scale.x, GRAB_RADIUS_M);
+        #[allow(clippy::cast_precision_loss)]
+        let from_the_table = GRAB_RADIUS_MM as f32 / 1_000.0;
+        assert_eq!(transform.scale.x, from_the_table);
+    }
+
     #[test]
     fn range_rings_take_their_radius_from_the_weapon_table() {
         let mut app = overlay_app();
@@ -2238,6 +2381,39 @@ mod band_line {
         assert_eq!(idle.hit_forecast(), None);
     }
 
+    /// The pickup line rides the same refresh, so what it says about reach is
+    /// this tick's reading and not a stale one.
+    #[test]
+    fn the_refresh_system_writes_the_pickup_reach_line() {
+        use crate::grab::{PickupReach, ReachView};
+
+        let mut app = App::new();
+        app.insert_resource(locked_on(60_000))
+            .insert_resource(ReachView {
+                live: vec![PickupReach {
+                    entity: PersistId::new(77),
+                    range_mm: 12_000,
+                    claimable: true,
+                }],
+                ..ReachView::default()
+            })
+            .init_resource::<ProjectileTracks>()
+            .init_resource::<LockBreak>()
+            .init_resource::<ShotFeedback>()
+            .add_systems(Update, refresh_combat_hud);
+        let line = app
+            .world_mut()
+            .spawn((Readout::PickupReach, Text::new("-"), TextColor(MUTED)))
+            .id();
+        app.update();
+        let text = app.world().get::<Text>(line).expect("the line exists");
+        assert!(
+            text.contains("IN REACH") && text.contains("12 m") && text.contains("25 m"),
+            "the pickup line did not report the reach: {}",
+            **text
+        );
+    }
+
     /// The band travels on the same refresh path as every other readout: the
     /// whole HUD is rewritten from one `CombatView`, so it cannot go stale
     /// against the lock beside it.
@@ -2245,6 +2421,7 @@ mod band_line {
     fn the_refresh_system_writes_the_band_line() {
         let mut app = App::new();
         app.insert_resource(locked_on(60_000))
+            .init_resource::<crate::grab::ReachView>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
             .init_resource::<ShotFeedback>()

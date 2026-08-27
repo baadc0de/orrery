@@ -9,6 +9,7 @@ pub mod assets;
 pub mod campaign;
 pub mod combat;
 pub mod craft;
+pub mod grab;
 pub mod hud;
 pub mod identity;
 pub mod intent;
@@ -506,6 +507,8 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<roster::RosterTask>()
             .init_resource::<SelectedLock>()
             .init_resource::<CombatView>()
+            .init_resource::<grab::ReachView>()
+            .init_resource::<grab::GrabLatch>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
             .init_resource::<ShotFeedback>()
@@ -558,6 +561,7 @@ impl Plugin for RegolithSkinPlugin {
                     read_combat_state,
                     hud::sync_lock_reticle,
                     hud::sync_range_rings,
+                    hud::sync_grab_reach_ring,
                     hud::sync_tracers,
                     hud::sync_impact_flash,
                     hud::sync_gauges,
@@ -819,6 +823,9 @@ fn controls(keys: &ButtonInput<KeyCode>, selected: Option<PersistId>) -> Control
         thrust: keys.pressed(KeyCode::ArrowUp),
         fire: keys.pressed(KeyCode::Space),
         lock_target: selected,
+        // Filled in by the proximity emitter below, not by a key: #568's
+        // owner decision is that flying into a pickup collects it.
+        grab: None,
     }
 }
 
@@ -832,6 +839,8 @@ fn drive_core(
     mut broken: ResMut<LockBreak>,
     mut shots: ResMut<ShotFeedback>,
     mut selected: ResMut<SelectedLock>,
+    mut reach: ResMut<grab::ReachView>,
+    mut latch: ResMut<grab::GrabLatch>,
     geometry_capture: Option<Res<GeometryCapture>>,
 ) {
     if geometry_capture
@@ -843,6 +852,11 @@ fn drive_core(
         }
     }
     let mut controls = controls(&keys, selected.target);
+    // The one place a grab is authored. It reads *this* tick's replicated
+    // pickup state through the ruleset's own reach predicate and latches, so
+    // an approach costs one order rather than one per tick inside 25 m.
+    *reach = grab::ReachView::read(session.executor(), session.local_entity());
+    controls.grab = latch.select(&reach);
     if geometry_capture
         .as_ref()
         .is_some_and(|capture| capture.auto_drive)

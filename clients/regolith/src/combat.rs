@@ -1123,7 +1123,7 @@ fn rock_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<&Rock> {
     }
 }
 
-fn integer_sqrt(value: u128) -> u128 {
+pub(crate) fn integer_sqrt(value: u128) -> u128 {
     if value < 2 {
         return value;
     }
