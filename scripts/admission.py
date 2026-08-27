@@ -36,6 +36,8 @@ CAMPAIGN_ID = re.compile(r"[a-z0-9-]{1,64}\Z")
 NODE = re.compile(r"[0-9a-f]{64}\Z")
 SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 DISPLAY_LABEL_MAX_CHARS = 32
+LOBBY_SECONDS = 90
+RESTART_DELAY_SECONDS = 5
 
 
 def display_label(raw: str) -> str | None:
@@ -53,7 +55,7 @@ class Refusal(Exception):
 class Campaign:
     ident: str; title: str; open: bool; host: str; peers: int; seconds: int
     loss_pct: int; jitter_ms: int; external_port: int; client_rev: str | None; ruleset_version: int | None
-    always_on: bool
+    always_on: bool; humans: int
 
 
 class Admission:
@@ -96,7 +98,12 @@ class Admission:
                 got[ident] = Campaign(ident, s["title"], s.get("open", "").lower() == "yes", host,
                     s.getint("peers"), s.getint("seconds"), s.getint("loss_pct"), s.getint("jitter_ms"),
                     external_port, s.get("client_rev") or None, ruleset_version,
-                    s.get("always_on", "").lower() == "yes")
+                    s.get("always_on", "").lower() == "yes", s.getint("humans", fallback=1))
+                # Existing one-human configuration predates `humans` and may
+                # use peers=8.  The explicit multi-human shape is bounded by
+                # D6's eight-peer full-mesh regime.
+                if got[ident].humans < 1 or ("humans" in s and got[ident].peers + got[ident].humans > 8):
+                    raise ValueError(f"{ident!r}: peers + humans must be between 1 and 8")
             self.last_good, self.last_note = got, None
             return got, None
         except (OSError, ValueError, configparser.Error, KeyError) as e:
@@ -116,10 +123,13 @@ class Admission:
             logging.warning(floor_note); note = floor_note if note is None else f"{note}; {floor_note}"
         rows = []
         for c in campaigns.values():
-            state = "paused" if c.open and paused else ("busy" if c.ident in self.children or c.ident in self.always_on else ("open" if c.open else "closed"))
+            attempt = self._always_on_attempt(c) if c.always_on else None
+            phase, slots_free = self._campaign_phase(c, attempt)
+            state = "paused" if c.open and paused else (phase if c.always_on else ("busy" if c.ident in self.children else ("open" if c.open else "closed")))
             rows.append({"id": c.ident, "title": c.title, "state": state, "peers": c.peers, "seconds": c.seconds,
                          "loss_pct": c.loss_pct, "jitter_ms": c.jitter_ms, "client_rev": c.client_rev,
-                         "server_rev": c.client_rev, "ruleset_version": c.ruleset_version})
+                         "server_rev": c.client_rev, "ruleset_version": c.ruleset_version,
+                         "humans": c.humans, "slots_free": slots_free})
         return {"campaigns": rows, "operator_note": note}
 
     @staticmethod
@@ -133,28 +143,75 @@ class Admission:
         with (p / "joins.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
 
-    @staticmethod
-    def session_roster(campaign: Campaign, nickname: str) -> dict[int, str]:
-        """Name the complete flock from the same session-scoped answer.
+    def _always_on_attempt(self, campaign: Campaign) -> dict[str, Any] | None:
+        """Read the supervisor generation; it is the lease clock of record."""
+        remote = f"/var/lib/orrery-p1-swarm/{campaign.ident}/attempt.json"
+        result = subprocess.run([self.ssh, "-i", str(self.ssh_key), f"orrery@{campaign.host}", "cat", remote],
+                                text=True, capture_output=True)
+        if result.returncode != 0:
+            return None
+        try:
+            value = json.loads(result.stdout)
+            if (not isinstance(value.get("attempt_id"), str) or not isinstance(value.get("started"), int)
+                    or not isinstance(value.get("expires_at"), int) or value["expires_at"] <= value["started"]):
+                raise ValueError("invalid attempt record")
+            return value
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            logging.error("always-on host returned an invalid attempt record for %s", campaign.ident)
+            return None
 
-        The host-scoped alternative either puts labels beside replicated craft
-        facts, crossing A13's useful boundary, or adds a second session-metadata
-        channel and teaches the host the exterior nickname. Admission already
-        owns the configured participant count and that sole exterior label, so
-        its live roster is the smaller sideband with one lookup path for human
-        and headless craft alike. The section id supplies stable bot labels;
-        neither those strings nor the player's label become identity.
-        """
-        roster = {}
+    def _read_slots(self, campaign: Campaign) -> list[dict[str, Any]]:
+        path = self.state / campaign.ident / "slots.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, list) and all(isinstance(row, dict) for row in value) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _write_slots(self, campaign: Campaign, slots: list[dict[str, Any]]) -> None:
+        self.atomic_bytes(self.state / campaign.ident / "slots.json",
+                          json.dumps(slots, separators=(",", ":")).encode())
+
+    def _campaign_phase(self, campaign: Campaign, attempt: dict[str, Any] | None) -> tuple[str, int]:
+        if not campaign.open:
+            return "closed", 0
+        if attempt is None:
+            return "restarting", 0
+        now = int(time.time())
+        if now >= attempt["expires_at"]:
+            return "restarting", 0
+        slots = [row for row in self._read_slots(campaign) if row.get("attempt_id") == attempt["attempt_id"]]
+        free = campaign.humans - len({row.get("slot") for row in slots})
+        if not free:
+            return "full", 0
+        return ("lobby" if now < attempt["started"] + LOBBY_SECONDS else "running", max(free, 0))
+
+    def session_roster(self, campaign: Campaign, attempt: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Return every configured seat; a reservation is not a liveness claim."""
+        reservations = {} if attempt is None else {
+            row.get("slot"): row for row in self._read_slots(campaign)
+            if row.get("attempt_id") == attempt["attempt_id"]
+        }
+        roster: list[dict[str, Any]] = []
         for slot in range(campaign.peers):
             suffix = f"-{slot + 1}"
-            generated = display_label(campaign.ident[:DISPLAY_LABEL_MAX_CHARS - len(suffix)] + suffix)
-            if generated is not None:
-                roster[slot] = generated
+            roster.append({"slot": slot, "kind": "bot", "state": "active",
+                           "nickname": display_label(campaign.ident[:DISPLAY_LABEL_MAX_CHARS - len(suffix)] + suffix)})
+        for slot in range(campaign.peers, campaign.peers + campaign.humans):
+            row = reservations.get(slot)
+            roster.append({"slot": slot, "kind": "human", "state": "reserved" if row else "empty",
+                           "nickname": row.get("nickname") if row else None})
+        return roster
+
+    @staticmethod
+    def legacy_session_roster(campaign: Campaign, nickname: str) -> dict[int, str]:
+        """The original one-human sideband, retained for non-standing campaigns."""
+        roster = {slot: display_label(campaign.ident[:DISPLAY_LABEL_MAX_CHARS - len(f"-{slot + 1}")] + f"-{slot + 1}")
+                  for slot in range(campaign.peers)}
         player = display_label(nickname)
         if player is not None:
             roster[campaign.peers] = player
-        return roster
+        return {slot: label for slot, label in roster.items() if label is not None}
 
     @staticmethod
     def socket_address(host: str, port: int) -> str:
@@ -194,6 +251,61 @@ class Admission:
         directory = self.state / c.ident; directory.mkdir(parents=True, exist_ok=True)
         lock = (directory / "lock").open("a+")
         try:
+            if c.always_on:
+                # The short flock is an allocation transaction, not a session lease.
+                # `attempt.json` is written by the supervisor at child spawn, so all
+                # reservations for a generation expire together at its boundary.
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                attempt = self._always_on_attempt(c)
+                phase, _ = self._campaign_phase(c, attempt)
+                if attempt is None or phase == "restarting":
+                    raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.")
+                if phase not in ("lobby", "full"):
+                    retry = max(1, attempt["expires_at"] - int(time.time()) + RESTART_DELAY_SECONDS)
+                    raise Refusal(409, "session_started", "This attempt has started; the next lobby opens shortly.", retry_after_s=retry)
+                slots = [row for row in self._read_slots(c) if row.get("attempt_id") == attempt["attempt_id"]]
+                existing = next((row for row in slots if row.get("node") == node), None)
+                slot = existing.get("slot") if existing else None
+                if existing is None:
+                    occupied = {row.get("slot") for row in slots}
+                    free_slots = [candidate for candidate in range(c.peers, c.peers + c.humans) if candidate not in occupied]
+                    if not free_slots:
+                        raise Refusal(409, "campaign_full", f"All {c.humans} player seats are full; try the next lobby.",
+                                      retry_after_s=max(1, attempt["expires_at"] - int(time.time()) + RESTART_DELAY_SECONDS))
+                    slot = free_slots[0]
+                    try:
+                        minted = self.output([self.invite, "mint", "--ledger", str(directory / "ledger.tsv"), "--label", nickname])
+                        account, sid = minted["account"], minted["session_id"]
+                        slots.append({"attempt_id": attempt["attempt_id"], "slot": slot, "session_id": sid,
+                                      "account": int(account), "node": node, "nickname": display_label(nickname),
+                                      "expires_at": attempt["expires_at"]})
+                        # A generation may turn over while minting.  Do not let a
+                        # stale answer reserve a seat in the next attempt.
+                        current = self._always_on_attempt(c)
+                        if current is None or current["attempt_id"] != attempt["attempt_id"]:
+                            raise Refusal(503, "host_failed", "The attempt restarted while reserving your seat — try again shortly.")
+                        self._write_slots(c, slots)
+                        self.append_join(c, {"when": int(time.time()), "campaign": ident, "nickname": nickname,
+                                             "account": int(account), "session_id": sid, "node": node, "slot": slot,
+                                             "attempt_id": attempt["attempt_id"]})
+                    except Refusal:
+                        raise
+                    except (RuntimeError, KeyError, ValueError) as e:
+                        logging.exception("admission subprocess/log failed: %s", e)
+                        raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
+                else:
+                    account, sid = existing["account"], existing["session_id"]
+                try:
+                    signed = self.output([self.invite, "session-token", "--issuer-credential", str(self.issuer),
+                                          "--account", str(account), "--node", node])
+                    remote = f"/var/lib/orrery-p1-swarm/{c.ident}"
+                    session_dir = self.state / "sessions" / sid; session_dir.mkdir(parents=True, exist_ok=True)
+                    listening = self._wait_always_on_listening(c, remote, session_dir)
+                    host_node, host_direct = self.dialable_listening(c, listening)
+                except (RuntimeError, KeyError, ValueError) as e:
+                    logging.error("always-on host returned an unusable listening address: %s", e)
+                    raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.") from e
+                return {"join": {"host_node": host_node, "slot": slot, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
             try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 lock.close()
@@ -208,20 +320,6 @@ class Admission:
                 logging.exception("admission subprocess/log failed: %s", e)
                 raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
             session_dir = self.state / "sessions" / sid; session_dir.mkdir(parents=True, exist_ok=True)
-            if c.always_on:
-                # The standing host is supervisor-owned.  It accepts any valid
-                # issuer token, but this service still serializes admissions so
-                # the harness's single external slot has one intended client.
-                remote = f"/var/lib/orrery-p1-swarm/{c.ident}"
-                listening = self._wait_always_on_listening(c, remote, session_dir)
-                try: host_node, host_direct = self.dialable_listening(c, listening)
-                except ValueError as e:
-                    logging.error("always-on host returned an unusable listening address: %s", e)
-                    raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.") from e
-                self.rosters[ident] = self.session_roster(c, nickname)
-                self.always_on.add(ident)
-                threading.Thread(target=self._release_always_on, args=(ident, c.seconds), daemon=True).start()
-                return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
             remote = f"/var/tmp/orrery/{sid}"
             # The harness writes its report and listening file into `remote`,
             # which lives on the *campaign* host and does not exist there yet.
@@ -241,12 +339,12 @@ class Admission:
                 logging.error("host returned an unusable listening address: %s", e)
                 raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
             self.children[ident] = child
-            self.rosters[ident] = self.session_roster(c, nickname)
+            self.rosters[ident] = self.legacy_session_roster(c, nickname)
             threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True).start()
             return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
         finally:
             # The flock stays held by the child/reaper, not the request.  It is released there.
-            if ident not in self.children and ident not in self.always_on:
+            if ident not in self.children:
                 self.locks.pop(ident, None)
                 lock.close()
 
@@ -268,6 +366,11 @@ class Admission:
         campaigns, _ = self.campaigns()
         if not CAMPAIGN_ID.fullmatch(ident) or ident not in campaigns:
             raise Refusal(404, "unknown_campaign", "That campaign has ended — refresh the list.")
+        c = campaigns[ident]
+        attempt = self._always_on_attempt(c) if c.always_on else None
+        phase, _ = self._campaign_phase(c, attempt)
+        if c.always_on:
+            return {"campaign": ident, "phase": phase, "roster": self.session_roster(c, attempt)}
         live = self.rosters.get(ident, {})
         return {"campaign": ident, "roster": [{"slot": slot, "nickname": nickname} for slot, nickname in sorted(live.items())]}
 
@@ -288,14 +391,6 @@ class Admission:
             self.atomic_bytes(local / "listening.txt", result.stdout.encode())
             return result.stdout.strip()
         raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.")
-
-    def _release_always_on(self, ident: str, seconds: int) -> None:
-        time.sleep(seconds)
-        self.always_on.discard(ident)
-        self.children.pop(ident, None)
-        self.rosters.pop(ident, None)
-        lock = self.locks.pop(ident, None)
-        if lock is not None: lock.close()
 
     def _reap(self, ident: str, c: Campaign, sid: str, remote: str, local: Path, child: subprocess.Popen[str]) -> None:
         try:
@@ -392,7 +487,7 @@ def main() -> None:
 class AdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(); root = Path(self.tmp.name); self.state, self.control = root / "state", root / "campaigns.conf"
-        self.control.write_text("[test]\ntitle = Test\nopen = yes\nhost = 203.0.113.7\nexternal_port = 52011\npeers = 8\nseconds = 60\nloss_pct = 3\njitter_ms = 100\nclient_rev = rev\nruleset_version = 14\n")
+        self.control.write_text("[test]\ntitle = Test\nopen = yes\nhost = 203.0.113.7\nexternal_port = 52011\npeers = 4\nhumans = 4\nseconds = 60\nloss_pct = 3\njitter_ms = 100\nclient_rev = rev\nruleset_version = 14\n")
         repo = Path(__file__).parents[1]; self.invite = repo / "target/debug/orrery-invite"; issuer_key = repo / "target/debug/orrery-issuer-key"
         if not self.invite.exists() or not issuer_key.exists(): self.skipTest("build orrery-invite and orrery-issuer-key before self-test")
         self.issuer = root / "issuer"; subprocess.run([str(issuer_key), "generate", "--key-id", "476", "--output", str(self.issuer)], check=True, capture_output=True)
@@ -405,6 +500,11 @@ class AdmissionTests(unittest.TestCase):
         for lock in self.service.locks.values(): lock.close()
         self.tmp.cleanup()
     def request(self) -> dict[str, Any]: return {"nickname": "ada", "node": "a" * 64, "client_rev": "rev", "ruleset_version": 14}
+    def enable_always_on(self) -> dict[str, Any]:
+        self.control.write_text(self.control.read_text() + "always_on = yes\n")
+        attempt = {"attempt_id": "test-attempt", "started": int(time.time()), "expires_at": int(time.time()) + 900}
+        self.service._always_on_attempt = lambda _: attempt  # type: ignore[method-assign]
+        return attempt
     def recorded_harness_command(self) -> str:
         args = self.ssh.parent / "ssh.args"
         deadline = time.monotonic() + 1
@@ -414,7 +514,7 @@ class AdmissionTests(unittest.TestCase):
                     if "--require-session" in line: return line
             time.sleep(0.001)
         self.fail("harness command was not recorded after join returned")
-    def test_a_busy_campaign_refuses_the_second_join_with_409(self) -> None:
+    def test_a_busy_legacy_campaign_refuses_the_second_join_with_409(self) -> None:
         self.service.join("test", self.request())
         with self.assertRaisesRegex(Refusal, ""): self.service.join("test", self.request())
         try: self.service.join("test", self.request())
@@ -448,10 +548,10 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
 
     def test_an_always_on_campaign_reads_the_standing_host_without_launching_one(self) -> None:
-        self.control.write_text(self.control.read_text().replace("seconds = 60", "seconds = 900\nalways_on = yes"))
+        self.enable_always_on()
         answer = self.service.join("test", self.request())
         self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
-        self.assertIn("test", self.service.always_on)
+        self.assertEqual(answer["join"]["slot"], 4)
         recorded = (self.ssh.parent / "ssh.args").read_text()
         self.assertIn("/var/lib/orrery-p1-swarm/test/listening.txt", recorded)
         self.assertNotIn("--external-peer", recorded, "admission must not launch a competing host")
@@ -507,14 +607,46 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(display_label("Ren\N{LATIN SMALL LETTER E WITH ACUTE}e"), "Rene")
         self.assertIsNone(display_label("\N{LATIN SMALL LETTER E WITH ACUTE}\N{RIGHT-TO-LEFT OVERRIDE}"))
         c = self.service.campaigns()[0]["test"]
-        roster = self.service.session_roster(c, "  ad\N{LATIN SMALL LETTER E WITH ACUTE}a  ")
+        roster = self.service.legacy_session_roster(c, "  ad\N{LATIN SMALL LETTER E WITH ACUTE}a  ")
         self.assertEqual(roster[c.peers], "ada")
         self.assertTrue(all(display_label(label) == label for label in roster.values()))
+
+    def test_always_on_allocator_is_ascending_idempotent_and_never_duplicates_a_seat(self) -> None:
+        self.enable_always_on()
+        first = self.service.join("test", self.request())
+        retry = self.service.join("test", self.request())
+        second_request = self.request(); second_request.update({"nickname": "lin", "node": "b" * 64})
+        second = self.service.join("test", second_request)
+        self.assertEqual((first["join"]["slot"], second["join"]["slot"]), (4, 5))
+        self.assertEqual((retry["join"]["slot"], retry["join"]["session_id"]),
+                         (first["join"]["slot"], first["join"]["session_id"]))
+        slots = json.loads((self.state / "test" / "slots.json").read_text())
+        self.assertEqual([row["slot"] for row in slots], [4, 5])
+
+    def test_always_on_full_roster_maps_all_eight_seats_and_refuses_the_ninth_reservation(self) -> None:
+        self.enable_always_on()
+        for number in range(4):
+            request = self.request(); request.update({"nickname": f"p{number}", "node": f"{number:x}" * 64})
+            self.service.join("test", request)
+        listing = self.service.listing()["campaigns"][0]
+        self.assertEqual((listing["state"], listing["slots_free"]), ("full", 0))
+        roster = self.service.roster("test")["roster"]
+        self.assertEqual(len(roster), 8)
+        self.assertEqual([seat["state"] for seat in roster[4:]], ["reserved"] * 4)
+        request = self.request(); request.update({"nickname": "late", "node": "f" * 64})
+        with self.assertRaises(Refusal) as caught: self.service.join("test", request)
+        self.assertEqual((caught.exception.status, caught.exception.error), (409, "campaign_full"))
+
+    def test_always_on_lobby_freezes_reservations_after_start(self) -> None:
+        attempt = self.enable_always_on()
+        attempt["started"] -= LOBBY_SECONDS + 1
+        with self.assertRaises(Refusal) as caught: self.service.join("test", self.request())
+        self.assertEqual((caught.exception.status, caught.exception.error), (409, "session_started"))
 
     def test_the_roster_forgets_a_session_when_it_ends(self) -> None:
         # A label that outlives its session names a player who is not there.
         self.service.join("test", self.request())
-        self.assertEqual(len(self.service.roster("test")["roster"]), 9)
+        self.assertEqual(len(self.service.roster("test")["roster"]), 5)
         for child in list(self.service.children.values()):
             child.kill()
         deadline = time.monotonic() + 2
@@ -529,6 +661,9 @@ class AdmissionTests(unittest.TestCase):
     def test_a_broken_control_file_keeps_serving_the_previous_parse(self) -> None:
         self.service.listing(); self.control.write_text("[broken\n")
         self.assertEqual(self.service.listing()["campaigns"][0]["id"], "test")
+    def test_legacy_eight_bot_campaigns_remain_parseable_until_they_opt_into_humans(self) -> None:
+        self.control.write_text(self.control.read_text().replace("peers = 4\nhumans = 4", "peers = 8"))
+        self.assertEqual(self.service.listing()["campaigns"][0]["humans"], 1)
     def test_a_conflicting_reupload_refuses_409_and_leaves_the_first_bytes(self) -> None:
         sid = self.service.join("test", self.request())["join"]["session_id"]; one = json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "one"}).encode(); self.service.upload(sid, one)
         with self.assertRaises(Refusal) as x: self.service.upload(sid, json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "two"}).encode())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise the one-external-peer P1 harness as a standing campaign host.
+"""Supervise the P1 harness as a standing campaign host.
 
 The harness deliberately ends after one peer and one configured session.  This
 supervisor is therefore the lifetime boundary: it waits for that child before
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import json
 import os
 import signal
 import subprocess
@@ -69,6 +70,16 @@ class Supervisor:
             attempts += 1
             attempt = self.args.state / f"attempt-{time.time_ns()}-{attempts}"
             attempt.mkdir(mode=0o750)
+            started = int(time.time())
+            # Admission uses this generation as its single lease boundary.  It
+            # is deliberately beside listening.txt, which it already reads via
+            # the restricted campaign-host SSH path.
+            record = {"attempt_id": attempt.name, "started": started,
+                      "expires_at": started + int(c["seconds"])}
+            temporary = self.args.state / "attempt.json.tmp"
+            with temporary.open("w", encoding="utf-8") as f:
+                json.dump(record, f, separators=(",", ":")); f.flush(); os.fsync(f.fileno())
+            os.replace(temporary, self.args.state / "attempt.json")
             # A stale record could point a volunteer at a process that has
             # exited.  Remove it before spawning; the child writes replacement
             # only after its socket is bound.
@@ -80,6 +91,10 @@ class Supervisor:
                 return 0
             if self.args.max_runs and attempts >= self.args.max_runs:
                 return status
+            # Between children there is no generation to reserve against.  In
+            # particular, do not leave the prior attempt's future expiry
+            # visible during the restart delay.
+            (self.args.state / "attempt.json").unlink(missing_ok=True)
             time.sleep(self.args.restart_delay)
         return 0
 
@@ -124,6 +139,9 @@ class Tests(unittest.TestCase):
             self.assertEqual(count.read_text(), "2", "failure must start a second child")
             attempts = sorted(state.glob("attempt-*"))
             self.assertEqual(len(attempts), 2, "each child needs an isolated report directory")
+            record = json.loads((state / "attempt.json").read_text())
+            self.assertEqual(record["attempt_id"], attempts[-1].name)
+            self.assertEqual(record["expires_at"] - record["started"], 900)
 
 
 def main() -> None:
