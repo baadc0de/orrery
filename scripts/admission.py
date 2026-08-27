@@ -125,8 +125,15 @@ class Admission:
         for c in campaigns.values():
             attempt = self._always_on_attempt(c) if c.always_on else None
             phase, slots_free = self._campaign_phase(c, attempt)
-            state = "paused" if c.open and paused else (phase if c.always_on else ("busy" if c.ident in self.children else ("open" if c.open else "closed")))
-            rows.append({"id": c.ident, "title": c.title, "state": state, "peers": c.peers, "seconds": c.seconds,
+            # `state` is the JOINABILITY word every shipped client keys on:
+            # `clients/regolith/src/admission.rs` treats `state == "open"` as
+            # joinable and nothing else. A lobby *is* open for joining, so it
+            # must say "open" here or every released binary refuses to offer the
+            # campaign. The finer phase travels in `phase`, which the roster
+            # endpoint has always carried and a lobby-aware client reads.
+            phase_state = "open" if phase == "lobby" else phase
+            state = "paused" if c.open and paused else (phase_state if c.always_on else ("busy" if c.ident in self.children else ("open" if c.open else "closed")))
+            rows.append({"id": c.ident, "title": c.title, "state": state, "phase": phase, "peers": c.peers, "seconds": c.seconds,
                          "loss_pct": c.loss_pct, "jitter_ms": c.jitter_ms, "client_rev": c.client_rev,
                          "server_rev": c.client_rev, "ruleset_version": c.ruleset_version,
                          "humans": c.humans, "slots_free": slots_free})
