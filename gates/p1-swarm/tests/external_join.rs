@@ -168,6 +168,9 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
 
     let external = report
         .get("external")
+        .and_then(|e| e.as_array())
+        .filter(|exteriors| exteriors.len() == 1)
+        .and_then(|exteriors| exteriors.first())
         .and_then(|e| e.as_object())
         .expect("the report names the external participant");
     // A clean end-of-run close is fine: the runner exits after its last tick,
@@ -180,6 +183,22 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
     assert!(
         external.get("uplink_frames").and_then(|v| v.as_u64()) > Some(0),
         "no frames arrived from the external peer"
+    );
+    assert!(
+        external.get("connected_ticks").and_then(|v| v.as_u64()) > Some(0),
+        "the report did not retain the external peer's connected span"
+    );
+    let uplink_delivered = external
+        .get("uplink_delivered")
+        .and_then(|v| v.as_u64())
+        .expect("the report counts delivered uplink datagrams");
+    let uplink_dropped = external
+        .get("uplink_dropped")
+        .and_then(|v| v.as_u64())
+        .expect("the report counts dropped uplink datagrams");
+    assert!(
+        uplink_delivered + uplink_dropped > 0,
+        "no uplink datagram reached an impairment decision"
     );
     assert!(
         external.get("downlink_frames").and_then(|v| v.as_u64()) > Some(0),

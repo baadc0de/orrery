@@ -156,7 +156,7 @@ self_test() {
       peers: 32, seconds: 3600, player_hours: 32.0,
       witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
       deferral_ledger_balances: true, total_gaps: 164022, total_shed: 162,
-      external: null
+      external: []
     } | if $session == "" then . else .identity.human_session_id = $session end' > "$dir/r.json"
     if [[ -n $2 ]]; then
       jq "$2" "$dir/r.json" > "$dir/r.next.json"
@@ -168,7 +168,7 @@ self_test() {
       local fixture_node
       fixture_node=$(jq -r .measurement_node "$dir/session.json")
       jq --slurpfile session "$dir/session.json" --arg node "$fixture_node" \
-        '.session = $session[0] | .external = {node: $node}' \
+        '.session = $session[0] | .external = [{node: $node}]' \
         "$dir/r.json" > "$dir/r.next.json"
       mv "$dir/r.next.json" "$dir/r.json"
     fi
@@ -562,8 +562,11 @@ validate_session_record() {
     || die 'refusing to bank: incomplete or inconsistent campaign session row'
   if jq -e '.session? != null' "$report" >/dev/null; then
     local measurement_node
-    measurement_node=$(jq -er '.external.node | select(type == "string" and length > 0)' "$report") \
-      || die 'refusing to bank: host report does not name the authenticated external node'
+    measurement_node=$(jq -er '.session.measurement_node | select(type == "string" and length > 0)' "$report") \
+      || die 'refusing to bank: campaign session does not name its measurement node'
+    jq -e --arg node "$measurement_node" \
+      '[.external[] | select(.node == $node)] | length == 1' "$report" >/dev/null \
+      || die 'refusing to bank: host report does not name the authenticated external node exactly once'
     jq -c '.session' "$report" \
       | python3 "$ROOT/scripts/verify-campaign-measurement.py" "$measurement_node" >/dev/null \
       || die 'refusing to bank: client measurement signature did not verify for the admitted node'

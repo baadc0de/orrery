@@ -140,9 +140,9 @@ cmd_assemble() {
     || die "assemble: session id '$session' is not a UUIDv7; mint one with orrery-invite"
 
   # The host must actually have hosted this run: an external participant in a
-  # witnessed island. A report with no external block is a pure-bot run and
+  # witnessed island. A report with no exterior rows is a pure-bot run and
   # needs no assembly; handing one here is a mistake worth naming.
-  jq -e '.external != null' "$raw" >/dev/null \
+  jq -e '.external | type == "array" and length > 0' "$raw" >/dev/null \
     || die 'assemble: the host report carries no external participant; nothing to assemble'
   jq -e '.witnessing == true' "$raw" >/dev/null \
     || die 'assemble: the host run was not witnessed; an unwitnessed hour banks nothing'
@@ -159,8 +159,11 @@ cmd_assemble() {
   # completed QUIC authentication and whose admission token it verified. The
   # client signs every client-owned row field with that same persistent key.
   local measurement_node
-  measurement_node=$(jq -er '.external.node | select(type == "string" and length > 0)' "$raw") \
-    || die 'assemble: the host report does not name the authenticated external node'
+  measurement_node=$(jq -er '.measurement_node | select(type == "string" and length > 0)' <<<"$row") \
+    || die 'assemble: the client row does not name its measurement node'
+  jq -e --arg node "$measurement_node" \
+    '[.external[] | select(.node == $node)] | length == 1' "$raw" >/dev/null \
+    || die 'assemble: the host report does not name the authenticated external node exactly once'
   printf '%s\n' "$row" \
     | python3 "$ROOT/scripts/verify-campaign-measurement.py" "$measurement_node" >/dev/null \
     || die 'assemble: the client measurement signature did not verify for the admitted node'
@@ -231,8 +234,9 @@ self_test() {
     peers: 5, seconds: 60, player_hours: 0.083,
     witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
     deferral_ledger_balances: true, total_gaps: 12, total_shed: 0,
-    external: { index: 4, node: "fixture", said_goodbye: true, connected: false,
-                uplink_frames: 100, downlink_frames: 400, downlink_dropped: 0 }
+    external: [{ index: 4, node: "fixture", said_goodbye: true, connected: false,
+                 connected_ticks: 3600, uplink_frames: 100, uplink_delivered: 97,
+                 uplink_dropped: 3, downlink_frames: 400, downlink_dropped: 0 }]
   }' > "$dir/raw.json"
   st_row() {
     jq -n --arg session "$1" --argjson mismatch "$2" --argjson observed "$3" '{
@@ -250,7 +254,7 @@ self_test() {
   st_row "$session" true 3.4 > "$dir/records.jsonl"
   local fixture_node
   fixture_node=$(jq -r .measurement_node "$dir/records.jsonl")
-  jq --arg node "$fixture_node" '.external.node = $node' "$dir/raw.json" > "$dir/raw.next.json"
+  jq --arg node "$fixture_node" '.external[0].node = $node' "$dir/raw.json" > "$dir/raw.next.json"
   mv "$dir/raw.next.json" "$dir/raw.json"
 
   "$0" assemble "$dir/raw.json" "$dir/records.jsonl" "$session" "$dir/r.json" 2>/dev/null \
@@ -306,7 +310,7 @@ json.dump(row,sys.stdout,separators=(",",":")); print()' > "$dir/forged-agree.js
 
   # A report that hosted nobody external must refuse.
   st_row "$session" true 3.4 > "$dir/records.jsonl"
-  jq '.external = null' "$dir/raw.json" > "$dir/raw-nobody.json"
+  jq '.external = []' "$dir/raw.json" > "$dir/raw-nobody.json"
   if "$0" assemble "$dir/raw-nobody.json" "$dir/records.jsonl" "$session" "$dir/r4.json" 2>/dev/null; then
     die 'self-test: a report with no external participant assembled anyway'
   fi
