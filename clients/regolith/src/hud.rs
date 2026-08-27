@@ -120,6 +120,17 @@ pub const IMPACT_FLASH_MESH_RADIUS_M: f32 = RETICLE_RADIUS_M * 0.12;
 /// before #531.
 pub const IMPACT_MARKER_RADIUS_M: f32 = RETICLE_RADIUS_M * 0.30;
 
+/// The marker ring's tube radius as a fraction of its own radius.
+///
+/// The camera's vertical field of view is [`crate::CAMERA_FOV_Y`], so on a
+/// 1080-line window the visible world height is `2·h·tan(FOV/2)` metres for a
+/// camera height `h`, and the ring's own radius is
+/// `IMPACT_MARKER_RADIUS_M · h / CAMERA_DEFAULT_HEIGHT_M`. Both are linear in
+/// `h`, so the ring's apparent thickness is the same at every zoom — about two
+/// and a half pixels at this ratio, which is a hairline that renders rather
+/// than a hairline that does not.
+pub const IMPACT_MARKER_TUBE_RATIO: f32 = 0.06;
+
 /// The radius the burst falls back to when the target's state is already gone.
 ///
 /// A hit that destroyed its target retires the replica, so the ruleset radius
@@ -568,7 +579,17 @@ pub fn spawn_world_overlay(
     });
     let tracer_mesh = meshes.add(Cuboid::new(TRACER_MESH_LENGTH_M, 0.5, 0.5));
     let flash_mesh = meshes.add(Sphere {
-        radius: RETICLE_RADIUS_M * 0.12,
+        radius: IMPACT_FLASH_MESH_RADIUS_M,
+    });
+    // The marker needs its own torus rather than the range rings'. Theirs is
+    // scaled to hundreds of metres, so a 0.0035 minor radius is a couple of
+    // pixels of tube; scaled to the marker's ~15 m it would be 0.05 m, which
+    // is well under a pixel at every zoom and would not render at all.
+    // `IMPACT_MARKER_TUBE_RATIO` is chosen so the ring is about two and a half
+    // pixels thick across the whole range instead.
+    let marker_mesh = meshes.add(Torus {
+        major_radius: 1.0,
+        minor_radius: IMPACT_MARKER_TUBE_RATIO,
     });
     let flash_material = materials.add(StandardMaterial {
         base_color: IMPACT_ORANGE,
@@ -658,7 +679,7 @@ pub fn spawn_world_overlay(
     // no volume of fire.
     commands.spawn((
         ImpactMarker,
-        Mesh3d(ring),
+        Mesh3d(marker_mesh),
         MeshMaterial3d(flash_material),
         Transform::default(),
         Visibility::Hidden,
@@ -1614,6 +1635,35 @@ mod tests {
         assert!(tracer_geometry(&mut app, 0).is_some());
         assert!(tracer_geometry(&mut app, 1).is_some());
         assert!(tracer_geometry(&mut app, 2).is_none());
+    }
+
+    /// The marker only does its job if it is actually drawn. Reusing the
+    /// range rings' torus — authored for radii in the hundreds of metres —
+    /// would have put a 0.05 m tube on a 15 m ring, which is well under a
+    /// pixel at every zoom: a correct opacity, a correct position, and
+    /// nothing on screen. That is the shape of #517, #524 and #514.
+    #[test]
+    fn the_marker_ring_renders_as_a_hairline_at_every_zoom() {
+        const LINES: f32 = 1080.0;
+        for height_m in [
+            crate::CAMERA_MIN_HEIGHT_M,
+            crate::CAMERA_DEFAULT_HEIGHT_M,
+            crate::CAMERA_MAX_HEIGHT_M,
+        ] {
+            let metres_per_pixel = 2.0 * crate::visible_half_height_m(height_m) / LINES;
+            let glyph = height_m / crate::CAMERA_DEFAULT_HEIGHT_M;
+            let radius_m = IMPACT_MARKER_RADIUS_M * glyph;
+            let tube_px = 2.0 * IMPACT_MARKER_TUBE_RATIO * radius_m / metres_per_pixel;
+            assert!(
+                (1.5_f32..=6.0).contains(&tube_px),
+                "the ring is {tube_px} px thick at {height_m} m of camera height"
+            );
+            let diameter_px = 2.0 * radius_m / metres_per_pixel;
+            assert!(
+                (24.0..=96.0).contains(&diameter_px),
+                "the ring is {diameter_px} px across at {height_m} m of camera height"
+            );
+        }
     }
 
     /// #531: the same adjudicated hit must be drawn at the same size in the
