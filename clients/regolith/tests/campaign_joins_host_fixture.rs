@@ -1121,6 +1121,15 @@ fn a_client_joins_measures_and_applies_replicated_state() {
         let _ = runtime.advance(Controls::default(), &mut sink);
         std::thread::sleep(Duration::from_millis(2));
     }
+    // The terminal broadcast is the explicit replication cut for the view
+    // property below.  The later acknowledgement drain continues to advance
+    // this client after the fixture has stopped broadcasting, so on a delayed
+    // runner it may legitimately age the replica past its two-second TTL.
+    // Check the view at the point the terminal replication was observed, not
+    // after deliberately exercising that no-more-replication lifetime.
+    assert_eq!(runtime.focus(), Some(PersistId::new(1)));
+    assert!(runtime.executor().state(PersistId::new(1)).is_some());
+
     // Driving the client to the terminal downlink can produce another uplink;
     // settle that traffic too before taking the fixture's final ledger cut.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1178,9 +1187,7 @@ fn a_client_joins_measures_and_applies_replicated_state() {
         truth.downlink_skipped_indices,
     );
 
-    // The replicated view holds the virtual bot, and the accumulator ran.
-    assert_eq!(runtime.focus(), Some(PersistId::new(1)));
-    assert!(runtime.executor().state(PersistId::new(1)).is_some());
+    // The accumulator ran.
     assert!(
         runtime.joined_ticks() >= 150,
         "every joined tick was accounted: {}",
