@@ -149,8 +149,8 @@ pub const CAMPAIGN_HYSTERESIS_PER_MILLE: i64 = 100;
 
 /// Commitment lags the campaign's engagement budget must absorb.
 ///
-/// `docs/01-spatial-model.md` §7 states the guarantee as `edge − m`, which
-/// accounts for **one** hysteretic commitment: the observer's. Interest
+/// `docs/01-spatial-model.md` §7 calls `edge − m` the one-body visibility
+/// radius: it accounts for the observer's hysteretic commitment. Interest
 /// membership compares two *committed* cells, though, and
 /// `orrery_spatial::hysteresis` latches each entity's commitment
 /// independently — "the committed `Cell` lags the geometric cell by at most
@@ -203,8 +203,8 @@ pub const CAMPAIGN_MIN_CELL_EDGE_M: f64 = {
 /// Campaign interest-cell edge. **The weapon table is sized to this, not the
 /// other way round.**
 ///
-/// The framework default is 128 m, whose 27-cell AOI guarantees only 115.2 m
-/// around the observer — inside every weapon's envelope. 512 m is the
+/// The framework default is 128 m, whose 27-cell AOI guarantees only 102.4 m
+/// for a pairwise interaction — inside every weapon's envelope. 512 m is the
 /// coarsening that gives the campaign a usable engagement budget while
 /// keeping the block small enough that craft actually cross cells.
 ///

@@ -201,7 +201,14 @@ stateDiagram-v2
     Crossing --> Interior: commit new cell (CellCrossing sent, 27-set diffed, re-key queued)
 ```
 
-Consequences: a strafing fight straddling a boundary generates zero crossings as long as oscillation amplitude stays under 12.8 m; a walking player (5 m/s) must commit ~2.6 s of directed movement to cross. Because commitment is hysteretic, two peers may briefly disagree about an entity's *geometric* cell but never about its *committed* cell — `CellCrossing` carries `(tick, auth_seq)` and only the authority holder emits it (single-writer invariant, D2). The AOI coverage guarantee degrades gracefully: with commitment lagging position by at most m, the worst-case guaranteed visibility radius is `edge − m` (115.2 m at defaults) — accounted for in tuning (§11).
+Consequences: a strafing fight straddling a boundary generates zero crossings as long as oscillation amplitude stays under 12.8 m; a walking player (5 m/s) must commit ~2.6 s of directed movement to cross. Because commitment is hysteretic, two peers may briefly disagree about an entity's *geometric* cell but never about its *committed* cell — `CellCrossing` carries `(tick, auth_seq)` and only the authority holder emits it (single-writer invariant, D2).
+
+There are two distinct AOI coverage bounds:
+
+- **One-body visibility radius: `edge − m`** (115.2 m at defaults). This accounts for the observer's committed cell lagging its geometric position by at most one margin. It is the right bound when the other position is not itself selected by a hysteretic committed cell.
+- **Two-body interaction radius: `edge − 2m`** (102.4 m at defaults). Interest membership compares the observer's and target's committed cells, and each entity latches its commitment independently. Their two lags can compose adversarially, so consumers sizing weapon reach, interaction range, or any other pairwise mechanic **must use this bound**. `orrery_spatial::pairwise_aoi_radius_m` derives it from the configured edge and hysteresis fraction.
+
+The single-writer invariant does not collapse the pairwise bound: it makes every replica agree on one entity's committed cell, but the observer and target remain two independently committed entities. Both bounds are accounted for in tuning (§11).
 
 ## 8. Hotspot detection and shard-cell splitting
 
@@ -237,10 +244,10 @@ These structures are **process-local, ephemeral, and invisible**: they have no n
 
 | Parameter | Default (D16) | Tuning pressure |
 |---|---|---|
-| Interest cell edge | 128 m | Must satisfy `edge ≥ AOI radius + hysteresis margin` for the coverage guarantee (§7). Bigger cells → more entities per 27-cell set → more proxy traffic and page-in volume; smaller cells → more crossings (rate ∝ v/edge) and more rooms. |
+| Interest cell edge | 128 m | Must satisfy `edge ≥ radius + hysteresis margin` for one-body visibility, or `edge ≥ radius + 2 × hysteresis margin` for a two-body interaction (§7). Bigger cells → more entities per 27-cell set → more proxy traffic and page-in volume; smaller cells → more crossings (rate ∝ v/edge) and more rooms. |
 | AOI radius | ≈ cell edge | Sets perceptual range; the 24-entity high-rate set and 1–4 Hz proxies (D16) bound bandwidth regardless, so oversizing AOI mostly costs proxy churn and load traffic. |
 | Shard level delta | −3 (8×8×8) | Larger shard cells → fewer, hotter actors; smaller → more placement churn. 8×8×8 ≈ 1 km³ at defaults fits the "handful of contiguous scans" goal. |
-| Hysteresis margin | 10% of edge | Below ~5% boundary fights thrash again; above ~20% the coverage guarantee visibly erodes (`edge − m`) and handoff feels laggy for fast movers. |
+| Hysteresis margin | 10% of edge | Below ~5% boundary fights thrash again; above ~20% the one-body (`edge − m`) and pairwise (`edge − 2m`) guarantees visibly erode, and handoff feels laggy for fast movers. |
 
 Per-genre starting points: close-quarters shooter (interactions ≤ 60 m): edge 64–128 m; open-world vehicular (engagements ~300 m): edge 256 m and accept larger page-ins; space sim: nested grids — e.g. a planetary grid at 128 m inside a system grid at 128 km — each with its own `CellId` space (§13). Expected occupancy math for capacity planning: entities-in-interest ≈ 27 · ρ · edge³ for density ρ; keep the *typical* value within a small multiple of the 24-entity high-rate set so the precise filter, not the cell filter, is the effective selector.
 

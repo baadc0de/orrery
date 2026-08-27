@@ -17,7 +17,7 @@ pub mod interest;
 pub mod plugin;
 pub mod visibility;
 
-pub use config::SpatialConfig;
+pub use config::{pairwise_aoi_radius_m, SpatialConfig};
 pub use hysteresis::{step_commit, GridPosition};
 pub use interest::{HighRate, InterestSelection, Proxy};
 pub use plugin::OrrerySpatialPlugin;
