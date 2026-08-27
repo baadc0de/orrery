@@ -477,11 +477,44 @@ jobs:
     # (many small standalone-workspace builds, and it does link) is not
     # `clippy`'s and not `test`'s, so neither result predicts it.
     runs-on: ubuntu-latest
+    # SPIKE ONLY (#585). This branch is a measurement rig and is not proposed
+    # for merge. It wires the S3 kache remote into `gates` exactly the way
+    # `clippy` has it so the numbers are comparable with #175's.
+    permissions:
+      contents: read
+      id-token: write
     # 656 s measured cold; 30 minutes is ~2.7x that, so a lane that hangs says
-    # so rather than burning the six-hour default.
-    timeout-minutes: 30
+    # so rather than burning the six-hour default. Raised for the spike so a
+    # cold cache-warming run cannot lose its own measurement to the bound.
+    timeout-minutes: 45
+    env:
+      ORRERY_CACHE_AVAILABLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Assume the cache role
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::590561279276:role/orrery-ci-cache
+          aws-region: eu-central-1
+          role-session-name: orrery-ci-gates-${{ github.run_id }}
+
+      - name: Install kache and point it at the S3 remote
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
+        with:
+          version: 0.14.2
+          s3-bucket: orrery-kache
+          s3-region: eu-central-1
+          s3-prefix: artifacts
+          manifest-key: gates-x86_64-unknown-linux-gnu
+          pr-comment: false
+          # The runner's root filesystem is ext4 without reflink, so the local
+          # store is a second physical copy of the cacheable part of `target/`
+          # (see the note on `clippy`'s step). This lane's `target/` is the
+          # middle one of the three, so the cap is real here, not insurance.
+          max-size: 20GiB
       # #171's answer to "would we know before hitting a ceiling?": sample free
       # disk every 2 s for the life of the lane and report the minimum, rather
       # than snapshotting at start (which misses the peak) or end (which
@@ -547,8 +580,59 @@ jobs:
             g++ pkg-config libx11-dev libasound2-dev libudev-dev \
             libwayland-dev libxkbcommon-dev
 
+      - name: Confirm rustc is wrapped and the S3 remote is configured
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-<unset>}"
+          [[ "${RUSTC_WRAPPER:-}" == *kache* ]] || {
+            echo "::error::RUSTC_WRAPPER is not kache — the lane would build uncached"
+            exit 1
+          }
+          kache doctor 2>&1 | tee doctor.txt || true
+          grep -qF 's3://orrery-kache/artifacts' doctor.txt || {
+            echo "::error::kache doctor does not report the s3://orrery-kache/artifacts remote"
+            exit 1
+          }
+
       - name: static gates, harness self-tests, standalone tools
         run: scripts/check.sh gates
+
+      # Same report `clippy` writes, same fields, so #585's table can be read
+      # against #175's. Runs BEFORE kache-action's post step pushes, so
+      # `bytes_up` undercounts; `bytes_down` — the billed direction — is
+      # complete.
+      - name: Cache report
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          kache stats --since 24h || true
+          kache report --format json --since 24h --output kache-gates.json
+          {
+            echo '### kache — gates'
+            echo '```'
+            jq -r '
+              (.network // {}) as $n |
+              "hit_rate_pct       \(.summary.hit_rate_pct)",
+              "local_hits         \(.summary.local_hits)",
+              "remote_hits        \(.summary.remote_hits)",
+              "prefetch_hits      \(.summary.prefetch_hits)",
+              "misses             \(.summary.misses)",
+              "total_crates       \(.summary.total_crates)",
+              "configured_backend \($n.configured_backend // "none")",
+              "bytes_down         \($n.bytes_down // 0)",
+              "bytes_up           \($n.bytes_up // 0)",
+              "downloads_ok       \($n.downloads_ok // 0)",
+              "downloads_failed   \($n.downloads_failed // 0)"
+            ' kache-gates.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        with:
+          name: kache-report-gates
+          path: kache-gates.json
+          retention-days: 30
 
       # The sampled minimum over the whole lane, next to the end-of-run `df`.
       # A run that filled the disk prints a healthy number at the end; the
