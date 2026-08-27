@@ -26,7 +26,7 @@ pub mod telemetry;
 pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
 
 /// Public campaign-admission origin used by a no-argument volunteer launch.
-pub const DEFAULT_ADMISSION_URL: &str = "http://campaigns.distopik.com:8080";
+pub const DEFAULT_ADMISSION_URL: &str = "https://campaigns.distopik.com";
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
