@@ -312,3 +312,74 @@ the snapshot-at-purchase rule.
   (and the verified absence of `assets/private-manifest.toml`).
 - **Issues:** #347 (body and all four comments, including the owner's
   2026-08-24 Kit B decision), #341, #345, #352.
+
+## Appendix: the independent second read (#561), and where it diverges
+
+This question was dispatched to **two agents in parallel and deliberately**, in separate
+worktrees, neither seeing the other's work, at the owner's instruction: "see if they
+agree on legalities." Both were told not to hedge toward agreement, because artificial
+convergence carries no information. The second read landed as PR #561
+(`docs/plans/kitbash-assets-licensing.md`, opencode); its distinct findings are folded
+here and that PR is closed rather than landing a near-duplicate doc beside this one.
+
+### Where the two reads agree
+
+Both worked from the fetched CGTrader text rather than recollection, and both reached
+the same operative conclusions independently:
+
+- **Kitbashing is expressly licensed.** s21A.4 grants "modify, create derivative works
+  of" to a buyer using the product solely as an Incorporated Product. Assembly is not
+  the problem.
+- **Extraction is the whole question.** Definition 8 plus s21A.2/s21A.3's affirmative
+  duty. Embedded in the executable is defensible; a peelable loose `.glb` is not.
+- **Recognisability is a red herring** against the seller's licence.
+- **Kit B carries its own Custom/no-AI terms** and must not be folded into Royalty Free.
+- **The uncertain link is identical**: whether embedding actually discharges s21A.3 is
+  industry custom, not anything adjudicated. Both send exactly that to a lawyer.
+
+Both also independently reproduced the prior adjudication recorded in #347 on
+2026-08-24, from primary sources, without mirroring its claims.
+
+### Where they diverge, and what each divergence is worth
+
+**1. A second, stronger counter-argument.** This doc's counter is that the MIT loader is
+effectively a published extraction manual, which makes "requires reverse-engineering
+tools" thin. The second read raises a different and broader one: a court (or CGTrader
+enforcing on a seller's behalf) could read s21A.3 strictly — hold that a shipped asset
+is *by definition* accessible to the player's machine, and that any client rendering a
+mesh has effectively distributed it. Under that reading **no amount of embedding
+saves you**, and the only clean paths are written per-pack permission or original
+geometry.
+
+Both reads judge it the unlikely construction, and for the same stated reason: the
+licence's own drafting names encryption and proprietary formats as sufficient, which
+gestures at the industry meaning ("you cannot unpak it casually"). It is recorded here
+because it is the risk that would invalidate the plan rather than merely constrain it.
+
+**2. A stronger requirement on the shipped form.** This doc concludes embedding
+discharges the duty "about as well as anything short of encryption". The second read
+asks for more: a **proprietary or encrypted bundle**, never a peelable `.glb`. The
+stricter reading costs little at #345's stage and is the safer default; adopt it.
+
+**3. Product-listing verification differed, and this is a methodological note worth
+keeping.** Both reads hit 403 on direct product-page fetches. This one routed through a
+reader proxy and obtained live figures (Kit A now $20, the $10 sale price in #347 having
+lapsed; Kit B $8). The second declined to substitute a proxy for the source and marked
+the listing labels as taken from #347's body, not re-verified.
+
+Neither approach is wrong, and the disagreement itself is the finding: a proxy read
+returned data but also a suspect artifact (Kit A's "(no AI)" suffix absent where #347
+records it). **Both outcomes argue the same rule** — snapshot the licence type, price and
+terms text at purchase, because the listing is not a stable citation.
+
+**4. Trade-dress risk is raised only here.** The second read does not address it. That is
+a gap in it rather than a disagreement: the exposure is real, it is third-party rather
+than contractual, and no CGTrader clause can cure it. It stays a live consideration.
+
+### What the double-read changes about confidence
+
+Two independent derivations from the same primary text reaching the same operative
+conclusion raises confidence in the *reading of the licence* materially. It raises
+confidence in "embedding satisfies s21A.3" **not at all** — both reads flagged that same
+link as unadjudicated, so agreement there reflects a shared limit rather than
+corroboration. That link is what a lawyer must confirm.
