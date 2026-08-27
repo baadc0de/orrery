@@ -262,7 +262,10 @@ async fn pump(
     reply.extend_from_slice(&(assigned as u64).to_le_bytes());
     write_message(&mut send, &reply).await?;
 
-    if matches!(mode, Mode::Join | Mode::TargetDestroyedBeforeDamage) {
+    if matches!(
+        mode,
+        Mode::Join | Mode::MaterialisedRock | Mode::TargetDestroyedBeforeDamage
+    ) {
         let claim_bytes = read_message(&mut recv).await?;
         let state_bytes = read_message(&mut recv).await?;
         let claim: StateClaim =
@@ -722,6 +725,22 @@ fn drive_until_joined(runtime: &mut CampaignRuntime, sink: &mut JsonlTelemetry, 
     }
 }
 
+fn drive_until_replica(
+    runtime: &mut CampaignRuntime,
+    target: PersistId,
+    sink: &mut JsonlTelemetry,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while runtime.executor().state(target).is_none() && Instant::now() < deadline {
+        let _ = runtime.advance(Controls::default(), sink);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        runtime.executor().state(target).is_some(),
+        "the target replica must arrive before player input can select it"
+    );
+}
+
 #[test]
 fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
     let fixture = HostFixture::spawn(Mode::Join);
@@ -730,6 +749,7 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
     drive_until_joined(&mut runtime, &mut sink, 1);
 
     let target = PersistId::new(1);
+    drive_until_replica(&mut runtime, target, &mut sink);
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         let _ = runtime.advance(
@@ -891,6 +911,7 @@ fn materialised_rock_replication_route_carries_lock_damage_and_rock_credit() {
     drive_until_joined(&mut runtime, &mut sink, 1);
 
     let target = fixture_authority(Mode::MaterialisedRock).0;
+    drive_until_replica(&mut runtime, target, &mut sink);
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         let _ = runtime.advance(
@@ -983,6 +1004,7 @@ fn a_delivered_campaign_lock_break_reaches_both_skin_consumers() {
     drive_until_joined(&mut runtime, &mut sink, 1);
 
     let target = PersistId::new(1);
+    drive_until_replica(&mut runtime, target, &mut sink);
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         let _ = runtime.advance(

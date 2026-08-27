@@ -388,6 +388,7 @@ pub struct CampaignRuntime {
     delivered_unroutable: u64,
     delivered_foreign: u64,
     pending_delivered: Vec<DeliveredOrder>,
+    pending_routing: Vec<(PersistId, Order)>,
     replica_freshness: BTreeMap<PersistId, ReplicaFreshness>,
     focus: Option<PersistId>,
     latest_cell: Option<CellId>,
@@ -557,6 +558,7 @@ impl CampaignRuntime {
             delivered_unroutable: 0,
             delivered_foreign: 0,
             pending_delivered: Vec::new(),
+            pending_routing: Vec::new(),
             replica_freshness: BTreeMap::new(),
             focus: None,
             latest_cell: None,
@@ -1027,6 +1029,7 @@ impl CampaignRuntime {
             &mut self.replica_freshness,
             &mut self.focus,
         );
+        self.flush_pending_routes(&link);
 
         if !link.is_connected() || link.host_said_goodbye() {
             self.state = JoinState::Closed {
@@ -1099,9 +1102,33 @@ impl CampaignRuntime {
             return;
         }
         let Some(slot) = replica_authority_slot(&self.replica_freshness, recipient) else {
-            self.delivered_unroutable += 1;
+            // The simulation runs before this tick's inbound drain. Hold the
+            // delivery only until that drain completes so a replica arriving
+            // on this tick can supply its route. `flush_pending_routes` runs
+            // after expiry, hence this never revives or outlives a replica.
+            self.pending_routing.push((recipient, order));
             return;
         };
+        self.send_remote_delivery(link, slot, recipient, order);
+    }
+
+    fn flush_pending_routes(&mut self, link: &CampaignLink) {
+        for (recipient, order) in std::mem::take(&mut self.pending_routing) {
+            if let Some(slot) = replica_authority_slot(&self.replica_freshness, recipient) {
+                self.send_remote_delivery(link, slot, recipient, order);
+            } else {
+                self.delivered_unroutable += 1;
+            }
+        }
+    }
+
+    fn send_remote_delivery(
+        &mut self,
+        link: &CampaignLink,
+        slot: u32,
+        recipient: PersistId,
+        order: Order,
+    ) {
         let inner = orrery_protocol::channels::encode_delivered_input(
             self.entity,
             recipient,
@@ -1657,7 +1684,7 @@ mod tests {
     fn materialised_replica_route_has_exactly_the_replica_lifetime() {
         let game = Regolith::honest();
         let own = PersistId::new(9);
-        let materialised = PersistId::new(0xC524_1234_5678_9abc);
+        let materialised = PersistId::new(0xC524_1234_5678_9ABC);
         let mut executor = Executor::new(game, UniverseSeed([0x63; 32]));
         executor.insert(own, game.spawn(own, 8));
         executor.insert(materialised, game.spawn(materialised, 2));
