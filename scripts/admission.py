@@ -53,6 +53,7 @@ class Refusal(Exception):
 class Campaign:
     ident: str; title: str; open: bool; host: str; peers: int; seconds: int
     loss_pct: int; jitter_ms: int; external_port: int; client_rev: str | None; ruleset_version: int | None
+    always_on: bool
 
 
 class Admission:
@@ -64,6 +65,7 @@ class Admission:
         self.last_good: dict[str, Campaign] | None = None
         self.last_note: str | None = None
         self.children: dict[str, subprocess.Popen[str]] = {}
+        self.always_on: set[str] = set()
         self.locks: dict[str, Any] = {}
         # Slot -> display label for the sessions currently live on each campaign.
         # Labels only (#484): never identity, never authority, never
@@ -93,7 +95,8 @@ class Admission:
                     raise ValueError("ruleset_version must be a u32")
                 got[ident] = Campaign(ident, s["title"], s.get("open", "").lower() == "yes", host,
                     s.getint("peers"), s.getint("seconds"), s.getint("loss_pct"), s.getint("jitter_ms"),
-                    external_port, s.get("client_rev") or None, ruleset_version)
+                    external_port, s.get("client_rev") or None, ruleset_version,
+                    s.get("always_on", "").lower() == "yes")
             self.last_good, self.last_note = got, None
             return got, None
         except (OSError, ValueError, configparser.Error, KeyError) as e:
@@ -113,7 +116,7 @@ class Admission:
             logging.warning(floor_note); note = floor_note if note is None else f"{note}; {floor_note}"
         rows = []
         for c in campaigns.values():
-            state = "paused" if c.open and paused else ("busy" if c.ident in self.children else ("open" if c.open else "closed"))
+            state = "paused" if c.open and paused else ("busy" if c.ident in self.children or c.ident in self.always_on else ("open" if c.open else "closed"))
             rows.append({"id": c.ident, "title": c.title, "state": state, "peers": c.peers, "seconds": c.seconds,
                          "loss_pct": c.loss_pct, "jitter_ms": c.jitter_ms, "client_rev": c.client_rev,
                          "server_rev": c.client_rev, "ruleset_version": c.ruleset_version})
@@ -205,6 +208,20 @@ class Admission:
                 logging.exception("admission subprocess/log failed: %s", e)
                 raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
             session_dir = self.state / "sessions" / sid; session_dir.mkdir(parents=True, exist_ok=True)
+            if c.always_on:
+                # The standing host is supervisor-owned.  It accepts any valid
+                # issuer token, but this service still serializes admissions so
+                # the harness's single external slot has one intended client.
+                remote = f"/var/lib/orrery-p1-swarm/{c.ident}"
+                listening = self._wait_always_on_listening(c, remote, session_dir)
+                try: host_node, host_direct = self.dialable_listening(c, listening)
+                except ValueError as e:
+                    logging.error("always-on host returned an unusable listening address: %s", e)
+                    raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.") from e
+                self.rosters[ident] = self.session_roster(c, nickname)
+                self.always_on.add(ident)
+                threading.Thread(target=self._release_always_on, args=(ident, c.seconds), daemon=True).start()
+                return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
             remote = f"/var/tmp/orrery/{sid}"
             # The harness writes its report and listening file into `remote`,
             # which lives on the *campaign* host and does not exist there yet.
@@ -229,7 +246,7 @@ class Admission:
             return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
         finally:
             # The flock stays held by the child/reaper, not the request.  It is released there.
-            if ident not in self.children:
+            if ident not in self.children and ident not in self.always_on:
                 self.locks.pop(ident, None)
                 lock.close()
 
@@ -264,6 +281,21 @@ class Admission:
             time.sleep(1)
         child.kill()
         raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.")
+
+    def _wait_always_on_listening(self, c: Campaign, remote: str, local: Path) -> str:
+        result = subprocess.run([self.ssh, "-i", str(self.ssh_key), f"orrery@{c.host}", "cat", f"{remote}/listening.txt"], text=True, capture_output=True)
+        if result.returncode == 0 and result.stdout.strip():
+            self.atomic_bytes(local / "listening.txt", result.stdout.encode())
+            return result.stdout.strip()
+        raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.")
+
+    def _release_always_on(self, ident: str, seconds: int) -> None:
+        time.sleep(seconds)
+        self.always_on.discard(ident)
+        self.children.pop(ident, None)
+        self.rosters.pop(ident, None)
+        lock = self.locks.pop(ident, None)
+        if lock is not None: lock.close()
 
     def _reap(self, ident: str, c: Campaign, sid: str, remote: str, local: Path, child: subprocess.Popen[str]) -> None:
         try:
@@ -414,6 +446,15 @@ class AdmissionTests(unittest.TestCase):
         fields = shlex.split(harness)
         self.assertEqual(fields[fields.index("--external-bind") + 1], "0.0.0.0:52011")
         self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
+
+    def test_an_always_on_campaign_reads_the_standing_host_without_launching_one(self) -> None:
+        self.control.write_text(self.control.read_text().replace("seconds = 60", "seconds = 900\nalways_on = yes"))
+        answer = self.service.join("test", self.request())
+        self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
+        self.assertIn("test", self.service.always_on)
+        recorded = (self.ssh.parent / "ssh.args").read_text()
+        self.assertIn("/var/lib/orrery-p1-swarm/test/listening.txt", recorded)
+        self.assertNotIn("--external-peer", recorded, "admission must not launch a competing host")
     def test_the_token_binds_the_presented_node_not_the_slot(self) -> None:
         token = self.service.join("test", self.request())["join"]["session_token"]
         self.assertGreater(len(token), 100, "the real signer returned a SessionTokenV1")

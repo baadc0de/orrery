@@ -330,6 +330,11 @@ lane_gates() {
     run cargo build --quiet -p orrery_identity --bins
     run python3 scripts/admission.py --self-test
 
+    # #474's standing-host supervisor. Its process test proves a failed
+    # harness child is reaped before a fresh attempt starts, with a separate
+    # report directory; the real binary is deliberately not needed here.
+    run python3 scripts/p1-swarm-always-on.py --self-test
+
     # The two P4 scripts, which until now ran their self-tests only in
     # nightly.yml. That is where the cost of an uncovered self-test was
     # actually paid: `p4-ledger.sh --self-test` counted ledger lines with `wc
