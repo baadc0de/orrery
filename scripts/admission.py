@@ -35,6 +35,13 @@ MAX_UPLOAD_BYTES = 64 * 1024**2
 CAMPAIGN_ID = re.compile(r"[a-z0-9-]{1,64}\Z")
 NODE = re.compile(r"[0-9a-f]{64}\Z")
 SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+DISPLAY_LABEL_MAX_CHARS = 32
+
+
+def display_label(raw: str) -> str | None:
+    """Return the bounded ASCII text the client is allowed to draw."""
+    cleaned = "".join(glyph for glyph in raw if " " <= glyph <= "~").strip()
+    return cleaned[:DISPLAY_LABEL_MAX_CHARS] or None
 
 
 class Refusal(Exception):
@@ -58,7 +65,7 @@ class Admission:
         self.last_note: str | None = None
         self.children: dict[str, subprocess.Popen[str]] = {}
         self.locks: dict[str, Any] = {}
-        # Slot -> nickname for the sessions currently live on each campaign.
+        # Slot -> display label for the sessions currently live on each campaign.
         # Labels only (#484): never identity, never authority, never
         # addressing, and nothing banks off them. It is deliberately in memory
         # and deliberately not `joins.jsonl` — that file is the durable
@@ -124,6 +131,29 @@ class Admission:
             f.write(json.dumps(row, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
 
     @staticmethod
+    def session_roster(campaign: Campaign, nickname: str) -> dict[int, str]:
+        """Name the complete flock from the same session-scoped answer.
+
+        The host-scoped alternative either puts labels beside replicated craft
+        facts, crossing A13's useful boundary, or adds a second session-metadata
+        channel and teaches the host the exterior nickname. Admission already
+        owns the configured participant count and that sole exterior label, so
+        its live roster is the smaller sideband with one lookup path for human
+        and headless craft alike. The section id supplies stable bot labels;
+        neither those strings nor the player's label become identity.
+        """
+        roster = {}
+        for slot in range(campaign.peers):
+            suffix = f"-{slot + 1}"
+            generated = display_label(campaign.ident[:DISPLAY_LABEL_MAX_CHARS - len(suffix)] + suffix)
+            if generated is not None:
+                roster[slot] = generated
+        player = display_label(nickname)
+        if player is not None:
+            roster[campaign.peers] = player
+        return roster
+
+    @staticmethod
     def socket_address(host: str, port: int) -> str:
         return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
@@ -156,7 +186,7 @@ class Admission:
             logging.warning("admissions paused: %d free bytes is below MINT_FLOOR_BYTES", free)
             raise Refusal(503, "admissions_paused", "Campaigns are temporarily unavailable while the operator makes room — nothing you did was wrong. Try again later.")
         nickname, node = request.get("nickname"), request.get("node")
-        if not isinstance(nickname, str) or not re.fullmatch(r"[^\t\r\n]{1,32}", nickname): raise Refusal(422, "bad_nickname", "Nicknames are 1–32 characters, no tabs or newlines.")
+        if not isinstance(nickname, str) or not re.fullmatch(r"[^\t\r\n]{1,32}", nickname) or display_label(nickname) is None or any(not " " <= glyph <= "~" for glyph in nickname): raise Refusal(422, "bad_nickname", "Nicknames are 1–32 visible ASCII characters, with no tabs or newlines.")
         if not isinstance(node, str) or not NODE.fullmatch(node): raise Refusal(422, "bad_node", "This build sent a bad transport key — reinstall the client.")
         directory = self.state / c.ident; directory.mkdir(parents=True, exist_ok=True)
         lock = (directory / "lock").open("a+")
@@ -194,7 +224,7 @@ class Admission:
                 logging.error("host returned an unusable listening address: %s", e)
                 raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
             self.children[ident] = child
-            self.rosters[ident] = {c.peers: nickname}
+            self.rosters[ident] = self.session_roster(c, nickname)
             threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True).start()
             return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
         finally:
@@ -204,7 +234,7 @@ class Admission:
                 lock.close()
 
     def roster(self, ident: str) -> dict[str, Any]:
-        """Slot -> nickname for whoever is playing this campaign right now.
+        """Slot -> display label for every craft in this live campaign.
 
         A nickname is a label and nothing else (#484), which is exactly why it
         is served here instead of riding with replicated craft state: it is not
@@ -215,8 +245,8 @@ class Admission:
         allowed to answer with an empty roster whenever it does not know.
 
         Empty is a real answer, not an error: a campaign nobody has joined has
-        no labels, and the client must draw those craft with no label rather
-        than inventing one.
+        no session and therefore no labels. The client must draw any craft for
+        which this sideband has no row with no label rather than inventing one.
         """
         campaigns, _ = self.campaigns()
         if not CAMPAIGN_ID.fullmatch(ident) or ident not in campaigns:
@@ -415,19 +445,35 @@ class AdmissionTests(unittest.TestCase):
         r = self.request(); r["nickname"] = "a\tb"
         with self.assertRaises(Refusal) as x: self.service.join("test", r)
         self.assertEqual(x.exception.status, 422); self.assertFalse((self.state / "test" / "ledger.tsv").exists())
-    def test_the_roster_names_the_live_session_by_slot(self) -> None:
+        r = self.request(); r["nickname"] = "Ren\N{LATIN SMALL LETTER E WITH ACUTE}e"
+        with self.assertRaises(Refusal) as x: self.service.join("test", r)
+        self.assertEqual(x.exception.status, 422); self.assertFalse((self.state / "test" / "ledger.tsv").exists())
+    def test_the_roster_names_every_craft_including_an_opponent(self) -> None:
         # The label the client draws on a ship comes from here, and the slot is
         # the only thing that maps it to a craft (entity = slot + 1, client
-        # side). A roster keyed by anything else labels the wrong ship.
+        # side). The eight harness slots are the opposition; checking only the
+        # exterior slot would preserve #523's exact blind spot.
         c = self.service.campaigns()[0]["test"]
         self.assertEqual(self.service.roster("test")["roster"], [], "nobody has joined yet")
         self.service.join("test", self.request())
-        self.assertEqual(self.service.roster("test")["roster"], [{"slot": c.peers, "nickname": "ada"}])
+        roster = self.service.roster("test")["roster"]
+        self.assertEqual(len(roster), c.peers + 1, "every harness craft and the exterior craft need a label")
+        self.assertEqual(roster[0], {"slot": 0, "nickname": "test-1"}, "an opponent must be named")
+        self.assertEqual(roster[-1], {"slot": c.peers, "nickname": "ada"})
+
+    def test_every_roster_label_takes_the_same_display_sanitiser(self) -> None:
+        self.assertEqual(display_label("  ada\N{BELL}  "), "ada")
+        self.assertEqual(display_label("Ren\N{LATIN SMALL LETTER E WITH ACUTE}e"), "Rene")
+        self.assertIsNone(display_label("\N{LATIN SMALL LETTER E WITH ACUTE}\N{RIGHT-TO-LEFT OVERRIDE}"))
+        c = self.service.campaigns()[0]["test"]
+        roster = self.service.session_roster(c, "  ad\N{LATIN SMALL LETTER E WITH ACUTE}a  ")
+        self.assertEqual(roster[c.peers], "ada")
+        self.assertTrue(all(display_label(label) == label for label in roster.values()))
 
     def test_the_roster_forgets_a_session_when_it_ends(self) -> None:
         # A label that outlives its session names a player who is not there.
         self.service.join("test", self.request())
-        self.assertEqual(len(self.service.roster("test")["roster"]), 1)
+        self.assertEqual(len(self.service.roster("test")["roster"]), 9)
         for child in list(self.service.children.values()):
             child.kill()
         deadline = time.monotonic() + 2
