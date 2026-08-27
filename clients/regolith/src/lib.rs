@@ -13,6 +13,7 @@ pub mod hud;
 pub mod identity;
 pub mod intent;
 pub mod join;
+pub mod legend;
 pub mod net;
 pub mod roster;
 pub mod session;
@@ -496,6 +497,7 @@ impl Plugin for RegolithSkinPlugin {
             .insert_resource(session)
             .init_resource::<VisualAssetPaths>()
             .init_resource::<OverlayState>()
+            .init_resource::<legend::LegendState>()
             .init_resource::<MetricWindow>()
             .init_resource::<CameraZoom>()
             .init_resource::<aoi::AoiBoundary>()
@@ -513,6 +515,14 @@ impl Plugin for RegolithSkinPlugin {
                 Update,
                 (
                     toggle_overlay,
+                    // The legend watches the same `ButtonInput` the intent
+                    // path reads and never consumes a press, so noticing an
+                    // input can never eat one.
+                    legend::note_used_inputs,
+                    legend::toggle_legend,
+                    legend::sync_legend
+                        .after(legend::note_used_inputs)
+                        .after(legend::toggle_legend),
                     sync_rendered_state,
                     select_clicked_body.before(sync_rendered_state),
                     recompose_craft_bodies.after(sync_rendered_state),
@@ -643,6 +653,7 @@ fn setup_scene(
         );
     }
     hud::spawn_hud(&mut commands);
+    legend::spawn_legend(&mut commands);
     hud::spawn_world_overlay(&mut commands, &mut meshes, &mut materials);
     starfield::spawn_starfield(&mut commands, &mut meshes, &mut materials);
     let presentation = SessionPresentation::from_join_state(session.join_state());

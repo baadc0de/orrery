@@ -33,9 +33,17 @@ It is strict named-field JSON with a V1 format marker, carrying `host_node`,
 automation, but exposes the token in shell history and process listings; prefer
 the join file or `@path` for new sessions.
 
-Controls are keyboard-only: Left/Right turn, Up thrusts, Space fires, and F3
-toggles the detailed overlay. The always-on strip and JSONL stream do not
-depend on F3.
+Controls: Left/Right turn, Up thrusts, Space fires, a left click picks the
+target, the mouse wheel zooms, F3 toggles the detailed overlay and F1 shows or
+hides the controls legend. The always-on strip and JSONL stream do not depend
+on F3.
+
+The legend itself is the answer to #564 — a new player was told none of the
+above. It sits in the bottom-right corner, dims each row as that input is
+demonstrated, and retires once every flight input has been used (or after 90 s
+in the seat). `src/legend.rs` is the whole of it, and its tests press the key
+each row names and assert the binding really fires, so a legend that drifts
+from the bindings fails rather than lying.
 
 There are deliberately no required assets. If `assets/regolith/craft.glb` is
 present it is used as visual geometry; otherwise the client renders Bevy
