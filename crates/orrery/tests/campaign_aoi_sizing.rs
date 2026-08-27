@@ -12,9 +12,9 @@
 //! would delete the interest-churn surface the campaign exists to exercise —
 //! so the weapon table was cut to fit instead.
 //!
-//! The bound the table is held to is `edge − 2m`, not the `edge − m` of
-//! `docs/01-spatial-model.md` §7, because §7 accounts for one hysteretic
-//! commitment and membership compares two. See `CAMPAIGN_COMMITMENT_LAGS`.
+//! The bound the table is held to is §7's two-body `edge − 2m`, because
+//! membership compares two independently hysteretic commitments. See
+//! `CAMPAIGN_COMMITMENT_LAGS`.
 
 use orrery_games::regolith::{
     campaign_engagement_budget_m, campaign_guaranteed_aoi_radius_m, weapon::WeaponKind,
@@ -22,7 +22,7 @@ use orrery_games::regolith::{
     MAX_ENGAGEMENT_RANGE_MM, MAX_TARGET_RADIUS_MM,
 };
 use orrery_protocol::DEFAULT_CELL_EDGE_M;
-use orrery_spatial::SpatialConfig;
+use orrery_spatial::{pairwise_aoi_radius_m, SpatialConfig};
 
 /// The margin the campaign sizes against must be the margin the framework
 /// actually applies, or the sizing is arithmetic about nothing.
@@ -33,6 +33,14 @@ fn the_campaign_aoi_uses_the_frameworks_own_hysteresis_margin() {
     assert!(
         (framework - campaign).abs() < 1e-6,
         "the campaign sizes against {campaign} but the framework commits with {framework}"
+    );
+
+    let framework_budget = pairwise_aoi_radius_m(CAMPAIGN_CELL_EDGE_M as f32, framework) as f64;
+    let campaign_budget = campaign_engagement_budget_m(CAMPAIGN_CELL_EDGE_M);
+    assert!(
+        (framework_budget - campaign_budget).abs() < 1e-4,
+        "the campaign derives a {campaign_budget} m pairwise budget but the framework derives \
+         {framework_budget} m"
     );
 
     let quantum = CAMPAIGN_CELL_EDGE_M / DEFAULT_CELL_EDGE_M;
