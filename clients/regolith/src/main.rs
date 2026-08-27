@@ -1,11 +1,12 @@
 use bevy::prelude::*;
+use orrery_games::regolith::REGOLITH_RULESET;
 use orrery_predict::OrreryPredictPlugin;
 use orrery_regolith_client::{
     admission::{resolve_admission_url, retry_pending_uploads, AdmissionPlugin},
     campaign::CampaignConfig,
     identity::{load_or_create, resolve_identity_path},
     session::{require_campaign_consent, ConfiguredImpairment, CONSENT_NOTICE},
-    RegolithSkinPlugin,
+    RegolithSkinPlugin, BUILD_REV,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -21,6 +22,17 @@ fn has_flag(args: &[std::ffi::OsString], flag: &str) -> bool {
 
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if has_flag(&args, "--build-info") {
+        // This small, dependency-free JSON record is copied into every release
+        // archive by package-client.yml.  The packaging step reads the binary,
+        // rather than a second hand-maintained version constant, before it
+        // publishes the archive.
+        println!(
+            r#"{{"client_rev":"{BUILD_REV}","ruleset_version":{}}}"#,
+            REGOLITH_RULESET.version
+        );
+        return;
+    }
     let identity_path = resolve_identity_path(&args, std::env::var_os("ORRERY_IDENTITY_FILE"));
     // Compatibility spelling retained for the operator runbook: the slot is
     // validated, but the printed NodeId now comes from the persistent client

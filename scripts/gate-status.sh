@@ -866,8 +866,9 @@ gate_ci_determinism_verdict_evidence() { ev_none; }
 #
 # GitHub-hosted runners perform the actual package builds. The local gate is a
 # manifest guard: it proves the release workflow retains its isolated trigger
-# surface, three standalone release builds, commit stamp, packaged checksums,
-# and release upload, but cannot claim a runner produced a binary.
+# surface, three standalone release builds, a binary-derived revision manifest,
+# archive-content assertions, packaged checksums, and release upload, but cannot
+# claim a runner produced a binary.
 gate_package_client_tier() { echo fast; }
 gate_package_client_prereq() { [[ -r "$ROOT/.github/workflows/package-client.yml" ]]; }
 gate_package_client_run() {
@@ -880,10 +881,15 @@ gate_package_client_run() {
     && grep -Fq 'windows-latest' <<<"$source" \
     && grep -Fq 'macos-latest' <<<"$source" \
     && grep -Fq 'working-directory: clients/regolith' <<<"$source" \
-    && grep -Fq 'cargo build --release' <<<"$source" \
+    && grep -Fq 'cargo build --release --locked' <<<"$source" \
     && grep -Fq 'ORRERY_BUILD_REV: ${{ github.sha }}' <<<"$source" \
+    && grep -Fq ' --build-info > stage/build-info.json' <<<"$source" \
+    && grep -Fq 'embedded client_rev' <<<"$source" \
+    && grep -Fq 'cp clients/regolith/PLAYTEST.md stage/README.md' <<<"$source" \
+    && grep -Fq 'test ! -e stage/assets' <<<"$source" \
     && grep -Fq 'tar -C stage -czf' <<<"$source" \
     && grep -Fq '7z a -tzip' <<<"$source" \
+    && grep -Fq '7z t "$archive"' <<<"$source" \
     && grep -Fq 'sha256sum' <<<"$source" \
     && grep -Fq 'actions/upload-artifact@v7' <<<"$source" \
     && grep -Fq 'actions/download-artifact@v8' <<<"$source" \
@@ -1307,6 +1313,47 @@ self_test() {
     || die 'self-test: a broken package-client stamp stage did not report FAILED'
   grep -qE '^  PASSED +package-client:package-client' <<<"$package_mutation" \
     && die 'self-test: a broken package-client stamp stage also reported PASSED'
+  rm -f "$dir/.github/workflows/package-client.yml"
+
+  # A release build must not re-resolve the standalone client's lockfile.
+  # Break the guarded --locked invocation, not this self-test's expectation.
+  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  sed -i 's/cargo build --release --locked/cargo build --release --unlocked/' \
+    "$dir/.github/workflows/package-client.yml"
+  local locked_mutation locked_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/locked-out" "$0" --fast \
+    >"$dir/locked-mutation-report" 2>&1
+  locked_status=$?
+  set -e
+  locked_mutation=$(cat "$dir/locked-mutation-report")
+  [[ $locked_status == 1 ]] \
+    || die "self-test: a missing --locked release build exited $locked_status rather than 1"
+  grep -qE '^  FAILED +package-client:package-client' <<<"$locked_mutation" \
+    || die 'self-test: a missing --locked release build did not report FAILED'
+  grep -qE '^  PASSED +package-client:package-client' <<<"$locked_mutation" \
+    && die 'self-test: a missing --locked release build also reported PASSED'
+  rm -f "$dir/.github/workflows/package-client.yml"
+
+  # The release manifest must come from the built binary. Removing that
+  # guarded stage cannot leave the package row green merely because a revision
+  # environment variable still exists elsewhere in the workflow.
+  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  sed -i 's/ --build-info > stage\/build-info.json/ --broken-build-info > stage\/build-info.json/' \
+    "$dir/.github/workflows/package-client.yml"
+  local build_info_mutation build_info_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/build-info-out" "$0" --fast \
+    >"$dir/build-info-mutation-report" 2>&1
+  build_info_status=$?
+  set -e
+  build_info_mutation=$(cat "$dir/build-info-mutation-report")
+  [[ $build_info_status == 1 ]] \
+    || die "self-test: a broken build-info stage exited $build_info_status rather than 1"
+  grep -qE '^  FAILED +package-client:package-client' <<<"$build_info_mutation" \
+    || die 'self-test: a broken build-info stage did not report FAILED'
+  grep -qE '^  PASSED +package-client:package-client' <<<"$build_info_mutation" \
+    && die 'self-test: a broken build-info stage also reported PASSED'
   rm -f "$dir/.github/workflows/package-client.yml"
 
   # The release handoff has its own job and trio. Mutate that guarded command,

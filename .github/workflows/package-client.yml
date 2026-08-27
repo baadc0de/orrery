@@ -75,7 +75,10 @@ jobs:
             libwayland-dev libxkbcommon-dev xvfb mesa-vulkan-drivers
 
       - name: Build the standalone Regolith workspace
-        run: cargo build --release
+        # The standalone workspace has its own lockfile. Refuse to resolve a
+        # newer dependency while producing a client somebody will be asked to
+        # reconcile against a campaign's pinned revision.
+        run: cargo build --release --locked
 
       # This is a rendered launch proof, not the non-graphics `--smoke-test`.
       # The client stays alive for twenty seconds, then exits successfully only
@@ -99,12 +102,29 @@ jobs:
             "$binary" --render-smoke
           fi
 
-      - name: Stage binary and its SHA-256
+      - name: Stage, identify, and checksum the code-only client
         working-directory: .
         run: |
+          set -euo pipefail
           mkdir -p stage dist
           artifact="orrery-regolith-${{ matrix.label }}"
           cp "clients/regolith/target/release/${{ matrix.binary }}" "stage/$artifact"
+          "stage/$artifact" --build-info > stage/build-info.json
+          node -e '
+            const fs = require("fs");
+            const info = JSON.parse(fs.readFileSync("stage/build-info.json", "utf8"));
+            if (info.client_rev !== process.env.GITHUB_SHA) {
+              throw new Error(`embedded client_rev ${info.client_rev} is not ${process.env.GITHUB_SHA}`);
+            }
+            if (!Number.isInteger(info.ruleset_version)) {
+              throw new Error("build-info has no integer ruleset_version");
+            }
+          '
+          cp clients/regolith/PLAYTEST.md stage/README.md
+          # There are deliberately no private or loose visual assets in this
+          # release. If that changes, #347 requires an encrypted/proprietary
+          # bundle before the archive can ship.
+          test ! -e stage/assets
           (
             cd stage
             if command -v sha256sum >/dev/null; then
@@ -113,20 +133,30 @@ jobs:
               shasum -a 256 "$artifact" > "$artifact.sha256"
             fi
           )
+          test -s "stage/$artifact"
+          test -s stage/build-info.json
+          test -s stage/README.md
+          test -s "stage/$artifact.sha256"
 
       - name: Package Unix client
         if: runner.os != 'Windows'
         working-directory: .
         run: |
           asset="orrery-regolith-${{ matrix.label }}"
-          tar -C stage -czf "dist/$asset.tar.gz" "$asset" "$asset.sha256"
+          archive="dist/$asset.tar.gz"
+          tar -C stage -czf "$archive" "$asset" "$asset.sha256" build-info.json README.md
+          test -s "$archive"
+          test "$(tar -tzf "$archive" | sort)" = "$(printf '%s\n' "$asset" "$asset.sha256" build-info.json README.md | sort)"
 
       - name: Package Windows client
         if: runner.os == 'Windows'
         working-directory: .
         run: |
           asset="orrery-regolith-${{ matrix.label }}"
-          7z a -tzip "dist/$asset.zip" "stage/$asset" "stage/$asset.sha256"
+          archive="dist/$asset.zip"
+          7z a -tzip "$archive" "stage/$asset" "stage/$asset.sha256" stage/build-info.json stage/README.md
+          7z t "$archive"
+          test -s "$archive"
 
       - name: Upload release assets for publication
         uses: actions/upload-artifact@v7
