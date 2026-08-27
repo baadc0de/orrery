@@ -924,8 +924,33 @@ fn capture_tracer_geometry(
 /// hold that — but "the fade reached a material in a live campaign, against
 /// the host's own boundary". This prints what
 /// [`aoi::sync_aoi_fade`] actually wrote.
-fn capture_aoi_census(session: Res<ActiveSession>, census: Res<aoi::AoiFadeCensus>) {
-    println!("aoi_census {}", census.line(session.aoi_edge_m()));
+fn capture_aoi_census(
+    session: Res<ActiveSession>,
+    census: Res<aoi::AoiFadeCensus>,
+    rock_bodies: Query<(), With<RockBody>>,
+    zoom: Res<CameraZoom>,
+) {
+    let mut counts = [0usize; 3];
+    for entity in session.executor().entities().copied() {
+        if let Some(RegolithState::Rock(rock)) = session.executor().state(entity) {
+            if rock.hull > 0 {
+                counts[match rock.tier {
+                    RockTier::Large => 0,
+                    RockTier::Medium => 1,
+                    RockTier::Small => 2,
+                }] += 1;
+            }
+        }
+    }
+    // The rock line rides along because #530 is judged at both zoom extremes
+    // and there is no way to read a tint out of a running window; the camera
+    // height says which extreme the frame was at.
+    println!(
+        "aoi_census {} | camera {:.0} m | {}",
+        census.line(session.aoi_edge_m()),
+        zoom.height_m(),
+        rock_census(counts, rock_bodies.iter().count()),
+    );
 }
 
 fn clear_refused_selection(
