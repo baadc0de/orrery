@@ -1,0 +1,19 @@
+[Unit]
+Description=Orrery always-on P1 swarm host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orrery
+Group=orrery
+ExecStart=/usr/bin/python3 /opt/orrery/bin/p1-swarm-always-on.py --control /etc/orrery/campaigns.conf --campaign shakedown --swarm /opt/orrery/bin/p1-swarm --issuer-key /etc/orrery/p1-swarm-issuer.pub --state /var/lib/orrery-p1-swarm/shakedown
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/orrery-p1-swarm
+
+[Install]
+WantedBy=multi-user.target

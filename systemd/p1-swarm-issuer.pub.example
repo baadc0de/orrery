@@ -1,0 +1,4 @@
+# Public verification key only: <issuer_key_id>:<ed25519_public_key_hex>
+# Generate from the admission service's issuer credential; do not put its
+# private credential in this file or on the host service.
+41:replace-with-the-64-hex-character-public-key
