@@ -47,6 +47,20 @@ type MarkerQuery<'w, 's> = Query<
     (&'static mut Transform, &'static mut Visibility),
     (With<ImpactMarker>, Without<ImpactFlash>),
 >;
+/// The impact burst, read-only: what [`sync_impact_flash`] left on it.
+///
+/// The capture in `crate::capture_impact_geometry` reads the transform the
+/// system wrote rather than recomputing the size beside it, which is the whole
+/// point of measuring in the render world.
+pub type FlashReadQuery<'w, 's> =
+    Query<'w, 's, (&'static Transform, &'static Visibility), With<ImpactFlash>>;
+/// The marker ring, read-only and disjoint from the burst.
+pub type MarkerReadQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Transform, &'static Visibility),
+    (With<ImpactMarker>, Without<ImpactFlash>),
+>;
 /// The glow disc, likewise disjoint.
 type GlowQuery<'w, 's> = Query<
     'w,
@@ -1761,6 +1775,115 @@ mod tests {
             impact_marker_radius_m(1.0, 1.0),
             Some(IMPACT_MARKER_RADIUS_M),
             "a burst smaller than the ring keeps its pointer at apparent size"
+        );
+    }
+
+    /// #531 asked whether an adjudicated hit is *legible* at both ends of the
+    /// zoom range, and the honest answer was that nobody had seen one. It has
+    /// now been seen, and this is the number that made it reproducible.
+    ///
+    /// The other burst tests reason about the constants. This one runs
+    /// [`sync_impact_flash`] and measures the transforms it actually wrote,
+    /// converted to pixels, which is what the complaint was about: the burst
+    /// sphere alone is 0.7 px across at 4 km on a 720-line window, and the cue
+    /// is legible anyway because the marker ring is the pointer. Measured live
+    /// on 2026-08-27: the ring held 27.8 px across at 4000 m, at 565 m and at
+    /// 161 m of camera height, and the burst overtook and suppressed it at
+    /// close range.
+    ///
+    /// The floor is on the **cue**, not on either half of it. A test that
+    /// asserted on the burst alone would demand the skin draw an extent it
+    /// does not know; a test that asserted on the ring alone would not notice
+    /// the ring being suppressed while the burst was still sub-pixel.
+    #[test]
+    fn the_impact_cue_clears_the_legibility_floor_at_both_zoom_extremes() {
+        /// Pixels the whole cue must span at any zoom. Well above
+        /// [`crate::MIN_LEGIBLE_DIAMETER_PX`]: a hit is an event the player is
+        /// meant to read in the frame it happens, not merely a mark that
+        /// renders.
+        const CUE_FLOOR_PX: f32 = 20.0;
+
+        let mut app = overlay_app();
+        body(&mut app, ME, 0.0, 0.0);
+        body(&mut app, THEM, 100.0, -40.0);
+        app.add_systems(Update, sync_impact_flash);
+        *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
+            cue: Some(ShotCue::Resolved {
+                target: THEM,
+                result: ShotResult::Hit,
+            }),
+            ticks_left: SHOT_CUE_TICKS,
+        };
+
+        // What the system wrote, read back the way `capture_impact_geometry`
+        // reads it in a live run: the burst's scale against its authored mesh
+        // radius, and the marker's scale, which is its world radius outright.
+        let cue_px = |app: &mut App, height_m: f32| {
+            *app.world_mut().resource_mut::<crate::CameraZoom>() = crate::CameraZoom::default()
+                .zoomed(if height_m > crate::CAMERA_DEFAULT_HEIGHT_M {
+                    -100.0
+                } else {
+                    100.0
+                });
+            app.update();
+            let burst_m = app
+                .world_mut()
+                .query_filtered::<&Transform, With<ImpactFlash>>()
+                .iter(app.world())
+                .next()
+                .expect("the flash exists")
+                .scale
+                .x
+                * IMPACT_FLASH_MESH_RADIUS_M;
+            let marker_m = app
+                .world_mut()
+                .query_filtered::<(&Transform, &Visibility), With<ImpactMarker>>()
+                .iter(app.world())
+                .next()
+                .map(|(transform, visibility)| {
+                    (*visibility != Visibility::Hidden).then_some(transform.scale.x)
+                })
+                .expect("the marker exists");
+            let px = |radius_m: f32| {
+                crate::apparent_diameter_px(radius_m, height_m, crate::REFERENCE_VIEWPORT_PX)
+            };
+            (px(burst_m), marker_m.map(px))
+        };
+
+        let (far_burst_px, far_marker_px) = cue_px(&mut app, crate::CAMERA_MAX_HEIGHT_M);
+        let (near_burst_px, near_marker_px) = cue_px(&mut app, crate::CAMERA_MIN_HEIGHT_M);
+
+        // The complaint's own number, kept as a fact rather than a target: at
+        // full zoom-out the burst on an interceptor is a couple of pixels.
+        assert!(
+            far_burst_px < CUE_FLOOR_PX,
+            "if the burst alone had grown to {far_burst_px} px at 4 km it would be \
+             claiming an extent again; #531 is about the cue, not the sphere"
+        );
+        let far_cue_px = far_marker_px.map_or(far_burst_px, |marker| marker.max(far_burst_px));
+        let near_cue_px = near_marker_px.map_or(near_burst_px, |marker| marker.max(near_burst_px));
+        for (where_, cue_px) in [("4000 m", far_cue_px), ("150 m", near_cue_px)] {
+            assert!(
+                cue_px >= CUE_FLOOR_PX,
+                "an adjudicated hit is {cue_px} px across at {where_} of camera height, \
+                 under the {CUE_FLOOR_PX} px floor"
+            );
+        }
+
+        // The ring is a glyph, so it is the *same* size on screen at both ends
+        // — that is what "constant apparent size" means, and it is the half of
+        // the cue that carries it when the burst cannot.
+        let far_marker_px = far_marker_px.expect("zoomed out, the ring is the cue");
+        assert!(
+            (far_marker_px
+                - crate::apparent_diameter_px(
+                    IMPACT_MARKER_RADIUS_M,
+                    crate::CAMERA_DEFAULT_HEIGHT_M,
+                    crate::REFERENCE_VIEWPORT_PX,
+                ))
+            .abs()
+                < 0.1,
+            "the ring is a glyph: {far_marker_px} px at 4 km must equal its size at 900 m"
         );
     }
 

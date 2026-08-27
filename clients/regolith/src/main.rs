@@ -143,6 +143,17 @@ fn main() {
     if has_flag(&args, "--capture-geometry") {
         app.insert_resource(orrery_regolith_client::GeometryCapture::auto_drive());
     }
+    if let Some(dir) = flag_value(&args, "--capture-frames") {
+        match orrery_regolith_client::FrameCapture::into_dir(PathBuf::from(dir)) {
+            Ok(capture) => {
+                app.insert_resource(capture);
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                return;
+            }
+        }
+    }
 
     if boot_ui {
         app.add_plugins(AdmissionPlugin::new(
