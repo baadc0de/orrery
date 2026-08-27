@@ -343,7 +343,9 @@ defined transition (despawn + focus release, as #505 implemented) rather than
 each client's improvisation. The presentation-mirror contract D42's seam work
 already owes (A9/brief phase 6) is the natural home; the point of this
 proposal is that the *bound itself* comes from the ruleset declaration, so a
-new game gets a coherent staleness story by writing one number.
+new game gets a coherent staleness story by writing one number. The
+contract's other clause -- which side may assert what, independent of how
+stale -- is named and defined in section 5.6.
 
 **Proof:** #505's mutation already exists (TTL → `u64::MAX` kills
 `campaign_replica_expires_instead_of_freezing_on_screen`); the new obligation
@@ -397,6 +399,133 @@ the outage. Mutation exists
 (`local_fallbacks_cannot_present_or_serialize_as_live_campaigns`). Cross-game
 cost: one enum on the envelope. Nothing more is proposed.
 
+### 5.6 Two authorities: simulation authority and visual authority
+
+*(Amendment, 2026-08-27, closing #519. The evidence here post-dates this
+node's original shakedown window: it is the #505 ghost, the #517/#518 tracer
+pair, the #522 burst gate and the #533/#536 boundary fade, each citation
+re-read on `main` at `5ee8bfd1` on 2026-08-27. This section defines the
+vocabulary; it proposes nothing beyond a definition and a review test, and
+section 7.7 records what remains owner-reserved.)*
+
+The presentation-mirror contract (section 5.3) bounds *how stale* a mirror may
+be. Its other clause is *which side may assert what*, and the shakedown's
+aftermath produced a vocabulary for it that is now used in seven doc-comments
+across `clients/regolith/src/` (`combat.rs:552`, `aoi.rs:12`, `aoi.rs:236`,
+`starfield.rs:51`, `lib.rs:265`, `lib.rs:1119`, `lib.rs:1456`), in A13 section
+3 (which builds a third tier, hearsay, on top of it) and throughout A14 --
+everywhere by reference to #519, nowhere with a definition. This section is
+that definition.
+
+- **Simulation authority** -- *what happened.* It is the ruleset's,
+  exercised under own-state discipline and expressed only as adjudicated
+  artifacts: hashed per-entity state, and the D46 event classes above
+  diagnostics (`docs/adr/0046-message-class-semantics.md:106-140`). In
+  Regolith terms: the muzzle `DamageDealt`
+  (`crates/orrery_games/src/regolith/mod.rs:503`), the target-authored
+  in-flight continuations (`mod.rs:556-566`), and the verdicts
+  (`Outcome::ShotResolved`, e.g. the `Hit` arm at `mod.rs:593-598`).
+  Presentation never infers it, predicts it, or fills gaps in it.
+- **Visual authority** -- *how it is shown.* It is the skin's: framing,
+  interpolation, smoothing, fades, labels, cues, and the timing of all of
+  them -- **provided the skin asserts nothing the ruleset has not said.**
+  D46 already states the mechanical half ("presentation feeds nothing
+  canonical", `0046-message-class-semantics.md:136-137`); this names the
+  perceptual half, which no data-flow rule can check: what the *player* is
+  made to believe.
+
+The failure mode the distinction exists to prevent: **a skin that quietly
+acquires simulation authority** -- drawing a claim the simulation never made,
+so the player believes something the ruleset would deny. F-C is the canonical
+conviction: the frozen ghost of #502/#505 was the skin asserting "target 3 is
+here, now" long after replication had stopped saying so, and the player aimed
+at a position 222,452 mm (X) and 255,552 mm (Z) from where the adjudicating
+host held the target -- rendered range 170,288 mm against a measured
+439,797 mm and a 403,000 mm limit (section 1 F-C; #505's capture table). The
+host was right to refuse; the screen was lying.
+
+#### The rule, in checkable form
+
+> **The skin may interpolate between facts the ruleset has stated; it may
+> never extrapolate into facts the ruleset has not stated.**
+
+Made mechanical, so a reader can classify a piece of skin code. For a drawn
+element `E`, let `F(E)` be the set of ruleset-authored facts it derives from:
+events this client received, plus replicated hashed state no older than the
+section 5.3 staleness bound. `E` is within visual authority iff all three
+hold:
+
+1. `E = f(F(E), camera, style)` -- a pure presentation function of those
+   facts plus camera and styling inputs, feeding nothing back (the D46
+   presentation-class rule).
+2. Every world-predicate a player would read off `E` -- "this exists", "it
+   is here", "it was hit", "it is named X", "you may not see past here" --
+   is entailed by some member of `F(E)`. Values *between* two members
+   (positions along a stated flight, transforms between refreshes) are
+   entailed; values or predicates *beyond* them (an outcome before its
+   verdict, a position after the bound, an invented name) are not.
+3. If `F(E)` is empty, `E` renders absence or visible uncertainty -- no
+   placeholder that could be mistaken for a fact.
+
+The review test that falls out of clause 2 is grep-shaped: **any skin code
+that draws an outcome must destructure the ruleset's outcome event verbatim,
+and any value drawn without a stated endpoint must be frozen, aged, or
+faded -- never advanced by a skin-side model of the world.** A `match` on
+`ShotResult` copied out of `Outcome::ShotResolved` is on the right side; a
+`predicted_hit` flag computed client-side would be on the wrong side, however
+accurate.
+
+#### The worked cases, each verified against the tree
+
+| Case | The fact set `F` | What the skin does | Side of the line |
+|---|---|---|---|
+| **#505 frozen ghost** (F-C) | replication stopped; `F` aged past any bound | pre-fix: kept drawing the last transform indefinitely | **Violation** -- the conviction. Fix: expiry as a defined transition, `REPLICA_TTL_TICKS = 120` (`clients/regolith/src/campaign.rs:79`, enforced at `campaign.rs:1212-1226`) |
+| **#517/#518 invisible tracer** | shooter receives one muzzle `DamageDealt` with `flight_ticks: None`; continuations are target-authored and never arrive (#518 measured 81 muzzle events, zero continuations) | pre-fix: drew nothing -- correctly declined to draw what it had not been told. It *looked* like a bug and was the contract working; the owner's read on the adjacent no-tracer hit: "it exercises the case where visual authority is with the skin" (#519, quoting PR #518) | **Compliant**, and the motivating example |
+| **#518 presentation-only flight** | the muzzle event plus the target's last replicated position | interpolates a flight using the ruleset's own timing (`projectile_flight_ticks`, `combat.rs:263-270`; `crates/orrery_games/src/regolith/mod.rs:1329`), endpoint **frozen** (`Track.destination`, `combat.rs:169-173`), arming no arrival cue | **Compliant interpolation** -- motion between two stated facts, asserting no outcome. Mutation pinned: `a_campaign_muzzle_interpolates_without_claiming_an_arrival` |
+| **Provisional cue** | final in-flight tick observed (`flight_ticks == 1`) | `ShotFeedback::arm_provisional` (`combat.rs:471-484`) claims only "an adjudication is due" -- `IMPACT...`, never a result | **Compliant** -- the cue's predicate is itself a stated fact (timing), not a predicted outcome |
+| **#522 impact burst** | `ShotCue::Resolved { result: ShotResult::Hit }` -- the target's adjudication, transcribed (`combat.rs:428-436`) | `impact_burst` draws only on that cue (`combat.rs:569-576`); before #522 it drew on the provisional arrival too, announcing a miss as a hit for one tick (`combat.rs:552-554`). #536 then sized it from the ruleset's own `radius_mm` (`clients/regolith/src/hud.rs:886-890`, `:159-164`) and anchored it on the *thing* hit, not a millimetre the ruleset never transmitted (`combat.rs:556-567`) | **Violation, caught and fixed** -- the quiet-acquisition failure in miniature |
+| **Roster labels** | admission's roster rows; nothing replicated | a craft with no sanitised name gets *no label at all* -- deliberately no "UNKNOWN"/"PLAYER 3" placeholder that could be mistaken for a chosen name (`clients/regolith/src/roster.rs:24-27`, `roster.rs:156-160`) | **Compliant** -- clause 3: absence rendered as absence |
+| **#533 AOI fade** | position relative to a boundary derived from the session's own cell edge | fades on *distance to the interest boundary*, describing the client's knowledge thinning -- "a faded craft is not damaged, not cloaked, and not further away than it is" (`clients/regolith/src/aoi.rs:12-16`); explicitly never a fade on staleness, which #505's expiry owns (`aoi.rs:18-26`) | **Compliant** -- uncertainty drawn as uncertainty |
+| **Offline sandbox boundary** | no host, no interest set: no boundary fact exists | draws no fade at all, "drawing one would be the skin asserting a limit the run does not have" (`aoi.rs:231-236`, `lib.rs:262-265`) | **Compliant** -- clause 3 again, in the negative |
+
+Two boundary notes that keep the rule honest rather than absolutist. First,
+visual authority is real authority: the skin *owns* how things are shown, and
+"asserts nothing new" does not mean "adds nothing" -- the #518 tracer, the
+fade band, the burst's sizing are all skin decisions the ruleset neither
+makes nor could. Second, a provisional cue that a later authoritative event
+contradicts is explicitly accepted (`combat.rs:428-436`): visual authority
+may be *early* about a stated fact; it may not be *inventive* about an
+unstated one.
+
+#### The testing consequence
+
+A test where one client owns both parties collapses the two authorities into
+one process: everything the skin might wrongly assert, the same process also
+adjudicates, so no disagreement can appear and the distinction is
+unexercisable. Live campaign play is the first configuration that separates
+them -- client owns the shooter, host owns the target -- which is why #517
+reached a player through a green tracer suite, the same root shape as the
+#502 and #514 misses. This is section 6's argument restated at the
+presentation layer, and it adds a requirement to section 6's two-process
+harness: at least one assertion must hold *rendered* claims against
+*adjudicated* facts across the process boundary (section 6's
+"positions rendered and positions adjudicated agree within the replication
+bound" is exactly that assertion).
+
+#### Where this should live
+
+This node keeps the definition here because A12 is where the
+presentation-mirror contract is argued from evidence, and A13 section 3 and
+A14 section 7 already cite #519 for it. If the contract graduates into an
+implementation epic (D42's seam work), the two-authorities clause should
+travel with it, and -- because A13's hearsay tier (H1-H5) is defined *as*
+"neither authority" and would inherit any drift in these definitions -- a
+short ADR naming the tiers (simulation authority / visual authority /
+hearsay) is worth considering at that point. **Recommended, not decided:**
+accepting ADRs is the owner's alone, and nothing in this section amends an
+Accepted record. D46 needs no amendment for this: its presentation-class
+rule is the enforcement mechanism this section gives a name to.
+
 ---
 
 ## 6. The sixth system: the harness must include the seams, because that is where all five bugs lived
@@ -413,7 +542,11 @@ harness synthesizes** — spawn frames, replication freshness, deployed
 versions, session routing. G7 already warned that goldens see only state
 hashes; the shakedown generalizes the warning: *every* single-process test
 sees only what one process believes, and all five failures were disagreements
-between two processes' beliefs.
+between two processes' beliefs. Section 5.6 adds the presentation-layer form
+of the same warning: a single-process test collapses simulation authority and
+visual authority into one owner, so a skin asserting more than the ruleset
+said (F-C) and a skin correctly declining to assert what it was never told
+(#517) are both invisible until two processes hold the two authorities.
 
 Two components, both with in-tree seeds:
 
@@ -507,6 +640,14 @@ Named rather than smoothed over; owners identified where they exist.
    did not run a live session itself. If none exists, recording one is worth
    an issue: the shakedown's own lesson is that "working" must be a measured
    fact somewhere.
+7. **Whether the two-authorities vocabulary (section 5.6) should become an
+   ADR.** Section 5.6 recommends a short tiers ADR (simulation authority /
+   visual authority / hearsay) *if and when* the presentation-mirror
+   contract graduates into D42's implementation epic, because A13's hearsay
+   rules are defined against these two and would inherit any drift.
+   Accepting ADRs and amending Accepted records is the owner's alone; until
+   then the definition lives here and D46 stands unamended as the
+   enforcement mechanism.
 
 ## 8. Verification log and stale-citation notes
 
@@ -541,3 +682,34 @@ Named rather than smoothed over; owners identified where they exist.
 - No code outside `docs/plans/` was changed. No ADR is amended; §5's
   proposals are proposals, and the decisions in §7 belong to their named
   owners.
+
+### Addendum: section 5.6 verification (2026-08-27, #519 amendment)
+
+- Every `path:line` in section 5.6, the section 5.3 pointer, and section 7.7
+  was read on `main` at `5ee8bfd1` on 2026-08-27. Key anchors:
+  `ShotCue`/`ShotFeedback` docs and `arm_provisional`
+  (`clients/regolith/src/combat.rs:428-436`, `:471-484`); `impact_burst`'s
+  gate and its #519-citing doc comment (`combat.rs:546-576`); the
+  presentation-only `Track` fields and the muzzle-flight build
+  (`combat.rs:169-173`, `:263-281`); the muzzle, continuation and `Hit`
+  emission sites (`crates/orrery_games/src/regolith/mod.rs:503`,
+  `:556-566`, `:593-598`); roster absence (`roster.rs:24-27`, `:156-160`);
+  the fade's claims (`aoi.rs:12-26`, `:231-236`); D46's class rules
+  (`0046-message-class-semantics.md:106-140`).
+- **Drift in this document's own original citations, recorded rather than
+  silently rewritten:** section 5.3 cites `REPLICA_TTL_TICKS = 120` at
+  `campaign.rs:78` (read at `709f206d`); on today's tree it is
+  `campaign.rs:79`, expiry at `:1212-1226`. The value and the conclusion
+  are unchanged.
+- The #505 disagreement figures (222,452 / 255,552 mm; 170,288 vs
+  439,797 vs 403,000 mm) are quoted from #505's capture table, as section 1
+  already does; the #518 figures (81 muzzle events, zero continuations;
+  1,371 post-fix tracer samples over 817 ticks) are quoted from #518's
+  measurement and live-evidence sections. Neither was re-derived from raw
+  session logs, which are not in the repository.
+- **Not verified:** the owner's comment on PR #518 is quoted in the form
+  issue #519 records ("it exercises the case where visual authority is
+  with the skin"); this amendment did not locate any longer or earlier
+  phrasing and quotes only that sentence. Also not verified: whether any
+  in-flight work already drafts the tiers ADR that section 7.7 defers to
+  the owner.
