@@ -196,6 +196,7 @@ mod swarm;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use orrery_core::CoreCodec as _;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use orrery_games::game::Tamper;
@@ -353,6 +354,16 @@ struct Args {
     #[arg(long)]
     external_peer: bool,
 
+    /// Number of stable human seats offered during the lobby. The full seat
+    /// namespace is `peers + external_slots`; inactive seats are not reused.
+    #[arg(long, default_value_t = 1)]
+    external_slots: usize,
+
+    /// Seconds from endpoint publication until active membership freezes.
+    /// A full lobby freezes immediately.
+    #[arg(long, default_value_t = 90)]
+    lobby_seconds: u64,
+
     /// Seconds to wait for the external peer's dial before giving up
     /// (`--external-peer` only).
     #[arg(long, default_value_t = 60)]
@@ -388,6 +399,17 @@ struct Args {
     #[arg(long, value_name = "KEYID:PUBKEY")]
     issuer_key: Option<String>,
 
+    /// Admission's authoritative `slots.json` on storage visible to this
+    /// host (`--external-peer` only). Required with a token-gated standing
+    /// host (issuer configured, no single `--require-session`).
+    #[arg(long, value_name = "PATH")]
+    reservation_journal: Option<std::path::PathBuf>,
+
+    /// Supervisor-owned attempt generation used to reject stale reservation
+    /// rows. Required whenever `--reservation-journal` is set.
+    #[arg(long)]
+    attempt_id: Option<String>,
+
     // ── The external runner's own mode ──────────────────────────────────────
     /// Run as the external peer process instead of hosting a swarm (#385).
     ///
@@ -405,6 +427,19 @@ struct Args {
     /// first bound socket is used when omitted.
     #[arg(long)]
     host_direct: Option<String>,
+
+    /// Admission-reserved human seat (`--external` only). Defaults to the
+    /// legacy single exterior seat immediately after the bots.
+    #[arg(long)]
+    slot: Option<usize>,
+
+    /// Admission session id (`--external` only).
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Hex-encoded `SessionTokenV1` (`--external` only).
+    #[arg(long)]
+    session_token: Option<String>,
 }
 
 /// Parse `--cheat <tamper>[:count]`.
@@ -457,12 +492,104 @@ fn parse_issuer_key(spec: &str) -> Result<orrery_protocol::IssuerKey> {
     ))
 }
 
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        bail!("session token hex has odd length");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).context("session token is not ASCII hex")?;
+            u8::from_str_radix(text, 16).with_context(|| "session token is not hex")
+        })
+        .collect()
+}
+
 fn cell_edge_m_for_session(external: bool, external_peer: bool) -> f32 {
     if external || external_peer {
         bot::campaign_cell_edge_m()
     } else {
         bot::default_cell_edge_m()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConnectedSeat {
+    slot: usize,
+    node: NodeId,
+}
+
+/// Freeze the one active roster and personalize only its witness recipients.
+///
+/// `connected` is the set admitted before the lobby deadline. Seats absent
+/// here stay absent for the whole attempt; this function never compacts or
+/// fills a gap in the configured seat namespace.
+fn build_start_manifests(
+    attempt_id: &str,
+    seed: u64,
+    seconds: u64,
+    bot_seats: usize,
+    island_seats: usize,
+    connected: &[ConnectedSeat],
+) -> Result<BTreeMap<usize, exterior::StartManifest>> {
+    if bot_seats > island_seats {
+        bail!("bot seats exceed the configured island seat namespace");
+    }
+    let island_seats = u16::try_from(island_seats).context("island seat count exceeds u16")?;
+    let mut occupied = BTreeSet::new();
+    let mut active = (0..bot_seats)
+        .map(|slot| exterior::ActiveSeat {
+            slot,
+            node: bot::bot_key(slot).public().to_string(),
+            entity: u64::try_from(slot).unwrap_or(u64::MAX).saturating_add(1),
+        })
+        .collect::<Vec<_>>();
+    occupied.extend(0..bot_seats);
+
+    // Load-bearing lobby stage: every admitted human is copied into the
+    // frozen active roster. The mutation proof removes one entry here and
+    // `start_manifest_names_every_connected_human` must fail.
+    for seat in connected {
+        if seat.slot < bot_seats || seat.slot >= usize::from(island_seats) {
+            bail!(
+                "connected human seat {} is outside the human seat range",
+                seat.slot
+            );
+        }
+        if !occupied.insert(seat.slot) {
+            bail!("seat {} was connected more than once", seat.slot);
+        }
+        active.push(exterior::ActiveSeat {
+            slot: seat.slot,
+            node: seat.node.to_string(),
+            entity: u64::try_from(seat.slot)
+                .context("seat does not fit the entity namespace")?
+                .checked_add(1)
+                .context("seat entity overflow")?,
+        });
+    }
+    active.sort_by_key(|seat| seat.slot);
+    let active_slots = active.iter().map(|seat| seat.slot).collect::<Vec<_>>();
+    let duration_ticks = seconds
+        .checked_mul(bot::TICK_HZ)
+        .context("attempt duration overflows ticks")?;
+
+    connected
+        .iter()
+        .map(|seat| {
+            let manifest = exterior::StartManifest {
+                attempt_id: attempt_id.to_owned(),
+                seed,
+                tick: 0,
+                island_seats,
+                active: active.clone(),
+                witness_recipients: swarm::witness_recipients(&active_slots, seat.slot),
+                duration_ticks,
+            };
+            Ok((seat.slot, manifest))
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -549,9 +676,16 @@ fn main() -> Result<()> {
         };
         let run = peer_runner::ExternalRun {
             peers: config.peers,
+            slot: args.slot.unwrap_or(config.peers),
+            island_seats: config
+                .peers
+                .checked_add(args.external_slots)
+                .context("island seat count overflow")?,
             seconds: config.seconds,
             seed: config.seed,
             witnessing: config.witnessing,
+            session_id: args.session_id.clone(),
+            session_token: args.session_token.as_deref().map(decode_hex).transpose()?,
             host: bridge::HostAddress {
                 node,
                 direct: Vec::new(),
@@ -561,7 +695,15 @@ fn main() -> Result<()> {
         return peer_runner::run(&run);
     }
 
-    let mut swarm = Swarm::new(config);
+    let configured_island_seats = config
+        .peers
+        .checked_add(args.external_slots)
+        .context("island seat count overflow")?;
+    let mut swarm = if args.external_peer {
+        Swarm::new_for_island(config, configured_island_seats)
+    } else {
+        Swarm::new(config)
+    };
     let _endpoint_guard;
     let _runtime_guard;
     if args.external_peer {
@@ -569,7 +711,6 @@ fn main() -> Result<()> {
         // slot's: the slot key belongs to the dialler and is what accept()
         // verifies against.
         let secret = bot::host_key();
-        let expected = bot::bot_key(config.peers).public();
         let admission = exterior::Admission {
             require_client_rev: args.require_client_rev.clone(),
             require_session: args.require_session.clone(),
@@ -579,16 +720,43 @@ fn main() -> Result<()> {
                 .map(parse_issuer_key)
                 .transpose()
                 .context("--issuer-key")?,
+            reservation_journal: match (&args.reservation_journal, &args.attempt_id) {
+                (Some(path), Some(attempt_id)) => Some(exterior::ReservationJournal {
+                    path: path.clone(),
+                    attempt_id: attempt_id.clone(),
+                }),
+                (None, None) => None,
+                _ => bail!("--reservation-journal and --attempt-id must be supplied together"),
+            },
         };
+        if admission.issuer.is_some()
+            && admission.require_session.is_none()
+            && admission.reservation_journal.is_none()
+        {
+            bail!(
+                "a standing token-gated host requires --reservation-journal and --attempt-id; refusing to run with unverified seats"
+            );
+        }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("tokio runtime")?;
-        let (endpoint, link, anchor_bytes, joined_node) = rt.block_on(async {
+        let island_seats = configured_island_seats;
+        if args.external_slots == 0 {
+            bail!("--external-peer requires at least one --external-slot");
+        }
+        // Admission retains the pre-lobby eight-bot/one-human shape only for
+        // campaigns without an explicit `humans` key. New multi-human
+        // campaigns obey #563's eight-seat cap.
+        if args.external_slots > 1 && island_seats > 8 {
+            bail!("the P1 campaign lobby is capped at eight total seats");
+        }
+        let (endpoint, joined) = rt.block_on(async {
             let endpoint = bridge::bind(secret, args.external_bind).await?;
             eprintln!(
-                "gates/p1-swarm: exterior slot {} listening, node {}, direct {:?}",
+                "gates/p1-swarm: exterior seats {}..{} listening, node {}, direct {:?}",
                 config.peers,
+                island_seats,
                 endpoint.id(),
                 endpoint.bound_sockets(),
             );
@@ -604,36 +772,123 @@ fn main() -> Result<()> {
                 );
                 std::fs::write(path, line).context("cannot write the exterior listening file")?;
             }
-            let joined = tokio::time::timeout(
-                std::time::Duration::from_secs(args.join_timeout_secs),
-                bridge::host_accept(
-                    &endpoint,
-                    expected,
-                    config.peers,
-                    config.witnessing,
-                    &admission,
-                ),
-            )
-            .await
-            .context("the external peer never dialled in time")??;
-            anyhow::Ok((endpoint, joined.0, joined.1, joined.2))
+            let lobby_seconds = if args.external_slots == 1 && args.attempt_id.is_none() {
+                args.join_timeout_secs
+            } else {
+                args.lobby_seconds
+            };
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(lobby_seconds.max(1));
+            let mut pending = Vec::new();
+            while pending.len() < args.external_slots {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let fixed_legacy_seat = (args.external_slots == 1
+                    && admission.reservation_journal.is_none())
+                .then(|| (config.peers, bot::bot_key(config.peers).public()));
+                let prepared = match tokio::time::timeout(
+                    remaining,
+                    bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission),
+                )
+                .await
+                {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(error)) => {
+                        eprintln!("gates/p1-swarm: refused pending join: {error:#}");
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                if prepared.index() < config.peers || prepared.index() >= island_seats {
+                    let reason = format!(
+                        "reservation_slot_out_of_range: requested slot {}, human seats are {}..{}",
+                        prepared.index(),
+                        config.peers,
+                        island_seats
+                    );
+                    let _ = prepared.refuse(reason).await;
+                    continue;
+                }
+                if pending
+                    .iter()
+                    .any(|joined: &bridge::PendingJoin| joined.index() == prepared.index())
+                {
+                    let reason = format!(
+                        "reservation_slot_occupied: slot {} already joined this lobby",
+                        prepared.index()
+                    );
+                    let _ = prepared.refuse(reason).await;
+                    continue;
+                }
+                eprintln!(
+                    "gates/p1-swarm: reservation seat {} connected as {}",
+                    prepared.index(),
+                    prepared.remote()
+                );
+                pending.push(prepared);
+            }
+            if pending.is_empty() {
+                bail!("the lobby closed without an admitted human");
+            }
+
+            let connected = pending
+                .iter()
+                .map(|join| ConnectedSeat {
+                    slot: join.index(),
+                    node: join.remote(),
+                })
+                .collect::<Vec<_>>();
+            let manifests = args
+                .attempt_id
+                .as_deref()
+                .map(|attempt_id| {
+                    build_start_manifests(
+                        attempt_id,
+                        config.seed,
+                        config.seconds,
+                        config.peers,
+                        island_seats,
+                        &connected,
+                    )
+                })
+                .transpose()?;
+            eprintln!(
+                "gates/p1-swarm: StartV1 freezes {} active humans across {} seats",
+                pending.len(),
+                island_seats
+            );
+
+            let mut finished = Vec::with_capacity(pending.len());
+            for prepared in pending {
+                let manifest = manifests
+                    .as_ref()
+                    .and_then(|by_slot| by_slot.get(&prepared.index()))
+                    .cloned();
+                finished.push(prepared.finish(manifest, config.witnessing).await?);
+            }
+            anyhow::Ok((endpoint, finished))
         })?;
         // Held for their lifetime: dropping the endpoint closes the
         // connection, and dropping the runtime waits on the pump tasks.
         _endpoint_guard = endpoint;
         _runtime_guard = rt;
 
-        let anchor = match anchor_bytes {
-            Some(bytes) => {
-                let claim: orrery_protocol::StateClaim = serde_json::from_slice(&bytes.claim_json)
-                    .context("external anchor claim did not decode")?;
-                let state = RegolithState::decode(&bytes.state)
-                    .context("external anchor state did not decode")?;
-                Some((claim, state))
-            }
-            None => None,
-        };
-        swarm = swarm.with_external(joined_node, anchor, link);
+        for (link, anchor_bytes, joined_node, slot) in joined {
+            let anchor = match anchor_bytes {
+                Some(bytes) => {
+                    let claim: orrery_protocol::StateClaim =
+                        serde_json::from_slice(&bytes.claim_json)
+                            .context("external anchor claim did not decode")?;
+                    let state = RegolithState::decode(&bytes.state)
+                        .context("external anchor state did not decode")?;
+                    Some((claim, state))
+                }
+                None => None,
+            };
+            swarm = swarm.with_external_at(slot, island_seats, joined_node, anchor, link);
+        }
     }
 
     let report = swarm.run();
@@ -922,5 +1177,49 @@ mod session_geometry_tests {
             orrery_protocol::DEFAULT_CELL_EDGE_M as f32,
             "the P1 gate continues to exercise the framework default"
         );
+    }
+
+    #[test]
+    fn start_manifest_names_every_connected_human() {
+        // Reservation order is deliberately the opposite of connection order:
+        // stable seats, not accept order, determine the frozen roster.
+        let connected = [
+            ConnectedSeat {
+                slot: 5,
+                node: bot::bot_key(5).public(),
+            },
+            ConnectedSeat {
+                slot: 4,
+                node: bot::bot_key(4).public(),
+            },
+        ];
+        let manifests = build_start_manifests("attempt-1", 17, 20, 4, 8, &connected)
+            .expect("valid frozen roster");
+
+        assert_eq!(manifests.keys().copied().collect::<Vec<_>>(), vec![4, 5]);
+        for (subject, manifest) in &manifests {
+            assert_eq!(manifest.attempt_id, "attempt-1");
+            assert_eq!(manifest.seed, 17);
+            assert_eq!(manifest.tick, 0);
+            assert_eq!(manifest.island_seats, 8);
+            assert_eq!(manifest.duration_ticks, 20 * bot::TICK_HZ);
+            assert_eq!(
+                manifest
+                    .active
+                    .iter()
+                    .map(|seat| seat.slot)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2, 3, 4, 5],
+                "StartV1 must name every human connected before the freeze"
+            );
+            assert_eq!(
+                manifest
+                    .active
+                    .iter()
+                    .find(|seat| seat.slot == *subject)
+                    .map(|seat| seat.node.clone()),
+                Some(bot::bot_key(*subject).public().to_string())
+            );
+        }
     }
 }

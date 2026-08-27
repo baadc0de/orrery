@@ -53,12 +53,12 @@ use orrery_protocol::{NodeId, PersistId, StateClaim, Tick};
 
 use crate::exterior::{
     encode_frame, AnchorFrame, Frame, HostLink, JoinReply, JoinRequest, Lane, RemoteLink,
-    LINK_QUEUE_DEPTH, MAX_FRAME_BYTES,
+    StartManifest, LINK_QUEUE_DEPTH, MAX_FRAME_BYTES,
 };
 
 /// The connection's application protocol. A grammar change bumps this as well
 /// as `JoinRequest::VERSION`; both sides must refuse what they do not speak.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/3";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/4";
 
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -258,18 +258,141 @@ async fn route_inbound(
     }
 }
 
-/// Host side: accepts the exterior peer's connection and runs the handshake.
-///
-/// Returns the live host queues plus the anchor the peer shipped (`None` on
-/// runs without witnessing). Pumps are spawned here, so the caller gets a
-/// working link or an error — never a half-wired slot.
-pub async fn host_accept(
-    endpoint: &Endpoint,
-    expected: NodeId,
+/// A transport-authenticated join held until the lobby freezes membership.
+pub struct PendingJoin {
+    connection: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    remote: NodeId,
     index: usize,
-    wants_anchor: bool,
+}
+
+impl PendingJoin {
+    /// Admission-authoritative seat requested by this client.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// QUIC-authenticated transport identity.
+    #[must_use]
+    pub const fn remote(&self) -> NodeId {
+        self.remote
+    }
+
+    /// Send a named lobby refusal before dropping the pending connection.
+    pub async fn refuse(mut self, reason: String) -> Result<()> {
+        write_message(
+            &mut self.send,
+            &JoinReply::Reject {
+                reason: reason.clone(),
+            }
+            .encode(),
+        )
+        .await?;
+        let _ = self.send.finish();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        bail!("join refused: {reason}")
+    }
+
+    /// Freeze this accepted seat, send its personalized `StartV1`, receive its
+    /// already-authored anchor, and arm the data pumps.
+    pub async fn finish(
+        mut self,
+        manifest: Option<StartManifest>,
+        wants_anchor: bool,
+    ) -> Result<(HostLink, Option<AnchorFrame>, NodeId, usize)> {
+        write_message(
+            &mut self.send,
+            &JoinReply::Accept {
+                index: self.index,
+                manifest,
+            }
+            .encode(),
+        )
+        .await?;
+
+        let anchor = if wants_anchor {
+            let claim = read_message(&mut self.recv).await?;
+            let state = read_message(&mut self.recv).await?;
+            if claim.is_empty() {
+                if !state.is_empty() {
+                    bail!("empty witness anchor claim carried a non-empty state");
+                }
+                None
+            } else {
+                let frame = AnchorFrame {
+                    claim_json: claim,
+                    state,
+                };
+                verify_join_anchor(&frame, self.remote, self.index)?;
+                Some(frame)
+            }
+        } else {
+            None
+        };
+
+        drop(self.send);
+        drop(self.recv);
+        let mut downlink_send = self
+            .connection
+            .open_uni()
+            .await
+            .context("could not open downlink stream")?;
+        announce(&mut downlink_send)
+            .await
+            .context("downlink announce failed")?;
+        let uplink_recv = self
+            .connection
+            .accept_uni()
+            .await
+            .context("uplink stream never arrived")?;
+
+        let connected = Arc::new(AtomicBool::new(true));
+        let (uplink_tx, uplink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+        let (downlink_tx, downlink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+        let (meta_tx, meta_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+        let goodbye = Arc::new(AtomicBool::new(false));
+        pump_ordered_reader_to(
+            "host",
+            Arc::clone(&connected),
+            Arc::clone(&goodbye),
+            self.connection.clone(),
+            uplink_recv,
+            uplink_tx,
+            Some(meta_tx),
+        );
+        pump_writer(
+            "host",
+            Arc::clone(&connected),
+            self.connection,
+            downlink_send,
+            downlink_rx,
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok((
+            HostLink {
+                uplink: std::sync::Mutex::new(uplink_rx),
+                downlink: downlink_tx,
+                meta: std::sync::Mutex::new(meta_rx),
+                connected,
+                goodbye,
+            },
+            anchor,
+            self.remote,
+            self.index,
+        ))
+    }
+}
+
+/// Accept and authenticate one join request, but do not send `Accept` until
+/// the caller freezes the lobby through [`PendingJoin::finish`].
+pub async fn host_prepare(
+    endpoint: &Endpoint,
+    expected: Option<(usize, NodeId)>,
     admission: &crate::exterior::Admission,
-) -> Result<(HostLink, Option<AnchorFrame>, NodeId)> {
+) -> Result<PendingJoin> {
     let incoming = endpoint
         .accept()
         .await
@@ -280,14 +403,6 @@ pub async fn host_accept(
         .await
         .context("join handshake failed")?;
     let remote = connection.remote_id();
-    // A token-gated campaign admits the authenticated transport identity the
-    // issuer signed, rather than re-deriving a publicly forgeable key from the
-    // slot. Open/test hosts retain the deterministic-slot restriction.
-    if admission.issuer.is_none() && remote != expected {
-        bail!("a connection arrived from {remote}, but slot {index} belongs to {expected}");
-    }
-
-    // The remote opened the first bidirectional stream; it drives the talk.
     let (mut send, mut recv) = connection
         .accept_bi()
         .await
@@ -295,11 +410,41 @@ pub async fn host_accept(
     let request_bytes = read_message(&mut recv).await?;
     let request =
         JoinRequest::decode(&request_bytes).map_err(|reason| anyhow::anyhow!("{reason}"))?;
+    let index = request
+        .slot
+        .or_else(|| expected.map(|(slot, _)| slot))
+        .ok_or_else(|| anyhow::anyhow!("no admission-granted slot was presented"))?;
 
-    // #345 §8: version pinning and invite-bound session identity are judged
-    // *here*, before Accept — a stale or uninvited client is told why at join
-    // rather than playing an hour that cannot bank.
-    if let Err(reason) = admission.judge(&request, &remote) {
+    if let Some((expected_index, expected_node)) = expected {
+        if index != expected_index {
+            let reason = format!(
+                "reservation_slot_mismatch: requested slot {index}, this host exposes slot {expected_index}"
+            );
+            write_message(
+                &mut send,
+                &JoinReply::Reject {
+                    reason: reason.clone(),
+                }
+                .encode(),
+            )
+            .await?;
+            let _ = send.finish();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            bail!("join refused: {reason}");
+        }
+        if admission.issuer.is_none() && remote != expected_node {
+            bail!(
+                "a connection arrived from {remote}, but slot {index} belongs to {expected_node}"
+            );
+        }
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    if let Err(reason) = admission.judge_at_for_slot(&request, &remote, index, now_ms) {
         write_message(
             &mut send,
             &JoinReply::Reject {
@@ -308,109 +453,37 @@ pub async fn host_accept(
             .encode(),
         )
         .await?;
-        // Flush before bailing: dropping the stream with the reply still in
-        // flight resets it, and the dialler would read a dead connection
-        // instead of the reason it is owed.
         let _ = send.finish();
         tokio::time::sleep(Duration::from_millis(200)).await;
         bail!("join refused: {reason}");
     }
 
-    write_message(&mut send, &JoinReply::Accept { index }.encode()).await?;
-
-    let anchor = if wants_anchor {
-        // Two messages, each length-prefixed: the claim, then the canonical
-        // state it commits to. Reading them separately is what keeps the
-        // frame stream aligned afterwards — a combined encoding whose inner
-        // lengths disagree with the outer one leaves stray bytes on the
-        // stream that desync every later frame (#385 learned this live: two
-        // orphan state bytes starved every reader for an afternoon).
-        let claim = read_message(&mut recv).await?;
-        let state = read_message(&mut recv).await?;
-        // An empty claim is the joiner saying, explicitly, that it authors no
-        // witness log. The slot is seated unanchored, the
-        // already-supported `with_external(…, None, …)` path; the run's
-        // witnessed clauses then cover the bot cohort, and the report shows
-        // nothing was shown or judged for this subject rather than
-        // pretending it was.
-        if claim.is_empty() {
-            if !state.is_empty() {
-                bail!("empty witness anchor claim carried a non-empty state");
-            }
-            None
-        } else {
-            let frame = AnchorFrame {
-                claim_json: claim,
-                state,
-            };
-            verify_join_anchor(&frame, remote, index)?;
-            Some(frame)
-        }
-    } else {
-        None
-    };
-
-    // The same stream now carries the shared/meta lane in both directions.
-    // Data path: frames ride two uni streams opened after the handshake, one
-    // per direction - NOT the handshake stream, which went silently deaf when
-    // reused in every test that exercised it (#385). The host opens its
-    // downlink stream before accepting the runner's uplink stream: both sides
-    // opening first makes both accepts resolve immediately, where
-    // accept-first on both ends deadlocks each against the other's open.
-    drop(send);
-    drop(recv);
-    let mut downlink_send = connection
-        .open_uni()
-        .await
-        .context("could not open downlink stream")?;
-    announce(&mut downlink_send)
-        .await
-        .context("downlink announce failed")?;
-    let uplink_recv = connection
-        .accept_uni()
-        .await
-        .context("uplink stream never arrived")?;
-
-    let connected = Arc::new(AtomicBool::new(true));
-    let (uplink_tx, uplink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
-    let (downlink_tx, downlink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
-    let (meta_tx, meta_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
-
-    let goodbye = Arc::new(AtomicBool::new(false));
-    pump_ordered_reader_to(
-        "host",
-        Arc::clone(&connected),
-        Arc::clone(&goodbye),
-        connection.clone(),
-        uplink_recv,
-        uplink_tx,
-        Some(meta_tx),
-    );
-    pump_writer(
-        "host",
-        Arc::clone(&connected),
+    Ok(PendingJoin {
         connection,
-        downlink_send,
-        downlink_rx,
-    );
-
-    // A freshly spawned task has not necessarily reached its first await, and
-    // an unpolled datagram reader drops what arrives in that window. Yielding
-    // here lets every pump park inside its socket read before the caller can
-    // produce traffic (#385's flaky-first-frame lesson).
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    Ok((
-        HostLink {
-            uplink: std::sync::Mutex::new(uplink_rx),
-            downlink: downlink_tx,
-            meta: std::sync::Mutex::new(meta_rx),
-            connected,
-            goodbye,
-        },
-        anchor,
+        send,
+        recv,
         remote,
-    ))
+        index,
+    })
+}
+
+/// Host side: accepts the exterior peer's connection and runs the handshake.
+///
+/// Returns the live host queues plus the anchor the peer shipped (`None` on
+/// runs without witnessing). Pumps are spawned here, so the caller gets a
+/// working link or an error — never a half-wired slot.
+#[allow(dead_code)]
+pub async fn host_accept(
+    endpoint: &Endpoint,
+    expected: NodeId,
+    index: usize,
+    wants_anchor: bool,
+    admission: &crate::exterior::Admission,
+) -> Result<(HostLink, Option<AnchorFrame>, NodeId)> {
+    let joined = host_prepare(endpoint, Some((index, expected)), admission).await?;
+    let (link, anchor, remote, joined_index) = joined.finish(None, wants_anchor).await?;
+    debug_assert_eq!(joined_index, index);
+    Ok((link, anchor, remote))
 }
 
 /// Verify the signed commitment before the caller can seat the exterior slot.
@@ -466,7 +539,10 @@ pub async fn remote_join(
     write_message(&mut send, &request.encode()).await?;
     let reply_bytes = read_message(&mut recv).await?;
     match JoinReply::decode(&reply_bytes).map_err(|reason| anyhow::anyhow!("{reason}"))? {
-        JoinReply::Accept { index: assigned } => {
+        JoinReply::Accept {
+            index: assigned,
+            manifest: _,
+        } => {
             if assigned != index {
                 bail!("the host assigned slot {assigned}; this peer derived {index}");
             }
@@ -1065,6 +1141,7 @@ mod tests {
             require_client_rev: None,
             require_session: None,
             issuer: Some(orrery_protocol::IssuerKey::new(key_id, issuer.public())),
+            reservation_journal: None,
         };
         let host_task = {
             let host_ep = host_ep.clone();
@@ -1076,6 +1153,7 @@ mod tests {
             client_rev: "test".to_owned(),
             session_id: None,
             token: Some(token),
+            slot: Some(slot),
         };
         let _link = remote_join(
             &remote_ep,
@@ -1120,6 +1198,7 @@ mod tests {
                         require_client_rev: Some("pinned-rev".to_owned()),
                         require_session: None,
                         issuer: None,
+                        reservation_journal: None,
                     },
                 )
                 .await

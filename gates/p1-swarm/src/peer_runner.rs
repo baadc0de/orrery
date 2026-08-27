@@ -22,8 +22,12 @@ use crate::bridge::{self, HostAddress};
 /// Everything the runner needs: which slot is its (derived), where the host
 /// is, and how long to play.
 pub struct ExternalRun {
-    /// Bots already on the host; this process occupies slot `peers`.
+    /// Bots already on the host.
     pub peers: usize,
+    /// Admission-reserved stable human seat.
+    pub slot: usize,
+    /// Full seat namespace, including inactive human seats.
+    pub island_seats: usize,
     /// Simulated seconds — which here are wall-clock seconds by design.
     pub seconds: u64,
     /// The seed both processes share. Derives this slot's transport key, every
@@ -32,6 +36,10 @@ pub struct ExternalRun {
     pub seed: u64,
     /// Run the witness pipeline, shipping a tick-zero anchor at join.
     pub witnessing: bool,
+    /// Admission session id, when this is a campaign join.
+    pub session_id: Option<String>,
+    /// Encoded node-bound session token, when this is a campaign join.
+    pub session_token: Option<Vec<u8>>,
     /// The host's address.
     pub host: HostAddress,
     /// A direct socket to prefer over discovery, for proofs without a relay.
@@ -45,8 +53,14 @@ pub struct ExternalRun {
 /// update, sample — because witnesses re-execute what this logs, and a
 /// different order would be a different trajectory.
 pub fn run(run: &ExternalRun) -> Result<()> {
-    let index = run.peers;
-    let count = run.peers + 1;
+    let index = run.slot;
+    let count = run.island_seats;
+    if index < run.peers || index >= count {
+        bail!(
+            "external slot {index} is outside human seats {}..{count}",
+            run.peers
+        );
+    }
     let secret = bot_key(index);
 
     // The same universe derivation Swarm::new does, so both processes step the
@@ -114,7 +128,12 @@ pub fn run(run: &ExternalRun) -> Result<()> {
         .context("tokio runtime")?;
     let endpoint = rt.block_on(bridge::bind(secret, None))?;
 
-    let request = crate::exterior::JoinRequest::plain(env!("P1_SWARM_COMMIT").to_owned());
+    let request = crate::exterior::JoinRequest {
+        client_rev: env!("P1_SWARM_COMMIT").to_owned(),
+        session_id: run.session_id.clone(),
+        token: run.session_token.clone(),
+        slot: Some(index),
+    };
     let remote_link = rt.block_on(bridge::remote_join(
         &endpoint,
         run.host.to_addr(run.direct),

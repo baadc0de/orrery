@@ -7,13 +7,15 @@ Wants=network-online.target
 Type=simple
 User=orrery
 Group=orrery
-ExecStart=/usr/bin/python3 /opt/orrery/bin/p1-swarm-always-on.py --control /etc/orrery/campaigns.conf --campaign shakedown --swarm /opt/orrery/bin/p1-swarm --issuer-key /etc/orrery/p1-swarm-issuer.pub --state /var/lib/orrery-p1-swarm/shakedown
+SupplementaryGroups=orrery-admission
+ExecStart=/usr/bin/python3 /opt/orrery/bin/p1-swarm-always-on.py --control /etc/orrery/campaigns.conf --campaign shakedown --swarm /opt/orrery/bin/p1-swarm --issuer-key /etc/orrery/p1-swarm-issuer.pub --state /var/lib/orrery-p1-swarm/shakedown --reservation-journal /var/lib/orrery-admission/shakedown/slots.json
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/orrery-p1-swarm
+ReadOnlyPaths=/var/lib/orrery-admission/shakedown
 
 [Install]
 WantedBy=multi-user.target

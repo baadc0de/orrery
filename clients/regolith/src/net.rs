@@ -34,7 +34,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 /// The connection's application protocol. Must match `gates/p1-swarm`'s
 /// `bridge::EXTERIOR_ALPN`; a grammar change bumps it there and here together.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/3";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/4";
 
 /// Longest frame the wire will carry or accept (`exterior::MAX_FRAME_BYTES`).
 pub const MAX_FRAME_BYTES: u32 = 64 * 1_024;
@@ -188,13 +188,12 @@ impl UplinkAck {
 }
 
 /// The handshake a dialling peer sends before any combat traffic
-/// (`exterior::JoinRequest`, version 3).
+/// (`exterior::JoinRequest`, version 4).
 ///
 /// The tail carries the invite-bound session identity and the operator-signed
-/// session token the host verifies at join (#345 §8). It rides after the
-/// revision in version 2, because that decoder always stopped reading at the
-/// revision. Version 3 adds reliable addressed delivered inputs to the data
-/// path, so an older participant is refused before combat traffic begins.
+/// session token the host verifies at join (#345 §8), followed by the
+/// admission-granted slot in version 4. Older versions cannot express #583's
+/// reservation binding and are refused before combat traffic begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// Build revision of the joining process, for the report and for pinning.
@@ -203,11 +202,13 @@ pub struct JoinRequest {
     pub session_id: Option<String>,
     /// Encoded `SessionTokenV1` authorizing this client's transport identity.
     pub token: Option<Vec<u8>>,
+    /// Admission-granted seat echoed to the host for journal verification.
+    pub slot: Option<usize>,
 }
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 3;
+    const VERSION: u16 = 4;
 
     /// A plain, identity-less join.
     #[must_use]
@@ -216,6 +217,7 @@ impl JoinRequest {
             client_rev,
             session_id: None,
             token: None,
+            slot: None,
         }
     }
 
@@ -228,7 +230,7 @@ impl JoinRequest {
         let rev = self.client_rev.as_bytes();
         out.push(u8::try_from(rev.len()).unwrap_or(u8::MAX));
         out.extend_from_slice(&rev[..rev.len().min(u8::MAX.into())]);
-        if self.session_id.is_some() || self.token.is_some() {
+        if self.session_id.is_some() || self.token.is_some() || self.slot.is_some() {
             let session = self.session_id.as_deref().unwrap_or("").as_bytes();
             out.push(u8::try_from(session.len()).unwrap_or(u8::MAX));
             out.extend_from_slice(&session[..session.len().min(u8::MAX.into())]);
@@ -236,6 +238,11 @@ impl JoinRequest {
             let token_len = u16::try_from(token.len()).unwrap_or(u16::MAX);
             out.extend_from_slice(&token_len.to_le_bytes());
             out.extend_from_slice(&token[..token.len().min(u16::MAX.into())]);
+            let slot = self
+                .slot
+                .and_then(|slot| u64::try_from(slot).ok())
+                .unwrap_or(u64::MAX);
+            out.extend_from_slice(&slot.to_le_bytes());
         }
         out
     }
@@ -292,10 +299,21 @@ impl JoinRequest {
             [] => None,
             bytes => Some(bytes.to_vec()),
         };
+        let rest = &rest[token_len..];
+        if rest.len() != 8 {
+            return Err("join truncated before reserved slot");
+        }
+        let encoded_slot = u64::from_le_bytes(rest.try_into().expect("eight bytes checked"));
+        let slot = if encoded_slot == u64::MAX {
+            None
+        } else {
+            Some(usize::try_from(encoded_slot).map_err(|_| "join slot overflow")?)
+        };
         Ok(Self {
             client_rev,
             session_id,
             token,
+            slot,
         })
     }
 }
@@ -570,7 +588,9 @@ pub async fn remote_join(
     expect: &crate::lobby::StartExpectation,
     anchor: Option<AnchorFrame>,
 ) -> Result<(CampaignLink, Option<crate::lobby::AcceptedStart>), String> {
-    const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+    // A correct lobby may hold the accept until its 90-second membership
+    // freeze. Ten seconds made the client abandon every production lobby.
+    const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(120);
     let debug = std::env::var_os("REGOLITH_NET_DEBUG").is_some();
     let step = |stage: &str| {
         if debug {
@@ -823,8 +843,8 @@ fn spawn_writer(
 mod tests {
     use super::*;
 
-    /// The exact bytes slice 1's host reads. `exterior::JoinRequest` v3 is
-    /// `[ORRX][03 00][rev len][rev]`; if this vector and `gates/p1-swarm` ever
+    /// The exact bytes the host reads. A plain `JoinRequest` v4 is
+    /// `[ORRX][04 00][rev len][rev]`; if this vector and `gates/p1-swarm` ever
     /// disagree, one side changed the grammar and both must move together.
     #[test]
     fn join_request_bytes_match_slice_1() {
@@ -833,7 +853,7 @@ mod tests {
             request.encode(),
             vec![
                 b'O', b'R', b'R', b'X', // magic
-                0x03, 0x00, // version 3, LE
+                0x04, 0x00, // version 4, LE
                 7,    // revision length
                 b'a', b'b', b'c', b'1', b'2', b'3', b'4',
             ]
@@ -862,26 +882,28 @@ mod tests {
         );
     }
 
-    /// #387's identity tail: `[session len u8][session][token len u16 LE]
-    /// [token]` after the revision, byte-identical to `exterior::JoinRequest`.
+    /// V4's identity tail: `[session len u8][session][token len u16 LE]
+    /// [token][slot u64 LE]`, byte-identical to `exterior::JoinRequest`.
     /// A tail-less request still decodes (both fields `None`), which is what
     /// keeps this client able to join a pre-#387 host and vice versa.
     #[test]
-    fn join_request_identity_tail_matches_slice_3() {
+    fn join_request_identity_tail_matches_slice_4() {
         let request = JoinRequest {
             client_rev: "ab".to_owned(),
             session_id: Some("cd".to_owned()),
             token: Some(vec![0xEE, 0xFF]),
+            slot: Some(7),
         };
         assert_eq!(
             request.encode(),
             vec![
                 b'O', b'R', b'R', b'X', // magic
-                0x03, 0x00, // version 3, LE
+                0x04, 0x00, // version 4, LE
                 2, b'a', b'b', // revision
                 2, b'c', b'd', // session id
                 0x02, 0x00, // token length, LE
                 0xEE, 0xFF, // token bytes
+                7, 0, 0, 0, 0, 0, 0, 0, // slot, LE
             ]
         );
         assert_eq!(JoinRequest::decode(&request.encode()), Ok(request.clone()));
@@ -889,7 +911,7 @@ mod tests {
         truncated.truncate(truncated.len() - 1);
         assert_eq!(
             JoinRequest::decode(&truncated),
-            Err("join truncated inside token")
+            Err("join truncated before reserved slot")
         );
     }
 

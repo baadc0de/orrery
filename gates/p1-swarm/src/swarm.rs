@@ -538,7 +538,7 @@ pub struct Swarm {
 /// witnessing require — where to send its traffic, what it committed to at
 /// tick zero, and which cell it last said it was in.
 pub struct ExteriorSlot {
-    /// The swarm slot this peer occupies: always `bots.len()`.
+    /// The stable human-seat slot this peer occupies.
     pub index: usize,
     /// Transport identity, verified against the dial at join time.
     pub node: NodeId,
@@ -747,10 +747,33 @@ fn tampered_indices(peers: usize, count: usize) -> Vec<usize> {
         .collect()
 }
 
+/// The deterministic measurement ring over frozen active seats.
+///
+/// Seat numbers need not be contiguous: an unoccupied human seat stays empty
+/// at Start and is omitted without renumbering anybody after it.
+pub(crate) fn witness_recipients(active_slots: &[usize], subject: usize) -> Vec<usize> {
+    let Some(position) = active_slots.iter().position(|slot| *slot == subject) else {
+        return Vec::new();
+    };
+    let width = orrery_witness::plugin::MAX_WITNESS_LINKS.min(active_slots.len().saturating_sub(1));
+    (1..=width)
+        .map(|offset| active_slots[(position + offset) % active_slots.len()])
+        .collect()
+}
+
 impl Swarm {
     /// Build a swarm from `config`.
     #[must_use]
     pub fn new(config: SwarmConfig) -> Self {
+        let bot_seats = config.peers;
+        Self::new_for_island(config, bot_seats)
+    }
+
+    /// Build the bot cohort in the full stable seat namespace used by a
+    /// campaign lobby. Human gaps still affect deterministic spawn geometry.
+    #[must_use]
+    pub(crate) fn new_for_island(config: SwarmConfig, island_seats: usize) -> Self {
+        assert!(island_seats >= config.peers);
         let mut universe = [0u8; 32];
         universe[0..8].copy_from_slice(&config.seed.to_le_bytes());
         let seed = UniverseSeed(universe);
@@ -764,7 +787,7 @@ impl Swarm {
             .map(|index| {
                 Bot::new(BotSpec {
                     index,
-                    count: config.peers,
+                    count: island_seats,
                     seed,
                     cell_edge_m: config.cell_edge_m,
                     witnessing: config.witnessing,
@@ -815,13 +838,39 @@ impl Swarm {
     #[allow(dead_code)]
     #[must_use]
     pub fn with_external(
-        mut self,
+        self,
         node: NodeId,
         anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
         link: crate::exterior::HostLink,
     ) -> Self {
         let index = self.bots.len();
-        let (pos, _) = crate::bot::spawn_pose(index, index + 1);
+        self.with_external_at(index, index + 1, node, anchor, link)
+    }
+
+    /// Attach a reserved exterior at its stable seat in the full configured
+    /// island. Vacant human seats are gaps, not renumbering opportunities.
+    #[must_use]
+    pub fn with_external_at(
+        mut self,
+        index: usize,
+        island_seats: usize,
+        node: NodeId,
+        anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+        link: crate::exterior::HostLink,
+    ) -> Self {
+        assert!(
+            index >= self.bots.len(),
+            "an exterior cannot replace a bot seat"
+        );
+        assert!(
+            index < island_seats,
+            "exterior seat must be inside the island"
+        );
+        assert!(
+            !self.exteriors.contains_key(&index),
+            "exterior seat already occupied"
+        );
+        let (pos, _) = crate::bot::spawn_pose(index, island_seats);
         let start_grid = crate::bot::grid_of(&pos, self.config.cell_edge_m);
         let cell = crate::bot::cell_of(start_grid);
         let entity = PersistId::new(index as u64 + 1);
@@ -847,10 +896,6 @@ impl Swarm {
                 goodbye: goodbye_flag,
             },
         );
-        // One more sample bucket than bots; the exterior's own upload is not
-        // measured host-side (slice 3's problem), so it stays empty and is
-        // never read.
-        self.samples.push(Vec::new());
         self
     }
 
@@ -864,9 +909,10 @@ impl Swarm {
 
     /// A slot index's transport identity, bots and external alike.
     fn node_of(&self, index: usize) -> NodeId {
-        self.exteriors
-            .get(&index)
-            .map_or_else(|| self.bots[index].node, |exterior| exterior.node)
+        self.exteriors.get(&index).map_or_else(
+            || self.bots.get(index).expect("active slot has a node").node,
+            |exterior| exterior.node,
+        )
     }
 
     /// Total participants, external peer included: the number the report
@@ -1251,32 +1297,33 @@ impl Swarm {
     /// seeding is P5's. Every anchor is the subject's own signed claim at tick
     /// zero, which is the only state a witness ever holds for someone else.
     fn seed_witnesses(&mut self) {
-        use orrery_witness::plugin::MAX_WITNESS_LINKS;
-
         // The external peer is witnessed exactly like a bot: it holds a slot
         // in the ring and shipped its tick-zero anchor at join. What nobody
         // host-side can do is watch *through* it — its own observations live in
         // its process, and coverage counts what this run's watchers saw.
-        let count = self.bots.len() + self.exteriors.len();
+        let active_slots: Vec<usize> = (0..self.bots.len())
+            .chain(self.exteriors.keys().copied())
+            .collect();
         // Ring assignment: peer i is witnessed by the next `MAX_WITNESS_LINKS`
         // peers around the ring. Deterministic, uniform, and it gives every peer
         // both a witness set and a watch list without a central chooser.
-        let sets: Vec<Vec<usize>> = (0..count)
-            .map(|index| {
-                (1..=MAX_WITNESS_LINKS.min(count.saturating_sub(1)))
-                    .map(|offset| (index + offset) % count)
-                    .collect()
-            })
+        let sets: BTreeMap<usize, Vec<usize>> = active_slots
+            .iter()
+            .copied()
+            .map(|slot| (slot, witness_recipients(&active_slots, slot)))
             .collect();
 
         // Anchors first: a watcher needs the subject's signed claim and the
         // state it commits to, and both have to be taken before anyone steps.
-        let mut anchors: Vec<(
-            PersistId,
-            NodeId,
-            orrery_protocol::StateClaim,
-            RegolithState,
-        )> = (0..self.bots.len())
+        let mut anchors: BTreeMap<
+            usize,
+            (
+                PersistId,
+                NodeId,
+                orrery_protocol::StateClaim,
+                RegolithState,
+            ),
+        > = (0..self.bots.len())
             .map(|index| {
                 let state = self.bots[index].state();
                 let entity = self.bots[index].entity();
@@ -1286,7 +1333,7 @@ impl Swarm {
                     .as_mut()
                     .expect("witnessing enabled")
                     .anchor(0, &state);
-                (entity, node, anchor, state)
+                (index, (entity, node, anchor, state))
             })
             .collect();
         for (slot, exterior) in &mut self.exteriors {
@@ -1294,7 +1341,9 @@ impl Swarm {
             let entity = exterior.entity;
             let node = exterior.node;
             match exterior.anchor.take() {
-                Some((claim, state)) => anchors.push((entity, node, claim, state)),
+                Some((claim, state)) => {
+                    anchors.insert(index, (entity, node, claim, state));
+                }
                 None => {
                     // A joiner with no witness log says so with an empty
                     // anchor at join. The slot seats
@@ -1312,18 +1361,18 @@ impl Swarm {
             debug_assert_eq!(*slot, index, "the exterior map key is its ring slot");
         }
 
-        for (index, witnesses) in sets.iter().enumerate() {
+        for (index, witnesses) in &sets {
             let members: Vec<NodeId> = witnesses
                 .iter()
                 .map(|watcher| self.node_of(*watcher))
                 .collect();
-            if self.exteriors.contains_key(&index) {
+            if self.exteriors.contains_key(index) {
                 // The external peer's witness set travels with it: nothing to
                 // configure host-side. Its authored frames reach these same
                 // watchers through the bridge.
                 continue;
             }
-            self.bots[index].set_witness_set(members);
+            self.bots[*index].set_witness_set(members);
             // Each of those peers watches this one.
             for watcher in witnesses {
                 if self.exteriors.contains_key(watcher) {
@@ -1333,7 +1382,9 @@ impl Swarm {
                     // rendered client lands (#386).
                     continue;
                 }
-                let (entity, node, anchor, state) = anchors[index].clone();
+                let Some((entity, node, anchor, state)) = anchors.get(index).cloned() else {
+                    continue;
+                };
                 self.bots[*watcher].watch(entity, node, anchor, state);
             }
         }

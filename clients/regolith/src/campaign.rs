@@ -101,9 +101,9 @@ const WITNESS_FRAME_TICKS: u16 = 10;
 const MAX_WITNESS_LINKS: usize = 7;
 
 /// How long the dial may take before the join attempt is declared failed.
-/// The handshake itself bounds each read at ten seconds; this adds dial and
-/// bind slack.
-const JOIN_DEADLINE_SECS: u64 = 30;
+/// The handshake may wait through the host's 90-second lobby; this adds dial
+/// and bind slack around that inner bound.
+const JOIN_DEADLINE_SECS: u64 = 125;
 
 /// Launch material for a joined campaign session.
 ///
@@ -525,6 +525,9 @@ impl CampaignRuntime {
                 .host_direct
                 .as_deref()
                 .and_then(|socket| socket.parse().ok());
+            // #583: the seat admission reserved, sent so the host can check it
+            // against its reservation journal rather than trusting the client.
+            let slot = config.slot;
             let expectation = config.start_expectation();
             let transport_secret = config.transport_secret.clone();
             let client_rev = crate::BUILD_REV.to_owned();
@@ -548,6 +551,7 @@ impl CampaignRuntime {
                             client_rev,
                             session_id: Some(session_id),
                             token: token?,
+                            slot: Some(slot),
                         };
                         let deadline = std::time::Duration::from_secs(JOIN_DEADLINE_SECS);
                         let (link, start) = tokio::time::timeout(
