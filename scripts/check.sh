@@ -348,6 +348,13 @@ lane_gates() {
     # #387's host-side assembly seam for human sessions: same cost profile as
     # the two above (jq only, sub-second), so it runs per commit with them.
     run scripts/p4-campaign-session.sh --self-test
+    # #572's attempt and accounting contract, which lands before the cohort
+    # hours it accounts for. Its fixtures are the two failure modes a
+    # multi-human attempt introduces — one interval banked twice, and a row
+    # bound to the wrong seat or the wrong platform — and the last of them runs
+    # the derived rows through the real `p4-ledger.sh append`. openssl and jq
+    # only; about two seconds.
+    run python3 scripts/p4-attempt-accounting.py --self-test
 
     # #173's compute-role smoke. Its real run needs AWS credentials and
     # happens nightly (nightly.yml `compute-identity-smoke`); this structural
