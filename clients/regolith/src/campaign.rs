@@ -86,6 +86,8 @@ const REPLICA_TTL_TICKS: u64 = 120;
 struct ReplicaFreshness {
     last_refresh_tick: u64,
     last_authoritative_tick: u64,
+    /// Exterior sender slot that authored the latest installed state.
+    authority_slot: u32,
     installed: bool,
 }
 
@@ -959,6 +961,7 @@ impl CampaignRuntime {
                                         let _ = refresh_replica(
                                             &mut self.replica_freshness,
                                             entity,
+                                            frame.peer,
                                             tick.0,
                                             at,
                                         );
@@ -1078,9 +1081,14 @@ impl CampaignRuntime {
     }
 
     /// Route a ruleset-produced delivery without ever applying foreign state
-    /// locally. The exterior participant owns the last slot, so every lower
-    /// participant slot is host-side; other ids name materialized authorities
-    /// this campaign host does not yet publish a route for and remain counted.
+    /// locally.
+    ///
+    /// The replication frame already names the authenticated exterior sender,
+    /// so each installed replica carries its route. Keeping that slot in the
+    /// freshness row deliberately makes replica presence and routability one
+    /// lifetime: expiry invalidates both, while a later install (including an
+    /// authority move) replaces both. An entity id is opaque and must never be
+    /// decoded as a transport location; one peer may author many entities.
     fn route_delivered_input(&mut self, link: &CampaignLink, recipient: PersistId, order: Order) {
         if recipient == self.entity {
             self.pending_delivered.push(DeliveredOrder {
@@ -1090,12 +1098,7 @@ impl CampaignRuntime {
             });
             return;
         }
-        let Some(slot) = recipient
-            .0
-            .checked_sub(1)
-            .and_then(|slot| u32::try_from(slot).ok())
-            .filter(|slot| (*slot as usize) < self.config.slot)
-        else {
+        let Some(slot) = replica_authority_slot(&self.replica_freshness, recipient) else {
             self.delivered_unroutable += 1;
             return;
         };
@@ -1216,9 +1219,20 @@ fn expire_stale_replicas(
     }
 }
 
+fn replica_authority_slot(
+    freshness: &BTreeMap<PersistId, ReplicaFreshness>,
+    entity: PersistId,
+) -> Option<u32> {
+    freshness
+        .get(&entity)
+        .filter(|replica| replica.installed)
+        .map(|replica| replica.authority_slot)
+}
+
 fn refresh_replica(
     freshness: &mut BTreeMap<PersistId, ReplicaFreshness>,
     entity: PersistId,
+    authority_slot: u32,
     client_tick: u64,
     authoritative_tick: u64,
 ) -> (&'static str, Option<u64>, Option<u64>) {
@@ -1227,6 +1241,7 @@ fn refresh_replica(
         ReplicaFreshness {
             last_refresh_tick: client_tick,
             last_authoritative_tick: authoritative_tick,
+            authority_slot,
             installed: true,
         },
     );
@@ -1583,6 +1598,7 @@ mod tests {
             ReplicaFreshness {
                 last_refresh_tick: 10,
                 last_authoritative_tick: 9,
+                authority_slot: 2,
                 installed: true,
             },
         )]);
@@ -1625,7 +1641,7 @@ mod tests {
         executor.insert(remote, game.spawn(remote, 2));
         let mut freshness = BTreeMap::new();
         let mut focus = Some(remote);
-        let _ = refresh_replica(&mut freshness, remote, 10, 10);
+        let _ = refresh_replica(&mut freshness, remote, 2, 10, 10);
 
         for tick in [70, 130, 190] {
             expire_stale_replicas(&mut executor, own, tick, &mut freshness, &mut focus);
@@ -1633,8 +1649,43 @@ mod tests {
                 executor.state(remote).is_some(),
                 "a replica refreshed at the ruleset's one-second allowance stays drawable"
             );
-            let _ = refresh_replica(&mut freshness, remote, tick, tick);
+            let _ = refresh_replica(&mut freshness, remote, 2, tick, tick);
         }
+    }
+
+    #[test]
+    fn materialised_replica_route_has_exactly_the_replica_lifetime() {
+        let game = Regolith::honest();
+        let own = PersistId::new(9);
+        let materialised = PersistId::new(0xC524_1234_5678_9abc);
+        let mut executor = Executor::new(game, UniverseSeed([0x63; 32]));
+        executor.insert(own, game.spawn(own, 8));
+        executor.insert(materialised, game.spawn(materialised, 2));
+        let mut freshness = BTreeMap::new();
+        let mut focus = Some(materialised);
+
+        let _ = refresh_replica(&mut freshness, materialised, 4, 10, 9);
+        assert_eq!(replica_authority_slot(&freshness, materialised), Some(4));
+
+        expire_stale_replicas(
+            &mut executor,
+            own,
+            11 + REPLICA_TTL_TICKS,
+            &mut freshness,
+            &mut focus,
+        );
+        assert_eq!(
+            replica_authority_slot(&freshness, materialised),
+            None,
+            "an expired replica must not leave a stale delivery route"
+        );
+
+        let _ = refresh_replica(&mut freshness, materialised, 6, 132, 130);
+        assert_eq!(
+            replica_authority_slot(&freshness, materialised),
+            Some(6),
+            "a reinstalled replica learns its current authority from its packet"
+        );
     }
 
     #[test]
@@ -1642,9 +1693,9 @@ mod tests {
         let remote = PersistId::new(3);
         let mut freshness = BTreeMap::new();
 
-        let _ = refresh_replica(&mut freshness, remote, 10, 9);
+        let _ = refresh_replica(&mut freshness, remote, 2, 10, 9);
         freshness.get_mut(&remote).expect("installed").installed = false;
-        let measurement = refresh_replica(&mut freshness, remote, 211, 210);
+        let measurement = refresh_replica(&mut freshness, remote, 2, 211, 210);
 
         assert_eq!(
             measurement,

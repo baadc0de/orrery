@@ -23,9 +23,9 @@ use bytes::Bytes;
 use iroh_base::SecretKey;
 use orrery_core::{CoreCodec as _, Executor};
 use orrery_games::regolith::archetype::Archetype;
-use orrery_games::regolith::campaign_spawn_pose;
 use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState};
+use orrery_games::regolith::{campaign_rock_seeds, campaign_spawn_pose};
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::encode_replication;
 use orrery_protocol::{CellId, ChainHash, NodeId, PersistId, StateClaim, Tick, WitnessMsg};
@@ -76,6 +76,7 @@ struct GroundTruth {
     damage_inputs_applied: u64,
     shots_resolved: u64,
     lock_breaks_sent: u64,
+    rock_credits_sent: u64,
 }
 
 impl GroundTruth {
@@ -195,6 +196,7 @@ impl HostFixture {
 #[derive(Clone, Copy)]
 enum Mode {
     Join,
+    MaterialisedRock,
     TargetDestroyedBeforeDamage,
     Reject,
     WrongSlot,
@@ -320,14 +322,14 @@ async fn pump(
         }
     });
 
-    // The virtual bot at slot 0: broadcast canonical craft state on a fixed
-    // cadence, skipping every DOWNLINK_SKIP_EVERY-th broadcast.
+    // The authority at slot 0 broadcasts one canonical entity on a fixed
+    // cadence, skipping every DOWNLINK_SKIP_EVERY-th broadcast. The rock mode
+    // is the important non-slot-shaped identity: its packet still names slot 0.
     {
         let truth_cloned = Arc::clone(&truth);
         let feed = feed_tx.clone();
         tokio::spawn(async move {
-            let bot_entity = PersistId::new(1); // slot 0's entity id
-            let state = campaign_craft(0, CLIENT_SLOT + 1);
+            let (authored_entity, state) = fixture_authority(mode);
             let cell = CellId::from_coords(bevy::math::IVec3::ONE, orrery_protocol::INTEREST_LEVEL)
                 .expect("representable cell");
             let mut broadcast_index = 0u64;
@@ -362,7 +364,12 @@ async fn pump(
                     // wraps `encode_replication`'s output in its own channel tag.
                     let payload = orrery_protocol::channels::tag(
                         orrery_protocol::channels::Channel::State,
-                        &encode_replication(&(encoded, cell, bot_entity, broadcast_index * STRIDE)),
+                        &encode_replication(&(
+                            encoded,
+                            cell,
+                            authored_entity,
+                            broadcast_index * STRIDE,
+                        )),
                     );
                     let frame = net::Frame {
                         peer: 0,
@@ -399,10 +406,10 @@ async fn pump(
     // strictly after deciding (#393's load-bearing ordering).
     let mut witness_head = ChainHash::EMPTY;
     let game = Regolith::honest();
-    let bot_entity = PersistId::new(1);
+    let (authored_entity, authored_state) = fixture_authority(mode);
     let client_entity = PersistId::new(CLIENT_SLOT as u64 + 1);
     let mut authority = Executor::new(game, crate_seed());
-    authority.insert(bot_entity, campaign_craft(0, CLIENT_SLOT + 1));
+    authority.insert(authored_entity, authored_state);
     let mut authority_tick = 0u64;
     loop {
         let Some(frame) = read_frame(&mut uplink_recv).await else {
@@ -455,7 +462,7 @@ async fn pump(
                         "the delivery names the authority that emitted it"
                     );
                     assert_eq!(
-                        delivered.recipient, bot_entity,
+                        delivered.recipient, authored_entity,
                         "the host applies only its own entity's delivery"
                     );
                     let order = Order::decode(&delivered.input)
@@ -471,14 +478,14 @@ async fn pump(
                         && matches!(order, Order::Damage { .. })
                     {
                         let RegolithState::Craft(mut target) = authority
-                            .state(bot_entity)
+                            .state(authored_entity)
                             .expect("the fixture host owns its target")
                             .clone()
                         else {
                             panic!("the fixture target is a craft");
                         };
                         target.hull = 0;
-                        authority.insert(bot_entity, RegolithState::Craft(target));
+                        authority.insert(authored_entity, RegolithState::Craft(target));
                     }
 
                     // A real target authority step produces the reply. Self-
@@ -488,7 +495,7 @@ async fn pump(
                     let mut pending = vec![order];
                     while !pending.is_empty() {
                         let output = authority
-                            .step_entity(bot_entity, Tick::new(authority_tick), &pending)
+                            .step_entity(authored_entity, Tick::new(authority_tick), &pending)
                             .expect("the fixture host owns its target");
                         authority_tick = authority_tick.saturating_add(1);
                         pending.clear();
@@ -500,7 +507,7 @@ async fn pump(
                             else {
                                 continue;
                             };
-                            if recipient == bot_entity {
+                            if recipient == authored_entity {
                                 pending.push(reply);
                                 continue;
                             }
@@ -514,8 +521,11 @@ async fn pump(
                             if matches!(reply, Order::LockBroken { .. }) {
                                 truth.lock().expect("truth lock").lock_breaks_sent += 1;
                             }
+                            if matches!(reply, Order::RockCredit { .. }) {
+                                truth.lock().expect("truth lock").rock_credits_sent += 1;
+                            }
                             let inner = orrery_protocol::channels::encode_delivered_input(
-                                bot_entity,
+                                authored_entity,
                                 recipient,
                                 &reply.to_canonical(),
                             );
@@ -552,7 +562,7 @@ async fn pump(
                                 matches!(
                                     record.source,
                                     orrery_protocol::RecordSource::InboundEvent { from }
-                                        if from == bot_entity
+                                        if from == authored_entity
                                 ) && matches!(
                                     Order::decode(&record.payload),
                                     Ok(Order::LockConfirmed { .. })
@@ -662,6 +672,18 @@ fn campaign_craft(slot: usize, count: usize) -> RegolithState {
         pos,
         yaw_urad,
     ))
+}
+
+fn fixture_authority(mode: Mode) -> (PersistId, RegolithState) {
+    if matches!(mode, Mode::MaterialisedRock) {
+        // Seed slot four is Small and therefore yields RockCredit after one
+        // stock-weapon hit. Its opaque high-bit identity cannot encode slot 0,
+        // while the exterior frame's `peer` field does so explicitly.
+        let seeded = campaign_rock_seeds(crate_seed(), 1)[4].clone();
+        (seeded.entity, RegolithState::Rock(seeded.rock))
+    } else {
+        (PersistId::new(1), campaign_craft(0, CLIENT_SLOT + 1))
+    }
 }
 
 fn sink_for(name: &str) -> JsonlTelemetry {
@@ -857,6 +879,99 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
     assert!(
         !shots.banner().is_empty(),
         "the authoritative shot result must remain visible to the player"
+    );
+}
+
+#[test]
+fn materialised_rock_replication_route_carries_lock_damage_and_rock_credit() {
+    let fixture = HostFixture::spawn(Mode::MaterialisedRock);
+    let mut sink = sink_for("regolith-campaign-materialised-rock-route");
+    let mut runtime =
+        CampaignRuntime::launch(fixture.config("materialised-rock-route"), crate_seed());
+    drive_until_joined(&mut runtime, &mut sink, 1);
+
+    let target = fixture_authority(Mode::MaterialisedRock).0;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let _ = runtime.advance(
+            Controls {
+                lock_target: Some(target),
+                right: true,
+                ..Controls::default()
+            },
+            &mut sink,
+        );
+        if matches!(
+            runtime.executor().state(runtime.entity()),
+            Some(RegolithState::Craft(craft))
+                if craft.lock_target == Some(target)
+                    && craft.lock_class == Some(orrery_games::regolith::state::LockClass::Rock)
+                    && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+        ) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        matches!(
+            runtime.executor().state(runtime.entity()),
+            Some(RegolithState::Craft(craft))
+                if craft.lock_target == Some(target)
+                    && craft.lock_class == Some(orrery_games::regolith::state::LockClass::Rock)
+                    && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+        ),
+        "the opaque-id rock's authority must receive LockRequested and answer"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let (inside_arc, credited) = match (
+            runtime.executor().state(runtime.entity()),
+            runtime.executor().state(target),
+        ) {
+            (Some(RegolithState::Craft(craft)), Some(RegolithState::Rock(rock))) => (
+                orrery_games::regolith::firing_arc_measurement(
+                    craft.archetype,
+                    craft.yaw_urad,
+                    craft.pos,
+                    rock.pos,
+                )
+                .inside,
+                craft.score_rock_points > 0,
+            ),
+            _ => (false, false),
+        };
+        if credited {
+            break;
+        }
+        let _ = runtime.advance(
+            Controls {
+                lock_target: Some(target),
+                right: !inside_arc,
+                fire: inside_arc,
+                ..Controls::default()
+            },
+            &mut sink,
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let score = match runtime.executor().state(runtime.entity()) {
+        Some(RegolithState::Craft(craft)) => craft.score_rock_points,
+        _ => panic!("the joined exterior authority remains a craft"),
+    };
+    let truth = fixture.truth();
+    assert!(
+        truth.damage_inputs_applied > 0,
+        "the materialised rock authority received routed Damage"
+    );
+    assert!(
+        truth.rock_credits_sent > 0,
+        "the materialised rock authority emitted RockCredit"
+    );
+    assert_eq!(
+        score, 1,
+        "the delivered RockCredit reached the player authority"
     );
 }
 
