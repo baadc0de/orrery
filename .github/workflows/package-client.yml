@@ -72,10 +72,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             g++ pkg-config libx11-dev libasound2-dev libudev-dev \
-            libwayland-dev libxkbcommon-dev
+            libwayland-dev libxkbcommon-dev xvfb mesa-vulkan-drivers
 
       - name: Build the standalone Regolith workspace
         run: cargo build --release
+
+      # This is a rendered launch proof, not the non-graphics `--smoke-test`.
+      # The client stays alive for twenty seconds, then exits successfully only
+      # after Bevy's primary-window screenshot callback proves the renderer
+      # completed a frame. That catches a compositor/backend failure that
+      # occurs after process creation, such as #550's delayed Wayland crash.
+      #
+      # Linux needs a virtual X server on a hosted runner. Explicitly removing
+      # WAYLAND_DISPLAY matters even under Xvfb: winit otherwise prefers a
+      # real Wayland session when one is present. Mesa's Vulkan software
+      # adapter supplies the renderer there; Windows and macOS use their
+      # runners' native display stacks and platform graphics backends.
+      - name: Render-smoke the built client
+        run: |
+          set -euo pipefail
+          binary="./target/release/${{ matrix.binary }}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
+              WGPU_BACKEND=vulkan "$binary" --render-smoke
+          else
+            "$binary" --render-smoke
+          fi
 
       - name: Stage binary and its SHA-256
         working-directory: .
