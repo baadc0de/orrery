@@ -243,6 +243,71 @@ pub fn read_aoi_boundary(session: Res<crate::ActiveSession>, mut boundary: ResMu
     });
 }
 
+/// What the fade actually did this frame, and the darkest it has ever gone.
+///
+/// **An evidence affordance, and deliberately a thin one**, in the same spirit
+/// as [`crate::rock_census`]. #533 is a claim about what the player sees, and
+/// the failure mode every presentation bug in this client has had (#517, #524,
+/// #514) is a correct number that never reaches a pixel — so this is recorded
+/// *inside* [`sync_aoi_fade`], from the opacity that was written to the
+/// material, rather than recomputed from the geometry beside it. A live run
+/// that never dips below 1.0 is a run in which nothing approached the
+/// boundary; a run that reports fades is the fade happening.
+#[derive(Resource, Debug, Clone, Default)]
+pub struct AoiFadeCensus {
+    /// Whether a boundary existed this frame.
+    pub bounded: bool,
+    /// Bodies the fade considered this frame.
+    pub bodies: usize,
+    /// Bodies drawn below full opacity this frame.
+    pub faded: usize,
+    /// The dimmest opacity written this frame; `1.0` when nothing faded.
+    pub dimmest: f32,
+    /// The dimmest opacity written since the process started.
+    pub dimmest_ever: f32,
+    /// How many distinct owners have ever been drawn faded.
+    pub ever_faded: std::collections::BTreeSet<orrery_protocol::PersistId>,
+}
+
+impl AoiFadeCensus {
+    fn open_frame(&mut self, bounded: bool) {
+        if self.dimmest_ever == 0.0 {
+            self.dimmest_ever = 1.0;
+        }
+        self.bounded = bounded;
+        self.bodies = 0;
+        self.faded = 0;
+        self.dimmest = 1.0;
+    }
+
+    fn observe(&mut self, owner: orrery_protocol::PersistId, opacity: f32) {
+        self.bodies += 1;
+        if opacity < 1.0 {
+            self.faded += 1;
+            self.ever_faded.insert(owner);
+        }
+        self.dimmest = self.dimmest.min(opacity);
+        self.dimmest_ever = self.dimmest_ever.min(opacity);
+    }
+
+    /// One line for the F3 pane and the capture log.
+    #[must_use]
+    pub fn line(&self, edge_m: Option<f32>) -> String {
+        match edge_m {
+            None => "aoi no interest boundary (local session)".to_owned(),
+            Some(edge_m) => format!(
+                "aoi edge {edge_m:.0} m | band {:.0} m | {} materials, {} faded | dimmest {:.2} (ever {:.2} over {} craft)",
+                fade_band_m(edge_m),
+                self.bodies,
+                self.faded,
+                self.dimmest,
+                self.dimmest_ever,
+                self.ever_faded.len(),
+            ),
+        }
+    }
+}
+
 /// Drives every [`AoiFadeable`] material from its owner's distance to the
 /// interest boundary.
 ///
@@ -254,14 +319,17 @@ pub fn read_aoi_boundary(session: Res<crate::ActiveSession>, mut boundary: ResMu
 pub fn sync_aoi_fade(
     session: Res<crate::ActiveSession>,
     boundary: Res<AoiBoundary>,
+    mut census: ResMut<AoiFadeCensus>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     fadeables: Query<(&AoiFadeable, &MeshMaterial3d<StandardMaterial>)>,
 ) {
+    census.open_frame(boundary.0.is_some());
     for (fade, handle) in &fadeables {
         let opacity = boundary.0.map_or(1.0, |frame| {
             body_position_m(session.executor(), fade.owner)
                 .map_or(1.0, |subject| frame.opacity_at(subject))
         });
+        census.observe(fade.owner, opacity);
         let Some(mut material) = materials.get_mut(&handle.0) else {
             continue;
         };
@@ -399,6 +467,7 @@ mod tests {
                 edge_m: EDGE,
                 observer: Vec3::ZERO,
             })))
+            .init_resource::<AoiFadeCensus>()
             .add_systems(Update, sync_aoi_fade);
 
         let authored = Color::srgb(0.40, 0.37, 0.34);
@@ -463,6 +532,12 @@ mod tests {
             seen[1].1 >= AOI_FADE_FLOOR,
             "the fade may never go below the legibility floor"
         );
+        // The live-evidence readout must report what actually reached the
+        // materials, or a green run proves nothing about the pixels.
+        let census = app.world().resource::<AoiFadeCensus>().clone();
+        assert_eq!((census.bodies, census.faded), (2, 1), "{census:?}");
+        assert!((census.dimmest - expected).abs() < 1e-3, "{census:?}");
+        assert!(census.line(Some(EDGE)).contains("1 faded"), "{census:?}");
 
         // No boundary — the offline sandbox, or a campaign still dialling —
         // restores every material rather than leaving the last fade burnt in.

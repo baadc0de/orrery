@@ -386,6 +386,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<MetricWindow>()
             .init_resource::<CameraZoom>()
             .init_resource::<aoi::AoiBoundary>()
+            .init_resource::<aoi::AoiFadeCensus>()
             .init_resource::<roster::ShipRoster>()
             .init_resource::<roster::RosterTask>()
             .init_resource::<SelectedLock>()
@@ -443,6 +444,13 @@ impl Plugin for RegolithSkinPlugin {
                     .after(sync_rendered_state),
             )
             .add_systems(Update, capture_tracer_geometry.after(hud::sync_tracers))
+            .add_systems(
+                Update,
+                capture_aoi_census
+                    .after(aoi::sync_aoi_fade)
+                    .run_if(resource_exists::<GeometryCapture>)
+                    .run_if(on_timer(Duration::from_secs(1))),
+            )
             .add_systems(Update, write_campaign_record_on_exit)
             .add_systems(
                 Update,
@@ -619,6 +627,16 @@ fn spawn_craft_body(
     if let Some(scene) = paths.craft_scene(asset_server) {
         // The optional glTF still wins when it is on disk: this work
         // improves the fallback, it does not replace the asset path.
+        //
+        // **Known limit of #533's fade on this branch.** The scene's own
+        // materials are owned by the glTF loader and are shared across every
+        // body that loads the same asset, so tagging them `AoiFadeable` here
+        // would fade every craft together the moment one of them neared the
+        // boundary. Only the firing-arc fans above carry the tag on this
+        // path, so a glTF hull fades its arc marking and not its plate. No
+        // asset ships in this checkout, so no run today takes this branch;
+        // doing it properly needs per-body material instances, which is a
+        // change to the asset path rather than to the fade.
         spawned.insert(WorldAssetRoot(scene));
         return;
     }
@@ -898,6 +916,16 @@ fn capture_tracer_geometry(
             );
         }
     }
+}
+
+/// Prints the interest-fade census once a second under `--capture-geometry`.
+///
+/// The evidence #533 needs is not "the arithmetic is right" — the unit tests
+/// hold that — but "the fade reached a material in a live campaign, against
+/// the host's own boundary". This prints what
+/// [`aoi::sync_aoi_fade`] actually wrote.
+fn capture_aoi_census(session: Res<ActiveSession>, census: Res<aoi::AoiFadeCensus>) {
+    println!("aoi_census {}", census.line(session.aoi_edge_m()));
 }
 
 fn clear_refused_selection(
@@ -1751,6 +1779,7 @@ fn refresh_f3_pane(
     session: Res<ActiveSession>,
     rock_bodies: Query<(), With<RockBody>>,
     roster: Res<roster::ShipRoster>,
+    fade_census: Res<aoi::AoiFadeCensus>,
     mut pane: Query<(&mut Text, &mut Node), With<F3Pane>>,
 ) {
     if let Ok((mut text, mut node)) = pane.single_mut() {
@@ -1784,6 +1813,8 @@ fn refresh_f3_pane(
         }
         text.push('\n');
         text.push_str(&rock_census(counts, rock_bodies.iter().count()));
+        text.push('\n');
+        text.push_str(&fade_census.line(session.aoi_edge_m()));
         text.push('\n');
         text.push_str(&roster.summary_line());
         text.push_str(&format!(
