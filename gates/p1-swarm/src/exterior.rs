@@ -54,6 +54,8 @@
 #![allow(dead_code)]
 
 use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -342,13 +344,11 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
 /// identity (#345 §8): the pre-minted session UUIDv7 the invite carries and
 /// the operator-signed `SessionTokenV1` authorizing this transport identity.
 ///
-/// The identity fields ride as an optional tail after the revision, still at
-/// version 3. Version 2 added the optional identity tail; version 3 adds
-/// reliable addressed delivered inputs to the data path. The version-2
-/// decoder always stopped reading at the revision,
-/// so a request with the tail is readable by an old host (which ignores it)
-/// and a request without it is readable here (both fields decode to `None`).
-/// A host *requiring* them refuses their absence at admission, not at parse.
+/// Version 4 appends the admission-granted slot to the identity tail. The slot
+/// is an echo, not an allocator: the host checks it against admission's shared
+/// reservation journal and refuses disagreement instead of correcting it.
+/// Versions 2 and 3 are rejected rather than guessed because they cannot state
+/// the reservation binding #583 requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// Build revision of the joining process, for the report and for pinning.
@@ -359,11 +359,14 @@ pub struct JoinRequest {
     /// Encoded `orrery_protocol::SessionTokenV1` authorizing the dialler's
     /// transport identity, when joining as a campaign participant.
     pub token: Option<Vec<u8>>,
+    /// Seat admission reserved for this session. Campaign joins must present
+    /// it; identity-less harness probes may omit it.
+    pub slot: Option<usize>,
 }
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 3;
+    const VERSION: u16 = 4;
 
     /// A plain, identity-less join — what the headless bot runner sends.
     #[must_use]
@@ -372,6 +375,7 @@ impl JoinRequest {
             client_rev,
             session_id: None,
             token: None,
+            slot: None,
         }
     }
 
@@ -384,7 +388,7 @@ impl JoinRequest {
         let rev = self.client_rev.as_bytes();
         out.push(u8::try_from(rev.len()).unwrap_or(u8::MAX));
         out.extend_from_slice(&rev[..rev.len().min(u8::MAX.into())]);
-        if self.session_id.is_some() || self.token.is_some() {
+        if self.session_id.is_some() || self.token.is_some() || self.slot.is_some() {
             let session = self.session_id.as_deref().unwrap_or("").as_bytes();
             out.push(u8::try_from(session.len()).unwrap_or(u8::MAX));
             out.extend_from_slice(&session[..session.len().min(u8::MAX.into())]);
@@ -392,6 +396,11 @@ impl JoinRequest {
             let token_len = u16::try_from(token.len()).unwrap_or(u16::MAX);
             out.extend_from_slice(&token_len.to_le_bytes());
             out.extend_from_slice(&token[..token.len().min(u16::MAX.into())]);
+            let slot = self
+                .slot
+                .and_then(|slot| u64::try_from(slot).ok())
+                .unwrap_or(u64::MAX);
+            out.extend_from_slice(&slot.to_le_bytes());
         }
         out
     }
@@ -427,6 +436,7 @@ impl JoinRequest {
                 client_rev,
                 session_id: None,
                 token: None,
+                slot: None,
             });
         }
         let session_len = rest[0] as usize;
@@ -451,11 +461,105 @@ impl JoinRequest {
             [] => None,
             bytes => Some(bytes.to_vec()),
         };
+        let rest = &rest[token_len..];
+        if rest.len() != 8 {
+            return Err("join truncated before reserved slot");
+        }
+        let encoded_slot = u64::from_le_bytes(rest.try_into().expect("eight bytes checked"));
+        let slot = if encoded_slot == u64::MAX {
+            None
+        } else {
+            Some(usize::try_from(encoded_slot).map_err(|_| "join slot overflow")?)
+        };
         Ok(Self {
             client_rev,
             session_id,
             token,
+            slot,
         })
+    }
+}
+
+/// One authoritative row written atomically by `scripts/admission.py`.
+#[derive(Debug, Deserialize)]
+struct ReservationRow {
+    attempt_id: String,
+    slot: usize,
+    session_id: String,
+    node: String,
+    expires_at: u64,
+}
+
+/// Host-visible view of admission's reservation journal (#583).
+///
+/// This is intentionally a co-location contract, not a cryptographic grant:
+/// admission and the harness must see the same storage. Today the two systemd
+/// units run on hel1 and the supervisor passes admission's `slots.json` path
+/// into the child. If either service moves, this design no longer holds and
+/// must be replaced by a signed reservation grant. Every read, parse, expiry,
+/// generation, identity, session, or slot failure refuses the join; an
+/// unavailable journal must never degrade to admission.
+#[derive(Debug, Clone)]
+pub struct ReservationJournal {
+    /// Atomic JSON journal written by admission.
+    pub path: PathBuf,
+    /// Supervisor-owned attempt generation this host is running.
+    pub attempt_id: String,
+}
+
+impl ReservationJournal {
+    fn verify(
+        &self,
+        request: &JoinRequest,
+        remote: &orrery_protocol::NodeId,
+        slot: usize,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let bytes = std::fs::read(&self.path).map_err(|error| {
+            format!(
+                "reservation_journal_unreadable: cannot read {}: {error}",
+                self.path.display()
+            )
+        })?;
+        let rows: Vec<ReservationRow> = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "reservation_journal_unreadable: {} did not decode: {error}",
+                self.path.display()
+            )
+        })?;
+        let session = request.session_id.as_deref().ok_or_else(|| {
+            "reservation_missing_session: no invite session id was presented".to_owned()
+        })?;
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == session)
+            .ok_or_else(|| {
+                format!("reservation_not_found: session {session} has no host-visible reservation")
+            })?;
+        if row.attempt_id != self.attempt_id {
+            return Err(format!(
+                "reservation_journal_stale: session {session} belongs to attempt {}, host is running {}",
+                row.attempt_id, self.attempt_id
+            ));
+        }
+        if row.expires_at <= now_ms / 1_000 {
+            return Err(format!(
+                "reservation_journal_stale: session {session} expired at {}",
+                row.expires_at
+            ));
+        }
+        if row.node != remote.to_string() {
+            return Err(format!(
+                "reservation_node_mismatch: session {session} is reserved for another transport identity"
+            ));
+        }
+        if row.slot != slot {
+            return Err(format!(
+                "reservation_slot_mismatch: requested slot {slot}, journal reserved {}",
+                row.slot
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -467,7 +571,7 @@ impl JoinRequest {
 /// judgement is a pure function of the request, the dialler's authenticated
 /// transport identity, and a clock — so it is testable without a socket, and
 /// `bridge::host_accept` only has to deliver its verdict.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Admission {
     /// Exact build revision the host pins (#345 §8's version pinning). A
     /// mismatching or absent revision is refused with a remedy in the reason.
@@ -479,6 +583,9 @@ pub struct Admission {
     /// `SessionTokenV1` that verifies under it *for the dialler's transport
     /// identity* — a token minted for any other node is refused.
     pub issuer: Option<orrery_protocol::IssuerKey>,
+    /// Required for a standing, token-gated campaign with no single pinned
+    /// session. See [`ReservationJournal`] for the co-location boundary.
+    pub reservation_journal: Option<ReservationJournal>,
 }
 
 impl Admission {
@@ -515,6 +622,18 @@ impl Admission {
         remote: &orrery_protocol::NodeId,
         now_ms: u64,
     ) -> Result<(), String> {
+        let slot = request.slot.unwrap_or(usize::MAX);
+        self.judge_at_for_slot(request, remote, slot, now_ms)
+    }
+
+    /// Judge a request for the exact slot the host is about to assign.
+    pub fn judge_at_for_slot(
+        &self,
+        request: &JoinRequest,
+        remote: &orrery_protocol::NodeId,
+        slot: usize,
+        now_ms: u64,
+    ) -> Result<(), String> {
         if let Some(pinned) = &self.require_client_rev {
             if &request.client_rev != pinned {
                 return Err(format!(
@@ -546,8 +665,49 @@ impl Admission {
                 .verify(token, remote)
                 .map_err(|error| format!("session token refused: {error:?}"))?;
         }
+        if let Some(claimed) = request.slot {
+            if claimed != slot {
+                return Err(format!(
+                    "reservation_slot_mismatch: requested slot {claimed}, host is assigning {slot}"
+                ));
+            }
+        }
+        if let Some(journal) = &self.reservation_journal {
+            journal.verify(request, remote, slot, now_ms)?;
+        }
         Ok(())
     }
+}
+
+/// One active seat in a frozen [`StartManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ActiveSeat {
+    /// Stable swarm slot.
+    pub slot: usize,
+    /// Hex transport identity holding the slot.
+    pub node: String,
+    /// Persistent entity id flown from tick zero.
+    pub entity: u64,
+}
+
+/// `StartV1`, field-for-field with the client half in PR #582.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StartManifest {
+    /// Supervisor-owned attempt generation.
+    pub attempt_id: String,
+    /// Host swarm seed. Carried for provenance; the client does not compare it
+    /// to its distinct 32-byte universe seed.
+    pub seed: u64,
+    /// Membership freeze tick; zero in this lobby cut.
+    pub tick: u64,
+    /// Configured seat namespace, including inactive seats.
+    pub island_seats: u16,
+    /// Bots and humans connected when membership froze.
+    pub active: Vec<ActiveSeat>,
+    /// This subject's host-chosen frozen witness ring.
+    pub witness_recipients: Vec<usize>,
+    /// Active run duration after Start, in ticks.
+    pub duration_ticks: u64,
 }
 
 /// The host's answer to a [`JoinRequest`].
@@ -558,6 +718,9 @@ pub enum JoinReply {
     Accept {
         /// The swarm slot assigned to this peer.
         index: usize,
+        /// Frozen active membership. A bare nine-byte accept remains the
+        /// compatibility form and carries `None`.
+        manifest: Option<StartManifest>,
     },
     /// The host refuses the join; the reason names itself.
     Reject {
@@ -572,10 +735,15 @@ impl JoinReply {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            Self::Accept { index } => {
+            Self::Accept { index, manifest } => {
                 out.push(0);
                 let index = u64::try_from(*index).unwrap_or(u64::MAX);
                 out.extend_from_slice(&index.to_le_bytes());
+                if let Some(manifest) = manifest {
+                    out.extend_from_slice(
+                        &serde_json::to_vec(manifest).expect("StartManifest serializes"),
+                    );
+                }
             }
             Self::Reject { reason } => {
                 out.push(1);
@@ -594,12 +762,17 @@ impl JoinReply {
                 let Some(rest) = bytes.get(1..9) else {
                     return Err("accept truncated");
                 };
-                Ok(Self::Accept {
-                    index: usize::try_from(u64::from_le_bytes(
-                        rest.try_into().expect("eight bytes"),
-                    ))
-                    .map_err(|_| "accept index overflow")?,
-                })
+                let index =
+                    usize::try_from(u64::from_le_bytes(rest.try_into().expect("eight bytes")))
+                        .map_err(|_| "accept index overflow")?;
+                let manifest = match bytes.get(9..) {
+                    None | Some([]) => None,
+                    Some(payload) => Some(
+                        serde_json::from_slice(payload)
+                            .map_err(|_| "accept manifest did not decode")?,
+                    ),
+                };
+                Ok(Self::Accept { index, manifest })
             }
             Some(1) => {
                 let Some(&len) = bytes.get(1) else {
@@ -797,6 +970,7 @@ mod tests {
             client_rev: "abc123".to_owned(),
             session_id: Some("018f8f4e-5c90-7abc-8123-000000000001".to_owned()),
             token: Some(vec![1, 2, 3, 4]),
+            slot: Some(7),
         };
         assert_eq!(JoinRequest::decode(&full.encode()), Ok(full.clone()));
 
@@ -849,11 +1023,13 @@ mod tests {
                 orrery_protocol::IssuerKeyId::new(41),
                 issuer_secret.public(),
             )),
+            reservation_journal: None,
         };
         let invited = JoinRequest {
             client_rev: "pinned-rev".to_owned(),
             session_id: Some(session.to_owned()),
             token: Some(signed_token(&issuer_secret, 41, dialler, NOW_MS - 1_000)),
+            slot: None,
         };
         assert_eq!(admission.judge_at(&invited, &dialler, NOW_MS), Ok(()));
 
@@ -915,10 +1091,139 @@ mod tests {
         );
     }
 
+    fn reservation_path(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "p1-swarm-{name}-{}-{}-{nonce}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    /// #583's load-bearing mutation: the token is valid for this node and
+    /// session, but the request edits the admission-granted seat. The journal
+    /// is authoritative and the host refuses instead of correcting it.
+    #[test]
+    fn valid_token_for_a_different_reserved_slot_is_refused() {
+        const NOW_MS: u64 = 1_756_000_000_000;
+        let issuer = iroh_base::SecretKey::from_bytes(&[0x61; 32]);
+        let dialler = iroh_base::SecretKey::from_bytes(&[0x62; 32]).public();
+        let session = "018f8f4e-5c90-7abc-8123-000000000083";
+        let path = reservation_path("wrong-slot");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!([{
+                "attempt_id": "attempt-live",
+                "slot": 4,
+                "session_id": session,
+                "node": dialler.to_string(),
+                "expires_at": NOW_MS / 1_000 + 60
+            }]))
+            .expect("journal serializes"),
+        )
+        .expect("journal written");
+        let admission = Admission {
+            issuer: Some(orrery_protocol::IssuerKey::new(
+                orrery_protocol::IssuerKeyId::new(583),
+                issuer.public(),
+            )),
+            reservation_journal: Some(ReservationJournal {
+                path: path.clone(),
+                attempt_id: "attempt-live".to_owned(),
+            }),
+            ..Admission::default()
+        };
+        let request = JoinRequest {
+            client_rev: "test".to_owned(),
+            session_id: Some(session.to_owned()),
+            token: Some(signed_token(&issuer, 583, dialler, NOW_MS - 1_000)),
+            slot: Some(5),
+        };
+        let reason = admission
+            .judge_at_for_slot(&request, &dialler, 5, NOW_MS)
+            .expect_err("a valid node token does not authorize another seat");
+        assert_eq!(
+            reason,
+            "reservation_slot_mismatch: requested slot 5, journal reserved 4"
+        );
+        std::fs::remove_file(path).expect("journal removed");
+    }
+
+    /// Journal availability is part of admission, never an optional hint.
+    #[test]
+    fn unreadable_reservation_journal_refuses_the_join() {
+        const NOW_MS: u64 = 1_756_000_000_000;
+        let issuer = iroh_base::SecretKey::from_bytes(&[0x63; 32]);
+        let dialler = iroh_base::SecretKey::from_bytes(&[0x64; 32]).public();
+        let path = reservation_path("unreadable");
+        std::fs::create_dir(&path).expect("directory stands in for unreadable file");
+        let admission = Admission {
+            issuer: Some(orrery_protocol::IssuerKey::new(
+                orrery_protocol::IssuerKeyId::new(584),
+                issuer.public(),
+            )),
+            reservation_journal: Some(ReservationJournal {
+                path: path.clone(),
+                attempt_id: "attempt-live".to_owned(),
+            }),
+            ..Admission::default()
+        };
+        let request = JoinRequest {
+            client_rev: "test".to_owned(),
+            session_id: Some("018f8f4e-5c90-7abc-8123-000000000084".to_owned()),
+            token: Some(signed_token(&issuer, 584, dialler, NOW_MS - 1_000)),
+            slot: Some(4),
+        };
+        let reason = admission
+            .judge_at_for_slot(&request, &dialler, 4, NOW_MS)
+            .expect_err("journal failure must fail closed");
+        assert!(
+            reason.starts_with("reservation_journal_unreadable:"),
+            "named refusal, got: {reason}"
+        );
+        std::fs::remove_dir(path).expect("directory removed");
+    }
+
     #[test]
     fn join_replies_round_trip_both_arms() {
-        let accept = JoinReply::Accept { index: 32 };
+        let accept = JoinReply::Accept {
+            index: 32,
+            manifest: None,
+        };
         assert_eq!(JoinReply::decode(&accept.encode()), Ok(accept.clone()));
+
+        let manifest = StartManifest {
+            attempt_id: "attempt-7".to_owned(),
+            seed: 99,
+            tick: 0,
+            island_seats: 8,
+            active: vec![ActiveSeat {
+                slot: 4,
+                node: "ab".repeat(32),
+                entity: 5,
+            }],
+            witness_recipients: vec![0, 1, 2],
+            duration_ticks: 54_000,
+        };
+        let started = JoinReply::Accept {
+            index: 4,
+            manifest: Some(manifest),
+        };
+        assert_eq!(JoinReply::decode(&started.encode()), Ok(started));
+        let mut broken_manifest = JoinReply::Accept {
+            index: 4,
+            manifest: None,
+        }
+        .encode();
+        broken_manifest.extend_from_slice(b"{");
+        assert_eq!(
+            JoinReply::decode(&broken_manifest),
+            Err("accept manifest did not decode"),
+            "trailing bytes are a manifest, never ignored padding"
+        );
 
         let reject = JoinReply::Reject {
             reason: "client rev pinned out".to_owned(),
