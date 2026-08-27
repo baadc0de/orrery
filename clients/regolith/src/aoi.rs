@@ -30,8 +30,10 @@
 //! It is derived from the same two facts the host uses, not invented here:
 //!
 //! * the interest cell edge — `orrery_games::regolith::CAMPAIGN_CELL_EDGE_M`,
-//!   1152 m since #545 sized it from the weapon table's longest reach rather
-//!   than the reach that happened to exist when #532 last touched it, the
+//!   512 m since #532 and deliberately still 512 m after #545, which cut the
+//!   weapon table to fit this edge rather than widening the edge to fit a
+//!   long gun — a block that swallowed the encounter would delete the
+//!   interest churn this fade exists to make legible. It is the
 //!   same constant `CampaignRuntime::committed_cell` divides by when it tells
 //!   the host which cell this craft is in (`campaign.rs:544`, `campaign.rs:1045`);
 //! * the 27-cell topology — the AOI is the committed cell plus its 26

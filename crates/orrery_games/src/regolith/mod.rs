@@ -133,7 +133,7 @@ pub const MAX_TARGET_RADIUS_MM: i64 = {
 /// The longest centre-to-centre range at which the ruleset will still resolve
 /// a shot, in millimetres: the widest weapon envelope plus the widest target.
 ///
-/// 940 m at the current table — Heavy's 700 m optimal plus 200 m falloff plus
+/// 400 m at the current table — Heavy's 300 m optimal plus 60 m falloff plus
 /// a 40 m Large rock.
 pub const MAX_ENGAGEMENT_RANGE_MM: i64 =
     weapon::MAX_WEAPON_REACH_MM.saturating_add(MAX_TARGET_RADIUS_MM);
@@ -142,37 +142,55 @@ pub const MAX_ENGAGEMENT_RANGE_MM: i64 =
 ///
 /// This restates `orrery_spatial::SpatialConfig`'s 0.10 default (D16) in the
 /// integer form the sizing below needs. `orrery_games` does not link Bevy, so
-/// the two cannot be one declaration; the client's
+/// the two cannot be one declaration; `orrery`'s
 /// `the_campaign_aoi_uses_the_frameworks_own_hysteresis_margin` pins them
 /// together from the side that sees both.
 pub const CAMPAIGN_HYSTERESIS_PER_MILLE: i64 = 100;
+
+/// Commitment lags the campaign's engagement budget must absorb.
+///
+/// `docs/01-spatial-model.md` §7 states the guarantee as `edge − m`, which
+/// accounts for **one** hysteretic commitment: the observer's. Interest
+/// membership compares two *committed* cells, though, and
+/// `orrery_spatial::hysteresis` latches each entity's commitment
+/// independently — "the committed [`Cell`] lags the geometric cell by at most
+/// the hysteresis margin", per entity. So the target can sit a full margin
+/// inside the observer's block geometrically while still being committed to
+/// the cell outside it, and the two lags compose adversarially.
+///
+/// This is why the campaign budgets `edge − 2m` rather than shaving an
+/// arbitrary safety factor off `edge − m`: the headroom is a mechanism, not a
+/// fudge. It is also why Stock's old 20.8 m of margin was not margin at all.
+pub const CAMPAIGN_COMMITMENT_LAGS: i64 = 2;
 
 /// Cell edges the campaign may choose from: whole multiples of the framework
 /// default, so the campaign grid stays a coarsening of the framework's.
 const CAMPAIGN_EDGE_QUANTUM_MM: i64 = 128_000;
 
-/// The smallest campaign cell edge whose *guaranteed* AOI radius still covers
-/// the ruleset's longest engagement, in metres.
+/// The smallest campaign cell edge whose engagement budget still covers the
+/// ruleset's longest engagement, in metres.
 ///
-/// The 27-cell AOI's guaranteed visibility radius is not the cell edge:
-/// commitment is hysteretic, so it lags position by up to `m`, and
-/// `docs/01-spatial-model.md` §7 gives the consequence as `edge − m`. With
-/// `m = edge / 10` that is `0.9 · edge`, so covering a reach `r` needs
+/// With the budget at `edge − 2m` and `m = edge / 10` that is `0.8 · edge`,
+/// so covering an engagement range `r` needs
 ///
 /// ```text
-/// 0.9 · edge ≥ r        =>        edge ≥ r · 10 / 9
+/// 0.8 · edge ≥ r        =>        edge ≥ r · 10 / 8
 /// ```
 ///
-/// rounded up to the next whole framework cell. This is derived from the
-/// weapon table, not measured against one weapon at one moment: #520 sized
-/// the edge to the stock weapon's 400 m and #545 arrived one weapon later,
-/// when Heavy's 900 m envelope out-ranged the guarantee by roughly 2×.
+/// rounded up to the next whole framework cell.
+///
+/// **This is a diagnostic, not the edge.** The campaign edge is held at 512 m
+/// deliberately (see [`CAMPAIGN_CELL_EDGE_M`]); what this figure does is name
+/// the edge a table would *need*, so that a weapon growing past the budget
+/// fails with an actionable number instead of a bare inequality. #520 sized
+/// the edge to the stock weapon's 400 m and #545 arrived one weapon later, so
+/// the bound is derived from the whole table rather than from whichever
+/// weapon was longest when someone last looked.
 pub const CAMPAIGN_MIN_CELL_EDGE_M: f64 = {
-    let guaranteed_per_mille = 1_000 - CAMPAIGN_HYSTERESIS_PER_MILLE;
+    let budget_per_mille = 1_000 - CAMPAIGN_COMMITMENT_LAGS * CAMPAIGN_HYSTERESIS_PER_MILLE;
     // Integer division truncates, so round the quotient up before quantising:
     // an edge one millimetre short of the requirement is still short.
-    let needed_mm =
-        (MAX_ENGAGEMENT_RANGE_MM * 1_000 + guaranteed_per_mille - 1) / guaranteed_per_mille;
+    let needed_mm = (MAX_ENGAGEMENT_RANGE_MM * 1_000 + budget_per_mille - 1) / budget_per_mille;
     let quantised = needed_mm.div_euclid(CAMPAIGN_EDGE_QUANTUM_MM) * CAMPAIGN_EDGE_QUANTUM_MM;
     let quantised = if quantised < needed_mm {
         quantised + CAMPAIGN_EDGE_QUANTUM_MM
@@ -182,33 +200,56 @@ pub const CAMPAIGN_MIN_CELL_EDGE_M: f64 = {
     quantised as f64 / 1_000.0
 };
 
-/// Campaign interest-cell edge, sized from the weapon table's longest reach.
+/// Campaign interest-cell edge. **The weapon table is sized to this, not the
+/// other way round.**
 ///
-/// The framework default is 128 m, but a 27-cell AOI at that edge guarantees
-/// only 115.2 m of visibility around the observer — inside every weapon's
-/// envelope. This edge must be at least [`CAMPAIGN_MIN_CELL_EDGE_M`], which
-/// the weapon table derives; it may be larger only at replication cost, so it
-/// is declared here rather than aliased, and
-/// `every_weapons_reach_fits_inside_the_campaign_aoi_guarantee` fails if the
-/// declared edge ever falls behind the table.
-pub const CAMPAIGN_CELL_EDGE_M: f64 = 1_152.0;
+/// The framework default is 128 m, whose 27-cell AOI guarantees only 115.2 m
+/// around the observer — inside every weapon's envelope. 512 m is the
+/// coarsening that gives the campaign a usable engagement budget while
+/// keeping the block small enough that craft actually cross cells.
+///
+/// That crossing is the point. The campaign is the shakedown for interest
+/// churn under jitter and loss: contacts entering and leaving the set,
+/// commitment latching and unlatching, replicas expiring and re-installing. A
+/// block wide enough to swallow the encounter — the crowd orbits at roughly
+/// 2.5 km — would delete that test surface, so widening the edge to fit a
+/// long gun is the wrong trade. When a weapon does not fit, the weapon
+/// yields: `every_weapons_reach_fits_inside_the_campaign_aoi_guarantee`
+/// fails, and [`CAMPAIGN_MIN_CELL_EDGE_M`] names what it would have cost.
+pub const CAMPAIGN_CELL_EDGE_M: f64 = 512.0;
 
 /// The radius around an observer in which the 27-cell AOI is *guaranteed* to
 /// hold a body, in metres, for a given cell edge.
 ///
-/// `edge − m` with `m` the hysteresis margin — the worst case in which
-/// commitment lags position by a full margin
-/// (`docs/01-spatial-model.md` §7).
+/// `edge − m` with `m` the hysteresis margin — the observer's commitment
+/// lagging position by a full margin (`docs/01-spatial-model.md` §7).
+/// 460.8 m at the campaign edge.
 #[must_use]
 pub fn campaign_guaranteed_aoi_radius_m(cell_edge_m: f64) -> f64 {
     cell_edge_m * (1_000 - CAMPAIGN_HYSTERESIS_PER_MILLE) as f64 / 1_000.0
 }
 
-/// Regolith v16's rules identity: v15's collision order, plus a campaign cell
-/// edge derived from the weapon table's longest reach (#545). The edge decides
-/// which cell a craft commits to, so a client on the old edge and a host on
-/// the new one disagree about interest membership — that is a wire-visible
-/// change, not a private constant.
+/// The centre-to-centre range the weapon table is allowed to occupy, in
+/// metres, for a given cell edge: `edge − 2m`.
+///
+/// The guarantee above minus one further commitment lag, because the target
+/// latches its own commitment too — see [`CAMPAIGN_COMMITMENT_LAGS`]. 409.6 m
+/// at the campaign edge, against a 400 m table.
+#[must_use]
+pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
+    cell_edge_m * (1_000 - CAMPAIGN_COMMITMENT_LAGS * CAMPAIGN_HYSTERESIS_PER_MILLE) as f64
+        / 1_000.0
+}
+
+/// Regolith v16's rules identity: v15's collision order, plus the #545 weapon
+/// reaches. Heavy's envelope out-ranged the campaign AOI's guarantee by
+/// roughly 2x and Stock sat 20.8 m inside it, so both were cut to fit the
+/// engagement budget; the cell edge is unchanged at 512 m.
+///
+/// Reach is adjudicated — `projectile_resolution` breaks a lock on it — so
+/// v15 and v16 genuinely differ and a mixed session would disagree about
+/// shots. Unlike a cell-edge change this does **not** move interest
+/// membership, so the blast radius stops at adjudication.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
     version: 16,
     digest: [0x66; 32],

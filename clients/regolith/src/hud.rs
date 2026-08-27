@@ -2005,6 +2005,10 @@ mod tests {
 
     #[test]
     fn a_full_track_reports_the_flight_it_has_left() {
+        // Half of Stock's optimal, read off the table: #545 cut Stock to
+        // 240 m and the literal 250 m this used stopped being "inside
+        // optimal" without the assertion below noticing.
+        let inside_optimal_m = WeaponKind::Stock.weapon().optimal_mm as f64 / 2_000.0;
         let mut tracks = ProjectileTracks::default();
         tracks.observe(&[in_flight(7)]);
         let view = CombatView {
@@ -2015,11 +2019,14 @@ mod tests {
                 progress: 30,
                 acquired: 1,
             },
-            target: Some(craft_view(THEM, Archetype::Cruiser, 250.0)),
+            target: Some(craft_view(THEM, Archetype::Cruiser, inside_optimal_m)),
             rock_target: None,
         };
         let line = target_relation(&view, &tracks);
-        assert!(line.contains("250 m"), "{line}");
+        assert!(
+            line.contains(&format!("{} m", inside_optimal_m as i64)),
+            "{line}"
+        );
         assert!(line.contains("inside optimal"), "{line}");
         assert!(line.contains("flight 7 t"), "{line}");
         assert_eq!(

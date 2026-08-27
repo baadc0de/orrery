@@ -1960,8 +1960,12 @@ mod ruleset_agreement {
     /// Every scenario shoots from the origin, standing still, at optimal
     /// range, so the range term is zero and the tracking term is the only
     /// thing moving.
-    const RANGE_MM: i64 = 300_000;
     const WEAPON: WeaponKind = WeaponKind::Stock;
+    /// The weapon's own optimal range, not the number that was its optimal
+    /// range when this was written: #545 cut Stock to 240 m and a literal
+    /// 300_000 here silently became a falloff shot, which is not what any of
+    /// these fixtures claim to be measuring.
+    const RANGE_MM: i64 = WEAPON.weapon().optimal_mm;
 
     /// A target at `RANGE_MM` along `+X`, closing sideways at `transverse_mms`.
     fn target_at(transverse_mms: i64) -> Craft {

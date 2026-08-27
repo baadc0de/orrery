@@ -82,8 +82,11 @@ impl WeaponKind {
                 damage_spread: 4,
                 rolls: 1,
                 cooldown_ticks: 20,
-                optimal_mm: 300_000,
-                falloff_mm: 100_000,
+                // #545: the original 300/100 shape, scaled by 0.8 to bring
+                // the baseline weapon inside the campaign's engagement
+                // budget with real margin rather than the 20.8 m it had.
+                optimal_mm: 240_000,
+                falloff_mm: 80_000,
                 projectile_speed_mms: 300_000,
                 tracking_urad_per_sec: 180_000,
             },
@@ -102,8 +105,14 @@ impl WeaponKind {
                 damage_spread: 12,
                 rolls: 1,
                 cooldown_ticks: 90,
-                optimal_mm: 700_000,
-                falloff_mm: 200_000,
+                // #545: 900 m out-ranged the campaign AOI's guarantee by
+                // roughly 2x. The cut comes almost entirely out of the
+                // falloff tail rather than the optimal band: inside
+                // `optimal_mm` Heavy still shoots flat further than anything
+                // else in the table, and the 200 m tail it loses was the
+                // part a 60_000 urad/s turret could rarely convert anyway.
+                optimal_mm: 300_000,
+                falloff_mm: 60_000,
                 projectile_speed_mms: 180_000,
                 tracking_urad_per_sec: 60_000,
             },

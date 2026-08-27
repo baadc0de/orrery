@@ -2968,10 +2968,18 @@ mod tests {
             "the campaign fixture must begin with a visible contact"
         );
 
-        const STOCK_REACH_MM: u128 = 406_000;
+        // Stock's own envelope against an interceptor, read off the ruleset
+        // table rather than restated: #545 cut Stock from 400 m to 320 m and a
+        // hand-copied 406_000 would have quietly stopped meaning "stock reach".
+        let stock_reach_mm = (orrery_games::regolith::weapon::WeaponKind::Stock
+            .weapon()
+            .reach_mm()
+            + orrery_games::regolith::archetype::Archetype::Interceptor
+                .limits()
+                .radius_mm) as u128;
         let mut phase = [0u128; 6];
         let (receiver_pos, _) = crate::bot::spawn_pose(8, 9);
-        let mut saw_far_contact = false;
+        let mut saw_far_departure = false;
         for tick in 0..45 * TICK_HZ {
             swarm.tick_once(tick, 3, &mut phase);
             if tick % TICK_HZ == TICK_HZ - 1 {
@@ -2980,35 +2988,21 @@ mod tests {
                     let in_scope = interest.contains(&bot.cell().expect("committed"));
                     let distance =
                         orrery_games::regolith::distance_mm(bot.craft().pos, receiver_pos);
-                    if distance <= STOCK_REACH_MM {
+                    if distance <= stock_reach_mm {
                         assert!(
                             in_scope,
                             "contact {} left scope at tick {tick}, only {distance} mm from the stationary player",
                             bot.entity().0,
                         );
-                    } else {
-                        saw_far_contact = true;
+                    } else if !in_scope {
+                        saw_far_departure = true;
                     }
                 }
             }
         }
         assert!(
-            saw_far_contact,
-            "the fixture must carry a contact past interaction range, or the guard \
-             above never had a choice to make"
-        );
-        // #545 sized the campaign edge from the weapon table's longest reach
-        // rather than the stock weapon's, which widened it from 512 m to
-        // 1152 m; a 45 s run of this fixture no longer produces a departure at
-        // all. The interest set is still bounded, and saying so here is what
-        // keeps the clause above from being satisfied by an AOI that simply
-        // contains the universe.
-        let (coords, level) = receiver_cell.coords();
-        let far = CellId::from_cell_coords(coords + glam::IVec3::new(2, 0, 0), level)
-            .expect("two cells over is addressable");
-        assert!(
-            !interest.contains(&far),
-            "the 27-cell block must still end somewhere"
+            saw_far_departure,
+            "the test must still exercise a genuine AOI departure after interaction range"
         );
     }
 
