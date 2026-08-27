@@ -28,20 +28,15 @@
 //!
 //! ## Sanitising
 //!
-//! The nickname is player-supplied text that the client draws. Admission's own
-//! rule is `[^\t\r\n]{1,32}` — 1 to 32 characters, no tabs or newlines — and
-//! [`sanitise_nickname`] stays consistent with it and then goes further,
-//! because "no tabs" is not the same as "safe to lay out": other control
-//! characters and the Unicode bidi overrides can reorder or blank a line.
+//! A roster label can originate with a player or the campaign's generated
+//! crowd. Both take the same defensive display path before anything reaches
+//! Bevy text.
 //!
 //! ## The font gap, stated rather than hidden
 //!
 //! No font asset is loaded, so Bevy's built-in ASCII-only face is what draws
-//! these labels (#526). A nickname containing non-ASCII letters will render as
-//! boxes until a font ships (#347). That is left as-is on purpose: mangling a
-//! player's chosen name into `????` destroys the identity the label exists to
-//! carry, and a box at least says "this glyph could not be drawn" rather than
-//! asserting a character nobody typed.
+//! these labels (#526). Unsupported glyphs are removed, never replaced with a
+//! question-mark string that could be mistaken for a real name.
 
 use std::collections::BTreeMap;
 use std::sync::{mpsc, Mutex};
@@ -94,17 +89,15 @@ pub fn entity_of_slot(slot: usize) -> PersistId {
 
 /// A nickname reduced to something safe to draw, or `None` if nothing is left.
 ///
-/// Consistent with admission's `[^\t\r\n]{1,32}` and stricter:
+/// Consistent with admission's display filter and defensive against a stale or
+/// independently implemented service:
 ///
-/// * every control character goes, not only tab and the newlines — a bell or a
-///   `\x0c` in a UI string is at best noise and at worst a layout break;
-/// * the Unicode bidi and zero-width formatting characters go, because they
-///   are the ones that can silently reorder a line or hide text inside a name
-///   that looks shorter than it is;
+/// * only visible ASCII survives. The default font has no contract for glyphs
+///   beyond it (#526), and ASCII also excludes controls, bidi overrides and
+///   zero-width formatting characters in one rule;
 /// * surrounding whitespace is trimmed, so a name padded to look longer does
 ///   not push its neighbours around;
-/// * the result is bounded at [`NICKNAME_MAX_CHARS`] *characters*, counted as
-///   `char`s rather than bytes so a multi-byte name is not cut mid-sequence.
+/// * the result is bounded at [`NICKNAME_MAX_CHARS`] characters.
 ///
 /// `None` means **no label**, and the caller must draw nothing rather than
 /// substitute a placeholder.
@@ -112,24 +105,14 @@ pub fn entity_of_slot(slot: usize) -> PersistId {
 pub fn sanitise_nickname(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
-        .filter(|glyph| !glyph.is_control() && !is_layout_hazard(*glyph))
+        .filter(char::is_ascii)
+        .filter(|glyph| !glyph.is_ascii_control())
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
     }
     Some(trimmed.chars().take(NICKNAME_MAX_CHARS).collect())
-}
-
-/// Zero-width and directional formatting characters, which are the ones that
-/// can rewrite a line's appearance without adding a visible glyph.
-fn is_layout_hazard(glyph: char) -> bool {
-    matches!(glyph,
-        '\u{200B}'..='\u{200F}'
-        | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{2069}'
-        | '\u{FEFF}')
 }
 
 /// The labels this client currently believes in.
@@ -220,6 +203,35 @@ mod tests {
         }
     }
 
+    /// #529's acceptance boundary is an opponent, not merely the exterior
+    /// craft that admission already named. Pin the complete slot-to-label
+    /// resolution so a full service response cannot collapse back to one seat.
+    #[test]
+    fn a_complete_campaign_roster_resolves_every_opponent() {
+        let mut roster = ShipRoster::default();
+        roster.accept(&RosterResponse {
+            roster: (0..=8)
+                .map(|slot| RosterRow {
+                    slot,
+                    nickname: if slot == 8 {
+                        "ada".to_owned()
+                    } else {
+                        format!("test-{}", slot + 1)
+                    },
+                })
+                .collect(),
+        });
+
+        assert_eq!(roster.len(), 9);
+        for slot in 0..8 {
+            assert!(
+                roster.label(entity_of_slot(slot)).is_some(),
+                "opponent slot {slot} must resolve to a display label"
+            );
+        }
+        assert_eq!(roster.label(entity_of_slot(8)), Some("ada"));
+    }
+
     /// A missing label must read as absent. Nothing here may invent a name.
     #[test]
     fn an_unlabelled_craft_gets_no_label_rather_than_a_placeholder() {
@@ -301,21 +313,22 @@ mod tests {
         // must not be able to break the layout either.
         assert_eq!(sanitise_nickname("a\tb"), Some("ab".to_owned()));
         assert_eq!(sanitise_nickname("a\u{7}b"), Some("ab".to_owned()));
-        // Bidi overrides and zero-width joiners cannot survive to the screen.
+        // Bidi overrides, zero-width joiners and unsupported font glyphs cannot
+        // survive to the screen.
         assert_eq!(
             sanitise_nickname("ada\u{202E}bob"),
             Some("adabob".to_owned())
         );
         assert_eq!(sanitise_nickname("a\u{200B}b"), Some("ab".to_owned()));
+        assert_eq!(sanitise_nickname("Ren\u{e9}e"), Some("Rene".to_owned()));
         // Nothing drawable means no label, never an empty one.
         assert_eq!(sanitise_nickname(""), None);
         assert_eq!(sanitise_nickname("   "), None);
         assert_eq!(sanitise_nickname("\u{FEFF}"), None);
-        // The bound is characters, and the cut is never mid-character.
-        let long = "\u{e9}".repeat(64);
-        let cut = sanitise_nickname(&long).expect("accented letters are drawable text");
+        // The bound is characters.
+        let long = "x".repeat(64);
+        let cut = sanitise_nickname(&long).expect("ASCII letters are drawable text");
         assert_eq!(cut.chars().count(), NICKNAME_MAX_CHARS);
-        assert!(cut.is_char_boundary(cut.len()));
     }
 }
 

@@ -424,7 +424,7 @@ Every failure a volunteer can actually hit, and what they see:
 | operator closed it | 403 | `campaign_closed` | "This campaign is closed; pick another." |
 | relay disk below the mint floor | 503 | `admissions_paused` | "Campaigns are temporarily unavailable while the operator makes room — nothing you did was wrong. Try again later." (§10.3; the listing shows `paused` before they ever click) |
 | someone else is playing | 409 | `campaign_busy` | "In use — try again in about N minutes." (`retry_after_s`) |
-| empty/tab-bearing/33-char nickname | 422 | `bad_nickname` | "Nicknames are 1–32 characters, no tabs or newlines." |
+| empty/non-ASCII/control-bearing/33-char nickname | 422 | `bad_nickname` | "Nicknames are 1–32 visible ASCII characters, with no tabs or newlines." |
 | malformed node key | 422 | `bad_node` | "This build sent a bad transport key — reinstall the client." |
 | wrong build | 403 | `client_rev_mismatch` | "This campaign needs build 54a8ee81 — download the current build." (checked at step 1 against the request's `client_rev`, so the refusal happens *before* the harness ever binds; the harness re-checks at join anyway, exterior.rs:520-526) |
 | harness would not start, ssh to campaign.host failed, or no listening file | 503 | `host_failed` | "The host could not start your session — tell the operator, nothing you did was wrong." |
@@ -546,9 +546,17 @@ not that identity.
 **A label, deliberately not an identity.** It is stored as the
 `volunteer_label` field of the campaign's invite ledger (the mint's `--label`,
 §3.2 step 7) and echoed into `joins.jsonl`; it appears in the operator's
-support view and nowhere in any signed or banked artifact. Constraints are the
-ledger's own: nonempty, ≤32 chars by service policy, no tab/CR/LF
-(`invite.rs:425-427` refuses the rest at mint).
+support view and nowhere in any signed or banked artifact. Display labels are
+nonempty visible ASCII and at most 32 characters, so the default client font
+can draw every accepted nickname and hostile controls never reach layout. The
+client applies the same filter defensively to roster responses.
+
+The live roster names the complete campaign flock: harness slots take stable
+`<campaign-id>-<ordinal>` display labels derived from the same control section,
+and the exterior slot takes the admitted nickname. This remains an in-memory
+presentation sideband, not simulation state; when the session ends the whole
+roster disappears. A missing row still means no label, never a generated
+placeholder at the client.
 
 Nicknames **collide freely**. Two volunteers named `ada` are two rows with
 two accounts; the operator disambiguates by session id and join time, which

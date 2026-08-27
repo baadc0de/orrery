@@ -446,8 +446,9 @@ impl Plugin for RegolithSkinPlugin {
             .add_systems(Update, capture_tracer_geometry.after(hud::sync_tracers))
             .add_systems(
                 Update,
-                capture_aoi_census
+                (capture_aoi_census, capture_ship_label_census)
                     .after(aoi::sync_aoi_fade)
+                    .after(sync_ship_labels)
                     .run_if(resource_exists::<GeometryCapture>)
                     .run_if(on_timer(Duration::from_secs(1))),
             )
@@ -950,6 +951,35 @@ fn capture_aoi_census(
         census.line(session.aoi_edge_m()),
         zoom.height_m(),
         rock_census(counts, rock_bodies.iter().count()),
+    );
+}
+
+/// Prints what the render world actually labelled, not merely what the last
+/// roster response promised. This is the headless proof for #529: a body may be
+/// present while its sideband label is absent or while it is off screen, and
+/// those cases must remain visible as `unlabelled` rather than being inferred
+/// away from the roster length.
+fn capture_ship_label_census(
+    bodies: Query<&CoreEntity, With<CraftBodyComposition>>,
+    labels: Query<(&ShipLabel, &Text)>,
+) {
+    let craft: BTreeSet<PersistId> = bodies.iter().map(|body| body.0).collect();
+    let mut names: Vec<(PersistId, &str)> = labels
+        .iter()
+        .filter_map(|(tag, text)| craft.contains(&tag.0).then_some((tag.0, text.as_str())))
+        .collect();
+    names.sort_unstable_by_key(|(entity, _)| *entity);
+    let resolved = names
+        .iter()
+        .map(|(entity, name)| format!("{}={name}", entity.0))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "ship_label_census craft={} labelled={} unlabelled={} resolved=[{}]",
+        craft.len(),
+        names.len(),
+        craft.len().saturating_sub(names.len()),
+        resolved,
     );
 }
 

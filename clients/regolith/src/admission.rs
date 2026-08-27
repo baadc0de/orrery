@@ -572,7 +572,11 @@ fn sync_nickname(
 }
 
 fn valid_nickname(nickname: &str) -> bool {
-    !nickname.is_empty() && nickname.chars().count() <= 32 && !nickname.contains(['\t', '\r', '\n'])
+    !nickname.trim().is_empty()
+        && nickname.chars().count() <= 32
+        && nickname
+            .chars()
+            .all(|glyph| glyph.is_ascii_graphic() || glyph == ' ')
 }
 
 fn rebuild_ui(
@@ -1141,6 +1145,15 @@ mod tests {
         // would cost more than it proves.
         app.add_systems(Update, (sync_nickname, rebuild_ui).chain());
         app.update();
+    }
+
+    #[test]
+    fn nickname_entry_accepts_only_text_the_default_font_can_draw() {
+        assert!(valid_nickname("ada"));
+        assert!(valid_nickname("Ada 7"));
+        assert!(!valid_nickname("   "));
+        assert!(!valid_nickname("Ren\u{e9}e"));
+        assert!(!valid_nickname("a\u{7}b"));
     }
 
     fn args(values: &[&str]) -> Vec<OsString> {
