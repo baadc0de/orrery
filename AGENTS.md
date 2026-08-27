@@ -139,6 +139,14 @@ describe those hosted runs and their cache posture, not this workstation or a
 future change: time a particular change where it will run and record the
 runner and cache state with the result.
 
+**And `gates` has already outgrown its entry there.** #585 re-measured it on
+2026-08-27 over 22 real pull-request runs — still cold and cacheless — at a
+mean of **1276 s** (median 1320, range 1004–1380, sd 112). #171's 656 s
+describes the 2026-08-20 tree, and the lane has roughly doubled since. The same
+issue priced an S3 remote for it and did not wire one; the numbers and the three
+reasons are in the `gates:` block of `.github/workflows/ci.yml` and in
+[docs/spikes/kache-remote-on-the-gates-lane.md](docs/spikes/kache-remote-on-the-gates-lane.md).
+
 ### Twelve workspaces, and only one of them is "the" workspace
 
 `cargo test --workspace` reaches the root workspace. Each standalone tool

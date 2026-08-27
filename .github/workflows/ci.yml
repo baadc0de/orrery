@@ -470,15 +470,56 @@ jobs:
     # NO S3 KACHE REMOTE, AND THAT IS ON PURPOSE. #175 gave one to `clippy`
     # ($1.15 per hour of wall-clock saved) and measured `test` at $16.70 with a
     # hit rate that swung 63.7 % -> 89.4 % on an unchanged tree, then took it
-    # back out — see the long block on `test` below. `gates` has no measurement
-    # of its own either way, so it starts where #171 measured it: cold. Wiring
-    # a remote here on the assumption that it helps is exactly the move #175
-    # exists to warn against. A follow-up may measure it — this lane's shape
-    # (many small standalone-workspace builds, and it does link) is not
-    # `clippy`'s and not `test`'s, so neither result predicts it.
+    # back out — see the long block on `test` below. This lane's shape (many
+    # small standalone-workspace builds, and it does link) is not `clippy`'s and
+    # not `test`'s, so neither result predicted it.
+    #
+    # IT HAS NOW BEEN MEASURED. #585, 2026-08-27, on a throwaway branch that was
+    # never merged; full write-up in docs/spikes/kache-remote-on-the-gates-lane.md.
+    # Three warm runs on an unchanged tree, #175's protocol:
+    #
+    #   wall-clock  637 s / 719 s / 848 s   mean 735 s vs 1276 s cold = -42 %
+    #   hit rate    96.8 % / 97.4 % / 98.2 %   (stable to 1.4 points)
+    #   pulled      3.11 / 3.14 / 3.19 GiB, mean 3.380 GB
+    #   cost        $0.304 a run = $2.02 per hour of wall-clock saved
+    #               ($228/month at this lane's measured 26 runs/day)
+    #
+    # That PASSES #175's test — $2.02 against `clippy`'s accepted $1.15 and
+    # `test`'s rejected $16.70 — and it is still not wired, for three reasons
+    # the write-up argues in full: (1) $228/month is a ~9x increase in this
+    # repository's cloud bill and #175 established that as the owner's call;
+    # (2) across the three identical runs the wall-clock ROSE with the hit rate,
+    # 637 -> 719 -> 848 s, as aggregate remote open/setup grew 5 -> 6 -> 8 min
+    # — the -42 % is the best reading of a degrading series; and (3) it halves
+    # the disk headroom, 68.64 GiB free at peak cacheless (#171) against
+    # 36-39 GiB with a 20 GiB local store that evicts every run.
+    #
+    # THE FINDING WORTH ACTING ON IS FREE AND IS NOT THE REMOTE. 3578 of this
+    # lane's 4844 cacheable units are SAME-RUN duplicates: it compiles one
+    # dependency graph twelve times, once per standalone workspace. kache with
+    # NO remote and no Actions cache measured 1100 s — 176 s (14 %) off the cold
+    # lane, 0 bytes over the wire, $0, and at 76 ms/hit against the remote's
+    # 176-225 ms. The remote's marginal price over that arm is $3.00 an hour,
+    # not $2.02.
+    #
+    # Linking does NOT break the caching assumption here, which is what the
+    # earlier version of this comment could not say: it caps the hit rate at
+    # ~98 % (the residual misses are `orrery_regolith_client` and the big
+    # integration-test binaries, 1.2-1.6 GB each) but that is 5-14 min of
+    # compile work against ~1.2 h avoided. The cross-cloud round trip decides
+    # the economics, not the linker.
+    #
+    # RE-MEASURE when the runners move into eu-central-1 — the same trigger the
+    # `test` block records, and stronger here: egress goes to $0 and the
+    # open/setup latency that is 37-47 % of this lane's download time goes with
+    # it. Prove it then; do not assume it.
     runs-on: ubuntu-latest
-    # 656 s measured cold; 30 minutes is ~2.7x that, so a lane that hangs says
-    # so rather than burning the six-hour default.
+    # 1276 s measured cold on 2026-08-27 over 22 pull-request runs (#585); #171's
+    # 656 s is the 2026-08-20 tree and is stale. 30 minutes is ~1.4x the current
+    # cold mean and ~1.3x its slowest sample, so a lane that hangs still says so
+    # rather than burning the six-hour default — but this bound is no longer
+    # comfortable, and the next lane growth should raise it rather than discover
+    # it as a cancellation.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
