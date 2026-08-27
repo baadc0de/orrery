@@ -63,16 +63,16 @@ pub const NICKNAME_MAX_CHARS: usize = 32;
 /// One row of the campaign roster.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RosterRow {
-    /// The swarm slot this nickname joined on.
+    /// The swarm slot whose craft carries this display label.
     pub slot: usize,
-    /// The player-supplied nickname, unsanitised as the service holds it.
+    /// The generated or player-supplied label, unsanitised as the service holds it.
     pub nickname: String,
 }
 
 /// The body of `GET /v1/campaigns/<id>/roster`.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RosterResponse {
-    /// One row per live session. Empty is an ordinary answer.
+    /// One row per labelled craft in the live campaign. Empty is ordinary.
     #[serde(default)]
     pub roster: Vec<RosterRow>,
 }
