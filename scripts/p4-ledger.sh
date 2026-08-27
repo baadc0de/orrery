@@ -129,6 +129,14 @@ self_test() {
     || die 'self-test: #329 no longer has a shakedown report command'
   has 'cmd_freeze' \
     || die 'self-test: #329 no longer has a freeze-window verifier'
+  has 'validate_attempt_binding' \
+    || die 'self-test: the attempt binding is no longer checked; several humans in one attempt would be indistinguishable in the ledger'
+  has 'refuse_a_second_claim_on_one_seat' \
+    || die 'self-test: nothing refuses a second claim on one seat; one interval could be banked twice across appends'
+  has '.session.banked_minutes / 60' \
+    || die 'self-test: player_hours is no longer cross-checked against the signed interval; the attempt total could be copied onto a participant'
+  has 'connected_ticks * $per / 60' \
+    || die 'self-test: the per-seat connected span is no longer recomputed; a human seated for part of an attempt could bank all of it'
 
   # Functional half. The structural checks above cannot tell a clause that is
   # read from one that is read and ignored, and every case below costs
@@ -445,9 +453,285 @@ self_test() {
   grep -q 'freeze window: PASS' "$dir/freeze.out" \
     || die 'self-test: unchanged endpoint digests did not emit the named freeze pass'
 
+  # ── The attempt binding (#576) ────────────────────────────────────────────
+  #
+  # Named cases, because "a named fixture fails" is the only useful report a
+  # mutation check can produce. The property under test is exactly-once
+  # attribution and the `(attempt, slot, session_id, node)` binding — not the
+  # shape of a row, which a report can satisfy while charging one interval to
+  # two people or charging a human interval to a bot seat.
+  local bind_dir="$dir/binding" bind_passed=0
+  mkdir -p "$bind_dir"
+  export P4_LEDGER_FILE="$bind_dir/hours.jsonl"
+
+  local st_attempt=018f9000-0000-7000-8000-00000000d001
+  local st_sid_a=018f9000-0000-7000-8000-0000000000d1
+  local st_sid_b=018f9000-0000-7000-8000-0000000000d2
+
+  # A derived human contribution, in the shape `p4-attempt-accounting.py derive`
+  # emits: identity carries the attempt and the seat, `binding` names the
+  # exterior, and `player_hours` is this participant's own signed interval.
+  # $1 slot  $2 session id  $3 banked minutes  $4 secret byte  $5 platform
+  # $6 extra jq applied last, so a mutation can land on exactly one field.
+  st_derived() {
+    local slot=$1 session=$2 minutes=$3 secret=$4 platform=$5 extra=${6:-}
+    local out="$bind_dir/human-$slot-$secret.json"
+    jq -n --arg session "$session" --argjson minutes "$minutes" --arg platform "$platform" '{
+      session_id: $session,
+      wall_start: "2026-08-27T12:00:00Z", wall_end: "2026-08-27T13:00:00Z",
+      distinct_play_minutes: $minutes, banked_minutes: $minutes,
+      platform_triple: $platform, client_rev: "self-test",
+      ruleset_id: "52", ruleset_version: 16, pipeline_digest: "selftestpipeline",
+      actor: "human",
+      configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
+      observed_loss_pct: 3, observed_jitter_p50_ms: 100, observed_jitter_p99_ms: 100,
+      afk_seconds: 0, afk_capped: false, impairment_mismatch: false
+    }' | python3 "$ROOT/scripts/sign-campaign-measurement-fixture.py" --secret-byte "$secret" \
+       > "$bind_dir/row-$slot-$secret.json"
+    local node
+    node=$(jq -r .measurement_node "$bind_dir/row-$slot-$secret.json")
+    jq -n --slurpfile row "$bind_dir/row-$slot-$secret.json" \
+      --arg attempt "$st_attempt" --arg session "$session" --arg node "$node" \
+      --argjson slot "$slot" --argjson minutes "$minutes" --arg platform "$platform" '
+      ($row[0]) as $r
+      | {
+        identity: {
+          seed: 5,
+          impairment: { loss: 0.03, jitter_ticks: 6, jitter_rate: 0.1, retransmit_ticks: 3 },
+          target: $platform,
+          commit: "0000000000000000000000000000000000000000",
+          actor: "human", human_session_id: $session,
+          attempt_id: $attempt, slot: $slot
+        },
+        started_at_unix_secs: 1750000000,
+        peers: 4, bots: 4, seconds: 3600, ticks: 108000,
+        valid_attempt_seconds: 3600, completed: true,
+        player_hours: ($minutes / 60),
+        witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
+        deferral_ledger_balances: true, total_gaps: 164022, total_shed: 162,
+        session: $r,
+        external: [{ index: $slot, node: $node, connected_ticks: ($minutes * 60 * 30), said_goodbye: true, connected: false }],
+        attempt: { attempt_id: $attempt, host_target: "x86_64-unknown-linux-gnu",
+                   bots: 4, valid_attempt_seconds: 3600 },
+        binding: { attempt_id: $attempt, slot: $slot, session_id: $session, node: $node,
+                   connected_ticks: ($minutes * 60 * 30),
+                   connected_minutes: $minutes, close: "goodbye" }
+      }' > "$out"
+    if [[ -n $extra ]]; then
+      jq "$extra" "$out" > "$out.next" && mv "$out.next" "$out"
+    fi
+    echo "$out"
+  }
+  # The bot contribution: the cohort's `B * valid_attempt_seconds / 3600`, one
+  # per attempt, binding no seat.
+  st_bot_contribution() {
+    local out="$bind_dir/bot.json"
+    jq -n --arg attempt "${1:-$st_attempt}" '{
+      identity: {
+        seed: 5,
+        impairment: { loss: 0.03, jitter_ticks: 6, jitter_rate: 0.1, retransmit_ticks: 3 },
+        target: "x86_64-unknown-linux-gnu",
+        commit: "0000000000000000000000000000000000000000",
+        actor: "bot", attempt_id: $attempt
+      },
+      started_at_unix_secs: 1750000000,
+      peers: 4, bots: 4, seconds: 3600, ticks: 108000,
+      valid_attempt_seconds: 3600, completed: true, player_hours: 4.0,
+      witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
+      deferral_ledger_balances: true, total_gaps: 164022, total_shed: 162,
+      attempt: { attempt_id: $attempt, host_target: "x86_64-unknown-linux-gnu",
+                 bots: 4, valid_attempt_seconds: 3600 },
+      contribution: { actor: "bot", player_hours: 4.0, derivation: "4 * 3600 / 3600" }
+    }' > "$out"
+    echo "$out"
+  }
+  st_bind_ok() { bind_passed=$(( bind_passed + 1 )); echo "$NAME: PASS $1"; }
+  # $1 fixture name, $2 report path. Must refuse *and* leave no line behind: a
+  # refusal that has already written is not a refusal.
+  st_bind_refuses() {
+    local name=$1 path=$2 before
+    before=$(st_lines)
+    if "$0" append "$path" >/dev/null 2>&1; then
+      die "self-test [$name]: this must not bank, and it did"
+    fi
+    [[ $(st_lines) == "$before" ]] \
+      || die "self-test [$name]: a refused contribution still touched the ledger"
+    st_bind_ok "$name"
+  }
+
+  local bot_input human_a human_b
+  bot_input=$(st_bot_contribution)
+  human_a=$(st_derived 4 "$st_sid_a" 50 7 x86_64-unknown-linux-gnu)
+  human_b=$(st_derived 5 "$st_sid_b" 42 8 x86_64-pc-windows-msvc)
+
+  "$0" append "$bot_input" >/dev/null 2>&1 \
+    || die 'self-test [a_cohort_attempt_banks_one_input_per_actor]: the bot contribution was refused'
+  "$0" append "$human_a" >/dev/null 2>&1 \
+    || die 'self-test [a_cohort_attempt_banks_one_input_per_actor]: the first human contribution was refused'
+  "$0" append "$human_b" >/dev/null 2>&1 \
+    || die 'self-test [a_cohort_attempt_banks_one_input_per_actor]: the second human contribution was refused'
+  [[ $(st_lines) == 3 ]] \
+    || die "self-test [a_cohort_attempt_banks_one_input_per_actor]: expected three ledger inputs, got $(st_lines)"
+  st_bind_ok a_cohort_attempt_banks_one_input_per_actor
+
+  # 4 + 50/60 + 42/60 = 5.5333. The defect this repairs would have banked the
+  # cohort total on each human row: 3 * 6.0 = 18 hours from one hour of play.
+  local banked_total
+  banked_total=$(jq -rs 'map(.player_hours) | add | (. * 10000 | round) / 10000' "$P4_LEDGER_FILE")
+  [[ $banked_total == 5.5333 ]] \
+    || die "self-test [each_row_banks_its_own_interval_not_the_cohort_total]: banked $banked_total, not 5.5333"
+  jq -es 'map(select(.actor == "human")) | all(.player_hours == (.session.banked_minutes / 60))' \
+    "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [each_row_banks_its_own_interval_not_the_cohort_total]: a human row did not bank its own signed interval'
+  jq -es 'map(select(.actor == "human")) | all(.player_hours != 6.0)' "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [each_row_banks_its_own_interval_not_the_cohort_total]: a human row banked the cohort total'
+  st_bind_ok each_row_banks_its_own_interval_not_the_cohort_total
+
+  # The binding reaches the ledger *line*, so reconciling a seat is an audit of
+  # the ledger rather than of a directory the operator may no longer have.
+  jq -es --arg attempt "$st_attempt" --arg a "$st_sid_a" --arg b "$st_sid_b" '
+    map(select(.actor == "human")) as $h
+    | ($h | all(.attempt_id == $attempt))
+    and ($h | map(.slot) | sort == [4, 5])
+    and ($h | map(.binding.session_id) | sort == ([$a, $b] | sort))
+    and ($h | all(.binding.node == .session.measurement_node))
+  ' "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [the_ledger_line_carries_the_seat_binding]: the banked lines do not name their exterior'
+  st_bind_ok the_ledger_line_carries_the_seat_binding
+
+  # The signed human platform, not the host's. The Windows client's half hour
+  # has to reach the `windows` bucket #240 counts "across all three platforms"
+  # from, and `attempt.host_target` keeps the host's own triple on every line.
+  jq -es '
+    (map(select(.actor == "human" and .target == "x86_64-pc-windows-msvc")) | length == 1)
+    and all(.attempt.host_target == "x86_64-unknown-linux-gnu")
+    and (map(select(.actor == "bot")) | all(.target == "x86_64-unknown-linux-gnu"))
+  ' "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [a_human_row_banks_on_its_own_signed_platform]: the platform fold lost the signed triple'
+  grep -q 'windows: 0.7 distinct hours' <<<"$("$0" total 2>&1)" \
+    || die "self-test [a_human_row_banks_on_its_own_signed_platform]: the Windows interval did not reach the windows bucket ('$("$0" total 2>&1)')"
+  st_bind_ok a_human_row_banks_on_its_own_signed_platform
+
+  # ── Exactly-once attribution ──────────────────────────────────────────────
+  #
+  # The same interval, re-derived at another commit so its `run_key` differs and
+  # the existing duplicate check cannot see it. This is the mutation target for
+  # `refuse_a_second_claim_on_one_seat`.
+  st_bind_refuses one_interval_may_not_be_banked_twice \
+    "$(st_derived 4 "$st_sid_a" 50 7 x86_64-unknown-linux-gnu \
+        '.identity.commit = "1111111111111111111111111111111111111111"')"
+
+  # A different person's row re-stamped onto a seat that already banked.
+  st_bind_refuses two_rows_may_not_bind_one_seat \
+    "$(st_derived 4 "$st_sid_b" 42 8 x86_64-pc-windows-msvc \
+        '.session.session_id = .identity.human_session_id
+         | .binding.session_id = .identity.human_session_id')"
+
+  # The bot cohort is one contribution per attempt, not one per participant.
+  st_bind_refuses a_bot_cohort_banks_once_per_attempt \
+    "$(jq '.identity.commit = "2222222222222222222222222222222222222222"' "$bot_input" \
+        > "$bind_dir/bot-again.json"; echo "$bind_dir/bot-again.json")"
+
+  # ── The binding itself ────────────────────────────────────────────────────
+  #
+  # Every case below takes a **fresh seat and a fresh session id**, so the only
+  # thing that can refuse it is the binding clause it names. Reusing a seat that
+  # has already banked would let `refuse_a_second_claim_on_one_seat` refuse it
+  # for the wrong reason, and the fixture would then pass with its own clause
+  # deleted — which is exactly what the first cut of this block did.
+  local st_fresh_slot=7 st_fresh_n=0
+  st_fresh() {
+    st_fresh_slot=$(( st_fresh_slot + 1 ))
+    st_fresh_n=$(( st_fresh_n + 1 ))
+    st_derived "$st_fresh_slot" \
+      "$(printf '018f9000-0000-7000-8000-0000000000f%x' "$st_fresh_n")" \
+      "${1:-50}" "$(( 20 + st_fresh_n ))" x86_64-unknown-linux-gnu "${2:-}"
+  }
+
+  # A row bound to the wrong slot, in both directions: a human interval charged
+  # to a bot seat, and a binding whose seat disagrees with the identity that
+  # carries it into the ledger line.
+  st_bind_refuses a_human_row_bound_to_a_bot_seat_is_refused \
+    "$(st_fresh 50 '.identity.slot = 2 | .binding.slot = 2')"
+  st_bind_refuses a_binding_that_disagrees_with_its_identity_is_refused \
+    "$(st_fresh 50 '.binding.slot = (.binding.slot + 20)')"
+  st_bind_refuses a_binding_naming_another_attempt_is_refused \
+    "$(st_fresh 50 '.binding.attempt_id = "018f9000-0000-7000-8000-00000000d999"')"
+  # Only the binding's own copy of the node moves here. Moving `.external.node`
+  # with it would be caught by the retained signature refusal instead, and this
+  # fixture would then survive its own clause being deleted.
+  st_bind_refuses a_row_bound_to_a_node_the_host_did_not_admit_is_refused \
+    "$(st_fresh 50 '.binding.node = (.binding.node | sub("^.."; "ff"))')"
+  # And the retained refusal, on its own: the signature must verify for the node
+  # the host admitted, whatever the binding says about it.
+  st_bind_refuses a_row_signed_by_an_unadmitted_key_is_still_refused \
+    "$(st_fresh 50 '.external[0].node = (.external[0].node | sub("^.."; "ff"))
+                    | .binding.node = .external[0].node
+                    | .session.measurement_node = .external[0].node')"
+  # #579's clause, retained: the admitted node must name **one** seat. A cohort
+  # report listing it twice is an ambiguous seat map, and a row bound into it is
+  # bound to nobody in particular.
+  st_bind_refuses a_node_naming_two_seats_is_refused \
+    "$(st_fresh 50 '.external = [.external[0], (.external[0] | .index = (.index + 1))]')"
+  st_bind_refuses a_binding_naming_another_participants_session_is_refused \
+    "$(st_fresh 50 '.binding.session_id = "018f9000-0000-7000-8000-00000000d888"')"
+  st_bind_refuses a_seat_that_was_never_connected_banks_nothing \
+    "$(st_fresh 50 '.binding.connected_ticks = 0')"
+  st_bind_refuses a_human_contribution_with_no_binding_is_refused \
+    "$(st_fresh 50 'del(.binding)')"
+  st_bind_refuses a_seat_binding_with_no_attempt_id_is_refused \
+    "$(st_fresh 50 'del(.identity.attempt_id)')"
+  # A fresh attempt, so the only clause that can refuse this is the one that
+  # says a bot contribution occupies no seat. Pointing it at the attempt whose
+  # bot contribution has already banked would refuse it as a duplicate instead.
+  st_bind_refuses a_bot_contribution_claiming_a_seat_is_refused \
+    "$(jq --arg s "$st_sid_a" --arg a 018f9000-0000-7000-8000-00000000d777 '
+        .identity.attempt_id = $a | .attempt.attempt_id = $a | .identity.slot = 4
+        | .binding = {attempt_id: $a, slot: 4, session_id: $s}' \
+        "$bot_input" > "$bind_dir/bot-seated.json"; echo "$bind_dir/bot-seated.json")"
+  st_bind_refuses a_leg_that_overflowed_its_queue_banks_nothing \
+    "$(st_fresh 50 '.binding.close = "queue_overflow"')"
+
+  # ── The non-constant denominator ──────────────────────────────────────────
+  #
+  # A human seated for part of an attempt played less than the attempt lasted.
+  # Both spellings of the over-claim are refused: banking more minutes than the
+  # seat was connected, and inflating the seat's own recorded span to match.
+  st_bind_refuses an_interval_may_not_exceed_its_seats_connected_span \
+    "$(st_fresh 50 '.binding.connected_ticks = (10 * 60 * 30) | .binding.connected_minutes = 10')"
+  # `connected_minutes` alone: the ticks and the interval are both honest, so
+  # only the clause that re-derives the span from the ticks can refuse this.
+  st_bind_refuses a_connected_span_that_contradicts_its_own_ticks_is_refused \
+    "$(st_fresh 50 '.binding.connected_minutes = 500')"
+  # And the honest partial seat still banks: 10 minutes of a 60-minute attempt
+  # is 10 minutes, not an hour and not a refusal.
+  local partial
+  partial=$(st_derived 6 018f9000-0000-7000-8000-0000000000d3 10 11 x86_64-unknown-linux-gnu)
+  "$0" append "$partial" >/dev/null 2>&1 \
+    || die 'self-test [a_partial_seat_banks_its_own_span]: an honest partial interval was refused'
+  jq -es 'map(select(.slot == 6)) | length == 1 and (.[0].player_hours * 6 | round) == 1' \
+    "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [a_partial_seat_banks_its_own_span]: a ten-minute seat did not bank ten minutes'
+  st_bind_ok a_partial_seat_banks_its_own_span
+
+  # ── The cross-check #576 asks for, on its own ─────────────────────────────
+  st_bind_refuses player_hours_must_equal_the_signed_interval \
+    "$(st_derived 7 018f9000-0000-7000-8000-0000000000d4 30 12 x86_64-unknown-linux-gnu \
+        '.player_hours = 6.0')"
+
+  # ── Retained: nothing above loosened the pre-cohort path ──────────────────
+  #
+  # A swarm report that names no attempt still banks, and the whole functional
+  # half above ran against exactly that shape.
+  local plain
+  plain=$(st_report 42 '')
+  P4_LEDGER_FILE="$bind_dir/plain.jsonl" "$0" append "$plain" >/dev/null 2>&1 \
+    || die 'self-test [a_report_with_no_attempt_still_banks]: the pre-cohort path was loosened shut'
+  st_bind_ok a_report_with_no_attempt_still_banks
+
   rm -rf "$dir"
   trap - EXIT
-  echo "$NAME: self-test passed"
+  echo "$NAME: self-test passed ($bind_passed attempt-binding fixtures)"
 }
 
 readonly ROOT="${P4_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -589,6 +873,118 @@ validate_session_record() {
     || die 'refusing to bank: session impairment_mismatch contradicts the row'\''s own observed/configured impairment'
 }
 
+# ── The attempt binding (#576) ───────────────────────────────────────────────
+#
+# `docs/plans/multi-human-attempt-accounting.md` §3–§4. A cohort attempt emits
+# one ledger input per *actor contribution*, and every human input binds to
+# exactly one exterior `(attempt_id, slot, session_id, node)`. Without that
+# binding several humans in one attempt are indistinguishable in the ledger, and
+# nothing here could tell one interval banked twice from two intervals.
+#
+# The ledger re-derives what it can rather than trusting the derived report: the
+# connected span is recomputed from `connected_ticks` and the attempt's own tick
+# rate, so inflating `binding.connected_minutes` is not a way past the per-seat
+# ceiling. `scripts/p4-attempt-accounting.py` checks the same clauses at
+# derivation time; both check the file rather than the caller, and this is the
+# one that still holds when a derived report is edited after assembly.
+readonly UUID_V7_RE='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+readonly BANKABLE_CLOSES='["goodbye","attempt_end","disconnected"]'
+
+validate_attempt_binding() {
+  local report=$1 actor=$2 attempt_id=$3
+
+  if [[ -z $attempt_id ]]; then
+    # A pre-cohort swarm report binds no seat, and stays bankable. What is
+    # refused is a *binding with nothing to bind to*: a row carrying seat
+    # evidence for an attempt it does not name is not reconcilable afterwards.
+    jq -e '.binding? == null and (.identity.slot? == null)' "$report" >/dev/null \
+      || die 'refusing to bank: a row carries a seat binding but names no identity.attempt_id'
+    return
+  fi
+  [[ $attempt_id =~ $UUID_V7_RE ]] \
+    || die 'refusing to bank: identity.attempt_id is not a coordinator-issued UUIDv7'
+
+  if [[ $actor == bot ]]; then
+    # The bot contribution is the cohort's, not a seat's:
+    # `B * valid_attempt_seconds / 3600`. It binds no exterior and carries no
+    # signed session row; a bot input claiming a seat is a human interval
+    # charged to the bot cohort.
+    jq -e '.binding? == null and (.identity.slot? == null) and (.session? == null)' "$report" >/dev/null \
+      || die 'refusing to bank: a bot contribution occupies no exterior seat and carries no signed session row'
+    return
+  fi
+
+  # All four binding clauses, against the row the file actually carries.
+  # `slot >= attempt.bots` is what keeps a human interval off a bot seat; the
+  # node equality is what makes this seat's row *this seat's* row, because the
+  # session token authenticates a NodeId without reserving a seat.
+  jq -e --arg attempt "$attempt_id" '
+    .binding as $b
+    | $b != null
+    and ($b.attempt_id == $attempt)
+    and ($b.slot | type == "number")
+    and ($b.slot == .identity.slot)
+    and ($b.session_id == .identity.human_session_id)
+    and ($b.session_id == .session.session_id)
+    and ($b.node | type == "string" and length == 64)
+    # .external is a list of seats since #579, and a derived human row carries
+    # the one seat it is bound to. The bound node must name that seat exactly
+    # once: "somewhere in the cohort" would let a row bound to slot 4 satisfy a
+    # check against the node admitted at slot 5.
+    and ([.external[] | select(.node == $b.node)] | length == 1)
+    and ($b.node == .session.measurement_node)
+    and ($b.connected_ticks | type == "number" and . > 0)
+    and (.attempt.bots | type == "number")
+    and ($b.slot >= .attempt.bots)
+  ' "$report" >/dev/null \
+    || die 'refusing to bank: the human contribution does not bind to one exterior (attempt, slot, session_id, node) of the attempt it names'
+  jq -e --argjson bankable "$BANKABLE_CLOSES" \
+    '.binding.close as $c | $bankable | index($c) != null' "$report" >/dev/null \
+    || die "refusing to bank: slot $(jq -r '.binding.slot' "$report") closed as $(jq -r '.binding.close' "$report"); that leg's evidence does not bank"
+
+  # The non-constant denominator, as a refusal rather than an assumption. A
+  # human seated for part of an attempt played less than the attempt lasted, so
+  # the ceiling is *this seat's* connected span and never the attempt's length —
+  # assuming presence for the whole attempt is exactly how a cohort over-counts.
+  # One tick of tolerance absorbs the boundary rounding between the client's
+  # wall clock and the host's tick clock, and nothing else.
+  jq -e '
+    (.seconds / .ticks) as $per
+    | (.binding.connected_ticks * $per / 60) as $connected
+    | (((.binding.connected_minutes // $connected) - $connected) | . * . < 1e-9)
+      and (.session.banked_minutes <= $connected + $per / 60)
+  ' "$report" >/dev/null \
+    || die "refusing to bank: slot $(jq -r '.binding.slot' "$report") banks $(jq -r '.session.banked_minutes' "$report") min, more than the seat's own connected span"
+}
+
+# One ledger input per actor contribution, and the ledger is the only place that
+# sees across appends. `run_key` already refuses the *same* identity twice; this
+# refuses a *different* identity claiming a seat, or an interval, this attempt
+# has already banked — the same interval re-derived at another commit, or a row
+# re-stamped onto a seat another row is already bound to.
+refuse_a_second_claim_on_one_seat() {
+  local actor=$1 attempt_id=$2 slot=$3 session=$4
+  [[ -n $attempt_id ]] || return 0
+  [[ -r $LEDGER ]] || return 0
+  local clash
+  clash=$(jq -rs --arg attempt "$attempt_id" --arg actor "$actor" \
+                 --arg slot "$slot" --arg session "$session" '
+    [ .[] | select(.attempt_id == $attempt) ] as $rows
+    | if $actor == "bot" then
+        (if ([ $rows[] | select((.actor // "bot") == "bot") ] | length) > 0
+         then "attempt \($attempt) has already banked its bot contribution"
+         else "" end)
+      else
+        (if ([ $rows[] | select((.slot | tostring) == $slot) ] | length) > 0
+         then "slot \($slot) of attempt \($attempt) already carries a banked interval"
+         elif ([ $rows[] | select(.human_session_id == $session) ] | length) > 0
+         then "session \($session) already banked an interval in attempt \($attempt)"
+         else "" end)
+      end
+  ' "$LEDGER")
+  [[ -z $clash ]] || die "refusing to bank: $clash; an interval is attributed exactly once"
+}
+
 cmd_append() {
   local report=${1:-}
   [[ -n $report && -r $report ]] || die "append: unreadable report '${report:-<none>}'"
@@ -633,6 +1029,7 @@ cmd_append() {
     || die "refusing to bank: the run accumulated $hours player-hours"
 
   local commit key measurement_key pipeline seed target actor human_session_id
+  local attempt_id slot
   commit=$(jq -r '.identity.commit // "unknown"' "$report")
   seed=$(jq -r '.identity.seed' "$report")
   target=$(jq -r '.identity.target' "$report")
@@ -647,6 +1044,20 @@ cmd_append() {
       || die 'refusing to bank: a human hour needs a coordinator-issued UUIDv7 identity.human_session_id'
   fi
   validate_session_record "$report" "$actor" "$human_session_id" "$target"
+  attempt_id=$(jq -r '.identity.attempt_id // empty' "$report")
+  slot=$(jq -r '.identity.slot // empty' "$report")
+  validate_attempt_binding "$report" "$actor" "$attempt_id"
+  # The cross-check #576 asks for, and the one that would have caught the defect
+  # this whole piece exists to repair: a human contribution's `player_hours` is
+  # *its own signed interval*, `banked_minutes / 60`, never the attempt total
+  # copied onto a participant. A report whose two numbers disagree is banking a
+  # figure its signed row does not attest.
+  jq -e '
+    if .session? == null then true else
+      ((.player_hours - (.session.banked_minutes / 60)) | . * . < 1e-9)
+    end
+  ' "$report" >/dev/null \
+    || die "refusing to bank: player_hours $(jq -r '.player_hours' "$report") is not the signed interval $(jq -r '.session.banked_minutes' "$report") / 60"
   # `run_key` is provenance for an individual run. It intentionally includes
   # commit, so an independently re-run report is retained for reproducibility.
   key=$(jq -cS '.identity' "$report" | sha256_hex | cut -c1-16)
@@ -675,6 +1086,9 @@ cmd_append() {
     note "already banked: run_key $key (seed $seed, commit ${commit:0:12}); nothing appended"
     return 0
   fi
+  # Held under the same lock as the append it guards: a second claim on one seat
+  # decided outside the lock could still be written by a concurrent appender.
+  refuse_a_second_claim_on_one_seat "$actor" "$attempt_id" "$slot" "$human_session_id"
 
   jq -c \
     --arg key "$key" \
@@ -688,6 +1102,12 @@ cmd_append() {
       pipeline: $pipeline,
       actor: (.identity.actor // "bot"),
       human_session_id: (if (.identity.actor // "bot") == "human" then .identity.human_session_id else null end),
+      # #576: the binding travels into the ledger *line*, not only the derived
+      # report beside it. Reconciling which seat of which attempt an hour came
+      # from is an audit of the ledger, and an audit cannot reach for a file the
+      # operator may no longer have.
+      attempt_id: (.identity.attempt_id // null),
+      slot: (.identity.slot // null),
       banked_at: $banked_at,
       seed: .identity.seed,
       impairment: .identity.impairment,
@@ -701,9 +1121,15 @@ cmd_append() {
       false_positives: .total_false_positives,
       gaps_repaired: .total_gaps,
       shed: .total_shed
-    } + (if .session? == null then {} else {session: .session} end)' "$report" >> "$LEDGER"
+    }
+    + (if .session? == null then {} else {session: .session} end)
+    + (if .attempt? == null then {} else {attempt: .attempt} end)
+    + (if .binding? == null then {} else {binding: .binding} end)
+    + (if .contribution? == null then {} else {contribution: .contribution} end)
+    + (if .link_impairment? == null then {} else {link_impairment: .link_impairment} end)' \
+    "$report" >> "$LEDGER"
 
-  note "banked $hours $actor player-hours: run_key $key, measurement_key $measurement_key, seed $seed, loss $loss, target $target, pipeline $pipeline"
+  note "banked $hours $actor player-hours: run_key $key, measurement_key $measurement_key, seed $seed, loss $loss, target $target, pipeline $pipeline${attempt_id:+, attempt $attempt_id${slot:+ slot $slot}}"
 }
 
 # The criterion's figure, and the thing `total` is progress against.

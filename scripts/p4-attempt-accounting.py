@@ -113,46 +113,79 @@ def refuse(detail: str) -> NoReturn:
 
 
 def normalize_exteriors(attempt: dict[str, Any]) -> list[dict[str, Any]]:
-    """`exteriors` is the contract; `external` is the one-slot spelling.
+    """`exteriors` is the contract; `external` is what the host actually emits.
 
-    #571 replaces `Option<ExteriorSlot>` with slot-indexed exteriors and will
-    serialize `exteriors` directly. Until it lands, a today's-shape report with
-    a single `external` block reads as a one-element cohort, so this contract
-    can be exercised against real host output before the host emits the plural
-    field. The two are never both authoritative: a report carrying both must
-    agree, or the accounting is being asked to choose between two accounts of
-    the same attempt.
+    #571 landed as #579: `Option<ExteriorSlot>` is now a slot map and
+    `SwarmReport.external` is a `Vec<ExteriorReport>` ordered by swarm slot, so
+    the host's own spelling is already plural. This reads three shapes and
+    normalizes them to one, because all three exist in the tree right now:
+
+    * `exteriors`, this contract's field — a host that carries it is read from
+      it directly;
+    * `external` as a **list**, which is `gates/p1-swarm`'s output since #579;
+    * `external` as a single **object**, the pre-#579 spelling, kept readable so
+      an archived report from before that refactor still derives.
+
+    The two field names are never both authoritative: a report carrying both
+    must name the same seats, or the accounting is being asked to choose between
+    two accounts of the same attempt.
+
+    What the host does **not** yet emit is `session_id` per seat —
+    `ExteriorReport` (`gates/p1-swarm/src/swarm.rs`, after #579) carries `index`,
+    `node`, `connected_ticks`, the frame counters, `said_goodbye`, `connected`
+    and `witness_anchored`, and no invite id. So `session_id` stays `None` for a
+    host-emitted seat, and the seat's identity comes from the node the host
+    admitted there plus the operator's pinned id; see `seat_for` in `derive`.
     """
+
+    def one(entry: Any) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            refuse("an exterior entry is not a JSON object")
+        # `connected` is the bridge's belief at report time; a seat still
+        # connected when the attempt ended closed *with* the attempt, which is
+        # a bankable close and not a disconnect.
+        close = entry.get("close")
+        if close is None:
+            if entry.get("said_goodbye"):
+                close = "goodbye"
+            elif entry.get("connected"):
+                close = "attempt_end"
+            else:
+                close = "disconnected"
+        return {
+            "slot": entry.get("slot", entry.get("index")),
+            "session_id": entry.get("session_id"),
+            "node": entry.get("node"),
+            "connected_ticks": entry.get("connected_ticks"),
+            "frames": {
+                "uplink": entry.get("uplink_frames", 0),
+                "downlink": entry.get("downlink_frames", 0),
+                "downlink_dropped": entry.get("downlink_dropped", 0),
+            },
+            "close": close,
+        }
+
     plural = attempt.get("exteriors")
     single = attempt.get("external")
     if plural is None and single is None:
         return []
     if plural is None:
-        return [
-            {
-                "slot": single.get("slot", single.get("index")),
-                "session_id": single.get("session_id"),
-                "node": single.get("node"),
-                "connected_ticks": single.get("connected_ticks"),
-                "frames": {
-                    "uplink": single.get("uplink_frames", 0),
-                    "downlink": single.get("downlink_frames", 0),
-                    "downlink_dropped": single.get("downlink_dropped", 0),
-                },
-                "close": single.get(
-                    "close", "goodbye" if single.get("said_goodbye") else "disconnected"
-                ),
-            }
-        ]
+        if isinstance(single, list):
+            return [one(entry) for entry in single]
+        return [one(single)]
     if not isinstance(plural, list):
         refuse("attempt.exteriors is not a list")
     if single is not None:
         slots = {entry.get("slot") for entry in plural}
-        if single.get("index", single.get("slot")) not in slots:
-            refuse(
-                "the attempt carries both `external` and `exteriors` and they name "
-                "different slots; one attempt has one account of its seats"
-            )
+        singles = single if isinstance(single, list) else [single]
+        for entry in singles:
+            if not isinstance(entry, dict):
+                refuse("an exterior entry is not a JSON object")
+            if entry.get("index", entry.get("slot")) not in slots:
+                refuse(
+                    "the attempt carries both `external` and `exteriors` and they name "
+                    "different slots; one attempt has one account of its seats"
+                )
     return plural
 
 
@@ -371,6 +404,14 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
 
     exteriors = normalize_exteriors(attempt)
     by_session: dict[str, dict[str, Any]] = {}
+    # The host's own account of a seat names a `node`, not an invite id:
+    # `ExteriorReport` after #579 carries `index`, `node`, `connected_ticks`, the
+    # frame counters and the close flags, and no `session_id`. The node is
+    # therefore the seat identity a host-emitted attempt can be bound by, and it
+    # is a *signed* one — the client's row carries the same value under its
+    # Ed25519 signature. A node that named two seats would make that binding
+    # ambiguous, so it is refused here as well as in the assembler.
+    by_node: dict[str, dict[str, Any]] = {}
     seen_slots: set[int] = set()
     for entry in exteriors:
         slot = entry.get("slot")
@@ -384,6 +425,14 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         close = entry.get("close")
         if close not in KNOWN_CLOSES:
             refuse(f"slot {slot} reports an unknown close reason {close!r}")
+        node = entry.get("node")
+        if isinstance(node, str) and node:
+            if node in by_node:
+                refuse(
+                    f"node {node} is seated at two slots in one attempt; a seat's admitted "
+                    "identity binds exactly one interval"
+                )
+            by_node[node] = entry
         session_id = entry.get("session_id")
         if session_id is None:
             continue
@@ -395,6 +444,42 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
                 "attributed exactly once"
             )
         by_session[session_id] = entry
+
+    def seat_for(session_id: str, row: dict[str, Any]) -> dict[str, Any]:
+        """The exterior this row binds to, by invite id when the host has one.
+
+        When the host seats an invite id — this contract's `exteriors` spelling —
+        that id is the binding, and a row naming an unseated id is refused. When
+        it does not, which is every report `gates/p1-swarm` emits today, the
+        binding is the QUIC-authenticated node the host admitted at that seat,
+        matched against the `measurement_node` the client signed. Either way the
+        row is bound to one seat by something the host recorded, never by
+        position in a file; and when the host *does* carry an id it must be this
+        row's, so the node path can never silently override a seated id.
+        """
+        seated = by_session.get(session_id)
+        if seated is not None:
+            return seated
+        node = row.get("measurement_node")
+        if isinstance(node, str) and node in by_node:
+            claimed = by_node[node].get("session_id")
+            if claimed is not None and claimed != session_id:
+                refuse(
+                    f"slot {by_node[node]['slot']} was pinned to session {claimed}, and the row "
+                    f"signed by that seat's node names {session_id}; the host's copy and the "
+                    "client's copy of the session id disagree"
+                )
+            return by_node[node]
+        if by_session:
+            refuse(
+                f"session {session_id} is not seated in attempt {attempt_id}; every row binds to "
+                "a matching exterior (attempt, slot, sid, node)"
+            )
+        refuse(
+            f"session {session_id} names node {row.get('measurement_node')!r}, which the host "
+            f"admitted at no seat of attempt {attempt_id}; every row binds to a matching "
+            "exterior (attempt, slot, sid, node)"
+        )
 
     rows = load_records(records_path)
     # Nothing is written until every row has bound and validated. A refusal that
@@ -451,12 +536,7 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         if row.get("actor") != "human":
             refuse(f"the client row for {session_id} does not name a human actor")
 
-        entry = by_session.get(session_id)
-        if entry is None:
-            refuse(
-                f"session {session_id} is not seated in attempt {attempt_id}; every row binds to "
-                "a matching exterior (attempt, slot, sid, node)"
-            )
+        entry = seat_for(session_id, row)
         slot = entry["slot"]
         if slot in bound_slots:
             refuse(f"two rows bind to slot {slot}; one seat carries one interval per attempt")
@@ -520,9 +600,13 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         report["player_hours"] = hours
         report["session"] = dict(row)
         report["session"]["pipeline_digest"] = pipeline
-        # `p4-ledger.sh` verifies the row's signature against `.external.node`.
-        # For a cohort that field is per-row, and it is the *bound* node.
-        report["external"] = {"node": node}
+        # `p4-ledger.sh` verifies the row's signature against the node the host
+        # admitted, and since #579 reads it out of `.external[]` — a list — and
+        # requires it to appear there **exactly once**. A derived human row is
+        # one seat's evidence, so its list is that one seat: the bound node, and
+        # no other, which is what makes the ledger's "exactly once" check name
+        # this seat rather than merely find the node somewhere in the cohort.
+        report["external"] = [dict(entry, node=node)]
         report["attempt"] = {
             "attempt_id": attempt_id,
             "host_target": host_target,
@@ -1191,6 +1275,91 @@ def self_test() -> None:
         if abs(legacy_manifest["attempt_total_hours"] - (4.0 + 50 / 60.0)) > 1e-9:
             die("self-test [the_one_slot_spelling_still_derives]: total moved")
         test.ok("the_one_slot_spelling_still_derives")
+
+        # ── the shape the host actually emits, since #579 ───────────────────
+        #
+        # `SwarmReport.external` is a `Vec<ExteriorReport>` ordered by swarm
+        # slot, and `ExteriorReport` carries no `session_id`. So the binding
+        # falls to the QUIC-authenticated node the host admitted at each seat,
+        # matched against the `measurement_node` the client signed — a signed
+        # value on both sides, and unique per seat since #579. Reading the
+        # singular object off a list is what the pre-#579 code did, and it
+        # raised `AttributeError` rather than refusing.
+        def host_shaped(**overrides: Any) -> dict[str, Any]:
+            attempt = fixture_attempt([])
+            del attempt["exteriors"]
+            attempt["external"] = [
+                {
+                    "index": 4,
+                    "node": node_a,
+                    "connected_ticks": 55 * 60 * 30,
+                    "said_goodbye": True,
+                    "connected": False,
+                    "uplink_frames": 100000,
+                    "downlink_frames": 400000,
+                    "downlink_dropped": 0,
+                    "witness_anchored": False,
+                },
+                {
+                    "index": 5,
+                    "node": node_b,
+                    "connected_ticks": 55 * 60 * 30,
+                    "said_goodbye": False,
+                    "connected": True,
+                    "uplink_frames": 100000,
+                    "downlink_frames": 400000,
+                    "downlink_dropped": 0,
+                    "witness_anchored": False,
+                },
+            ]
+            attempt["per_link_impairment"] = fixture_links([4, 5], 4)
+            attempt.update(overrides)
+            return attempt
+
+        manifest, emitted = test.must_derive(host_shaped(), [row_a, row_b], "host-array")
+        humans = [report for report in emitted if report["identity"]["actor"] == "human"]
+        by_slot = {report["binding"]["slot"]: report for report in humans}
+        if sorted(by_slot) != [4, 5]:
+            die("self-test [the_hosts_exterior_array_binds_by_admitted_node]: seats not bound")
+        if by_slot[4]["binding"]["node"] != node_a or by_slot[5]["binding"]["node"] != node_b:
+            die("self-test [the_hosts_exterior_array_binds_by_admitted_node]: bound to the wrong node")
+        if by_slot[4]["binding"]["session_id"] != SESSION_A:
+            die("self-test [the_hosts_exterior_array_binds_by_admitted_node]: wrong session on slot 4")
+        if abs(manifest["attempt_total_hours"] - (4.0 + 50 / 60.0 + 42 / 60.0)) > 1e-9:
+            die("self-test [the_hosts_exterior_array_binds_by_admitted_node]: total moved")
+        # A seat still connected at report time closed *with* the attempt.
+        if by_slot[5]["binding"]["close"] != "attempt_end":
+            die("self-test [the_hosts_exterior_array_binds_by_admitted_node]: a live seat read as a disconnect")
+        test.ok("the_hosts_exterior_array_binds_by_admitted_node")
+
+        # `.external` must still be a list on the derived row: `p4-ledger.sh`
+        # reads the admitted node out of it and requires it exactly once.
+        if [entry["node"] for entry in by_slot[4]["external"]] != [node_a]:
+            die("self-test [a_derived_row_carries_its_one_seat_as_a_list]: external is not this seat")
+        test.ok("a_derived_row_carries_its_one_seat_as_a_list")
+
+        # The node is the seat identity, so a node at two seats is ambiguous and
+        # refused before any row is read.
+        ambiguous = host_shaped()
+        ambiguous["external"][1]["node"] = node_a
+        test.must_refuse(ambiguous, [row_a, row_b], "node-twice", "seated at two slots")
+        test.ok("a_node_seated_at_two_slots_is_refused")
+
+        # A row signed by a key this attempt admitted nowhere.
+        stranger = fixture_row(SESSION_C, 30, "x86_64-unknown-linux-gnu", 0x33)
+        test.must_refuse(
+            host_shaped(), [row_a, stranger], "stranger-node", "admitted at no seat"
+        )
+        test.ok("a_row_whose_node_the_host_never_admitted_is_refused")
+
+        # And when the host *does* seat an id, it wins: a row landing on that
+        # seat by node while naming a different id is #476's two-copy
+        # disagreement, not a second way in.
+        pinned = host_shaped()
+        pinned["external"][0]["session_id"] = SESSION_C
+        moved = fixture_row(SESSION_A, 50, "x86_64-unknown-linux-gnu", 0x11)
+        test.must_refuse(pinned, [moved], "pinned-disagrees", "disagree")
+        test.ok("a_seated_id_that_disagrees_with_the_rows_id_is_refused")
 
         print(f"{NAME}: self-test passed ({test.passed} fixtures)")
 
