@@ -266,8 +266,14 @@ pub struct ExteriorReport {
     pub said_goodbye: bool,
     /// Whether the bridge believed the connection was alive at report time.
     pub connected: bool,
+    /// Host ticks during which the bridge reported this slot connected.
+    pub connected_ticks: u64,
     /// Frames forwarded from the remote into the router.
     pub uplink_frames: u64,
+    /// Uplink datagrams retained by the impairment router.
+    pub uplink_delivered: u64,
+    /// Uplink datagrams discarded by the impairment router.
+    pub uplink_dropped: u64,
     /// Frames queued for the remote out of router deliveries.
     pub downlink_frames: u64,
     /// Downlink frames refused because the queue was full. Zero at criterion
@@ -326,8 +332,8 @@ pub struct SwarmReport {
     pub total_replicas: usize,
     /// Whether the witness pipeline ran.
     pub witnessing: bool,
-    /// What the external peer did, when one joined (#385).
-    pub external: Option<ExteriorReport>,
+    /// What each external peer did, ordered by swarm slot (#385, #571).
+    pub external: Vec<ExteriorReport>,
     /// Player-hours accumulated: peers times simulated seconds.
     pub player_hours: f64,
     /// Chain gaps detected across the swarm — expected under loss.
@@ -517,8 +523,8 @@ pub struct Swarm {
     samples: Vec<Vec<u64>>,
     /// NodeId → swarm index, for routing.
     index_of: BTreeMap<NodeId, usize>,
-    /// The connected external peer, when the run has one (#385).
-    exterior: Option<ExteriorSlot>,
+    /// Connected external peers, keyed by their swarm slots (#385, #571).
+    exteriors: BTreeMap<usize, ExteriorSlot>,
     /// The in-process cluster that re-runs filed reports.
     adjudicator: Adjudicator,
     /// Every verdict it reached.
@@ -553,6 +559,12 @@ pub struct ExteriorSlot {
     pub link: crate::exterior::HostLink,
     /// Frames forwarded up, for the report.
     uplink_frames: u64,
+    /// Host ticks during which the bridge reported this slot connected.
+    connected_ticks: u64,
+    /// Uplink datagrams retained by the impairment router.
+    uplink_delivered: u64,
+    /// Uplink datagrams discarded by the impairment router.
+    uplink_dropped: u64,
     /// Frames queued down, for the report.
     downlink_frames: u64,
     /// Downlink frames refused on a full queue.
@@ -616,6 +628,13 @@ impl ExteriorSlot {
     /// `router.accept` at the swarm's own tick, never around it, which is the
     /// whole point of the bridge (#385's module docs).
     fn pump_uplink(&mut self, tick: u64, router: &mut Router) {
+        if self
+            .link
+            .connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.connected_ticks += 1;
+        }
         let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
         if debug && tick.is_multiple_of(60) {
             eprintln!(
@@ -659,6 +678,14 @@ impl ExteriorSlot {
                         usize::try_from(frame.peer).unwrap_or(usize::MAX),
                         datagram.payload,
                     );
+                    match disposition {
+                        crate::router::DatagramDisposition::Delivered => {
+                            self.uplink_delivered += 1;
+                        }
+                        crate::router::DatagramDisposition::Dropped => {
+                            self.uplink_dropped += 1;
+                        }
+                    }
                     self.acknowledge_uplink(UplinkAck {
                         sequence: datagram.sequence,
                         outcome: match disposition {
@@ -772,7 +799,7 @@ impl Swarm {
             index_of,
             adjudicator: Adjudicator::new(seed),
             docket: Docket::default(),
-            exterior: None,
+            exteriors: BTreeMap::new(),
         }
     }
 
@@ -801,19 +828,25 @@ impl Swarm {
         self.index_of.insert(node, index);
         let goodbye_flag = link.goodbye.clone();
         let witness_anchored = anchor.is_some();
-        self.exterior = Some(ExteriorSlot {
+        self.exteriors.insert(
             index,
-            node,
-            entity,
-            cell,
-            anchor,
-            witness_anchored,
-            link,
-            uplink_frames: 0,
-            downlink_frames: 0,
-            downlink_dropped: 0,
-            goodbye: goodbye_flag,
-        });
+            ExteriorSlot {
+                index,
+                node,
+                entity,
+                cell,
+                anchor,
+                witness_anchored,
+                link,
+                uplink_frames: 0,
+                connected_ticks: 0,
+                uplink_delivered: 0,
+                uplink_dropped: 0,
+                downlink_frames: 0,
+                downlink_dropped: 0,
+                goodbye: goodbye_flag,
+            },
+        );
         // One more sample bucket than bots; the exterior's own upload is not
         // measured host-side (slice 3's problem), so it stays empty and is
         // never read.
@@ -823,23 +856,23 @@ impl Swarm {
 
     #[cfg(test)]
     pub(crate) fn exterior_witness_anchored(&self) -> Option<bool> {
-        self.exterior
-            .as_ref()
+        self.exteriors
+            .values()
+            .next()
             .map(|exterior| exterior.witness_anchored)
     }
 
     /// A slot index's transport identity, bots and external alike.
     fn node_of(&self, index: usize) -> NodeId {
-        match &self.exterior {
-            Some(exterior) if exterior.index == index => exterior.node,
-            _ => self.bots[index].node,
-        }
+        self.exteriors
+            .get(&index)
+            .map_or_else(|| self.bots[index].node, |exterior| exterior.node)
     }
 
     /// Total participants, external peer included: the number the report
     /// counts as peers and hours.
     fn total_peers(&self) -> usize {
-        self.bots.len() + usize::from(self.exterior.is_some())
+        self.bots.len() + self.exteriors.len()
     }
 
     /// Tell every peer which of its island-mates the harness modified.
@@ -873,7 +906,7 @@ impl Swarm {
         // The external peer is an island-mate like any other: it takes the
         // slot's deterministic spawn pose (`with_external`), so the host knows
         // its starting cell without asking.
-        if let Some(exterior) = &self.exterior {
+        for exterior in self.exteriors.values() {
             roster.push((exterior.node, exterior.cell()));
         }
 
@@ -901,7 +934,7 @@ impl Swarm {
     fn refresh_rosters(&mut self, tick: u64) {
         // Pump the exterior's meta frames first, so today's roster carries the
         // cell it just reported rather than yesterday's.
-        if let Some(exterior) = &mut self.exterior {
+        for exterior in self.exteriors.values_mut() {
             while let Ok(raw) = {
                 let mut r = exterior.link.meta.lock().expect("meta lock");
                 r.try_recv()
@@ -914,7 +947,7 @@ impl Swarm {
             .iter_mut()
             .map(|bot| (bot.node, bot.cell().expect("committed")))
             .collect();
-        if let Some(exterior) = &self.exterior {
+        for exterior in self.exteriors.values() {
             let interest = exterior.cell().neighbors27();
             for (index, (_, cell)) in roster.iter().enumerate() {
                 eprintln!(
@@ -962,9 +995,9 @@ impl Swarm {
     fn collect_sends(&mut self, tick: u64) {
         // Disjoint field borrows: the exterior pumps into the router directly,
         // at this same tick, so its traffic is impaired like a bot's.
-        let exterior = self.exterior.as_mut();
+        let exteriors = &mut self.exteriors;
         let router = &mut self.router;
-        if let Some(exterior) = exterior {
+        for exterior in exteriors.values_mut() {
             exterior.pump_uplink(tick, router);
         }
         for index in 0..self.bots.len() {
@@ -1005,9 +1038,9 @@ impl Swarm {
                     .iter()
                     .position(|bot| bot.authors(recipient))
                     .or_else(|| {
-                        self.exterior
-                            .as_ref()
-                            .filter(|exterior| exterior.entity == recipient)
+                        self.exteriors
+                            .values()
+                            .find(|exterior| exterior.entity == recipient)
                             .map(|exterior| exterior.index)
                     });
                 let Some(target) = target else {
@@ -1031,16 +1064,14 @@ impl Swarm {
     /// Hand every due packet to its recipient's buffer, on the lane it came in on.
     fn deliver(&mut self, tick: u64) {
         for delivery in self.router.deliver_due(tick) {
-            if let Some(exterior) = &mut self.exterior {
-                if delivery.to == exterior.index {
-                    let from = self
-                        .index_of
-                        .get(&delivery.from)
-                        .copied()
-                        .unwrap_or(usize::MAX);
-                    exterior.deliver_from(from, delivery.stream, delivery.payload);
-                    continue;
-                }
+            if let Some(exterior) = self.exteriors.get_mut(&delivery.to) {
+                let from = self
+                    .index_of
+                    .get(&delivery.from)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                exterior.deliver_from(from, delivery.stream, delivery.payload);
+                continue;
             }
             // The router already carries the sender's identity verbatim.
             let from_entity = self
@@ -1049,9 +1080,9 @@ impl Swarm {
                 .and_then(|index| self.bots.get(*index))
                 .map(Bot::entity)
                 .or_else(|| {
-                    self.exterior
-                        .as_ref()
-                        .filter(|exterior| exterior.node == delivery.from)
+                    self.exteriors
+                        .values()
+                        .find(|exterior| exterior.node == delivery.from)
                         .map(|exterior| exterior.entity)
                 })
                 .unwrap_or(PersistId::new(0));
@@ -1081,7 +1112,7 @@ impl Swarm {
         // and bankable hours need real connected time — so the host may not
         // outrun it. Pure-bot runs keep their faster-than-real-time pacing and
         // every nightly number that depends on it (#385).
-        let real_time = self.exterior.is_some();
+        let real_time = !self.exteriors.is_empty();
         let tick_duration = std::time::Duration::from_nanos(1_000_000_000 / TICK_HZ);
 
         let mut phase = [0u128; 6];
@@ -1226,7 +1257,7 @@ impl Swarm {
         // in the ring and shipped its tick-zero anchor at join. What nobody
         // host-side can do is watch *through* it — its own observations live in
         // its process, and coverage counts what this run's watchers saw.
-        let count = self.bots.len() + usize::from(self.exterior.is_some());
+        let count = self.bots.len() + self.exteriors.len();
         // Ring assignment: peer i is witnessed by the next `MAX_WITNESS_LINKS`
         // peers around the ring. Deterministic, uniform, and it gives every peer
         // both a witness set and a watch list without a central chooser.
@@ -1238,7 +1269,6 @@ impl Swarm {
             })
             .collect();
 
-        let exterior_index = self.exterior.as_ref().map(|exterior| exterior.index);
         // Anchors first: a watcher needs the subject's signed claim and the
         // state it commits to, and both have to be taken before anyone steps.
         let mut anchors: Vec<(
@@ -1259,7 +1289,7 @@ impl Swarm {
                 (entity, node, anchor, state)
             })
             .collect();
-        if let Some(exterior) = &mut self.exterior {
+        for (slot, exterior) in &mut self.exteriors {
             let index = exterior.index;
             let entity = exterior.entity;
             let node = exterior.node;
@@ -1279,7 +1309,7 @@ impl Swarm {
                     );
                 }
             }
-            debug_assert_eq!(index, count - 1, "the exterior takes the last ring slot");
+            debug_assert_eq!(*slot, index, "the exterior map key is its ring slot");
         }
 
         for (index, witnesses) in sets.iter().enumerate() {
@@ -1287,7 +1317,7 @@ impl Swarm {
                 .iter()
                 .map(|watcher| self.node_of(*watcher))
                 .collect();
-            if Some(index) == exterior_index {
+            if self.exteriors.contains_key(&index) {
                 // The external peer's witness set travels with it: nothing to
                 // configure host-side. Its authored frames reach these same
                 // watchers through the bridge.
@@ -1296,7 +1326,7 @@ impl Swarm {
             self.bots[index].set_witness_set(members);
             // Each of those peers watches this one.
             for watcher in witnesses {
-                if Some(*watcher) == exterior_index {
+                if self.exteriors.contains_key(watcher) {
                     // A bot cannot be armed by a remote subject's anchor here —
                     // but the external peer is not watching anyone either in
                     // slice 1; both directions of that asymmetry close when the
@@ -1483,19 +1513,26 @@ impl Swarm {
             total_undecodable: per_peer.iter().map(|p| p.undecodable).sum(),
             total_replicas: per_peer.iter().map(|p| p.replicas).sum(),
             witnessing: self.config.witnessing,
-            external: self.exterior.as_ref().map(|exterior| ExteriorReport {
-                index: exterior.index,
-                node: exterior.node,
-                connected: exterior
-                    .link
-                    .connected
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                uplink_frames: exterior.uplink_frames,
-                downlink_frames: exterior.downlink_frames,
-                downlink_dropped: exterior.downlink_dropped,
-                said_goodbye: exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed),
-                witness_anchored: exterior.witness_anchored,
-            }),
+            external: self
+                .exteriors
+                .values()
+                .map(|exterior| ExteriorReport {
+                    index: exterior.index,
+                    node: exterior.node,
+                    connected: exterior
+                        .link
+                        .connected
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    connected_ticks: exterior.connected_ticks,
+                    uplink_frames: exterior.uplink_frames,
+                    uplink_delivered: exterior.uplink_delivered,
+                    uplink_dropped: exterior.uplink_dropped,
+                    downlink_frames: exterior.downlink_frames,
+                    downlink_dropped: exterior.downlink_dropped,
+                    said_goodbye: exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed),
+                    witness_anchored: exterior.witness_anchored,
+                })
+                .collect(),
             player_hours: self.total_peers() as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
             total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
@@ -1783,15 +1820,18 @@ impl SwarmReport {
         // stayed joined and traffic actually flowed both ways. A silent slot
         // would otherwise bank its player-hour while measuring nothing — the
         // exact shape #375 exists to refuse.
-        if let Some(external) = &self.external {
+        for external in &self.external {
             let clean_close = external.connected || external.said_goodbye;
             if !clean_close {
                 failures.push(CriterionFailure {
                     clause: "the external peer stays connected",
                     detail: format!(
-                        "the bridge reported a disconnect; {} uplink / {} downlink frames \
+                        "slot {} bridge reported a disconnect; {} uplink / {} downlink frames \
                          before it dropped, {} downlink refused on a full queue",
-                        external.uplink_frames, external.downlink_frames, external.downlink_dropped,
+                        external.index,
+                        external.uplink_frames,
+                        external.downlink_frames,
+                        external.downlink_dropped,
                     ),
                 });
             }
@@ -1799,9 +1839,9 @@ impl SwarmReport {
                 failures.push(CriterionFailure {
                     clause: "the external peer participates",
                     detail: format!(
-                        "{} uplink / {} downlink frames moved; an island member that sends \
+                        "slot {} moved {} uplink / {} downlink frames; an island member that sends \
                          or receives nothing measures nothing",
-                        external.uplink_frames, external.downlink_frames,
+                        external.index, external.uplink_frames, external.downlink_frames,
                     ),
                 });
             }
@@ -1809,9 +1849,9 @@ impl SwarmReport {
                 failures.push(CriterionFailure {
                     clause: "the host keeps up with its own clock",
                     detail: format!(
-                        "{} downlink frames were refused on a full queue; the pump fell \
+                        "slot {} had {} downlink frames refused on a full queue; the pump fell \
                          behind the real-time tick",
-                        external.downlink_dropped,
+                        external.index, external.downlink_dropped,
                     ),
                 });
             }
@@ -2130,7 +2170,7 @@ mod tests {
             total_undecodable: 0,
             total_replicas: 992,
             witnessing: true,
-            external: None,
+            external: Vec::new(),
             player_hours: 32.0,
             total_gaps: 13_009,
             total_false_positives: 0,
@@ -2539,12 +2579,16 @@ mod tests {
             .expect("uplink queue accepts the datagram");
 
         swarm
-            .exterior
-            .as_mut()
+            .exteriors
+            .get_mut(&1)
             .expect("external slot")
             .pump_uplink(7, &mut swarm.router);
 
         assert_eq!(swarm.router.counters.dropped, 1, "the router dropped it");
+        let exterior = swarm.exteriors.get(&1).expect("external slot");
+        assert_eq!(exterior.connected_ticks, 1);
+        assert_eq!(exterior.uplink_delivered, 0);
+        assert_eq!(exterior.uplink_dropped, 1);
         let frame = remote_link
             .downlink
             .lock()
@@ -2595,8 +2639,8 @@ mod tests {
         }
 
         swarm
-            .exterior
-            .as_mut()
+            .exteriors
+            .get_mut(&1)
             .expect("external slot")
             .pump_uplink(11, &mut swarm.router);
 
@@ -2624,6 +2668,12 @@ mod tests {
             client_dropped, swarm.router.counters.dropped,
             "the remote's ACK-derived loss figure must equal actual router drops"
         );
+        let exterior = swarm.exteriors.get(&1).expect("external slot");
+        assert_eq!(
+            exterior.uplink_delivered + exterior.uplink_dropped,
+            SENT as u64
+        );
+        assert_eq!(exterior.uplink_dropped, client_dropped);
     }
 
     /// The bridge is only worth its name if an exterior slot behaves like a
@@ -2737,10 +2787,10 @@ mod tests {
             .expect("the uplink queue accepts meta frames");
         // The uplink pump is what turns meta frames into roster cells; drain
         // it the way collect_sends would.
-        if let Some(exterior) = &mut swarm.exterior {
+        if let Some(exterior) = swarm.exteriors.get_mut(&ext_index) {
             exterior.pump_uplink(0, &mut swarm.router);
         }
-        if let Some(exterior) = &mut swarm.exterior {
+        if let Some(exterior) = swarm.exteriors.get_mut(&ext_index) {
             while let Ok(raw) = {
                 let mut r = exterior.link.meta.lock().expect("meta lock");
                 r.try_recv()
@@ -2952,7 +3002,7 @@ mod tests {
         swarm = swarm.with_external(bot_key(8).public(), None, host_link);
         swarm.form_island();
 
-        let receiver_cell = swarm.exterior.as_ref().expect("external slot").cell();
+        let receiver_cell = swarm.exteriors.get(&8).expect("external slot").cell();
         let interest = receiver_cell.neighbors27();
         let initially_visible: Vec<PersistId> = swarm
             .bots

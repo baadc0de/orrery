@@ -561,7 +561,7 @@ class AdmissionTests(unittest.TestCase):
     def test_an_uploaded_row_for_another_session_still_refuses_assembly(self) -> None:
         # Exercise the real assembler: it must reject a records file with no matching row.
         script = Path(__file__).parents[1] / "scripts" / "p4-campaign-session.sh"; sid = "018f8f4e-5c90-7abc-8123-0000000000aa"; raw = Path(self.tmp.name) / "raw.json"; records = Path(self.tmp.name) / "records.jsonl"
-        raw.write_text('{"external":{},"witnessing":true,"identity":{"target":"x","commit":"0000000000000000000000000000000000000000"}}')
+        raw.write_text('{"external":[],"witnessing":true,"identity":{"target":"x","commit":"0000000000000000000000000000000000000000"}}')
         records.write_text('{"session_id":"018f8f4e-5c90-7abc-8123-0000000000ab","actor":"human","platform_triple":"x","impairment_mismatch":false,"configured_impairment_profile":{"loss_pct":0,"jitter_p50_ms":0,"jitter_p99_ms":0},"observed_loss_pct":0,"observed_jitter_p50_ms":0,"observed_jitter_p99_ms":0}\n')
         self.assertNotEqual(subprocess.run([str(script), "assemble", str(raw), str(records), sid, str(Path(self.tmp.name) / "out.json")], env={**os.environ, "P4_PIPELINE_ID": "test"}).returncode, 0)
 
