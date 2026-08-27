@@ -303,11 +303,18 @@ impl JoinRequest {
 /// The host's answer to a [`JoinRequest`] (`exterior::JoinReply`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinReply {
-    /// The sender joins at this swarm slot; its entity derives from the slot
-    /// exactly as a bot's does.
+    /// The sender joins at this swarm slot.
+    ///
+    /// Reservation-bound join (#574) makes the *reply* the authority on which
+    /// seat this client holds, rather than the client deriving one and
+    /// insisting the host agrees. A reply that also carries a `StartV1`
+    /// manifest states the frozen membership of the attempt as well.
     Accept {
         /// The swarm slot assigned to this peer.
         index: usize,
+        /// The frozen active membership, when the host sends one. `None` from
+        /// every host older than #574, whose accept is the bare index.
+        manifest: Option<crate::lobby::StartManifest>,
     },
     /// The host refuses the join; the reason names itself.
     Reject {
@@ -336,12 +343,22 @@ impl JoinReply {
                 let Some(rest) = bytes.get(1..9) else {
                     return Err("accept truncated");
                 };
-                Ok(Self::Accept {
-                    index: usize::try_from(u64::from_le_bytes(
-                        rest.try_into().expect("eight bytes"),
-                    ))
-                    .map_err(|_| "accept index overflow")?,
-                })
+                let index =
+                    usize::try_from(u64::from_le_bytes(rest.try_into().expect("eight bytes")))
+                        .map_err(|_| "accept index overflow")?;
+                // Anything past the index is the `StartV1` manifest. A bare
+                // nine-byte accept is the pre-#574 reply and carries none;
+                // trailing bytes that do not decode are a malformed reply, not
+                // a manifest to shrug off, because shrugging would leave the
+                // client playing with no membership it agreed to.
+                let manifest = match bytes.get(9..) {
+                    None | Some([]) => None,
+                    Some(payload) => Some(
+                        crate::lobby::StartManifest::decode(payload)
+                            .map_err(|_| "accept manifest did not decode")?,
+                    ),
+                };
+                Ok(Self::Accept { index, manifest })
             }
             Some(1) => {
                 let Some(&len) = bytes.get(1) else {
@@ -526,23 +543,33 @@ impl CampaignLink {
 ///
 /// `anchor` is the caller-authored tick-zero commitment. `None` retains #387's
 /// explicit empty-anchor convention for clients that legitimately have no log.
-/// The assigned slot is verified against `expected_slot` — a host assigning a
-/// different slot is a misconfiguration to refuse, exactly as the runner
-/// refuses one.
+///
+/// `expect` is everything the caller already spent on that anchor: the seat
+/// admission reserved, the entity spawned into it, this client's transport
+/// identity and the island size the spawn pose was computed against. When the
+/// host sends a `StartV1` manifest it is checked against all of it and
+/// **adopted**; when it disagrees the join is refused rather than repaired,
+/// because the tick-zero claim is already signed and a session played against
+/// a manifest the client does not match is evidence nobody can reconcile.
+///
+/// A host that sends no manifest — every host older than #574 — still has its
+/// bare accept checked against the reserved seat, which is the only statement
+/// about membership such a host makes.
 ///
 /// The returned link's pumps run on the caller's tokio runtime, which must
 /// outlive the link.
 ///
 /// # Errors
 /// A rendered string for every refusal: dial failure, handshake timeout or
-/// truncation, reject reply, slot mismatch, stream setup failure.
+/// truncation, reject reply, slot mismatch, manifest mismatch, stream setup
+/// failure.
 pub async fn remote_join(
     endpoint: &iroh::Endpoint,
     address: iroh::EndpointAddr,
     request: &JoinRequest,
-    expected_slot: usize,
+    expect: &crate::lobby::StartExpectation,
     anchor: Option<AnchorFrame>,
-) -> Result<CampaignLink, String> {
+) -> Result<(CampaignLink, Option<crate::lobby::AcceptedStart>), String> {
     const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
     let debug = std::env::var_os("REGOLITH_NET_DEBUG").is_some();
     let step = |stage: &str| {
@@ -573,20 +600,27 @@ pub async fn remote_join(
         .map_err(|_| "handshake read timed out".to_string())?
         .map_err(|error| format!("read join reply: {error}"))?;
     step("join reply read");
-    match JoinReply::decode(&reply_bytes) {
-        Ok(JoinReply::Accept { index }) => {
-            if index != expected_slot {
+    let accepted_start = match JoinReply::decode(&reply_bytes) {
+        Ok(JoinReply::Accept { index, manifest }) => {
+            if index != expect.slot {
                 return Err(format!(
-                    "the host assigned slot {index}; this client was launched for slot \
-                     {expected_slot}"
+                    "the host assigned slot {index}; this client reserved slot {}",
+                    expect.slot
                 ));
+            }
+            match manifest {
+                None => None,
+                Some(manifest) => Some(
+                    crate::lobby::accept_start(&manifest, expect)
+                        .map_err(|mismatch| mismatch.player_sentence())?,
+                ),
             }
         }
         Ok(JoinReply::Reject { reason }) => {
             return Err(format!("the host refused the join: {reason}"));
         }
         Err(reason) => return Err(format!("the host's reply did not decode: {reason}")),
-    }
+    };
 
     // Two separately framed messages, exactly as the headless producer ships:
     // signed claim first, then the canonical state it commits to. The empty
@@ -642,12 +676,15 @@ pub async fn remote_join(
     // (#385's flaky-first-frame lesson).
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    Ok(CampaignLink {
-        downlink: Arc::new(Mutex::new(inbound_rx)),
-        uplink: outbound_tx,
-        connected,
-        closed_by_host,
-    })
+    Ok((
+        CampaignLink {
+            downlink: Arc::new(Mutex::new(inbound_rx)),
+            uplink: outbound_tx,
+            connected,
+            closed_by_host,
+        },
+        accepted_start,
+    ))
 }
 
 async fn announce(stream: &mut iroh::endpoint::SendStream) -> Result<(), String> {
@@ -955,7 +992,10 @@ mod tests {
     /// what slice 1's host writes back.
     #[test]
     fn join_reply_decode_matches_slice_1() {
-        let accept = JoinReply::Accept { index: 5 };
+        let accept = JoinReply::Accept {
+            index: 5,
+            manifest: None,
+        };
         let mut bytes = vec![0];
         bytes.extend_from_slice(&5u64.to_le_bytes());
         assert_eq!(JoinReply::decode(&bytes), Ok(accept));
@@ -970,6 +1010,46 @@ mod tests {
         );
         assert_eq!(JoinReply::decode(&[7]), Err("unknown join reply"));
         assert_eq!(JoinReply::decode(&[0, 1, 2]), Err("accept truncated"));
+    }
+
+    /// Reservation-bound join: the accept is where the frozen membership
+    /// arrives, and the client takes it from the reply rather than deriving
+    /// one. Trailing bytes that are not a manifest are a broken reply, not a
+    /// manifest to ignore — ignoring one would leave the client playing with
+    /// no membership it ever agreed to.
+    #[test]
+    fn an_accept_carries_the_start_manifest_when_the_host_sends_one() {
+        let manifest = crate::lobby::StartManifest {
+            attempt_id: "0192f0a0-0000-7000-8000-000000000001".to_owned(),
+            seed: 3,
+            tick: 0,
+            island_seats: 8,
+            active: vec![crate::lobby::ActiveSeat {
+                slot: 7,
+                node: "ab".repeat(32),
+                entity: 8,
+            }],
+            witness_recipients: Vec::new(),
+            duration_ticks: 216_000,
+        };
+        let mut bytes = vec![0];
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&manifest.encode());
+        assert_eq!(
+            JoinReply::decode(&bytes),
+            Ok(JoinReply::Accept {
+                index: 7,
+                manifest: Some(manifest)
+            })
+        );
+
+        let mut junk = vec![0];
+        junk.extend_from_slice(&7u64.to_le_bytes());
+        junk.extend_from_slice(b"{not a manifest}");
+        assert_eq!(
+            JoinReply::decode(&junk),
+            Err("accept manifest did not decode")
+        );
     }
 
     /// The client's slot keys are byte-for-byte the harness's `bot_key`

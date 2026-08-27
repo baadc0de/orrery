@@ -134,6 +134,16 @@ pub struct CampaignConfig {
     /// Persistent client identity presented at admission, used for the QUIC
     /// handshake and the finished measurement signature.
     pub transport_secret: iroh_base::SecretKey,
+    /// How many seats the host's island has, when admission said.
+    ///
+    /// The spawn pose is a function of `(slot, island_seats)`
+    /// (`orrery_games::regolith::campaign_spawn_pose`), so a client that
+    /// guesses this number starts somewhere the host did not put it. Before
+    /// #573 the client used `slot + 1`, which is right only for the sole
+    /// human in the last seat and wrong for the first of several. `None`
+    /// keeps that derivation, because a service that does not publish
+    /// `humans` is a one-human service and the two agree there.
+    pub island_seats: Option<u16>,
     /// Where to fetch this campaign's nickname roster, when one is reachable.
     ///
     /// `None` for a session that never spoke to an admission service — the
@@ -143,6 +153,30 @@ pub struct CampaignConfig {
 }
 
 impl CampaignConfig {
+    /// The island size the spawn pose is computed against.
+    ///
+    /// The host's number when admission published one, and otherwise the
+    /// pre-#573 derivation, which is exactly right for the single-human
+    /// campaign that is the only thing a service without `humans` can run.
+    #[must_use]
+    pub fn island_seats(&self) -> u16 {
+        let derived = u16::try_from(self.slot.saturating_add(1)).unwrap_or(u16::MAX);
+        self.island_seats
+            .map_or(derived, |seats| seats.max(derived))
+    }
+
+    /// What the host's `StartV1` manifest must agree with before this client
+    /// will play. Every field is already spent on the tick-zero anchor.
+    #[must_use]
+    pub fn start_expectation(&self) -> crate::lobby::StartExpectation {
+        crate::lobby::StartExpectation {
+            slot: self.slot,
+            entity: self.slot as u64 + 1,
+            node_hex: self.transport_secret.public().to_string(),
+            island_seats: self.island_seats(),
+        }
+    }
+
     /// The actor behind a campaign session built from this config.
     #[must_use]
     pub fn actor(&self) -> Actor {
@@ -349,7 +383,20 @@ impl DeliveredOrder {
 
 /// What one dial attempt reports back to the render loop: the endpoint (kept
 /// alive with the pumps) or why the join did not happen.
-type PendingJoin = Arc<Mutex<Option<Result<(iroh::Endpoint, Arc<CampaignLink>), String>>>>;
+type PendingJoin = Arc<
+    Mutex<
+        Option<
+            Result<
+                (
+                    iroh::Endpoint,
+                    Arc<CampaignLink>,
+                    Option<crate::lobby::AcceptedStart>,
+                ),
+                String,
+            >,
+        >,
+    >,
+>;
 
 /// The tokio runtime and endpoint keeping the pumps alive. Dropping either
 /// closes the connection under the link (#385's joined-but-deaf lesson), so
@@ -368,6 +415,10 @@ pub struct CampaignRuntime {
     link: Option<Arc<CampaignLink>>,
     pending_join: PendingJoin,
     net: Option<NetGuard>,
+    /// The host's frozen membership, once it has been checked against what
+    /// this client already anchored. `None` against a host that sends no
+    /// manifest, which is every host until #574 lands.
+    start: Option<crate::lobby::AcceptedStart>,
 
     executor: Executor<Regolith>,
     pipeline: IntentPipeline,
@@ -409,7 +460,7 @@ impl CampaignRuntime {
         // signed tick-zero state must use the same campaign pose as the host's
         // headless peers; the compact scenario ring is a different world and
         // leaves every host-owned target kilometres outside weapon reach.
-        let (pos, yaw_urad) = campaign_spawn_pose(config.slot, config.slot.saturating_add(1));
+        let (pos, yaw_urad) = campaign_spawn_pose(config.slot, usize::from(config.island_seats()));
         executor.insert(
             entity,
             RegolithState::Craft(Craft::spawned(
@@ -474,7 +525,7 @@ impl CampaignRuntime {
                 .host_direct
                 .as_deref()
                 .and_then(|socket| socket.parse().ok());
-            let slot = config.slot;
+            let expectation = config.start_expectation();
             let transport_secret = config.transport_secret.clone();
             let client_rev = crate::BUILD_REV.to_owned();
             let session_id = config.session_id.clone();
@@ -499,13 +550,13 @@ impl CampaignRuntime {
                             token: token?,
                         };
                         let deadline = std::time::Duration::from_secs(JOIN_DEADLINE_SECS);
-                        let link = tokio::time::timeout(
+                        let (link, start) = tokio::time::timeout(
                             deadline,
-                            net::remote_join(&endpoint, addr, &request, slot, Some(anchor)),
+                            net::remote_join(&endpoint, addr, &request, &expectation, Some(anchor)),
                         )
                         .await
                         .map_err(|_| format!("the join did not complete within {deadline:?}"))??;
-                        Ok((endpoint, Arc::new(link)))
+                        Ok((endpoint, Arc::new(link), start))
                     });
                     *thread_pending.lock().expect("pending lock") = Some(joined);
                 });
@@ -570,6 +621,7 @@ impl CampaignRuntime {
             entity,
             campaign,
             pending_join,
+            start: None,
         }
     }
 
@@ -586,10 +638,20 @@ impl CampaignRuntime {
                         JoinState::Failed("the dial thread never reported back".to_owned());
                 }
             }
-            Some(Ok((endpoint, link))) => {
+            Some(Ok((endpoint, link, start))) => {
                 if let Some(net) = self.net.as_mut() {
                     net._endpoint = Some(endpoint);
                 }
+                if let Some(start) = &start {
+                    bevy::log::info!(
+                        "campaign: adopted StartV1 attempt {} - {} seats, {} active, witnesses {:?}",
+                        start.attempt_id,
+                        start.island_seats,
+                        start.active_slots.len(),
+                        start.witness_recipients
+                    );
+                }
+                self.start = start;
                 self.link = Some(link);
                 self.state = JoinState::Joined;
             }
@@ -635,6 +697,47 @@ impl CampaignRuntime {
     #[must_use]
     pub fn config(&self) -> &CampaignConfig {
         &self.config
+    }
+
+    /// The host's frozen membership, when it sent one.
+    #[must_use]
+    pub fn accepted_start(&self) -> Option<&crate::lobby::AcceptedStart> {
+        self.start.as_ref()
+    }
+
+    /// Who canonical state is broadcast to.
+    ///
+    /// The manifest's active set minus this client when there is one, because
+    /// a later human is not a lower-numbered slot and `0..slot` would silently
+    /// stop replicating to it. Without a manifest this is the pre-#574
+    /// derivation: the sole exterior occupies the last seat, so every slot
+    /// below it is exactly the rest of the island.
+    #[must_use]
+    fn broadcast_recipients(&self) -> Vec<usize> {
+        match &self.start {
+            Some(start) => start
+                .active_slots
+                .iter()
+                .copied()
+                .filter(|slot| *slot != self.config.slot)
+                .collect(),
+            None => (0..self.config.slot).collect(),
+        }
+    }
+
+    /// Who witness claims and frames are addressed to.
+    ///
+    /// The host chooses the ring (D28 reserves witness-set choice to the
+    /// coordinator), so a manifest's `witness_recipients` is adopted whole
+    /// rather than intersected with anything derived here. Without a manifest
+    /// this is the harness's deterministic ring, bounded at
+    /// [`MAX_WITNESS_LINKS`] exactly as before.
+    #[must_use]
+    fn witness_recipients(&self) -> Vec<usize> {
+        match &self.start {
+            Some(start) => start.witness_recipients.clone(),
+            None => (0..self.config.slot.min(MAX_WITNESS_LINKS)).collect(),
+        }
     }
 
     /// The live link, exactly when the state machine has reached Joined.
@@ -858,15 +961,17 @@ impl CampaignRuntime {
         }
         let authored = self.witness_log.cut_frame(tick.0);
 
-        // The exterior slot is last in the host's deterministic witness ring;
-        // its next peers wrap to slots 0..K. StreamShared matches the headless
-        // plugin's reliable shared stream and is not subject to datagram loss.
-        let witness_count = self.config.slot.min(MAX_WITNESS_LINKS);
+        // The host names this subject's frozen ring in `StartV1`; without a
+        // manifest the exterior slot is last in the harness's deterministic
+        // ring and its next peers wrap to slots 0..K. StreamShared matches the
+        // headless plugin's reliable shared stream and is not subject to
+        // datagram loss.
+        let witness_count = self.witness_recipients();
         if let Some(claim) = claim {
             let payload = Bytes::from(orrery_protocol::channels::encode_witness(
                 &WitnessMsg::Claim(claim),
             ));
-            self.publish_witness_payload(&link, witness_count, payload);
+            self.publish_witness_payload(&link, &witness_count, payload);
         }
         if let Some(authored) = authored {
             let heads = authored
@@ -884,17 +989,18 @@ impl CampaignRuntime {
                     heads,
                 },
             ));
-            self.publish_witness_payload(&link, witness_count, payload);
+            self.publish_witness_payload(&link, &witness_count, payload);
         }
 
         // ── Outbound: canonical state to every island-mate ────────────────
-        // The external peer occupies slot N of N+1, so slots below it are
-        // exactly the other members; the join reply pinned N.
+        // The manifest's active set minus this client, when the host sent one.
+        // Without a manifest the external peer occupies slot N of N+1, so
+        // slots below it are exactly the other members; the join reply pins N.
         if tick.0 % SEND_EVERY_TICKS == SEND_EVERY_TICKS - 1 {
             let cell = self.committed_cell();
             self.latest_cell = Some(cell);
             let payload = encode_state_broadcast(&self.executor, self.entity, cell, tick.0 + 1);
-            for recipient in 0..self.config.slot {
+            for recipient in self.broadcast_recipients() {
                 let datagram = UplinkDatagram {
                     sequence: self.uplink_sequence,
                     payload: Bytes::clone(&payload),
@@ -1066,13 +1172,13 @@ impl CampaignRuntime {
     fn publish_witness_payload(
         &mut self,
         link: &CampaignLink,
-        witness_count: usize,
+        recipients: &[usize],
         payload: Bytes,
     ) {
-        for recipient in 0..witness_count {
+        for recipient in recipients {
             if link
                 .try_uplink(net::Frame {
-                    peer: recipient as u32,
+                    peer: *recipient as u32,
                     lane: Lane::StreamShared,
                     payload: payload.clone(),
                 })
@@ -1748,9 +1854,63 @@ mod tests {
                 jitter_p99_ms: 100,
             },
             transport_secret: iroh_base::SecretKey::from_bytes(&[0x49; 32]),
+            island_seats: None,
             roster_url: None,
         };
         assert_eq!(config.actor(), Actor::Human);
+    }
+
+    /// The spawn pose is a function of `(slot, island_seats)`, and the host
+    /// computes it over the *configured* island. A human in seat 4 of 8 whose
+    /// client derived `slot + 1 = 5` would spawn on a different orbit than the
+    /// host put it on, so the number must come from the host when the host
+    /// states it and only fall back where the two provably agree.
+    #[test]
+    fn the_spawn_pose_uses_the_island_the_host_configured() {
+        let mut config = CampaignConfig {
+            host_node_hex: "61a71521afb8e193d0d0fc248f85ed20bc78efa1120c83334579129b4171405b"
+                .to_owned(),
+            host_direct: None,
+            slot: 4,
+            session_id: "s-1".to_owned(),
+            session_token_hex: None,
+            wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
+            configured: ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+            transport_secret: iroh_base::SecretKey::from_bytes(&[0x49; 32]),
+            island_seats: Some(8),
+            roster_url: None,
+        };
+        assert_eq!(config.island_seats(), 8);
+        assert_eq!(
+            campaign_spawn_pose(4, 8),
+            campaign_spawn_pose(config.slot, usize::from(config.island_seats())),
+        );
+        assert_ne!(
+            campaign_spawn_pose(4, 8),
+            campaign_spawn_pose(4, 5),
+            "the pre-#573 derivation is a different orbit, which is the bug"
+        );
+
+        // A service that never says how big the island is is a one-human
+        // service, where the sole human sits in the last seat and the two
+        // derivations agree exactly.
+        config.island_seats = None;
+        config.slot = 7;
+        assert_eq!(config.island_seats(), 8);
+
+        // The expectation the manifest is checked against is built from the
+        // same numbers, so it cannot drift from the pose that was anchored.
+        let expectation = config.start_expectation();
+        assert_eq!((expectation.slot, expectation.entity), (7, 8));
+        assert_eq!(expectation.island_seats, 8);
+        assert_eq!(
+            expectation.node_hex,
+            config.transport_secret.public().to_string()
+        );
     }
 
     /// The client's broadcast must be the exact bytes a bot's receive path

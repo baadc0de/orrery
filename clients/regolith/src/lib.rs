@@ -15,6 +15,7 @@ pub mod identity;
 pub mod intent;
 pub mod join;
 pub mod legend;
+pub mod lobby;
 pub mod net;
 pub mod roster;
 pub mod session;
@@ -90,6 +91,8 @@ struct AlwaysOnStrip;
 struct SessionBanner;
 #[derive(Component)]
 struct F3Pane;
+#[derive(Component)]
+struct LobbyPanel;
 
 #[derive(Debug, Default, Resource)]
 struct OverlayState {
@@ -505,6 +508,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<aoi::AoiFadeCensus>()
             .init_resource::<roster::ShipRoster>()
             .init_resource::<roster::RosterTask>()
+            .init_resource::<lobby::LobbyView>()
             .init_resource::<SelectedLock>()
             .init_resource::<CombatView>()
             .init_resource::<grab::ReachView>()
@@ -602,6 +606,7 @@ impl Plugin for RegolithSkinPlugin {
                 Update,
                 roster::refresh_roster.run_if(on_timer(roster::ROSTER_REFRESH)),
             )
+            .add_systems(Update, refresh_lobby_panel)
             .add_systems(
                 Update,
                 drive_zoom_sweep
@@ -704,6 +709,123 @@ fn setup_scene(
         },
         F3Pane,
     ));
+    // The waiting room. Top-centre, under the session banner: it must be the
+    // first thing read, and it must not sit on the controls legend in the
+    // bottom-right — the lobby is exactly when a first-time player should be
+    // reading that legend, so the two are on screen together rather than in
+    // sequence. Hidden until the host has actually described a lobby.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(LOBBY_PANEL_TOP_PX),
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::Center,
+            ..Default::default()
+        },
+        GlobalZIndex(99),
+        children![(
+            Text::new(""),
+            TextFont::from_font_size(LOBBY_ROW_FONT_PX),
+            TextColor(Color::srgb(0.86, 0.90, 0.95)),
+            Node {
+                display: Display::None,
+                padding: UiRect::axes(Val::Px(14.0), Val::Px(9.0)),
+                border_radius: BorderRadius::all(Val::Px(8.0)),
+                ..Default::default()
+            },
+            BackgroundColor(Color::srgba(0.035, 0.05, 0.075, 0.92)),
+            LobbyPanel,
+        )],
+    ));
+}
+
+/// Where the waiting-room panel sits, in pixels from the top.
+///
+/// Clear of the session banner at 8 px and of nothing else: a full eight-seat
+/// room is a heading, three summary lines and eight rows, which at
+/// [`LOBBY_ROW_FONT_PX`] is roughly 190 px and finishes well above the
+/// mid-screen crosshair even in the 720-line window #552 calls tight.
+const LOBBY_PANEL_TOP_PX: f32 = 44.0;
+
+/// Font size of a waiting-room line, in pixels.
+const LOBBY_ROW_FONT_PX: f32 = 13.0;
+
+/// Whether the waiting room belongs on screen at all.
+///
+/// Two conditions, both necessary. The player must still be waiting for
+/// something — a dial in flight, a refusal to read, or a host that says the
+/// attempt has not started — and the host must have said enough to draw. A
+/// service older than #573 satisfies the first and never the second, so it
+/// gets no panel rather than a room assembled out of craft labels.
+fn lobby_panel_visible(
+    presentation: SessionPresentation,
+    lobby: &lobby::LobbyView,
+    has_notice: bool,
+) -> bool {
+    let still_waiting = match (presentation, &lobby.phase) {
+        // Nothing to wait for: this run never joined a campaign.
+        (SessionPresentation::Local, _) => false,
+        // Dialling, refused, failed or dropped: the room is where the player
+        // finds out which, and it carries the notice saying so.
+        (
+            SessionPresentation::Dialing
+            | SessionPresentation::Failed
+            | SessionPresentation::Refused
+            | SessionPresentation::Disconnected,
+            _,
+        ) => true,
+        // Joined: keep the room up only while the host says the attempt has
+        // not started. A waiting room over a live game is a lie about play.
+        (SessionPresentation::Live, Some(phase)) => phase.is_waiting(),
+        (SessionPresentation::Live, None) => false,
+    };
+    still_waiting && (lobby.is_describable() || has_notice)
+}
+
+/// Draw the waiting room, or nothing at all.
+///
+/// The panel appears only when the host has actually described a lobby: a
+/// phase it named, and at least one human seat. A service older than #573
+/// sends neither, and the correct output there is no panel — inventing a seat
+/// map out of whatever rows arrived would put a room on screen that no host
+/// asserted (A12 §5.6, ADR-0050).
+///
+/// It also retires itself once the attempt is running and this client is in
+/// it. A waiting room over a live game is a lie about the state of play, and
+/// the seat map's job is done the moment the ships are the seat map.
+fn refresh_lobby_panel(
+    session: Res<ActiveSession>,
+    lobby: Res<lobby::LobbyView>,
+    mut panel: Query<(&mut Text, &mut Node), With<LobbyPanel>>,
+) {
+    let presentation = SessionPresentation::from_join_state(session.join_state());
+    // What the host said about *this* client's join, in the room where the
+    // player is waiting for it. `JoinState` already carries the host's own
+    // words; nothing here paraphrases them.
+    let notice = match session.join_state() {
+        Some(JoinState::Refused(reason)) => Some(lobby::refusal_sentence(None, Some(reason), None)),
+        Some(JoinState::Failed(reason)) => {
+            lobby::plain_ascii(reason).map(|reason| format!("Could not join: {reason}"))
+        }
+        Some(JoinState::Closed { .. }) => {
+            Some("The host ended this attempt. The next lobby opens shortly.".to_owned())
+        }
+        Some(JoinState::Dialing | JoinState::Joined) | None => None,
+    };
+    let visible = lobby_panel_visible(presentation, &lobby, notice.is_some());
+    let Ok((mut text, mut node)) = panel.single_mut() else {
+        return;
+    };
+    node.display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if visible {
+        let mut view = lobby.clone();
+        view.notice = notice.or_else(|| lobby.notice.clone());
+        **text = view.text();
+    }
 }
 
 /// Spawns one rendered body for a core entity.
@@ -2927,10 +3049,8 @@ mod tests {
 
         let mut roster = ShipRoster::default();
         roster.accept(&RosterResponse {
-            roster: vec![RosterRow {
-                slot: 8,
-                nickname: "ada".to_owned(),
-            }],
+            roster: vec![RosterRow::labelled(8, "ada")],
+            ..Default::default()
         });
         let known = entity_of_slot(8);
         let stranger = entity_of_slot(3);
@@ -2963,6 +3083,150 @@ mod tests {
             [(known, Some(Vec2::ZERO)), (stranger, Some(Vec2::ZERO))].into_iter(),
         );
         assert!(silent.is_empty(), "no roster means no tags: {silent:?}");
+    }
+
+    /// #575: the waiting room appears only where the host described one, and
+    /// it gets out of the way once the attempt is running.
+    #[test]
+    fn the_waiting_room_is_drawn_only_while_the_host_says_there_is_one() {
+        use crate::lobby::{LobbyPhase, LobbyView, Seat, SeatKind, SeatState};
+
+        let room = LobbyView {
+            seats: vec![
+                Seat {
+                    slot: 4,
+                    kind: SeatKind::Human,
+                    state: SeatState::Connected,
+                    nickname: Some("ada".to_owned()),
+                },
+                Seat {
+                    slot: 5,
+                    kind: SeatKind::Human,
+                    state: SeatState::Empty,
+                    nickname: None,
+                },
+            ],
+            phase: Some(LobbyPhase::Lobby),
+            starts_in_s: None,
+            own_slot: Some(4),
+            notice: None,
+        };
+        assert!(lobby_panel_visible(
+            SessionPresentation::Dialing,
+            &room,
+            false
+        ));
+        assert!(lobby_panel_visible(SessionPresentation::Live, &room, false));
+
+        // The attempt started: the seat map's job is done, the ships are the
+        // seat map now.
+        let running = LobbyView {
+            phase: Some(LobbyPhase::Running),
+            ..room.clone()
+        };
+        assert!(!lobby_panel_visible(
+            SessionPresentation::Live,
+            &running,
+            false
+        ));
+
+        // A service older than #573 describes no room, so none is drawn — not
+        // one assembled from whatever craft labels arrived.
+        let legacy = LobbyView {
+            phase: None,
+            ..room.clone()
+        };
+        assert!(!lobby_panel_visible(
+            SessionPresentation::Live,
+            &legacy,
+            false
+        ));
+        assert!(!lobby_panel_visible(
+            SessionPresentation::Dialing,
+            &legacy,
+            false
+        ));
+        // Unless there is something to tell the player about their own join.
+        assert!(lobby_panel_visible(
+            SessionPresentation::Refused,
+            &legacy,
+            true
+        ));
+
+        // The offline sandbox has no host and therefore no room.
+        assert!(!lobby_panel_visible(
+            SessionPresentation::Local,
+            &room,
+            true
+        ));
+    }
+
+    /// The fit proof at the default window Bevy opens, 1280x720.
+    ///
+    /// #552 records that 720 lines is already tight, so this is numeric rather
+    /// than a look, exactly as `legend::legend_fits_the_default_720_line_window`
+    /// is: a full eight-seat room, with the longest names admission will hand
+    /// over and a refusal sentence under it, measured against the window and
+    /// against the controls legend it must not reach.
+    #[test]
+    fn the_waiting_room_fits_the_default_720_line_window() {
+        use crate::legend;
+        use crate::lobby::{LobbyPhase, LobbyView, Seat, SeatKind, SeatState};
+
+        const WINDOW_W: f32 = 1280.0;
+        const WINDOW_H: f32 = 720.0;
+        // `legend::spawn_legend` puts its panel in the bottom-right corner.
+        let legend_top = WINDOW_H - legend::MARGIN_PX - legend::height_px();
+
+        let longest = "x".repeat(crate::roster::NICKNAME_MAX_CHARS);
+        let room = LobbyView {
+            seats: (0..8)
+                .map(|slot| Seat {
+                    slot,
+                    kind: if slot < 4 {
+                        SeatKind::Bot
+                    } else {
+                        SeatKind::Human
+                    },
+                    state: SeatState::Reserved,
+                    nickname: Some(longest.clone()),
+                })
+                .collect(),
+            phase: Some(LobbyPhase::Restarting),
+            starts_in_s: Some(90),
+            own_slot: Some(4),
+            notice: Some(lobby::refusal_sentence(
+                Some("campaign_full"),
+                Some("All 4 player seats are full; try the next lobby."),
+                Some(126),
+            )),
+        };
+
+        let lines = room.lines();
+        // Heading, phase, occupancy, countdown, eight seats, notice.
+        assert_eq!(lines.len(), 13, "{lines:?}");
+        assert!(
+            lines.iter().all(|line| line.is_ascii()),
+            "Bevy's built-in face draws boxes for anything else: {lines:?}"
+        );
+
+        let widest = lines
+            .iter()
+            .map(|line| legend::text_width_px(line, LOBBY_ROW_FONT_PX))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            widest < WINDOW_W,
+            "the widest waiting-room line measures {widest:.1} px in a {WINDOW_W:.0} px window"
+        );
+
+        let height = lines.len() as f32 * LOBBY_ROW_FONT_PX * legend::LINE_HEIGHT_RATIO
+            + 2.0 * legend::PADDING_PX;
+        let bottom = LOBBY_PANEL_TOP_PX + height;
+        assert!(
+            bottom < legend_top,
+            "the waiting room ends at {bottom:.1} px and the controls legend starts at \
+             {legend_top:.1} px: a first-time player must be able to read both at once"
+        );
     }
 
     #[test]
