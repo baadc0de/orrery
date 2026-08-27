@@ -102,19 +102,115 @@ const CAMPAIGN_ROCK_TIERS: [RockTier; CAMPAIGN_ROCK_COUNT] = [
     RockTier::Small,
     RockTier::Small,
 ];
-/// Campaign interest-cell edge, sized for Regolith's stock engagement reach.
+/// The widest body a weapon can be locked onto, in millimetres.
 ///
-/// The framework default is 128 m, but a 27-cell AOI at that edge can drop a
-/// craft only 172 m from the observer. Every campaign craft starts with a
-/// stock weapon whose 400 m reach is still live there. A 512 m edge preserves
-/// the 10% commitment margin and keeps the whole stock interaction radius in
-/// the coarse AOI without changing the 27-cell topology or the P1 gate's
-/// framework-default exercise.
-pub const CAMPAIGN_CELL_EDGE_M: f64 = 512.0;
+/// `projectile_resolution` adds the *target's* radius to the weapon envelope
+/// before it compares centre-to-centre range, and interest membership keys off
+/// a body's centre. So the AOI has to cover the weapon envelope plus the
+/// largest radius anything adjudicable can carry — craft chassis and rock
+/// tiers alike, both read from their own tables rather than restated.
+pub const MAX_TARGET_RADIUS_MM: i64 = {
+    let mut widest = 0;
+    let mut index = 0;
+    while index < Archetype::ALL.len() {
+        let radius = Archetype::ALL[index].limits().radius_mm;
+        if radius > widest {
+            widest = radius;
+        }
+        index += 1;
+    }
+    let mut index = 0;
+    while index < RockTier::ALL.len() {
+        let radius = RockTier::ALL[index].limits().radius_mm;
+        if radius > widest {
+            widest = radius;
+        }
+        index += 1;
+    }
+    widest
+};
 
-/// Regolith v15's rules identity: collision forces compose in sealed input order.
+/// The longest centre-to-centre range at which the ruleset will still resolve
+/// a shot, in millimetres: the widest weapon envelope plus the widest target.
+///
+/// 940 m at the current table — Heavy's 700 m optimal plus 200 m falloff plus
+/// a 40 m Large rock.
+pub const MAX_ENGAGEMENT_RANGE_MM: i64 =
+    weapon::MAX_WEAPON_REACH_MM.saturating_add(MAX_TARGET_RADIUS_MM);
+
+/// The hysteresis margin as a fraction of the cell edge, in per-mille.
+///
+/// This restates `orrery_spatial::SpatialConfig`'s 0.10 default (D16) in the
+/// integer form the sizing below needs. `orrery_games` does not link Bevy, so
+/// the two cannot be one declaration; the client's
+/// `the_campaign_aoi_uses_the_frameworks_own_hysteresis_margin` pins them
+/// together from the side that sees both.
+pub const CAMPAIGN_HYSTERESIS_PER_MILLE: i64 = 100;
+
+/// Cell edges the campaign may choose from: whole multiples of the framework
+/// default, so the campaign grid stays a coarsening of the framework's.
+const CAMPAIGN_EDGE_QUANTUM_MM: i64 = 128_000;
+
+/// The smallest campaign cell edge whose *guaranteed* AOI radius still covers
+/// the ruleset's longest engagement, in metres.
+///
+/// The 27-cell AOI's guaranteed visibility radius is not the cell edge:
+/// commitment is hysteretic, so it lags position by up to `m`, and
+/// `docs/01-spatial-model.md` §7 gives the consequence as `edge − m`. With
+/// `m = edge / 10` that is `0.9 · edge`, so covering a reach `r` needs
+///
+/// ```text
+/// 0.9 · edge ≥ r        =>        edge ≥ r · 10 / 9
+/// ```
+///
+/// rounded up to the next whole framework cell. This is derived from the
+/// weapon table, not measured against one weapon at one moment: #520 sized
+/// the edge to the stock weapon's 400 m and #545 arrived one weapon later,
+/// when Heavy's 900 m envelope out-ranged the guarantee by roughly 2×.
+pub const CAMPAIGN_MIN_CELL_EDGE_M: f64 = {
+    let guaranteed_per_mille = 1_000 - CAMPAIGN_HYSTERESIS_PER_MILLE;
+    // Integer division truncates, so round the quotient up before quantising:
+    // an edge one millimetre short of the requirement is still short.
+    let needed_mm =
+        (MAX_ENGAGEMENT_RANGE_MM * 1_000 + guaranteed_per_mille - 1) / guaranteed_per_mille;
+    let quantised = needed_mm.div_euclid(CAMPAIGN_EDGE_QUANTUM_MM) * CAMPAIGN_EDGE_QUANTUM_MM;
+    let quantised = if quantised < needed_mm {
+        quantised + CAMPAIGN_EDGE_QUANTUM_MM
+    } else {
+        quantised
+    };
+    quantised as f64 / 1_000.0
+};
+
+/// Campaign interest-cell edge, sized from the weapon table's longest reach.
+///
+/// The framework default is 128 m, but a 27-cell AOI at that edge guarantees
+/// only 115.2 m of visibility around the observer — inside every weapon's
+/// envelope. This edge must be at least [`CAMPAIGN_MIN_CELL_EDGE_M`], which
+/// the weapon table derives; it may be larger only at replication cost, so it
+/// is declared here rather than aliased, and
+/// `every_weapons_reach_fits_inside_the_campaign_aoi_guarantee` fails if the
+/// declared edge ever falls behind the table.
+pub const CAMPAIGN_CELL_EDGE_M: f64 = 1_152.0;
+
+/// The radius around an observer in which the 27-cell AOI is *guaranteed* to
+/// hold a body, in metres, for a given cell edge.
+///
+/// `edge − m` with `m` the hysteresis margin — the worst case in which
+/// commitment lags position by a full margin
+/// (`docs/01-spatial-model.md` §7).
+#[must_use]
+pub fn campaign_guaranteed_aoi_radius_m(cell_edge_m: f64) -> f64 {
+    cell_edge_m * (1_000 - CAMPAIGN_HYSTERESIS_PER_MILLE) as f64 / 1_000.0
+}
+
+/// Regolith v16's rules identity: v15's collision order, plus a campaign cell
+/// edge derived from the weapon table's longest reach (#545). The edge decides
+/// which cell a craft commits to, so a client on the old edge and a host on
+/// the new one disagree about interest membership — that is a wire-visible
+/// change, not a private constant.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 15,
+    version: 16,
     digest: [0x66; 32],
 };
 

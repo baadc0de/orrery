@@ -2971,7 +2971,7 @@ mod tests {
         const STOCK_REACH_MM: u128 = 406_000;
         let mut phase = [0u128; 6];
         let (receiver_pos, _) = crate::bot::spawn_pose(8, 9);
-        let mut saw_far_departure = false;
+        let mut saw_far_contact = false;
         for tick in 0..45 * TICK_HZ {
             swarm.tick_once(tick, 3, &mut phase);
             if tick % TICK_HZ == TICK_HZ - 1 {
@@ -2986,15 +2986,29 @@ mod tests {
                             "contact {} left scope at tick {tick}, only {distance} mm from the stationary player",
                             bot.entity().0,
                         );
-                    } else if !in_scope {
-                        saw_far_departure = true;
+                    } else {
+                        saw_far_contact = true;
                     }
                 }
             }
         }
         assert!(
-            saw_far_departure,
-            "the test must still exercise a genuine AOI departure after interaction range"
+            saw_far_contact,
+            "the fixture must carry a contact past interaction range, or the guard \
+             above never had a choice to make"
+        );
+        // #545 sized the campaign edge from the weapon table's longest reach
+        // rather than the stock weapon's, which widened it from 512 m to
+        // 1152 m; a 45 s run of this fixture no longer produces a departure at
+        // all. The interest set is still bounded, and saying so here is what
+        // keeps the clause above from being satisfied by an AOI that simply
+        // contains the universe.
+        let (coords, level) = receiver_cell.coords();
+        let far = CellId::from_cell_coords(coords + glam::IVec3::new(2, 0, 0), level)
+            .expect("two cells over is addressable");
+        assert!(
+            !interest.contains(&far),
+            "the 27-cell block must still end somewhere"
         );
     }
 

@@ -8,19 +8,20 @@ use orrery_core::{
 use orrery_games::game::Game;
 use orrery_games::regolith::{
     archetype::Archetype,
-    campaign_rock_seeds, campaign_spawn_pose, distance_mm,
+    campaign_guaranteed_aoi_radius_m, campaign_rock_seeds, campaign_spawn_pose, distance_mm,
     invariants::INVARIANTS,
     order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult},
     pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
     state::{
         BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
     },
-    weapon::WeaponKind,
+    weapon::{WeaponKind, MAX_WEAPON_REACH_MM},
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
-    CAMPAIGN_ROCK_COUNT, ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET,
-    ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS,
-    LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET,
-    RESPAWN_TICKS,
+    CAMPAIGN_CELL_EDGE_M, CAMPAIGN_MIN_CELL_EDGE_M, CAMPAIGN_ROCK_COUNT, ISLAND_CRAFT_BUDGET,
+    ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET,
+    KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK,
+    MAX_ENGAGEMENT_RANGE_MM, MAX_TARGET_RADIUS_MM, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS,
+    REGOLITH_RULESET, RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -325,9 +326,68 @@ fn sample<'a>(
     }
 }
 
+/// #545, and the class #520 settled only for the weapon that existed then.
+///
+/// A weapon out-ranging the AOI is a target that can be shot at while the
+/// host is not obliged to replicate it. The guarantee is not the cell edge:
+/// commitment is hysteretic, so it lags position by up to the margin and the
+/// worst case is `edge − m` (`docs/01-spatial-model.md` §7).
+///
+/// This asserts the *relationship*, not the constants: widen any weapon's
+/// `optimal_mm` or `falloff_mm` past what the declared edge guarantees and
+/// this fails, because the derived minimum edge moves and the declared one
+/// does not follow on its own.
 #[test]
-fn v15_collision_order_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 15);
+fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
+    let guaranteed_m = campaign_guaranteed_aoi_radius_m(CAMPAIGN_CELL_EDGE_M);
+
+    for kind in WeaponKind::ALL {
+        let envelope_mm = kind.weapon().reach_mm() + MAX_TARGET_RADIUS_MM;
+        let envelope_m = envelope_mm as f64 / 1_000.0;
+        assert!(
+            envelope_m <= guaranteed_m,
+            "{kind:?} reaches {envelope_m} m but the campaign AOI only guarantees \
+             {guaranteed_m} m at a {CAMPAIGN_CELL_EDGE_M} m edge — raise \
+             CAMPAIGN_CELL_EDGE_M to at least {CAMPAIGN_MIN_CELL_EDGE_M} m or \
+             shorten the weapon"
+        );
+    }
+
+    let required_m = campaign_guaranteed_aoi_radius_m(CAMPAIGN_MIN_CELL_EDGE_M);
+    assert!(
+        guaranteed_m >= required_m,
+        "the declared edge {CAMPAIGN_CELL_EDGE_M} m guarantees {guaranteed_m} m, \
+         behind the weapon table's own requirement of {CAMPAIGN_MIN_CELL_EDGE_M} m \
+         ({required_m} m guaranteed)"
+    );
+
+    // The derivation is the tightest edge that covers the table, not a
+    // slack constant that happens to be large enough: one framework cell
+    // less would not cover it.
+    assert!(
+        campaign_guaranteed_aoi_radius_m(CAMPAIGN_MIN_CELL_EDGE_M - 128.0)
+            < MAX_ENGAGEMENT_RANGE_MM as f64 / 1_000.0,
+        "CAMPAIGN_MIN_CELL_EDGE_M is not the smallest edge that covers the table"
+    );
+
+    // The longest reach is read from the table, not restated beside it.
+    assert_eq!(
+        MAX_WEAPON_REACH_MM,
+        WeaponKind::ALL
+            .into_iter()
+            .map(|kind| kind.weapon().reach_mm())
+            .max()
+            .expect("the weapon table is not empty")
+    );
+    assert_eq!(
+        MAX_ENGAGEMENT_RANGE_MM,
+        MAX_WEAPON_REACH_MM + MAX_TARGET_RADIUS_MM
+    );
+}
+
+#[test]
+fn v16_collision_order_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 16);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -341,6 +401,13 @@ fn v15_collision_order_ruleset_identity_and_island_budget_are_pinned() {
         }),
         [400_000, 300_000, 900_000]
     );
+    assert_eq!(
+        MAX_TARGET_RADIUS_MM, 40_000,
+        "a Large rock is the widest target"
+    );
+    assert_eq!(MAX_ENGAGEMENT_RANGE_MM, 940_000);
+    assert_eq!(CAMPAIGN_MIN_CELL_EDGE_M, 1_152.0);
+    assert_eq!(CAMPAIGN_CELL_EDGE_M, 1_152.0);
     assert_eq!(ISLAND_CRAFT_BUDGET, 8);
     assert_eq!(ISLAND_ROCK_BUDGET, 24);
     assert_eq!(ISLAND_PICKUP_BUDGET, 4);
