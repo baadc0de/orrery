@@ -47,6 +47,14 @@ not a rendering check: a successful line says `graphics were intentionally not
 initialized`, while a composition error remains a client failure. Run the
 ordinary client to exercise graphics-device capability.
 
+`--render-smoke` is the bounded rendered launch proof used by the release
+workflow. It keeps the windowed client alive for twenty seconds, then requests a
+primary-window screenshot and exits successfully only when Bevy reports that
+the renderer completed that frame. It exits with an error after 60 seconds if
+the renderer never produces the screenshot. This distinguishes process spawn
+from a client that remains alive and renders, including delayed compositor
+failures.
+
 ## Verifying presentation without a desktop
 
 Presentation issues (#524, #530, #531) sat blocked for want of a way to see the

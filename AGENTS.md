@@ -292,17 +292,19 @@ the headless spine producing identical bytes on four platforms, which is why
 its legs install no graphics dependencies. A render/input skin makes no
 determinism claim — #320's constraint 3 puts input source and rendering as the
 only deltas from the bot path — so it has nothing to assert there and would
-cost the matrix its headlessness. Its home is instead: Linux per commit in
-`scripts/check.sh`'s WORKSPACES table (role `test`, run by the `gates` lane),
-and Windows/macOS per commit in `ci.yml`'s `client-platforms` job, whose legs
-assert via `scripts/client-tests.sh` — an executed-test floor plus a check
-that the client's own unittest binary ran, because a compile-heavy Bevy job
-can otherwise pass with zero tests executed or with another workspace's suite
-standing in. The job carries no apt packages (those are Linux-only build
-inputs) and caches no `target/` (a Bevy-sized one per platform would evict the
-determinism legs' caches under the shared 10 GB Actions allowance). The job's
-legs go live when `clients/regolith/` exists on the checked-out tree, so its
-merge order relative to PR #342 does not matter.
+cost the matrix its headlessness. Its test suite runs on Linux per commit in
+`scripts/check.sh`'s WORKSPACES table (role `test`, run by the `gates` lane).
+Release-time launch coverage instead lives in `package-client.yml`'s
+three-platform `package-client` matrix (Linux, Windows and macOS), triggered
+only by manual dispatches on the allowed ref and `playtest-*` tags; never add a
+PR trigger because that workflow will hold the private-assets credential. Each
+leg builds the release binary and runs `--render-smoke`: it must remain alive
+for twenty seconds and complete a primary-window screenshot before it exits
+successfully. This is an assertion that rendering work really completed, not
+just that a compile-heavy Bevy process spawned or a green command ran without
+doing the client work. Linux supplies Xvfb and forces X11 while removing
+`WAYLAND_DISPLAY`; Windows and macOS use the hosted runners' native display
+stacks.
 
 **All workflow jobs run on GitHub-hosted runners.** `ci.yml` and `nightly.yml`
 name `ubuntu-latest`, `windows-latest`, `macos-latest`, or a matrix value for

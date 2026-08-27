@@ -7,7 +7,7 @@ use orrery_regolith_client::{
     session::{require_campaign_consent, ConfiguredImpairment, CONSENT_NOTICE},
     RegolithSkinPlugin,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 fn flag_value(args: &[std::ffi::OsString], flag: &str) -> Option<String> {
     args.windows(2)
@@ -80,6 +80,7 @@ fn main() {
 
     let smoke_ticks =
         flag_value(&args, "--smoke-ticks").and_then(|value| value.parse::<u64>().ok());
+    let render_smoke = has_flag(&args, "--render-smoke");
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -168,6 +169,14 @@ fn main() {
         app.insert_resource(SmokeTicks(ticks));
         app.add_systems(Update, exit_smoke_after_joined_ticks);
     }
+    if render_smoke {
+        // This is intentionally a rendered proof, unlike `--smoke-test` and
+        // `--smoke-ticks`: after the client has stayed alive for a while, the
+        // screenshot callback only fires once the renderer has produced a
+        // primary-window frame. The callback then exits cleanly.
+        app.init_resource::<RenderSmoke>()
+            .add_systems(Update, render_smoke_after_minimum_uptime);
+    }
     app.run();
 }
 
@@ -205,6 +214,60 @@ fn run_smoke_test() {
 /// Tick budget for the headless campaign proof (`--smoke-ticks`).
 #[derive(Resource)]
 struct SmokeTicks(u64);
+
+/// State for the bounded rendered-client smoke proof.
+#[derive(Default, Resource)]
+struct RenderSmoke {
+    started_at: Option<Duration>,
+    screenshot_requested: bool,
+}
+
+/// Stay alive long enough to catch delayed compositor failures, then require a
+/// completed renderer screenshot before declaring the rendered smoke proof a
+/// success. A renderer that never reaches the screenshot callback is fatal
+/// rather than leaving the packaging runner stuck indefinitely.
+fn render_smoke_after_minimum_uptime(
+    time: Res<Time>,
+    mut smoke: ResMut<RenderSmoke>,
+    mut commands: Commands,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
+
+    // #550's Wayland teardown arrived 7--17 seconds after launch. Keep the
+    // minimum above that observed range before asking the renderer to prove a
+    // frame, so this mode would have rejected that failure.
+    const MINIMUM_UPTIME: Duration = Duration::from_secs(20);
+    const TIMEOUT: Duration = Duration::from_secs(60);
+
+    let elapsed = time.elapsed();
+    let started_at = smoke.started_at.get_or_insert(elapsed);
+    let running_for = elapsed.saturating_sub(*started_at);
+    if running_for >= TIMEOUT {
+        error!(
+            "smoke: renderer did not capture a frame within {} seconds",
+            TIMEOUT.as_secs()
+        );
+        exit.write(AppExit::Error(
+            std::num::NonZeroU8::new(1).expect("one is non-zero"),
+        ));
+        return;
+    }
+    if running_for < MINIMUM_UPTIME || smoke.screenshot_requested {
+        return;
+    }
+
+    smoke.screenshot_requested = true;
+    commands.spawn(Screenshot::primary_window()).observe(
+        move |_captured: On<ScreenshotCaptured>, mut exit: MessageWriter<AppExit>| {
+            info!(
+                "smoke: renderer captured a primary-window frame after at least {} seconds; exiting successfully",
+                MINIMUM_UPTIME.as_secs()
+            );
+            exit.write(AppExit::Success);
+        },
+    );
+}
 
 fn exit_smoke_after_joined_ticks(
     budget: Res<SmokeTicks>,
