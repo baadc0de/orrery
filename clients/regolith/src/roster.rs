@@ -61,20 +61,83 @@ pub const ROSTER_TIMEOUT: Duration = Duration::from_secs(4);
 pub const NICKNAME_MAX_CHARS: usize = 32;
 
 /// One row of the campaign roster.
+///
+/// #573 turned this endpoint's answer from "labelled craft" into a **complete
+/// seat map**: every configured seat, its kind, its state, and who holds it,
+/// with an empty seat representable. Both shapes decode into this one type —
+/// `kind` and `state` are absent from a service older than #573, and
+/// `nickname` became nullable when an empty seat gained the right to have no
+/// label at all.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RosterRow {
     /// The swarm slot whose craft carries this display label.
     pub slot: usize,
-    /// The generated or player-supplied label, unsanitised as the service holds it.
-    pub nickname: String,
+    /// The generated or player-supplied label, unsanitised as the service
+    /// holds it. `null` for a seat with nobody in it, which draws no name.
+    #[serde(default)]
+    pub nickname: Option<String>,
+    /// `bot` or `human`, when the service says which.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `active`, `reserved`, `connected`, `empty` or `vacant`, when the
+    /// service says which.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+impl RosterRow {
+    /// A labelled row, as a pre-#573 service sends it. Test convenience.
+    #[must_use]
+    pub fn labelled(slot: usize, nickname: &str) -> Self {
+        Self {
+            slot,
+            nickname: Some(nickname.to_owned()),
+            kind: None,
+            state: None,
+        }
+    }
 }
 
 /// The body of `GET /v1/campaigns/<id>/roster`.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RosterResponse {
-    /// One row per labelled craft in the live campaign. Empty is ordinary.
+    /// One row per seat in the live campaign. Empty is ordinary.
     #[serde(default)]
     pub roster: Vec<RosterRow>,
+    /// The attempt phase, when the service names one. A service older than
+    /// #573 names none, and the client must not guess one for it.
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// Seconds until Start, when the service sends them. Nothing extrapolates
+    /// this locally; see [`crate::lobby`].
+    #[serde(default)]
+    pub starts_in_s: Option<u64>,
+}
+
+impl RosterResponse {
+    /// The waiting room this answer describes.
+    ///
+    /// A straight transcription: every row becomes a seat, in the order the
+    /// service listed them, and a field the service omitted stays omitted.
+    #[must_use]
+    pub fn lobby_view(&self, own_slot: Option<usize>) -> crate::lobby::LobbyView {
+        crate::lobby::LobbyView {
+            seats: self
+                .roster
+                .iter()
+                .map(|row| crate::lobby::Seat {
+                    slot: row.slot,
+                    kind: crate::lobby::SeatKind::parse(row.kind.as_deref()),
+                    state: crate::lobby::SeatState::parse(row.state.as_deref()),
+                    nickname: row.nickname.as_deref().and_then(sanitise_nickname),
+                })
+                .collect(),
+            phase: self.phase.as_deref().map(crate::lobby::LobbyPhase::parse),
+            starts_in_s: self.starts_in_s,
+            own_slot,
+            notice: None,
+        }
+    }
 }
 
 /// The craft a swarm slot flies.
@@ -140,7 +203,10 @@ impl ShipRoster {
         self.labels = response
             .roster
             .iter()
-            .filter_map(|row| Some((entity_of_slot(row.slot), sanitise_nickname(&row.nickname)?)))
+            .filter_map(|row| {
+                let name = sanitise_nickname(row.nickname.as_deref()?)?;
+                Some((entity_of_slot(row.slot), name))
+            })
             .collect();
         self.fetches = self.fetches.saturating_add(1);
         self.last_error = None;
@@ -211,15 +277,15 @@ mod tests {
         let mut roster = ShipRoster::default();
         roster.accept(&RosterResponse {
             roster: (0..=8)
-                .map(|slot| RosterRow {
-                    slot,
-                    nickname: if slot == 8 {
-                        "ada".to_owned()
+                .map(|slot| {
+                    if slot == 8 {
+                        RosterRow::labelled(slot, "ada")
                     } else {
-                        format!("test-{}", slot + 1)
-                    },
+                        RosterRow::labelled(slot, &format!("test-{}", slot + 1))
+                    }
                 })
                 .collect(),
+            ..Default::default()
         });
 
         assert_eq!(roster.len(), 9);
@@ -237,10 +303,8 @@ mod tests {
     fn an_unlabelled_craft_gets_no_label_rather_than_a_placeholder() {
         let mut roster = ShipRoster::default();
         roster.accept(&RosterResponse {
-            roster: vec![RosterRow {
-                slot: 8,
-                nickname: "ada".to_owned(),
-            }],
+            roster: vec![RosterRow::labelled(8, "ada")],
+            ..Default::default()
         });
         assert_eq!(roster.label(entity_of_slot(8)), Some("ada"));
         assert_eq!(
@@ -252,10 +316,8 @@ mod tests {
         // A row whose nickname sanitises away is the same as no row: it must
         // not become an empty label, which would draw as a blank name tag.
         roster.accept(&RosterResponse {
-            roster: vec![RosterRow {
-                slot: 4,
-                nickname: "\u{202E}\u{200B}   ".to_owned(),
-            }],
+            roster: vec![RosterRow::labelled(4, "\u{202E}\u{200B}   ")],
+            ..Default::default()
         });
         assert!(
             roster.is_empty(),
@@ -269,22 +331,15 @@ mod tests {
         let mut roster = ShipRoster::default();
         roster.accept(&RosterResponse {
             roster: vec![
-                RosterRow {
-                    slot: 8,
-                    nickname: "ada".to_owned(),
-                },
-                RosterRow {
-                    slot: 2,
-                    nickname: "grace".to_owned(),
-                },
+                RosterRow::labelled(8, "ada"),
+                RosterRow::labelled(2, "grace"),
             ],
+            ..Default::default()
         });
         assert_eq!(roster.len(), 2);
         roster.accept(&RosterResponse {
-            roster: vec![RosterRow {
-                slot: 8,
-                nickname: "ada".to_owned(),
-            }],
+            roster: vec![RosterRow::labelled(8, "ada")],
+            ..Default::default()
         });
         assert_eq!(roster.label(entity_of_slot(2)), None, "grace left");
         assert_eq!(roster.len(), 1);
@@ -295,10 +350,8 @@ mod tests {
     fn a_failed_fetch_keeps_the_labels_it_already_had() {
         let mut roster = ShipRoster::default();
         roster.accept(&RosterResponse {
-            roster: vec![RosterRow {
-                slot: 8,
-                nickname: "ada".to_owned(),
-            }],
+            roster: vec![RosterRow::labelled(8, "ada")],
+            ..Default::default()
         });
         roster.fail("connection refused".to_owned());
         assert_eq!(roster.label(entity_of_slot(8)), Some("ada"));
@@ -359,12 +412,23 @@ pub fn refresh_roster(
     session: Res<crate::ActiveSession>,
     task: Res<RosterTask>,
     mut roster: ResMut<ShipRoster>,
+    mut lobby: ResMut<crate::lobby::LobbyView>,
 ) {
+    let own_slot = match &*session {
+        crate::ActiveSession::Campaign(runtime) => Some(runtime.config().slot),
+        crate::ActiveSession::Local(_) => None,
+    };
     let mut slot = task.0.lock().expect("roster task lock");
     if let Some(receiver) = slot.as_ref() {
         match receiver.try_recv() {
             Ok(Ok(response)) => {
                 roster.accept(&response);
+                // The waiting room is replaced wholesale for the same reason
+                // the labels are: the answer is the room *now*, and merging
+                // would keep a seat occupied by somebody who left.
+                let notice = lobby.notice.take();
+                *lobby = response.lobby_view(own_slot);
+                lobby.notice = notice;
                 *slot = None;
             }
             Ok(Err(error)) => {

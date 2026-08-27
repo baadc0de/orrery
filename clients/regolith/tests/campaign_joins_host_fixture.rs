@@ -172,6 +172,7 @@ impl HostFixture {
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
             configured: configured(),
             transport_secret: net::slot_secret(CLIENT_SLOT),
+            island_seats: None,
             roster_url: None,
         }
     }
@@ -200,6 +201,10 @@ enum Mode {
     TargetDestroyedBeforeDamage,
     Reject,
     WrongSlot,
+    /// Accept the reserved seat, then hand over a `StartV1` that puts a
+    /// different entity in it. Everything else about the join is correct, so
+    /// only the manifest check can stop the session.
+    MismatchedManifest,
 }
 
 /// The fixture's pump: accept → verify identity → handshake → data path.
@@ -260,6 +265,27 @@ async fn pump(
     };
     let mut reply = vec![0u8];
     reply.extend_from_slice(&(assigned as u64).to_le_bytes());
+    if matches!(mode, Mode::MismatchedManifest) {
+        // The seat is right, the identity is right, and the entity is not.
+        // The client already signed a tick-zero claim over `CLIENT_SLOT + 1`,
+        // so this manifest describes a game it cannot produce evidence for.
+        reply.extend_from_slice(
+            &orrery_regolith_client::lobby::StartManifest {
+                attempt_id: "0192f0a0-0000-7000-8000-00000000000f".to_owned(),
+                seed: 1,
+                tick: 0,
+                island_seats: (CLIENT_SLOT + 1) as u16,
+                active: vec![orrery_regolith_client::lobby::ActiveSeat {
+                    slot: CLIENT_SLOT,
+                    node: net::slot_secret(CLIENT_SLOT).public().to_string(),
+                    entity: CLIENT_SLOT as u64 + 99,
+                }],
+                witness_recipients: Vec::new(),
+                duration_ticks: 216_000,
+            }
+            .encode(),
+        );
+    }
     write_message(&mut send, &reply).await?;
 
     if matches!(
@@ -1237,6 +1263,57 @@ fn a_refused_join_never_proceeds_as_if_local() {
     let progress = runtime.accumulator().progress();
     assert_eq!(progress.banked_minutes, 0.0);
     assert!(runtime.shutdown().is_none(), "no record without a session");
+
+    drop(sink);
+}
+
+/// **Fail closed on manifest mismatch (#575).**
+///
+/// The host accepts the reserved seat and then describes an attempt this
+/// client cannot be part of. Every earlier gate passes — the transport
+/// identity is the reserved one, the assigned slot is the reserved one — so
+/// the only thing that can refuse this session is the manifest check itself.
+/// A client that played on here would sign witness frames for an entity the
+/// host does not believe it flies: evidence nobody can reconcile, which is
+/// worse than not playing at all.
+#[test]
+fn a_mismatched_manifest_refuses_the_attempt_rather_than_playing_on() {
+    let fixture = HostFixture::spawn(Mode::MismatchedManifest);
+    let mut sink = sink_for("regolith-campaign-manifest");
+    let mut runtime = CampaignRuntime::launch(fixture.config("manifest"), crate_seed());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while matches!(runtime.state(), JoinState::Dialing) && Instant::now() < deadline {
+        runtime.poll_join();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match runtime.state() {
+        JoinState::Failed(reason) => {
+            assert!(
+                reason.contains("Refusing to play"),
+                "the refusal says it is refusing: {reason}"
+            );
+            assert!(
+                reason.contains("entity"),
+                "the refusal names the disagreement: {reason}"
+            );
+        }
+        other => panic!("expected Failed(manifest mismatch), got {other:?}"),
+    }
+
+    // Not one tick of play, and nothing bankable, exactly as for a refusal.
+    let report = runtime.advance(
+        Controls {
+            thrust: true,
+            fire: true,
+            ..Controls::default()
+        },
+        &mut sink,
+    );
+    assert_eq!(report.intents, 0, "a refused manifest drives nothing");
+    assert_eq!(runtime.joined_ticks(), 0);
+    assert!(runtime.accepted_start().is_none());
+    assert_eq!(runtime.accumulator().progress().banked_minutes, 0.0);
 
     drop(sink);
 }

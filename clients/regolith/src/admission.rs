@@ -50,8 +50,19 @@ pub struct CampaignListing {
     pub title: String,
     /// `open`, `busy`, `closed`, or `paused`.
     pub state: String,
-    /// Host peer count; the client occupies the next deterministic slot.
+    /// Host peer count; human seats extend it rather than consuming it.
     pub peers: usize,
+    /// How many of the island's seats are for people, when the service says.
+    ///
+    /// Absent from every service older than #573, which ran one human in the
+    /// seat after the bots. `peers + humans` is the island size the host
+    /// computes every spawn pose against, so this is what stops the client
+    /// guessing that number (`docs/plans/multi-human-campaign.md` §3.2).
+    #[serde(default)]
+    pub humans: Option<u16>,
+    /// How many human seats are still reservable, when the service says.
+    #[serde(default)]
+    pub slots_free: Option<u16>,
     /// Planned session duration.
     pub seconds: u64,
     /// Configured packet loss percentage.
@@ -63,6 +74,17 @@ pub struct CampaignListing {
     /// Service alias for the required client revision.
     #[serde(default)]
     pub server_rev: Option<String>,
+}
+
+impl CampaignListing {
+    /// The island size this campaign runs, when the service published enough
+    /// to say. `None` leaves the pre-#573 derivation in place rather than
+    /// guessing a number the host never stated.
+    #[must_use]
+    pub fn island_seats(&self) -> Option<u16> {
+        let peers = u16::try_from(self.peers).ok()?;
+        peers.checked_add(self.humans?)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,9 +115,21 @@ struct ConfiguredResponse {
     jitter_p99_ms: u64,
 }
 
+/// A refusal body: `{"error": code, "detail": text, ...}`.
+///
+/// `error` is the machine-readable condition #573 names (`campaign_full`,
+/// `session_started`, `host_failed`); `detail` is the service's own sentence;
+/// `retry_after_s` is the wait it computed. All three go to
+/// [`crate::lobby::refusal_sentence`], which is the only place that decides
+/// what the player reads.
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
-    detail: String,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    retry_after_s: Option<u64>,
 }
 
 /// The boot gate states from the accepted campaign-admission design.
@@ -300,11 +334,16 @@ fn post_join(url: &str, nickname: &str, node: &str) -> Result<JoinResponse, Stri
         response.json().map_err(|error| error.to_string())
     } else {
         let status = response.status();
-        let detail = response
-            .json::<ErrorResponse>()
-            .map(|body| body.detail)
-            .unwrap_or_else(|_| format!("campaign service answered HTTP {status}"));
-        Err(detail)
+        Err(response.json::<ErrorResponse>().map_or_else(
+            |_| format!("The campaign service answered HTTP {status}."),
+            |body| {
+                crate::lobby::refusal_sentence(
+                    body.error.as_deref(),
+                    body.detail.as_deref(),
+                    body.retry_after_s,
+                )
+            },
+        ))
     }
 }
 
@@ -375,9 +414,11 @@ fn poll_worker(
         WorkerReply::Joined(Ok(answer)) => {
             // The campaign id is only knowable from the gate that asked; the
             // join answer does not echo it, and the roster URL needs it.
-            let campaign_id = match &*gate {
-                JoinGate::Admitting { campaign, .. } => Some(campaign.id.clone()),
-                _ => None,
+            let (campaign_id, island_seats) = match &*gate {
+                JoinGate::Admitting { campaign, .. } => {
+                    (Some(campaign.id.clone()), campaign.island_seats())
+                }
+                _ => (None, None),
             };
             let artifact = write_join_artifact(&settings.telemetry_path, &answer.join);
             match artifact {
@@ -405,6 +446,7 @@ fn poll_worker(
                     jitter_p99_ms: answer.configured.jitter_p99_ms,
                 },
                 transport_secret: settings.transport_secret.clone(),
+                island_seats,
                 // The one place a roster URL can come from: the origin this
                 // client actually joined through.
                 roster_url: campaign_id
@@ -989,7 +1031,7 @@ fn post_upload(origin: &str, session_id: &str, body: &[u8]) -> Result<(), String
         let status = response.status();
         let detail = response
             .json::<ErrorResponse>()
-            .map(|body| body.detail)
+            .map(|body| body.detail.unwrap_or_else(|| format!("HTTP {status}")))
             .unwrap_or_else(|_| format!("HTTP {status}"));
         Err(detail)
     }

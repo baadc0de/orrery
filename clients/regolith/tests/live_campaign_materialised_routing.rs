@@ -112,6 +112,7 @@ fn deployed_campaign_routes_a_materialised_rock_and_returns_credit() {
         wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
         configured,
         transport_secret: secret,
+        island_seats: None,
         roster_url: Some(roster_url),
     };
     let telemetry = std::env::temp_dir().join(format!(

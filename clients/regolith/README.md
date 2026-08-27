@@ -33,6 +33,35 @@ It is strict named-field JSON with a V1 format marker, carrying `host_node`,
 automation, but exposes the token in shell history and process listings; prefer
 the join file or `@path` for new sessions.
 
+## The waiting room
+
+A campaign that has a lobby draws one, top-centre, under the session banner:
+the phase the host named, how many player seats are taken, every configured
+seat with its state and who holds it, and the countdown — but only when the
+host actually sends `starts_in_s`. Nothing here is derived from a local clock,
+and an empty seat draws its state word and **no name**, the same absence rule
+`src/roster.rs` applies to craft labels (#484). A service that names no phase
+describes no lobby, so none is drawn rather than one assembled out of whatever
+rows arrived. `src/lobby.rs` is the whole of it.
+
+The room shares the screen with the controls legend rather than preceding it:
+the lobby is exactly when a first-time player has nothing to do but read, and
+`the_waiting_room_fits_the_default_720_line_window` measures that the two do
+not collide at 1280x720.
+
+`--island-seats <n>` states the host's island size on the `--join` path, which
+otherwise falls back to `slot + 1`. Admission supplies it automatically from
+the campaign listing's `peers + humans` when the service publishes them. The
+number matters because the spawn pose is a function of `(slot, island_seats)`:
+a human in seat 4 of 8 whose client assumed 5 starts on an orbit the host did
+not put it on.
+
+If the host sends a `StartV1` manifest, the client adopts the membership it
+names — active seats to replicate to, witness recipients to send frames to —
+and **refuses the session outright** if the manifest disagrees with the
+tick-zero anchor already signed. That claim cannot be re-signed, so a
+disagreement is fatal rather than adjustable.
+
 Controls: Left/Right turn, Up thrusts, Space fires, a left click picks the
 target, the mouse wheel zooms, F3 toggles the detailed overlay and F1 shows or
 hides the controls legend. The always-on strip and JSONL stream do not depend

@@ -136,6 +136,13 @@ fn main() {
             wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
             configured,
             transport_secret: transport_secret.clone(),
+            // The island size, when the operator states it. A join file names
+            // a host and a seat, not the island's size, so without the flag
+            // this keeps the pre-#573 `slot + 1` derivation — right for the
+            // sole human in the last seat, which is what a join file has
+            // always described.
+            island_seats: flag_value(&args, "--island-seats")
+                .and_then(|value| value.parse::<u16>().ok()),
             // A join file names a host, not a campaign, so this path cannot
             // work out on its own which roster to ask for. `--roster-campaign`
             // supplies the id when the operator knows it; without it every
