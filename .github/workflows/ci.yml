@@ -492,23 +492,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Assume the cache role
-        if: env.ORRERY_CACHE_AVAILABLE == 'true'
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: arn:aws:iam::590561279276:role/orrery-ci-cache
-          aws-region: eu-central-1
-          role-session-name: orrery-ci-gates-${{ github.run_id }}
-
-      - name: Install kache and point it at the S3 remote
+      # SPIKE ARM B (#585): kache installed with NO remote and NO GitHub
+      # Actions cache behind it, so the only hits available are same-run
+      # duplicates across the twelve workspaces. Zero egress, zero infra.
+      - name: Install kache with no remote at all
         if: env.ORRERY_CACHE_AVAILABLE == 'true'
         uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
         with:
           version: 0.14.2
-          s3-bucket: orrery-kache
-          s3-region: eu-central-1
-          s3-prefix: artifacts
-          manifest-key: gates-x86_64-unknown-linux-gnu
+          github-cache: false
           pr-comment: false
           # The runner's root filesystem is ext4 without reflink, so the local
           # store is a second physical copy of the cacheable part of `target/`
@@ -590,10 +582,6 @@ jobs:
             exit 1
           }
           kache doctor 2>&1 | tee doctor.txt || true
-          grep -qF 's3://orrery-kache/artifacts' doctor.txt || {
-            echo "::error::kache doctor does not report the s3://orrery-kache/artifacts remote"
-            exit 1
-          }
 
       - name: static gates, harness self-tests, standalone tools
         run: scripts/check.sh gates
