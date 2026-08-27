@@ -66,13 +66,22 @@ jobs:
       #
       # Linux only: the macOS and Windows runners ship their own display and
       # audio SDKs, and `apt-get` does not exist there.
-      - name: Install Bevy's Linux build dependencies
+      # Build deps give headers and the -dev symlinks; the render-smoke step
+      # below *runs* the binary, which is a different dependency set. Bevy and
+      # winit dlopen the X11/xkb stack, so those libraries never appear in
+      # `ldd` and are not pulled in as -dev dependencies either --
+      # `libxkbcommon-dev` in particular does not provide
+      # `libxkbcommon-x11.so.0`, which winit's X11 backend needs. Building was
+      # enough until #562 made this leg launch the client.
+      - name: Install Bevy's Linux build and runtime dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             g++ pkg-config libx11-dev libasound2-dev libudev-dev \
-            libwayland-dev libxkbcommon-dev xvfb mesa-vulkan-drivers
+            libwayland-dev libxkbcommon-dev xvfb mesa-vulkan-drivers \
+            libxkbcommon-x11-0 libxcb-xkb1 libx11-xcb1 libxcb-randr0 \
+            libxcursor1 libxrandr2 libxi6 libxinerama1 libvulkan1
 
       - name: Build the standalone Regolith workspace
         # The standalone workspace has its own lockfile. Refuse to resolve a
