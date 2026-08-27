@@ -82,6 +82,14 @@ deliberately absent from the index above, which is the accepted set; it is
 non-normative until the owner decides the visibility/spatial-query layering and
 the accepted-record tensions the proposal names.
 
+D50 is **proposed, not accepted**:
+[ADR-0050](adr/0050-knowledge-tiers.md) holds it. It is deliberately absent
+from the index above, which is the accepted set; it names the knowledge tiers
+(simulation authority / visual authority / hearsay) and homes A14's hearsay
+rules H1-H6. The owner signalled acceptance in principle on 2026-08-27 while
+explicitly reserving the right to change their mind; it is non-normative
+until the owner flips its status.
+
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
 ADR file. D19 deliberately follows that reserved gap.
