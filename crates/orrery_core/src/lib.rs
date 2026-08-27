@@ -1,5 +1,9 @@
 //! Orrery's verifiable core (D9, docs/06-verifiable-core.md).
 //!
+//! (#585 spike: this line exists only to invalidate this crate's cache key,
+//! so the gates lane can be measured the way a real pull request hits it.
+//! Never merged.)
+//!
 //! Orrery does not need determinism to keep peers in sync — live sync is state
 //! replication, and a misprediction is corrected by the next authoritative
 //! snapshot. It needs determinism to prove, *after the fact*, that an authority
