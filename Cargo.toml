@@ -150,6 +150,24 @@ unwrap_used = "warn"
 [patch.crates-io]
 bevy_replicon = { path = "vendor/bevy_replicon" }
 
+# D43 (f)(2): the canonical crates' build pins `overflow-checks = false`
+# uniformly across profiles. Cargo's default splits dev (panic) from release
+# (wrap), and that *profile-dependence* is the hazard the clause closes --
+# the same stray operation must not behave one way in a test and another in
+# a shipped client. `overflow-checks = true` is unavailable here: it means
+# panic, which (f)(1) bars outright.
+#
+# This does not license plain arithmetic. Canonical code still uses the
+# explicit-semantics operations that set the overflow flag (f)(3); the pin
+# only turns an operation the review missed from a cross-profile divergence
+# into an ordinary defect. `test` inherits `dev` and `bench` inherits
+# `release`, so these two entries cover all four profiles.
+[profile.dev]
+overflow-checks = false
+
+[profile.release]
+overflow-checks = false
+
 [workspace.lints.rust]
 missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(docsrs_aeronet)"] }
