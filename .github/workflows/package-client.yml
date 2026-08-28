@@ -89,6 +89,20 @@ jobs:
         # reconcile against a campaign's pinned revision.
         run: cargo build --release --locked
 
+      # A rendered launch is necessary but cannot prove a volunteer can enter
+      # the deployed world. The Linux candidate therefore exercises its own
+      # baked origin and joinability predicate, seats two distinct identities,
+      # completes both iroh handshakes, and exits only after each executor has
+      # received the other's nickname-bound replicated craft. The campaign's
+      # client_rev pin must already target this build; a mismatch fails here
+      # before any archive is offered to testers.
+      - name: Preflight two clients against the deployed campaign
+        if: runner.os == 'Linux'
+        run: >-
+          ../../scripts/client-campaign-preflight.sh
+          --binary ./target/release/${{ matrix.binary }}
+          --campaign shakedown
+
       # This is a rendered launch proof, not the non-graphics `--smoke-test`.
       # The client stays alive for twenty seconds, then exits successfully only
       # after Bevy's primary-window screenshot callback proves the renderer
@@ -127,6 +141,9 @@ jobs:
             }
             if (!Number.isInteger(info.ruleset_version)) {
               throw new Error("build-info has no integer ruleset_version");
+            }
+            if (typeof info.admission_url !== "string" || !info.admission_url.startsWith("https://")) {
+              throw new Error("build-info has no HTTPS admission_url");
             }
           '
           cp clients/regolith/PLAYTEST.md stage/README.md

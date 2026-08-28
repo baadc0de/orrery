@@ -225,6 +225,18 @@ impl ShipRoster {
         self.labels.get(&entity).map(String::as_str)
     }
 
+    /// The craft carrying an exact display label, when the current roster has one.
+    ///
+    /// Used by the release preflight to bind a requested peer nickname to the
+    /// replicated entity it must actually observe. Finding a roster row alone
+    /// is not proof that the peer's craft reached this client.
+    #[must_use]
+    pub fn entity_named(&self, nickname: &str) -> Option<PersistId> {
+        self.labels
+            .iter()
+            .find_map(|(entity, label)| (label == nickname).then_some(*entity))
+    }
+
     /// How many craft currently carry a label.
     #[must_use]
     pub fn len(&self) -> usize {

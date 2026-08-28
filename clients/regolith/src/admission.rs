@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy::input_focus::AutoFocus;
 use bevy::prelude::*;
@@ -130,6 +130,28 @@ struct ErrorResponse {
     detail: Option<String>,
     #[serde(default)]
     retry_after_s: Option<u64>,
+}
+
+#[derive(Debug)]
+struct AdmissionRefusal {
+    code: Option<String>,
+    detail: String,
+    retry_after_s: Option<u64>,
+}
+
+impl AdmissionRefusal {
+    fn sentence(&self) -> String {
+        crate::lobby::refusal_sentence(self.code.as_deref(), Some(&self.detail), self.retry_after_s)
+    }
+}
+
+/// Result of the non-interactive admission path.
+#[derive(Debug)]
+pub enum HeadlessAdmission {
+    /// Admission minted a seat and returned the launch material.
+    Admitted(Box<CampaignConfig>),
+    /// Admission returned the exact refusal the caller asked to probe.
+    ExpectedRefusal,
 }
 
 /// The boot gate states from the accepted campaign-admission design.
@@ -319,8 +341,17 @@ fn get_campaigns(url: &str) -> Result<CampaignsResponse, String> {
     }
 }
 
-fn post_join(url: &str, nickname: &str, node: &str) -> Result<JoinResponse, String> {
-    let response = client()?
+fn post_join_detailed(
+    url: &str,
+    nickname: &str,
+    node: &str,
+) -> Result<JoinResponse, AdmissionRefusal> {
+    let response = client()
+        .map_err(|detail| AdmissionRefusal {
+            code: None,
+            detail,
+            retry_after_s: None,
+        })?
         .post(url)
         .json(&serde_json::json!({
             "nickname": nickname,
@@ -329,22 +360,38 @@ fn post_join(url: &str, nickname: &str, node: &str) -> Result<JoinResponse, Stri
             "ruleset_version": REGOLITH_RULESET.version,
         }))
         .send()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| AdmissionRefusal {
+            code: None,
+            detail: error.to_string(),
+            retry_after_s: None,
+        })?;
     if response.status().is_success() {
-        response.json().map_err(|error| error.to_string())
+        response.json().map_err(|error| AdmissionRefusal {
+            code: None,
+            detail: error.to_string(),
+            retry_after_s: None,
+        })
     } else {
         let status = response.status();
         Err(response.json::<ErrorResponse>().map_or_else(
-            |_| format!("The campaign service answered HTTP {status}."),
-            |body| {
-                crate::lobby::refusal_sentence(
-                    body.error.as_deref(),
-                    body.detail.as_deref(),
-                    body.retry_after_s,
-                )
+            |_| AdmissionRefusal {
+                code: None,
+                detail: format!("The campaign service answered HTTP {status}."),
+                retry_after_s: None,
+            },
+            |body| AdmissionRefusal {
+                code: body.error,
+                detail: body
+                    .detail
+                    .unwrap_or_else(|| format!("The campaign service answered HTTP {status}.")),
+                retry_after_s: body.retry_after_s,
             },
         ))
     }
+}
+
+fn post_join(url: &str, nickname: &str, node: &str) -> Result<JoinResponse, String> {
+    post_join_detailed(url, nickname, node).map_err(|refusal| refusal.sentence())
 }
 
 fn poll_worker(
@@ -827,6 +874,166 @@ fn campaign_is_compatible_and_open(campaign: &CampaignListing) -> bool {
         .as_ref()
         .or(campaign.client_rev.as_ref());
     campaign.state == "open" && required_rev.is_none_or(|revision| revision == BUILD_REV)
+}
+
+/// Discover and admit one campaign without keyboard or pointer input.
+///
+/// This is the release preflight's entry point. It deliberately calls the
+/// same listing decoder, compatibility/open predicate, and join request as the
+/// interactive admission UI. A temporary non-open phase is retried because an
+/// always-on campaign cycles through lobby, running, and restarting; a build
+/// mismatch is terminal because waiting cannot make the embedded revision
+/// change.
+///
+/// When `expected_refusal` is present, the request is sent even if the listing
+/// says the build is incompatible. That negative probe succeeds only when
+/// admission itself returns the named machine-readable refusal.
+///
+/// # Errors
+/// A named stage and its detail when discovery, compatibility, admission, or
+/// join-artifact persistence fails before the deadline.
+pub fn admit_headless(
+    origin: &str,
+    campaign_id: &str,
+    nickname: &str,
+    transport_secret: &iroh_base::SecretKey,
+    telemetry_path: &Path,
+    timeout: Duration,
+    expected_refusal: Option<&str>,
+) -> Result<HeadlessAdmission, String> {
+    if !valid_nickname(nickname) {
+        return Err("nickname: needs 1-32 visible ASCII characters".to_owned());
+    }
+    let deadline = Instant::now() + timeout;
+    let url = format!("{origin}/v1/campaigns");
+    let mut origin_reported = false;
+    loop {
+        let answer = match get_campaigns(&url) {
+            Ok(answer) => answer,
+            Err(detail) if Instant::now() < deadline => {
+                eprintln!("PREFLIGHT WAIT admission-origin origin={origin} detail={detail}");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            Err(detail) => return Err(format!("admission-origin: {detail}")),
+        };
+        if !origin_reported {
+            println!("PREFLIGHT PASS admission-origin origin={origin}");
+            origin_reported = true;
+        }
+
+        let Some(campaign) = answer
+            .campaigns
+            .iter()
+            .find(|campaign| campaign.id == campaign_id)
+        else {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "campaign-joinable: campaign {campaign_id:?} was not listed before the timeout"
+                ));
+            }
+            eprintln!("PREFLIGHT WAIT campaign-joinable campaign={campaign_id} state=absent");
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+
+        let required_rev = campaign
+            .server_rev
+            .as_ref()
+            .or(campaign.client_rev.as_ref());
+        if expected_refusal.is_none() && required_rev.is_some_and(|revision| revision != BUILD_REV)
+        {
+            return Err(format!(
+                "campaign-compatible: campaign {campaign_id:?} needs build {}, this binary is {BUILD_REV}",
+                required_rev.expect("checked as some")
+            ));
+        }
+
+        if expected_refusal.is_none() && !campaign_is_compatible_and_open(campaign) {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "campaign-joinable: campaign {campaign_id:?} stayed state={:?} before the timeout",
+                    campaign.state
+                ));
+            }
+            eprintln!(
+                "PREFLIGHT WAIT campaign-joinable campaign={campaign_id} state={}",
+                campaign.state
+            );
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        let join_url = format!("{origin}/v1/campaigns/{campaign_id}/join");
+        let node = transport_secret.public().to_string();
+        if let Some(expected) = expected_refusal {
+            return match post_join_detailed(&join_url, nickname, &node) {
+                Err(refusal) if refusal.code.as_deref() == Some(expected) => {
+                    println!(
+                        "PREFLIGHT PASS admission-refusal campaign={campaign_id} error={expected}"
+                    );
+                    Ok(HeadlessAdmission::ExpectedRefusal)
+                }
+                Err(refusal) => Err(format!(
+                    "admission-refusal: expected {expected:?}, got {:?}: {}",
+                    refusal.code, refusal.detail
+                )),
+                Ok(_) => Err(format!(
+                    "admission-refusal: expected {expected:?}, but admission minted a seat"
+                )),
+            };
+        }
+
+        println!("PREFLIGHT PASS campaign-joinable campaign={campaign_id}");
+        match post_join_detailed(&join_url, nickname, &node) {
+            Ok(answer) => {
+                let path = write_join_artifact(telemetry_path, &answer.join)
+                    .map_err(|error| format!("join-artifact: {error}"))?;
+                println!(
+                    "PREFLIGHT PASS admission-accepted campaign={campaign_id} slot={} artifact={}",
+                    answer.join.slot,
+                    path.display()
+                );
+                return Ok(HeadlessAdmission::Admitted(Box::new(CampaignConfig {
+                    host_node_hex: answer.join.host_node,
+                    host_direct: Some(answer.host_direct),
+                    slot: answer.join.slot,
+                    session_id: answer.join.session_id,
+                    session_token_hex: Some(answer.join.session_token),
+                    wall_start_utc: crate::campaign::utc_now_iso8601(),
+                    configured: ConfiguredImpairment {
+                        loss_pct: answer.configured.loss_pct,
+                        jitter_p50_ms: answer.configured.jitter_p50_ms,
+                        jitter_p99_ms: answer.configured.jitter_p99_ms,
+                    },
+                    transport_secret: transport_secret.clone(),
+                    island_seats: campaign.island_seats(),
+                    roster_url: Some(format!("{origin}/v1/campaigns/{campaign_id}/roster")),
+                })));
+            }
+            Err(refusal)
+                if matches!(
+                    refusal.code.as_deref(),
+                    Some("host_failed" | "session_started" | "campaign_full")
+                ) && Instant::now() < deadline =>
+            {
+                eprintln!(
+                    "PREFLIGHT WAIT admission-accepted campaign={campaign_id} error={} detail={}",
+                    refusal.code.as_deref().unwrap_or("unknown"),
+                    refusal.detail
+                );
+                let wait = refusal.retry_after_s.unwrap_or(1).clamp(1, 5);
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+            Err(refusal) => {
+                return Err(format!(
+                    "admission-accepted: {} ({})",
+                    refusal.code.as_deref().unwrap_or("unnamed_refusal"),
+                    refusal.detail
+                ));
+            }
+        }
+    }
 }
 
 fn spawn_text(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) {
@@ -1323,5 +1530,17 @@ mod tests {
                 ..
             } if refusal == reason
         ));
+    }
+
+    #[test]
+    fn headless_refusal_keeps_admissions_machine_readable_error_name() {
+        let response = r#"{"error":"client_rev_mismatch","detail":"download the current build"}"#;
+        let (url, request) = join_test_server("403 Forbidden", response);
+
+        let refusal = post_join_detailed(&url, "ada", "node")
+            .expect_err("a mismatched client revision is refused");
+        assert!(!request.recv().expect("captured join request").is_empty());
+        assert_eq!(refusal.code.as_deref(), Some("client_rev_mismatch"));
+        assert_eq!(refusal.detail, "download the current build");
     }
 }
