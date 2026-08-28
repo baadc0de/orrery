@@ -86,15 +86,36 @@ print(origin.rstrip("/"))
     outer_timeout=$((TIMEOUT_SECS * 2 + 60))
 
     run_client() { # side, nickname, expected peer
-        local side=$1 nickname=$2 peer=$3
+        local side=$1 nickname=$2 peer=$3 wrapper_status binary_status
         timeout --kill-after=10s "${outer_timeout}s" \
             "$XVFB_RUN_BIN" -a env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
-            WGPU_BACKEND=vulkan "$BINARY" \
-            --headless-join "$CAMPAIGN" --nickname "$nickname" \
-            --expect-peer "$peer" --campaign-consent \
-            --headless-timeout-secs "$TIMEOUT_SECS" \
-            --identity-file "$dir/$side.identity" \
-            --telemetry-jsonl "$dir/$side.jsonl" >"$dir/$side.log" 2>&1
+            WGPU_BACKEND=vulkan bash -c '
+                status_file=$1
+                shift
+                "$@"
+                status=$?
+                printf "%s\n" "$status" >"$status_file"
+                exit "$status"
+            ' client-status "$dir/$side.status" "$BINARY" \
+                --headless-join "$CAMPAIGN" --nickname "$nickname" \
+                --expect-peer "$peer" --campaign-consent \
+                --headless-timeout-secs "$TIMEOUT_SECS" \
+                --identity-file "$dir/$side.identity" \
+                --telemetry-jsonl "$dir/$side.jsonl" >"$dir/$side.log" 2>&1
+        wrapper_status=$?
+
+        # xvfb-run can fail while tearing down Xvfb after the client has
+        # already exited successfully. The release signal is the binary's
+        # status, recorded inside that wrapper. If the binary never started or
+        # the outer timeout killed it before it could record a status, retain
+        # the wrapper's failure instead.
+        if [[ -r $dir/$side.status ]] \
+            && read -r binary_status <"$dir/$side.status" \
+            && [[ $binary_status =~ ^(0|[1-9][0-9]{0,2})$ ]] \
+            && ((binary_status <= 255)); then
+            return "$binary_status"
+        fi
+        return "$wrapper_status"
     }
 
     run_client a "$nickname_a" "$nickname_b" & local pid_a=$!
@@ -145,7 +166,12 @@ shift # -a
 while [[ ${1:-} == -* || ${1:-} == *=* ]]; do
     if [[ $1 == -u ]]; then shift 2; else shift; fi
 done
-exec "$@"
+"$@"
+status=$?
+if [[ ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} == wrapper-cleanup-error ]]; then
+    exit 1
+fi
+exit "$status"
 SH
     cat >"$dir/bin/client" <<'SH'
 #!/usr/bin/env bash
@@ -183,6 +209,9 @@ case ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} in
         ;;
     *) echo "PREFLIGHT PASS peer-observed nickname=$peer entity=7" ;;
 esac
+if [[ ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} == client-error ]]; then
+    exit 7
+fi
 SH
     chmod +x "$dir/bin/xvfb-run" "$dir/bin/client"
 
@@ -201,6 +230,30 @@ SH
     [[ $pass_count == 13 && $fail_count == 0 ]] \
         || die "self-test baseline counted $pass_count pass / $fail_count fail, expected 13 / 0"
     ((passing += 1))
+
+    status=0; output="$(st_run wrapper-cleanup-error)" || status=$?
+    ((status == 0)) || die "self-test wrapper-cleanup regression failed ($output)"
+    grep -Fq 'PASS client-a-exit binary exited 0' <<<"$output" \
+        || die 'self-test wrapper-cleanup regression did not retain client-a-exit success'
+    grep -Fq 'PASS client-b-exit binary exited 0' <<<"$output" \
+        || die 'self-test wrapper-cleanup regression did not retain client-b-exit success'
+    pass_count=$(grep -c '^PASS ' <<<"$output" || true)
+    fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
+    [[ $pass_count == 13 && $fail_count == 0 ]] \
+        || die "self-test wrapper-cleanup regression counted $pass_count pass / $fail_count fail, expected 13 / 0"
+    ((passing += 1))
+
+    status=0; output="$(st_run client-error)" || status=$?
+    ((status != 0)) || die 'self-test mutation with two client errors passed'
+    grep -Fq 'FAIL client-a-exit binary exited 7' <<<"$output" \
+        || die 'self-test client-error mutation did not fail named check client-a-exit'
+    grep -Fq 'FAIL client-b-exit binary exited 7' <<<"$output" \
+        || die 'self-test client-error mutation did not fail named check client-b-exit'
+    pass_count=$(grep -c '^PASS ' <<<"$output" || true)
+    fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
+    [[ $pass_count == 11 && $fail_count == 2 ]] \
+        || die "self-test client-error mutation counted $pass_count pass / $fail_count fail, expected 11 / 2"
+    ((mutations += 1))
 
     status=0; output="$(st_run not-seated)" || status=$?
     ((status != 0)) || die 'self-test mutation with no seated client passed'
@@ -238,7 +291,7 @@ SH
         || die "self-test one-peer mutation counted $pass_count pass / $fail_count fail, expected 12 / 1"
     ((mutations += 1))
 
-    echo "$NAME: self-test passed ($passing baseline: 13 pass / 0 fail; $mutations guarded mutations: no-seat 11 pass / 2 fail at client-a-seated + client-b-seated, one-seat 12 pass / 1 fail at client-b-seated, one-peer 12 pass / 1 fail at client-b-peer)"
+    echo "$NAME: self-test passed ($passing baselines: ordinary + wrapper-cleanup each 13 pass / 0 fail; client-error mutation 11 pass / 2 fail at client-a-exit + client-b-exit; $mutations total mutations: no-seat 11 pass / 2 fail at client-a-seated + client-b-seated, one-seat 12 pass / 1 fail at client-b-seated, one-peer 12 pass / 1 fail at client-b-peer)"
 }
 
 while (($#)); do
