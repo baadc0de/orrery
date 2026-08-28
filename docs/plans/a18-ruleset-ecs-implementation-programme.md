@@ -16,6 +16,11 @@
 > tranche successor, not a shippable design. It supersedes nothing: A11
 > section 5's tranche table remains the record of what was planned on
 > 2026-08-25, and section 2 below is the diff against what is true today.
+>
+> **The epic this node plans is
+> [#626](https://github.com/baadc0de/orrery/issues/626)**, filed with sixteen
+> children on 2026-08-28. Where a stage below names lanes, the issue numbers
+> are in that epic's child table.
 
 ## 1. Verdict up front
 
@@ -748,7 +753,8 @@ stage above proceeds past its named blocker without it.
 
 ## Cross-references
 
-- Epic and traceability: [#395](https://github.com/baadc0de/orrery/issues/395)
+- Planning epic and traceability: [#395](https://github.com/baadc0de/orrery/issues/395)
+- Implementation epic this node plans: [#626](https://github.com/baadc0de/orrery/issues/626)
 - Capstone this node succeeds: [A11](a11-adrs-and-pr-plan.md) sections 2, 3, 5
 - Fixture set and named checks: [A10](a10-conformance-benchmarks.md) section 9
 - Source brief: [ruleset-ecs-migration-brief.md](ruleset-ecs-migration-brief.md)
