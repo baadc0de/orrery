@@ -8,6 +8,7 @@ pub mod aoi;
 pub mod assets;
 pub mod campaign;
 pub mod combat;
+mod contact_arrows;
 pub mod craft;
 pub mod grab;
 mod hearsay;
@@ -401,12 +402,9 @@ impl ActiveSession {
     /// The campaign's current hearsay snapshot, for the rendering skin only.
     ///
     /// This is crate-private so input and ruleset crates cannot import a
-    /// hearsay path. The next consumer is the screen-edge-arrow skin (#610).
+    /// hearsay path. Its one consumer is the screen-edge-arrow skin,
+    /// [`contact_arrows::sync_contact_arrows`] (#610).
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "A16 piece 4 is the first render consumer of this isolated view"
-    )]
     pub(crate) fn hearsay_view(
         &self,
         roster: &roster::ShipRoster,
@@ -577,6 +575,12 @@ impl Plugin for RegolithSkinPlugin {
                     follow_camera.after(sync_rendered_state),
                     starfield::sync_starfield.after(follow_camera),
                     sync_ship_labels.after(follow_camera),
+                    // After `follow_camera` for the same reason the ship
+                    // labels are: an edge arrow is a bearing taken from
+                    // *this* frame's camera basis and own-craft position.
+                    contact_arrows::sync_contact_arrows
+                        .after(follow_camera)
+                        .after(ensure_local_body),
                     zoom_camera.before(follow_camera),
                     refresh_session_banner,
                     refresh_strip,
