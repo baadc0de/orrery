@@ -76,6 +76,7 @@ fn an_empty_standing_lobby_stays_available() {
     let dir = std::env::temp_dir().join(format!("p1-idle-lobby-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let listening_path = dir.join("listening.txt");
+    let active_seats_path = dir.join("active-seats.json");
     let journal_path = dir.join("slots.json");
     let host_err_path = dir.join("host.err");
     std::fs::write(&journal_path, b"[]").expect("empty reservation journal");
@@ -104,6 +105,8 @@ fn an_empty_standing_lobby_stays_available() {
         .arg(&journal_path)
         .arg("--listening-file")
         .arg(&listening_path)
+        .arg("--active-seats-file")
+        .arg(&active_seats_path)
         .arg("--external-bind")
         .arg(external_bind.to_string())
         .stdout(Stdio::null())
@@ -123,6 +126,10 @@ fn an_empty_standing_lobby_stays_available() {
     assert!(
         status.is_none(),
         "a reservation-backed host must reopen after an empty lobby"
+    );
+    assert!(
+        !active_seats_path.exists(),
+        "an empty lobby must not claim that any human is active"
     );
     host.kill().expect("stop idle host after proof");
     host.wait().expect("reap idle host after proof");
@@ -336,6 +343,7 @@ fn two_reserved_clients_join_in_reverse_reservation_order() {
     std::fs::create_dir_all(&dir).expect("temp dir");
     let report_path = dir.join("report.json");
     let listening_path = dir.join("listening.txt");
+    let active_seats_path = dir.join("active-seats.json");
     let journal_path = dir.join("slots.json");
     let host_err_path = dir.join("host.err");
     let issuer = iroh_base::SecretKey::from_bytes(&[0x58; 32]);
@@ -394,6 +402,8 @@ fn two_reserved_clients_join_in_reverse_reservation_order() {
         .arg(&journal_path)
         .arg("--listening-file")
         .arg(&listening_path)
+        .arg("--active-seats-file")
+        .arg(&active_seats_path)
         .arg("--external-bind")
         .arg(external_bind.to_string())
         .stdout(Stdio::null())
@@ -464,5 +474,15 @@ fn two_reserved_clients_join_in_reverse_reservation_order() {
             .collect::<Vec<_>>(),
         vec![4, 5],
         "arrival order must not renumber reserved seats"
+    );
+    let active_seats: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&active_seats_path).expect("frozen active seats written"),
+    )
+    .expect("active seats record parses");
+    assert_eq!(active_seats["attempt_id"], "attempt-reverse");
+    assert_eq!(
+        active_seats["active_slots"],
+        serde_json::json!([4, 5]),
+        "the host must publish every connected seat at StartV1 freeze"
     );
 }
