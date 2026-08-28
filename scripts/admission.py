@@ -67,6 +67,7 @@ class Admission:
         self.last_good: dict[str, Campaign] | None = None
         self.last_note: str | None = None
         self.children: dict[str, subprocess.Popen[str]] = {}
+        self.reapers: set[threading.Thread] = set()
         self.always_on: set[str] = set()
         self.locks: dict[str, Any] = {}
         # Slot -> display label for the sessions currently live on each campaign.
@@ -347,7 +348,9 @@ class Admission:
                 raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
             self.children[ident] = child
             self.rosters[ident] = self.legacy_session_roster(c, nickname)
-            threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True).start()
+            reaper = threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True)
+            self.reapers.add(reaper)
+            reaper.start()
             return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
         finally:
             # The flock stays held by the child/reaper, not the request.  It is released there.
@@ -410,8 +413,18 @@ class Admission:
         finally:
             self.children.pop(ident, None)
             self.rosters.pop(ident, None)
-        lock = self.locks.pop(ident, None)
-        if lock is not None: lock.close()
+            lock = self.locks.pop(ident, None)
+            if lock is not None: lock.close()
+            self.reapers.discard(threading.current_thread())
+
+    def shutdown(self) -> None:
+        """Stop child sessions and wait for their reapers to finish."""
+        children = list(self.children.values())
+        for child in children:
+            if child.poll() is None: child.kill()
+        for child in children:
+            child.wait()
+        for reaper in list(self.reapers): reaper.join()
 
     def known_session(self, sid: str) -> bool:
         if not SESSION.fullmatch(sid): return False
@@ -501,9 +514,7 @@ class AdmissionTests(unittest.TestCase):
         self.ssh = root / "ssh"; self.ssh.write_text("#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/ssh.args\"\ncase \" $* \" in *' cat '*listening.txt*) echo 'f2a1 0.0.0.0:52011';; *' cat '*raw.json*) echo '{}';; *) sleep 60;; esac\n"); self.ssh.chmod(0o755)
         self.service = Admission(self.control, self.state, str(self.invite), str(self.ssh), root / "key", self.issuer, "swarm", lambda _: type("V", (), {"f_bavail": 20 * 1024**3, "f_frsize": 1})())
     def tearDown(self) -> None:
-        for child in self.service.children.values():
-            child.kill(); child.wait()
-        time.sleep(0.02)
+        self.service.shutdown()
         for lock in self.service.locks.values(): lock.close()
         self.tmp.cleanup()
     def request(self) -> dict[str, Any]: return {"nickname": "ada", "node": "a" * 64, "client_rev": "rev", "ruleset_version": 14}
