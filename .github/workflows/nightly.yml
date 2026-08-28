@@ -147,6 +147,64 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Moved here from `ci.yml` on 2026-08-28. These two were the only checks
+  # costing more than four minutes -- `static gates` 1092 s and `workspace
+  # tests` 796 s, measured over three pull requests that day -- and together
+  # they were the whole of a ~20 minute merge latency.
+  #
+  # They did not stop being run; they stopped being run *twice*. Development
+  # happens on a 16-core box where every agent lane already executes
+  # `scripts/check.sh` in its own worktree before a pull request is opened, so
+  # the per-PR copy duplicated evidence that already existed. What is unique to
+  # a hosted runner is the cold, unfamiliar environment -- and that is exactly
+  # what a nightly is for.
+  #
+  # The trade, stated plainly: an environment-dependent failure is now caught
+  # here rather than at merge. #587's missing `libxkbcommon-x11` runtime library
+  # is the worked example -- it built everywhere and died only on a clean
+  # runner. A day's delay on that class of bug is the price of a merge that
+  # takes four minutes instead of twenty.
+  #
+  # Determinism deliberately stayed in `ci.yml`: four platforms plus the verdict
+  # cost about four minutes combined, and a cross-platform determinism break
+  # sitting on `main` overnight is the one regression that is genuinely
+  # expensive to unwind.
+  standalone-gates:
+    name: static gates (standalone workspaces, harness self-tests)
+    runs-on: ubuntu-latest
+    # 1092 s measured with the shared local cache warm; a nightly runner is cold
+    # and has no kache remote (#585 measured one at $2.02/hour saved and
+    # declined it), so this is sized against the 1276 s cold mean plus headroom.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install Bevy's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+      - run: scripts/check.sh gates
+
+  workspace-tests:
+    name: workspace tests (root cargo test --workspace)
+    runs-on: ubuntu-latest
+    # 796 s measured warm; same cold-runner reasoning as `standalone-gates`.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install Bevy's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+      - run: scripts/check.sh test
+
   p1-swarm:
     name: P1 swarm gate (32 peers, one simulated hour, clean + impaired + witnessed)
     # Simulated hour, no cluster, no ports, no shared state: the harness couples

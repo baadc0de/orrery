@@ -446,7 +446,31 @@ jobs:
     # `changes` adds the second condition: a markdown-only PR has nothing
     # here to check. Skipped still reports the required check; see `changes`.
     needs: changes
-    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
+    # MOVED TO NIGHTLY (2026-08-28). This lane and its sibling were the only two
+    # costing more than four minutes -- `static gates` 1092 s and `workspace
+    # tests` 796 s, measured over three pull requests on 2026-08-28 -- while
+    # every other required check finishes in 5-205 s. Together they were the
+    # whole of a ~20 minute merge latency.
+    #
+    # Both are Linux-only and both are reproduced locally before every merge:
+    # development happens on a 16-core box where each agent lane already runs
+    # `scripts/check.sh` in its own worktree over a shared kache. The evidence
+    # they provide is therefore duplicated per pull request, and only their
+    # cold-runner environment is unique.
+    #
+    # What that trades away, stated plainly: an environment-dependent failure --
+    # the missing `libxkbcommon-x11` runtime library in #587 is the worked
+    # example -- is now caught by the nightly rather than at merge.
+    #
+    # Determinism deliberately did NOT move. All four platforms plus the verdict
+    # cost about four minutes combined, and cross-platform determinism is the
+    # project's central claim; a break there sitting on `main` overnight is the
+    # one regression that is genuinely expensive to unwind.
+    #
+    # Label a pull request `full-ci` to run this here anyway.
+    if: >-
+      github.event_name != 'push' && needs.changes.outputs.code == 'true'
+      && contains(github.event.pull_request.labels.*.name, 'full-ci')
     # Hosted since #178, and the last lane to get there. It was never short of
     # headroom: #171 measured it cold and cacheless on `ubuntu-latest` at
     # **656 s**, peaking at 17.57 GiB of disk growth with **68.64 GiB still
@@ -643,7 +667,31 @@ jobs:
     # `changes` adds the second condition: a markdown-only PR has nothing
     # here to check. Skipped still reports the required check; see `changes`.
     needs: changes
-    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
+    # MOVED TO NIGHTLY (2026-08-28). This lane and its sibling were the only two
+    # costing more than four minutes -- `static gates` 1092 s and `workspace
+    # tests` 796 s, measured over three pull requests on 2026-08-28 -- while
+    # every other required check finishes in 5-205 s. Together they were the
+    # whole of a ~20 minute merge latency.
+    #
+    # Both are Linux-only and both are reproduced locally before every merge:
+    # development happens on a 16-core box where each agent lane already runs
+    # `scripts/check.sh` in its own worktree over a shared kache. The evidence
+    # they provide is therefore duplicated per pull request, and only their
+    # cold-runner environment is unique.
+    #
+    # What that trades away, stated plainly: an environment-dependent failure --
+    # the missing `libxkbcommon-x11` runtime library in #587 is the worked
+    # example -- is now caught by the nightly rather than at merge.
+    #
+    # Determinism deliberately did NOT move. All four platforms plus the verdict
+    # cost about four minutes combined, and cross-platform determinism is the
+    # project's central claim; a break there sitting on `main` overnight is the
+    # one regression that is genuinely expensive to unwind.
+    #
+    # Label a pull request `full-ci` to run this here anyway.
+    if: >-
+      github.event_name != 'push' && needs.changes.outputs.code == 'true'
+      && contains(github.event.pull_request.labels.*.name, 'full-ci')
     # Hosted since #178, and this is the lane whose fit was in question. #171
     # measured it cold on `ubuntu-latest` twice: 674 s and 681 s wall-clock,
     # 46.92 GiB peak disk growth, **39.29 GiB still free at the peak** — 0.84x
