@@ -151,7 +151,15 @@ impl<R: Ruleset> Executor<R> {
     ) -> Option<TickOutcome<R::CoreEvent>> {
         let mut own = self.states.remove(&entity)?;
         let neighbors = &self.states;
-        let mut view = StateView::new(entity, &mut own, neighbors);
+        let staleness_cap = self.ruleset.max_neighbor_staleness_ticks();
+        let mut view = StateView::observed(
+            entity,
+            &mut own,
+            neighbors,
+            &self.state_ticks,
+            tick,
+            staleness_cap,
+        );
         let ordered = OrderedInputs::new(inputs);
         let mut rng = tick_rng(self.seed, entity, tick);
 
@@ -160,10 +168,22 @@ impl<R: Ruleset> Executor<R> {
         let neighbor_frames = neighbor_reads
             .iter()
             .map(|neighbor| {
-                let state = neighbors.get(neighbor);
+                let observed_tick = self.state_ticks.get(neighbor).copied();
+                let fresh = observed_tick.is_some_and(|observed_tick| {
+                    // Saturating, not checked: an observation stamped at
+                    // or after `tick` is the freshest there is. `step` stamps
+                    // T+1 on each entity as it finishes, so a neighbour
+                    // already stepped this tick would otherwise vanish.
+                    tick.0.saturating_sub(observed_tick.0) <= staleness_cap
+                });
+                let state = fresh.then(|| neighbors.get(neighbor)).flatten();
                 NeighborFrame {
                     neighbor: *neighbor,
-                    observed_tick: self.state_ticks.get(neighbor).copied().unwrap_or(tick),
+                    observed_tick: if fresh {
+                        observed_tick.unwrap_or(tick)
+                    } else {
+                        tick
+                    },
                     state: state.map(CoreCodec::to_canonical),
                 }
             })
@@ -682,6 +702,12 @@ mod tests {
                     digest: [2; 32],
                 }
             }
+            fn max_neighbor_reads(&self) -> usize {
+                1
+            }
+            fn max_neighbor_staleness_ticks(&self) -> u64 {
+                1
+            }
             fn step(
                 &self,
                 view: &mut StateView<'_, Body>,
@@ -704,6 +730,125 @@ mod tests {
         assert_eq!(outcome.neighbor_frames[0].neighbor, PersistId::new(2));
         assert_eq!(outcome.neighbor_frames[0].observed_tick, Tick::new(0));
         assert!(outcome.neighbor_frames[0].state.is_some());
+    }
+
+    #[test]
+    fn executor_hides_neighbor_observations_older_than_ruleset_cap() {
+        struct FreshnessPeeker;
+        impl Ruleset for FreshnessPeeker {
+            type CoreState = Body;
+            type CoreInput = Nudge;
+            type CoreEvent = ();
+
+            fn id(&self) -> RulesetId {
+                RulesetId {
+                    version: 1,
+                    digest: [8; 32],
+                }
+            }
+
+            fn max_neighbor_reads(&self) -> usize {
+                1
+            }
+
+            fn max_neighbor_staleness_ticks(&self) -> u64 {
+                1
+            }
+
+            fn step(
+                &self,
+                view: &mut StateView<'_, Body>,
+                _inputs: &OrderedInputs<'_, Nudge>,
+                _rng: &mut crate::rng::TickRng,
+            ) -> StepOutput<()> {
+                if view.neighbor(PersistId::new(2)).is_some() {
+                    view.own_mut().pos.x = 1;
+                }
+                StepOutput::default()
+            }
+        }
+
+        let mut exec = Executor::new(FreshnessPeeker, UniverseSeed([5; 32]));
+        exec.insert_observed(PersistId::new(1), body(), Tick::new(5));
+        exec.insert_observed(PersistId::new(2), body(), Tick::new(5));
+        let outcome = exec
+            .step_entity(PersistId::new(1), Tick::new(7), &[])
+            .expect("reader is installed");
+
+        assert_eq!(
+            exec.state(PersistId::new(1)).unwrap().pos.x,
+            0,
+            "neighbor age 2 exceeded the ruleset maximum of 1 tick but remained visible"
+        );
+        assert_eq!(outcome.neighbor_frames.len(), 1);
+        assert!(
+            outcome.neighbor_frames[0].state.is_none(),
+            "an expired neighbor must be logged as absent for deterministic replay"
+        );
+        assert_eq!(outcome.neighbor_frames[0].observed_tick, Tick::new(7));
+    }
+
+    /// A neighbour stamped at or after the reader's tick must stay visible.
+    ///
+    /// `step` stamps each entity with `tick + 1` as it finishes, so every
+    /// neighbour already stepped this tick carries an observation *ahead* of
+    /// the reader's tick. A freshness check written with `checked_sub` reads
+    /// that as unrepresentable and hides the neighbour — which silently
+    /// removes same-tick neighbours from every read, collision resolution
+    /// included, while every staleness test still passes.
+    #[test]
+    fn a_neighbor_stamped_after_the_readers_tick_is_fresher_than_fresh() {
+        struct FreshnessPeeker;
+        impl Ruleset for FreshnessPeeker {
+            type CoreState = Body;
+            type CoreInput = Nudge;
+            type CoreEvent = ();
+
+            fn id(&self) -> RulesetId {
+                RulesetId {
+                    version: 1,
+                    digest: [0; 32],
+                }
+            }
+            fn max_neighbor_reads(&self) -> usize {
+                1
+            }
+            fn max_neighbor_staleness_ticks(&self) -> u64 {
+                1
+            }
+            fn step(
+                &self,
+                view: &mut StateView<'_, Body>,
+                _inputs: &OrderedInputs<'_, Nudge>,
+                _rng: &mut crate::rng::TickRng,
+            ) -> StepOutput<()> {
+                if view.neighbor(PersistId::new(2)).is_some() {
+                    view.own_mut().pos.x = 1;
+                }
+                StepOutput::default()
+            }
+        }
+
+        let mut exec = Executor::new(FreshnessPeeker, UniverseSeed([5; 32]));
+        exec.insert_observed(PersistId::new(1), body(), Tick::new(7));
+        // Exactly what `step` leaves behind for an entity that ran first at
+        // tick 7: its observation is stamped 8.
+        exec.insert_observed(PersistId::new(2), body(), Tick::new(8));
+        let outcome = exec
+            .step_entity(PersistId::new(1), Tick::new(7), &[])
+            .expect("reader is installed");
+
+        assert_eq!(
+            exec.state(PersistId::new(1)).unwrap().pos.x,
+            1,
+            "a neighbour stepped earlier in this same tick was hidden; an \
+             observation ahead of the reader is the freshest there is, and \
+             hiding it removes same-tick neighbours from every read"
+        );
+        assert!(
+            outcome.neighbor_frames[0].state.is_some(),
+            "the frame must carry the state it actually read"
+        );
     }
 
     #[test]

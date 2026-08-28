@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use orrery_protocol::{PersistId, RulesetId};
+use orrery_protocol::{PersistId, RulesetId, Tick};
 
 use crate::invariants::Invariant;
 use crate::quantize::Quantized;
@@ -86,6 +86,7 @@ pub struct StateView<'a, S> {
     entity: PersistId,
     own: &'a mut S,
     neighbors: &'a BTreeMap<PersistId, S>,
+    observation_ticks: Option<(&'a BTreeMap<PersistId, Tick>, Tick, u64)>,
     reads: Vec<PersistId>,
 }
 
@@ -96,6 +97,26 @@ impl<'a, S> StateView<'a, S> {
             entity,
             own,
             neighbors,
+            observation_ticks: None,
+            reads: Vec::new(),
+        }
+    }
+
+    /// Build a live view that hides observations older than the ruleset's
+    /// declared staleness cap.
+    pub(crate) fn observed(
+        entity: PersistId,
+        own: &'a mut S,
+        neighbors: &'a BTreeMap<PersistId, S>,
+        observation_ticks: &'a BTreeMap<PersistId, Tick>,
+        tick: Tick,
+        staleness_cap: u64,
+    ) -> Self {
+        Self {
+            entity,
+            own,
+            neighbors,
+            observation_ticks: Some((observation_ticks, tick, staleness_cap)),
             reads: Vec::new(),
         }
     }
@@ -129,7 +150,20 @@ impl<'a, S> StateView<'a, S> {
     /// log. A view that let neighbours be read without recording would produce
     /// windows that cannot be replayed.
     pub fn neighbor(&mut self, id: PersistId) -> Option<&S> {
-        let found = self.neighbors.get(&id);
+        let fresh = self
+            .observation_ticks
+            .is_none_or(|(observed, tick, staleness_cap)| {
+                observed.get(&id).is_some_and(|observed_tick| {
+                    // An observation stamped at or after the reader's tick
+                    // is fresher than fresh, not stale: `step` sets each
+                    // entity's tick to T+1 as it finishes, so every neighbour
+                    // already stepped this tick reads as T+1 > T. Treating
+                    // that as unreadable hid same-tick neighbours entirely
+                    // and silently broke collision resolution.
+                    tick.0.saturating_sub(observed_tick.0) <= staleness_cap
+                })
+            });
+        let found = fresh.then(|| self.neighbors.get(&id)).flatten();
         if !self.reads.contains(&id) {
             self.reads.push(id);
         }
