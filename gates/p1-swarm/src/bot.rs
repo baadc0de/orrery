@@ -43,7 +43,9 @@ use orrery_games::regolith::{
     collision_candidate, distance_mm, firing_arc_measurement, Regolith, REGOLITH_RULESET,
 };
 use orrery_net::budget::{UploadBudget, UploadMeter};
-use orrery_net::channels::{encode_replication, Channel};
+#[cfg(test)]
+use orrery_net::channels::encode_replication;
+use orrery_net::channels::{encode_replication_compressed, Channel};
 use orrery_net::peer_link::{
     forget_departed_links, receive_peer_packets, send_peer_packets, PeerLinkCounters, PeerPacket,
     SendPacket,
@@ -1177,7 +1179,8 @@ impl Bot {
         let sends: Vec<_> = authored
             .into_iter()
             .flat_map(|(entity, state, cell)| {
-                let payload = encode_replication(&(state.to_canonical(), cell, entity, tick + 1));
+                let payload =
+                    encode_replication_compressed(&(state.to_canonical(), cell, entity, tick + 1));
                 membership
                     .peers
                     .iter()

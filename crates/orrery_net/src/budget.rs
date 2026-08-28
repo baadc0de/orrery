@@ -39,7 +39,7 @@ use core::time::Duration;
 
 use bevy_ecs::prelude::*;
 
-use crate::channels::{untag, Channel, TAG_WITNESS};
+use crate::channels::{untag, Channel, TAG_WITNESS, TAG_WITNESS_COMPRESSED};
 use orrery_protocol::NodeId;
 
 /// Per-datagram wire overhead: IP+UDP 28 B, QUIC short header + AEAD ≈ 32 B.
@@ -464,7 +464,13 @@ pub fn lane_of(channel: Channel, payload: &[u8]) -> Lane {
         return Lane::Control;
     }
     match untag(payload) {
-        Some((Channel::State, body)) if body.first() == Some(&TAG_WITNESS) => Lane::Witness,
+        Some((Channel::State, body))
+            if body
+                .first()
+                .is_some_and(|tag| *tag == TAG_WITNESS || *tag == TAG_WITNESS_COMPRESSED) =>
+        {
+            Lane::Witness
+        }
         _ => Lane::Replication,
     }
 }
@@ -655,7 +661,7 @@ mod tests {
 
     #[test]
     fn the_lane_is_read_off_the_wire_rather_than_taken_on_trust() {
-        use crate::channels::{encode_replication, encode_witness};
+        use crate::channels::{encode_replication, encode_witness, encode_witness_compressed};
 
         // The sub-tag a receiver routes on is the same byte the meter reads, so
         // the two cannot disagree about what a datagram was.
@@ -666,6 +672,13 @@ mod tests {
         assert_eq!(
             lane_of(Channel::State, &encode_replication(&[1u8, 2, 3])),
             Lane::Replication
+        );
+        assert_eq!(
+            lane_of(
+                Channel::State,
+                &encode_witness_compressed(&vec![0u8; 4_096])
+            ),
+            Lane::Witness
         );
         // Control is control regardless of what it carries: the witness crate
         // encodes its repair traffic with `encode_witness` and sends it on the

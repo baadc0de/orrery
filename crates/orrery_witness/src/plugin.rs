@@ -36,7 +36,7 @@ use bytes::Bytes;
 use orrery_core::store::AuthorityLog;
 use orrery_core::{log::HeadTransition, Ruleset};
 use orrery_net::budget::{Bandwidth, RateMeter, UploadBudget};
-use orrery_net::channels::{decode_witness, encode_witness, Channel};
+use orrery_net::channels::{decode_witness, encode_witness, encode_witness_compressed, Channel};
 use orrery_net::peer_link::{control_payload_budget, payload_budget};
 use orrery_net::{IslandMembership, PeerPacket, SendPacket, StreamMode};
 use orrery_protocol::{
@@ -552,7 +552,7 @@ pub fn publish_authored(
             published.frame.first_tick.0 + u64::from(published.frame.tick_count).saturating_sub(1);
         newest = Some(newest.map_or(last_tick, |held: u64| held.max(last_tick)));
 
-        let payload = Bytes::from(encode_witness(&WitnessMsg::Frame {
+        let payload = Bytes::from(encode_witness_compressed(&WitnessMsg::Frame {
             frame: published.frame.clone(),
             heads,
         }));
@@ -1133,7 +1133,7 @@ pub fn serve_repair_requests(
         // dropped repair, and a witness that cannot tell "I have nothing" from
         // "you ignored me" would eventually report an honest peer for the
         // second when it was the first.
-        let payload = encode_witness(&WitnessMsg::RangeResponse {
+        let payload = encode_witness_compressed(&WitnessMsg::RangeResponse {
             response: served.response.clone(),
             heads: served.heads.clone(),
             resume_from: served.resume_from,
