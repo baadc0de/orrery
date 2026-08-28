@@ -187,6 +187,7 @@
 mod adjudicate;
 mod bot;
 mod bridge;
+mod delta_stats;
 mod exterior;
 mod peer_runner;
 mod profile;
@@ -291,6 +292,11 @@ struct Args {
     /// Write the full report as JSON to this path.
     #[arg(long)]
     json: Option<String>,
+
+    /// Measure canonical changed bytes against the previous send and a modeled
+    /// 1 Hz keyframe, grouped by body type in the JSON report.
+    #[arg(long)]
+    delta_stats: bool,
 
     /// Print the report and exit zero even if a clause failed.
     #[arg(long)]
@@ -676,6 +682,7 @@ fn main() -> Result<()> {
                 .map_or(0, |since| since.as_secs())
         }),
         replica_scope_capture: args.replica_scope_capture,
+        delta_stats: args.delta_stats,
     };
 
     eprintln!(
