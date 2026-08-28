@@ -1,6 +1,7 @@
 //! The swarm: N bots, a router between them, and the criterion they must meet.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -16,9 +17,18 @@ use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_
 
 use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{Bot, BotSpec, TICK_HZ};
-use crate::exterior::{Frame, Lane, UplinkAck, UplinkDatagram, UplinkOutcome};
+use crate::exterior::{
+    Frame, HearsayContact, HearsayContacts, HearsaySource, Lane, UplinkAck, UplinkDatagram,
+    UplinkOutcome,
+};
 
 use crate::router::{Impairment, Router, RouterCounters};
+
+/// Five seconds at the fixed 60 Hz simulation cadence.
+///
+/// Serving the preceding buffer makes every delivered fold at least this old;
+/// the current buffer is never a serving source.
+const HEARSAY_FOLD_TICKS: u64 = 5 * TICK_HZ;
 
 /// The harness's modified clients: which cheat, and how many peers run it.
 ///
@@ -533,6 +543,10 @@ pub struct Swarm {
     index_of: BTreeMap<NodeId, usize>,
     /// Connected external peers, keyed by their swarm slots (#385, #571).
     exteriors: BTreeMap<usize, ExteriorSlot>,
+    /// The two roster snapshots which enforce hearsay's age floor.
+    hearsay_buffers: HearsayBuffers,
+    /// Test seam for H2's required on/off replication diff.
+    hearsay_fold_enabled: bool,
     /// The in-process cluster that re-runs filed reports.
     adjudicator: Adjudicator,
     /// Every verdict it reached.
@@ -556,6 +570,8 @@ pub struct ExteriorSlot {
     /// meta frames as the peer moves; starts honest by construction because
     /// both sides derive the pose from the slot alone (`bot::spawn_pose`).
     cell: CellId,
+    /// Host tick at which the current cell fact was read from a Meta report.
+    cell_fact_tick: u64,
     /// The tick-zero claim the peer shipped after joining, with the state it
     /// commits to — what watchers arm against instead of reading a local
     /// `Chain`. Present when witnessing is on and the peer authors a witness
@@ -580,6 +596,22 @@ pub struct ExteriorSlot {
     /// True once the runner's clean end-of-run marker arrived. Shared with
     /// the bridge's reader task, which is what sees the marker first.
     pub goodbye: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One crewed-roster snapshot retained by the hearsay fold.
+#[derive(Debug)]
+struct HearsaySnapshot {
+    fold_tick: u64,
+    contacts: Vec<HearsayContact>,
+}
+
+/// Current and preceding roster folds.
+///
+/// Both names are load-bearing: only `previous` may be encoded for delivery.
+#[derive(Debug, Default)]
+struct HearsayBuffers {
+    previous: Option<HearsaySnapshot>,
+    current: Option<HearsaySnapshot>,
 }
 
 /// Why a subject is or is not inside a receiver's replicated interest set.
@@ -653,6 +685,39 @@ fn scope_capture_records(roster: &[(usize, NodeId, CellId)]) -> Vec<ScopeCapture
                 })
         })
         .collect()
+}
+
+/// Render the exact opt-in scope diagnostic bytes written by the host.
+fn scope_capture_output(tick: u64, roster: &[(usize, NodeId, CellId)]) -> String {
+    let mut output = String::new();
+    for capture in scope_capture_records(roster) {
+        writeln!(
+            output,
+            "replica_scope_capture host_tick={tick} subject_seat={} receiver_seat={} \
+             in_scope={} scope_reason={} subject_cell={} receiver_cell={}",
+            capture.subject_seat,
+            capture.receiver_seat,
+            capture.in_scope,
+            capture.reason.as_str(),
+            capture.subject_cell.to_bits(),
+            capture.receiver_cell.to_bits(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    output
+}
+
+/// Apply the campaign's H5 reveal filter between snapshot and encoding.
+///
+/// Regolith is regime-1 public today, so every crewed contact passes. Keeping
+/// this boundary named prevents a future hidden class from leaking merely
+/// because it was added to the roster.
+fn public_hearsay_record(snapshot: &HearsaySnapshot) -> HearsayContacts {
+    HearsayContacts {
+        source: HearsaySource::HostRosterFold,
+        fold_tick: snapshot.fold_tick,
+        contacts: snapshot.contacts.clone(),
+    }
 }
 
 impl ExteriorSlot {
@@ -741,7 +806,7 @@ impl ExteriorSlot {
                 Lane::Meta => {
                     // One u64: the sender's current interest cell, raw bits.
                     if let Ok(raw) = <[u8; 8]>::try_from(frame.payload.as_ref()) {
-                        self.set_cell_from_bits(u64::from_le_bytes(raw));
+                        self.set_cell_from_bits(u64::from_le_bytes(raw), tick);
                     }
                     continue;
                 }
@@ -801,12 +866,12 @@ impl ExteriorSlot {
         self.cell
     }
 
-    /// Records a meta-lane cell report.
     /// Records a raw meta-lane cell report, refusing encodings that are not
     /// cells rather than storing them.
-    fn set_cell_from_bits(&mut self, raw: u64) {
+    fn set_cell_from_bits(&mut self, raw: u64, fact_tick: u64) {
         if let Some(cell) = CellId::from_bits(raw) {
             self.cell = cell;
+            self.cell_fact_tick = fact_tick;
         }
     }
 }
@@ -904,6 +969,8 @@ impl Swarm {
             adjudicator: Adjudicator::new(seed),
             docket: Docket::default(),
             exteriors: BTreeMap::new(),
+            hearsay_buffers: HearsayBuffers::default(),
+            hearsay_fold_enabled: true,
         }
     }
 
@@ -965,6 +1032,7 @@ impl Swarm {
                 node,
                 entity,
                 cell,
+                cell_fact_tick: 0,
                 anchor,
                 witness_anchored,
                 link,
@@ -1058,7 +1126,7 @@ impl Swarm {
     /// Stands in for the coordinator re-broadcasting a manifest as peers move.
     /// Without it a bot's view of its island-mates' cells freezes at tick zero
     /// and the visibility gate stops reflecting the world.
-    fn refresh_rosters(&mut self, tick: u64) {
+    fn refresh_rosters(&mut self, tick: u64) -> String {
         // Pump the exterior's meta frames first, so today's roster carries the
         // cell it just reported rather than yesterday's.
         for exterior in self.exteriors.values_mut() {
@@ -1066,23 +1134,18 @@ impl Swarm {
                 let mut r = exterior.link.meta.lock().expect("meta lock");
                 r.try_recv()
             } {
-                exterior.set_cell_from_bits(raw);
+                exterior.set_cell_from_bits(raw, tick);
             }
         }
         let roster = self.active_roster();
-        if self.config.replica_scope_capture {
-            for capture in scope_capture_records(&roster) {
-                eprintln!(
-                    "replica_scope_capture host_tick={tick} subject_seat={} receiver_seat={} \
-                     in_scope={} scope_reason={} subject_cell={} receiver_cell={}",
-                    capture.subject_seat,
-                    capture.receiver_seat,
-                    capture.in_scope,
-                    capture.reason.as_str(),
-                    capture.subject_cell.to_bits(),
-                    capture.receiver_cell.to_bits(),
-                );
-            }
+        self.fold_hearsay_contacts(tick);
+        let capture = if self.config.replica_scope_capture {
+            scope_capture_output(tick, &roster)
+        } else {
+            String::new()
+        };
+        if !capture.is_empty() {
+            eprint!("{capture}");
         }
         for bot in &mut self.bots {
             let others: Vec<PeerEntry> = roster
@@ -1094,6 +1157,46 @@ impl Swarm {
                 })
                 .collect();
             bot.set_island(others);
+        }
+        capture
+    }
+
+    /// Rotate the five-second roster buffers and deliver only the preceding
+    /// crewed snapshot. This is the H4 anti-wallhack boundary, not a cache.
+    fn fold_hearsay_contacts(&mut self, tick: u64) {
+        if self.exteriors.is_empty()
+            || !self.hearsay_fold_enabled
+            || !tick.saturating_add(1).is_multiple_of(HEARSAY_FOLD_TICKS)
+        {
+            return;
+        }
+
+        let contacts = self
+            .exteriors
+            .values()
+            .map(|exterior| HearsayContact {
+                seat: u8::try_from(exterior.index).expect("exterior seat fits the wire record"),
+                cell: exterior.cell().to_bits(),
+                fact_age_ticks: u16::try_from(tick.saturating_sub(exterior.cell_fact_tick))
+                    .unwrap_or(u16::MAX),
+            })
+            .collect();
+        let snapshot = HearsaySnapshot {
+            fold_tick: tick,
+            contacts,
+        };
+        self.hearsay_buffers.previous = self.hearsay_buffers.current.replace(snapshot);
+
+        let Some(previous) = self.hearsay_buffers.previous.as_ref() else {
+            return;
+        };
+        let payload = public_hearsay_record(previous).encode();
+        for exterior in self.exteriors.values_mut() {
+            exterior.queue_downlink(Frame {
+                peer: u32::MAX,
+                lane: Lane::Meta,
+                payload: payload.clone(),
+            });
         }
     }
 
@@ -1267,7 +1370,7 @@ impl Swarm {
                     let rate = self.bots[index].upload_rate_bits();
                     self.samples[index].push(rate);
                 }
-                self.refresh_rosters(tick);
+                let _ = self.refresh_rosters(tick);
             }
 
             if self.config.late_join_tick == Some(tick) {
@@ -2167,6 +2270,82 @@ impl SwarmReport {
 mod tests {
     use super::*;
 
+    fn hearsay_test_swarm(
+        bot_seats: usize,
+        exterior_seats: &[usize],
+        island_seats: usize,
+    ) -> (Swarm, Vec<(usize, crate::exterior::RemoteLink)>) {
+        use crate::bot::bot_key;
+        use crate::exterior::link_pair;
+
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: bot_seats,
+                cell_edge_m: crate::bot::campaign_cell_edge_m(),
+                campaign: true,
+                replica_scope_capture: true,
+                ..SwarmConfig::default()
+            },
+            island_seats,
+        );
+        let mut remotes = Vec::new();
+        for &seat in exterior_seats {
+            let (host_link, remote_link) = link_pair();
+            swarm =
+                swarm.with_external_at(seat, island_seats, bot_key(seat).public(), None, host_link);
+            remotes.push((seat, remote_link));
+        }
+        swarm.form_island();
+        (swarm, remotes)
+    }
+
+    fn report_current_exterior_cells(
+        swarm: &mut Swarm,
+        remotes: &[(usize, crate::exterior::RemoteLink)],
+        tick: u64,
+    ) {
+        for (seat, remote) in remotes {
+            let cell = swarm.exteriors.get(seat).expect("exterior seat").cell();
+            remote
+                .uplink
+                .try_send(Frame {
+                    peer: u32::MAX,
+                    lane: Lane::Meta,
+                    payload: Bytes::copy_from_slice(&cell.to_bits().to_le_bytes()),
+                })
+                .expect("the host queue accepts a cell report");
+            swarm
+                .exteriors
+                .get_mut(seat)
+                .expect("exterior seat")
+                .pump_uplink(tick, &mut swarm.router);
+            assert_eq!(
+                swarm
+                    .exteriors
+                    .get(seat)
+                    .expect("exterior seat")
+                    .cell_fact_tick,
+                tick,
+                "the fact tick is the host tick which read the Meta report"
+            );
+        }
+    }
+
+    fn receive_hearsay(remote: &crate::exterior::RemoteLink) -> HearsayContacts {
+        loop {
+            let frame = remote
+                .downlink
+                .lock()
+                .expect("downlink lock")
+                .try_recv()
+                .expect("a hearsay record was queued");
+            if let Some(contacts) = HearsayContacts::decode(&frame.payload) {
+                assert_eq!(frame.lane, Lane::Meta);
+                return contacts;
+            }
+        }
+    }
+
     #[test]
     fn replica_scope_capture_covers_every_active_seat_pair() {
         use crate::bot::{bot_key, cell_of, grid_of};
@@ -2259,6 +2438,105 @@ mod tests {
             }),
             "the distant human pair must be logged as out of interest"
         );
+    }
+
+    #[test]
+    fn hearsay_fold_never_delivers_a_contact_younger_than_256_ticks() {
+        let (mut swarm, remotes) = hearsay_test_swarm(2, &[2, 3], 4);
+        let h4_floor_ticks = (512 * TICK_HZ).div_ceil(120);
+        assert_eq!(h4_floor_ticks, 256, "ceil(E / v_max * tick_hz)");
+        let assert_old_enough = |record: HearsayContacts, delivery_tick: u64| {
+            assert!(!record.contacts.is_empty(), "the age check is not vacuous");
+            for contact in record.contacts {
+                let delivered_age = delivery_tick
+                    .saturating_sub(record.fold_tick)
+                    .saturating_add(u64::from(contact.fact_age_ticks));
+                assert!(
+                    delivered_age >= h4_floor_ticks,
+                    "seat {} was delivered at age {delivered_age}, below {h4_floor_ticks} ticks",
+                    contact.seat
+                );
+            }
+        };
+
+        report_current_exterior_cells(&mut swarm, &remotes, 250);
+        let first_fold_tick = HEARSAY_FOLD_TICKS - 1;
+        let _ = swarm.refresh_rosters(first_fold_tick);
+        for (_, remote) in &remotes {
+            if let Ok(frame) = remote.downlink.lock().expect("downlink lock").try_recv() {
+                let record = HearsayContacts::decode(&frame.payload)
+                    .expect("a Meta downlink at the fold boundary is hearsay");
+                assert_old_enough(record, first_fold_tick);
+            }
+        }
+
+        report_current_exterior_cells(&mut swarm, &remotes, 550);
+        let delivery_tick = 2 * HEARSAY_FOLD_TICKS - 1;
+        let _ = swarm.refresh_rosters(delivery_tick);
+
+        for (_, remote) in &remotes {
+            assert_old_enough(receive_hearsay(remote), delivery_tick);
+        }
+    }
+
+    #[test]
+    fn hearsay_fold_does_not_change_replica_scope_capture_bytes() {
+        fn deterministic_capture(fold_enabled: bool) -> (Vec<u8>, usize) {
+            let (mut swarm, remotes) = hearsay_test_swarm(3, &[3, 4, 5], 6);
+            swarm.hearsay_fold_enabled = fold_enabled;
+            let mut capture = Vec::new();
+            for second in 1..=10 {
+                let tick = second * TICK_HZ - 1;
+                report_current_exterior_cells(&mut swarm, &remotes, tick - 10);
+                capture.extend_from_slice(swarm.refresh_rosters(tick).as_bytes());
+            }
+            let records = remotes
+                .iter()
+                .filter(|(_, remote)| {
+                    remote
+                        .downlink
+                        .lock()
+                        .expect("downlink lock")
+                        .try_recv()
+                        .ok()
+                        .and_then(|frame| HearsayContacts::decode(&frame.payload))
+                        .is_some()
+                })
+                .count();
+            (capture, records)
+        }
+
+        let (with_fold, delivered) = deterministic_capture(true);
+        let (without_fold, disabled_deliveries) = deterministic_capture(false);
+        assert!(!with_fold.is_empty(), "the opt-in scope log ran");
+        assert_eq!(delivered, 3, "the enabled run exercised fold delivery");
+        assert_eq!(
+            disabled_deliveries, 0,
+            "the control really disabled the fold"
+        );
+        assert_eq!(
+            with_fold, without_fold,
+            "H2: hearsay must not change replica membership or rate"
+        );
+    }
+
+    #[test]
+    fn hearsay_fold_contains_only_crewed_seats() {
+        let (mut swarm, remotes) = hearsay_test_swarm(5, &[5, 7], 8);
+        report_current_exterior_cells(&mut swarm, &remotes, 250);
+        let _ = swarm.refresh_rosters(HEARSAY_FOLD_TICKS - 1);
+        report_current_exterior_cells(&mut swarm, &remotes, 550);
+        let _ = swarm.refresh_rosters(2 * HEARSAY_FOLD_TICKS - 1);
+
+        for (_, remote) in &remotes {
+            let record = receive_hearsay(remote);
+            let seats = record
+                .contacts
+                .iter()
+                .map(|contact| usize::from(contact.seat))
+                .collect::<Vec<_>>();
+            assert_eq!(seats, vec![5, 7], "bots and the vacant seat stay absent");
+        }
     }
 
     #[test]
@@ -3034,7 +3312,7 @@ mod tests {
                 let mut r = exterior.link.meta.lock().expect("meta lock");
                 r.try_recv()
             } {
-                exterior.set_cell_from_bits(raw);
+                exterior.set_cell_from_bits(raw, 0);
             }
             assert_eq!(exterior.cell(), moved, "meta updated the roster cell");
         } else {
@@ -3272,7 +3550,7 @@ mod tests {
         for tick in 0..45 * TICK_HZ {
             swarm.tick_once(tick, 3, &mut phase);
             if tick % TICK_HZ == TICK_HZ - 1 {
-                swarm.refresh_rosters(tick);
+                let _ = swarm.refresh_rosters(tick);
                 for bot in &mut swarm.bots {
                     let in_scope = interest.contains(&bot.cell().expect("committed"));
                     let distance =
