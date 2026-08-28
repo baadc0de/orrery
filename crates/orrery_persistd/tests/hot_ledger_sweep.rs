@@ -197,15 +197,52 @@ async fn bank_receipt(db: &foundationdb::Database, parties: &[AccountId]) {
 /// FoundationDB's exact-key uniqueness — the canonical ten-byte row plus a
 /// drifted-spelling twin — and it is the shape of defect a migration or a
 /// buggy second writer would leave behind.
+///
+/// **The drifted twin is this suite's fixture, and this suite removes it**
+/// ([`retract_duplicate_ownership`]). It is an eleven-byte key in `[li, lj)`,
+/// which is precisely the shape `keyspace::is_registered_l_family_key`
+/// refuses, so a twin left behind is an offender in the ambient `l`-family
+/// audit (`tests/lease_fdb.rs`) — a *different* test binary, in the same
+/// `cargo test` invocation, against the same cluster. Leaving it there does
+/// not weaken this test and does not strengthen that one: it only teaches the
+/// reader of a red nightly that a planted fixture is an unexplained row
+/// (#666, and #624/#646 before it for the sweep's cursor). The audit stays
+/// ambient and non-cleaning; the writer cleans up after itself.
 async fn plant_duplicate_ownership(db: &foundationdb::Database, item: ItemUid, owner: u64) {
     db.run(|trx, _| async move {
-        let mut drifted = keyspace::ledger_item_key(item).to_vec();
-        drifted.push(b'#');
+        let drifted = drifted_item_key(item);
         trx.set(&drifted, &postcard::to_stdvec(&item_row(owner)).unwrap());
         Ok(())
     })
     .await
     .expect("plant duplicate");
+}
+
+/// The exact key [`plant_duplicate_ownership`] writes: the canonical
+/// ten-byte item key plus the one byte that makes it a second spelling.
+///
+/// Built here rather than at both call sites so plant and retract cannot
+/// drift apart into a clear that misses the row it was meant to remove.
+fn drifted_item_key(item: ItemUid) -> Vec<u8> {
+    let mut drifted = keyspace::ledger_item_key(item).to_vec();
+    drifted.push(b'#');
+    drifted
+}
+
+/// Remove the planted twin once the pass that had to see it has returned.
+///
+/// Called after `run_pass` and *before* this test's assertions, so the
+/// evidence lives in the returned report rather than in the cluster: a
+/// failing assertion here then fails alone, instead of cascading into a
+/// second, unexplained failure in the `l`-family audit that would look like a
+/// stray writer.
+async fn retract_duplicate_ownership(db: &foundationdb::Database, item: ItemUid) {
+    db.run(|trx, _| async move {
+        trx.clear(&drifted_item_key(item));
+        Ok(())
+    })
+    .await
+    .expect("retract duplicate");
 }
 
 /// Open the process's FDB context and a sweeper over it.
@@ -289,6 +326,10 @@ async fn fdb_planted_duplicate_ownership_row_is_found_and_names_the_item() {
     plant_duplicate_ownership(&db, duplicated, rival).await;
 
     let report = sweeper.run_pass(unix_ms()).await.expect("pass runs");
+    // The pass has seen it; the report below is the evidence. The durable
+    // twin is this test's fixture and goes now, before any assertion can
+    // leave it behind for the `l`-family audit to find.
+    retract_duplicate_ownership(&db, duplicated).await;
     let duplicates: Vec<_> = report
         .findings
         .iter()
@@ -482,6 +523,13 @@ async fn emit_time_to_detection() {
         let report = sweeper.run_pass(unix_ms()).await.expect("measured pass");
         let detected_at = unix_ms();
         pass_durations_ms.push(pass_started.elapsed().as_millis() as u64);
+        // Same fixture discipline as the acceptance arm: the round's twin has
+        // been seen, so it goes before the next round plants another. Twelve
+        // eleven-byte rows left in the item sub-span would be twelve offenders
+        // in the ambient `l`-family audit. It happens *after* the duration is
+        // banked — a retract inside the timed span would be measured as sweep
+        // cost, and this arm's whole output is a duration.
+        retract_duplicate_ownership(&db, violation).await;
 
         let caught = report.findings.iter().any(|finding| {
             finding.kind == FindingKind::DuplicateOwnershipRow && finding.item == Some(violation)
