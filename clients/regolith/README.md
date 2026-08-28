@@ -157,15 +157,23 @@ velocity**.
   traces while the camera translates, so the near, middle and far layers smear
   in exactly the 0.31 / 0.13 / 0.04 ratio their parallax already had, at every
   zoom, with no per-layer number to keep in step.
-* **Brightness is thrust.** The field rests at 72% of each layer's declared
-  grey and reaches the full grey when the craft is gaining speed at its own
-  chassis's published acceleration ceiling. Coasting fast is long and dim;
+* **Brightness is thrust.** The field rests at 62% of each layer's declared
+  grey, and reaches the full grey and half again as wide when the craft is
+  gaining speed at its own chassis's published acceleration ceiling. Width is
+  in there because a star is a pixel and a half across, so what it *renders*
+  at is set by coverage rather than by the colour it declares: a value-only
+  flare moved the captured peak from 22 to 25 of 255, while value and width
+  together take the lit area from 37 px to 86 px at the same 50 m/s. Coasting fast is long and dim;
   opening the throttle is bright. Because Regolith's drag scales with speed,
   full thrust at terminal velocity settles the light back down on its own —
   nothing models that, it falls out of measuring the change of speed.
-* **The star does not move.** The mark runs from the star's true point
-  *backwards*, over ground the camera has already crossed. Nothing is ever
-  drawn ahead of where a star is.
+* **The star does not move,** and is the bright end of its own mark. The rest
+  of the mark covers only the screen positions the star's image passed through
+  while the camera crossed them, so on screen the fade streams away opposite
+  the direction of flight — the direction the field is visibly moving. The
+  direction is derived in `smear_corners`, not guessed; a capture at 120 m/s
+  measures the near layer sliding 12 px up-screen per 0.33 s and the marks'
+  bright ends leading that slide.
 * **The ruleset owns the ceiling.** The drawn speed is clamped to
   `Archetype::limits().max_speed_mms` for the craft's own chassis, so the sky
   can never claim a speed the ruleset does not allow — and there is no copy of

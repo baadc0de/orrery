@@ -79,9 +79,11 @@
 //!
 //! Length alone would make acceleration merely the derivative of something the
 //! player has to watch change. The second channel is brightness: the field
-//! rests at [`STAR_REST_LEVEL`] of each layer's own grey and rises to the full
-//! grey when the craft is gaining speed at its chassis's published
-//! acceleration ceiling. The two readouts are independent, which is the whole
+//! rests at [`STAR_REST_LEVEL`] of each layer's own grey, and at the full grey
+//! and half again as wide when the craft is gaining speed at its chassis's
+//! published acceleration ceiling. Width is in there because at a pixel and a
+//! half across it is coverage, not declared colour, that decides how bright a
+//! star actually renders — see [`STAR_FLARE_WIDTH_GAIN`]. The two readouts are independent, which is the whole
 //! point of the physics they serve — **length is velocity, brightness is
 //! force**. Coasting fast is long and dim; opening the throttle from a stop is
 //! short and bright; and because Regolith's drag pulls back proportionally to
@@ -94,11 +96,12 @@
 //! Nothing here reads or writes simulation state, and nothing here is a source
 //! of truth (#519). Specifically:
 //!
-//! * a star's **centre stays exactly where it was** — the smear is drawn
-//!   *behind* it, from `centre + half` to `centre - (half + smear)` along the
-//!   direction of travel, so the leading end is still the star's true point
-//!   and the field never claims a position it does not hold. The tile lattice
-//!   in [`tile_translation`] is untouched by any of this;
+//! * a star's **centre stays exactly where it was**, and is the bright end of
+//!   its own mark. The rest of the mark covers only the screen positions the
+//!   star's image passed through while the camera crossed them — see
+//!   [`smear_corners`] for the derivation of which way that runs — so nothing
+//!   is drawn where the image has not been. The tile lattice in
+//!   [`tile_translation`] is untouched by any of this;
 //! * the only inputs are the own craft's replicated `QVel` and its own
 //!   `Archetype::limits()`. The speed the smear stands for is **clamped to
 //!   that chassis's published ceiling** ([`smear_length_m`]), so the sky can
@@ -217,7 +220,7 @@ pub const STAR_EXPOSURE_SECONDS: f32 =
 /// brighten because vertex colours multiply into the material's base colour:
 /// the layer's declared grey stays the ceiling, so #518's tracers keep the top
 /// of the value range whatever the throttle is doing.
-pub const STAR_REST_LEVEL: f32 = 0.72;
+pub const STAR_REST_LEVEL: f32 = 0.62;
 
 /// How dark the trailing end of a fully stretched smear goes, as a fraction of
 /// its head.
@@ -235,6 +238,17 @@ pub const STAR_TAIL_LEVEL: f32 = 0.3;
 /// Widening the smear as it stretches keeps it a mark rather than a shimmer,
 /// and costs nothing in honesty: width says nothing.
 pub const STAR_SMEAR_WIDTH_GAIN: f32 = 0.7;
+
+/// How much wider a mark is drawn at full thrust.
+///
+/// Measured, not guessed: at the sizes this field draws, a star covers a pixel
+/// and a half, so how bright it *renders* is set by how much of the pixel it
+/// covers rather than by the colour it declares. A value-only flare moved the
+/// captured peak from 22 to 25 of 255 — real, but not something a player
+/// notices while flying. Width is the lever that actually reaches the screen,
+/// and it says nothing: a wider mark is not a longer one, a faster one, or one
+/// anywhere else.
+pub const STAR_FLARE_WIDTH_GAIN: f32 = 0.5;
 
 /// The slowest filtered speed the field will take a direction from, in metres
 /// per second.
@@ -469,29 +483,59 @@ pub fn smear_stretch(half_m: f32, length_m: f32) -> f32 {
     (length_m / span).clamp(0.0, 1.0)
 }
 
+/// How wide a mark is drawn, in metres, for a star of `half_m`.
+///
+/// Two gains, both appearance: stretching widens it so a long thin mark stays
+/// a mark rather than a shimmer, and thrust widens it because coverage is what
+/// carries brightness at this size. Neither is a quantity.
+#[must_use]
+pub fn smear_width_m(half_m: f32, length_m: f32, flare: f32) -> f32 {
+    let stretch = smear_stretch(half_m, length_m);
+    half_m * (1.0 + STAR_SMEAR_WIDTH_GAIN * stretch + STAR_FLARE_WIDTH_GAIN * flare.clamp(0.0, 1.0))
+}
+
+/// The widest a mark may ever be drawn, as a multiple of the star's own
+/// half-edge. Both gains at once.
+pub const STAR_MAX_WIDTH_GAIN: f32 = 1.0 + STAR_SMEAR_WIDTH_GAIN + STAR_FLARE_WIDTH_GAIN;
+
 /// The four corners of one star's mark, in the tile's own XZ plane.
 ///
-/// Returned in the winding [`star_tile_mesh`] indexes: trailing-left,
-/// leading-left, leading-right, trailing-right, where "leading" is `+along`.
+/// Returned in the winding [`star_tile_mesh`] indexes, and at zero length they
+/// are the same four corners the unsmeared field always had.
 ///
-/// The star's own centre is **not** moved. The mark runs from `centre + half`
-/// down to `centre - (half + length)` along the direction of travel, so its
-/// bright leading end sits on the star's true point and everything invented
-/// lies behind it, over ground the camera has already crossed. Nothing is ever
-/// drawn ahead of where the star actually is.
+/// **Which way the mark runs, derived rather than guessed.** The star is
+/// fixed and the camera translates by `speed × T` along `along` during the
+/// exposure, so the star's *image* sweeps backwards across the screen by that
+/// much. Expressed as world points at the camera's pose **now**, the positions
+/// its image passed through run from the star itself forward along the
+/// direction of travel — so the mark spans `centre - half` to
+/// `centre + half + length` along `along`, and on screen that reads as a trail
+/// streaming away opposite the direction of flight, which is the direction the
+/// whole field is visibly moving.
+///
+/// The star's own centre is **not** moved, and the `-along` end — the bright
+/// one — is the star's true point. Everything else covers only screen
+/// positions the star's image genuinely occupied while the camera crossed
+/// them. Nothing is drawn where the image has not been.
 #[must_use]
-pub fn smear_corners(centre: Vec2, half_m: f32, along: Vec2, length_m: f32) -> [Vec2; 4] {
+pub fn smear_corners(
+    centre: Vec2,
+    half_m: f32,
+    along: Vec2,
+    length_m: f32,
+    flare: f32,
+) -> [Vec2; 4] {
     let along = along.try_normalize().unwrap_or(Vec2::X);
     let across = Vec2::new(-along.y, along.x);
     let length = length_m.max(0.0);
-    let width = half_m * (1.0 + STAR_SMEAR_WIDTH_GAIN * smear_stretch(half_m, length));
-    let lead = half_m;
-    let trail = -(half_m + length);
+    let width = smear_width_m(half_m, length, flare);
+    let head = -half_m;
+    let tail = half_m + length;
     [
-        centre + along * trail - across * width,
-        centre + along * lead - across * width,
-        centre + along * lead + across * width,
-        centre + along * trail + across * width,
+        centre + along * head - across * width,
+        centre + along * tail - across * width,
+        centre + along * tail + across * width,
+        centre + along * head + across * width,
     ]
 }
 
@@ -521,11 +565,10 @@ pub fn tile_vertices(
     let mut positions = Vec::with_capacity(stars.len() * 4);
     let mut colours = Vec::with_capacity(stars.len() * 4);
     for star in stars {
-        let corners = smear_corners(star.centre, star.half_m, along, length_m);
+        let corners = smear_corners(star.centre, star.half_m, along, length_m, flare);
         let (head, tail) = smear_levels(smear_stretch(star.half_m, length_m), flare);
-        // The corner order out of `smear_corners` is trailing, leading,
-        // leading, trailing.
-        for (corner, level) in corners.into_iter().zip([tail, head, head, tail]) {
+        // The corner order out of `smear_corners` is head, tail, tail, head.
+        for (corner, level) in corners.into_iter().zip([head, tail, tail, head]) {
             positions.push([corner.x, 0.0, corner.y]);
             colours.push([level, level, level, 1.0]);
         }
@@ -936,24 +979,23 @@ mod tests {
             (Vec2::new(1.0, 1.0).normalize(), "diagonal"),
         ] {
             let length = 60.0;
-            let corners = smear_corners(star, half, along, length);
+            let corners = smear_corners(star, half, along, length, 1.0);
             for corner in corners {
                 let ahead = (corner - star).dot(along);
                 assert!(
-                    ahead <= half + 1e-3,
-                    "the {name} mark reaches {ahead} m ahead of the star, which is further \
-                     than the star's own {half} m half-edge — the field would be claiming a \
-                     position the craft has not reached"
+                    ahead >= -(half + 1e-3),
+                    "the {name} mark reaches {ahead} m the wrong side of the star, past its \
+                     own {half} m half-edge — that is screen the star's image has not been on"
                 );
                 assert!(
-                    ahead >= -(half + length) - 1e-3,
-                    "the {name} mark reaches {ahead} m behind the star, past the {} m the \
+                    ahead <= half + length + 1e-3,
+                    "the {name} mark reaches {ahead} m along the velocity, past the {} m the \
                      exposure covers",
                     half + length
                 );
                 let sideways = (corner - star).dot(Vec2::new(-along.y, along.x)).abs();
                 assert!(
-                    sideways < half * (1.0 + STAR_SMEAR_WIDTH_GAIN) + 1e-3,
+                    sideways < half * STAR_MAX_WIDTH_GAIN + 1e-3,
                     "the {name} mark is {sideways} m wide of the velocity, which is wider than \
                      the smear is allowed to spread"
                 );
@@ -962,16 +1004,16 @@ mod tests {
             let reach = corners
                 .iter()
                 .map(|corner| (*corner - star).dot(along))
-                .fold(f32::INFINITY, f32::min);
+                .fold(f32::NEG_INFINITY, f32::max);
             assert!(
-                (reach + half + length).abs() < 1e-3,
-                "the {name} mark must run the whole {} m back, reached {reach} m",
+                (reach - half - length).abs() < 1e-3,
+                "the {name} mark must run the whole {} m of the exposure, reached {reach} m",
                 half + length
             );
         }
 
         // At rest the mark is the square the field has always drawn.
-        let still = smear_corners(star, half, Vec2::X, 0.0);
+        let still = smear_corners(star, half, Vec2::X, 0.0, 0.0);
         assert_eq!(still[1], star + Vec2::new(half, -half));
         assert_eq!(still[3], star + Vec2::new(-half, half));
     }
@@ -1050,6 +1092,28 @@ mod tests {
             (full - 1.0).abs() < 1e-6,
             "full thrust must reach the layer grey, reached {full}"
         );
+        // The flare also has to reach the screen. At a pixel and a half across
+        // a star renders as its coverage, so the value alone moved the
+        // captured peak by three of 255; the width carries the rest.
+        let half = STAR_LAYERS[0].half_size_m;
+        let resting = smear_width_m(half, 0.0, 0.0);
+        let burning = smear_width_m(half, 0.0, 1.0);
+        assert!(
+            burning > resting * 1.4,
+            "full thrust widened a mark from {resting} m to only {burning} m, which is not \
+             enough coverage for the flare to be seen at this size"
+        );
+        for length_m in [0.0f32, 10.0, 200.0] {
+            for flare in [0.0f32, 0.5, 1.0] {
+                let width = smear_width_m(half, length_m, flare);
+                assert!(
+                    width <= half * STAR_MAX_WIDTH_GAIN + 1e-4,
+                    "a mark {width} m wide is past the {} m the two gains allow",
+                    half * STAR_MAX_WIDTH_GAIN
+                );
+            }
+        }
+
         // And a flat, unstretched mark is one flat value: no ramp at rest.
         let (head, tail) = smear_levels(0.0, 0.0);
         assert!(
@@ -1210,13 +1274,13 @@ mod tests {
             for corner in chunk {
                 let offset = Vec2::new(corner[0], corner[2]) - star.centre;
                 assert!(
-                    offset.dot(along) <= star.half_m + 1e-2,
-                    "a drawn corner sits {} m ahead of its star along the replicated \
-                     velocity, past the star's own {} m half-edge",
+                    offset.dot(along) >= -(star.half_m + 1e-2),
+                    "a drawn corner sits {} m the wrong side of its star along the \
+                     replicated velocity, past the star's own {} m half-edge",
                     offset.dot(along),
                     star.half_m
                 );
-                if offset.dot(along) < -(star.half_m + 1e-2) {
+                if offset.dot(along) > star.half_m + 1e-2 {
                     moved += 1;
                 }
             }
@@ -1232,7 +1296,7 @@ mod tests {
                 })
                 .fold(0.0f32, f32::max);
             assert!(
-                widest < star.half_m * (1.0 + STAR_SMEAR_WIDTH_GAIN) + 1e-2,
+                widest < star.half_m * STAR_MAX_WIDTH_GAIN + 1e-2,
                 "a star {} m across was drawn {widest} m wide of the velocity",
                 star.half_m
             );
