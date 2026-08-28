@@ -10,6 +10,7 @@ pub mod campaign;
 pub mod combat;
 pub mod craft;
 pub mod grab;
+mod hearsay;
 pub mod hud;
 pub mod identity;
 pub mod intent;
@@ -394,6 +395,25 @@ impl ActiveSession {
             Self::Campaign(runtime) => {
                 matches!(runtime.state(), JoinState::Joined).then(|| runtime.cell_edge_m() as f32)
             }
+        }
+    }
+
+    /// The campaign's current hearsay snapshot, for the rendering skin only.
+    ///
+    /// This is crate-private so input and ruleset crates cannot import a
+    /// hearsay path. The next consumer is the screen-edge-arrow skin (#610).
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "A16 piece 4 is the first render consumer of this isolated view"
+    )]
+    pub(crate) fn hearsay_view(
+        &self,
+        roster: &roster::ShipRoster,
+    ) -> Option<hearsay::HearsayRenderView> {
+        match self {
+            Self::Local(_) => None,
+            Self::Campaign(runtime) => Some(runtime.hearsay_view(roster)),
         }
     }
 

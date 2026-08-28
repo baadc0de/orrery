@@ -187,6 +187,101 @@ impl UplinkAck {
     }
 }
 
+/// The party that computed a hearsay contact fold.
+///
+/// This is carried with every [`HearsayContacts`] message so the rendering
+/// skin receives provenance as data, not as a local convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HearsaySource {
+    /// The campaign host's fold over committed craft-cell reports.
+    HostRosterFold,
+}
+
+impl HearsaySource {
+    const HOST_ROSTER_FOLD_TAG: u8 = 0x01;
+
+    const fn decode(tag: u8) -> Option<Self> {
+        match tag {
+            Self::HOST_ROSTER_FOLD_TAG => Some(Self::HostRosterFold),
+            _ => None,
+        }
+    }
+}
+
+/// One source- and age-labelled contact in a [`HearsayContacts`] fold.
+///
+/// `cell` is raw `CellId` bits at the committed 512-metre level.
+/// `fact_age_ticks` is the age of that cell fact at the fold tick, not the
+/// age of the enclosing Meta message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HearsayContact {
+    /// The roster seat whose craft this contact concerns.
+    pub seat: u8,
+    /// Raw `CellId` bits for the reported craft cell.
+    pub cell: u64,
+    /// Age of the cell fact when the source took the fold.
+    pub fact_age_ticks: u16,
+}
+
+/// A host-to-client hearsay fold on the Meta lane.
+///
+/// The exterior-wire form is `[0xa2][source][fold tick u64 LE][count]`, then
+/// `count` `[seat][cell u64 LE][fact age u16 LE]` entries. It mirrors
+/// `gates/p1-swarm/src/exterior.rs`; this standalone client cannot depend on
+/// the harness binary that owns the other half of the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HearsayContacts {
+    /// Who computed the fold.
+    pub source: HearsaySource,
+    /// Tick at which the source took the roster snapshot.
+    pub fold_tick: u64,
+    /// Contacts included in this fold.
+    pub contacts: Vec<HearsayContact>,
+}
+
+impl HearsayContacts {
+    const TAG: u8 = 0xa2;
+    const HEADER_BYTES: usize = 11;
+    const CONTACT_BYTES: usize = 11;
+
+    /// Decodes this record and refuses every other member of the Meta grammar.
+    ///
+    /// Unknown tags and sources, truncated records, and count/length
+    /// mismatches all decode to `None`, matching the host's tolerant grammar.
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let [tag, source, tail @ ..] = payload else {
+            return None;
+        };
+        if *tag != Self::TAG || tail.len() < 9 {
+            return None;
+        }
+        let source = HearsaySource::decode(*source)?;
+        let fold_tick = u64::from_le_bytes(tail[..8].try_into().expect("eight bytes read"));
+        let count = usize::from(tail[8]);
+        let expected_len = Self::HEADER_BYTES + Self::CONTACT_BYTES * count;
+        if payload.len() != expected_len {
+            return None;
+        }
+
+        let contacts = payload[Self::HEADER_BYTES..]
+            .chunks_exact(Self::CONTACT_BYTES)
+            .map(|entry| HearsayContact {
+                seat: entry[0],
+                cell: u64::from_le_bytes(entry[1..9].try_into().expect("entry has eleven bytes")),
+                fact_age_ticks: u16::from_le_bytes(
+                    entry[9..11].try_into().expect("entry has eleven bytes"),
+                ),
+            })
+            .collect();
+        Some(Self {
+            source,
+            fold_tick,
+            contacts,
+        })
+    }
+}
+
 /// The handshake a dialling peer sends before any combat traffic
 /// (`exterior::JoinRequest`, version 4).
 ///
@@ -995,6 +1090,54 @@ mod tests {
             "cell report, not ack"
         );
         assert_eq!(UplinkAck::decode(&[]), None, "empty");
+    }
+
+    /// The #607 wire contract: one source-labelled fold, two contact entries,
+    /// and no tolerance for a count that would accept only a plausible prefix.
+    #[test]
+    fn hearsay_decode_matches_the_p1_contract() {
+        let mut payload = vec![0xa2, 0x01];
+        payload.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        payload.push(2);
+        payload.extend_from_slice(&[3]);
+        payload.extend_from_slice(&0x8899_aabb_ccdd_eeffu64.to_le_bytes());
+        payload.extend_from_slice(&0xcafeu16.to_le_bytes());
+        payload.extend_from_slice(&[7]);
+        payload.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        payload.extend_from_slice(&0xbeefu16.to_le_bytes());
+
+        assert_eq!(
+            HearsayContacts::decode(&payload),
+            Some(HearsayContacts {
+                source: HearsaySource::HostRosterFold,
+                fold_tick: 0x0123_4567_89ab_cdef,
+                contacts: vec![
+                    HearsayContact {
+                        seat: 3,
+                        cell: 0x8899_aabb_ccdd_eeff,
+                        fact_age_ticks: 0xcafe,
+                    },
+                    HearsayContact {
+                        seat: 7,
+                        cell: 0x0102_0304_0506_0708,
+                        fact_age_ticks: 0xbeef,
+                    },
+                ],
+            }),
+            "the standalone client must mirror exterior.rs byte for byte"
+        );
+
+        payload[10] = 1;
+        assert_eq!(
+            HearsayContacts::decode(&payload),
+            None,
+            "a corrupted count must not become a plausible contact prefix"
+        );
+        assert_eq!(
+            HearsayContacts::decode(&[0xa3, 0x01]),
+            None,
+            "another Meta tag is not hearsay"
+        );
     }
 
     /// The uplink envelope is `[sequence u64 LE][payload]`.
