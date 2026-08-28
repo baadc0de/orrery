@@ -105,6 +105,11 @@ struct JoinObject {
 struct JoinResponse {
     join: JoinObject,
     host_direct: String,
+    /// The display label admission granted with this seat. Older services did
+    /// not echo it; absence must stay absence rather than being backfilled from
+    /// the public roster.
+    #[serde(default)]
+    nickname: Option<String>,
     configured: ConfiguredResponse,
 }
 
@@ -404,6 +409,7 @@ fn poll_worker(
     gate: Option<ResMut<JoinGate>>,
     dirty: Option<ResMut<UiDirty>>,
     mut session: ResMut<ActiveSession>,
+    mut roster: ResMut<crate::roster::ShipRoster>,
     roots: Query<Entity, With<JoinUiRoot>>,
 ) {
     // This system removes both resources itself on a successful join, so from
@@ -480,10 +486,16 @@ fn poll_worker(
                     return;
                 }
             }
+            let own_label = answer.nickname;
+            roster.set_own(crate::roster::OwnLabelGrant {
+                slot: answer.join.slot,
+                nickname: own_label.as_deref(),
+            });
             let config = CampaignConfig {
                 host_node_hex: answer.join.host_node,
                 host_direct: Some(answer.host_direct),
                 slot: answer.join.slot,
+                own_label,
                 session_id: answer.join.session_id,
                 session_token_hex: Some(answer.join.session_token),
                 wall_start_utc: crate::campaign::utc_now_iso8601(),
@@ -998,6 +1010,7 @@ pub fn admit_headless(
                     host_node_hex: answer.join.host_node,
                     host_direct: Some(answer.host_direct),
                     slot: answer.join.slot,
+                    own_label: answer.nickname,
                     session_id: answer.join.session_id,
                     session_token_hex: Some(answer.join.session_token),
                     wall_start_utc: crate::campaign::utc_now_iso8601(),
@@ -1487,10 +1500,11 @@ mod tests {
 
     #[test]
     fn join_post_sends_the_current_regolith_ruleset_version() {
-        let accepted = r#"{"join":{"host_node":"node","slot":1,"session_id":"session","session_token":"token"},"host_direct":"127.0.0.1:1","configured":{"loss_pct":0.0,"jitter_p50_ms":0,"jitter_p99_ms":0}}"#;
+        let accepted = r#"{"join":{"host_node":"node","slot":1,"session_id":"session","session_token":"token"},"host_direct":"127.0.0.1:1","nickname":"ada","configured":{"loss_pct":0.0,"jitter_p50_ms":0,"jitter_p99_ms":0}}"#;
         let (url, request) = join_test_server("200 OK", accepted);
 
-        post_join(&url, "ada", "node").expect("current ruleset is admitted");
+        let answer = post_join(&url, "ada", "node").expect("current ruleset is admitted");
+        assert_eq!(answer.nickname.as_deref(), Some("ada"));
 
         let request = request.recv().expect("captured join request");
         let body_start = request
