@@ -7060,6 +7060,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "flate2",
  "glam 0.32.1",
  "hmac",
  "iroh-base",
