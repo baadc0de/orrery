@@ -22,8 +22,8 @@ use orrery_games::regolith::{
     CAMPAIGN_CELL_EDGE_M, CAMPAIGN_MIN_CELL_EDGE_M, CAMPAIGN_ROCK_COUNT, ISLAND_CRAFT_BUDGET,
     ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET,
     KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK,
-    MAX_ENGAGEMENT_RANGE_MM, MAX_TARGET_RADIUS_MM, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS,
-    REGOLITH_RULESET, RESPAWN_TICKS,
+    MAX_ENGAGEMENT_RANGE_MM, MAX_NEIGHBOR_READS, MAX_TARGET_RADIUS_MM, PICKUP_SCORE_POINTS,
+    PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -183,6 +183,62 @@ fn ship_striking_a_rock_produces_a_recorded_adjudicated_collision() {
         executor.state(rock_id),
         Some(RegolithState::Rock(Rock { collisions: 1, .. }))
     ));
+}
+
+#[test]
+fn combined_visibility_and_collision_read_exactly_the_declared_neighbor_bound() {
+    let target = PersistId::new(1);
+    let locker = PersistId::new(2);
+    let cover = PersistId::new(3);
+    let collider = PersistId::new(4);
+    let mut target_state = craft_at(100_000);
+    target_state.vel.x = 60_000;
+    let mut locker_state = locked_craft(target);
+    locker_state.pos = QPos::default();
+    let cover_state = Rock::spawned(
+        RockTier::Small,
+        0,
+        QPos {
+            x: 50_000,
+            y: 0,
+            z: 0,
+        },
+        QVel::default(),
+    );
+    let collider_state = Rock::spawned(
+        RockTier::Small,
+        0,
+        QPos {
+            x: 110_000,
+            y: 0,
+            z: 0,
+        },
+        QVel::default(),
+    );
+
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xC8; 32]));
+    executor.insert_observed(target, RegolithState::Craft(target_state), Tick::new(100));
+    executor.insert_observed(locker, RegolithState::Craft(locker_state), Tick::new(99));
+    executor.insert_observed(cover, RegolithState::Rock(cover_state), Tick::new(98));
+    executor.insert_observed(collider, RegolithState::Rock(collider_state), Tick::new(97));
+
+    let outcome = executor
+        .step_entity(
+            target,
+            Tick::new(100),
+            &[
+                Order::ClaimCover {
+                    locker,
+                    rock: cover,
+                },
+                Order::Collide { other: collider },
+            ],
+        )
+        .expect("target exists");
+
+    assert_eq!(outcome.neighbor_reads, [locker, cover, collider]);
+    assert_eq!(outcome.neighbor_reads.len(), MAX_NEIGHBOR_READS);
+    assert_eq!(outcome.neighbor_frames.len(), MAX_NEIGHBOR_READS);
 }
 
 #[test]

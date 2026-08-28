@@ -113,7 +113,8 @@ recorded reads become `NeighborFrame` records in first-read order
 serves exactly the recorded frames, refuses a frame older than the ruleset's
 staleness bound, and caps how many frames a tick may pull in
 (`crates/orrery_core/src/replay.rs:236`, `:252`; Regolith declares
-`MAX_NEIGHBOR_READS = 4` and `MAX_NEIGHBOR_STALENESS_TICKS = 60`,
+`MAX_NEIGHBOR_READS` from its three audited read slots and
+`MAX_NEIGHBOR_STALENESS_TICKS = 60`,
 `crates/orrery_games/src/regolith/mod.rs:81-84`). Own-state discipline
 completes the closure: neighbours are snapshotted before the step, so "a step
 cannot observe another entity's mutation from the same tick"
@@ -208,7 +209,8 @@ the layering this node proposes, so it is worth reading closely.
 This is the issue's own design rule 2 ("prefer query-as-input over
 query-in-step"), implemented: the candidate set is assembled outside the
 adjudicated code, the step makes point tests against declared candidates, the
-read-set is bounded by construction (`MAX_NEIGHBOR_READS = 4`). The #353 cost
+read-set is bounded by construction: the cap derives from the three audited
+read slots (locker, rock, collision counterparty). The #353 cost
 objection - reading every intervening rock per lock per tick into the audit
 payload - was resolved not by avoiding LoS but by inverting the query. The
 incentive analysis closes cleanly too: the claiming target *benefits* from a
@@ -575,12 +577,6 @@ Corrections to the issue thread, found by this verification pass:
 - **The issue's "20 Hz" witness-stream description**: the landed cadence is
   budget-derived, 6 Hz at mesh defaults (`docs/03-replication.md:184-186`);
   ADR-0040 already flags the D9/docs/02 reconciliation as owner work.
-- **One live nit found in passing**: `MAX_NEIGHBOR_READS` is 4 while its doc
-  comment says "at most three distinct recorded frames"
-  (`crates/orrery_games/src/regolith/mod.rs:81-82`), and the audited
-  predicates read at most three (locker, rock, collision counterparty). One
-  unit of unexplained slack or a stale comment - either way the two lines
-  disagree; flagged, not fixed, per this node's scope.
 - **Stale citation in an Accepted record**: ADR-0046 cites
   `crates/orrery_core/src/executor.rs:103-106` for the own-state snapshot
   rule (`0046-message-class-semantics.md:55-57`); the rule now lives at

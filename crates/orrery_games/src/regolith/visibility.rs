@@ -21,6 +21,45 @@ pub(crate) struct VerifiedClaims {
     pub(crate) arithmetic_overflowed: bool,
 }
 
+/// One recorded-neighbour slot in the audited claims stage.
+#[derive(Clone, Copy)]
+enum NeighborReadSlot {
+    /// The craft whose lock a cover claim challenges.
+    CoverLocker,
+    /// The rock a cover claim names as occluder.
+    CoverRock,
+    /// The counterparty a collision claim names.
+    Collision,
+}
+
+/// Every slot that [`verify_claims`] may read in one step.
+///
+/// The public ruleset cap is derived from this array, which the read stage
+/// itself maps over. Adding a recorded-neighbour read therefore requires an
+/// explicit new slot, raises the cap with it, and is adjudication that needs a
+/// ruleset-version bump.
+const NEIGHBOR_READ_SLOTS: [NeighborReadSlot; 3] = [
+    NeighborReadSlot::CoverLocker,
+    NeighborReadSlot::CoverRock,
+    NeighborReadSlot::Collision,
+];
+
+pub(crate) const MAX_NEIGHBOR_READS: usize = NEIGHBOR_READ_SLOTS.len();
+
+impl NeighborReadSlot {
+    fn target(
+        self,
+        cover: Option<(PersistId, PersistId)>,
+        collision: Option<PersistId>,
+    ) -> Option<PersistId> {
+        match self {
+            Self::CoverLocker => cover.map(|(locker, _)| locker),
+            Self::CoverRock => cover.map(|(_, rock)| rock),
+            Self::Collision => collision,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Body {
     pos: QPos,
@@ -127,12 +166,10 @@ pub(crate) fn verify_claims(
         Order::Collide { other } => Some(*other),
         _ => None,
     });
-    let [locker, rock, collision] = [
-        cover.map(|pair| pair.0),
-        cover.map(|pair| pair.1),
-        collision_id,
-    ]
-    .map(|id| id.and_then(|id| view.neighbor(id).cloned()));
+    let [locker, rock, collision] = NEIGHBOR_READ_SLOTS.map(|slot| {
+        slot.target(cover, collision_id)
+            .and_then(|id| view.neighbor(id).cloned())
+    });
 
     let visibility = cover.and_then(|(locker_id, rock_id)| {
         verify_visibility(view, locker_id, rock_id, locker.as_ref(), rock.as_ref())
