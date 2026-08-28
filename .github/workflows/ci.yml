@@ -515,12 +515,13 @@ jobs:
     # it. Prove it then; do not assume it.
     runs-on: ubuntu-latest
     # 1276 s measured cold on 2026-08-27 over 22 pull-request runs (#585); #171's
-    # 656 s is the 2026-08-20 tree and is stale. 30 minutes is ~1.4x the current
-    # cold mean and ~1.3x its slowest sample, so a lane that hangs still says so
-    # rather than burning the six-hour default — but this bound is no longer
-    # comfortable, and the next lane growth should raise it rather than discover
-    # it as a cancellation.
-    timeout-minutes: 30
+    # 656 s is the 2026-08-20 tree and is stale. #585 measured the cold mean at
+    # 1276 s over 22 same-day PR runs (median 1320, range 1004-1380, sd 112), so
+    # 30 minutes was only ~1.4x the mean and ~1.3x the slowest sample. That is
+    # not enough headroom for a lane whose own spread is 376 s: the next growth
+    # would have been discovered as a cancellation rather than a slow run.
+    # 45 minutes is ~2.1x the cold mean, the same ratio `determinism` carries.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       # #171's answer to "would we know before hitting a ceiling?": sample free
@@ -539,6 +540,31 @@ jobs:
           echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
+
+      # kache with NO REMOTE AND NO ACTIONS CACHE. This is not the S3 arm that
+      # `clippy` runs and that the block above declines for this lane; it never
+      # touches the network and stores nothing between runs.
+      #
+      # What it buys is same-run deduplication. #585 found that of 4,844
+      # cacheable units, 3,578 were served by the *local* store: this lane
+      # compiles the same bevy/iroh dependency graph up to twelve times, once
+      # per standalone workspace, into twelve separate `target/` directories.
+      # kache collapses that inside a single run before any bucket is involved.
+      #
+      # Measured (#585 run 6, `github-cache: false`, no S3 configuration):
+      # 1100 s against the 1276 s cold mean — 176 s, 14 % — for 0 bytes over
+      # the wire and $0. It is also the *efficient* third of the saving: 76 ms
+      # per hit off local disk against the remote's 176–225 ms across two
+      # clouds, a 9.9x return against 4.1–5.4x.
+      #
+      # `RUSTC_WRAPPER` is emptied at workflow scope for runners with no kache
+      # on PATH; the action sets it back to `kache` through `$GITHUB_ENV`.
+      - name: Install kache with no remote, for same-run deduplication
+        uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
+        with:
+          version: 0.14.2
+          github-cache: false
+          pr-comment: false
 
       # Registry and git checkouts only — deliberately not `target/`, the same
       # judgement as `clippy` and `test` and for the same two reasons. This
