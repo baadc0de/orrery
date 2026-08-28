@@ -341,6 +341,14 @@ struct Args {
     #[arg(long)]
     stamp_wall_clock: bool,
 
+    /// Emit one directed replica-scope decision for every active non-self seat
+    /// pair at each one-second roster refresh.
+    ///
+    /// Eight active seats produce 3,360 lines/minute, so this diagnostic is
+    /// opt-in and changes neither the island roster nor replicated traffic.
+    #[arg(long)]
+    replica_scope_capture: bool,
+
     /// Structural self-check for CI images with no time to run a swarm.
     #[arg(long)]
     self_test: bool,
@@ -667,6 +675,7 @@ fn main() -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs())
         }),
+        replica_scope_capture: args.replica_scope_capture,
     };
 
     eprintln!(
