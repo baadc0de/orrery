@@ -416,9 +416,25 @@ mod tests {
     #[test]
     fn the_fade_ramps_over_a_second_of_travel_and_stops_at_the_floor() {
         let band = fade_band_m(EDGE);
+        // Derived, not written down. The literal 120.0 that stood here was
+        // correct until v18 raised the interceptor ceiling to 480 m/s, at
+        // which point it failed -- and it failed in a standalone workspace the
+        // root `check.sh test` does not reach, so it was merged before anyone
+        // saw it. Deriving the expectation from the same two inputs the
+        // function uses means a future ceiling change moves both together.
+        #[allow(clippy::cast_precision_loss)]
+        let fastest_ms = Archetype::ALL
+            .iter()
+            .map(|archetype| archetype.limits().max_speed_mms)
+            .max()
+            .expect("Regolith publishes at least one chassis") as f32
+            / 1_000.0;
+        let expected = (fastest_ms * FADE_BAND_SECONDS).min(EDGE * 0.5);
         assert!(
-            (band - 120.0).abs() < 0.5,
-            "the fastest chassis covers 120 m/s; got {band}"
+            (band - expected).abs() < 0.5,
+            "the band is {FADE_BAND_SECONDS}s of the fastest chassis \
+             ({fastest_ms} m/s), capped at half a cell edge; expected \
+             {expected}, got {band}"
         );
         assert!(band < EDGE * 0.5 + 0.001);
         assert!(
