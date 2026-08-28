@@ -32,7 +32,7 @@ use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::PersistId;
+use crate::{CellId, PersistId};
 
 /// The two logical channels the design defines (docs/02-networking.md §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +124,28 @@ pub const TAG_REPLICATION: u8 = 0xE6;
 /// allocating its output buffer.
 pub const TAG_REPLICATION_COMPRESSED: u8 = 0xE9;
 
+/// Sub-tag marking a keyframe-referenced replication delta.
+///
+/// The postcard envelope is `(entity, tick, keyframe_age, cell, patch)`. The
+/// patch is a skip/write program over the canonical bytes of the referenced
+/// keyframe; see [`encode_delta_patch`] and [`apply_delta_patch`].
+pub const TAG_REPLICATION_DELTA: u8 = 0xEB;
+
+/// The decoded envelope of one keyframe-referenced replication delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationDelta {
+    /// Entity whose canonical state is patched.
+    pub entity: PersistId,
+    /// Universe tick of the current state.
+    pub tick: u64,
+    /// Number of ticks back to the referenced keyframe.
+    pub keyframe_age: u16,
+    /// New committed cell, present only when it changed since the keyframe.
+    pub cell: Option<CellId>,
+    /// Skip/write patch over the keyframe's canonical bytes.
+    pub patch: Vec<u8>,
+}
+
 /// Encode replication traffic as a state datagram.
 pub fn encode_replication<T: Serialize>(msg: &T) -> Vec<u8> {
     let mut payload = Vec::with_capacity(64);
@@ -140,6 +162,210 @@ pub fn encode_replication<T: Serialize>(msg: &T) -> Vec<u8> {
 #[must_use]
 pub fn encode_replication_compressed<T: Serialize>(msg: &T) -> Vec<u8> {
     encode_sub_tagged_compressed(msg, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED)
+}
+
+/// Encode a keyframe-referenced replication delta, falling back to the
+/// absolute keyframe whenever the delta datagram would not be smaller.
+///
+/// `absolute` is the ordinary current-state replication message that the
+/// delta would replace. Comparing the complete encoded datagrams keeps the
+/// same smaller-only convention as [`encode_replication_compressed`], including
+/// any DEFLATE win available to the absolute form.
+#[must_use]
+pub fn encode_replication_delta<T: Serialize>(absolute: &T, delta: &ReplicationDelta) -> Vec<u8> {
+    let keyframe = encode_replication_compressed(absolute);
+    let candidate = encode_replication_delta_candidate(delta);
+    if candidate.len() < keyframe.len() {
+        candidate
+    } else {
+        keyframe
+    }
+}
+
+/// Decode a keyframe-referenced replication delta from a state datagram.
+///
+/// Returns `None` for every other state sub-tag and for malformed or oversized
+/// envelopes. The peer-declared patch length is checked before allocating the
+/// returned [`ReplicationDelta::patch`].
+#[must_use]
+pub fn decode_replication_delta(payload: &[u8]) -> Option<ReplicationDelta> {
+    let (channel, rest) = untag(payload)?;
+    if channel != Channel::State || rest.first() != Some(&TAG_REPLICATION_DELTA) {
+        return None;
+    }
+
+    let body = rest.get(1..)?;
+    let (entity, body) = postcard::take_from_bytes::<PersistId>(body).ok()?;
+    let (tick, body) = postcard::take_from_bytes::<u64>(body).ok()?;
+    let (keyframe_age, body) = postcard::take_from_bytes::<u16>(body).ok()?;
+    let (cell, body) = postcard::take_from_bytes::<Option<CellId>>(body).ok()?;
+    let (declared, patch) = postcard::take_from_bytes::<usize>(body).ok()?;
+    let declared = accept_declared_len(declared)?;
+    if patch.len() != declared {
+        return None;
+    }
+
+    Some(ReplicationDelta {
+        entity,
+        tick,
+        keyframe_age,
+        cell,
+        patch: patch.to_vec(),
+    })
+}
+
+/// Encode `current` as a skip/write patch against `keyframe`.
+///
+/// The body is `new_len:varint` followed by `(skip:varint,
+/// write_len:varint, literals...)` operations. Skips copy keyframe bytes at
+/// the same offset. Bytes beyond the keyframe length are always literals, so
+/// growing canonical states (including v18's filling craft trail) reconstruct
+/// exactly. One-byte equal gaps are folded into a literal run because writing
+/// one byte is cheaper than another pair of run headers.
+#[must_use]
+pub fn encode_delta_patch(keyframe: &[u8], current: &[u8]) -> Vec<u8> {
+    let new_len = u32::try_from(current.len()).expect("canonical state length fits in u32");
+    let mut patch = Vec::with_capacity(current.len().saturating_add(8));
+    push_varint(new_len, &mut patch);
+
+    let mut offset = 0usize;
+    while offset < current.len() {
+        let skip_start = offset;
+        while offset < current.len()
+            && keyframe
+                .get(offset)
+                .is_some_and(|byte| *byte == current[offset])
+        {
+            offset += 1;
+        }
+        let skip = offset - skip_start;
+        let write_start = offset;
+
+        while offset < current.len() {
+            if keyframe
+                .get(offset)
+                .is_none_or(|byte| *byte != current[offset])
+            {
+                offset += 1;
+                continue;
+            }
+
+            let equal_start = offset;
+            while offset < current.len()
+                && keyframe
+                    .get(offset)
+                    .is_some_and(|byte| *byte == current[offset])
+            {
+                offset += 1;
+            }
+            let equal_len = offset - equal_start;
+            if offset == current.len() || equal_len > 1 {
+                offset = equal_start;
+                break;
+            }
+        }
+
+        let write_len = offset - write_start;
+        push_varint(
+            u32::try_from(skip).expect("canonical state length fits in u32"),
+            &mut patch,
+        );
+        push_varint(
+            u32::try_from(write_len).expect("canonical state length fits in u32"),
+            &mut patch,
+        );
+        patch.extend_from_slice(&current[write_start..offset]);
+    }
+
+    patch
+}
+
+/// Apply a skip/write `patch` to canonical `keyframe` bytes.
+///
+/// Malformed programs, non-canonical varints, skips past the keyframe, trailing
+/// bytes, and output sizes above [`MAX_RELIABLE_MESSAGE_BYTES`] are refused.
+/// The declared output bound is checked before allocating its buffer.
+#[must_use]
+pub fn apply_delta_patch(keyframe: &[u8], patch: &[u8]) -> Option<Vec<u8>> {
+    let (declared, mut operations) = take_varint(patch)?;
+    let new_len = accept_declared_len(usize::try_from(declared).ok()?)?;
+    let mut output = Vec::with_capacity(new_len);
+
+    while output.len() < new_len {
+        let (skip, rest) = take_varint(operations)?;
+        let (write_len, rest) = take_varint(rest)?;
+        let skip = usize::try_from(skip).ok()?;
+        let write_len = usize::try_from(write_len).ok()?;
+        if skip == 0 && write_len == 0 {
+            return None;
+        }
+
+        let after_skip = output.len().checked_add(skip)?;
+        if after_skip > new_len || after_skip > keyframe.len() {
+            return None;
+        }
+        output.extend_from_slice(keyframe.get(output.len()..after_skip)?);
+
+        let after_write = output.len().checked_add(write_len)?;
+        if after_write > new_len {
+            return None;
+        }
+        let (literals, rest) = rest.split_at_checked(write_len)?;
+        output.extend_from_slice(literals);
+        operations = rest;
+    }
+
+    operations.is_empty().then_some(output)
+}
+
+fn encode_replication_delta_candidate(delta: &ReplicationDelta) -> Vec<u8> {
+    let body = postcard::to_stdvec(&(
+        delta.entity,
+        delta.tick,
+        delta.keyframe_age,
+        delta.cell,
+        delta.patch.as_slice(),
+    ))
+    .expect("wire message is serializable");
+    let mut payload = Vec::with_capacity(body.len().saturating_add(1));
+    payload.push(TAG_REPLICATION_DELTA);
+    payload.extend_from_slice(&body);
+    tag(Channel::State, &payload)
+}
+
+fn push_varint(mut value: u32, out: &mut Vec<u8>) {
+    loop {
+        let low = u8::try_from(value & 0x7f).expect("seven bits fit in u8");
+        value >>= 7;
+        if value == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+fn take_varint(bytes: &[u8]) -> Option<(u32, &[u8])> {
+    let mut value = 0u32;
+    for (index, byte) in bytes.iter().copied().take(5).enumerate() {
+        let shift = u32::try_from(index).ok()?.checked_mul(7)?;
+        let low = u32::from(byte & 0x7f);
+        if low > (u32::MAX >> shift) {
+            return None;
+        }
+        let chunk = low << shift;
+        value = value.checked_add(chunk)?;
+        if byte & 0x80 == 0 {
+            let consumed = index.checked_add(1)?;
+            let canonical_len = if value == 0 {
+                1
+            } else {
+                usize::try_from((32 - value.leading_zeros()).div_ceil(7)).ok()?
+            };
+            return (canonical_len == consumed).then_some((value, bytes.get(consumed..)?));
+        }
+    }
+    None
 }
 
 /// Decode replication traffic from a state datagram.
@@ -181,12 +407,12 @@ fn decode_sub_tagged<T: DeserializeOwned>(
     postcard::from_bytes(&decoded).ok()
 }
 
-/// Accept a compressed envelope's declared plaintext size, or refuse it.
+/// Accept an untrusted peer's declared allocation size, or refuse it.
 ///
-/// Checked **before** the `Vec::with_capacity` below, and that ordering is the
-/// whole point: the declaration is four bytes chosen by an untrusted peer, so
-/// an unbounded one would have us reserve up to 4 GiB before a single byte of
-/// the payload is examined. The later `decoded.len() != declared` check
+/// Checked **before** either the compressed decoder or delta patch applier's
+/// `Vec::with_capacity`, and that ordering is the whole point: the declaration
+/// is chosen by an untrusted peer, so an unbounded one would have us reserve up
+/// to 4 GiB before a single byte of output is examined. A later length mismatch
 /// rejects the same envelope, but only after the allocation has happened --
 /// which is why that check cannot stand in for this one.
 fn accept_declared_len(declared: usize) -> Option<usize> {
@@ -469,6 +695,63 @@ mod tests {
     /// does not cover it: with the bound deleted that test still passes,
     /// because the trailing `decoded.len() != declared` mismatch rejects the
     /// same envelope -- after the oversized allocation the bound exists to
+    /// `apply_delta_patch` refuses an oversized declared output length.
+    ///
+    /// The bound is in the code, but nothing pinned it: removing
+    /// `accept_declared_len` from the patch decoder left all 133 tests green.
+    /// That is the identical gap #649 shipped on the DEFLATE decoder -- a
+    /// later structural check rejects the same message, but only after
+    /// `Vec::with_capacity` has reserved on a stranger's varint. The
+    /// allocation is the hazard, so the predicate is asserted where it is made.
+    #[test]
+    fn a_delta_patch_declaring_an_oversized_output_is_refused_before_allocating() {
+        /// Little-endian base-128, canonical length, matching `take_varint`.
+        fn varint(mut value: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = u8::try_from(value & 0x7f).expect("seven bits");
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return out;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+
+        let keyframe = vec![0u8; 8];
+        let over = u32::try_from(MAX_RELIABLE_MESSAGE_BYTES).expect("cap fits u32") + 1;
+
+        // A patch that would SUCCEED if the bound were absent: skip nothing,
+        // write `over` literals. Refusing it therefore proves the cap ran,
+        // not merely that some later structural check rejected the message.
+        // An envelope that fails either way proves nothing -- which is how
+        // #649's oversize test came to pass with its bound deleted.
+        let mut hostile = varint(over);
+        hostile.extend_from_slice(&varint(0));
+        hostile.extend_from_slice(&varint(over));
+        hostile.extend(std::iter::repeat_n(0xAB, over as usize));
+
+        let well_formed_if_unbounded = {
+            let (declared, ops) = take_varint(&hostile).expect("varint header");
+            let (skip, rest) = take_varint(ops).expect("skip");
+            let (write, rest) = take_varint(rest).expect("write");
+            declared == over && skip == 0 && write == over && rest.len() == over as usize
+        };
+        assert!(
+            well_formed_if_unbounded,
+            "the hostile patch must be structurally valid, or the refusal \
+             below would prove nothing about the cap"
+        );
+
+        assert_eq!(
+            apply_delta_patch(&keyframe, &hostile),
+            None,
+            "a peer declaring {over} output bytes must be refused before that \
+             capacity is reserved, even though the patch is otherwise well formed"
+        );
+    }
+
     /// prevent. Asserting the predicate directly is the only way to hold it.
     #[test]
     fn a_declared_plaintext_size_above_the_cap_is_refused_before_allocating() {

@@ -694,6 +694,26 @@ mod tests {
     }
 
     #[test]
+    fn a_delta_datagram_is_charged_to_the_replication_lane() {
+        use orrery_protocol::channels::{
+            encode_delta_patch, encode_replication_delta, ReplicationDelta, TAG_REPLICATION_DELTA,
+        };
+
+        let absolute = (0u8..=u8::MAX).collect::<Vec<_>>();
+        let delta = ReplicationDelta {
+            entity: orrery_protocol::PersistId::new(7),
+            tick: 16_384,
+            keyframe_age: 60,
+            cell: None,
+            patch: encode_delta_patch(&absolute, &absolute),
+        };
+        let encoded = encode_replication_delta(&absolute, &delta);
+        let (_, body) = untag(&encoded).expect("state channel tag");
+        assert_eq!(body.first(), Some(&TAG_REPLICATION_DELTA));
+        assert_eq!(lane_of(Channel::State, &encoded), Lane::Replication);
+    }
+
+    #[test]
     fn the_tally_answers_which_lane_spent_the_budget() {
         // "Peak upload was 1006 kbps" does not say which dial to turn, and that
         // was precisely P4's question.
