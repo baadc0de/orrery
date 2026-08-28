@@ -1649,19 +1649,26 @@ mod tests {
     use orrery_games::regolith::state::LockClass;
 
     #[test]
-    fn two_active_humans_are_mutual_broadcast_recipients_regardless_of_seat_order() {
+    fn three_active_humans_are_pairwise_broadcast_recipients_regardless_of_seat_order() {
         let start = crate::lobby::AcceptedStart {
-            attempt_id: "attempt-594".to_owned(),
+            attempt_id: "attempt-601".to_owned(),
             island_seats: 8,
-            active_slots: vec![0, 1, 2, 3, 4, 5, 6],
+            active_slots: vec![0, 1, 2, 3, 4, 5, 6, 7],
             witness_recipients: Vec::new(),
             duration_ticks: 216_000,
         };
-        let from_a = broadcast_recipients(Some(&start), 5);
-        let from_b = broadcast_recipients(Some(&start), 6);
+        let human_slots = [5, 6, 7];
 
-        assert!(from_a.contains(&6), "slot 5 must broadcast up to slot 6");
-        assert!(from_b.contains(&5), "slot 6 must broadcast down to slot 5");
+        for subject in human_slots {
+            let recipients = broadcast_recipients(Some(&start), subject);
+            for peer in human_slots {
+                assert_eq!(
+                    recipients.contains(&peer),
+                    peer != subject,
+                    "human slot {subject} must broadcast to every other human, including slot 7"
+                );
+            }
+        }
     }
 
     #[test]

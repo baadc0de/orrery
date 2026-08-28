@@ -49,6 +49,6 @@ publishes the GitHub release after its slowest platform finishes. Do not spend
 a waiting tester session on a rebuild. When one platform is urgently needed,
 its `regolith-<platform>` workflow artifact is downloadable as soon as that
 matrix leg finishes, before the final release-publishing job runs. The Linux
-leg also has to complete the two-client deployed-campaign preflight before its
+leg also has to complete the three-client deployed-campaign preflight before its
 archive is staged, so update the campaign's revision pin to the candidate
 commit before starting the release workflow.
