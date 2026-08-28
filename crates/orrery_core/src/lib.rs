@@ -97,3 +97,36 @@ pub use ruleset::{
 };
 pub use store::{AuthorityLog, BundleError, ClaimRecord, Retention};
 pub use tolerance::{Tolerance, ToleranceOutcome, TrajectorySample};
+
+#[cfg(test)]
+mod overflow_profile_pin {
+    /// D43 (f)(2): the canonical crates' build pins `overflow-checks = false`
+    /// uniformly across profiles.
+    ///
+    /// This asserts the *behaviour* rather than parsing the workspace
+    /// manifest or reading a cfg flag, so it cannot be satisfied by a
+    /// `[profile]` entry that some other configuration overrides -- it fails
+    /// whenever this build would actually panic on overflow. It runs under
+    /// the `test` profile, which inherits `dev`: the half Cargo defaults to
+    /// `true`, and therefore the half that splits dev from release.
+    ///
+    /// The clause exists because *profile-dependence* is the hazard. The same
+    /// stray operation must not panic in a test and wrap in a shipped client.
+    /// The pin was absent from the root manifest entirely until this test
+    /// arrived with it, which is the argument for the test existing: an
+    /// Accepted clause with nothing asserting it drifts back out in silence.
+    #[test]
+    fn canonical_arithmetic_wraps_instead_of_panicking() {
+        let at_max = std::hint::black_box(i32::MAX);
+        let wrapped = std::panic::catch_unwind(|| std::hint::black_box(at_max + 1));
+
+        assert_eq!(
+            wrapped.ok(),
+            Some(i32::MIN),
+            "overflow-checks is ON in this profile: D43 (f)(1) bars resolving \
+             overflow by aborting the tick, and (f)(2) requires one behaviour \
+             across all profiles. Restore the `[profile.dev]` and \
+             `[profile.release]` pin in the workspace root Cargo.toml."
+        );
+    }
+}
