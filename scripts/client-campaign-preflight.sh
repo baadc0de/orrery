@@ -53,7 +53,7 @@ run_preflight() {
     command -v "$XVFB_RUN_BIN" >/dev/null 2>&1 || die "required command is unavailable: $XVFB_RUN_BIN"
     command -v timeout >/dev/null 2>&1 || die 'required command is unavailable: timeout'
 
-    local dir build_info origin nickname_a nickname_b outer_timeout
+    local dir build_info origin run_suffix nickname_a nickname_b outer_timeout
     dir="$(mktemp -d)"
     # shellcheck disable=SC2064 # Expand the validated mktemp path now.
     trap "rm -rf '$dir'" EXIT
@@ -77,10 +77,12 @@ print(origin.rstrip("/"))
     }
     result PASS build-info-default-origin "binary reports $origin"
 
-    # PID keeps simultaneous workflow retries from sharing names, while the
+    # The mktemp suffix is unique across concurrent runners and PID namespaces;
+    # `$$` is not (sandboxed invocations all commonly run as PID 2). The final
     # suffix gives the self-test fixture and the log reader a stable side.
-    nickname_a="preflight-$$-a"
-    nickname_b="preflight-$$-b"
+    run_suffix=${dir##*.}
+    nickname_a="preflight-$run_suffix-a"
+    nickname_b="preflight-$run_suffix-b"
     outer_timeout=$((TIMEOUT_SECS * 2 + 60))
 
     run_client() { # side, nickname, expected peer
@@ -170,10 +172,17 @@ case ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} in
     one-seated) [[ $nickname == *-b ]] || echo 'PREFLIGHT PASS handshake-seated slot=5' ;;
     *) echo 'PREFLIGHT PASS handshake-seated slot=5' ;;
 esac
-# Keep every non-seat assertion green in the seat mutations. That isolates the
-# guarded stage: if either seated-marker check vanished, a lying zero-exit
-# process could satisfy everything else.
-echo "PREFLIGHT PASS peer-observed nickname=$peer entity=7"
+# Keep every non-seat assertion green in the seat mutations. The one-peer arm
+# then removes exactly B's observation, proving that mutual observation is two
+# independently named checks rather than "some client saw somebody".
+case ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} in
+    one-peer)
+        if [[ $nickname == *-a ]]; then
+            echo "PREFLIGHT PASS peer-observed nickname=$peer entity=7"
+        fi
+        ;;
+    *) echo "PREFLIGHT PASS peer-observed nickname=$peer entity=7" ;;
+esac
 SH
     chmod +x "$dir/bin/xvfb-run" "$dir/bin/client"
 
@@ -217,7 +226,19 @@ SH
         || die "self-test one-seat mutation counted $pass_count pass / $fail_count fail, expected 12 / 1"
     ((mutations += 1))
 
-    echo "$NAME: self-test passed ($passing baseline: 13 pass / 0 fail; $mutations guarded mutations: no-seat 11 pass / 2 fail at client-a-seated + client-b-seated, one-seat 12 pass / 1 fail at client-b-seated)"
+    status=0; output="$(st_run one-peer)" || status=$?
+    ((status != 0)) || die 'self-test mutation with only one observing client passed'
+    grep -Fq 'PASS client-a-peer ' <<<"$output" \
+        || die 'self-test one-peer mutation did not retain client-a-peer pass'
+    grep -Fq 'FAIL client-b-peer ' <<<"$output" \
+        || die 'self-test one-peer mutation did not fail named check client-b-peer'
+    pass_count=$(grep -c '^PASS ' <<<"$output" || true)
+    fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
+    [[ $pass_count == 12 && $fail_count == 1 ]] \
+        || die "self-test one-peer mutation counted $pass_count pass / $fail_count fail, expected 12 / 1"
+    ((mutations += 1))
+
+    echo "$NAME: self-test passed ($passing baseline: 13 pass / 0 fail; $mutations guarded mutations: no-seat 11 pass / 2 fail at client-a-seated + client-b-seated, one-seat 12 pass / 1 fail at client-b-seated, one-peer 12 pass / 1 fail at client-b-peer)"
 }
 
 while (($#)); do
