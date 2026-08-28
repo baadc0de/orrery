@@ -97,17 +97,18 @@ bounded live admission and transport proof. It reads the campaign list through
 the baked admission origin, applies the same compatibility/open predicate as
 the buttons in the lobby, requests a seat, and exits successfully only after
 the iroh handshake reaches `JoinState::Joined` and at least one joined tick
-runs. Adding `--expect-peer <nickname>` also requires that nickname's roster
-slot to exist as a different `RegolithState::Craft` in the local executor — a
-roster row by itself cannot satisfy it. `--headless-timeout-secs` defaults to
-1020 seconds so an arbitrary launch can wait through the deployed campaign's
+runs. Adding one or more `--expect-peer <nickname>` options also requires every
+named roster slot to exist as a different `RegolithState::Craft` in the local
+executor — a roster row by itself cannot satisfy it. The probe exits only after
+all named peers have been observed. `--headless-timeout-secs` defaults to 1020
+seconds so an arbitrary launch can wait through the deployed campaign's
 900-second attempt plus restart.
 
-The release workflow runs two copies through
-`scripts/client-campaign-preflight.sh`. Each copy names the other with
-`--expect-peer`; both must independently report the baked origin, a joinable
-listing, admission acceptance, a completed handshake, and the other's
-replicated craft. A negative compatibility probe can use
+The release workflow runs three copies through
+`scripts/client-campaign-preflight.sh`. Each copy names both others with
+repeated `--expect-peer` options; all three must independently report the baked
+origin, a joinable listing, admission acceptance, a completed handshake, and
+both other replicated crafts. A negative compatibility probe can use
 `--expect-admission-refusal client_rev_mismatch`; it sends the binary's actual
 embedded revision and succeeds only when admission returns that exact error
 name.

@@ -549,7 +549,7 @@ fn build_start_manifests(
 
     // Load-bearing lobby stage: every admitted human is copied into the
     // frozen active roster. The mutation proof removes one entry here and
-    // `start_manifest_names_every_connected_human` must fail.
+    // `start_manifest_names_all_three_connected_humans` must fail.
     for seat in connected {
         if seat.slot < bot_seats || seat.slot >= usize::from(island_seats) {
             bail!(
@@ -1188,23 +1188,27 @@ mod session_geometry_tests {
     }
 
     #[test]
-    fn start_manifest_names_every_connected_human() {
+    fn start_manifest_names_all_three_connected_humans() {
         // Reservation order is deliberately the opposite of connection order:
         // stable seats, not accept order, determine the frozen roster.
         let connected = [
+            ConnectedSeat {
+                slot: 7,
+                node: bot::bot_key(7).public(),
+            },
             ConnectedSeat {
                 slot: 5,
                 node: bot::bot_key(5).public(),
             },
             ConnectedSeat {
-                slot: 4,
-                node: bot::bot_key(4).public(),
+                slot: 6,
+                node: bot::bot_key(6).public(),
             },
         ];
-        let manifests = build_start_manifests("attempt-1", 17, 20, 4, 8, &connected)
+        let manifests = build_start_manifests("attempt-1", 17, 20, 5, 8, &connected)
             .expect("valid frozen roster");
 
-        assert_eq!(manifests.keys().copied().collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(manifests.keys().copied().collect::<Vec<_>>(), vec![5, 6, 7]);
         for (subject, manifest) in &manifests {
             assert_eq!(manifest.attempt_id, "attempt-1");
             assert_eq!(manifest.seed, 17);
@@ -1217,8 +1221,8 @@ mod session_geometry_tests {
                     .iter()
                     .map(|seat| seat.slot)
                     .collect::<Vec<_>>(),
-                vec![0, 1, 2, 3, 4, 5],
-                "StartV1 must name every human connected before the freeze"
+                vec![0, 1, 2, 3, 4, 5, 6, 7],
+                "StartV1 must name all three humans connected before the freeze"
             );
             assert_eq!(
                 manifest

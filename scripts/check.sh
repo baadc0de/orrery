@@ -324,8 +324,9 @@ lane_gates() {
 
     # #587's built-client/deployed-service preflight. The live run belongs to
     # package-client's Linux leg; these fixtures prove that a green process
-    # with no seated client, and a pair with only one seated client, both fail
-    # their named checks rather than reading as launch success.
+    # with no seated client, and a trio with only one seated client, both fail
+    # their named checks. It also hides the third craft from the first two and
+    # requires both directed third-seat checks to fail by name.
     run scripts/client-campaign-preflight.sh --self-test
 
     # #478's admission service. Its suite was never run here at all, so the

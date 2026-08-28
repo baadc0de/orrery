@@ -29,7 +29,7 @@ Volunteer options:
 Preflight and diagnostics:
   --headless-join <campaign>      Select, admit, and join a campaign without input
   --nickname <name>               Nickname used by --headless-join
-  --expect-peer <name>            Exit only after that peer's craft is replicated
+  --expect-peer <name>            Exit after that peer's craft is replicated (repeatable)
   --headless-timeout-secs <n>     Bound discovery and joining (default: 1020)
   --expect-admission-refusal <id> Succeed only on that named admission refusal
   --build-info                    Print embedded revision, ruleset, and default URL
@@ -42,6 +42,13 @@ fn flag_value(args: &[std::ffi::OsString], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].to_string_lossy().into_owned())
+}
+
+fn flag_values(args: &[std::ffi::OsString], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].to_string_lossy().into_owned())
+        .collect()
 }
 
 fn has_flag(args: &[std::ffi::OsString], flag: &str) -> bool {
@@ -68,19 +75,19 @@ fn main() {
 
     let headless_campaign = flag_value(&args, "--headless-join");
     let headless_nickname = flag_value(&args, "--nickname");
-    let expected_peer = flag_value(&args, "--expect-peer");
+    let expected_peers = flag_values(&args, "--expect-peer");
     let expected_refusal = flag_value(&args, "--expect-admission-refusal");
     if headless_campaign.is_some() && headless_nickname.is_none() {
         command_error("--headless-join needs --nickname <name>");
     }
     if headless_campaign.is_none()
-        && (headless_nickname.is_some() || expected_peer.is_some() || expected_refusal.is_some())
+        && (headless_nickname.is_some() || !expected_peers.is_empty() || expected_refusal.is_some())
     {
         command_error(
             "--nickname, --expect-peer, and --expect-admission-refusal require --headless-join",
         );
     }
-    if expected_peer.is_some() && expected_refusal.is_some() {
+    if !expected_peers.is_empty() && expected_refusal.is_some() {
         command_error("--expect-peer cannot be combined with --expect-admission-refusal");
     }
     let headless_timeout_value = flag_value(&args, "--headless-timeout-secs");
@@ -287,7 +294,8 @@ fn main() {
     }
     if headless_campaign.is_some() {
         app.insert_resource(HeadlessJoinProbe {
-            expected_peer,
+            expected_peers,
+            observed_peers: std::collections::BTreeSet::new(),
             started_at: std::time::Instant::now(),
             timeout: headless_timeout,
             seated_reported: false,
@@ -313,7 +321,8 @@ fn preflight_error(message: &str) -> ! {
 /// State for one bounded non-interactive campaign proof.
 #[derive(Resource)]
 struct HeadlessJoinProbe {
-    expected_peer: Option<String>,
+    expected_peers: Vec<String>,
+    observed_peers: std::collections::BTreeSet<String>,
     started_at: std::time::Instant,
     timeout: Duration,
     seated_reported: bool,
@@ -361,29 +370,41 @@ fn monitor_headless_join(
                 );
                 probe.seated_reported = true;
             }
-            let Some(expected) = probe.expected_peer.as_deref() else {
+            if probe.expected_peers.is_empty() {
                 exit.write(AppExit::Success);
                 return;
-            };
-            let peer = roster.entity_named(expected);
-            let peer_state = peer.and_then(|entity| runtime.executor().state(entity));
-            let peer_is_replicated_craft = matches!(
-                peer_state,
-                Some(orrery_games::regolith::state::RegolithState::Craft(_))
-            );
-            let our_broadcast_to_peer_settled =
-                peer.is_some_and(|entity| runtime.replication_is_mutual_with(entity));
-            if named_peer_is_observed(
-                runtime.entity(),
-                peer,
-                peer_is_replicated_craft,
-                our_broadcast_to_peer_settled,
-            ) {
-                let entity = peer.expect("the observation predicate requires an entity");
-                println!(
-                    "PREFLIGHT PASS peer-observed nickname={expected} entity={}",
-                    entity.0
+            }
+            for expected in probe.expected_peers.clone() {
+                if probe.observed_peers.contains(&expected) {
+                    continue;
+                }
+                let peer = roster.entity_named(&expected);
+                let peer_state = peer.and_then(|entity| runtime.executor().state(entity));
+                let peer_is_replicated_craft = matches!(
+                    peer_state,
+                    Some(orrery_games::regolith::state::RegolithState::Craft(_))
                 );
+                let our_broadcast_to_peer_settled =
+                    peer.is_some_and(|entity| runtime.replication_is_mutual_with(entity));
+                if named_peer_is_observed(
+                    runtime.entity(),
+                    peer,
+                    peer_is_replicated_craft,
+                    our_broadcast_to_peer_settled,
+                ) {
+                    let entity = peer.expect("the observation predicate requires an entity");
+                    println!(
+                        "PREFLIGHT PASS peer-observed nickname={expected} entity={}",
+                        entity.0
+                    );
+                    probe.observed_peers.insert(expected);
+                }
+            }
+            if probe
+                .expected_peers
+                .iter()
+                .all(|peer| probe.observed_peers.contains(peer))
+            {
                 exit.write(AppExit::Success);
                 return;
             }
@@ -396,9 +417,14 @@ fn monitor_headless_join(
     }
 
     if probe.started_at.elapsed() >= probe.timeout {
-        if let Some(peer) = &probe.expected_peer {
+        if !probe.expected_peers.is_empty() {
+            let missing = probe
+                .expected_peers
+                .iter()
+                .filter(|peer| !probe.observed_peers.contains(*peer))
+                .collect::<Vec<_>>();
             eprintln!(
-                "PREFLIGHT FAIL peer-observed: seated={} peer={peer:?} was not present as a replicated remote craft before {} seconds",
+                "PREFLIGHT FAIL peer-observed: seated={} peers={missing:?} were not present as mutually replicated remote craft before {} seconds",
                 probe.seated_reported,
                 probe.timeout.as_secs()
             );
@@ -538,9 +564,27 @@ fn exit_smoke_after_joined_ticks(
 
 #[cfg(test)]
 mod tests {
-    use super::{named_peer_is_observed, run_smoke_test, transport_is_seated};
+    use super::{flag_values, named_peer_is_observed, run_smoke_test, transport_is_seated};
     use orrery_protocol::PersistId;
     use orrery_regolith_client::campaign::JoinState;
+    use std::ffi::OsString;
+
+    #[test]
+    fn repeated_expect_peer_values_are_preserved_in_order() {
+        let args = [
+            "client",
+            "--expect-peer",
+            "second-human",
+            "--expect-peer",
+            "third-human",
+        ]
+        .map(OsString::from);
+
+        assert_eq!(
+            flag_values(&args, "--expect-peer"),
+            ["second-human", "third-human"]
+        );
+    }
 
     #[test]
     fn smoke_test_assembles_the_regolith_skin() {

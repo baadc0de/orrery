@@ -91,12 +91,12 @@ jobs:
 
       # A rendered launch is necessary but cannot prove a volunteer can enter
       # the deployed world. The Linux candidate therefore exercises its own
-      # baked origin and joinability predicate, seats two distinct identities,
-      # completes both iroh handshakes, and exits only after each executor has
-      # received the other's nickname-bound replicated craft. The campaign's
+      # baked origin and joinability predicate, seats three distinct identities,
+      # completes all three iroh handshakes, and exits only after each executor
+      # has received both other nickname-bound replicated crafts. The campaign's
       # client_rev pin must already target this build; a mismatch fails here
       # before any archive is offered to testers.
-      - name: Preflight two clients against the deployed campaign
+      - name: Preflight three clients against the deployed campaign
         if: runner.os == 'Linux'
         run: >-
           ../../scripts/client-campaign-preflight.sh
