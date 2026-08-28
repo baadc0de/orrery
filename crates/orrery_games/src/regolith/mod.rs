@@ -78,8 +78,8 @@ const _: () = assert!(
 );
 /// Visibility-transition claims are capped at four per second.
 pub const COVER_CLAIM_INTERVAL_TICKS: u16 = (TICK_HZ / 4) as u16;
-/// Visibility plus collision can read at most three distinct recorded frames.
-pub const MAX_NEIGHBOR_READS: usize = 4;
+/// Maximum distinct neighbour frames the audited claims stage can read per step.
+pub const MAX_NEIGHBOR_READS: usize = visibility::MAX_NEIGHBOR_READS;
 /// Claims arrive at 2 Hz; one missed claim is tolerated before refusing a frame.
 pub const MAX_NEIGHBOR_STALENESS_TICKS: u64 = TICK_HZ as u64;
 /// Two-centimetre inward margin: twice VC-7's one-centimetre position epsilon.
