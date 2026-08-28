@@ -36,6 +36,161 @@ pub const TAU_URAD: i32 = 6_283_185;
 /// The inherited schema limit; Regolith's pilot always supplies zero pitch.
 pub const PITCH_LIMIT_URAD: i32 = 1_570_796;
 
+/// Maximum number of sampled positions retained behind a craft.
+pub const TRAIL_CAPACITY: usize = 4;
+/// One trail point every twelve simulation ticks (5 Hz at the fixed 60 Hz tick).
+pub const TRAIL_SAMPLE_TICKS: u8 = 12;
+/// Trail-position lattice, in millimetres per encoded metre.
+pub const TRAIL_QUANTUM_MM: i64 = 1_000;
+/// Maximum canonical bytes added to a craft by its full trail.
+pub const TRAIL_MAX_ENCODED_BYTES: usize = 1 + TRAIL_CAPACITY * 3 * core::mem::size_of::<i16>();
+
+/// One whole-metre, grid-relative trail position.
+///
+/// Regolith's furthest campaign content is below 3 km and its reflecting
+/// island edge is 1 km, so signed 16-bit metres leave more than a tenfold
+/// range margin while halving each coordinate compared with an `i32` point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrailPoint {
+    /// Whole metres along x.
+    pub x_m: i16,
+    /// Whole metres along y.
+    pub y_m: i16,
+    /// Whole metres along z.
+    pub z_m: i16,
+}
+
+impl TrailPoint {
+    fn from_pos(pos: QPos, overflowed: &mut bool) -> Option<Self> {
+        Some(Self {
+            x_m: quantize_trail_axis(pos.x, overflowed)?,
+            y_m: quantize_trail_axis(pos.y, overflowed)?,
+            z_m: quantize_trail_axis(pos.z, overflowed)?,
+        })
+    }
+}
+
+/// A bounded, oldest-first trail with overwrite-oldest ring semantics.
+///
+/// The backing array never grows. Once full, each 5 Hz sample removes the
+/// oldest point and appends the newest. The sample phase is part of canonical
+/// state so replay takes samples on exactly the same ticks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trail {
+    points: [TrailPoint; TRAIL_CAPACITY],
+    len: u8,
+    sample_phase: u8,
+}
+
+impl Default for Trail {
+    fn default() -> Self {
+        Self {
+            points: [TrailPoint::default(); TRAIL_CAPACITY],
+            len: 0,
+            sample_phase: 0,
+        }
+    }
+}
+
+impl Trail {
+    /// Number of retained points.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether no point has been sampled yet.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Retained points from oldest to newest.
+    pub fn points(&self) -> impl ExactSizeIterator<Item = TrailPoint> + '_ {
+        self.points[..self.len()].iter().copied()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn advance(&mut self, pos: QPos, overflowed: &mut bool) {
+        let Some(next_phase) = self.sample_phase.checked_add(1) else {
+            *overflowed = true;
+            self.sample_phase = 0;
+            return;
+        };
+        if next_phase < TRAIL_SAMPLE_TICKS {
+            self.sample_phase = next_phase;
+            return;
+        }
+        self.sample_phase = 0;
+        let Some(point) = TrailPoint::from_pos(pos, overflowed) else {
+            return;
+        };
+        if self.len() < TRAIL_CAPACITY {
+            self.points[self.len()] = point;
+            self.len += 1;
+        } else {
+            self.points.rotate_left(1);
+            self.points[TRAIL_CAPACITY - 1] = point;
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        // Four points need three length bits; a phase in 0..12 needs four.
+        out.push((self.sample_phase << 3) | self.len);
+        for point in self.points() {
+            out.extend_from_slice(&point.x_m.to_le_bytes());
+            out.extend_from_slice(&point.y_m.to_le_bytes());
+            out.extend_from_slice(&point.z_m.to_le_bytes());
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let Some(meta) = bytes.first().copied() else {
+            return Err(CodecError("regolith trail: missing metadata"));
+        };
+        let len = meta & 0b111;
+        let sample_phase = meta >> 3;
+        if usize::from(len) > TRAIL_CAPACITY || sample_phase >= TRAIL_SAMPLE_TICKS {
+            return Err(CodecError("regolith trail: invalid length or sample phase"));
+        }
+        let expected = 1 + usize::from(len) * 3 * core::mem::size_of::<i16>();
+        if bytes.len() != expected {
+            return Err(CodecError("regolith trail: wrong length"));
+        }
+        let mut trail = Self {
+            len,
+            sample_phase,
+            ..Self::default()
+        };
+        for (index, chunk) in bytes[1..].chunks_exact(6).enumerate() {
+            trail.points[index] = TrailPoint {
+                x_m: i16::from_le_bytes([chunk[0], chunk[1]]),
+                y_m: i16::from_le_bytes([chunk[2], chunk[3]]),
+                z_m: i16::from_le_bytes([chunk[4], chunk[5]]),
+            };
+        }
+        Ok(trail)
+    }
+}
+
+fn quantize_trail_axis(mm: i64, overflowed: &mut bool) -> Option<i16> {
+    let whole = mm / TRAIL_QUANTUM_MM;
+    let remainder = mm % TRAIL_QUANTUM_MM;
+    let adjustment = i64::from(remainder >= TRAIL_QUANTUM_MM / 2)
+        - i64::from(remainder <= -(TRAIL_QUANTUM_MM / 2));
+    let Some(rounded) = whole.checked_add(adjustment) else {
+        *overflowed = true;
+        return None;
+    };
+    i16::try_from(rounded).ok().or_else(|| {
+        *overflowed = true;
+        None
+    })
+}
+
 /// A craft's verifiable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Craft {
@@ -47,6 +202,8 @@ pub struct Craft {
     pub pos: QPos,
     /// Lattice velocity.
     pub vel: QVel,
+    /// Bounded, quantized positions sampled behind this craft.
+    pub trail: Trail,
     /// Heading.
     pub yaw_urad: i32,
     /// Retained schema field; input discipline locks it to zero.
@@ -279,7 +436,7 @@ pub enum RegolithState {
     BloomDirector(BloomDirector),
 }
 
-const CRAFT_ENCODED_LEN: usize = 132;
+const CRAFT_BASE_ENCODED_LEN: usize = 132;
 
 impl Quantized for Craft {
     fn quantize(&mut self) {
@@ -362,9 +519,14 @@ impl CoreCodec for Craft {
         out.push(u8::from(self.last_cover_occluded));
         out.extend_from_slice(&self.collisions.to_le_bytes());
         out.push(u8::from(self.arithmetic_overflowed));
+        self.trail.encode(out);
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 || bytes[126] > 1 || bytes[131] > 1 {
+        if bytes.len() <= CRAFT_BASE_ENCODED_LEN
+            || bytes[106] > 1
+            || bytes[126] > 1
+            || bytes[131] > 1
+        {
             return Err(CodecError("regolith craft: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -382,6 +544,7 @@ impl CoreCodec for Craft {
                 y: i64_at(34),
                 z: i64_at(42),
             },
+            trail: Trail::decode(&bytes[CRAFT_BASE_ENCODED_LEN..])?,
             yaw_urad: i32_at(50),
             pitch_urad: i32_at(54),
             hull: i32_at(58),
@@ -612,6 +775,7 @@ impl Craft {
             weapon: WeaponKind::Stock,
             pos,
             vel: QVel::default(),
+            trail: Trail::default(),
             yaw_urad: yaw_urad.rem_euclid(TAU_URAD),
             pitch_urad: 0,
             hull: limits.max_hull,

@@ -91,7 +91,7 @@ impl Archetype {
     pub const fn limits(self) -> Limits {
         match self {
             Self::Interceptor => Limits {
-                max_speed_mms: 120_000,
+                max_speed_mms: 480_000,
                 max_accel_mmss: 60_000,
                 max_hull: 100,
                 max_shield: 50,
@@ -99,7 +99,7 @@ impl Archetype {
                 mass_units: 1,
             },
             Self::Cruiser => Limits {
-                max_speed_mms: 60_000,
+                max_speed_mms: 120_000,
                 max_accel_mmss: 20_000,
                 max_hull: 300,
                 max_shield: 150,

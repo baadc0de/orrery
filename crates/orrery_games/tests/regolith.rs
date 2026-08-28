@@ -16,14 +16,15 @@ use orrery_games::regolith::{
     projectile_flight_ticks,
     state::{
         BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
+        TRAIL_CAPACITY, TRAIL_MAX_ENCODED_BYTES, TRAIL_SAMPLE_TICKS,
     },
     weapon::{WeaponKind, MAX_WEAPON_REACH_MM},
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
-    CAMPAIGN_CELL_EDGE_M, CAMPAIGN_MIN_CELL_EDGE_M, CAMPAIGN_ROCK_COUNT, ISLAND_CRAFT_BUDGET,
-    ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET,
-    KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK,
-    MAX_ENGAGEMENT_RANGE_MM, MAX_NEIGHBOR_READS, MAX_TARGET_RADIUS_MM, PICKUP_SCORE_POINTS,
-    PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
+    CAMPAIGN_CELL_EDGE_M, CAMPAIGN_MIN_CELL_EDGE_M, CAMPAIGN_ROCK_COUNT, DRAG_PER_SEC_PER_MILLE,
+    ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
+    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS,
+    LOCK_DECAY_PER_TICK, MAX_ENGAGEMENT_RANGE_MM, MAX_NEIGHBOR_READS, MAX_TARGET_RADIUS_MM,
+    PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -470,8 +471,8 @@ fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
 }
 
 #[test]
-fn v17_collision_order_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 17);
+fn v18_speed_trail_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 18);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 240_000);
@@ -498,6 +499,202 @@ fn v17_collision_order_ruleset_identity_and_island_budget_are_pinned() {
     assert_eq!(ISLAND_DIRECTOR_BUDGET, 1);
     assert_eq!(ISLAND_WINDOW_BUDGET, 37);
     assert_eq!((KILL_SCORE_POINTS, PICKUP_SCORE_POINTS), (25, 5));
+}
+
+#[test]
+fn v18_speed_caps_and_velocity_change_bounds_are_pinned() {
+    let interceptor = Archetype::Interceptor.limits();
+    let cruiser = Archetype::Cruiser.limits();
+    assert_eq!(
+        interceptor.max_speed_mms, 480_000,
+        "interceptor speed ceiling must be 480,000 mm/s (four times v17)"
+    );
+    assert_eq!(
+        cruiser.max_speed_mms, 120_000,
+        "cruiser speed ceiling must be 120,000 mm/s (twice v17)"
+    );
+
+    let bound = |archetype: Archetype| {
+        let limits = archetype.limits();
+        limits.max_accel_mmss / TICK_HZ as i64
+            + limits.max_speed_mms * DRAG_PER_SEC_PER_MILLE / (1_000 * TICK_HZ as i64)
+            + 100
+    };
+    assert_eq!(
+        bound(Archetype::Interceptor),
+        1_500,
+        "interceptor stage-1 velocity-change bound must include 1,000 mm/s thrust, \
+         400 mm/s cap-speed drag, and the 100 mm/s margin"
+    );
+    assert_eq!(
+        bound(Archetype::Cruiser),
+        533,
+        "cruiser stage-1 velocity-change bound must include 333 mm/s thrust, \
+         100 mm/s cap-speed drag, and the 100 mm/s margin"
+    );
+
+    for archetype in Archetype::ALL {
+        let limits = archetype.limits();
+        let drag_equilibrium_mms = limits.max_accel_mmss * 1_000 / DRAG_PER_SEC_PER_MILLE;
+        assert!(
+            limits.max_speed_mms < drag_equilibrium_mms,
+            "{archetype:?} ceiling {} mm/s must bind below its {} mm/s drag equilibrium",
+            limits.max_speed_mms,
+            drag_equilibrium_mms
+        );
+    }
+}
+
+#[test]
+fn thrust_accumulates_delta_velocity_instead_of_replacing_velocity() {
+    let entity = PersistId::new(1);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x18; 32]));
+    executor.insert(entity, RegolithState::Craft(craft_at(0)));
+    let thrust = Order::Thrust {
+        accel_mmss: 60_000,
+        yaw_urad: 0,
+        pitch_urad: 0,
+    };
+    executor
+        .step_entity(entity, Tick::new(1), core::slice::from_ref(&thrust))
+        .expect("craft exists");
+    let first = match executor.state(entity) {
+        Some(RegolithState::Craft(craft)) => craft.vel.x,
+        _ => panic!("craft remains a craft"),
+    };
+    executor
+        .step_entity(entity, Tick::new(2), core::slice::from_ref(&thrust))
+        .expect("craft exists");
+    let second = match executor.state(entity) {
+        Some(RegolithState::Craft(craft)) => craft.vel.x,
+        _ => panic!("craft remains a craft"),
+    };
+    assert!(
+        second > first,
+        "thrust must accumulate delta velocity: first tick {first} mm/s, second tick {second} mm/s"
+    );
+    assert!(
+        second < 2_100,
+        "two ticks of 60,000 mm/s^2 thrust must add about 2,000 mm/s, not set an arbitrary speed; got {second} mm/s"
+    );
+}
+
+#[test]
+fn craft_trail_is_quantized_bounded_hashed_and_costs_25_bytes_when_full() {
+    let entity = PersistId::new(1);
+    let mut craft = craft_at(0);
+    craft.vel = QVel {
+        x: 480_000,
+        y: 0,
+        z: 0,
+    };
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x19; 32]));
+    executor.insert(entity, RegolithState::Craft(craft));
+    for tick in 1..=u64::from(TRAIL_SAMPLE_TICKS) * (TRAIL_CAPACITY as u64 + 1) {
+        executor
+            .step_entity(entity, Tick::new(tick), &[])
+            .expect("craft exists");
+    }
+    let RegolithState::Craft(craft) = executor.state(entity).expect("craft exists") else {
+        panic!("craft remains a craft")
+    };
+    let points = craft.trail.points().collect::<Vec<_>>();
+    assert_eq!(
+        points.len(),
+        TRAIL_CAPACITY,
+        "trail retained {} points, expected hard capacity {TRAIL_CAPACITY}",
+        points.len()
+    );
+    assert!(
+        points.windows(2).all(|pair| pair[0].x_m < pair[1].x_m),
+        "whole-metre trail points must remain oldest-first behind a +x craft: {points:?}"
+    );
+    assert!(
+        points[0].x_m > 100,
+        "the fifth sample must overwrite the oldest ring entry; oldest retained point was {:?}",
+        points[0]
+    );
+
+    let encoded = craft.to_canonical();
+    assert_eq!(
+        encoded.len(),
+        132 + TRAIL_MAX_ENCODED_BYTES,
+        "a full four-point trail must add exactly {TRAIL_MAX_ENCODED_BYTES} canonical bytes to the 132-byte v17 craft"
+    );
+    assert_eq!(Craft::decode(&encoded), Ok(craft.clone()));
+
+    let mut without_trail = craft.clone();
+    without_trail.trail = Default::default();
+    assert_ne!(
+        orrery_core::state_hash(&RegolithState::Craft(craft.clone())),
+        orrery_core::state_hash(&RegolithState::Craft(without_trail)),
+        "trail points must participate in the replicated canonical bytes and state hash"
+    );
+}
+
+#[test]
+fn trail_quantization_is_integer_and_out_of_range_sets_the_hashed_overflow_flag() {
+    let entity = PersistId::new(1);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x1A; 32]));
+    executor.insert(
+        entity,
+        RegolithState::Craft(Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: 1_500,
+                y: -1_500,
+                z: 499,
+            },
+            0,
+        )),
+    );
+    for tick in 1..=u64::from(TRAIL_SAMPLE_TICKS) {
+        executor
+            .step_entity(entity, Tick::new(tick), &[])
+            .expect("craft exists");
+    }
+    let Some(RegolithState::Craft(craft)) = executor.state(entity) else {
+        panic!("craft remains a craft")
+    };
+    assert_eq!(
+        craft.trail.points().collect::<Vec<_>>(),
+        [orrery_games::regolith::state::TrailPoint {
+            x_m: 2,
+            y_m: -2,
+            z_m: 0,
+        }],
+        "trail positions must snap integer millimetres to whole metres, half away from zero"
+    );
+
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x1B; 32]));
+    executor.insert(
+        entity,
+        RegolithState::Craft(Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: (i64::from(i16::MAX) + 1) * 1_000,
+                y: 0,
+                z: 0,
+            },
+            0,
+        )),
+    );
+    for tick in 1..=u64::from(TRAIL_SAMPLE_TICKS) {
+        executor
+            .step_entity(entity, Tick::new(tick), &[])
+            .expect("craft exists");
+    }
+    let Some(RegolithState::Craft(craft)) = executor.state(entity) else {
+        panic!("craft remains a craft")
+    };
+    assert!(
+        craft.arithmetic_overflowed,
+        "a trail coordinate beyond signed 16-bit metres must set the canonical arithmetic-overflow flag"
+    );
+    assert!(
+        craft.trail.is_empty(),
+        "an unrepresentable trail coordinate must not be clamped into hashed state"
+    );
 }
 
 fn pilot_orders(seed: u8, entity: u64, slot: u64, tick: u64) -> Vec<Order> {
