@@ -1637,7 +1637,14 @@ fn encode_state_broadcast(
     // real two-process run, #387); the fixture now pins the double tag.
     Bytes::from(orrery_protocol::channels::tag(
         orrery_protocol::channels::Channel::State,
-        &orrery_protocol::channels::encode_replication(&(encoded, cell, entity, at)),
+        // Compressed, like the harness (`bot.rs`). #649 taught
+        // `decode_replication` both tags and switched the harness's own
+        // broadcast, but left this one plain -- so every byte a real player
+        // sent stayed uncompressed while the measured bots' did not, and the
+        // 32-peer numbers the gate reports were quietly better than what a
+        // human client actually puts on the wire. The encoder only keeps the
+        // compressed form when it is smaller, so the tag never costs bytes.
+        &orrery_protocol::channels::encode_replication_compressed(&(encoded, cell, entity, at)),
     ))
 }
 
@@ -1700,6 +1707,53 @@ fn platform_triple() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The client's own broadcast goes out compressed, like the harness's.
+    ///
+    /// #649 taught `decode_replication` both tags and switched the harness
+    /// (`gates/p1-swarm/src/bot.rs`), but left this encoder plain -- so every
+    /// byte a real player sent stayed uncompressed while the measured bots'
+    /// did not, and the 32-peer gate numbers were quietly better than what a
+    /// human client puts on the wire.
+    ///
+    /// This drives `encode_state_broadcast` itself rather than the codec it
+    /// calls: the receiver accepts both forms by design, so the only thing
+    /// that pins the sender's choice is an assertion on the sender.
+    #[test]
+    fn the_clients_own_broadcast_goes_out_compressed() {
+        use orrery_protocol::channels::{
+            untag, Channel, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED,
+        };
+
+        let mut executor = Executor::new(Regolith::honest(), UniverseSeed([3; 32]));
+        let entity = PersistId::new(2);
+        executor.insert(
+            entity,
+            RegolithState::Craft(Craft::spawned(
+                Archetype::Cruiser,
+                orrery_core::QPos::default(),
+                0,
+            )),
+        );
+
+        let wire =
+            encode_state_broadcast(&executor, entity, CellId::from_bits(7).expect("a cell"), 9);
+
+        let (channel, inner) = untag(&wire).expect("the outer channel tag");
+        assert_eq!(channel, Channel::State);
+        let (doubled, body) = untag(inner).expect("the doubled channel tag");
+        assert_eq!(
+            doubled,
+            Channel::State,
+            "the doubled tag #387 pinned must survive"
+        );
+        assert_eq!(
+            body.first().copied(),
+            Some(TAG_REPLICATION_COMPRESSED),
+            "canonical craft state compresses, so the broadcast must leave as \
+             {TAG_REPLICATION_COMPRESSED:#x} rather than plain {TAG_REPLICATION:#x}"
+        );
+    }
+
     /// Bytes as the host's `exterior::HearsayContacts::encode` lays them out.
     fn hearsay_wire(fold_tick: u64, seat: u8) -> Vec<u8> {
         let mut out = vec![0xa2, 0x01];
