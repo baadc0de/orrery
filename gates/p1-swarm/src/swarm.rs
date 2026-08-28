@@ -17,6 +17,7 @@ use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_
 
 use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{Bot, BotSpec, TICK_HZ};
+use crate::delta_stats::{DeltaStats, DeltaStatsReport};
 use crate::exterior::{
     Frame, HearsayContact, HearsayContacts, HearsaySource, Lane, UplinkAck, UplinkDatagram,
     UplinkOutcome,
@@ -94,6 +95,8 @@ pub struct SwarmConfig {
     /// only observes the roster and must not affect either the roster or the
     /// replication path.
     pub replica_scope_capture: bool,
+    /// Observe changed canonical bytes at the existing replication send seam.
+    pub delta_stats: bool,
 }
 
 impl Default for SwarmConfig {
@@ -112,6 +115,7 @@ impl Default for SwarmConfig {
             enforcing: false,
             started_at_unix_secs: None,
             replica_scope_capture: false,
+            delta_stats: false,
         }
     }
 }
@@ -328,6 +332,9 @@ pub struct SwarmReport {
     pub ticks: u64,
     /// Per-peer results.
     pub per_peer: Vec<PeerReport>,
+    /// A19 changed-byte measurements, present only with `--delta-stats`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_stats: Option<DeltaStatsReport>,
     /// Highest peak upload across the swarm, bits per simulated second.
     pub worst_peak_upload_bits: u64,
     /// Highest p99 upload across the swarm.
@@ -953,6 +960,11 @@ impl Swarm {
             for seeded in campaign_rock_seeds(seed, bots.len()) {
                 bots[seeded.owner_slot]
                     .host_entity(seeded.entity, RegolithState::Rock(seeded.rock));
+            }
+        }
+        if config.delta_stats {
+            for bot in &mut bots {
+                bot.enable_delta_stats(config.send_hz);
             }
         }
         let index_of = bots
@@ -1727,6 +1739,13 @@ impl Swarm {
                 total
             },
         );
+        let delta_stats = self.config.delta_stats.then(|| {
+            let mut total = DeltaStats::new(self.config.send_hz);
+            for stats in self.bots.iter().filter_map(Bot::delta_stats) {
+                total.merge(stats);
+            }
+            total.report()
+        });
 
         SwarmReport {
             identity: RunIdentity {
@@ -1742,6 +1761,7 @@ impl Swarm {
             peers: self.total_peers(),
             seconds: self.config.seconds,
             ticks,
+            delta_stats,
             worst_peak_upload_bits: per_peer
                 .iter()
                 .map(|p| p.peak_upload_bits)
@@ -2700,6 +2720,7 @@ mod tests {
             seconds: 3_600,
             ticks: 3_600 * TICK_HZ,
             per_peer: Vec::new(),
+            delta_stats: None,
             worst_peak_upload_bits: 973_000,
             worst_p99_upload_bits: 906_000,
             min_cells_visited: 81,

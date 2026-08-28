@@ -66,6 +66,7 @@ use orrery_witness::plugin::{
 };
 use orrery_witness::{Watch, Witness, WitnessConfig, WitnessPlugin, WitnessSignal, Witnessed};
 
+use crate::delta_stats::DeltaStats;
 use crate::profile::Profile;
 
 /// Tick-zero claims repeat at 2 Hz (docs/06 §6).
@@ -254,6 +255,9 @@ pub struct Bot {
     /// itself must not be able to tell, or the false-positive count would be
     /// measuring the oracle instead of the witness.
     tampered_subjects: Vec<NodeId>,
+    /// A19's opt-in observation of canonical changes at the existing send
+    /// seam. It never influences the payload or recipient set.
+    delta_stats: Option<DeltaStats>,
 }
 
 /// Witness signals a peer raised, by kind and by whether the accused was one of
@@ -664,6 +668,7 @@ impl Bot {
             }),
             signals: SignalTally::default(),
             tampered_subjects: Vec::new(),
+            delta_stats: None,
             last_high_rate: Vec::new(),
             demoted_at: Vec::new(),
             tick: 0,
@@ -720,6 +725,17 @@ impl Bot {
         core::iter::once(self.entity)
             .chain(self.hosted.iter().copied())
             .collect()
+    }
+
+    /// Enable A19's changed-byte observation at this run's send cadence.
+    pub fn enable_delta_stats(&mut self, send_hz: u64) {
+        self.delta_stats = Some(DeltaStats::new(send_hz));
+    }
+
+    /// This authority's completed changed-byte observations.
+    #[must_use]
+    pub fn delta_stats(&self) -> Option<&DeltaStats> {
+        self.delta_stats.as_ref()
     }
 
     /// The bot's current speed in metres per second.
@@ -1175,12 +1191,21 @@ impl Bot {
                 Some((entity, state, cell))
             })
             .collect();
+        let authored: Vec<_> = authored
+            .into_iter()
+            .map(|(entity, state, cell)| {
+                let canonical = state.to_canonical();
+                if let Some(stats) = &mut self.delta_stats {
+                    stats.observe(entity, &state, &canonical);
+                }
+                let payload = encode_replication_compressed(&(canonical, cell, entity, tick + 1));
+                (cell, payload)
+            })
+            .collect();
         let membership = self.app.world().resource::<orrery_net::IslandMembership>();
         let sends: Vec<_> = authored
             .into_iter()
-            .flat_map(|(entity, state, cell)| {
-                let payload =
-                    encode_replication_compressed(&(state.to_canonical(), cell, entity, tick + 1));
+            .flat_map(|(cell, payload)| {
                 membership
                     .peers
                     .iter()
