@@ -10,7 +10,7 @@ use orrery_protocol::UniverseSeed;
 use orrery_regolith_client::campaign::{CampaignConfig, CampaignRuntime, JoinState};
 use orrery_regolith_client::intent::Controls;
 use orrery_regolith_client::net;
-use orrery_regolith_client::roster::{entity_of_slot, RosterResponse, ShipRoster};
+use orrery_regolith_client::roster::{entity_of_slot, OwnLabelGrant, RosterResponse, ShipRoster};
 use orrery_regolith_client::session::ConfiguredImpairment;
 use orrery_regolith_client::telemetry::JsonlTelemetry;
 use serde::Deserialize;
@@ -19,6 +19,8 @@ use serde::Deserialize;
 struct AdmissionJoin {
     join: JoinFields,
     host_direct: String,
+    #[serde(default)]
+    nickname: Option<String>,
     configured: Configured,
 }
 
@@ -74,11 +76,17 @@ fn deployed_campaign_routes_a_materialised_rock_and_returns_credit() {
         .json::<RosterResponse>()
         .expect("decode live campaign roster");
     let mut roster = ShipRoster::default();
-    roster.accept(&roster_response);
+    roster.accept(
+        &roster_response,
+        Some(OwnLabelGrant {
+            slot: admitted.join.slot,
+            nickname: admitted.nickname.as_deref(),
+        }),
+    );
     assert_eq!(
         roster.len(),
-        admitted.join.slot + 1,
-        "the live roster must name every harness craft and the exterior craft"
+        admitted.join.slot + usize::from(admitted.nickname.is_some()),
+        "the live roster must name every opponent; own identity needs a join grant"
     );
     for slot in 0..admitted.join.slot {
         assert!(
@@ -107,6 +115,7 @@ fn deployed_campaign_routes_a_materialised_rock_and_returns_credit() {
         host_node_hex: admitted.join.host_node,
         host_direct: Some(admitted.host_direct),
         slot: admitted.join.slot,
+        own_label: admitted.nickname,
         session_id: admitted.join.session_id.clone(),
         session_token_hex: Some(admitted.join.session_token),
         wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),

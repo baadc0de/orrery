@@ -307,6 +307,7 @@ class Admission:
                 slots = [row for row in self._read_slots(c) if row.get("attempt_id") == attempt["attempt_id"]]
                 existing = next((row for row in slots if row.get("node") == node), None)
                 slot = existing.get("slot") if existing else None
+                granted_nickname = existing.get("nickname") if existing else None
                 if existing is None:
                     occupied = {row.get("slot") for row in slots}
                     free_slots = [candidate for candidate in range(c.peers, c.peers + c.humans) if candidate not in occupied]
@@ -317,8 +318,9 @@ class Admission:
                     try:
                         minted = self.output([self.invite, "mint", "--ledger", str(directory / "ledger.tsv"), "--label", nickname])
                         account, sid = minted["account"], minted["session_id"]
+                        granted_nickname = display_label(nickname)
                         slots.append({"attempt_id": attempt["attempt_id"], "slot": slot, "session_id": sid,
-                                      "account": int(account), "node": node, "nickname": display_label(nickname),
+                                      "account": int(account), "node": node, "nickname": granted_nickname,
                                       "expires_at": attempt["expires_at"]})
                         # A generation may turn over while minting.  Do not let a
                         # stale answer reserve a seat in the next attempt.
@@ -345,7 +347,7 @@ class Admission:
                 except (RuntimeError, KeyError, ValueError) as e:
                     logging.error("always-on host returned an unusable listening address: %s", e)
                     raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.") from e
-                return {"join": {"host_node": host_node, "slot": slot, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
+                return {"join": {"host_node": host_node, "slot": slot, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "nickname": granted_nickname, "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
             try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 lock.close()
@@ -383,7 +385,7 @@ class Admission:
             reaper = threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True)
             self.reapers.add(reaper)
             reaper.start()
-            return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
+            return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "nickname": display_label(nickname), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
         finally:
             # The flock stays held by the child/reaper, not the request.  It is released there.
             if ident not in self.children:
@@ -679,6 +681,17 @@ class AdmissionTests(unittest.TestCase):
                          (first["join"]["slot"], first["join"]["session_id"]))
         slots = json.loads((self.state / "test" / "slots.json").read_text())
         self.assertEqual([row["slot"] for row in slots], [4, 5])
+
+    def test_join_reply_echoes_the_granted_nickname_and_a_retry_cannot_rename_it(self) -> None:
+        self.enable_always_on()
+        first = self.service.join("test", self.request())
+        renamed = self.request(); renamed["nickname"] = "shooshte"
+        retry = self.service.join("test", renamed)
+        self.assertEqual(first["nickname"], "ada")
+        self.assertEqual(retry["nickname"], "ada",
+                         "the reply must echo the existing grant, not the retry's request")
+        self.assertEqual((retry["join"]["slot"], retry["join"]["session_id"]),
+                         (first["join"]["slot"], first["join"]["session_id"]))
 
     def test_always_on_full_roster_maps_all_eight_seats_and_refuses_the_ninth_reservation(self) -> None:
         self.enable_always_on()

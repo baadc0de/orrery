@@ -398,6 +398,7 @@ and the two paths stay one code path:
   },
   "host_direct": "95.216.0.1:52011",
   "account": 17,
+  "nickname": "ada",
   "expires_in_s": 3600,
   "configured": { "loss_pct": 3, "jitter_p50_ms": 100, "jitter_p99_ms": 100 }
 }
@@ -415,6 +416,13 @@ and discovery must not be a silent dependency. `configured` feeds the client's
 `ConfiguredImpairment` (`clients/regolith/src/campaign.rs:97-99`) so the
 mismatch flag compares against what the *host* declares, ending the last
 copy-paste (the `--expect-*` flags).
+
+`nickname` is the display label admission granted in this transaction. It is
+top-level rather than part of `join` so the latter remains a byte-compatible
+`CampaignJoinFileV1`. On an idempotent retry it echoes the existing
+reservation's label, not the new request text. Clients treat its absence from
+an older service as no own label; the public roster may label other craft but
+must not backfill the local craft by slot.
 
 Every failure a volunteer can actually hit, and what they see:
 

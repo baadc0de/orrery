@@ -119,6 +119,13 @@ pub struct CampaignConfig {
     /// The swarm slot this client occupies. It derives the entity id, but not
     /// the durable transport identity.
     pub slot: usize,
+    /// This client's display label, when admission granted one in the same
+    /// reply as [`Self::slot`].
+    ///
+    /// `None` is the honest state for an older admission service and for a
+    /// join-file launch: neither source asserted an own label. The public
+    /// roster must never fill this field by matching a locally held slot.
+    pub own_label: Option<String>,
     /// Coordinator-issued session identity for the banking row, presented to
     /// the host at join (#345 §8). For a campaign session this is the
     /// pre-minted UUIDv7 the invite carries.
@@ -1985,6 +1992,7 @@ mod tests {
                 .to_owned(),
             host_direct: None,
             slot: 4,
+            own_label: None,
             session_id: "s-1".to_owned(),
             session_token_hex: None,
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
@@ -2012,6 +2020,7 @@ mod tests {
                 .to_owned(),
             host_direct: None,
             slot: 4,
+            own_label: None,
             session_id: "s-1".to_owned(),
             session_token_hex: None,
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),

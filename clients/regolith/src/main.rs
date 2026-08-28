@@ -227,6 +227,10 @@ fn main() {
             host_node_hex: input.host_node,
             host_direct: flag_value(&args, "--host-direct"),
             slot: input.slot,
+            // A join file grants transport/session material but carries no
+            // host-asserted display label. The public roster is not allowed to
+            // guess this craft's identity from the slot.
+            own_label: None,
             session_id: input.session_id,
             session_token_hex: input.session_token,
             wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),

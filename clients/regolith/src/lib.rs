@@ -481,6 +481,13 @@ impl Plugin for RegolithSkinPlugin {
                 self.telemetry_path.display()
             )
         });
+        let mut ship_roster = roster::ShipRoster::default();
+        if let Some(config) = &self.campaign {
+            ship_roster.set_own(roster::OwnLabelGrant {
+                slot: config.slot,
+                nickname: config.own_label.as_deref(),
+            });
+        }
         // The joined session starts its dial here, at plugin build, so the
         // handshake overlaps window startup instead of serialising behind it.
         let session = match &self.campaign {
@@ -506,7 +513,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<CameraZoom>()
             .init_resource::<aoi::AoiBoundary>()
             .init_resource::<aoi::AoiFadeCensus>()
-            .init_resource::<roster::ShipRoster>()
+            .insert_resource(ship_roster)
             .init_resource::<roster::RosterTask>()
             .init_resource::<lobby::LobbyView>()
             .init_resource::<SelectedLock>()
@@ -3048,10 +3055,13 @@ mod tests {
         use crate::roster::{entity_of_slot, RosterResponse, RosterRow, ShipRoster};
 
         let mut roster = ShipRoster::default();
-        roster.accept(&RosterResponse {
-            roster: vec![RosterRow::labelled(8, "ada")],
-            ..Default::default()
-        });
+        roster.accept(
+            &RosterResponse {
+                roster: vec![RosterRow::labelled(8, "ada")],
+                ..Default::default()
+            },
+            None,
+        );
         let known = entity_of_slot(8);
         let stranger = entity_of_slot(3);
 

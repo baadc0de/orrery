@@ -1,26 +1,27 @@
-//! Nicknames, fetched from admission and drawn as labels on ships.
+//! Nicknames, asserted by admission and drawn as labels on ships.
 //!
 //! "You have to know who you are fighting" (#523). The admission service
-//! already receives a nickname at join and keeps it; nothing carried it
-//! anywhere the client could see. This module carries it.
+//! already receives a nickname at join and keeps it. The successful join reply
+//! is the source for this client's own label; the public roster labels other
+//! craft. This module keeps those two statements separate.
 //!
 //! ## A nickname is a label, and only a label
 //!
 //! The owner settled this in #484: nicknames are labels. Everything here
 //! follows from that one sentence.
 //!
-//! * **It never travels with simulation state.** The roster is a separate
-//!   `GET /v1/campaigns/<id>/roster` off the admission service, not a field on
-//!   replicated craft state. Unbounded player-supplied text on the replication
-//!   hot path would spend the determinism-critical budget on decoration, and
-//!   would make a label something a state hash could disagree about. The
-//!   alternative — a display name replicated alongside craft state — is
-//!   simpler to consume and was rejected for exactly that.
-//! * **It may be late, stale, missing or wrong with no consequence.** Nothing
-//!   downstream of [`ShipRoster`] is read by the intent pipeline, the
-//!   executor, the banking row, or any addressing decision. Craft are
-//!   identified by [`orrery_protocol::PersistId`] everywhere they matter, and
-//!   this module maps *to* a label, never *from* one.
+//! * **It never travels with simulation state.** Other-craft labels come from
+//!   `GET /v1/campaigns/<id>/roster`; the own label comes from the successful
+//!   join reply. Neither is a field on replicated craft state. Unbounded
+//!   player-supplied text on the replication hot path would spend the
+//!   determinism-critical budget on decoration, and would make a label
+//!   something a state hash could disagree about.
+//! * **A public row never says who this client is.** It may be late, stale,
+//!   missing or wrong without affecting simulation, but attributing its label
+//!   to the local craft would turn public hearsay plus a slot assumption into
+//!   an identity claim. [`OwnLabelGrant`] is the only source for that craft.
+//!   Nothing downstream of [`ShipRoster`] is read by the intent pipeline, the
+//!   executor, the banking row, or any addressing decision.
 //! * **A missing label reads as absent.** [`ShipRoster::label`] returns
 //!   `None` and the caller draws no text at all. There is deliberately no
 //!   placeholder: "UNKNOWN", "PLAYER 3" or an empty quoted string could all be
@@ -114,27 +115,49 @@ pub struct RosterResponse {
     pub starts_in_s: Option<u64>,
 }
 
+/// Admission's assertion about this client's own display label.
+///
+/// The slot and optional nickname arrive together through the successful join
+/// path. `nickname: None` means the reply source did not assert a drawable own
+/// label, so the local craft and waiting-room row must render no name. In
+/// particular, neither may substitute a matching row from the public roster.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnLabelGrant<'a> {
+    /// The slot admission granted to this client.
+    pub slot: usize,
+    /// The label admission echoed, or absence for an older service/join file.
+    pub nickname: Option<&'a str>,
+}
+
 impl RosterResponse {
     /// The waiting room this answer describes.
     ///
-    /// A straight transcription: every row becomes a seat, in the order the
-    /// service listed them, and a field the service omitted stays omitted.
+    /// Every row becomes a seat in service order. Other-seat labels are a
+    /// straight transcription; the local seat's label comes only from `own`.
     #[must_use]
-    pub fn lobby_view(&self, own_slot: Option<usize>) -> crate::lobby::LobbyView {
+    pub fn lobby_view(&self, own: Option<OwnLabelGrant<'_>>) -> crate::lobby::LobbyView {
         crate::lobby::LobbyView {
             seats: self
                 .roster
                 .iter()
-                .map(|row| crate::lobby::Seat {
-                    slot: row.slot,
-                    kind: crate::lobby::SeatKind::parse(row.kind.as_deref()),
-                    state: crate::lobby::SeatState::parse(row.state.as_deref()),
-                    nickname: row.nickname.as_deref().and_then(sanitise_nickname),
+                .map(|row| {
+                    let nickname = match own {
+                        Some(grant) if row.slot == grant.slot => {
+                            grant.nickname.and_then(sanitise_nickname)
+                        }
+                        _ => row.nickname.as_deref().and_then(sanitise_nickname),
+                    };
+                    crate::lobby::Seat {
+                        slot: row.slot,
+                        kind: crate::lobby::SeatKind::parse(row.kind.as_deref()),
+                        state: crate::lobby::SeatState::parse(row.state.as_deref()),
+                        nickname,
+                    }
                 })
                 .collect(),
             phase: self.phase.as_deref().map(crate::lobby::LobbyPhase::parse),
             starts_in_s: self.starts_in_s,
-            own_slot,
+            own_slot: own.map(|grant| grant.slot),
             notice: None,
         }
     }
@@ -194,20 +217,34 @@ pub struct ShipRoster {
 }
 
 impl ShipRoster {
-    /// Replaces every label from one roster answer.
+    /// Installs admission's own-label assertion without waiting for a public
+    /// roster fetch. An absent label removes text for the local craft.
+    pub fn set_own(&mut self, grant: OwnLabelGrant<'_>) {
+        let entity = entity_of_slot(grant.slot);
+        self.labels.remove(&entity);
+        if let Some(name) = grant.nickname.and_then(sanitise_nickname) {
+            self.labels.insert(entity, name);
+        }
+    }
+
+    /// Replaces the public labels from one roster answer and reapplies `own`.
     ///
     /// Wholesale replacement, not a merge: the service's answer is the set of
     /// players who are live *now*, so a row that stopped being sent means that
     /// player left, and merging would keep labelling a ship nobody is flying.
-    pub fn accept(&mut self, response: &RosterResponse) {
+    pub fn accept(&mut self, response: &RosterResponse, own: Option<OwnLabelGrant<'_>>) {
         self.labels = response
             .roster
             .iter()
             .filter_map(|row| {
+                let entity = entity_of_slot(row.slot);
                 let name = sanitise_nickname(row.nickname.as_deref()?)?;
-                Some((entity_of_slot(row.slot), name))
+                Some((entity, name))
             })
             .collect();
+        if let Some(grant) = own {
+            self.set_own(grant);
+        }
         self.fetches = self.fetches.saturating_add(1);
         self.last_error = None;
     }
@@ -287,18 +324,21 @@ mod tests {
     #[test]
     fn a_complete_campaign_roster_resolves_every_opponent() {
         let mut roster = ShipRoster::default();
-        roster.accept(&RosterResponse {
-            roster: (0..=8)
-                .map(|slot| {
-                    if slot == 8 {
-                        RosterRow::labelled(slot, "ada")
-                    } else {
-                        RosterRow::labelled(slot, &format!("test-{}", slot + 1))
-                    }
-                })
-                .collect(),
-            ..Default::default()
-        });
+        roster.accept(
+            &RosterResponse {
+                roster: (0..=8)
+                    .map(|slot| {
+                        if slot == 8 {
+                            RosterRow::labelled(slot, "ada")
+                        } else {
+                            RosterRow::labelled(slot, &format!("test-{}", slot + 1))
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            None,
+        );
 
         assert_eq!(roster.len(), 9);
         for slot in 0..8 {
@@ -310,14 +350,84 @@ mod tests {
         assert_eq!(roster.label(entity_of_slot(8)), Some("ada"));
     }
 
+    /// #600: a public roster can name every slot but cannot say which name is
+    /// this client's. Only the label granted in the join reply may be attached
+    /// to the local craft or to the waiting-room row marked `you`.
+    #[test]
+    fn the_local_craft_is_labelled_only_by_its_join_grant() {
+        let response = RosterResponse {
+            roster: vec![
+                RosterRow {
+                    slot: 5,
+                    nickname: Some("shooshte".to_owned()),
+                    kind: Some("human".to_owned()),
+                    state: Some("active".to_owned()),
+                },
+                RosterRow::labelled(6, "baadc0de"),
+            ],
+            phase: Some("lobby".to_owned()),
+            ..Default::default()
+        };
+        let local = entity_of_slot(5);
+        let other = entity_of_slot(6);
+        let unlabelled_grant = Some(OwnLabelGrant {
+            slot: 5,
+            nickname: None,
+        });
+
+        let mut roster = ShipRoster::default();
+        roster.accept(&response, unlabelled_grant);
+        assert_eq!(
+            roster.label(local),
+            None,
+            "a public row must not attribute another player's label to the local craft"
+        );
+        assert_eq!(roster.label(other), Some("baadc0de"));
+        let room = response.lobby_view(unlabelled_grant);
+        assert_eq!(
+            room.seats
+                .iter()
+                .find(|seat| seat.slot == 5)
+                .unwrap()
+                .nickname,
+            None,
+            "the waiting-room row marked `you` has the same attribution boundary"
+        );
+
+        let granted = Some(OwnLabelGrant {
+            slot: 5,
+            nickname: Some("themre"),
+        });
+        roster.accept(&response, granted);
+        assert_eq!(
+            roster.label(local),
+            Some("themre"),
+            "the join grant, not the public row, names the local craft"
+        );
+        assert_eq!(
+            response
+                .lobby_view(granted)
+                .seats
+                .into_iter()
+                .find(|seat| seat.slot == 5)
+                .unwrap()
+                .nickname
+                .as_deref(),
+            Some("themre")
+        );
+    }
+
     /// A missing label must read as absent. Nothing here may invent a name.
     #[test]
     fn an_unlabelled_craft_gets_no_label_rather_than_a_placeholder() {
         let mut roster = ShipRoster::default();
-        roster.accept(&RosterResponse {
-            roster: vec![RosterRow::labelled(8, "ada")],
-            ..Default::default()
-        });
+        roster.accept(
+            &RosterResponse {
+                roster: vec![RosterRow::labelled(8, "ada")],
+                ..Default::default()
+            },
+            None,
+        );
         assert_eq!(roster.label(entity_of_slot(8)), Some("ada"));
         assert_eq!(
             roster.label(entity_of_slot(3)),
@@ -327,10 +437,13 @@ mod tests {
 
         // A row whose nickname sanitises away is the same as no row: it must
         // not become an empty label, which would draw as a blank name tag.
-        roster.accept(&RosterResponse {
-            roster: vec![RosterRow::labelled(4, "\u{202E}\u{200B}   ")],
-            ..Default::default()
-        });
+        roster.accept(
+            &RosterResponse {
+                roster: vec![RosterRow::labelled(4, "\u{202E}\u{200B}   ")],
+                ..Default::default()
+            },
+            None,
+        );
         assert!(
             roster.is_empty(),
             "a nickname with nothing drawable in it is not a label"
@@ -341,18 +454,24 @@ mod tests {
     #[test]
     fn a_roster_answer_replaces_the_labels_rather_than_merging_them() {
         let mut roster = ShipRoster::default();
-        roster.accept(&RosterResponse {
-            roster: vec![
-                RosterRow::labelled(8, "ada"),
-                RosterRow::labelled(2, "grace"),
-            ],
-            ..Default::default()
-        });
+        roster.accept(
+            &RosterResponse {
+                roster: vec![
+                    RosterRow::labelled(8, "ada"),
+                    RosterRow::labelled(2, "grace"),
+                ],
+                ..Default::default()
+            },
+            None,
+        );
         assert_eq!(roster.len(), 2);
-        roster.accept(&RosterResponse {
-            roster: vec![RosterRow::labelled(8, "ada")],
-            ..Default::default()
-        });
+        roster.accept(
+            &RosterResponse {
+                roster: vec![RosterRow::labelled(8, "ada")],
+                ..Default::default()
+            },
+            None,
+        );
         assert_eq!(roster.label(entity_of_slot(2)), None, "grace left");
         assert_eq!(roster.len(), 1);
     }
@@ -361,10 +480,13 @@ mod tests {
     #[test]
     fn a_failed_fetch_keeps_the_labels_it_already_had() {
         let mut roster = ShipRoster::default();
-        roster.accept(&RosterResponse {
-            roster: vec![RosterRow::labelled(8, "ada")],
-            ..Default::default()
-        });
+        roster.accept(
+            &RosterResponse {
+                roster: vec![RosterRow::labelled(8, "ada")],
+                ..Default::default()
+            },
+            None,
+        );
         roster.fail("connection refused".to_owned());
         assert_eq!(roster.label(entity_of_slot(8)), Some("ada"));
         assert!(roster.summary_line().contains("connection refused"));
@@ -426,20 +548,23 @@ pub fn refresh_roster(
     mut roster: ResMut<ShipRoster>,
     mut lobby: ResMut<crate::lobby::LobbyView>,
 ) {
-    let own_slot = match &*session {
-        crate::ActiveSession::Campaign(runtime) => Some(runtime.config().slot),
-        crate::ActiveSession::Local(_) => None,
-    };
     let mut slot = task.0.lock().expect("roster task lock");
     if let Some(receiver) = slot.as_ref() {
         match receiver.try_recv() {
             Ok(Ok(response)) => {
-                roster.accept(&response);
+                let own = match &*session {
+                    crate::ActiveSession::Campaign(runtime) => Some(OwnLabelGrant {
+                        slot: runtime.config().slot,
+                        nickname: runtime.config().own_label.as_deref(),
+                    }),
+                    crate::ActiveSession::Local(_) => None,
+                };
+                roster.accept(&response, own);
                 // The waiting room is replaced wholesale for the same reason
                 // the labels are: the answer is the room *now*, and merging
                 // would keep a seat occupied by somebody who left.
                 let notice = lobby.notice.take();
-                *lobby = response.lobby_view(own_slot);
+                *lobby = response.lobby_view(own);
                 lobby.notice = notice;
                 *slot = None;
             }
