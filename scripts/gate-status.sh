@@ -885,6 +885,8 @@ gate_package_client_run() {
     && grep -Fq 'ORRERY_BUILD_REV: ${{ github.sha }}' <<<"$source" \
     && grep -Fq ' --build-info > stage/build-info.json' <<<"$source" \
     && grep -Fq 'embedded client_rev' <<<"$source" \
+    && grep -Fq 'scripts/client-campaign-preflight.sh' <<<"$source" \
+    && grep -Fq -- '--campaign shakedown' <<<"$source" \
     && grep -Fq 'cp clients/regolith/PLAYTEST.md stage/README.md' <<<"$source" \
     && grep -Fq 'test ! -e stage/assets' <<<"$source" \
     && grep -Fq 'tar -C stage -czf' <<<"$source" \
@@ -1313,6 +1315,27 @@ self_test() {
     || die 'self-test: a broken package-client stamp stage did not report FAILED'
   grep -qE '^  PASSED +package-client:package-client' <<<"$package_mutation" \
     && die 'self-test: a broken package-client stamp stage also reported PASSED'
+  rm -f "$dir/.github/workflows/package-client.yml"
+
+  # The release candidate must run the deployed-campaign proof, not merely
+  # carry a self-tested script that no workflow invokes. Break that guarded
+  # handoff and require the package job's named row to fail.
+  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  sed -i 's#scripts/client-campaign-preflight.sh#scripts/broken-client-campaign-preflight.sh#' \
+    "$dir/.github/workflows/package-client.yml"
+  local client_preflight_mutation client_preflight_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/client-preflight-out" "$0" --fast \
+    >"$dir/client-preflight-mutation-report" 2>&1
+  client_preflight_status=$?
+  set -e
+  client_preflight_mutation=$(cat "$dir/client-preflight-mutation-report")
+  [[ $client_preflight_status == 1 ]] \
+    || die "self-test: a broken client campaign preflight exited $client_preflight_status rather than 1"
+  grep -qE '^  FAILED +package-client:package-client' <<<"$client_preflight_mutation" \
+    || die 'self-test: a broken client campaign preflight did not fail the package-client row'
+  grep -qE '^  PASSED +package-client:package-client' <<<"$client_preflight_mutation" \
+    && die 'self-test: a broken client campaign preflight also reported PASSED'
   rm -f "$dir/.github/workflows/package-client.yml"
 
   # A release build must not re-resolve the standalone client's lockfile.

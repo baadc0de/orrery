@@ -1,5 +1,5 @@
 use orrery_games::regolith::REGOLITH_RULESET;
-use orrery_regolith_client::BUILD_REV;
+use orrery_regolith_client::{BUILD_REV, DEFAULT_ADMISSION_URL};
 use std::process::Command;
 
 #[test]
@@ -14,4 +14,5 @@ fn build_info_reports_the_binarys_embedded_campaign_identity() {
         serde_json::from_slice(&output.stdout).expect("--build-info emits JSON");
     assert_eq!(info["client_rev"], BUILD_REV);
     assert_eq!(info["ruleset_version"], REGOLITH_RULESET.version);
+    assert_eq!(info["admission_url"], DEFAULT_ADMISSION_URL);
 }

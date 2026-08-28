@@ -322,6 +322,12 @@ lane_gates() {
     # than a pass that learned nothing.
     run scripts/campaign-release-preflight.sh --self-test
 
+    # #587's built-client/deployed-service preflight. The live run belongs to
+    # package-client's Linux leg; these fixtures prove that a green process
+    # with no seated client, and a pair with only one seated client, both fail
+    # their named checks rather than reading as launch success.
+    run scripts/client-campaign-preflight.sh --self-test
+
     # #478's admission service. Its suite was never run here at all, so the
     # thirteen tests #478 landed had never executed in CI — and when the
     # identity binaries are absent the suite skips every one of them and still

@@ -38,3 +38,17 @@ again. If it says this build is refused or needs a different revision, download
 the newest archive from the Releases page and replace the whole extracted
 folder. A version refusal is intentional: the campaign only accepts the build
 and ruleset it has pinned, so every banked session remains auditable.
+
+`--help` prints the available command-line options and exits without opening a
+window.
+
+## Operator note: a rebuild cannot rescue a live session
+
+The three-platform packaging workflow takes roughly fifteen minutes and only
+publishes the GitHub release after its slowest platform finishes. Do not spend
+a waiting tester session on a rebuild. When one platform is urgently needed,
+its `regolith-<platform>` workflow artifact is downloadable as soon as that
+matrix leg finishes, before the final release-publishing job runs. The Linux
+leg also has to complete the two-client deployed-campaign preflight before its
+archive is staged, so update the campaign's revision pin to the candidate
+commit before starting the release workflow.

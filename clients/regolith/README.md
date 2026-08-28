@@ -92,6 +92,29 @@ the renderer never produces the screenshot. This distinguishes process spawn
 from a client that remains alive and renders, including delayed compositor
 failures.
 
+`--headless-join <campaign> --nickname <name> --campaign-consent` is the
+bounded live admission and transport proof. It reads the campaign list through
+the baked admission origin, applies the same compatibility/open predicate as
+the buttons in the lobby, requests a seat, and exits successfully only after
+the iroh handshake reaches `JoinState::Joined` and at least one joined tick
+runs. Adding `--expect-peer <nickname>` also requires that nickname's roster
+slot to exist as a different `RegolithState::Craft` in the local executor — a
+roster row by itself cannot satisfy it. `--headless-timeout-secs` defaults to
+1020 seconds so an arbitrary launch can wait through the deployed campaign's
+900-second attempt plus restart.
+
+The release workflow runs two copies through
+`scripts/client-campaign-preflight.sh`. Each copy names the other with
+`--expect-peer`; both must independently report the baked origin, a joinable
+listing, admission acceptance, a completed handshake, and the other's
+replicated craft. A negative compatibility probe can use
+`--expect-admission-refusal client_rev_mismatch`; it sends the binary's actual
+embedded revision and succeeds only when admission returns that exact error
+name.
+
+`--help` prints the command-line usage before Bevy, identity loading, or window
+creation begins.
+
 ## Verifying presentation without a desktop
 
 Presentation issues (#524, #530, #531) sat blocked for want of a way to see the
