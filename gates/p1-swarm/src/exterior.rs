@@ -25,7 +25,8 @@
 //! - the **meta** lane, which exists only on this leg: one connection stands in
 //!   for a whole island membership, so connection facts travel beside combat
 //!   traffic. The remote sends its interest cell once per simulated second;
-//!   the host returns settled uplink-datagram acknowledgments.
+//!   the host returns settled uplink-datagram acknowledgments and hearsay
+//!   contact folds.
 //!
 //! Every frame names a **swarm index** — but which end of the hop it names
 //! depends on the direction, because each side routes by the only index it
@@ -80,8 +81,9 @@ pub enum Lane {
     StreamShared,
     /// The stream lane's per-message bulk streams: reliable, unordered.
     StreamBulk,
-    /// Out-of-band facts about the connection: remote interest-cell reports
-    /// and host acknowledgments of impaired uplink datagrams.
+    /// Out-of-band facts about the connection: remote interest-cell reports,
+    /// host acknowledgments of impaired uplink datagrams and host hearsay
+    /// contact folds.
     Meta,
 }
 
@@ -208,6 +210,127 @@ impl UplinkAck {
         Some(Self {
             sequence: u64::from_le_bytes(sequence.try_into().expect("eight bytes checked")),
             outcome,
+        })
+    }
+}
+
+/// The party that computed a hearsay contact fold.
+///
+/// This is transmitted with every [`HearsayContacts`] record so hearsay
+/// provenance survives the whole downlink rather than becoming a client-side
+/// convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HearsaySource {
+    /// The campaign host's fold over its roster of committed craft cells.
+    HostRosterFold,
+}
+
+impl HearsaySource {
+    const HOST_ROSTER_FOLD_TAG: u8 = 0x01;
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::HostRosterFold => Self::HOST_ROSTER_FOLD_TAG,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            Self::HOST_ROSTER_FOLD_TAG => Some(Self::HostRosterFold),
+            _ => None,
+        }
+    }
+}
+
+/// One source- and age-labelled craft contact in a [`HearsayContacts`] fold.
+///
+/// `cell` is raw 512-metre `CellId` bits. `fact_age_ticks` is the age of that
+/// cell fact at `fold_tick`, rather than the age of the record envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HearsayContact {
+    /// The roster seat to resolve to a craft identity.
+    pub seat: u8,
+    /// Raw `CellId` bits at the committed 512-metre level.
+    pub cell: u64,
+    /// Age of this cell fact when the source folded its roster.
+    pub fact_age_ticks: u16,
+}
+
+/// A form-agnostic hearsay fold sent from the host on the existing Meta lane.
+///
+/// The encoding is `[tag 0xa2][source][fold_tick u64][count]` followed by
+/// `count` `[seat][cell u64][fact_age_ticks u16]` triples, all little-endian.
+/// It deliberately carries no rendering information: consumers may draw edge
+/// arrows today or a minimap later from the same `(seat, cell, age)` facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HearsayContacts {
+    /// Who computed this fold, transmitted to satisfy hearsay provenance.
+    pub source: HearsaySource,
+    /// Tick at which the source took this roster snapshot.
+    pub fold_tick: u64,
+    /// The source- and age-labelled contact facts in this fold.
+    pub contacts: Vec<HearsayContact>,
+}
+
+impl HearsayContacts {
+    /// Meta payload discriminator, distinct from the ACK tag (`0xa1`).
+    const TAG: u8 = 0xa2;
+    const HEADER_BYTES: usize = 11;
+    const CONTACT_BYTES: usize = 11;
+
+    /// Encodes this fold for a host-to-exterior Meta-lane [`Frame`].
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let count = u8::try_from(self.contacts.len()).expect("hearsay contact count fits u8");
+        let mut out =
+            BytesMut::with_capacity(Self::HEADER_BYTES + Self::CONTACT_BYTES * self.contacts.len());
+        out.put_u8(Self::TAG);
+        out.put_u8(self.source.tag());
+        out.put_u64_le(self.fold_tick);
+        out.put_u8(count);
+        for contact in &self.contacts {
+            out.put_u8(contact.seat);
+            out.put_u64_le(contact.cell);
+            out.put_u16_le(contact.fact_age_ticks);
+        }
+        out.freeze()
+    }
+
+    /// Decodes only the HearsayContacts member of the Meta lane grammar.
+    ///
+    /// Tags this version does not own, unknown sources, truncated records and
+    /// length mismatches are ignored. The exact-length check keeps a corrupted
+    /// count from being accepted as a plausible prefix of a larger fold.
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let [tag, source, tail @ ..] = payload else {
+            return None;
+        };
+        if *tag != Self::TAG || tail.len() < 9 {
+            return None;
+        }
+        let source = HearsaySource::from_tag(*source)?;
+        let fold_tick = u64::from_le_bytes(tail[..8].try_into().expect("eight bytes read"));
+        let count = usize::from(tail[8]);
+        let expected_len = Self::HEADER_BYTES + Self::CONTACT_BYTES * count;
+        if payload.len() != expected_len {
+            return None;
+        }
+
+        let mut contacts = Vec::with_capacity(count);
+        for entry in payload[Self::HEADER_BYTES..].chunks_exact(Self::CONTACT_BYTES) {
+            contacts.push(HearsayContact {
+                seat: entry[0],
+                cell: u64::from_le_bytes(entry[1..9].try_into().expect("entry has eleven bytes")),
+                fact_age_ticks: u16::from_le_bytes(
+                    entry[9..11].try_into().expect("entry has eleven bytes"),
+                ),
+            });
+        }
+        Some(Self {
+            source,
+            fold_tick,
+            contacts,
         })
     }
 }
@@ -885,6 +1008,113 @@ mod tests {
         }
         assert_eq!(UplinkAck::decode(&7u64.to_le_bytes()), None, "not a cell");
         assert_eq!(UplinkAck::decode(&[0xff]), None, "not goodbye");
+    }
+
+    #[test]
+    fn hearsay_contacts_round_trip_at_the_eight_craft_budget() {
+        let contacts = HearsayContacts {
+            source: HearsaySource::HostRosterFold,
+            fold_tick: 0x0123_4567_89ab_cdef,
+            contacts: (0..8)
+                .map(|seat| HearsayContact {
+                    seat,
+                    cell: 0x1000_0000_0000_0000 + u64::from(seat),
+                    fact_age_ticks: 256 + u16::from(seat),
+                })
+                .collect(),
+        };
+
+        let wire = contacts.encode();
+        assert_eq!(wire.len(), 99, "11-byte header plus eight 11-byte contacts");
+        assert_eq!(&wire[..2], &[0xa2, 0x01], "tag and source are on the wire");
+        assert_eq!(HearsayContacts::decode(&wire), Some(contacts));
+        assert_eq!(
+            UplinkAck::decode(&wire),
+            None,
+            "an ACK-only older client ignores the unknown Meta tag"
+        );
+    }
+
+    #[test]
+    fn hearsay_contacts_decode_source_cell_and_age_from_wire() {
+        let wire = [
+            0xa2, 0x01, // tag, host-roster-fold source
+            0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, // fold tick
+            0x02, // count
+            0x03, // seat
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // cell
+            0x00, 0x01, // fact age
+            0x07, // seat
+            0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, // cell
+            0xfe, 0xca, // fact age
+        ];
+        assert_eq!(
+            HearsayContacts::decode(&wire),
+            Some(HearsayContacts {
+                source: HearsaySource::HostRosterFold,
+                fold_tick: 0x0123_4567_89ab_cdef,
+                contacts: vec![
+                    HearsayContact {
+                        seat: 3,
+                        cell: 0x1122_3344_5566_7788,
+                        fact_age_ticks: 256,
+                    },
+                    HearsayContact {
+                        seat: 7,
+                        cell: 0x99aa_bbcc_ddee_ff00,
+                        fact_age_ticks: 0xcafe,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn hearsay_contacts_reject_corrupted_count_in_transit() {
+        let contacts = HearsayContacts {
+            source: HearsaySource::HostRosterFold,
+            fold_tick: 120,
+            contacts: vec![
+                HearsayContact {
+                    seat: 2,
+                    cell: 11,
+                    fact_age_ticks: 256,
+                },
+                HearsayContact {
+                    seat: 5,
+                    cell: 22,
+                    fact_age_ticks: 512,
+                },
+            ],
+        };
+        let mut wire = contacts.encode().to_vec();
+        wire[10] = 1; // Transit corruption: only one of the two entries is claimed.
+
+        assert_eq!(
+            HearsayContacts::decode(&wire),
+            None,
+            "a corrupted count must not decode to a plausible contact prefix"
+        );
+    }
+
+    #[test]
+    fn hearsay_contacts_ignore_unknown_tags_and_sources() {
+        let contacts = HearsayContacts {
+            source: HearsaySource::HostRosterFold,
+            fold_tick: 0,
+            contacts: Vec::new(),
+        };
+        let mut wire = contacts.encode().to_vec();
+        wire[0] = 0xa3;
+        assert_eq!(HearsayContacts::decode(&wire), None, "unknown tag ignored");
+
+        wire[0] = 0xa2;
+        wire[1] = 0x02;
+        assert_eq!(
+            HearsayContacts::decode(&wire),
+            None,
+            "unknown source ignored"
+        );
     }
 
     #[test]
