@@ -978,6 +978,14 @@ fn main() -> Result<()> {
         report.control_bytes / 1_000,
     );
     eprintln!(
+        "gates/p1-swarm: replication wire {} keyframes / {} deltas, keyframes {:.1}% of messages and {:.1}% of bytes; {} deltas_unanchored",
+        report.keyframe_messages,
+        report.delta_messages,
+        report.keyframe_message_share * 100.0,
+        report.keyframe_byte_share * 100.0,
+        report.deltas_unanchored,
+    );
+    eprintln!(
         "gates/p1-swarm: least-travelled peer visited {} cells; {} packets shed; link carried {} delivered / {} dropped",
         report.min_cells_visited, report.total_shed, report.link.delivered, report.link.dropped,
     );

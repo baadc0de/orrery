@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aeronet_iroh::stream::{IrohStreamIo, RecvMessage, StreamMode};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_ecs::system::SystemParam;
 use bevy_math::Vec3;
 use bevy_time::{Real, Time};
 use bytes::Bytes;
@@ -42,7 +43,7 @@ use orrery_games::regolith::weapon::WeaponKind;
 use orrery_games::regolith::{
     collision_candidate, distance_mm, firing_arc_measurement, Regolith, REGOLITH_RULESET,
 };
-use orrery_net::budget::{UploadBudget, UploadMeter};
+use orrery_net::budget::{datagram_wire_bytes, UploadBudget, UploadMeter};
 #[cfg(test)]
 use orrery_net::channels::encode_replication;
 use orrery_net::channels::{encode_replication_compressed, Channel};
@@ -52,6 +53,10 @@ use orrery_net::peer_link::{
 };
 use orrery_net::plugin::Peer;
 use orrery_net::{IslandMembership, IslandSource};
+use orrery_protocol::channels::{
+    apply_delta_patch, decode_replication_delta, encode_delta_patch, encode_replication_delta,
+    ReplicationDelta, TAG_REPLICATION_DELTA,
+};
 use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
 use orrery_protocol::{
     CellId, NodeId, PersistId, RecordSource, StateClaim, Tick, UniverseSeed, DEFAULT_CELL_EDGE_M,
@@ -93,6 +98,12 @@ pub const TICK_HZ: u64 = 60;
 /// margin to matter. Anything much faster stops testing hysteresis and starts
 /// testing whether cells can be skipped entirely.
 const CRUISE_MPS: f64 = 32.0;
+
+/// Default number of state sends between the 1 Hz keyframes.
+///
+/// [`Swarm`](crate::swarm::Swarm) replaces this with its configured send rate,
+/// so lowering `--send-hz` never lowers the 1 Hz liveness heartbeat with it.
+const DEFAULT_KEYFRAME_EVERY_SENDS: u64 = 20;
 
 /// How soon a re-promotion counts as a pop, in ticks.
 ///
@@ -185,6 +196,8 @@ pub struct Bot {
     replica_seen_at: BTreeMap<PersistId, u64>,
     /// First authenticated transport identity seen authoring each replica.
     replica_authorities: BTreeMap<PersistId, NodeId>,
+    /// Canonical keyframes used by the direct core-observation receive seam.
+    replica_keyframes: ReplicaKeyframes,
     /// Target-authored shot verdicts retained only for live-path regression tests.
     #[cfg(test)]
     resolved_shots: Vec<Outcome>,
@@ -258,6 +271,92 @@ pub struct Bot {
     /// A19's opt-in observation of canonical changes at the existing send
     /// seam. It never influences the payload or recipient set.
     delta_stats: Option<DeltaStats>,
+    /// Last authored keyframe and its byte-identical cached wire form.
+    sender_keyframes: BTreeMap<PersistId, SenderKeyframe>,
+    /// Audience seen on the preceding send, per authored entity.
+    replication_audiences: BTreeMap<PersistId, BTreeSet<NodeId>>,
+    /// Number of state-send opportunities this authority has processed.
+    replication_send_index: u64,
+    /// State sends per 1 Hz keyframe interval.
+    keyframe_every_sends: u64,
+    /// Offered keyframe/delta traffic, split beside the shipping lane meter.
+    replication_wire: ReplicationWireCounters,
+}
+
+/// One absolute anchor retained by a sender.
+#[derive(Debug, Clone)]
+struct SenderKeyframe {
+    canonical: Vec<u8>,
+    cell: CellId,
+    tick: u64,
+    payload: Vec<u8>,
+}
+
+/// One absolute anchor retained by a receiver.
+#[derive(Debug, Clone)]
+struct ReceiverKeyframe {
+    canonical: Vec<u8>,
+    cell: CellId,
+    tick: u64,
+}
+
+/// Per-entity receiver anchors for keyframe-referenced deltas.
+#[derive(Resource, Debug, Default, Clone)]
+pub struct ReplicaKeyframes {
+    anchors: BTreeMap<PersistId, ReceiverKeyframe>,
+}
+
+/// A reconstructed absolute replication state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedReplica {
+    pub(crate) canonical: Vec<u8>,
+    pub(crate) cell: CellId,
+    pub(crate) entity: PersistId,
+    pub(crate) tick: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicaDecodeError {
+    NotReplication,
+    UnanchoredDelta,
+    BadPatch,
+}
+
+/// Keyframe/delta traffic offered to the shipping send path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationWireCounters {
+    /// Absolute keyframe messages, counted once per recipient.
+    pub keyframe_messages: u64,
+    /// Delta messages, counted once per recipient.
+    pub delta_messages: u64,
+    /// Keyframe wire bytes including datagram overhead.
+    pub keyframe_bytes: u64,
+    /// Delta wire bytes including datagram overhead.
+    pub delta_bytes: u64,
+}
+
+impl ReplicationWireCounters {
+    fn record(&mut self, kind: ReplicationKind, payload_len: usize) {
+        // `send_peer_packets` adds the outer channel tag before charging the
+        // datagram. Mirror that exact one-byte framing here.
+        let wire = datagram_wire_bytes(payload_len.saturating_add(1));
+        match kind {
+            ReplicationKind::Keyframe => {
+                self.keyframe_messages += 1;
+                self.keyframe_bytes += wire;
+            }
+            ReplicationKind::Delta => {
+                self.delta_messages += 1;
+                self.delta_bytes += wire;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationKind {
+    Keyframe,
+    Delta,
 }
 
 /// Witness signals a peer raised, by kind and by whether the accused was one of
@@ -369,10 +468,64 @@ pub struct ReplicaCounters {
     pub undecodable: u64,
     /// Packets whose body did not decode.
     pub bad_body: u64,
+    /// Deltas whose referenced keyframe has not arrived on this link.
+    pub deltas_unanchored: u64,
     /// Replicas spawned.
     pub spawned: u64,
     /// Replicas updated.
     pub updated: u64,
+}
+
+/// Mutable receiver state consumed together by [`apply_replicas`].
+#[derive(SystemParam)]
+pub struct ReplicaReceiveState<'w> {
+    counters: ResMut<'w, ReplicaCounters>,
+    keyframes: ResMut<'w, ReplicaKeyframes>,
+}
+
+pub(crate) fn decode_replica(
+    payload: &[u8],
+    keyframes: &mut ReplicaKeyframes,
+) -> Result<DecodedReplica, ReplicaDecodeError> {
+    if let Some((canonical, cell, entity, tick)) =
+        orrery_net::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(payload)
+    {
+        keyframes.anchors.insert(
+            entity,
+            ReceiverKeyframe {
+                canonical: canonical.clone(),
+                cell,
+                tick,
+            },
+        );
+        return Ok(DecodedReplica {
+            canonical,
+            cell,
+            entity,
+            tick,
+        });
+    }
+
+    let Some(delta) = decode_replication_delta(payload) else {
+        return Err(ReplicaDecodeError::NotReplication);
+    };
+    let referenced_tick = delta
+        .tick
+        .checked_sub(u64::from(delta.keyframe_age))
+        .ok_or(ReplicaDecodeError::UnanchoredDelta)?;
+    let anchor = keyframes
+        .anchors
+        .get(&delta.entity)
+        .filter(|anchor| anchor.tick == referenced_tick)
+        .ok_or(ReplicaDecodeError::UnanchoredDelta)?;
+    let canonical =
+        apply_delta_patch(&anchor.canonical, &delta.patch).ok_or(ReplicaDecodeError::BadPatch)?;
+    Ok(DecodedReplica {
+        canonical,
+        cell: delta.cell.unwrap_or(anchor.cell),
+        entity: delta.entity,
+        tick: delta.tick,
+    })
 }
 
 /// Upserts a replica entity per peer from the state packets that arrive.
@@ -386,40 +539,50 @@ pub fn apply_replicas(
     mut commands: Commands,
     edge: Res<CellEdge>,
     tick: Res<SimTick>,
-    mut counters: ResMut<ReplicaCounters>,
+    mut receive: ReplicaReceiveState,
     existing: Query<(Entity, &Replica)>,
     witness: Option<ResMut<WitnessState<Regolith>>>,
 ) {
     let mut witness = witness;
     for packet in packets.read() {
-        counters.seen += 1;
+        receive.counters.seen += 1;
         if packet.channel != orrery_net::channels::Channel::State {
-            counters.wrong_channel += 1;
+            receive.counters.wrong_channel += 1;
             continue;
         }
         // Witness records share this lane and are sub-tagged as such; skipping
         // them is not a decode failure. Counting them would make `undecodable`
         // — the guard that catches the harness measuring an empty world — fire
         // constantly and stop meaning anything.
-        let Some((encoded, cell, entity, at)) = orrery_net::channels::decode_replication::<(
-            Vec<u8>,
-            CellId,
-            orrery_protocol::PersistId,
-            u64,
-        )>(&packet.payload) else {
-            if orrery_net::channels::decode_witness::<orrery_protocol::WitnessMsg>(&packet.payload)
-                .is_none()
-            {
-                counters.undecodable += 1;
+        let decoded = match decode_replica(&packet.payload, &mut receive.keyframes) {
+            Ok(decoded) => decoded,
+            Err(ReplicaDecodeError::UnanchoredDelta) => {
+                receive.counters.deltas_unanchored += 1;
+                continue;
             }
+            Err(ReplicaDecodeError::BadPatch) => {
+                receive.counters.bad_body += 1;
+                continue;
+            }
+            Err(ReplicaDecodeError::NotReplication) => {
+                if orrery_net::channels::decode_witness::<orrery_protocol::WitnessMsg>(
+                    &packet.payload,
+                )
+                .is_none()
+                {
+                    receive.counters.undecodable += 1;
+                }
+                continue;
+            }
+        };
+        let Ok(state) = <RegolithState as orrery_core::CoreCodec>::decode(&decoded.canonical)
+        else {
+            receive.counters.bad_body += 1;
             continue;
         };
-        let Ok(state) = <RegolithState as orrery_core::CoreCodec>::decode(&encoded) else {
-            counters.bad_body += 1;
-            continue;
-        };
+        let entity = decoded.entity;
         let RegolithState::Craft(craft) = &state else {
-            counters.bad_body += 1;
+            receive.counters.bad_body += 1;
             continue;
         };
         // Stage 1, on everything received, witnessed or not (docs/06 §3) — and
@@ -431,7 +594,7 @@ pub fn apply_replicas(
             witness.0.observe(orrery_witness::Observation {
                 entity,
                 state: &state,
-                tick: orrery_protocol::Tick::new(at),
+                tick: orrery_protocol::Tick::new(decoded.tick),
             });
         }
 
@@ -443,16 +606,18 @@ pub fn apply_replicas(
             .find(|(_, replica)| replica.0 == packet.from)
         {
             Some((entity, _)) => {
-                counters.updated += 1;
-                commands
-                    .entity(entity)
-                    .insert((Cell(cell), GridPosition(grid), LastSeen(tick.0)));
+                receive.counters.updated += 1;
+                commands.entity(entity).insert((
+                    Cell(decoded.cell),
+                    GridPosition(grid),
+                    LastSeen(tick.0),
+                ));
             }
             None => {
-                counters.spawned += 1;
+                receive.counters.spawned += 1;
                 commands.spawn((
                     Replica(packet.from),
-                    Cell(cell),
+                    Cell(decoded.cell),
                     GridPosition(grid),
                     LastSeen(tick.0),
                 ));
@@ -562,6 +727,7 @@ impl Bot {
         .insert_resource(Time::<Real>::default())
         .insert_resource(CellEdge(cell_edge_m))
         .init_resource::<ReplicaCounters>()
+        .init_resource::<ReplicaKeyframes>()
         .init_resource::<SimTick>()
         .add_message::<PeerPacket>()
         .add_message::<SendPacket>()
@@ -618,6 +784,7 @@ impl Bot {
             delivered_outbox: Vec::new(),
             replica_seen_at: BTreeMap::new(),
             replica_authorities: BTreeMap::new(),
+            replica_keyframes: ReplicaKeyframes::default(),
             #[cfg(test)]
             resolved_shots: Vec::new(),
             foreign_deliveries: 0,
@@ -669,6 +836,11 @@ impl Bot {
             signals: SignalTally::default(),
             tampered_subjects: Vec::new(),
             delta_stats: None,
+            sender_keyframes: BTreeMap::new(),
+            replication_audiences: BTreeMap::new(),
+            replication_send_index: 0,
+            keyframe_every_sends: DEFAULT_KEYFRAME_EVERY_SENDS,
+            replication_wire: ReplicationWireCounters::default(),
             last_high_rate: Vec::new(),
             demoted_at: Vec::new(),
             tick: 0,
@@ -730,6 +902,11 @@ impl Bot {
     /// Enable A19's changed-byte observation at this run's send cadence.
     pub fn enable_delta_stats(&mut self, send_hz: u64) {
         self.delta_stats = Some(DeltaStats::new(send_hz));
+    }
+
+    /// Keep the sender-clocked keyframe cadence at one simulated second.
+    pub fn set_replication_send_hz(&mut self, send_hz: u64) {
+        self.keyframe_every_sends = send_hz.max(1);
     }
 
     /// This authority's completed changed-byte observations.
@@ -1172,52 +1349,126 @@ impl Bot {
         let player_cell = self.cell().expect("committed");
         let cell_edge_m = self.app.world().resource::<CellEdge>().0;
         let node = self.node;
+        let send_index = self.replication_send_index;
+        let keyframe_every = self.keyframe_every_sends;
+        let membership = self.app.world().resource::<IslandMembership>();
+        let audiences: BTreeMap<PersistId, BTreeSet<NodeId>> = self
+            .authored_entities()
+            .into_iter()
+            .map(|entity| {
+                let state = self.executor.state(entity).expect("authored entity");
+                let cell = authored_cell(entity, self.entity, state, player_cell, cell_edge_m);
+                let audience = membership
+                    .peers
+                    .iter()
+                    .filter(|entry| entry.node != node && entry.cells.contains(&cell))
+                    .map(|entry| entry.node)
+                    .collect();
+                (entity, audience)
+            })
+            .collect();
         let authored: Vec<_> = self
             .authored_entities()
             .into_iter()
             .filter_map(|entity| {
                 let state = self.executor.state(entity)?.clone();
-                let cell = if entity == self.entity {
-                    player_cell
-                } else {
-                    let pos = match &state {
-                        RegolithState::Craft(craft) => craft.pos,
-                        RegolithState::Rock(rock) => rock.pos,
-                        RegolithState::Pickup(pickup) => pickup.pos,
-                        RegolithState::BloomDirector(_) => QPos::default(),
+                let cell = authored_cell(entity, self.entity, &state, player_cell, cell_edge_m);
+                let audience = audiences.get(&entity)?.clone();
+                Some((entity, state, cell, audience))
+            })
+            .collect();
+        let mut sends = Vec::new();
+        for (entity, state, cell, audience) in authored {
+            let canonical = state.to_canonical();
+            if let Some(stats) = &mut self.delta_stats {
+                stats.observe(entity, &state, &canonical);
+            }
+
+            let previous_audience = self
+                .replication_audiences
+                .get(&entity)
+                .cloned()
+                .unwrap_or_default();
+            let added: BTreeSet<NodeId> =
+                audience.difference(&previous_audience).copied().collect();
+            let existing: BTreeSet<NodeId> = audience.difference(&added).copied().collect();
+            let observed_tick = tick + 1;
+            let due = !self.sender_keyframes.contains_key(&entity)
+                || send_index % keyframe_every == entity.0 % keyframe_every;
+
+            if due {
+                let payload = encode_replication_compressed(&(
+                    canonical.clone(),
+                    cell,
+                    entity,
+                    observed_tick,
+                ));
+                self.sender_keyframes.insert(
+                    entity,
+                    SenderKeyframe {
+                        canonical,
+                        cell,
+                        tick: observed_tick,
+                        payload: payload.clone(),
+                    },
+                );
+                sends.extend(
+                    audience
+                        .iter()
+                        .copied()
+                        .map(|peer| (peer, payload.clone(), ReplicationKind::Keyframe)),
+                );
+            } else if let Some(keyframe) = self.sender_keyframes.get(&entity) {
+                // New subscribers are deliberately excluded from this tick's
+                // delta audience. Datagram ordering is not a baseline protocol:
+                // their cached keyframe must arrive before any delta is even
+                // eligible for that link.
+                sends.extend(
+                    added
+                        .iter()
+                        .copied()
+                        .map(|peer| (peer, keyframe.payload.clone(), ReplicationKind::Keyframe)),
+                );
+
+                let cell_changed = cell != keyframe.cell;
+                if canonical != keyframe.canonical || cell_changed {
+                    let keyframe_age = u16::try_from(observed_tick - keyframe.tick)
+                        .expect("a 1 Hz keyframe age fits in u16 ticks");
+                    let patch = encode_delta_patch(&keyframe.canonical, &canonical);
+                    let delta = ReplicationDelta {
+                        entity,
+                        tick: observed_tick,
+                        keyframe_age,
+                        cell: cell_changed.then_some(cell),
+                        patch,
                     };
-                    cell_of(grid_of(&pos, cell_edge_m))
-                };
-                Some((entity, state, cell))
-            })
-            .collect();
-        let authored: Vec<_> = authored
-            .into_iter()
-            .map(|(entity, state, cell)| {
-                let canonical = state.to_canonical();
-                if let Some(stats) = &mut self.delta_stats {
-                    stats.observe(entity, &state, &canonical);
+                    let absolute = (canonical, cell, entity, observed_tick);
+                    if let Some(payload) = encode_delta_if_smaller(&absolute, &delta) {
+                        sends.extend(
+                            existing
+                                .iter()
+                                .copied()
+                                .map(|peer| (peer, payload.clone(), ReplicationKind::Delta)),
+                        );
+                    }
+                    // A size fallback is an absolute keyframe. Emitting one on
+                    // the arbitrary tick where entropy crossed the codec's size
+                    // boundary would bypass the per-entity stagger and recreate
+                    // the peak burst this cadence exists to remove. The state is
+                    // therefore left for this entity's next staggered keyframe;
+                    // the larger delta is never sent.
                 }
-                let payload = encode_replication_compressed(&(canonical, cell, entity, tick + 1));
-                (cell, payload)
-            })
-            .collect();
-        let membership = self.app.world().resource::<orrery_net::IslandMembership>();
-        let sends: Vec<_> = authored
-            .into_iter()
-            .flat_map(|(cell, payload)| {
-                membership
-                    .peers
-                    .iter()
-                    .filter(move |entry| entry.node != node && entry.cells.contains(&cell))
-                    .map(move |entry| (entry.node, payload.clone()))
-            })
-            .collect();
+            }
+            self.replication_audiences.insert(entity, audience);
+        }
+        self.replication_send_index += 1;
+
         let mut messages = self
             .app
             .world_mut()
             .resource_mut::<bevy_ecs::message::Messages<SendPacket>>();
-        for (peer, payload) in sends {
+        for (peer, payload, kind) in sends {
+            self.replication_wire.record(kind, payload.len());
             messages.write(SendPacket {
                 to: peer,
                 channel: Channel::State,
@@ -1328,26 +1579,23 @@ impl Bot {
         if stream.is_none() {
             let replication = orrery_net::channels::untag(&payload)
                 .filter(|(channel, _)| *channel == Channel::State)
-                .and_then(|(_, inner)| {
-                    orrery_net::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(
-                        inner,
-                    )
-                });
-            if let Some((encoded, _cell, entity, observed_tick)) = replication {
+                .and_then(|(_, inner)| decode_replica(inner, &mut self.replica_keyframes).ok());
+            if let Some(replication) = replication {
+                let entity = replication.entity;
                 let authority_matches = self
                     .replica_authorities
                     .get(&entity)
                     .is_none_or(|authority| *authority == from);
                 if entity != self.entity && !self.authors(entity) && authority_matches {
-                    if let Ok(state) = RegolithState::decode(&encoded) {
+                    if let Ok(state) = RegolithState::decode(&replication.canonical) {
                         self.replica_authorities.entry(entity).or_insert(from);
                         self.executor.insert_observed(
                             entity,
                             state.clone(),
-                            Tick::new(observed_tick),
+                            Tick::new(replication.tick),
                         );
                         if let Some(shadow) = &mut self.honest_shadow {
-                            shadow.insert_observed(entity, state, Tick::new(observed_tick));
+                            shadow.insert_observed(entity, state, Tick::new(replication.tick));
                         }
                         self.replica_seen_at.insert(entity, self.tick);
                     }
@@ -1665,6 +1913,12 @@ impl Bot {
         *self.app.world().resource::<ReplicaCounters>()
     }
 
+    /// Keyframe/delta traffic offered to the real send path.
+    #[must_use]
+    pub fn replication_wire_counters(&self) -> ReplicationWireCounters {
+        self.replication_wire
+    }
+
     /// Replica entities this peer holds, tagged or not.
     #[must_use]
     pub fn replicas(&mut self) -> usize {
@@ -1680,6 +1934,40 @@ impl Bot {
         let mut query = world.query_filtered::<Entity, Or<(With<HighRate>, With<Proxy>)>>();
         query.iter(world).count()
     }
+}
+
+fn authored_cell(
+    entity: PersistId,
+    primary: PersistId,
+    state: &RegolithState,
+    player_cell: CellId,
+    cell_edge_m: f32,
+) -> CellId {
+    if entity == primary {
+        return player_cell;
+    }
+    let pos = match state {
+        RegolithState::Craft(craft) => craft.pos,
+        RegolithState::Rock(rock) => rock.pos,
+        RegolithState::Pickup(pickup) => pickup.pos,
+        RegolithState::BloomDirector(_) => QPos::default(),
+    };
+    cell_of(grid_of(&pos, cell_edge_m))
+}
+
+fn is_delta_payload(payload: &[u8]) -> bool {
+    orrery_protocol::channels::untag(payload).is_some_and(|(channel, body)| {
+        channel == orrery_protocol::channels::Channel::State
+            && body.first() == Some(&TAG_REPLICATION_DELTA)
+    })
+}
+
+fn encode_delta_if_smaller(
+    absolute: &(Vec<u8>, CellId, PersistId, u64),
+    delta: &ReplicationDelta,
+) -> Option<Vec<u8>> {
+    let payload = encode_replication_delta(absolute, delta);
+    is_delta_payload(&payload).then_some(payload)
 }
 
 /// A deterministic key per bot index.
@@ -1741,6 +2029,192 @@ pub fn campaign_cell_edge_m() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn replication_test_bot(index: usize) -> Bot {
+        Bot::new(BotSpec {
+            index,
+            count: 32,
+            seed: UniverseSeed([0xA1; 32]),
+            cell_edge_m: default_cell_edge_m(),
+            witnessing: false,
+            cheat: None,
+            enforcing: false,
+        })
+    }
+
+    fn audience_entry(sender: &mut Bot, peer: NodeId) -> PeerEntry {
+        PeerEntry {
+            node: peer,
+            cells: sender.cell().expect("committed").neighbors27(),
+        }
+    }
+
+    fn drain_replication(bot: &mut Bot) -> Vec<(NodeId, Vec<u8>)> {
+        bot.drain_outbound()
+            .into_iter()
+            .filter_map(|(peer, stream, payload)| {
+                if stream.is_some() {
+                    return None;
+                }
+                let (channel, inner) = orrery_net::channels::untag(&payload)?;
+                (channel == Channel::State).then(|| (peer, inner.to_vec()))
+            })
+            .collect()
+    }
+
+    fn step_and_send(bot: &mut Bot, tick: u64) -> Vec<(NodeId, Vec<u8>)> {
+        bot.step_core(tick, default_cell_edge_m());
+        if tick % 3 == 2 {
+            bot.broadcast_state(tick);
+        }
+        bot.update();
+        drain_replication(bot)
+    }
+
+    #[test]
+    fn a_delta_stream_reconstructs_the_same_replica_states_as_the_snapshot_stream() {
+        let mut delta_sender = replication_test_bot(19);
+        let mut snapshot_control = replication_test_bot(19);
+        let receiver = bot_key(31).public();
+        delta_sender.link(receiver, 1_200);
+        let receiver_entry = audience_entry(&mut delta_sender, receiver);
+        delta_sender.set_island(vec![receiver_entry]);
+        let mut keyframes = ReplicaKeyframes::default();
+
+        for tick in 0..180 {
+            let sent = step_and_send(&mut delta_sender, tick);
+            snapshot_control.step_core(tick, default_cell_edge_m());
+            snapshot_control.update();
+            if tick % 3 != 2 {
+                assert!(sent.is_empty());
+                continue;
+            }
+
+            let control_canonical = snapshot_control.state().to_canonical();
+            let control_payload = encode_replication_compressed(&(
+                control_canonical,
+                snapshot_control.cell().expect("committed"),
+                snapshot_control.entity(),
+                tick + 1,
+            ));
+            let (control, ..) =
+                orrery_net::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(
+                    &control_payload,
+                )
+                .expect("full-snapshot control decodes");
+            assert_eq!(sent.len(), 1, "moving craft emits one state per send");
+            let reconstructed = decode_replica(&sent[0].1, &mut keyframes)
+                .expect("the receiver reconstructs every authored state");
+            assert_eq!(
+                reconstructed.canonical, control,
+                "receiver trajectory diverged from the same-seed full-snapshot control at tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newly_interested_peer_receives_a_keyframe_before_any_delta() {
+        let mut sender = replication_test_bot(19);
+        let established = bot_key(30).public();
+        let joining = bot_key(31).public();
+        sender.link(established, 1_200);
+        sender.link(joining, 1_200);
+        let established_entry = audience_entry(&mut sender, established);
+        sender.set_island(vec![established_entry]);
+        for tick in 0..3 {
+            let _ = step_and_send(&mut sender, tick);
+        }
+
+        let established_entry = audience_entry(&mut sender, established);
+        let joining_entry = audience_entry(&mut sender, joining);
+        sender.set_island(vec![established_entry, joining_entry]);
+        let mut first_joiner_payloads = Vec::new();
+        for tick in 3..6 {
+            first_joiner_payloads.extend(
+                step_and_send(&mut sender, tick)
+                    .into_iter()
+                    .filter(|(peer, _)| *peer == joining)
+                    .map(|(_, payload)| payload),
+            );
+        }
+        assert_eq!(
+            first_joiner_payloads.len(),
+            1,
+            "a late joiner receives only its 27-cell neighborhood, but a newly interested peer did not receive exactly one immediate anchor"
+        );
+        assert!(
+            orrery_net::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(
+                &first_joiner_payloads[0]
+            )
+            .is_some(),
+            "the first packet to a newly interested peer must be a keyframe"
+        );
+        assert!(!is_delta_payload(&first_joiner_payloads[0]));
+
+        let next = (6..9)
+            .flat_map(|tick| step_and_send(&mut sender, tick))
+            .find(|(peer, _)| *peer == joining)
+            .expect("the joining peer receives the following update");
+        assert!(is_delta_payload(&next.1));
+    }
+
+    #[test]
+    fn a_shed_or_lost_delta_is_fully_superseded_by_the_next() {
+        let mut sender = replication_test_bot(19);
+        let receiver = bot_key(31).public();
+        sender.link(receiver, 1_200);
+        let receiver_entry = audience_entry(&mut sender, receiver);
+        sender.set_island(vec![receiver_entry]);
+
+        let mut updates = Vec::new();
+        let mut expected = Vec::new();
+        for tick in 0..9 {
+            let sent = step_and_send(&mut sender, tick);
+            if tick % 3 == 2 {
+                assert_eq!(sent.len(), 1);
+                updates.push(sent[0].1.clone());
+                expected.push(sender.state().to_canonical());
+            }
+        }
+        assert!(!is_delta_payload(&updates[0]), "first send is an anchor");
+        assert!(
+            is_delta_payload(&updates[1]),
+            "arbitrary dropped send is a delta"
+        );
+        assert!(
+            is_delta_payload(&updates[2]),
+            "following send is still before the keyframe"
+        );
+
+        let mut keyframes = ReplicaKeyframes::default();
+        let anchor = decode_replica(&updates[0], &mut keyframes).expect("anchor decodes");
+        assert_eq!(anchor.canonical, expected[0]);
+        // `updates[1]` is lost or shed. Applying the following delta directly
+        // to the retained keyframe must nevertheless produce the full state.
+        let converged = decode_replica(&updates[2], &mut keyframes)
+            .expect("the following delta remains independently decodable");
+        assert_eq!(converged.canonical, expected[2]);
+    }
+
+    #[test]
+    fn a_size_fallback_waits_for_the_staggered_keyframe_slot() {
+        let entity = PersistId::new(7);
+        let cell = CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL).expect("origin cell");
+        let keyframe = vec![0; 128];
+        let current = vec![1; 128];
+        let absolute = (current.clone(), cell, entity, 6);
+        let delta = ReplicationDelta {
+            entity,
+            tick: 6,
+            keyframe_age: 3,
+            cell: None,
+            patch: encode_delta_patch(&keyframe, &current),
+        };
+        assert!(
+            encode_delta_if_smaller(&absolute, &delta).is_none(),
+            "the codec selected an absolute fallback; an off-phase sender must wait instead of bypassing the keyframe stagger"
+        );
+    }
 
     /// One tick of this harness's roam under `rules`, on `archetype`.
     fn hash_after_a_thrust(rules: Regolith, archetype: Archetype) -> [u8; 32] {

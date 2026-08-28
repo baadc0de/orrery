@@ -253,6 +253,8 @@ pub struct PeerReport {
     /// empty world — the most expensive kind of green, and one this harness
     /// produced for real before this counter existed.
     pub undecodable: u64,
+    /// Deltas dropped because their referenced keyframe was absent.
+    pub deltas_unanchored: u64,
 }
 
 /// Everything needed to reproduce a run, and to say which code produced it.
@@ -353,6 +355,8 @@ pub struct SwarmReport {
     pub stranded_in_flight: usize,
     /// Inbound state packets no peer could decode.
     pub total_undecodable: u64,
+    /// Deltas no receiver could apply for want of their exact keyframe.
+    pub deltas_unanchored: u64,
     /// Replica entities held across the swarm at the end of the run.
     pub total_replicas: usize,
     /// Whether the witness pipeline ran.
@@ -429,6 +433,18 @@ pub struct SwarmReport {
     pub observation_coverage: f64,
     /// Wire bytes the swarm spent on replicated entity state.
     pub replication_bytes: u64,
+    /// Absolute keyframes offered to the send path, per recipient.
+    pub keyframe_messages: u64,
+    /// Keyframe-referenced deltas offered to the send path, per recipient.
+    pub delta_messages: u64,
+    /// Keyframe wire bytes offered to the send path, including overhead.
+    pub keyframe_bytes: u64,
+    /// Delta wire bytes offered to the send path, including overhead.
+    pub delta_bytes: u64,
+    /// Keyframes' share of replication messages, in 0.0–1.0.
+    pub keyframe_message_share: f64,
+    /// Keyframes' share of replication wire bytes, in 0.0–1.0.
+    pub keyframe_byte_share: f64,
     /// Wire bytes the swarm spent on the verifiable-core lane: log frames and
     /// state claims (docs/03-replication.md §5.3a).
     pub witness_bytes: u64,
@@ -961,6 +977,9 @@ impl Swarm {
                 bots[seeded.owner_slot]
                     .host_entity(seeded.entity, RegolithState::Rock(seeded.rock));
             }
+        }
+        for bot in &mut bots {
+            bot.set_replication_send_hz(config.send_hz);
         }
         if config.delta_stats {
             for bot in &mut bots {
@@ -1722,6 +1741,7 @@ impl Swarm {
                     tagged,
                     proxied,
                     undecodable,
+                    deltas_unanchored: bot.replica_counters().deltas_unanchored,
                 }
             })
             .collect();
@@ -1746,6 +1766,20 @@ impl Swarm {
             }
             total.report()
         });
+        let replication_wire = self.bots.iter().map(Bot::replication_wire_counters).fold(
+            crate::bot::ReplicationWireCounters::default(),
+            |mut total, peer| {
+                total.keyframe_messages += peer.keyframe_messages;
+                total.delta_messages += peer.delta_messages;
+                total.keyframe_bytes += peer.keyframe_bytes;
+                total.delta_bytes += peer.delta_bytes;
+                total
+            },
+        );
+        let replication_messages =
+            replication_wire.keyframe_messages + replication_wire.delta_messages;
+        let measured_replication_bytes =
+            replication_wire.keyframe_bytes + replication_wire.delta_bytes;
 
         SwarmReport {
             identity: RunIdentity {
@@ -1779,6 +1813,7 @@ impl Swarm {
             total_interest_churn: per_peer.iter().map(|p| p.interest_churn).sum(),
             stranded_in_flight: self.router.in_flight(),
             total_undecodable: per_peer.iter().map(|p| p.undecodable).sum(),
+            deltas_unanchored: per_peer.iter().map(|p| p.deltas_unanchored).sum(),
             total_replicas: per_peer.iter().map(|p| p.replicas).sum(),
             witnessing: self.config.witnessing,
             external: self
@@ -1887,6 +1922,20 @@ impl Swarm {
                 }
             },
             replication_bytes: lanes.replication_bytes,
+            keyframe_messages: replication_wire.keyframe_messages,
+            delta_messages: replication_wire.delta_messages,
+            keyframe_bytes: replication_wire.keyframe_bytes,
+            delta_bytes: replication_wire.delta_bytes,
+            keyframe_message_share: if replication_messages == 0 {
+                0.0
+            } else {
+                replication_wire.keyframe_messages as f64 / replication_messages as f64
+            },
+            keyframe_byte_share: if measured_replication_bytes == 0 {
+                0.0
+            } else {
+                replication_wire.keyframe_bytes as f64 / measured_replication_bytes as f64
+            },
             witness_bytes: lanes.witness_bytes,
             control_bytes: lanes.control_bytes,
             witness_lane_share: lanes.witness_share(),
@@ -2272,11 +2321,11 @@ impl SwarmReport {
                         .to_owned(),
                 });
             }
-            if join.tracked > join.in_neighbourhood {
+            if join.tracked != join.in_neighbourhood {
                 failures.push(CriterionFailure {
                     clause: "a late joiner receives only its 27-cell neighborhood",
                     detail: format!(
-                        "tracked {} peers with only {} in the neighbourhood",
+                        "tracked {} peers with {} in the neighbourhood",
                         join.tracked, join.in_neighbourhood
                     ),
                 });
@@ -2730,6 +2779,7 @@ mod tests {
             total_interest_churn: 8_426,
             stranded_in_flight: 0,
             total_undecodable: 0,
+            deltas_unanchored: 0,
             total_replicas: 992,
             witnessing: true,
             external: Vec::new(),
@@ -2760,6 +2810,12 @@ mod tests {
             deferral_ledger_balances: true,
             observation_coverage: 0.96,
             replication_bytes: 0,
+            keyframe_messages: 0,
+            delta_messages: 0,
+            keyframe_bytes: 0,
+            delta_bytes: 0,
+            keyframe_message_share: 0.0,
+            keyframe_byte_share: 0.0,
             witness_bytes: 0,
             control_bytes: 0,
             witness_lane_share: 0.45,
@@ -3486,6 +3542,7 @@ mod tests {
 
         let mut confirmed = false;
         let mut collided: Option<Rock> = None;
+        let mut keyframes = crate::bot::ReplicaKeyframes::default();
         while let Ok(frame) = remote_link
             .downlink
             .lock()
@@ -3511,16 +3568,11 @@ mod tests {
                 Lane::Datagram => {
                     let state = orrery_protocol::channels::untag(&frame.payload)
                         .and_then(|(_, inner)| {
-                            orrery_protocol::channels::decode_replication::<(
-                                Vec<u8>,
-                                CellId,
-                                PersistId,
-                                u64,
-                            )>(inner)
+                            crate::bot::decode_replica(inner, &mut keyframes).ok()
                         })
-                        .and_then(|(encoded, _, entity, _)| {
-                            (entity == target.entity)
-                                .then(|| RegolithState::decode(&encoded).ok())
+                        .and_then(|replication| {
+                            (replication.entity == target.entity)
+                                .then(|| RegolithState::decode(&replication.canonical).ok())
                                 .flatten()
                         });
                     if let Some(RegolithState::Rock(rock)) = state {
