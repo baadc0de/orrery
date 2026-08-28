@@ -72,6 +72,14 @@ const SEND_HZ: u32 = 20;
 /// Ticks between state broadcasts (`TICK_HZ / SEND_HZ`, floored at one).
 const SEND_EVERY_TICKS: u64 = (orrery_core::TICK_HZ / SEND_HZ) as u64;
 
+/// State broadcasts between absolute replication keyframes.
+///
+/// The gateway's sender-clocked path uses a one-hertz absolute heartbeat and
+/// patches every intervening canonical state against it. This client has one
+/// authored entity, but keeps the same cadence so a human upload obeys the
+/// arithmetic the swarm gate measures.
+const KEYFRAME_EVERY_SENDS: u64 = SEND_HZ as u64;
+
 /// How long a remote state remains drawable without a replication refresh.
 ///
 /// This matches the headless peer's two-second replica lifetime: twice the
@@ -455,14 +463,31 @@ pub struct CampaignRuntime {
     pending_delivered: Vec<DeliveredOrder>,
     pending_routing: Vec<(PersistId, Order)>,
     replica_freshness: BTreeMap<PersistId, ReplicaFreshness>,
+    /// Last absolute sample for each remote entity, used to reconstruct its
+    /// keyframe-referenced deltas.
+    replica_keyframes: BTreeMap<PersistId, ReplicationKeyframe>,
     focus: Option<PersistId>,
     latest_cell: Option<CellId>,
+    /// This client's most recently emitted absolute sample. Every outbound
+    /// delta patches these canonical bytes, never the preceding delta.
+    broadcast_keyframe: Option<ReplicationKeyframe>,
+    /// Number of authored state-send opportunities so keyframes use the same
+    /// per-entity stagger as the swarm gate.
+    broadcast_send_index: u64,
     /// Client-only received hearsay. This stays outside the executor and
     /// reaches only the crate-private rendering view.
     hearsay: crate::hearsay::HearsayState,
 
     campaign: CampaignSession,
     record_written: bool,
+}
+
+/// Canonical bytes and metadata carried by an absolute replication keyframe.
+#[derive(Clone)]
+struct ReplicationKeyframe {
+    canonical: Vec<u8>,
+    cell: CellId,
+    at: u64,
 }
 
 /// One inbound Meta-lane payload, classified by the client's grammar.
@@ -491,6 +516,22 @@ fn classify_meta(payload: &[u8]) -> MetaFrame {
     } else {
         MetaFrame::Ignored
     }
+}
+
+/// Whether a delta references the keyframe this client actually holds.
+///
+/// A delta is a patch against one specific keyframe. Applying it to a
+/// *different* one produces bytes that decode successfully and are silently
+/// wrong -- a corrupt replica with no error anywhere, which is the worst
+/// failure shape available here. The age field is the sender's claim about
+/// which keyframe it patched; this is where that claim is checked against
+/// what we hold.
+///
+/// Extracted from `advance` so the rule is reachable by test: the branch
+/// itself needs a live `CampaignLink` and a dial thread, and severing it left
+/// the whole suite green.
+fn delta_is_anchored(keyframe_at: u64, delta_tick: u64, keyframe_age: u16) -> bool {
+    delta_tick.checked_sub(u64::from(keyframe_age)) == Some(keyframe_at)
 }
 
 impl CampaignRuntime {
@@ -662,8 +703,11 @@ impl CampaignRuntime {
             pending_delivered: Vec::new(),
             pending_routing: Vec::new(),
             replica_freshness: BTreeMap::new(),
+            replica_keyframes: BTreeMap::new(),
             focus: None,
             latest_cell: None,
+            broadcast_keyframe: None,
+            broadcast_send_index: 0,
             hearsay: crate::hearsay::HearsayState::default(),
             record_written: false,
             config,
@@ -1073,25 +1117,34 @@ impl CampaignRuntime {
         if tick.0 % SEND_EVERY_TICKS == SEND_EVERY_TICKS - 1 {
             let cell = self.committed_cell();
             self.latest_cell = Some(cell);
-            let payload = encode_state_broadcast(&self.executor, self.entity, cell, tick.0 + 1);
-            for recipient in self.broadcast_recipients() {
-                let datagram = UplinkDatagram {
-                    sequence: self.uplink_sequence,
-                    payload: Bytes::clone(&payload),
-                };
-                self.uplink_sequence = self.uplink_sequence.wrapping_add(1);
-                self.uplink_sent += 1;
-                let frame = net::Frame {
-                    peer: recipient as u32,
-                    lane: Lane::Datagram,
-                    payload: datagram.encode(),
-                };
-                match link.try_uplink(frame) {
-                    Ok(()) => {
-                        self.pending_broadcast_recipients
-                            .insert(datagram.sequence, recipient);
+            let payload = encode_state_broadcast(
+                &self.executor,
+                self.entity,
+                cell,
+                tick.0 + 1,
+                &mut self.broadcast_keyframe,
+                &mut self.broadcast_send_index,
+            );
+            if let Some(payload) = payload {
+                for recipient in self.broadcast_recipients() {
+                    let datagram = UplinkDatagram {
+                        sequence: self.uplink_sequence,
+                        payload: Bytes::clone(&payload),
+                    };
+                    self.uplink_sequence = self.uplink_sequence.wrapping_add(1);
+                    self.uplink_sent += 1;
+                    let frame = net::Frame {
+                        peer: recipient as u32,
+                        lane: Lane::Datagram,
+                        payload: datagram.encode(),
+                    };
+                    match link.try_uplink(frame) {
+                        Ok(()) => {
+                            self.pending_broadcast_recipients
+                                .insert(datagram.sequence, recipient);
+                        }
+                        Err(_) => self.uplink_shed += 1,
                     }
-                    Err(_) => self.uplink_shed += 1,
                 }
             }
         }
@@ -1148,6 +1201,14 @@ impl CampaignRuntime {
                     };
                     match decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(&inner) {
                         Some((encoded, _cell, entity, at)) => {
+                            self.replica_keyframes.insert(
+                                entity,
+                                ReplicationKeyframe {
+                                    canonical: encoded.clone(),
+                                    cell: _cell,
+                                    at,
+                                },
+                            );
                             match <RegolithState as CoreCodec>::decode(&encoded) {
                                 Ok(state) => {
                                     if entity != self.entity {
@@ -1173,12 +1234,56 @@ impl CampaignRuntime {
                             self.campaign
                                 .observe_arrival(arrival.missing, arrival.deviation_ms);
                         }
-                        None => {
-                            // Witness frames share this sub-tagged lane
-                            // upstream; neither is replication we can read.
-                            // Counted, so a silent empty world cannot hide.
-                            self.undecodable += 1;
-                        }
+                        None => match orrery_protocol::channels::decode_replication_delta(&inner) {
+                            Some(delta) => {
+                                let Some(keyframe) = self.replica_keyframes.get(&delta.entity)
+                                else {
+                                    self.undecodable += 1;
+                                    continue;
+                                };
+                                if !delta_is_anchored(keyframe.at, delta.tick, delta.keyframe_age) {
+                                    self.undecodable += 1;
+                                    continue;
+                                }
+                                let Some(encoded) = orrery_protocol::channels::apply_delta_patch(
+                                    &keyframe.canonical,
+                                    &delta.patch,
+                                ) else {
+                                    self.undecodable += 1;
+                                    continue;
+                                };
+                                let _cell = delta.cell.unwrap_or(keyframe.cell);
+                                match <RegolithState as CoreCodec>::decode(&encoded) {
+                                    Ok(state) => {
+                                        if delta.entity != self.entity {
+                                            let _ = refresh_replica(
+                                                &mut self.replica_freshness,
+                                                delta.entity,
+                                                frame.peer,
+                                                tick.0,
+                                                delta.tick,
+                                            );
+                                        }
+                                        self.executor.insert(delta.entity, state);
+                                        if delta.entity != self.entity && self.focus.is_none() {
+                                            self.focus = Some(delta.entity);
+                                        }
+                                        let arrival =
+                                            self.downlink.record(frame.peer, delta.tick, now_ms);
+                                        self.downlink_arrivals += 1;
+                                        self.campaign
+                                            .observe_arrival(arrival.missing, arrival.deviation_ms);
+                                    }
+                                    Err(_) => self.undecodable += 1,
+                                }
+                            }
+                            None => {
+                                // Witness frames share this sub-tagged lane
+                                // upstream; neither is replication we can read.
+                                // Counted, so a silent empty world cannot hide.
+                                self.undecodable += 1;
+                            }
+                        },
                     }
                 }
                 Lane::StreamShared => {
@@ -1621,31 +1726,75 @@ fn encode_state_broadcast(
     entity: PersistId,
     cell: CellId,
     at: u64,
-) -> Bytes {
+    keyframe: &mut Option<ReplicationKeyframe>,
+    send_index: &mut u64,
+) -> Option<Bytes> {
     let encoded = match executor.state(entity) {
         Some(state) => state.to_canonical(),
         None => Vec::new(),
     };
-    // The harness's exact wire bytes. `broadcast_state` builds
-    // `encode_replication(...)` — `[State][TAG_REPLICATION][postcard]` — and
-    // `send_peer_packets` then tags the whole payload again with its channel
-    // (`tag(Channel::State, …)`), so what a bot's receive path unwraps is
-    // `[State][State][TAG_REPLICATION][postcard]`: one channel tag stripped
-    // by `receive_peer_packets`, the second by `decode_replication`. #386
-    // sent the single-tagged form and every one of its broadcasts was
-    // counted undecodable by every bot on the island (found by the first
-    // real two-process run, #387); the fixture now pins the double tag.
-    Bytes::from(orrery_protocol::channels::tag(
-        orrery_protocol::channels::Channel::State,
-        // Compressed, like the harness (`bot.rs`). #649 taught
-        // `decode_replication` both tags and switched the harness's own
-        // broadcast, but left this one plain -- so every byte a real player
-        // sent stayed uncompressed while the measured bots' did not, and the
-        // 32-peer numbers the gate reports were quietly better than what a
-        // human client actually puts on the wire. The encoder only keeps the
-        // compressed form when it is smaller, so the tag never costs bytes.
-        &orrery_protocol::channels::encode_replication_compressed(&(encoded, cell, entity, at)),
-    ))
+    // The harness's exact wire bytes. Its keyframes and deltas both carry the
+    // inner State channel tag, then `send_peer_packets` adds the outer tag.
+    // What a bot's receive path unwraps is therefore
+    // `[State][State][replication envelope]`: one channel tag stripped by
+    // `receive_peer_packets`, the second by the replication decoder. #386
+    // sent the single-tagged form and every broadcast was counted undecodable
+    // by every bot on the island (found by the first real two-process run,
+    // #387); the fixture now pins the double tag.
+    encode_keyframe_or_delta(encoded, cell, entity, at, keyframe, send_index).map(|payload| {
+        Bytes::from(orrery_protocol::channels::tag(
+            orrery_protocol::channels::Channel::State,
+            &payload,
+        ))
+    })
+}
+
+/// Encode one client state broadcast with the same keyframe-referenced delta
+/// arithmetic as the swarm bot.
+fn encode_keyframe_or_delta(
+    encoded: Vec<u8>,
+    cell: CellId,
+    entity: PersistId,
+    at: u64,
+    keyframe: &mut Option<ReplicationKeyframe>,
+    send_index: &mut u64,
+) -> Option<Vec<u8>> {
+    let absolute = (encoded.clone(), cell, entity, at);
+    let keyframe_due = keyframe.as_ref().is_none()
+        || *send_index % KEYFRAME_EVERY_SENDS == entity.0 % KEYFRAME_EVERY_SENDS;
+    *send_index = (*send_index).wrapping_add(1);
+    if keyframe_due {
+        *keyframe = Some(ReplicationKeyframe {
+            canonical: encoded,
+            cell,
+            at,
+        });
+        return Some(orrery_protocol::channels::encode_replication_compressed(
+            &absolute,
+        ));
+    }
+
+    let previous = keyframe.as_ref().expect("keyframe checked above");
+    let cell_changed = cell != previous.cell;
+    if encoded == previous.canonical && !cell_changed {
+        return None;
+    }
+    let delta = orrery_protocol::channels::ReplicationDelta {
+        entity,
+        tick: at,
+        keyframe_age: u16::try_from(at.saturating_sub(previous.at))
+            .expect("keyframe age fits between one-hertz broadcasts"),
+        cell: cell_changed.then_some(cell),
+        patch: orrery_protocol::channels::encode_delta_patch(&previous.canonical, &encoded),
+    };
+    let wire = orrery_protocol::channels::encode_replication_delta(&absolute, &delta);
+    let is_delta = orrery_protocol::channels::untag(&wire).is_some_and(|(_, body)| {
+        body.first() == Some(&orrery_protocol::channels::TAG_REPLICATION_DELTA)
+    });
+    // The codec's smaller-only fallback is an absolute keyframe. Sending it
+    // here would bypass the per-entity stagger and recreate a peak burst, so
+    // leave this state for the next scheduled keyframe like the swarm gate.
+    is_delta.then_some(wire)
 }
 
 /// Decode lowercase/uppercase hex into bytes, with a reason on refusal.
@@ -1735,8 +1884,17 @@ mod tests {
             )),
         );
 
-        let wire =
-            encode_state_broadcast(&executor, entity, CellId::from_bits(7).expect("a cell"), 9);
+        let mut keyframe = None;
+        let mut send_index = 0;
+        let wire = encode_state_broadcast(
+            &executor,
+            entity,
+            CellId::from_bits(7).expect("a cell"),
+            9,
+            &mut keyframe,
+            &mut send_index,
+        )
+        .expect("first broadcast is a keyframe");
 
         let (channel, inner) = untag(&wire).expect("the outer channel tag");
         assert_eq!(channel, Channel::State);
@@ -1751,6 +1909,32 @@ mod tests {
             Some(TAG_REPLICATION_COMPRESSED),
             "canonical craft state compresses, so the broadcast must leave as \
              {TAG_REPLICATION_COMPRESSED:#x} rather than plain {TAG_REPLICATION:#x}"
+        );
+    }
+
+    /// A delta may only be applied to the keyframe it was patched against.
+    ///
+    /// Severing this check left every test green, and the consequence is not
+    /// a decode error: `apply_delta_patch` against the wrong keyframe returns
+    /// bytes that decode into a *plausible, wrong* state. A silently corrupt
+    /// replica is worse than a dropped frame, because nothing counts it.
+    #[test]
+    fn a_delta_may_only_be_applied_to_the_keyframe_it_names() {
+        assert!(
+            delta_is_anchored(600, 640, 40),
+            "tick 640 minus an age of 40 is the keyframe at 600"
+        );
+        assert!(
+            !delta_is_anchored(600, 640, 39),
+            "an off-by-one age names a keyframe this client does not hold"
+        );
+        assert!(
+            !delta_is_anchored(600, 640, 41),
+            "and so does an age one too large"
+        );
+        assert!(
+            !delta_is_anchored(600, 10, 40),
+            "a delta older than its own age underflows rather than anchoring"
         );
     }
 
@@ -2217,10 +2401,33 @@ mod tests {
         let game = Regolith::honest();
         let mut executor = Executor::new(game, UniverseSeed([9u8; 32]));
         let entity = PersistId::new(5);
-        executor.insert(entity, game.spawn(entity, 4));
+        let keyframe_state = game.spawn(entity, 4);
+        executor.insert(entity, keyframe_state.clone());
+        let keyframe_canonical = executor
+            .state(entity)
+            .expect("inserted keyframe state")
+            .to_canonical();
         let cell = CellId::from_coords(IVec3::ONE, orrery_protocol::INTEREST_LEVEL)
             .expect("representable cell");
-        let bytes = encode_state_broadcast(&executor, entity, cell, 42);
+        let mut keyframe = None;
+        let mut send_index = 0;
+        let bytes =
+            encode_state_broadcast(&executor, entity, cell, 42, &mut keyframe, &mut send_index)
+                .expect("first broadcast is a keyframe");
+        let expected_keyframe = orrery_protocol::channels::tag(
+            orrery_protocol::channels::Channel::State,
+            &orrery_protocol::channels::encode_replication_compressed(&(
+                keyframe_canonical,
+                cell,
+                entity,
+                42_u64,
+            )),
+        );
+        assert_eq!(
+            bytes.as_ref(),
+            expected_keyframe,
+            "the client's keyframe bytes must be the gate bot's double-tagged wire"
+        );
         // Step 1: the bot-side channel untag.
         let (channel, inner) =
             orrery_protocol::channels::untag(&bytes).expect("outer channel tag present");
@@ -2233,6 +2440,47 @@ mod tests {
         assert!(
             <RegolithState as CoreCodec>::decode(&encoded).is_ok(),
             "the canonical state body round-trips"
+        );
+
+        let RegolithState::Craft(mut current_state) = keyframe_state else {
+            unreachable!("Regolith spawn is a craft")
+        };
+        current_state.pos.x += 1;
+        let current_state = RegolithState::Craft(current_state);
+        executor.insert(entity, current_state);
+        let current = executor
+            .state(entity)
+            .expect("inserted changed state")
+            .to_canonical();
+        let delta =
+            encode_state_broadcast(&executor, entity, cell, 45, &mut keyframe, &mut send_index)
+                .expect("changed state broadcasts a delta");
+        let expected_delta = orrery_protocol::channels::tag(
+            orrery_protocol::channels::Channel::State,
+            &orrery_protocol::channels::encode_replication_delta(
+                &(current.clone(), cell, entity, 45_u64),
+                &orrery_protocol::channels::ReplicationDelta {
+                    entity,
+                    tick: 45,
+                    keyframe_age: 3,
+                    cell: None,
+                    patch: orrery_protocol::channels::encode_delta_patch(&encoded, &current),
+                },
+            ),
+        );
+        assert_eq!(
+            delta.as_ref(),
+            expected_delta,
+            "the client's delta bytes must be the gate bot's double-tagged wire"
+        );
+        let (_, delta_inner) =
+            orrery_protocol::channels::untag(&delta).expect("delta outer channel tag");
+        let (_, delta_body) =
+            orrery_protocol::channels::untag(delta_inner).expect("delta inner channel tag");
+        assert_eq!(
+            delta_body.first().copied(),
+            Some(orrery_protocol::channels::TAG_REPLICATION_DELTA),
+            "the changed state pair must exercise the delta branch"
         );
     }
 
