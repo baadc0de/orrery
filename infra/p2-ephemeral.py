@@ -456,6 +456,29 @@ def qualify_with_retries(candidate: dict[str, Any], amis: dict[str, str]) -> dic
     return last
 
 
+def candidate_line(row: dict[str, Any]) -> str:
+    """One candidate's result line, including *why* when it is not qualified.
+
+    The reason matters more than the metrics here. Without it, a candidate
+    that never launched and one that launched and measured badly print the
+    same shape -- three `None` metrics -- so 47 identical rows read as a
+    fleet-wide hardware verdict rather than as one controller fault repeated
+    47 times. That misreading is not hypothetical: it is exactly what the
+    2026-08-24 nightly looked like, and the issue filed against it named the
+    wrong cause as a result.
+    """
+    measured = row.get("measured") or {}
+    detail = ""
+    if row.get("status") != "qualified" and row.get("reason"):
+        detail = f" reason={row['reason']!r}"
+    return (
+        f"{row['instance_type']}: {row['status']} "
+        f"barriers/s={measured.get('aggregate_barriers_per_s')} "
+        f"p99_ms={measured.get('worst_sync_p99_ms')} "
+        f"max_ms={measured.get('worst_sync_max_ms')}{detail}"
+    )
+
+
 def write_candidate_evidence(rows: list[dict[str, Any]]) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "candidate-qualification.json").write_text(
@@ -608,11 +631,14 @@ def controller() -> int:
             row = future.result()
             rows.append(row)
             measured = row.get("measured") or {}
-            print(
-                f"{row['instance_type']}: {row['status']} "
-                f"barriers/s={measured.get('aggregate_barriers_per_s')} "
-                f"p99_ms={measured.get('worst_sync_p99_ms')} max_ms={measured.get('worst_sync_max_ms')}"
-            )
+            # Print the reason too. Without it a candidate that never
+            # launched and one that launched and measured badly print the
+            # same shape -- three `None` metrics -- and 47 identical rows
+            # read as a fleet-wide hardware verdict rather than as one
+            # controller fault repeated 47 times. That misreading is not
+            # hypothetical: it is what the 2026-08-24 nightly looked like,
+            # and the issue filed against it named the wrong cause.
+            print(candidate_line(row))
     rows.sort(key=lambda row: row["instance_type"])
     write_candidate_evidence(rows)
     winner = select_gate_candidate(rows)
@@ -636,6 +662,32 @@ def self_test() -> int:
     for needle in required_q:
         if needle not in q:
             raise ControllerError(f"self-test: qualification user data lost guarded stage {needle!r}")
+    # A launch failure and a bad measurement must not print the same shape.
+    # 47 rows of three `None`s with no reason is what sent #623's diagnosis
+    # to the wrong cause; the reason is what distinguishes them.
+    errored = candidate_line(
+        {"instance_type": "c6gd.2xlarge", "status": "error", "reason": "boom"}
+    )
+    if "reason='boom'" not in errored:
+        raise ControllerError(
+            "self-test: an errored candidate must print why it failed, not "
+            f"only three empty metrics; got {errored!r}"
+        )
+    if "barriers/s=None" not in errored:
+        raise ControllerError("self-test: the metric columns must still be printed")
+    passed = candidate_line(
+        {
+            "instance_type": "c6gd.2xlarge",
+            "status": "qualified",
+            "reason": "unused",
+            "measured": {"aggregate_barriers_per_s": 941.0},
+        }
+    )
+    if "reason=" in passed:
+        raise ControllerError(
+            f"self-test: a qualified candidate needs no reason column; got {passed!r}"
+        )
+
     required_g = [
         ".github/actions/foundationdb/action.yml", "foundationdb-server_", "mount --bind /mnt/orrery-nvme/foundationdb /var/lib/foundationdb",
         "mount -t tmpfs", "P2_GATE_DATA_DIR=\"$data_dir\"", "P2_GATE_PROVISIONING_JSON=/tmp/provisioning.json",
