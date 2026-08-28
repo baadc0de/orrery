@@ -529,6 +529,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<legend::LegendState>()
             .init_resource::<MetricWindow>()
             .init_resource::<CameraZoom>()
+            .init_resource::<starfield::StarDrift>()
             .init_resource::<aoi::AoiBoundary>()
             .init_resource::<aoi::AoiFadeCensus>()
             .insert_resource(ship_roster)
@@ -573,7 +574,14 @@ impl Plugin for RegolithSkinPlugin {
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     follow_camera.after(sync_rendered_state),
-                    starfield::sync_starfield.after(follow_camera),
+                    (
+                        starfield::sync_starfield.after(follow_camera),
+                        // After `read_combat_state`, so the smear is drawn
+                        // from the velocity this frame's `CombatView` copied
+                        // out of the executor rather than the previous
+                        // frame's.
+                        starfield::drive_star_smear.after(read_combat_state),
+                    ),
                     sync_ship_labels.after(follow_camera),
                     // After `follow_camera` for the same reason the ship
                     // labels are: an edge arrow is a bearing taken from

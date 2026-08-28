@@ -664,6 +664,13 @@ impl CraftView {
         self.archetype.limits().max_speed_mms as f64 / 1_000.0
     }
 
+    /// Acceleration ceiling published by the chassis, in metres per second
+    /// squared.
+    #[must_use]
+    pub fn max_accel_mss(&self) -> f64 {
+        self.archetype.limits().max_accel_mmss as f64 / 1_000.0
+    }
+
     /// Current speed, in metres per second.
     #[must_use]
     pub fn speed_ms(&self) -> f64 {

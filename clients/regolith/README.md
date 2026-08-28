@@ -143,6 +143,40 @@ triple the host sent and nothing else.
 Nothing here is readable by intent submission, range, arc, lock or collision
 code, and the offline sandbox has no hearsay, so it draws no arrows.
 
+## The starfield reads out the throttle
+
+`src/starfield.rs` keeps the world-anchored, tiled field of #525 exactly as it
+was — a star's world position still never moves, and the tile lattice is
+untouched — and draws each star as a **smear along the craft's own replicated
+velocity**.
+
+* **Length is speed.** The mark is `speed x 0.2 s` long *in the layer's own
+  plane*, and 0.2 s is `hud::TRACER_PERSISTENCE_TICKS` — the same window a
+  tracer streak stands for, so both marks on the screen mean *this far per
+  blink*. That length is not tuned: it is the segment the star genuinely
+  traces while the camera translates, so the near, middle and far layers smear
+  in exactly the 0.31 / 0.13 / 0.04 ratio their parallax already had, at every
+  zoom, with no per-layer number to keep in step.
+* **Brightness is thrust.** The field rests at 72% of each layer's declared
+  grey and reaches the full grey when the craft is gaining speed at its own
+  chassis's published acceleration ceiling. Coasting fast is long and dim;
+  opening the throttle is bright. Because Regolith's drag scales with speed,
+  full thrust at terminal velocity settles the light back down on its own —
+  nothing models that, it falls out of measuring the change of speed.
+* **The star does not move.** The mark runs from the star's true point
+  *backwards*, over ground the camera has already crossed. Nothing is ever
+  drawn ahead of where a star is.
+* **The ruleset owns the ceiling.** The drawn speed is clamped to
+  `Archetype::limits().max_speed_mms` for the craft's own chassis, so the sky
+  can never claim a speed the ruleset does not allow — and there is no copy of
+  that number in the client, so raising the cap raises the clamp.
+  `the_smear_never_outruns_the_chassis_speed_ceiling` is that clamp.
+* **No craft, no motion.** A client that holds no craft draws no smear at all
+  rather than coasting on the last velocity it saw.
+
+Nothing here is readable by intent submission, range, arc, lock or collision
+code, and the quantity it shows is the one the HUD already prints as a number.
+
 ## Verifying presentation without a desktop
 
 Presentation issues (#524, #530, #531) sat blocked for want of a way to see the
