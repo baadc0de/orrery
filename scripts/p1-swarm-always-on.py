@@ -64,6 +64,13 @@ class Supervisor:
                 "--peers", c["peers"], "--external-slots", c.get("humans", "1"),
                 "--lobby-seconds", str(LOBBY_SECONDS), "--seconds", c["seconds"], "--min-cells", "1",
                 "--impaired", "--witness", "--stamp-wall-clock", "--json", str(attempt / "raw.json"),
+                # Every directed seat pair, with a reason code (#612). The owner
+                # chose the log volume -- roughly 3,360 lines/min at eight seats
+                # against 1,060 without -- over being unable to classify the next
+                # "someone is shooting me and I cannot see them" report. That
+                # question has already cost one investigation, which concluded
+                # on evidence that turned out to be a logging-order artifact.
+                "--replica-scope-capture",
                 "--listening-file", str(listening), "--active-seats-file", str(active_seats),
                 "--issuer-key", issuer_key(self.args.issuer_key),
                 "--reservation-journal", str(self.args.reservation_journal),
@@ -179,6 +186,9 @@ class Tests(unittest.TestCase):
             self.assertEqual(command[command.index("--reservation-journal") + 1], str(root / "slots.json"))
             self.assertEqual(command[command.index("--attempt-id") + 1], "attempt-7")
             self.assertEqual(command[command.index("--active-seats-file") + 1], str(root / "state" / "active-seats.json"))
+            # The standing host must always capture scope; a live report we
+            # cannot classify is the expensive outcome, not the log volume.
+            self.assertIn("--replica-scope-capture", command)
 
     def test_failed_child_is_reaped_then_a_fresh_attempt_starts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
