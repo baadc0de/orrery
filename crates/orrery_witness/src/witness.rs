@@ -1023,12 +1023,21 @@ impl<R: Ruleset> Witness<R> {
             for record in &slice.records {
                 let RecordSource::NeighborFrame {
                     neighbor,
-                    present: _,
+                    present,
                     observed_tick,
                 } = record.source
                 else {
                     continue;
                 };
+                // `present` describes the reader's replicated view, not the
+                // neighbour's global existence. A claim held by this witness
+                // cannot prove that the reader received the corresponding
+                // state packet, so an honest absent read has nothing to
+                // cross-check. Replay below still requires an empty payload
+                // and reproduces the absence exactly.
+                if !present {
+                    continue;
+                }
                 let Some(watched_neighbor) = self.watched.get(&neighbor) else {
                     continue;
                 };

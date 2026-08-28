@@ -251,8 +251,8 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
 /// shots. Unlike a cell-edge change this does **not** move interest
 /// membership, so the blast radius stops at adjudication.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 16,
-    digest: [0x66; 32],
+    version: 17,
+    digest: [0x67; 32],
 };
 
 /// One canonical rock installed by the campaign composition root.

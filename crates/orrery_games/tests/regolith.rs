@@ -470,8 +470,8 @@ fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
 }
 
 #[test]
-fn v16_collision_order_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 16);
+fn v17_collision_order_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 17);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 240_000);
