@@ -116,6 +116,33 @@ name.
 `--help` prints the command-line usage before Bevy, identity loading, or window
 creation begins.
 
+## Contact arrows at the screen edge
+
+A crewed seat the campaign host names in its hearsay fold, and which this
+client is **not** currently replicating, gets one chevron on the window edge
+plus one ASCII line: the roster's label when there is one, then the fact's age
+in whole seconds. `A16` (`docs/plans/a16-hearsay-contact-arrows.md`) settles
+what that mark is allowed to mean, and `src/contact_arrows.rs` carries the
+list; the short version is that the arrow asserts the `(seat, cell, age)`
+triple the host sent and nothing else.
+
+* The bearing runs to the **centre of the reported 512 m cell**, recomputed as
+  the player moves and frozen between folds — no interpolation, no lead, no
+  trail, no inferred velocity, and no range readout.
+* The age is always on screen, and is carried a second time in the chevron's
+  alpha: a fold delivers facts 5-10 s old and they are dropped at 15 s, so an
+  arrow is never bright and never quite invisible.
+* A seat with a **live replica draws no arrow at all.** If the ship is on
+  screen, the body is the better statement about it.
+* An absent roster label draws **no name**, only the age. There is no
+  `UNKNOWN` and no `PLAYER 3`.
+* Two contacts on the same bearing stack **along that bearing**, inward from
+  the edge. Sliding them apart along the edge would invent a bearing the host
+  never sent.
+
+Nothing here is readable by intent submission, range, arc, lock or collision
+code, and the offline sandbox has no hearsay, so it draws no arrows.
+
 ## Verifying presentation without a desktop
 
 Presentation issues (#524, #530, #531) sat blocked for want of a way to see the

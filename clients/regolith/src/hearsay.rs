@@ -4,8 +4,9 @@
 //!
 //! The campaign host can send a delayed, coarse cell report for a craft this
 //! client does not currently replicate. This module keeps that latest report
-//! briefly and turns it into one **render-only** snapshot for the future
-//! screen-edge-arrow skin. It does not draw an arrow itself.
+//! briefly and turns it into one **render-only** snapshot for the
+//! screen-edge-arrow skin ([`crate::contact_arrows`]). It does not draw an
+//! arrow itself.
 //!
 //! This is presentation state, never game state. Nothing here is readable by
 //! intent submission, range, arc, lock, or collision code; it is not inserted
@@ -30,11 +31,6 @@
 //! distance-based fade: the AOI module fades a *live replica* as it approaches
 //! the interest boundary, whereas this one has no replica and expires only the
 //! no-longer-reported hearsay fact.
-
-#![allow(
-    dead_code,
-    reason = "A16 piece 4 is the first render consumer of this deliberately isolated view"
-)]
 
 use std::collections::BTreeMap;
 
