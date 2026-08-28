@@ -60,7 +60,8 @@ use orrery_protocol::{
 
 use crate::intent::{decode_packet, encode_orders, Controls, IntentPipeline, OrderPacket};
 use crate::net::{
-    self, CampaignLink, HostAddress, JoinRequest, Lane, UplinkAck, UplinkDatagram, UplinkOutcome,
+    self, CampaignLink, HearsayContacts, HostAddress, JoinRequest, Lane, UplinkAck, UplinkDatagram,
+    UplinkOutcome,
 };
 use crate::session::{Actor, CampaignSession, ConfiguredImpairment, SessionRecord};
 
@@ -456,9 +457,40 @@ pub struct CampaignRuntime {
     replica_freshness: BTreeMap<PersistId, ReplicaFreshness>,
     focus: Option<PersistId>,
     latest_cell: Option<CellId>,
+    /// Client-only received hearsay. This stays outside the executor and
+    /// reaches only the crate-private rendering view.
+    hearsay: crate::hearsay::HearsayState,
 
     campaign: CampaignSession,
     record_written: bool,
+}
+
+/// One inbound Meta-lane payload, classified by the client's grammar.
+///
+/// Extracted from `advance` so the classification is reachable by test: the
+/// branch itself needs a live `CampaignLink` and a dial thread, and an
+/// untested branch here fails silently -- hearsay simply never arrives, which
+/// looks exactly like a host that sent none.
+#[derive(Debug)]
+enum MetaFrame {
+    /// The router's settled uplink decision.
+    Ack(UplinkAck),
+    /// A host hearsay fold (#608).
+    Hearsay(HearsayContacts),
+    /// Some other member of the Meta grammar, not ours to interpret.
+    Ignored,
+}
+
+/// Reads one Meta payload. Ack first: the two tags are disjoint, and this
+/// order is what keeps a fold from being consumed as a malformed ack.
+fn classify_meta(payload: &[u8]) -> MetaFrame {
+    if let Some(ack) = UplinkAck::decode(payload) {
+        MetaFrame::Ack(ack)
+    } else if let Some(contacts) = HearsayContacts::decode(payload) {
+        MetaFrame::Hearsay(contacts)
+    } else {
+        MetaFrame::Ignored
+    }
 }
 
 impl CampaignRuntime {
@@ -632,6 +664,7 @@ impl CampaignRuntime {
             replica_freshness: BTreeMap::new(),
             focus: None,
             latest_cell: None,
+            hearsay: crate::hearsay::HearsayState::default(),
             record_written: false,
             config,
             executor,
@@ -877,6 +910,19 @@ impl CampaignRuntime {
         self.latest_cell
     }
 
+    /// The latest client-only hearsay view, for the rendering skin.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "A16 piece 4 is the first render consumer of this isolated view"
+    )]
+    pub(crate) fn hearsay_view(
+        &self,
+        roster: &crate::roster::ShipRoster,
+    ) -> crate::hearsay::HearsayRenderView {
+        self.hearsay.render_view(roster, self.tick.0)
+    }
+
     /// Drive one simulation tick of the joined session.
     ///
     /// Order mirrors the runner: produce orders through the shared pipeline,
@@ -1068,8 +1114,8 @@ impl CampaignRuntime {
         // ── Inbound: replicated state, acks, liveness ─────────────────────
         for frame in link.drain_downlink() {
             match frame.lane {
-                Lane::Meta => {
-                    if let Some(ack) = UplinkAck::decode(&frame.payload) {
+                Lane::Meta => match classify_meta(&frame.payload) {
+                    MetaFrame::Ack(ack) => {
                         // THE uplink measurement: the router's settled
                         // decision, not a transport write.
                         let dropped = ack.outcome == UplinkOutcome::Dropped;
@@ -1082,8 +1128,10 @@ impl CampaignRuntime {
                             ack,
                         );
                     }
+                    MetaFrame::Hearsay(contacts) => self.hearsay.accept(contacts, tick.0),
                     // Anything else on meta is not ours to interpret.
-                }
+                    MetaFrame::Ignored => {}
+                },
                 Lane::Datagram => {
                     let now_ms = self.started_at.elapsed().as_secs_f64() * 1_000.0;
                     // Strip the outer channel tag first (the harness wire is
@@ -1172,6 +1220,7 @@ impl CampaignRuntime {
             &mut self.replica_freshness,
             &mut self.focus,
         );
+        self.hearsay.expire(tick.0);
         self.flush_pending_routes(&link);
 
         if !link.is_connected() || link.host_said_goodbye() {
@@ -1651,6 +1700,48 @@ fn platform_triple() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Bytes as the host's `exterior::HearsayContacts::encode` lays them out.
+    fn hearsay_wire(fold_tick: u64, seat: u8) -> Vec<u8> {
+        let mut out = vec![0xa2, 0x01];
+        out.extend_from_slice(&fold_tick.to_le_bytes());
+        out.push(1);
+        out.push(seat);
+        out.extend_from_slice(&7u64.to_le_bytes());
+        out.extend_from_slice(&300u16.to_le_bytes());
+        out
+    }
+
+    /// The branch `advance` takes for every inbound Meta frame. Without this,
+    /// severing the client's only wire-to-state feed leaves the suite green
+    /// and hearsay simply never arrives in a live game.
+    #[test]
+    fn a_host_fold_on_the_meta_lane_is_classified_as_hearsay() {
+        let classified = classify_meta(&hearsay_wire(600, 3));
+        let MetaFrame::Hearsay(contacts) = classified else {
+            panic!("a host fold must reach the hearsay arm, got {classified:?}");
+        };
+        assert_eq!(contacts.fold_tick, 600);
+        assert_eq!(contacts.contacts.len(), 1);
+        assert_eq!(contacts.contacts[0].seat, 3);
+    }
+
+    /// Ack precedence, both directions: the two tags are disjoint, so neither
+    /// decoder may consume the other's frame.
+    #[test]
+    fn an_ack_is_still_an_ack_and_never_a_fold() {
+        // [tag][outcome][sequence u64 LE] -- outcome precedes the sequence.
+        let mut ack = vec![0xa1, 0];
+        ack.extend_from_slice(&42u64.to_le_bytes());
+        assert!(
+            matches!(classify_meta(&ack), MetaFrame::Ack(_)),
+            "the ack arm keeps priority over hearsay"
+        );
+        assert!(
+            matches!(classify_meta(&[0xa3, 0x01]), MetaFrame::Ignored),
+            "an unknown Meta member is ignored, not guessed at"
+        );
+    }
+
     use super::*;
     use crate::session::{Actor, ConfiguredImpairment};
     use orrery_games::regolith::state::LockClass;
