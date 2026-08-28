@@ -180,6 +180,13 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      # `foundationdb-gen` does `include_bytes!` on
+      # /usr/include/foundationdb/fdb.options, so the header is a COMPILE-time
+      # dependency of this lane, not just a runtime one. Omitting it is what
+      # made this job's first run fail: the ci.yml original carries this step
+      # and the move to nightly dropped it.
+      - name: Install the FoundationDB client
+        uses: ./.github/actions/foundationdb
       - name: Install Bevy's Linux build dependencies
         run: |
           sudo apt-get update
