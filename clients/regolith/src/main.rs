@@ -327,8 +327,11 @@ fn named_peer_is_observed(
     local: orrery_protocol::PersistId,
     peer: Option<orrery_protocol::PersistId>,
     peer_is_replicated_craft: bool,
+    our_broadcast_to_peer_settled: bool,
 ) -> bool {
-    peer.is_some_and(|peer| peer != local) && peer_is_replicated_craft
+    peer.is_some_and(|peer| peer != local)
+        && peer_is_replicated_craft
+        && our_broadcast_to_peer_settled
 }
 
 fn monitor_headless_join(
@@ -368,7 +371,14 @@ fn monitor_headless_join(
                 peer_state,
                 Some(orrery_games::regolith::state::RegolithState::Craft(_))
             );
-            if named_peer_is_observed(runtime.entity(), peer, peer_is_replicated_craft) {
+            let our_broadcast_to_peer_settled =
+                peer.is_some_and(|entity| runtime.replication_is_mutual_with(entity));
+            if named_peer_is_observed(
+                runtime.entity(),
+                peer,
+                peer_is_replicated_craft,
+                our_broadcast_to_peer_settled,
+            ) {
                 let entity = peer.expect("the observation predicate requires an entity");
                 println!(
                     "PREFLIGHT PASS peer-observed nickname={expected} entity={}",
@@ -548,9 +558,19 @@ mod tests {
     fn headless_join_requires_the_named_peer_to_be_a_replicated_remote_craft() {
         let local = PersistId::new(7);
         let remote = PersistId::new(8);
-        assert!(!named_peer_is_observed(local, None, false));
-        assert!(!named_peer_is_observed(local, Some(remote), false));
-        assert!(!named_peer_is_observed(local, Some(local), true));
-        assert!(named_peer_is_observed(local, Some(remote), true));
+        assert!(!named_peer_is_observed(local, None, false, false));
+        assert!(!named_peer_is_observed(local, Some(remote), false, true));
+        assert!(!named_peer_is_observed(local, Some(local), true, true));
+        assert!(named_peer_is_observed(local, Some(remote), true, true));
+    }
+
+    #[test]
+    fn headless_join_waits_for_our_broadcast_to_the_observed_peer_to_settle() {
+        let local = PersistId::new(6);
+        let remote = PersistId::new(7);
+        assert!(
+            !named_peer_is_observed(local, Some(remote), true, false),
+            "receiving the peer is only one half of mutual observation"
+        );
     }
 }

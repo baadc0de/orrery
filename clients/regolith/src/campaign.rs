@@ -36,7 +36,7 @@
 //! be *compared against* the measurement, which is what
 //! `SessionRecord::impairment_mismatch` is for.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -433,6 +433,12 @@ pub struct CampaignRuntime {
     uplink_shed: u64,
     uplink_acks: u64,
     uplink_dropped: u64,
+    /// State datagrams awaiting the host router's settled decision, by
+    /// connection-local sequence and addressed swarm slot.
+    pending_broadcast_recipients: BTreeMap<u64, usize>,
+    /// Swarm slots to which the host router has retained at least one state
+    /// broadcast from this client.
+    settled_broadcast_recipients: BTreeSet<usize>,
     downlink: DownlinkTracker,
     downlink_arrivals: u64,
     undecodable: u64,
@@ -607,6 +613,8 @@ impl CampaignRuntime {
             uplink_shed: 0,
             uplink_acks: 0,
             uplink_dropped: 0,
+            pending_broadcast_recipients: BTreeMap::new(),
+            settled_broadcast_recipients: BTreeSet::new(),
             downlink: DownlinkTracker::default(),
             downlink_arrivals: 0,
             undecodable: 0,
@@ -718,15 +726,24 @@ impl CampaignRuntime {
     /// below it is exactly the rest of the island.
     #[must_use]
     fn broadcast_recipients(&self) -> Vec<usize> {
-        match &self.start {
-            Some(start) => start
-                .active_slots
-                .iter()
-                .copied()
-                .filter(|slot| *slot != self.config.slot)
-                .collect(),
-            None => (0..self.config.slot).collect(),
-        }
+        broadcast_recipients(self.start.as_ref(), self.config.slot)
+    }
+
+    /// Whether replication with one installed remote is proven in both
+    /// directions for the release preflight.
+    ///
+    /// The installed replica proves that peer's state reached this client.
+    /// The settled recipient proves the host's impaired router retained this
+    /// client's state addressed to the authenticated slot that authored the
+    /// replica. Waiting for both keeps a successful headless probe alive until
+    /// its half of the mutual exchange is beyond the async client writer.
+    #[must_use]
+    pub fn replication_is_mutual_with(&self, entity: PersistId) -> bool {
+        replication_is_mutual(
+            &self.replica_freshness,
+            &self.settled_broadcast_recipients,
+            entity,
+        )
     }
 
     /// Who witness claims and frames are addressed to.
@@ -1016,8 +1033,12 @@ impl CampaignRuntime {
                     lane: Lane::Datagram,
                     payload: datagram.encode(),
                 };
-                if link.try_uplink(frame).is_err() {
-                    self.uplink_shed += 1;
+                match link.try_uplink(frame) {
+                    Ok(()) => {
+                        self.pending_broadcast_recipients
+                            .insert(datagram.sequence, recipient);
+                    }
+                    Err(_) => self.uplink_shed += 1,
                 }
             }
         }
@@ -1048,6 +1069,11 @@ impl CampaignRuntime {
                         self.uplink_acks += 1;
                         self.uplink_dropped += u64::from(dropped);
                         self.campaign.observe_uplink_ack(dropped);
+                        settle_broadcast_ack(
+                            &mut self.pending_broadcast_recipients,
+                            &mut self.settled_broadcast_recipients,
+                            ack,
+                        );
                     }
                     // Anything else on meta is not ours to interpret.
                 }
@@ -1366,6 +1392,46 @@ fn replica_authority_slot(
         .map(|replica| replica.authority_slot)
 }
 
+fn broadcast_recipients(
+    start: Option<&crate::lobby::AcceptedStart>,
+    own_slot: usize,
+) -> Vec<usize> {
+    match start {
+        Some(start) => start
+            .active_slots
+            .iter()
+            .copied()
+            .filter(|slot| *slot != own_slot)
+            .collect(),
+        None => (0..own_slot).collect(),
+    }
+}
+
+fn settle_broadcast_ack(
+    pending: &mut BTreeMap<u64, usize>,
+    settled: &mut BTreeSet<usize>,
+    ack: UplinkAck,
+) {
+    let Some(recipient) = pending.remove(&ack.sequence) else {
+        return;
+    };
+    if ack.outcome == UplinkOutcome::Delivered {
+        settled.insert(recipient);
+    }
+}
+
+fn replication_is_mutual(
+    freshness: &BTreeMap<PersistId, ReplicaFreshness>,
+    settled: &BTreeSet<usize>,
+    entity: PersistId,
+) -> bool {
+    replica_authority_slot(freshness, entity).is_some_and(|slot| {
+        usize::try_from(slot)
+            .ok()
+            .is_some_and(|slot| settled.contains(&slot))
+    })
+}
+
 fn refresh_replica(
     freshness: &mut BTreeMap<PersistId, ReplicaFreshness>,
     entity: PersistId,
@@ -1581,6 +1647,69 @@ mod tests {
     use super::*;
     use crate::session::{Actor, ConfiguredImpairment};
     use orrery_games::regolith::state::LockClass;
+
+    #[test]
+    fn two_active_humans_are_mutual_broadcast_recipients_regardless_of_seat_order() {
+        let start = crate::lobby::AcceptedStart {
+            attempt_id: "attempt-594".to_owned(),
+            island_seats: 8,
+            active_slots: vec![0, 1, 2, 3, 4, 5, 6],
+            witness_recipients: Vec::new(),
+            duration_ticks: 216_000,
+        };
+        let from_a = broadcast_recipients(Some(&start), 5);
+        let from_b = broadcast_recipients(Some(&start), 6);
+
+        assert!(from_a.contains(&6), "slot 5 must broadcast up to slot 6");
+        assert!(from_b.contains(&5), "slot 6 must broadcast down to slot 5");
+    }
+
+    #[test]
+    fn mutual_observation_waits_for_our_broadcast_to_that_same_peer_to_settle() {
+        let peer = PersistId::new(7);
+        let freshness = BTreeMap::from([(
+            peer,
+            ReplicaFreshness {
+                last_refresh_tick: 10,
+                last_authoritative_tick: 9,
+                authority_slot: 6,
+                installed: true,
+            },
+        )]);
+        let mut pending = BTreeMap::from([(41, 6)]);
+        let mut settled = BTreeSet::new();
+
+        assert!(
+            !replication_is_mutual(&freshness, &settled, peer),
+            "receiving the peer does not prove our async writer sent back"
+        );
+        settle_broadcast_ack(
+            &mut pending,
+            &mut settled,
+            UplinkAck {
+                sequence: 41,
+                outcome: UplinkOutcome::Dropped,
+            },
+        );
+        assert!(
+            !replication_is_mutual(&freshness, &settled, peer),
+            "the impaired router dropping our reply is still one-way"
+        );
+
+        pending.insert(42, 6);
+        settle_broadcast_ack(
+            &mut pending,
+            &mut settled,
+            UplinkAck {
+                sequence: 42,
+                outcome: UplinkOutcome::Delivered,
+            },
+        );
+        assert!(
+            replication_is_mutual(&freshness, &settled, peer),
+            "the peer arrived here and our state is retained for its exact slot"
+        );
+    }
 
     #[test]
     fn authoritative_deliveries_are_composed_before_this_ticks_human_orders() {
