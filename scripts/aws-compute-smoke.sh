@@ -31,15 +31,19 @@
 #         the error string, not the exit code: DryRunOperation or a NotFound
 #         would mean the request was AUTHORISED, which is exactly the failure
 #         this probe exists to catch.
-#   N4  terminate-instances <untagged dummy id>
-#         No --dry-run needed: the tag guard denies before the id is ever
-#         looked up, so nothing can happen. If the aws:ResourceTag condition
-#         were missing, AWS would answer NotFound instead of denying — the
-#         runtime half of the mutation proof the self-test below does
-#         structurally.
-#   N5  create-tags outside a launch     -> UnauthorizedOperation
+#   N4  create-tags outside a launch     -> UnauthorizedOperation
 #         The ec2:CreateAction=RunInstances guard must make the
 #         retag-then-terminate lateral move impossible.
+#
+# Policy document shape, not a live AWS probe:
+#   S1  `TerminateTaggedOnly` permits `ec2:TerminateInstances` only when
+#       aws:ResourceTag/orrery-ci-ephemeral=true.
+#       This proves the checked-out Terraform policy still expresses the tag
+#       guard. It does NOT prove how EC2 evaluates that condition against a
+#       real untagged instance, nor that the checked-out policy is deployed.
+#       #622 removed N4 because EC2 now resolves a synthetic instance's
+#       existence before evaluating the tag condition; `NotFound` from that
+#       request therefore proves neither an allow nor a denial.
 #
 # Every figure lands in $COMPUTE_SMOKE_OUT/result.json, and the PASSED marker
 # is written last — a run killed mid-way leaves no marker, and evidence
@@ -61,9 +65,10 @@
 #     in prose, and a prose mention would satisfy a polarity-inverted check
 #     without the code carrying it.
 #
-# Structural passing does not prove AWS enforces anything; N3–N5 prove that,
-# nightly, against the real service. The two halves fail in different places
-# by design.
+# Structural passing does not prove AWS enforces anything. N1–N4 prove their
+# refusals nightly against the real service; S1 proves only the Terraform policy
+# shape for termination. The two kinds of check fail in different places by
+# design.
 set -euo pipefail
 
 readonly NAME=aws-compute-smoke
@@ -75,6 +80,74 @@ KACHE_BUCKET=${ORRERY_KACHE_BUCKET:-orrery-kache}
 OUT=${COMPUTE_SMOKE_OUT:-target/compute-identity-smoke}
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# #622's replacement for the former live "terminate untagged instance" probe.
+#
+# EC2 now looks up a synthetic instance ID before it evaluates the
+# aws:ResourceTag condition, so that call returns NotFound regardless of
+# whether the tag guard exists. Widening its accepted errors would be a green
+# check that asserts nothing. Read the policy document instead, and say
+# precisely what that means: this checks the source policy shape, not EC2's
+# evaluation order or the currently deployed policy.
+assert_termination_policy_shape() {
+  local tf="$ROOT/infra/iam-compute-policy.tf"
+  local code termination terminate_action_count
+
+  [[ -r $tf ]] || die "policy-shape check: $tf is not readable"
+  code=$(grep -v '^[[:space:]]*#' "$tf")
+
+  # Pull exactly one Terraform `statement` block, rather than grepping the
+  # whole document: ReadTaggedConsoleEvidence carries the same resource-tag
+  # condition, which must not make a missing termination condition pass.
+  if ! termination=$(awk '
+    /^[[:space:]]*statement[[:space:]]*\{/ {
+      in_statement = 1
+      depth = 0
+      matches_sid = 0
+      block = ""
+    }
+    in_statement {
+      block = block $0 ORS
+      if ($0 ~ /sid[[:space:]]*=[[:space:]]*"TerminateTaggedOnly"/) {
+        matches_sid = 1
+      }
+      opens = gsub(/\{/, "{")
+      closes = gsub(/\}/, "}")
+      depth += opens - closes
+      if (depth == 0) {
+        if (matches_sid) {
+          print block
+          found = 1
+          exit
+        }
+        in_statement = 0
+      }
+    }
+    END { if (!found) exit 1 }
+  ' <<<"$code"); then
+    die 'policy-shape check: TerminateTaggedOnly statement is missing — cannot prove termination is tag-guarded'
+  fi
+
+  terminate_action_count=$(grep -Fc '"ec2:TerminateInstances"' <<<"$code" || true)
+  [[ $terminate_action_count == 1 ]] || die "policy-shape check: found $terminate_action_count ec2:TerminateInstances grants; expected exactly one tag-guarded grant"
+
+  termination_has() { # needle explanation
+    if ! grep -Fq -- "$1" <<<"$termination"; then
+      die "policy-shape check: TerminateTaggedOnly lacks '$1' — $2"
+    fi
+  }
+
+  termination_has 'effect    = "Allow"' \
+    'termination is no longer an explicit allow statement'
+  termination_has 'actions   = ["ec2:TerminateInstances"]' \
+    'the one termination grant has changed shape'
+  termination_has 'variable = "aws:ResourceTag/${local.ephemeral_tag_key}"' \
+    'termination is no longer conditioned on the ephemeral ownership tag'
+  termination_has 'values   = [local.ephemeral_tag_value]' \
+    'termination no longer requires the ephemeral ownership-tag value'
+
+  echo "$NAME: POLICY-SHAPE PASSED: TerminateTaggedOnly is the sole termination grant and requires aws:ResourceTag/orrery-ci-ephemeral=true (Terraform source only; not EC2 evaluation or deployed-policy proof)"
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # --self-test: structure, no cloud.
@@ -131,10 +204,7 @@ self_test() {
     'launch no longer forces the ownership tag, so CI could create instances it cannot kill'
   has_code 'ec2:CreateAction' \
     'CreateTags is no longer confined to launch, so the retag-and-kill move is open'
-  has_code '"ec2:TerminateInstances"' \
-    'there is no termination grant'
-  has_code 'aws:ResourceTag/' \
-    'termination is no longer guarded by the ownership tag'
+  assert_termination_policy_shape
 
   # Least privilege, negative space.
   has_code '"*.metal"' \
@@ -235,7 +305,7 @@ RESULT="$OUT/result.json"
 rm -f "$OUT/PASSED"
 
 principal='' account='' candidates=-1 images=-1
-positives=0 denials=0
+positives=0 denials=0 policy_assertions=0
 
 positive() { # label
   echo "PASS  $1"
@@ -260,6 +330,14 @@ expect_denied() { # label want cmd...
   fi
   denied "$label" "$want"
 }
+
+# S1 — #622's policy-document assertion. Unlike the live probes below, this
+# deliberately does not claim a call against a real untagged instance was
+# denied; EC2's synthetic-ID evaluation order no longer makes such a claim
+# testable without separate privileged machinery to create that instance.
+echo "== Terraform policy-shape assertion =="
+assert_termination_policy_shape
+policy_assertions=$((policy_assertions + 1))
 
 echo "== positive probes =="
 
@@ -333,21 +411,7 @@ expect_denied "run-instances t3.micro, Canonical image, correct tag (dry-run)" "
     --image-id "$probe_ami" --instance-type t3.micro --count 1 \
     --tag-specifications 'ResourceType=instance,Tags=[{Key=orrery-ci-ephemeral,Value=true}]'
 
-# N4 — the termination tag guard, against an untagged-looking dummy id.
-#
-# The id is `i-00000000000000001` rather than the more obvious all-zeros form,
-# because EC2 validates instance-id syntax before authorisation and rejects
-# `i-00000000000000000` as `InvalidInstanceID.Malformed` — which would mask the
-# verdict this probe reads. `i-00000000000000001` parses and answers
-# `InvalidInstanceID.NotFound` to a principal that *is* authorised, so under
-# this role the only way to see `UnauthorizedOperation` is the tag condition
-# doing its job. NotFound here would mean the condition is missing.
-# Denied before existence is checked, so this cannot affect anything.
-expect_denied "terminate untagged instance" "UnauthorizedOperation" \
-  aws ec2 terminate-instances --region "$REGION" \
-    --instance-ids i-00000000000000001
-
-# N5 — retag-and-kill, step one: tagging outside a launch call.
+# N4 — retag-and-kill, step one: tagging outside a launch call.
 expect_denied "create-tags outside launch" "UnauthorizedOperation" \
   aws ec2 create-tags --region "$REGION" \
     --resources i-00000000000000001 \
@@ -361,10 +425,12 @@ jq -n \
   --argjson images "$images" \
   --argjson positives "$positives" \
   --argjson denials "$denials" \
+  --argjson policy_assertions "$policy_assertions" \
   '{principal: $principal, account: $account, region: $region,
     candidates_found: $candidates, images_found: $images,
     positives_passed: $positives, denials_proved: $denials,
+    policy_assertions_passed: $policy_assertions,
     passed: true}' >"$RESULT"
 
-echo "$NAME: $positives positive probes passed, $denials least-privilege denials proved; report at $RESULT"
+echo "$NAME: $positives positive probes passed, $denials live least-privilege denials proved, $policy_assertions Terraform policy-shape assertion passed; report at $RESULT"
 touch "$OUT/PASSED"
