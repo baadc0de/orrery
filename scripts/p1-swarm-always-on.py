@@ -59,11 +59,13 @@ class Supervisor:
     def command(self, attempt: Path, c: dict[str, str]) -> list[str]:
         bind_host = "::" if ":" in c["host"] else "0.0.0.0"
         listening = self.args.state / "listening.txt"
+        active_seats = self.args.state / "active-seats.json"
         return [self.args.swarm, "--external-peer", "--external-bind", f"{bind_host}:{c['external_port']}",
                 "--peers", c["peers"], "--external-slots", c.get("humans", "1"),
                 "--lobby-seconds", str(LOBBY_SECONDS), "--seconds", c["seconds"], "--min-cells", "1",
                 "--impaired", "--witness", "--stamp-wall-clock", "--json", str(attempt / "raw.json"),
-                "--listening-file", str(listening), "--issuer-key", issuer_key(self.args.issuer_key),
+                "--listening-file", str(listening), "--active-seats-file", str(active_seats),
+                "--issuer-key", issuer_key(self.args.issuer_key),
                 "--reservation-journal", str(self.args.reservation_journal),
                 "--attempt-id", attempt.name] + (
                 ["--require-client-rev", c["client_rev"]] if c.get("client_rev") else [])
@@ -106,6 +108,10 @@ class Supervisor:
             # Never publish a new generation beside the previous child's
             # listening address.
             (self.args.state / "listening.txt").unlink(missing_ok=True)
+            # The host writes this only after it freezes StartV1 membership.
+            # It is generation-bound, but removing it also makes a new lobby's
+            # lack of connections explicit to admission.
+            (self.args.state / "active-seats.json").unlink(missing_ok=True)
             # Admission uses this generation as its single lease boundary.  It
             # is deliberately beside listening.txt, which it already reads via
             # the co-located standing-host path. The active lease includes the
@@ -172,6 +178,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(command[command.index("--lobby-seconds") + 1], str(LOBBY_SECONDS))
             self.assertEqual(command[command.index("--reservation-journal") + 1], str(root / "slots.json"))
             self.assertEqual(command[command.index("--attempt-id") + 1], "attempt-7")
+            self.assertEqual(command[command.index("--active-seats-file") + 1], str(root / "state" / "active-seats.json"))
 
     def test_failed_child_is_reaped_then_a_fresh_attempt_starts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -197,6 +197,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use orrery_core::CoreCodec as _;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::str::FromStr;
 
 use orrery_games::game::Tamper;
@@ -375,6 +376,12 @@ struct Args {
     #[arg(long)]
     listening_file: Option<String>,
 
+    /// Atomically write the attempt id and human seats frozen into `StartV1`.
+    /// The co-located admission service reads this host-authored fact for its
+    /// waiting-room roster; no file is written before membership freezes.
+    #[arg(long, value_name = "PATH")]
+    active_seats_file: Option<std::path::PathBuf>,
+
     /// Bind the exterior endpoint to this exact socket (`--external-peer`
     /// only). Omit it to retain iroh's wildcard, ephemeral-port default.
     #[arg(long, value_name = "IP:PORT")]
@@ -518,6 +525,26 @@ fn cell_edge_m_for_session(external: bool, external_peer: bool) -> f32 {
 struct ConnectedSeat {
     slot: usize,
     node: NodeId,
+}
+
+/// Publish the host's frozen membership without exposing a partial JSON file.
+fn write_active_seats(path: &Path, attempt_id: &str, connected: &[ConnectedSeat]) -> Result<()> {
+    let mut slots = connected.iter().map(|seat| seat.slot).collect::<Vec<_>>();
+    slots.sort_unstable();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "attempt_id": attempt_id,
+        "active_slots": slots,
+    }))
+    .context("serialize frozen active seats")?;
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes).with_context(|| {
+        format!(
+            "cannot write active seats temporary file {}",
+            temporary.display()
+        )
+    })?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("cannot publish active seats file {}", path.display()))
 }
 
 /// Freeze the one active roster and personalize only its witness recipients.
@@ -862,6 +889,9 @@ fn main() -> Result<()> {
                     )
                 })
                 .transpose()?;
+            if let (Some(path), Some(attempt_id)) = (&args.active_seats_file, args.attempt_id.as_deref()) {
+                write_active_seats(path, attempt_id, &connected)?;
+            }
             eprintln!(
                 "gates/p1-swarm: StartV1 freezes {} active humans across {} seats",
                 pending.len(),

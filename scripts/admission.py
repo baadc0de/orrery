@@ -187,6 +187,24 @@ class Admission:
             return None
         return listening if listening.strip() else None
 
+    def _standing_host_active_slots(self, campaign: Campaign, attempt: dict[str, Any] | None) -> set[int]:
+        """Return only the host's frozen human seats for this generation."""
+        if attempt is None:
+            return set()
+        path = self.standing_host_state / campaign.ident / "active-seats.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            slots = value["active_slots"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return set()
+        if value.get("attempt_id") != attempt["attempt_id"] or not isinstance(slots, list):
+            return set()
+        if (any(not isinstance(slot, int) or isinstance(slot, bool)
+                or not campaign.peers <= slot < campaign.peers + campaign.humans for slot in slots)
+                or len(set(slots)) != len(slots)):
+            return set()
+        return set(slots)
+
     def _campaign_phase(self, campaign: Campaign, attempt: dict[str, Any] | None) -> tuple[str, int]:
         if not campaign.open:
             return "closed", 0
@@ -214,6 +232,7 @@ class Admission:
             row.get("slot"): row for row in self._read_slots(campaign)
             if row.get("attempt_id") == attempt["attempt_id"]
         }
+        active_slots = self._standing_host_active_slots(campaign, attempt)
         roster: list[dict[str, Any]] = []
         for slot in range(campaign.peers):
             suffix = f"-{slot + 1}"
@@ -221,7 +240,7 @@ class Admission:
                            "nickname": display_label(campaign.ident[:DISPLAY_LABEL_MAX_CHARS - len(suffix)] + suffix)})
         for slot in range(campaign.peers, campaign.peers + campaign.humans):
             row = reservations.get(slot)
-            roster.append({"slot": slot, "kind": "human", "state": "reserved" if row else "empty",
+            roster.append({"slot": slot, "kind": "human", "state": "active" if row and slot in active_slots else ("reserved" if row else "empty"),
                            "nickname": row.get("nickname") if row else None})
         return roster
 
@@ -674,6 +693,27 @@ class AdmissionTests(unittest.TestCase):
         request = self.request(); request.update({"nickname": "late", "node": "f" * 64})
         with self.assertRaises(Refusal) as caught: self.service.join("test", request)
         self.assertEqual((caught.exception.status, caught.exception.error), (409, "campaign_full"))
+
+    def test_always_on_roster_marks_only_host_frozen_seats_active(self) -> None:
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        second_request = self.request(); second_request.update({"nickname": "lin", "node": "b" * 64})
+        second = self.service.join("test", second_request)
+        self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
+                         ["reserved", "reserved", "empty", "empty"],
+                         "a reservation alone is not a connection claim")
+        (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [first["join"]["slot"]],
+        }))
+        self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
+                         ["active", "reserved", "empty", "empty"],
+                         "only the seat frozen by the host is active")
+        (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
+            "attempt_id": "stale-attempt", "active_slots": [first["join"]["slot"], second["join"]["slot"]],
+        }))
+        self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
+                         ["reserved", "reserved", "empty", "empty"],
+                         "a prior generation must not assert present membership")
 
     def test_always_on_lobby_freezes_reservations_after_start(self) -> None:
         attempt = self.enable_always_on()
