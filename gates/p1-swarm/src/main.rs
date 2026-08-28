@@ -737,6 +737,7 @@ fn main() -> Result<()> {
                 "a standing token-gated host requires --reservation-journal and --attempt-id; refusing to run with unverified seats"
             );
         }
+        let reopen_empty_lobby = admission.reservation_journal.is_some();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -777,57 +778,64 @@ fn main() -> Result<()> {
             } else {
                 args.lobby_seconds
             };
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(lobby_seconds.max(1));
             let mut pending = Vec::new();
-            while pending.len() < args.external_slots {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let fixed_legacy_seat = (args.external_slots == 1
-                    && admission.reservation_journal.is_none())
-                .then(|| (config.peers, bot::bot_key(config.peers).public()));
-                let prepared = match tokio::time::timeout(
-                    remaining,
-                    bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission),
-                )
-                .await
-                {
-                    Ok(Ok(prepared)) => prepared,
-                    Ok(Err(error)) => {
-                        eprintln!("gates/p1-swarm: refused pending join: {error:#}");
+            loop {
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(lobby_seconds.max(1));
+                while pending.len() < args.external_slots {
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let fixed_legacy_seat = (args.external_slots == 1
+                        && admission.reservation_journal.is_none())
+                    .then(|| (config.peers, bot::bot_key(config.peers).public()));
+                    let prepared = match tokio::time::timeout(
+                        remaining,
+                        bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission),
+                    )
+                    .await
+                    {
+                        Ok(Ok(prepared)) => prepared,
+                        Ok(Err(error)) => {
+                            eprintln!("gates/p1-swarm: refused pending join: {error:#}");
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    if prepared.index() < config.peers || prepared.index() >= island_seats {
+                        let reason = format!(
+                            "reservation_slot_out_of_range: requested slot {}, human seats are {}..{}",
+                            prepared.index(),
+                            config.peers,
+                            island_seats
+                        );
+                        let _ = prepared.refuse(reason).await;
                         continue;
                     }
-                    Err(_) => break,
-                };
-                if prepared.index() < config.peers || prepared.index() >= island_seats {
-                    let reason = format!(
-                        "reservation_slot_out_of_range: requested slot {}, human seats are {}..{}",
+                    if pending
+                        .iter()
+                        .any(|joined: &bridge::PendingJoin| joined.index() == prepared.index())
+                    {
+                        let reason = format!(
+                            "reservation_slot_occupied: slot {} already joined this lobby",
+                            prepared.index()
+                        );
+                        let _ = prepared.refuse(reason).await;
+                        continue;
+                    }
+                    eprintln!(
+                        "gates/p1-swarm: reservation seat {} connected as {}",
                         prepared.index(),
-                        config.peers,
-                        island_seats
+                        prepared.remote()
                     );
-                    let _ = prepared.refuse(reason).await;
-                    continue;
+                    pending.push(prepared);
                 }
-                if pending
-                    .iter()
-                    .any(|joined: &bridge::PendingJoin| joined.index() == prepared.index())
-                {
-                    let reason = format!(
-                        "reservation_slot_occupied: slot {} already joined this lobby",
-                        prepared.index()
-                    );
-                    let _ = prepared.refuse(reason).await;
-                    continue;
+                if !pending.is_empty() || !reopen_empty_lobby {
+                    break;
                 }
-                eprintln!(
-                    "gates/p1-swarm: reservation seat {} connected as {}",
-                    prepared.index(),
-                    prepared.remote()
-                );
-                pending.push(prepared);
+                eprintln!("gates/p1-swarm: standing lobby stayed empty; reopening");
             }
             if pending.is_empty() {
                 bail!("the lobby closed without an admitted human");

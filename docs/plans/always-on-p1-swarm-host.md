@@ -21,13 +21,14 @@ Install `/opt/orrery/bin/p1-swarm-always-on.py`,
 mode-0644 `/etc/orrery/p1-swarm-issuer.pub` containing only the issuer key id
 and public key (`<id>:<hex>`).  The existing admission mint output already
 names these as `issuer_key_id` and `issuer_public_key`; combine those two
-public values.  Do not copy the issuer credential.  Create and give `orrery:orrery` ownership of
+public values.  Do not copy the issuer credential.  Create and give
+`orrery:orrery-admission` ownership of
 `/var/lib/orrery-p1-swarm/shakedown`. Also create admission's campaign
 directory before starting either unit, owned by its sole writer but readable
 by the swarm's supplementary group:
 
 ```sh
-install -d -o orrery -g orrery -m 0750 /var/lib/orrery-p1-swarm/shakedown
+install -d -o orrery -g orrery-admission -m 0750 /var/lib/orrery-p1-swarm/shakedown
 install -d -o orrery-admission -g orrery-admission -m 0750 /var/lib/orrery-admission/shakedown
 systemctl daemon-reload
 systemctl enable --now orrery-p1-swarm
@@ -50,17 +51,28 @@ undecodable, expired, or wrong-generation journal refuses the join. A session,
 node, or slot mismatch is also a named refusal; the host never corrects the
 client to the journal's seat and never treats journal unavailability as allow.
 
+The reverse read is local too: admission reads `attempt.json` and
+`listening.txt` from `/var/lib/orrery-p1-swarm/shakedown`, whose
+`orrery-admission` group and `0750` mode grant traversal without write access.
+The admission unit mounts that tree read-only. Do not route these standing-host
+reads through SSH: the configured campaign address is the public dial address,
+not a host-key bootstrap mechanism, and a missing `known_hosts` row would make
+a listening host appear to be restarting.
+
 Confirm `listening.txt` contains the stable host NodeId and UDP port 41641,
 and verify UDP reachability from a different network.  The admission service
 uses the same `always_on` flag: it mints the ordinary token bound to the
-client's transport key, reads that listening record over its existing SSH path,
-and returns it instead of launching a second harness. For a multi-human
+client's transport key, reads that listening record from the co-located host
+state, and returns it instead of launching a second harness. For a multi-human
 campaign, admission reads the supervisor-written `attempt.json` in that same
 directory and uses its generation and `expires_at` as the reservation lease:
 the short allocation lock assigns the earliest free human slot, and all leases
-expire together at the attempt boundary. Configure the friends campaign so
-`peers + humans = 8`; human seats extend the bot count, rather than consuming
-it. The first 90 seconds are the lobby. A full lobby starts immediately; at
+expire together at the attempt boundary. `expires_at` covers the 90-second
+lobby plus `seconds`. While a lobby remains empty, the harness keeps its bound
+endpoint and reopens another lobby window; the supervisor advances `started`
+and `expires_at` only while that generation has no reservations. Configure the
+friends campaign so `peers + humans = 8`; human seats extend the bot count,
+rather than consuming it. The first 90 seconds are the lobby. A full lobby starts immediately; at
 the deadline the host sends the same frozen `StartV1` active roster to every
 connected human. After that membership is frozen until the next attempt: a
 seat that was empty at Start remains empty, and a vacated seat is not reused.

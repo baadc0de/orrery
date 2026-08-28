@@ -60,9 +60,10 @@ class Campaign:
 
 class Admission:
     def __init__(self, control: Path, state: Path, invite: str, ssh: str, ssh_key: Path,
-                 issuer: Path, swarm: str, statvfs=os.statvfs):
+                 issuer: Path, swarm: str, standing_host_state: Path, statvfs=os.statvfs):
         self.control, self.state = control, state
         self.invite, self.ssh, self.ssh_key, self.issuer, self.swarm = invite, ssh, ssh_key, issuer, swarm
+        self.standing_host_state = standing_host_state
         self.statvfs = statvfs
         self.last_good: dict[str, Campaign] | None = None
         self.last_note: str | None = None
@@ -152,19 +153,18 @@ class Admission:
             f.write(json.dumps(row, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
 
     def _always_on_attempt(self, campaign: Campaign) -> dict[str, Any] | None:
-        """Read the supervisor generation; it is the lease clock of record."""
-        remote = f"/var/lib/orrery-p1-swarm/{campaign.ident}/attempt.json"
-        result = subprocess.run([self.ssh, "-i", str(self.ssh_key), f"orrery@{campaign.host}", "cat", remote],
-                                text=True, capture_output=True)
-        if result.returncode != 0:
+        """Read the co-located supervisor generation; it is the lease clock of record."""
+        path = self.standing_host_state / campaign.ident / "attempt.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
             return None
         try:
-            value = json.loads(result.stdout)
             if (not isinstance(value.get("attempt_id"), str) or not isinstance(value.get("started"), int)
                     or not isinstance(value.get("expires_at"), int) or value["expires_at"] <= value["started"]):
                 raise ValueError("invalid attempt record")
             return value
-        except (json.JSONDecodeError, ValueError, AttributeError):
+        except (ValueError, AttributeError):
             logging.error("always-on host returned an invalid attempt record for %s", campaign.ident)
             return None
 
@@ -180,19 +180,33 @@ class Admission:
         self.atomic_bytes(self.state / campaign.ident / "slots.json",
                           json.dumps(slots, separators=(",", ":")).encode())
 
+    def _standing_host_listening(self, campaign: Campaign) -> str | None:
+        try:
+            listening = (self.standing_host_state / campaign.ident / "listening.txt").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return listening if listening.strip() else None
+
     def _campaign_phase(self, campaign: Campaign, attempt: dict[str, Any] | None) -> tuple[str, int]:
         if not campaign.open:
             return "closed", 0
-        if attempt is None:
+        if attempt is None or self._standing_host_listening(campaign) is None:
             return "restarting", 0
         now = int(time.time())
         if now >= attempt["expires_at"]:
             return "restarting", 0
         slots = [row for row in self._read_slots(campaign) if row.get("attempt_id") == attempt["attempt_id"]]
         free = campaign.humans - len({row.get("slot") for row in slots})
+        # A standing host reopens empty lobby windows without respawning. Its
+        # supervisor advances `started` at the same boundary, but this clause
+        # also keeps the listing joinable during that atomic hand-off.
+        if not slots:
+            return "lobby", max(free, 0)
+        if now >= attempt["started"] + LOBBY_SECONDS:
+            return "running", 0
         if not free:
             return "full", 0
-        return ("lobby" if now < attempt["started"] + LOBBY_SECONDS else "running", max(free, 0))
+        return "lobby", max(free, 0)
 
     def session_roster(self, campaign: Campaign, attempt: dict[str, Any] | None) -> list[dict[str, Any]]:
         """Return every configured seat; a reservation is not a liveness claim."""
@@ -306,9 +320,8 @@ class Admission:
                 try:
                     signed = self.output([self.invite, "session-token", "--issuer-credential", str(self.issuer),
                                           "--account", str(account), "--node", node])
-                    remote = f"/var/lib/orrery-p1-swarm/{c.ident}"
                     session_dir = self.state / "sessions" / sid; session_dir.mkdir(parents=True, exist_ok=True)
-                    listening = self._wait_always_on_listening(c, remote, session_dir)
+                    listening = self._wait_always_on_listening(c, session_dir)
                     host_node, host_direct = self.dialable_listening(c, listening)
                 except (RuntimeError, KeyError, ValueError) as e:
                     logging.error("always-on host returned an unusable listening address: %s", e)
@@ -395,11 +408,11 @@ class Admission:
         child.kill()
         raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.")
 
-    def _wait_always_on_listening(self, c: Campaign, remote: str, local: Path) -> str:
-        result = subprocess.run([self.ssh, "-i", str(self.ssh_key), f"orrery@{c.host}", "cat", f"{remote}/listening.txt"], text=True, capture_output=True)
-        if result.returncode == 0 and result.stdout.strip():
-            self.atomic_bytes(local / "listening.txt", result.stdout.encode())
-            return result.stdout.strip()
+    def _wait_always_on_listening(self, c: Campaign, local: Path) -> str:
+        listening = self._standing_host_listening(c)
+        if listening is not None:
+            self.atomic_bytes(local / "listening.txt", listening.encode())
+            return listening.strip()
         raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.")
 
     def _reap(self, ident: str, c: Campaign, sid: str, remote: str, local: Path, child: subprocess.Popen[str]) -> None:
@@ -497,22 +510,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(); p.add_argument("--control", type=Path, default=Path("/etc/orrery/campaigns.conf")); p.add_argument("--state", type=Path, default=Path("/var/lib/orrery-admission")); p.add_argument("--invite", default="orrery-invite"); p.add_argument("--ssh", default="ssh"); p.add_argument("--ssh-key", type=Path, default=Path("/var/lib/orrery-admission/campaign_ssh_key")); p.add_argument("--issuer", type=Path, default=Path("/var/lib/orrery-admission/issuer.cred")); p.add_argument("--swarm", default="p1-swarm"); p.add_argument("--listen", default="127.0.0.1:8323"); p.add_argument("--self-test", action="store_true"); a = p.parse_args()
+    p = argparse.ArgumentParser(); p.add_argument("--control", type=Path, default=Path("/etc/orrery/campaigns.conf")); p.add_argument("--state", type=Path, default=Path("/var/lib/orrery-admission")); p.add_argument("--invite", default="orrery-invite"); p.add_argument("--ssh", default="ssh"); p.add_argument("--ssh-key", type=Path, default=Path("/var/lib/orrery-admission/campaign_ssh_key")); p.add_argument("--issuer", type=Path, default=Path("/var/lib/orrery-admission/issuer.cred")); p.add_argument("--swarm", default="p1-swarm"); p.add_argument("--standing-host-state", type=Path, default=Path("/var/lib/orrery-p1-swarm")); p.add_argument("--listen", default="127.0.0.1:8323"); p.add_argument("--self-test", action="store_true"); a = p.parse_args()
     if a.self_test: unittest.main(argv=[sys.argv[0]] + ([os.environ["ADMISSION_TEST"]] if "ADMISSION_TEST" in os.environ else [])); return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    host, port = a.listen.rsplit(":", 1); Handler.service = Admission(a.control, a.state, a.invite, a.ssh, a.ssh_key, a.issuer, a.swarm)
+    host, port = a.listen.rsplit(":", 1); Handler.service = Admission(a.control, a.state, a.invite, a.ssh, a.ssh_key, a.issuer, a.swarm, a.standing_host_state)
     ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
 
 
 class AdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(); root = Path(self.tmp.name); self.state, self.control = root / "state", root / "campaigns.conf"
+        self.standing_host_state = root / "standing-host"
         self.control.write_text("[test]\ntitle = Test\nopen = yes\nhost = 203.0.113.7\nexternal_port = 52011\npeers = 4\nhumans = 4\nseconds = 60\nloss_pct = 3\njitter_ms = 100\nclient_rev = rev\nruleset_version = 14\n")
         repo = Path(__file__).parents[1]; self.invite = repo / "target/debug/orrery-invite"; issuer_key = repo / "target/debug/orrery-issuer-key"
         if not self.invite.exists() or not issuer_key.exists(): self.skipTest("build orrery-invite and orrery-issuer-key before self-test")
         self.issuer = root / "issuer"; subprocess.run([str(issuer_key), "generate", "--key-id", "476", "--output", str(self.issuer)], check=True, capture_output=True)
         self.ssh = root / "ssh"; self.ssh.write_text("#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/ssh.args\"\ncase \" $* \" in *' cat '*listening.txt*) echo 'f2a1 0.0.0.0:52011';; *' cat '*raw.json*) echo '{}';; *) sleep 60;; esac\n"); self.ssh.chmod(0o755)
-        self.service = Admission(self.control, self.state, str(self.invite), str(self.ssh), root / "key", self.issuer, "swarm", lambda _: type("V", (), {"f_bavail": 20 * 1024**3, "f_frsize": 1})())
+        self.service = Admission(self.control, self.state, str(self.invite), str(self.ssh), root / "key", self.issuer, "swarm", self.standing_host_state, lambda _: type("V", (), {"f_bavail": 20 * 1024**3, "f_frsize": 1})())
     def tearDown(self) -> None:
         self.service.shutdown()
         for lock in self.service.locks.values(): lock.close()
@@ -521,7 +535,9 @@ class AdmissionTests(unittest.TestCase):
     def enable_always_on(self) -> dict[str, Any]:
         self.control.write_text(self.control.read_text() + "always_on = yes\n")
         attempt = {"attempt_id": "test-attempt", "started": int(time.time()), "expires_at": int(time.time()) + 900}
-        self.service._always_on_attempt = lambda _: attempt  # type: ignore[method-assign]
+        host = self.standing_host_state / "test"; host.mkdir(parents=True, exist_ok=True)
+        (host / "attempt.json").write_text(json.dumps(attempt))
+        (host / "listening.txt").write_text("f2a1 0.0.0.0:52011\n")
         return attempt
     def recorded_harness_command(self) -> str:
         args = self.ssh.parent / "ssh.args"
@@ -566,13 +582,17 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
 
     def test_an_always_on_campaign_reads_the_standing_host_without_launching_one(self) -> None:
-        self.enable_always_on()
+        attempt = self.enable_always_on()
+        attempt["started"] -= LOBBY_SECONDS + 1
+        (self.standing_host_state / "test" / "attempt.json").write_text(json.dumps(attempt))
+        listing = self.service.listing()["campaigns"][0]
+        self.assertEqual((listing["state"], listing["phase"], listing["slots_free"]),
+                         ("open", "lobby", 4), "an empty standing host remains joinable")
         answer = self.service.join("test", self.request())
         self.assertEqual(answer["host_direct"], "203.0.113.7:52011")
         self.assertEqual(answer["join"]["slot"], 4)
-        recorded = (self.ssh.parent / "ssh.args").read_text()
-        self.assertIn("/var/lib/orrery-p1-swarm/test/listening.txt", recorded)
-        self.assertNotIn("--external-peer", recorded, "admission must not launch a competing host")
+        self.assertFalse((self.ssh.parent / "ssh.args").exists(),
+                         "a co-located standing host must not depend on self-SSH")
     def test_the_token_binds_the_presented_node_not_the_slot(self) -> None:
         token = self.service.join("test", self.request())["join"]["session_token"]
         self.assertGreater(len(token), 100, "the real signer returned a SessionTokenV1")
@@ -658,6 +678,11 @@ class AdmissionTests(unittest.TestCase):
     def test_always_on_lobby_freezes_reservations_after_start(self) -> None:
         attempt = self.enable_always_on()
         attempt["started"] -= LOBBY_SECONDS + 1
+        (self.standing_host_state / "test" / "attempt.json").write_text(json.dumps(attempt))
+        (self.state / "test").mkdir(parents=True, exist_ok=True)
+        (self.state / "test" / "slots.json").write_text(json.dumps([{
+            "attempt_id": attempt["attempt_id"], "slot": 4,
+        }]))
         with self.assertRaises(Refusal) as caught: self.service.join("test", self.request())
         self.assertEqual((caught.exception.status, caught.exception.error), (409, "session_started"))
 
