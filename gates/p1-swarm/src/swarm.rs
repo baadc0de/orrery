@@ -77,6 +77,13 @@ pub struct SwarmConfig {
     /// Read by the caller rather than by the swarm: nothing inside the run may
     /// consult a clock, or the run stops being a function of its seed.
     pub started_at_unix_secs: Option<u64>,
+    /// Emit the all-seat replica-scope diagnostic once per roster refresh.
+    ///
+    /// This is deliberately opt-in: eight active seats produce 56 directed,
+    /// non-self decisions each second (3,360 lines per minute). The capture
+    /// only observes the roster and must not affect either the roster or the
+    /// replication path.
+    pub replica_scope_capture: bool,
 }
 
 impl Default for SwarmConfig {
@@ -94,6 +101,7 @@ impl Default for SwarmConfig {
             cheats: None,
             enforcing: false,
             started_at_unix_secs: None,
+            replica_scope_capture: false,
         }
     }
 }
@@ -574,6 +582,79 @@ pub struct ExteriorSlot {
     pub goodbye: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Why a subject is or is not inside a receiver's replicated interest set.
+///
+/// The capture is diagnostic only. It is a rendering of the roster after the
+/// coordinator-side refresh, not an input to any replication decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeReason {
+    /// The subject's committed cell is one of the receiver's 27 interest cells.
+    InInterest,
+    /// The subject's committed cell is outside the receiver's interest cells.
+    OutOfInterest,
+}
+
+impl ScopeReason {
+    /// Stable text for the diagnostic line.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InInterest => "in_interest",
+            Self::OutOfInterest => "out_of_interest",
+        }
+    }
+}
+
+/// One directed replica-scope decision written by `replica_scope_capture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScopeCapture {
+    /// Stable slot of the state author.
+    subject_seat: usize,
+    /// Stable slot which would receive that author's state.
+    receiver_seat: usize,
+    /// The author's committed cell.
+    subject_cell: CellId,
+    /// The receiver's committed cell.
+    receiver_cell: CellId,
+    /// Whether the receiver's interest set contains the author.
+    in_scope: bool,
+    /// Readable classification of `in_scope` for operators.
+    reason: ScopeReason,
+}
+
+/// Produce every directed, non-self replica-scope decision for active seats.
+///
+/// This is intentionally independent of the replication path: it reads the
+/// already-selected cells and makes no change to recipients, router state, or
+/// manifest contents.
+fn scope_capture_records(roster: &[(usize, NodeId, CellId)]) -> Vec<ScopeCapture> {
+    roster
+        .iter()
+        .flat_map(|(subject_seat, _, subject_cell)| {
+            roster
+                .iter()
+                .filter_map(move |(receiver_seat, _, receiver_cell)| {
+                    if subject_seat == receiver_seat {
+                        return None;
+                    }
+                    let in_scope = receiver_cell.neighbors27().contains(subject_cell);
+                    let reason = if in_scope {
+                        ScopeReason::InInterest
+                    } else {
+                        ScopeReason::OutOfInterest
+                    };
+                    Some(ScopeCapture {
+                        subject_seat: *subject_seat,
+                        receiver_seat: *receiver_seat,
+                        subject_cell: *subject_cell,
+                        receiver_cell: *receiver_cell,
+                        in_scope,
+                        reason,
+                    })
+                })
+        })
+        .collect()
+}
+
 impl ExteriorSlot {
     /// Queues one frame on the established synchronous side of the bridge.
     /// `try_send` performs the send immediately; unlike `Sender::send`, it
@@ -988,36 +1069,49 @@ impl Swarm {
                 exterior.set_cell_from_bits(raw);
             }
         }
-        let mut roster: Vec<(NodeId, CellId)> = self
-            .bots
-            .iter_mut()
-            .map(|bot| (bot.node, bot.cell().expect("committed")))
-            .collect();
-        for exterior in self.exteriors.values() {
-            let interest = exterior.cell().neighbors27();
-            for (index, (_, cell)) in roster.iter().enumerate() {
+        let roster = self.active_roster();
+        if self.config.replica_scope_capture {
+            for capture in scope_capture_records(&roster) {
                 eprintln!(
-                    "replica_scope_capture host_tick={tick} entity={} in_scope={} \
-                     subject_cell={} receiver_cell={}",
-                    index + 1,
-                    interest.contains(cell),
-                    cell.to_bits(),
-                    exterior.cell().to_bits(),
+                    "replica_scope_capture host_tick={tick} subject_seat={} receiver_seat={} \
+                     in_scope={} scope_reason={} subject_cell={} receiver_cell={}",
+                    capture.subject_seat,
+                    capture.receiver_seat,
+                    capture.in_scope,
+                    capture.reason.as_str(),
+                    capture.subject_cell.to_bits(),
+                    capture.receiver_cell.to_bits(),
                 );
             }
-            roster.push((exterior.node, exterior.cell()));
         }
         for bot in &mut self.bots {
             let others: Vec<PeerEntry> = roster
                 .iter()
-                .filter(|(node, _)| *node != bot.node)
-                .map(|(node, cell)| PeerEntry {
+                .filter(|(_, node, _)| *node != bot.node)
+                .map(|(_, node, cell)| PeerEntry {
                     node: *node,
                     cells: cell.neighbors27(),
                 })
                 .collect();
             bot.set_island(others);
         }
+    }
+
+    /// Every active seat's stable index, transport identity, and committed
+    /// cell. This is read by the diagnostic and the normal bot-manifest
+    /// refresh; neither reader may add or remove a recipient.
+    fn active_roster(&mut self) -> Vec<(usize, NodeId, CellId)> {
+        let mut roster: Vec<_> = self
+            .bots
+            .iter_mut()
+            .map(|bot| (bot.index, bot.node, bot.cell().expect("committed")))
+            .collect();
+        roster.extend(
+            self.exteriors
+                .values()
+                .map(|exterior| (exterior.index, exterior.node, exterior.cell())),
+        );
+        roster
     }
 
     /// Queue this bot's state to the island-mates whose interest covers it.
@@ -2072,6 +2166,100 @@ impl SwarmReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replica_scope_capture_covers_every_active_seat_pair() {
+        use crate::bot::{bot_key, cell_of, grid_of};
+        use crate::exterior::link_pair;
+        use orrery_core::QPos;
+
+        let cell_edge_m = crate::bot::campaign_cell_edge_m();
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: 3,
+                cell_edge_m,
+                campaign: true,
+                replica_scope_capture: true,
+                ..SwarmConfig::default()
+            },
+            6,
+        );
+        for seat in 3..6 {
+            let (host_link, _remote_link) = link_pair();
+            swarm = swarm.with_external_at(seat, 6, bot_key(seat).public(), None, host_link);
+        }
+
+        // Two humans occupy the same local encounter while the third is far
+        // outside its 27-cell AOI. The log must make both classifications
+        // explicit, rather than leaving an operator to infer distance from
+        // raw cell ids.
+        let near = swarm.bots[0].cell().expect("committed bot cell");
+        swarm.exteriors.get_mut(&3).expect("first exterior").cell = near;
+        swarm.exteriors.get_mut(&4).expect("second exterior").cell = near;
+        swarm.exteriors.get_mut(&5).expect("third exterior").cell = cell_of(grid_of(
+            &QPos::from_metres(900_000.0, 0.0, -900_000.0),
+            cell_edge_m,
+        ));
+
+        let roster = swarm.active_roster();
+        let captures = scope_capture_records(&roster);
+        assert_eq!(captures.len(), 30, "six active seats have 6 * 5 pairs");
+
+        for (subject_seat, _, subject_cell) in &roster {
+            for (receiver_seat, _, receiver_cell) in &roster {
+                if subject_seat == receiver_seat {
+                    assert!(
+                        !captures.iter().any(|capture| {
+                            capture.subject_seat == *subject_seat
+                                && capture.receiver_seat == *receiver_seat
+                        }),
+                        "a seat must never log a replica decision to itself"
+                    );
+                    continue;
+                }
+                let capture = captures
+                    .iter()
+                    .find(|capture| {
+                        capture.subject_seat == *subject_seat
+                            && capture.receiver_seat == *receiver_seat
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing capture for subject seat {subject_seat} to receiver seat {receiver_seat}"
+                        )
+                    });
+                let expected_in_scope = receiver_cell.neighbors27().contains(subject_cell);
+                assert_eq!(capture.subject_cell, *subject_cell);
+                assert_eq!(capture.receiver_cell, *receiver_cell);
+                assert_eq!(capture.in_scope, expected_in_scope);
+                assert_eq!(
+                    capture.reason,
+                    if expected_in_scope {
+                        ScopeReason::InInterest
+                    } else {
+                        ScopeReason::OutOfInterest
+                    }
+                );
+            }
+        }
+
+        assert!(
+            captures.iter().any(|capture| {
+                capture.subject_seat == 3
+                    && capture.receiver_seat == 4
+                    && capture.reason == ScopeReason::InInterest
+            }),
+            "the first human must be logged as visible to the second human"
+        );
+        assert!(
+            captures.iter().any(|capture| {
+                capture.subject_seat == 3
+                    && capture.receiver_seat == 5
+                    && capture.reason == ScopeReason::OutOfInterest
+            }),
+            "the distant human pair must be logged as out of interest"
+        );
+    }
 
     #[test]
     fn campaign_projectile_keeps_the_arc_verdict_it_had_when_fired() {
