@@ -560,6 +560,24 @@ async fn fdb_migration_transaction_error_preserves_source_indexes() {
 // policy (C-8: these suites write into whatever cluster they are pointed at),
 // and surfacing them loudly rather than letting them read as corruption is
 // exactly what this audit is for.
+//
+// **On CI, though, "stranded history" is the wrong first hypothesis, and it
+// has now been the wrong one twice.** `nightly.yml`'s `fdb-tests` job
+// provisions a throwaway single-node cluster with the runner and discards it
+// with the runner, so nothing survives from a previous night: an offender
+// there was written *during this invocation*, by a sibling test binary in the
+// same `cargo test -p orrery_persistd -p orrery_seed -p orrery_identity` run.
+// Both failures so far were exactly that. #624/#646 was the hot-ledger
+// sweep's own `la` cursor row — live, correct data written by a pass moments
+// earlier, and merely unregistered here. #666 was the same suite's *planted*
+// duplicate-ownership twin, `ledger_item_key(uid) ‖ b'#'`: eleven bytes in
+// `[li, lj)`, a deliberate fixture that outlived the test that wrote it.
+// `hot_ledger_sweep.rs` now retracts that twin, which is where the
+// responsibility belongs — this audit stays ambient and never cleans, because
+// finding genuinely stranded rows is the whole of its job and a scan that
+// tidied its own findings would be one bug away from tidying a real one.
+// So: read an offender as a live writer first and as history last, and
+// identify the writer from the bytes before anyone reaches for a delete.
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn the_l_family_holds_only_registered_sub_discriminators() {
@@ -610,7 +628,9 @@ async fn the_l_family_holds_only_registered_sub_discriminators() {
          discriminator:length shape ({registered}): {offenders:x?}; \
          {old_shape_candidates} are 13-byte old-shape registrar candidates and \
          {other_shapes} have another shape — trace every writer before cleanup \
-         (D35 clause (b))",
+         (D35 clause (b)). On CI's per-run throwaway cluster nothing survives \
+         a previous run, so the writer ran in this invocation: look at a \
+         sibling suite's fixtures first",
         offenders.len(),
     );
 }
