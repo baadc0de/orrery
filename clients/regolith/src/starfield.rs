@@ -712,6 +712,23 @@ pub fn drawn_velocity_ms(own: Option<&CraftView>) -> Option<Vec2> {
 /// Drives the smear from the own craft's replicated velocity.
 ///
 /// Reads [`crate::CombatView`], which is itself a straight copy of hashed
+/// The two ceilings the smear is scaled against, read from the craft's own
+/// chassis.
+///
+/// Extracted so the *source* of the ceiling is assertable, not just its use.
+/// `smear_length_m` is already tested against a ceiling passed to it, which
+/// says nothing about where the caller got that number: substituting a literal
+/// `120.0` here left every test green. That matters because the published
+/// interceptor ceiling is moving to 480 m/s, and a stale literal would
+/// saturate the smear at a quarter of its length precisely when the readout is
+/// carrying the most information.
+fn smear_ceilings(own: Option<&crate::combat::CraftView>) -> (f32, f32) {
+    #[allow(clippy::cast_possible_truncation)]
+    own.map_or((0.0, 0.0), |craft| {
+        (craft.max_speed_ms() as f32, craft.max_accel_mss() as f32)
+    })
+}
+
 /// state, and writes nothing but mesh vertices.
 pub fn drive_star_smear(
     time: Res<Time>,
@@ -725,10 +742,7 @@ pub fn drive_star_smear(
     let Some(field) = field.as_mut() else {
         return;
     };
-    #[allow(clippy::cast_possible_truncation)]
-    let (max_speed_ms, max_accel_mss) = own.map_or((0.0, 0.0), |craft| {
-        (craft.max_speed_ms() as f32, craft.max_accel_mss() as f32)
-    });
+    let (max_speed_ms, max_accel_mss) = smear_ceilings(own.as_ref());
     let length_m = smear_length_m(drift.speed_ms(), max_speed_ms);
     let flare = thrust_flare(drift.gaining_mss(), max_accel_mss);
     let along = drift.along;
@@ -763,6 +777,52 @@ mod tests {
 
     /// The window #552 records as already tight.
     const TIGHT_VIEWPORT_PX: f32 = 720.0;
+
+    /// The smear's ceilings come from the flown chassis, not a constant.
+    ///
+    /// `the_smear_never_outruns_the_chassis_speed_ceiling` tests
+    /// `smear_length_m` against a ceiling *handed to it*, which says nothing
+    /// about where the caller found that number. Substituting a literal
+    /// `120.0` at the call site left the whole suite green — and the published
+    /// interceptor ceiling is moving to 480 m/s, where a stale literal would
+    /// saturate the smear at a quarter of its length exactly when the readout
+    /// carries the most information.
+    #[test]
+    fn the_smear_reads_its_ceilings_from_the_chassis_being_flown() {
+        for archetype in [Archetype::Interceptor, Archetype::Cruiser] {
+            let limits = archetype.limits();
+            #[allow(clippy::cast_precision_loss)]
+            let (published_speed, published_accel) = (
+                limits.max_speed_mms as f32 / 1_000.0,
+                limits.max_accel_mmss as f32 / 1_000.0,
+            );
+            let view = crate::combat::CraftView {
+                entity: orrery_protocol::PersistId::new(1),
+                archetype,
+                weapon: orrery_games::regolith::weapon::WeaponKind::Stock,
+                hull: 100,
+                shield: 50,
+                cooldown: 0,
+                respawn_in: 0,
+                shots: 0,
+                pos: orrery_core::QPos::default(),
+                yaw_urad: 0,
+                vel: orrery_core::QVel::default(),
+                score: 0,
+            };
+            assert_eq!(
+                smear_ceilings(Some(&view)),
+                (published_speed, published_accel),
+                "{archetype:?}: the smear must scale against this chassis's \
+                 published ceilings, so raising them raises the readout"
+            );
+        }
+        assert_eq!(
+            smear_ceilings(None),
+            (0.0, 0.0),
+            "no craft is no ceiling, and no smear"
+        );
+    }
 
     fn interceptor() -> (f32, f32) {
         let limits = Archetype::Interceptor.limits();
