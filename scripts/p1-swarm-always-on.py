@@ -22,7 +22,7 @@ import time
 import unittest
 from pathlib import Path
 
-LOBBY_SECONDS = 90
+LOBBY_SECONDS = 180
 CHILD_EXIT_GRACE_SECONDS = 30
 
 
@@ -169,7 +169,7 @@ class Tests(unittest.TestCase):
                 "humans": "4", "seconds": "900",
             })
             self.assertEqual(command[command.index("--external-slots") + 1], "4")
-            self.assertEqual(command[command.index("--lobby-seconds") + 1], "90")
+            self.assertEqual(command[command.index("--lobby-seconds") + 1], str(LOBBY_SECONDS))
             self.assertEqual(command[command.index("--reservation-journal") + 1], str(root / "slots.json"))
             self.assertEqual(command[command.index("--attempt-id") + 1], "attempt-7")
 

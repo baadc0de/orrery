@@ -36,7 +36,7 @@ CAMPAIGN_ID = re.compile(r"[a-z0-9-]{1,64}\Z")
 NODE = re.compile(r"[0-9a-f]{64}\Z")
 SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 DISPLAY_LABEL_MAX_CHARS = 32
-LOBBY_SECONDS = 90
+LOBBY_SECONDS = 180
 RESTART_DELAY_SECONDS = 5
 
 
