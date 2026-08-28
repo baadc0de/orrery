@@ -26,6 +26,9 @@
 //! kinds it is holding regardless of how it arrived. Five bytes on a lane whose
 //! messages are pages and intents is not a trade worth making twice.
 
+use std::io::{Read, Write};
+
+use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -113,6 +116,14 @@ pub fn untag(payload: &[u8]) -> Option<(Channel, &[u8])> {
 /// length prefixes out of them.
 pub const TAG_REPLICATION: u8 = 0xE6;
 
+/// Compressed sibling of [`TAG_REPLICATION`].
+///
+/// The body is a DEFLATE stream with its uncompressed `u32` length prepended. A
+/// separate tag keeps the existing uncompressed wire readable during a
+/// rolling upgrade and lets receivers reject an oversized declaration before
+/// allocating its output buffer.
+pub const TAG_REPLICATION_COMPRESSED: u8 = 0xE9;
+
 /// Encode replication traffic as a state datagram.
 pub fn encode_replication<T: Serialize>(msg: &T) -> Vec<u8> {
     let mut payload = Vec::with_capacity(64);
@@ -121,22 +132,93 @@ pub fn encode_replication<T: Serialize>(msg: &T) -> Vec<u8> {
     tag(Channel::State, &payload)
 }
 
+/// Encode replication traffic, using bounded block compression when it makes
+/// the complete state datagram smaller.
+///
+/// Small or incompressible messages retain the ordinary
+/// [`TAG_REPLICATION`] form, so compression never increases wire use.
+#[must_use]
+pub fn encode_replication_compressed<T: Serialize>(msg: &T) -> Vec<u8> {
+    encode_sub_tagged_compressed(msg, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED)
+}
+
 /// Decode replication traffic from a state datagram.
 pub fn decode_replication<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
-    decode_sub_tagged(payload, TAG_REPLICATION)
+    decode_sub_tagged(payload, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED)
 }
 
 /// Shared body of the sub-tagged state decoders.
-fn decode_sub_tagged<T: DeserializeOwned>(payload: &[u8], expect: u8) -> Option<T> {
+fn decode_sub_tagged<T: DeserializeOwned>(
+    payload: &[u8],
+    plain_tag: u8,
+    compressed_tag: u8,
+) -> Option<T> {
     let (channel, rest) = untag(payload)?;
     if channel != Channel::State {
         return None;
     }
     let (marker, body) = rest.split_first()?;
-    if *marker != expect {
+    if *marker == plain_tag {
+        return postcard::from_bytes(body).ok();
+    }
+    if *marker != compressed_tag {
         return None;
     }
-    postcard::from_bytes(body).ok()
+    let declared = accept_declared_len(
+        usize::try_from(u32::from_le_bytes(body.get(..4)?.try_into().ok()?)).ok()?,
+    )?;
+    let compressed = body.get(4..)?;
+    let mut decoder = DeflateDecoder::new(compressed);
+    let mut decoded = Vec::with_capacity(declared);
+    decoder
+        .by_ref()
+        .take(u64::try_from(declared).ok()?.saturating_add(1))
+        .read_to_end(&mut decoded)
+        .ok()?;
+    if decoded.len() != declared {
+        return None;
+    }
+    postcard::from_bytes(&decoded).ok()
+}
+
+/// Accept a compressed envelope's declared plaintext size, or refuse it.
+///
+/// Checked **before** the `Vec::with_capacity` below, and that ordering is the
+/// whole point: the declaration is four bytes chosen by an untrusted peer, so
+/// an unbounded one would have us reserve up to 4 GiB before a single byte of
+/// the payload is examined. The later `decoded.len() != declared` check
+/// rejects the same envelope, but only after the allocation has happened --
+/// which is why that check cannot stand in for this one.
+fn accept_declared_len(declared: usize) -> Option<usize> {
+    (declared <= MAX_RELIABLE_MESSAGE_BYTES).then_some(declared)
+}
+
+/// Serialize once and keep the compressed form only when it is smaller.
+fn encode_sub_tagged_compressed<T: Serialize>(
+    msg: &T,
+    plain_tag: u8,
+    compressed_tag: u8,
+) -> Vec<u8> {
+    let plain = postcard::to_stdvec(msg).expect("wire message is serializable");
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(6));
+    encoder.write_all(&plain).expect("Vec writes cannot fail");
+    let deflated = encoder.finish().expect("Vec writes cannot fail");
+    let mut compressed = Vec::with_capacity(deflated.len() + 4);
+    compressed.extend_from_slice(
+        &u32::try_from(plain.len())
+            .expect("wire message is bounded to u32")
+            .to_le_bytes(),
+    );
+    compressed.extend_from_slice(&deflated);
+    let (marker, body) = if compressed.len() < plain.len() {
+        (compressed_tag, compressed)
+    } else {
+        (plain_tag, plain)
+    };
+    let mut payload = Vec::with_capacity(body.len() + 1);
+    payload.push(marker);
+    payload.extend_from_slice(&body);
+    tag(Channel::State, &payload)
 }
 
 /// Sub-tag marking a state datagram as verifiable-core traffic.
@@ -153,6 +235,10 @@ fn decode_sub_tagged<T: DeserializeOwned>(payload: &[u8], expect: u8) -> Option<
 /// prefix out of them. Reliable delivered inputs have their own control-lane
 /// [`TAG_DELIVERED_INPUT`] discriminator.
 pub const TAG_WITNESS: u8 = 0xE7;
+
+/// Compressed sibling of [`TAG_WITNESS`], with the same bounded DEFLATE envelope
+/// as [`TAG_REPLICATION_COMPRESSED`].
+pub const TAG_WITNESS_COMPRESSED: u8 = 0xEA;
 
 /// Sub-tag marking a reliable, addressed core input produced by
 /// `Game::deliver` from another authority's outcome.
@@ -213,12 +299,23 @@ pub fn encode_witness<T: Serialize>(msg: &T) -> Vec<u8> {
     tag(Channel::State, &payload)
 }
 
+/// Encode verifiable-core traffic, using bounded block compression when it
+/// makes the complete message smaller.
+///
+/// This is intended for multi-tick log frames. Claims and other small messages
+/// normally retain [`TAG_WITNESS`] because the compressed form would not win.
+#[must_use]
+pub fn encode_witness_compressed<T: Serialize>(msg: &T) -> Vec<u8> {
+    encode_sub_tagged_compressed(msg, TAG_WITNESS, TAG_WITNESS_COMPRESSED)
+}
+
 /// Decode verifiable-core traffic from a state datagram.
 ///
-/// Returns `None` for anything not carrying [`TAG_WITNESS`], *before* handing
-/// bytes to postcard — which is the point.
+/// Returns `None` for anything carrying neither [`TAG_WITNESS`] nor
+/// [`TAG_WITNESS_COMPRESSED`], *before* handing bytes to postcard — which is
+/// the point.
 pub fn decode_witness<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
-    decode_sub_tagged(payload, TAG_WITNESS)
+    decode_sub_tagged(payload, TAG_WITNESS, TAG_WITNESS_COMPRESSED)
 }
 
 /// Encode a message as a **state** datagram: `[TAG_STATE][postcard]`.
@@ -342,5 +439,71 @@ mod tests {
         );
         assert!(decode_replication::<Vec<u8>>(&delivered).is_none());
         assert!(decode_delivered_input(&encode_datagram(&42u64)).is_none());
+    }
+
+    #[test]
+    fn compressed_state_subtags_roundtrip_and_never_expand_small_messages() {
+        let repetitive = vec![0x5a; 4_096];
+        let replication = encode_replication_compressed(&repetitive);
+        let (_, replication_body) = untag(&replication).expect("state tag");
+        assert_eq!(replication_body[0], TAG_REPLICATION_COMPRESSED);
+        assert_eq!(
+            decode_replication::<Vec<u8>>(&replication),
+            Some(repetitive.clone())
+        );
+
+        let witness = encode_witness_compressed(&repetitive);
+        let (_, witness_body) = untag(&witness).expect("state tag");
+        assert_eq!(witness_body[0], TAG_WITNESS_COMPRESSED);
+        assert_eq!(decode_witness::<Vec<u8>>(&witness), Some(repetitive));
+
+        let small = encode_witness_compressed(&7u8);
+        let (_, small_body) = untag(&small).expect("state tag");
+        assert_eq!(small_body[0], TAG_WITNESS);
+        assert_eq!(decode_witness::<u8>(&small), Some(7));
+    }
+
+    /// The declared-size bound, pinned on its own.
+    ///
+    /// `compressed_state_decoder_rejects_oversized_or_truncated_envelopes`
+    /// does not cover it: with the bound deleted that test still passes,
+    /// because the trailing `decoded.len() != declared` mismatch rejects the
+    /// same envelope -- after the oversized allocation the bound exists to
+    /// prevent. Asserting the predicate directly is the only way to hold it.
+    #[test]
+    fn a_declared_plaintext_size_above_the_cap_is_refused_before_allocating() {
+        assert_eq!(
+            accept_declared_len(MAX_RELIABLE_MESSAGE_BYTES),
+            Some(MAX_RELIABLE_MESSAGE_BYTES),
+            "the cap itself is admissible"
+        );
+        assert_eq!(
+            accept_declared_len(MAX_RELIABLE_MESSAGE_BYTES + 1),
+            None,
+            "one byte over the cap is refused"
+        );
+        assert_eq!(
+            accept_declared_len(usize::try_from(u32::MAX).expect("u32 fits usize")),
+            None,
+            "a peer declaring the largest encodable size must not have it \
+             reserved on its say-so"
+        );
+    }
+
+    #[test]
+    fn compressed_state_decoder_rejects_oversized_or_truncated_envelopes() {
+        let mut oversized = vec![TAG_WITNESS_COMPRESSED];
+        oversized.extend_from_slice(
+            &u32::try_from(MAX_RELIABLE_MESSAGE_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        oversized.extend_from_slice(&[0x03, 0x00]);
+        assert!(decode_witness::<Vec<u8>>(&tag(Channel::State, &oversized)).is_none());
+
+        let mut truncated = vec![TAG_REPLICATION_COMPRESSED];
+        truncated.extend_from_slice(&128u32.to_le_bytes());
+        truncated.extend_from_slice(&[0x03, 0x00]);
+        assert!(decode_replication::<Vec<u8>>(&tag(Channel::State, &truncated)).is_none());
     }
 }

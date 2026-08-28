@@ -24,6 +24,7 @@ serde = { workspace = true }
 serde_json = "1"
 postcard = { workspace = true, optional = true }
 bytes = { workspace = true, features = ["serde"] }
+flate2 = { workspace = true }
 bitcode = { version = "0.6", optional = true }
 # Witness-set seeding (D28 clause (c)). The draw is a keyed shuffle that both
 # the coordinator and every later auditor must reproduce byte for byte, so the
