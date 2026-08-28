@@ -537,11 +537,20 @@ async fn fdb_migration_transaction_error_preserves_source_indexes() {
 // the only door.
 //
 // This audit is the loud half of that posture ("a skip must never read as a
-// pass"): scan `[b'l', b'm')`, report every key whose byte 1 is not one of
-// the four registered `l` sub-discriminators (`b`/`e`/`i`/`r` — the registry
-// in `keyspace.rs`'s tests owns the authoritative table), and fail when any
-// exist. Expected count on a cluster that has never served a pre-D35 run:
-// zero.
+// pass"): scan `[b'l', b'm')`, report every key that does not match a
+// registered `l` sub-kind's discriminator and exact length, and fail when any
+// exist. The current set is `la`/2, `lb`/18, `le`/14, `li`/10 and `lr`/12:
+// the hot-ledger sweep added its cursor after D35, beside balances, registrar
+// rows, items and receipts. `keyspace` owns those shapes and proves they agree
+// with the constructor registry; this ambient audit must not restate a
+// snapshot of them. Exact lengths make a 13-byte old-shape registrar row fail
+// even when its grid high byte collides with a registered discriminator.
+//
+// This is intentionally an audit of the cluster it is pointed at, not a
+// fixture-owned round trip, and it never cleans what it finds. A 13-byte
+// offender is a candidate old-shape registrar row. Any other length is a
+// different, unregistered writer and must be traced before it is labelled or
+// removed.
 //
 // One implementation-time caveat, recorded because it changes what "zero"
 // means on some clusters: this tier's own `unique_grid_id()` helpers have
@@ -563,8 +572,8 @@ async fn the_l_family_holds_only_registered_sub_discriminators() {
     let context = FdbContext::connect(&cluster).expect("configured FDB cluster file must open");
 
     // Every key of the family: begin `[b'l']`, exclusive end `[b'm']`. Keys in
-    // this range all begin with `0x6c` by construction, so byte 1 alone decides
-    // whether a row belongs to a registered kind.
+    // this range all begin with `0x6c` by construction; byte 1 and exact key
+    // length together decide whether a row belongs to a registered kind.
     let offenders: Vec<Vec<u8>> = context
         .database()
         .run(|trx, _| async move {
@@ -579,7 +588,7 @@ async fn the_l_family_holds_only_registered_sub_discriminators() {
             let mut offenders = Vec::new();
             while let Some(kv) = stream.try_next().await? {
                 let key = kv.key().to_vec();
-                if !matches!(key.get(1), Some(b'b' | b'e' | b'i' | b'r')) {
+                if !keyspace::is_registered_l_family_key(&key) {
                     offenders.push(key);
                 }
             }
@@ -588,13 +597,20 @@ async fn the_l_family_holds_only_registered_sub_discriminators() {
         .await
         .expect("configured FDB cluster must be reachable for the l-family audit");
 
+    let old_shape_candidates = offenders.iter().filter(|key| key.len() == 13).count();
+    let other_shapes = offenders.len() - old_shape_candidates;
+    let registered = keyspace::L_FAMILY_KEY_SHAPES
+        .iter()
+        .map(|(byte, len)| format!("{}:{len}", char::from(*byte)))
+        .collect::<Vec<_>>()
+        .join(", ");
     assert!(
         offenders.is_empty(),
-        "the `l` family holds {} key(s) whose byte 1 is not a registered \
-         sub-discriminator (b/e/i/r): {offenders:x?} — old-shape pre-D35 \
-         registrar rows sort here as unreachable garbage after the key format \
-         changed; any cluster holding them is a development store, disposable \
-         by policy (D35 clause (b))",
-        offenders.len()
+        "the `l` family holds {} key(s) that do not match a registered \
+         discriminator:length shape ({registered}): {offenders:x?}; \
+         {old_shape_candidates} are 13-byte old-shape registrar candidates and \
+         {other_shapes} have another shape — trace every writer before cleanup \
+         (D35 clause (b))",
+        offenders.len(),
     );
 }

@@ -333,6 +333,31 @@ pub fn lease_key(grid: GridId, entity: PersistId) -> [u8; 14] {
     key[6..].copy_from_slice(&entity.0.to_be_bytes());
     key
 }
+
+/// Registered `(byte-1 discriminator, key length)` shapes inside `[l, m)`.
+///
+/// Kept in byte order: `la` is the hot-ledger sweep cursor, `lb` balances,
+/// `le` durable lease registrar rows, `li` item ownership, and `lr` receipts.
+/// The ambient FoundationDB audit uses this list rather than restating it, and
+/// the test-only family registry proves that both views contain the same bytes.
+pub const L_FAMILY_KEY_SHAPES: &[(u8, usize)] =
+    &[(b'a', 2), (b'b', 18), (b'e', 14), (b'i', 10), (b'r', 12)];
+
+/// Whether `key` belongs to one of the registered sub-spans of `[l, m)`.
+///
+/// The exact lengths are load-bearing: a pre-D35 registrar row is 13 bytes, so
+/// accepting discriminators alone would miss one whose grid high byte happened
+/// to be `a`, `b`, `e`, `i`, or `r`.
+#[must_use]
+pub fn is_registered_l_family_key(key: &[u8]) -> bool {
+    key.first() == Some(&b'l')
+        && key.get(1).is_some_and(|byte| {
+            L_FAMILY_KEY_SHAPES
+                .iter()
+                .any(|(registered, len)| byte == registered && key.len() == *len)
+        })
+}
+
 /// Location index `lease-cell/{grid}/{cell}/{entity}` used for actor restore.
 #[must_use]
 pub fn lease_cell_key(grid: GridId, cell: CellId, entity: PersistId) -> [u8; 21] {
@@ -2774,6 +2799,63 @@ mod tests {
             (b'a', "ledger/audit sweep cursor"),
             "the cursor is the ledger family's first sub-kind, in discriminator order"
         );
+    }
+
+    #[test]
+    fn l_family_shape_predicate_matches_registered_sub_discriminators() {
+        let predicate: Vec<u8> = L_FAMILY_KEY_SHAPES
+            .iter()
+            .map(|(discriminator, _)| *discriminator)
+            .collect();
+        let registry = registered_families()
+            .into_iter()
+            .find(|family| family.prefix == b'l')
+            .and_then(|family| match family.kinds {
+                Kinds::SubKinds { table } => Some(table),
+                Kinds::WholeSpan { .. } => None,
+            })
+            .expect("the l family has registered sub-kinds");
+        let registry_discriminators: Vec<u8> =
+            registry.iter().map(|kind| kind.discriminator).collect();
+        let predicate_names: String = predicate.iter().map(|byte| char::from(*byte)).collect();
+        let registry_names: String = registry_discriminators
+            .iter()
+            .map(|byte| char::from(*byte))
+            .collect();
+
+        assert_eq!(
+            predicate,
+            registry_discriminators,
+            "the l-family shape predicate and registry disagree about the count or identity of \
+             permitted byte-1 discriminators; the ambient FDB audit must accept every registered \
+             writer and reject every unregistered one: predicate count {} ({predicate_names}), \
+             registry count {} ({registry_names})",
+            predicate_names.len(),
+            registry_names.len(),
+        );
+
+        for kind in registry {
+            assert!(
+                is_registered_l_family_key(&kind.sample),
+                "the l-family shape predicate rejects the registered `{}` sample ({} bytes): \
+                 {:x?}",
+                kind.name,
+                kind.sample.len(),
+                kind.sample,
+            );
+        }
+
+        for (discriminator, _) in L_FAMILY_KEY_SHAPES {
+            let mut old_shape = vec![0; 13];
+            old_shape[0] = b'l';
+            old_shape[1] = *discriminator;
+            assert!(
+                !is_registered_l_family_key(&old_shape),
+                "a 13-byte old-shape registrar candidate with registered discriminator `{}` \
+                 must still fail the ambient audit",
+                char::from(*discriminator),
+            );
+        }
     }
 
     #[test]
