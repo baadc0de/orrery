@@ -68,6 +68,67 @@ fn wait_for_listening(path: &std::path::Path) -> (String, String) {
 }
 
 #[test]
+fn an_empty_standing_lobby_stays_available() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("p1-idle-lobby-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let listening_path = dir.join("listening.txt");
+    let journal_path = dir.join("slots.json");
+    let host_err_path = dir.join("host.err");
+    std::fs::write(&journal_path, b"[]").expect("empty reservation journal");
+    let issuer = iroh_base::SecretKey::from_bytes(&[0x59; 32]);
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve exterior port");
+    let external_bind = reservation.local_addr().expect("reserved exterior address");
+    drop(reservation);
+
+    let mut host = Command::new(bin())
+        .args([
+            "--peers",
+            "4",
+            "--external-slots",
+            "4",
+            "--lobby-seconds",
+            "1",
+            "--seconds",
+            "1",
+            "--external-peer",
+            "--attempt-id",
+            "attempt-idle",
+            "--issuer-key",
+            &format!("592:{}", issuer.public()),
+        ])
+        .arg("--reservation-journal")
+        .arg(&journal_path)
+        .arg("--listening-file")
+        .arg(&listening_path)
+        .arg("--external-bind")
+        .arg(external_bind.to_string())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&host_err_path).expect("host err file"))
+        .spawn()
+        .expect("standing host process starts");
+
+    wait_for_listening(&listening_path);
+    std::thread::sleep(Duration::from_millis(2_200));
+    let status = host.try_wait().expect("standing host status");
+    if status.is_some() {
+        eprintln!(
+            "{}",
+            std::fs::read_to_string(&host_err_path).unwrap_or_default()
+        );
+    }
+    assert!(
+        status.is_none(),
+        "a reservation-backed host must reopen after an empty lobby"
+    );
+    host.kill().expect("stop idle host after proof");
+    host.wait().expect("reap idle host after proof");
+}
+
+#[test]
 #[ignore = "two real processes at wall clock; run via scripts/p1-swarm-gate.sh or --ignored"]
 fn an_external_peer_joins_witnesses_and_moves_frames() {
     let dir = std::env::temp_dir().join(format!("p1-external-{}", std::process::id()));
