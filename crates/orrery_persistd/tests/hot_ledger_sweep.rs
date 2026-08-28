@@ -422,12 +422,22 @@ async fn fdb_cursor_resumes_across_restart() {
     let first_context = FdbContext::connect(&cluster).expect("configured cluster opens");
     let sweeper_one = HotLedgerSweeper::from_context(&first_context);
     seed_clean_ledger(&first_context.database()).await;
+    // These receipts are this test's pre-restart history.  The clean-ledger
+    // fixture deliberately banks no receipts, so relying on another test's
+    // history here would make cursor advancement an ordering accident.
+    bank_receipt(&first_context.database(), &[buyer(), seller()]).await;
+    bank_receipt(&first_context.database(), &[buyer(), seller()]).await;
 
     // Pass one. `sweeper_one` is dropped afterwards — the durable cursor row
     // is the only thing carried into the next block, which is what a restart
     // keeps too.
     let cursor_after_first = {
         let report = sweeper_one.run_pass(unix_ms()).await.expect("first pass");
+        assert!(
+            report.population.new_receipts >= 2,
+            "the first pass judged this test's two pre-restart receipts, got {}",
+            report.population.new_receipts
+        );
         assert!(
             !report.cursor_after.is_empty(),
             "the cursor advanced past at least one receipt"
