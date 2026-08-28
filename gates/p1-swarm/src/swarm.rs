@@ -2269,6 +2269,7 @@ impl SwarmReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orrery_games::regolith::{archetype::Archetype, CAMPAIGN_CELL_EDGE_M};
 
     fn hearsay_test_swarm(
         bot_seats: usize,
@@ -2441,10 +2442,33 @@ mod tests {
     }
 
     #[test]
-    fn hearsay_fold_never_delivers_a_contact_younger_than_256_ticks() {
+    fn hearsay_fold_never_delivers_a_contact_younger_than_the_v18_crossing_floor() {
         let (mut swarm, remotes) = hearsay_test_swarm(2, &[2, 3], 4);
-        let h4_floor_ticks = (512 * TICK_HZ).div_ceil(120);
-        assert_eq!(h4_floor_ticks, 256, "ceil(E / v_max * tick_hz)");
+        let cell_edge_m = CAMPAIGN_CELL_EDGE_M as u64;
+        assert_eq!(
+            cell_edge_m as f64, CAMPAIGN_CELL_EDGE_M,
+            "campaign cell edge must be an exact whole metre for the H4 derivation"
+        );
+        let max_speed_mms = Archetype::ALL
+            .iter()
+            .map(|archetype| archetype.limits().max_speed_mms)
+            .max()
+            .expect("Regolith publishes at least one chassis");
+        assert_eq!(
+            max_speed_mms % 1_000,
+            0,
+            "maximum chassis speed must be an exact m/s for the H4 derivation"
+        );
+        let max_speed_mps = u64::try_from(max_speed_mms / 1_000).expect("speed is positive");
+        let h4_floor_ticks = (cell_edge_m * TICK_HZ).div_ceil(max_speed_mps);
+        assert_eq!(
+            h4_floor_ticks, 64,
+            "ceil(512 m / 480 m/s * 60 ticks/s) must be 64 ticks"
+        );
+        assert!(
+            HEARSAY_FOLD_TICKS >= h4_floor_ticks,
+            "the five-second hearsay fold ({HEARSAY_FOLD_TICKS} ticks) must be no younger than the v18 crossing floor ({h4_floor_ticks} ticks)"
+        );
         let assert_old_enough = |record: HearsayContacts, delivery_tick: u64| {
             assert!(!record.contacts.is_empty(), "the age check is not vacuous");
             for contact in record.contacts {

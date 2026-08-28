@@ -241,18 +241,15 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
-/// Regolith v16's rules identity: v15's collision order, plus the #545 weapon
-/// reaches. Heavy's envelope out-ranged the campaign AOI's guarantee by
-/// roughly 2x and Stock sat 20.8 m inside it, so both were cut to fit the
-/// engagement budget; the cell edge is unchanged at 512 m.
+/// Regolith v18's rules identity: v17's staleness-cap execution, plus higher
+/// chassis speed ceilings and the bounded, quantized craft trail.
 ///
-/// Reach is adjudicated — `projectile_resolution` breaks a lock on it — so
-/// v15 and v16 genuinely differ and a mixed session would disagree about
-/// shots. Unlike a cell-edge change this does **not** move interest
-/// membership, so the blast radius stops at adjudication.
+/// Both changes alter canonical state hashes and movement outcomes. A mixed
+/// session would disagree even before combat, so it must fail ruleset identity
+/// matching rather than trying to interpolate across the change.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 17,
-    digest: [0x67; 32],
+    version: 18,
+    digest: [0x68; 32],
 };
 
 /// One canonical rock installed by the campaign composition root.
@@ -533,6 +530,8 @@ impl Regolith {
             own.locks_acquired,
         );
         let mut collisions = own.collisions;
+        let mut trail = own.trail.clone();
+        let mut arithmetic_overflowed = own.arithmetic_overflowed;
         let mut lock_reply = None;
         let mut lock_decay_progress = own.lock_decay_progress;
         let mut cover_claim_cooldown = own.cover_claim_cooldown.saturating_sub(1);
@@ -563,9 +562,15 @@ impl Regolith {
                     let theta = f64::from(yaw) / 1_000_000.0;
                     let phi = f64::from(pitch) / 1_000_000.0;
                     let horizontal = libm::cos(phi);
-                    vx += accel * horizontal * libm::cos(theta) * DT;
-                    vy += accel * libm::sin(phi) * DT;
-                    vz += accel * horizontal * libm::sin(theta) * DT;
+                    // Thrust contributes Δv for this tick. It does not replace
+                    // velocity: repeated thrust therefore builds speed over
+                    // time until drag and the chassis ceiling balance it.
+                    let delta_vx = accel * horizontal * libm::cos(theta) * DT;
+                    let delta_vy = accel * libm::sin(phi) * DT;
+                    let delta_vz = accel * horizontal * libm::sin(theta) * DT;
+                    vx += delta_vx;
+                    vy += delta_vy;
+                    vz += delta_vz;
                     yaw = yaw.wrapping_add(*yaw_urad).rem_euclid(TAU_URAD);
                     pitch = pitch
                         .saturating_add(*pitch_urad)
@@ -868,6 +873,7 @@ impl Regolith {
         px += vx * DT;
         py += vy * DT;
         pz += vz * DT;
+        let mut respawned = false;
         if !was_alive && hull == 0 && respawn_in > 0 {
             respawn_in -= 1;
             if respawn_in == 0 {
@@ -889,12 +895,23 @@ impl Regolith {
                 lock_progress = 0;
                 lock_decay_progress = 0;
                 cover_claim_cooldown = 0;
+                respawned = true;
             }
+        }
+        let next_pos = QPos::from_metres(px, py, pz);
+        let next_vel = QVel::from_metres_per_sec(vx, vy, vz);
+        if hull == 0 || respawned {
+            // A wreck has no engine trail, and a respawn must not draw one
+            // enormous segment from the wreck to the new spawn position.
+            trail.clear();
+        } else {
+            trail.advance(next_pos, &mut arithmetic_overflowed);
         }
         let next = Craft {
             weapon: equipped,
-            pos: QPos::from_metres(px, py, pz),
-            vel: QVel::from_metres_per_sec(vx, vy, vz),
+            pos: next_pos,
+            vel: next_vel,
+            trail,
             yaw_urad: yaw,
             pitch_urad: pitch,
             hull,
@@ -915,6 +932,7 @@ impl Regolith {
             lock_decay_progress,
             cover_claim_cooldown,
             collisions,
+            arithmetic_overflowed,
             ..own
         };
         (next, events)
