@@ -52,6 +52,10 @@ impl Plugin for OrreryPersistClientPlugin {
             .init_resource::<ReportQueue>()
             .init_resource::<AuthorityCorrectionQueue>()
             .init_resource::<UplinkSeq>()
+            // The authority plugin normally creates this host-driven universe
+            // tick first. Initializing it here too keeps this plugin runnable
+            // on its own; the host still owns advancing the value.
+            .init_resource::<orrery_authority::ContactTick>()
             .add_message::<bevy_replicon::server::uplink::ComponentDiff>()
             // The net plugin normally owns these message resources. Declaring
             // them here too keeps this plugin independently runnable in tests
