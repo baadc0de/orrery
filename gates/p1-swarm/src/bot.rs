@@ -22,7 +22,7 @@
 //! actually exercises hysteresis and interest-set churn.
 
 use core::time::Duration;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aeronet_iroh::stream::{IrohStreamIo, RecvMessage, StreamMode};
 use bevy_app::prelude::*;
@@ -111,6 +111,10 @@ const DEFAULT_KEYFRAME_EVERY_SENDS: u64 = 20;
 /// trips inside a second never got the benefit of that ramp.
 const POP_WINDOW_TICKS: u64 = 60;
 
+/// One interest-refresh period, the interval over which boundary returns can
+/// churn subscriptions and storage keys before the system observes them.
+const BOUNDARY_RETURN_WINDOW_TICKS: u64 = TICK_HZ;
+
 /// The rate a briefly demoted entity must stay above for the demotion to be
 /// invisible: the midpoint of the 1–4 Hz proxy range.
 ///
@@ -156,6 +160,34 @@ pub struct BotSpec {
     /// detection and files nothing, which is P4's posture for the honest legs
     /// and useless for the conviction one.
     pub enforcing: bool,
+}
+
+/// One return to the cell committed immediately before the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundaryReturn {
+    tick: u64,
+}
+
+/// Sliding one-refresh-period measurement of returns to the same cell.
+#[derive(Debug, Default)]
+struct BoundaryReturnWindow {
+    recent: VecDeque<BoundaryReturn>,
+    max_returns: u64,
+}
+
+impl BoundaryReturnWindow {
+    fn record(&mut self, tick: u64) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|sample| tick.saturating_sub(sample.tick) >= BOUNDARY_RETURN_WINDOW_TICKS)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(BoundaryReturn { tick });
+        let returns = self.recent.len() as u64;
+        self.max_returns = self.max_returns.max(returns);
+    }
 }
 
 /// A synthetic peer.
@@ -225,10 +257,14 @@ pub struct Bot {
     /// a boundary" means. A bot travelling in a straight line crosses a great
     /// many boundaries and thrashes none; a bot loitering on one boundary
     /// crosses the same one repeatedly, re-keying storage and churning
-    /// subscriptions each time. The 10% hysteresis margin exists to make this
-    /// number zero, so measuring total crossings would measure travel rather
-    /// than the thing the margin fixes.
+    /// subscriptions each time. A single return can be a genuine reversal
+    /// after crossing the full hysteresis deadband, so the criterion judges
+    /// the one-refresh-period maximum rather than this run-wide total.
     pub boundary_flips: u64,
+    /// Most returns to one cell observed in any interest-refresh period.
+    pub max_boundary_returns_in_window: u64,
+    /// Recent returns used to measure the sliding refresh-period maximum.
+    boundary_return_window: BoundaryReturnWindow,
     /// The cell committed before the current one.
     previous_cell: Option<CellId>,
     /// The cell committed now.
@@ -886,6 +922,8 @@ impl Bot {
             visited: vec![cell_of(start_grid)],
             crossings: 0,
             boundary_flips: 0,
+            max_boundary_returns_in_window: 0,
+            boundary_return_window: BoundaryReturnWindow::default(),
             previous_cell: None,
             current_cell: Some(cell_of(start_grid)),
             interest_churn: 0,
@@ -952,6 +990,8 @@ impl Bot {
         committed.0 = committed_cell;
         bot.current_cell = Some(committed_cell);
         bot.previous_cell = None;
+        bot.max_boundary_returns_in_window = 0;
+        bot.boundary_return_window = BoundaryReturnWindow::default();
         bot.visited = vec![committed_cell];
         bot
     }
@@ -1355,36 +1395,16 @@ impl Bot {
 
     /// Record what changed this tick: cell crossings and interest churn.
     pub fn sample(&mut self) {
-        let world = self.app.world_mut();
-        let mut cells = world.query_filtered::<&Cell, With<LocalPlayer>>();
-        if let Ok(cell) = cells.single(world) {
-            if self.current_cell != Some(cell.0) {
-                self.crossings += 1;
-                // Returning to the cell committed *before* the last one is the
-                // boundary flip the hysteresis margin exists to prevent.
-                let is_flip = self.previous_cell == Some(cell.0);
-                if is_flip {
-                    self.boundary_flips += 1;
-                }
-                if self.audience_trace {
-                    eprintln!(
-                        "audience_trace kind=cell_commitment seat={} tick={} entity={} previous={:?} current={:?} next={:?} flip={is_flip}",
-                        self.index,
-                        self.tick,
-                        self.entity.0,
-                        self.previous_cell,
-                        self.current_cell,
-                        cell.0,
-                    );
-                }
-                self.previous_cell = self.current_cell;
-                self.current_cell = Some(cell.0);
-                if !self.visited.contains(&cell.0) {
-                    self.visited.push(cell.0);
-                }
-            }
+        let committed_cell = {
+            let world = self.app.world_mut();
+            let mut cells = world.query_filtered::<&Cell, With<LocalPlayer>>();
+            cells.single(world).ok().map(|cell| cell.0)
+        };
+        if let Some(cell) = committed_cell {
+            self.record_cell_commitment(cell);
         }
 
+        let world = self.app.world_mut();
         let high: Vec<Entity> = world.resource::<InterestSelection>().high_rate.clone();
         let entered: Vec<Entity> = high
             .iter()
@@ -1447,6 +1467,35 @@ impl Bot {
 
         self.last_high_rate = high;
         self.tick += 1;
+    }
+
+    fn record_cell_commitment(&mut self, cell: CellId) {
+        if self.current_cell == Some(cell) {
+            return;
+        }
+        self.crossings += 1;
+        let is_return = self.previous_cell == Some(cell);
+        if is_return {
+            self.boundary_flips += 1;
+            self.boundary_return_window.record(self.tick);
+            self.max_boundary_returns_in_window = self.boundary_return_window.max_returns;
+        }
+        if self.audience_trace {
+            eprintln!(
+                "audience_trace kind=cell_commitment seat={} tick={} entity={} previous={:?} current={:?} next={:?} flip={is_return}",
+                self.index,
+                self.tick,
+                self.entity.0,
+                self.previous_cell,
+                self.current_cell,
+                cell,
+            );
+        }
+        self.previous_cell = self.current_cell;
+        self.current_cell = Some(cell);
+        if !self.visited.contains(&cell) {
+            self.visited.push(cell);
+        }
     }
 
     /// This peer's upload rate over the meter's window, in simulated time.
@@ -1829,6 +1878,13 @@ impl Bot {
     pub fn replace_craft_for_test(&mut self, craft: Craft) {
         self.executor
             .insert(self.entity, RegolithState::Craft(craft));
+    }
+
+    #[cfg(test)]
+    /// Records a captured committed-cell transition at an explicit tick.
+    pub fn record_cell_commitment_for_test(&mut self, cell: CellId, tick: u64) {
+        self.tick = tick;
+        self.record_cell_commitment(cell);
     }
 
     #[cfg(test)]
@@ -2370,6 +2426,23 @@ pub fn campaign_cell_edge_m() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_return_window_measures_returns_in_a_sliding_second() {
+        let mut window = BoundaryReturnWindow::default();
+
+        window.record(0);
+        window.record(20);
+        window.record(59);
+        assert_eq!(window.max_returns, 3);
+
+        window.record(60);
+        assert_eq!(
+            window.recent.len(),
+            3,
+            "the half-open one-second window must evict a return exactly 60 ticks old"
+        );
+    }
 
     fn replication_test_bot(index: usize) -> Bot {
         Bot::new(BotSpec {
