@@ -79,6 +79,14 @@ class Supervisor:
                 # question has already cost one investigation, which concluded
                 # on evidence that turned out to be a logging-order artifact.
                 "--replica-scope-capture",
+                # #653. At v18's 480 m/s interceptor ceiling a craft clears the
+                # 460.8 m one-body AOI guarantee in 0.96 s -- inside one 1 Hz
+                # interest refresh -- so a human can be shot by someone their
+                # roster has not heard of yet. This turns on both halves: the
+                # swept margin that covers where a craft can reach, and the
+                # ordered crossing event that corrects the roster on the
+                # commitment rather than at the next refresh.
+                "--swept-interest-margin",
                 "--listening-file", str(listening), "--active-seats-file", str(active_seats),
                 "--issuer-key", issuer_key(self.args.issuer_key),
                 "--reservation-journal", str(self.args.reservation_journal),
@@ -238,6 +246,8 @@ class Tests(unittest.TestCase):
             # The standing host must always capture scope; a live report we
             # cannot classify is the expensive outcome, not the log volume.
             self.assertIn("--replica-scope-capture", command)
+            # #653 must reach the live host, not only the gate harness.
+            self.assertIn("--swept-interest-margin", command)
 
             configured = Supervisor(args).command(root / "attempt-8", {
                 "host": "203.0.113.7", "external_port": "41641", "peers": "4",

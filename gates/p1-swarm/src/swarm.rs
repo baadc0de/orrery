@@ -17,7 +17,10 @@ use orrery_games::regolith::{campaign_rock_seeds, pilot::PILOT_SCENARIOS, REGOLI
 use orrery_net::peer_link::StreamMode;
 use orrery_protocol::channels::{decode_replication, decode_replication_delta};
 use orrery_protocol::coord::PeerEntry;
-use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_TICKS};
+use orrery_protocol::{
+    CellId, InterestCellCrossing, NodeId, PersistId, SeqPair, Tick, UniverseSeed,
+    MAX_ADJUDICATION_TICKS,
+};
 
 use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{Bot, BotSpec, TICK_HZ};
@@ -92,6 +95,21 @@ struct LiveJoins {
     receiver: mpsc::Receiver<JoinedExternal>,
     membership: Arc<Mutex<LiveMembership>>,
     island_seats: usize,
+}
+
+/// One peer-authored crossing waiting for the host roster to apply it.
+#[derive(Debug)]
+struct HostInterestCrossing {
+    node: NodeId,
+    crossing: InterestCellCrossing,
+}
+
+/// The last crossing order the host accepted for one stable bot seat.
+#[derive(Debug, Clone, Copy)]
+struct AppliedInterestCrossing {
+    seq: SeqPair,
+    tick: Tick,
+    committed_cell: CellId,
 }
 /// The coordinator's bulk interest refresh remains 1 Hz (#653/#692).
 const INTEREST_REFRESH_PERIOD_S: f64 = 1.0;
@@ -957,6 +975,8 @@ pub struct Swarm {
     delivery_gaps: Option<DeliveryGapTracker>,
     /// Actual cell counts installed by the swept-margin load point.
     interest_margin_stats: Option<InterestMarginStats>,
+    /// Ordered crossing fence per stable bot seat.
+    applied_interest_crossings: Vec<Option<AppliedInterestCrossing>>,
     /// Replication messages admitted by the meter, split by A19 wire kind.
     admitted_keyframes: u64,
     admitted_deltas: u64,
@@ -1441,6 +1461,7 @@ impl Swarm {
             interest_margin_stats: config
                 .swept_interest_margin
                 .then(InterestMarginStats::default),
+            applied_interest_crossings: vec![None; config.peers],
             admitted_keyframes: 0,
             admitted_deltas: 0,
             exteriors: BTreeMap::new(),
@@ -1680,6 +1701,47 @@ impl Swarm {
         }
         self.replace_shot_interest_scope(&roster);
         capture
+    }
+
+    /// Apply immediate crossing coverage to the membership every sender reads.
+    ///
+    /// This is the host half of #653/#692. The swept set pages likely cells in
+    /// before arrival; the ordered event closes the reactive tail between 1 Hz
+    /// bulk repairs. Applying the event directly to `IslandMembership` is what
+    /// lets `broadcast_state`'s existing audience diff offer a cached keyframe
+    /// on the next send tick, with no additional presence-keyframe policy.
+    fn apply_interest_crossings(&mut self, events: Vec<HostInterestCrossing>) {
+        for event in events {
+            let index = *self
+                .index_of
+                .get(&event.node)
+                .expect("a crossing authority has one stable host seat");
+            if let Some(applied) = self.applied_interest_crossings[index] {
+                assert!(
+                    event.crossing.seq.supersedes(applied.seq)
+                        && event.crossing.tick > applied.tick
+                        && event.crossing.from == applied.committed_cell,
+                    "interest crossing for seat {index} did not chain after the host's ordered fence: previous {applied:?}, offered {:?}",
+                    event.crossing,
+                );
+            } else {
+                assert_eq!(
+                    event.crossing.seq.auth_seq, 1,
+                    "a seat's first emitted crossing must start its authority order at one"
+                );
+            }
+
+            for bot in &mut self.bots {
+                if bot.node != event.node {
+                    bot.apply_interest_crossing(event.node, &event.crossing);
+                }
+            }
+            self.applied_interest_crossings[index] = Some(AppliedInterestCrossing {
+                seq: event.crossing.seq,
+                tick: event.crossing.tick,
+                committed_cell: event.crossing.to,
+            });
+        }
     }
 
     /// Retain the same directed decisions the replica-scope capture renders.
@@ -2303,10 +2365,20 @@ impl Swarm {
         }
         phase[2] += mark.elapsed().as_nanos();
         mark = std::time::Instant::now();
+        let mut interest_crossings = Vec::new();
         for bot in &mut self.bots {
-            bot.sample();
+            if let Some(crossing) = bot.sample_with_interest_crossing(
+                self.config.swept_interest_margin,
+                INTEREST_REFRESH_PERIOD_S,
+            ) {
+                interest_crossings.push(HostInterestCrossing {
+                    node: bot.node,
+                    crossing,
+                });
+            }
             bot.drain_signals();
         }
+        self.apply_interest_crossings(interest_crossings);
         // Stage 4, in the same tick the report was filed. The cluster is
         // in-process and believes nothing the reporter said: it checks the
         // reporter's signature, then re-runs the bundle under the shipping
@@ -3394,6 +3466,84 @@ mod tests {
         assert_ne!(
             expected, sorted,
             "fixture must detect accidental transport-key sorting"
+        );
+    }
+
+    #[test]
+    fn a_crossing_driven_roster_add_gets_its_keyframe_on_the_next_send_tick() {
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 2,
+            swept_interest_margin: true,
+            witnessing: false,
+            ..SwarmConfig::default()
+        });
+        let receiver = swarm.bots[1].node;
+        let from = swarm.bots[1].cell().expect("receiver starts committed");
+        let (from_coords, level) = from.coords();
+        let to = CellId::from_coords(from_coords + glam::IVec3::X, level)
+            .expect("adjacent crossing cell");
+        let sender_cell = CellId::from_coords(from_coords + 2 * glam::IVec3::X, level)
+            .expect("newly covered outer face");
+        assert!(!from.neighbors27().contains(&sender_cell));
+        assert!(to.neighbors27().contains(&sender_cell));
+        swarm.bots[0].place_local_player_for_test(sender_cell);
+        swarm.form_island();
+
+        // Cache a sender anchor mid-keyframe interval while the receiver is
+        // still outside the audience. Entity 1's stagger makes send index 1 a
+        // keyframe slot; index 2 below is therefore an ordinary delta slot.
+        swarm.bots[0].broadcast_state(2);
+        swarm.bots[0].update();
+        assert!(swarm.bots[0].drain_outbound().is_empty());
+        swarm.bots[0].broadcast_state(5);
+        swarm.bots[0].update();
+        assert!(swarm.bots[0].drain_outbound().is_empty());
+
+        // Drive the receiver through the real Bevy hysteresis system, then
+        // deliver the ordered crossing without invoking the 1 Hz bulk repair.
+        swarm.bots[1].move_local_player_for_test(glam::Vec3::new(
+            from_coords.x as f32 + 1.2,
+            from_coords.y as f32 + 0.5,
+            from_coords.z as f32 + 0.5,
+        ));
+        swarm.bots[1].update();
+        let crossing = swarm.bots[1]
+            .sample_with_interest_crossing(true, INTEREST_REFRESH_PERIOD_S)
+            .expect("hysteresis crossing emits the ordered host event");
+        assert_eq!((crossing.from, crossing.to), (from, to));
+        swarm.apply_interest_crossings(vec![HostInterestCrossing {
+            node: receiver,
+            crossing,
+        }]);
+
+        // The next send opportunity reads the corrected IslandMembership.
+        // #671's existing `added` rule must supply the cached anchor and exclude
+        // this link from the delta audience; A21 explicitly wants no other
+        // presence keyframe mechanism.
+        swarm.bots[0].broadcast_state(8);
+        swarm.bots[0].update();
+        let sent = swarm.bots[0]
+            .drain_outbound()
+            .into_iter()
+            .filter_map(|(peer, stream, payload)| {
+                (peer == receiver && stream.is_none()).then_some(payload)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent.len(),
+            1,
+            "crossing-to-roster propagation must offer exactly one cached anchor on the next send tick"
+        );
+        let (channel, payload) =
+            orrery_net::channels::untag(&sent[0]).expect("state datagram carries its channel tag");
+        assert_eq!(channel, orrery_net::channels::Channel::State);
+        assert!(
+            decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(payload).is_some(),
+            "the crossing-driven roster add's first eligible packet must be a keyframe"
+        );
+        assert!(
+            decode_replication_delta(payload).is_none(),
+            "the newly-added link must not receive a delta before its cached keyframe"
         );
     }
 
