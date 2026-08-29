@@ -22,7 +22,9 @@
 #
 # Negative, each of which MUST be refused by IAM, and every one of which is
 # side-effect-free *by construction*, not by good luck:
-#   N1  s3 ls on the cache bucket        -> AccessDenied   (no S3 grant at all)
+#   N1  s3api list-buckets               -> AccessDenied   (no S3 grant at all)
+#         This has no bucket-existence precondition: a missing cache bucket
+#         must not be able to turn an IAM proof into NoSuchBucket.
 #   N2  iam list-roles                   -> AccessDenied   (no IAM grant)
 #   N3  run-instances --dry-run t3.micro -> UnauthorizedOperation
 #         The instance-type allow-list must refuse a family outside it.
@@ -31,9 +33,6 @@
 #         the error string, not the exit code: DryRunOperation or a NotFound
 #         would mean the request was AUTHORISED, which is exactly the failure
 #         this probe exists to catch.
-#   N4  create-tags outside a launch     -> UnauthorizedOperation
-#         The ec2:CreateAction=RunInstances guard must make the
-#         retag-then-terminate lateral move impossible.
 #
 # Policy document shape, not a live AWS probe:
 #   S1  `TerminateTaggedOnly` permits `ec2:TerminateInstances` only when
@@ -44,6 +43,11 @@
 #       #622 removed N4 because EC2 now resolves a synthetic instance's
 #       existence before evaluating the tag condition; `NotFound` from that
 #       request therefore proves neither an allow nor a denial.
+#   S2  `TagOnlyAtLaunch` is the sole `ec2:CreateTags` grant and requires
+#       ec2:CreateAction=RunInstances.
+#       This likewise proves only the checked-out Terraform source. #679
+#       removed the live retag-outside-launch probe because EC2 now resolves
+#       its synthetic instance ID before evaluating that condition.
 #
 # Every figure lands in $COMPUTE_SMOKE_OUT/result.json, and the PASSED marker
 # is written last — a run killed mid-way leaves no marker, and evidence
@@ -65,10 +69,10 @@
 #     in prose, and a prose mention would satisfy a polarity-inverted check
 #     without the code carrying it.
 #
-# Structural passing does not prove AWS enforces anything. N1–N4 prove their
-# refusals nightly against the real service; S1 proves only the Terraform policy
-# shape for termination. The two kinds of check fail in different places by
-# design.
+# Structural passing does not prove AWS enforces anything. N1–N3 prove their
+# refusals nightly against the real service; S1–S2 prove only the Terraform
+# policy shape for the two halves of the tag chain. The two kinds of check fail
+# in different places by design.
 set -euo pipefail
 
 readonly NAME=aws-compute-smoke
@@ -76,7 +80,6 @@ die() { echo "$NAME: $*" >&2; exit 2; }
 
 REGION=${ORRERY_AWS_REGION:-eu-central-1}
 ROLE_NAME=${ORRERY_COMPUTE_ROLE_NAME:-orrery-ci-compute}
-KACHE_BUCKET=${ORRERY_KACHE_BUCKET:-orrery-kache}
 OUT=${COMPUTE_SMOKE_OUT:-target/compute-identity-smoke}
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -149,6 +152,74 @@ assert_termination_policy_shape() {
   echo "$NAME: POLICY-SHAPE PASSED: TerminateTaggedOnly is the sole termination grant and requires aws:ResourceTag/orrery-ci-ephemeral=true (Terraform source only; not EC2 evaluation or deployed-policy proof)"
 }
 
+# #679's replacement for the former live "create-tags outside launch" probe.
+#
+# EC2 now looks up that probe's synthetic instance ID before it evaluates the
+# ec2:CreateAction condition, so InvalidInstanceID.NotFound says nothing about
+# whether tagging an existing object is allowed. Accepting NotFound would make
+# the check green while asserting nothing. Read exactly the CreateTags statement
+# in the policy instead; as with the termination assertion above, this proves
+# source shape, not EC2 evaluation order or the currently deployed policy.
+assert_create_tags_policy_shape() {
+  local tf="$ROOT/infra/iam-compute-policy.tf"
+  local code create_tags create_tags_action_count
+
+  [[ -r $tf ]] || die "policy-shape check: $tf is not readable"
+  code=$(grep -v '^[[:space:]]*#' "$tf")
+
+  # Pull exactly one Terraform `statement` block, rather than grepping the
+  # whole document: another statement could carry an ec2:CreateAction
+  # condition and must not make a missing TagOnlyAtLaunch condition pass.
+  if ! create_tags=$(awk '
+    /^[[:space:]]*statement[[:space:]]*\{/ {
+      in_statement = 1
+      depth = 0
+      matches_sid = 0
+      block = ""
+    }
+    in_statement {
+      block = block $0 ORS
+      if ($0 ~ /sid[[:space:]]*=[[:space:]]*"TagOnlyAtLaunch"/) {
+        matches_sid = 1
+      }
+      opens = gsub(/\{/, "{")
+      closes = gsub(/\}/, "}")
+      depth += opens - closes
+      if (depth == 0) {
+        if (matches_sid) {
+          print block
+          found = 1
+          exit
+        }
+        in_statement = 0
+      }
+    }
+    END { if (!found) exit 1 }
+  ' <<<"$code"); then
+    die 'policy-shape check: TagOnlyAtLaunch statement is missing — cannot prove CreateTags is confined to RunInstances'
+  fi
+
+  create_tags_action_count=$(grep -Fc '"ec2:CreateTags"' <<<"$code" || true)
+  [[ $create_tags_action_count == 1 ]] || die "policy-shape check: found $create_tags_action_count ec2:CreateTags grants; expected exactly one launch-guarded grant"
+
+  create_tags_has() { # needle explanation
+    if ! grep -Fq -- "$1" <<<"$create_tags"; then
+      die "policy-shape check: TagOnlyAtLaunch lacks '$1' — $2"
+    fi
+  }
+
+  create_tags_has 'effect    = "Allow"' \
+    'CreateTags is no longer an explicit allow statement'
+  create_tags_has 'actions   = ["ec2:CreateTags"]' \
+    'the one CreateTags grant has changed shape'
+  create_tags_has 'variable = "ec2:CreateAction"' \
+    'CreateTags is no longer confined to a creation action'
+  create_tags_has 'values   = ["RunInstances"]' \
+    'CreateTags is no longer confined to RunInstances'
+
+  echo "$NAME: POLICY-SHAPE PASSED: TagOnlyAtLaunch is the sole CreateTags grant and requires ec2:CreateAction=RunInstances (Terraform source only; not EC2 evaluation or deployed-policy proof)"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # --self-test: structure, no cloud.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,9 +273,8 @@ self_test() {
     'there is no launch grant'
   has_code 'aws:RequestTag/' \
     'launch no longer forces the ownership tag, so CI could create instances it cannot kill'
-  has_code 'ec2:CreateAction' \
-    'CreateTags is no longer confined to launch, so the retag-and-kill move is open'
   assert_termination_policy_shape
+  assert_create_tags_policy_shape
 
   # Least privilege, negative space.
   has_code '"*.metal"' \
@@ -331,12 +401,14 @@ expect_denied() { # label want cmd...
   denied "$label" "$want"
 }
 
-# S1 — #622's policy-document assertion. Unlike the live probes below, this
-# deliberately does not claim a call against a real untagged instance was
-# denied; EC2's synthetic-ID evaluation order no longer makes such a claim
-# testable without separate privileged machinery to create that instance.
-echo "== Terraform policy-shape assertion =="
+# S1–S2 — #622/#679's policy-document assertions. Unlike the live probes
+# below, these deliberately do not claim calls against real untagged or
+# pre-existing instances were denied; EC2's synthetic-ID evaluation order no
+# longer makes such claims testable without separate privileged machinery.
+echo "== Terraform policy-shape assertions =="
 assert_termination_policy_shape
+policy_assertions=$((policy_assertions + 1))
+assert_create_tags_policy_shape
 policy_assertions=$((policy_assertions + 1))
 
 echo "== positive probes =="
@@ -368,9 +440,10 @@ positive "image resolution returned $images candidate base images"
 
 echo "== negative probes (each of these SHOULD be refused) =="
 
-# N1 — no S3 at all: the cache belongs to the other role.
-expect_denied "s3 ls $KACHE_BUCKET" "AccessDenied" \
-  aws s3 ls "s3://$KACHE_BUCKET" --region "$REGION"
+# N1 — no S3 at all: the cache belongs to the other role. ListBuckets has no
+# target resource, so a missing bucket cannot answer before IAM does.
+expect_denied "s3 list-buckets" "AccessDenied" \
+  aws s3api list-buckets --region "$REGION"
 
 # N2 — no IAM.
 expect_denied "iam list-roles" "AccessDenied" \
@@ -410,12 +483,6 @@ expect_denied "run-instances t3.micro, Canonical image, correct tag (dry-run)" "
   aws ec2 run-instances --region "$REGION" --dry-run \
     --image-id "$probe_ami" --instance-type t3.micro --count 1 \
     --tag-specifications 'ResourceType=instance,Tags=[{Key=orrery-ci-ephemeral,Value=true}]'
-
-# N4 — retag-and-kill, step one: tagging outside a launch call.
-expect_denied "create-tags outside launch" "UnauthorizedOperation" \
-  aws ec2 create-tags --region "$REGION" \
-    --resources i-00000000000000001 \
-    --tags "Key=orrery-ci-ephemeral,Value=true" "Key=smoke-probe,Value=outside-launch"
 
 jq -n \
   --arg principal "$principal" \

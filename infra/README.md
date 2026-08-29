@@ -262,18 +262,21 @@ including shapes like `u-*.metal` and `mac*.metal` no family pattern covers.
 nightly.yml's `compute-identity-smoke` job assumes the role through
 [`.github/actions/aws-compute-role`](../.github/actions/aws-compute-role/action.yml)
 and runs [`scripts/aws-compute-smoke.sh`](../scripts/aws-compute-smoke.sh):
-three positive probes (identity, discovery, image resolution), four live
-refusals, and one Terraform policy-shape assertion. The launch probe uses
+three positive probes (identity, discovery, image resolution), three live
+refusals, and two Terraform policy-shape assertions. The launch probe uses
 `--dry-run`, so not even a broken policy can start anything during the proof.
 The termination assertion confirms the source policy's sole
 `TerminateTaggedOnly` grant requires
 `aws:ResourceTag/orrery-ci-ephemeral=true`; it does **not** claim EC2 denied a
 real untagged instance, or that the checked-out source is the deployed policy.
-That distinction is deliberate: #622 found that EC2 now resolves a synthetic
-instance's existence before evaluating its tag condition, making the former
-live negative probe incapable of proving a denial. The script's `--self-test`
-runs per-commit in `check.sh`'s gates lane and also executes that named
-policy-shape assertion.
+The `TagOnlyAtLaunch` assertion likewise confirms the source policy's sole
+`ec2:CreateTags` grant requires `ec2:CreateAction=RunInstances`; it does **not**
+claim EC2 denied a real attempt to retag an existing instance, or that the
+checked-out source is deployed. Those distinctions are deliberate: #622 and
+#679 found EC2 resolves a synthetic instance's existence before evaluating its
+tag/CreateAction condition, making both former live negative probes incapable
+of proving a denial. The script's `--self-test` runs per-commit in `check.sh`'s
+gates lane and also executes both named policy-shape assertions.
 
 ---
 
@@ -428,9 +431,11 @@ $ gh run watch                       # or watch https://github.com/baadc0de/orre
 ```
 
 and read the `compute-identity-smoke` job: it prints the assumed principal,
-exercises the discovery query #176 will start from, and requires five IAM
-refusals (S3, IAM, off-list launch under `--dry-run`, untagged termination,
-retag-outside-launch). A green run there is #173's acceptance evidence.
+exercises the discovery query #176 will start from, and requires three IAM
+refusals (S3, IAM, off-list launch under `--dry-run`) plus source assertions
+for tag-guarded termination and CreateTags confined to RunInstances. The
+source assertions do not establish deployed-policy parity. A green run there
+is #173's acceptance evidence.
 
 Then hand the outputs onward rather than transcribing them — a mistyped role
 ARN fails as an opaque `AccessDenied` several minutes into a job:
@@ -472,7 +477,7 @@ the lifecycle rule would eventually expire it.
 | `BucketAlreadyExists` | Bucket names are global. Set `cache_bucket_name`. (`orrery-kache` was free on 2026-08-21.) |
 | A transition rule to IA/Glacier tiers almost nothing | The account reports `TransitionDefaultMinimumObjectSize: all_storage_classes_128K` — transitions skip objects under 128 KB, which is most of a build cache. Override it or do not add transitions. There are none today. |
 | `compute-identity-smoke` fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Almost always the ref: this role accepts **only** `ref:refs/heads/main`, so a dispatch on a branch is refused by design. Compare the token's `sub` against `terraform output -raw compute_allowed_oidc_subjects` character by character. A repository rename changes the prefix — see the row above. |
-| …a live negative probe fails with anything but `UnauthorizedOperation`/`AccessDenied` | The live policy check has widened or the probe no longer reaches IAM. Treat it as a security regression, not flakiness; `scripts/aws-compute-smoke.sh --self-test` names the guarded clause. The termination guard is different after #622: it is a Terraform policy-shape assertion because a synthetic instance ID now yields `InvalidInstanceID.NotFound` before EC2 evaluates tags. |
+| …a live negative probe fails with anything but `UnauthorizedOperation`/`AccessDenied` | The live policy check has widened or the probe no longer reaches IAM. Treat it as a security regression, not flakiness; `scripts/aws-compute-smoke.sh --self-test` names the guarded clause. The termination and CreateTags guards are different after #622/#679: they are Terraform policy-shape assertions because a synthetic instance ID now yields `InvalidInstanceID.NotFound` before EC2 evaluates its tag/CreateAction condition. |
 | The composite action refuses with "pull_request events cannot assume…" | Working as designed — same-repo PRs cannot launch machines (fork PRs never even get an OIDC token). Merge, or widen `compute_allowed_subject_suffixes` deliberately. |
 
 ## Watching the size

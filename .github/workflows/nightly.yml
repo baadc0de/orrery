@@ -1190,13 +1190,14 @@ jobs:
     # long-lived key anywhere in secrets, prints the assumed principal it
     # resolved to, and then proves the credential is least-privilege in fact —
     # three positive probes (identity, instance-type discovery, image
-    # resolution), four live refusals it REQUIRES (no S3, no IAM, an
-    # out-of-allow-list launch denied under --dry-run, retag-outside-launch
-    # denied), and one Terraform policy-shape assertion: the checked-out
-    # TerminateTaggedOnly statement requires the ephemeral ownership tag.
-    # That source assertion does not claim EC2 denied a real untagged instance
-    # or that the policy is deployed; #622 removed the former synthetic-ID
-    # probe when EC2 began resolving instance existence before tag evaluation.
+    # resolution), three live refusals it REQUIRES (no S3, no IAM, and an
+    # out-of-allow-list launch denied under --dry-run), and two Terraform
+    # policy-shape assertions: the checked-out TerminateTaggedOnly statement
+    # requires the ephemeral ownership tag, and TagOnlyAtLaunch confines
+    # CreateTags to RunInstances. Those source assertions do not claim EC2
+    # denied real calls or that the policy is deployed; #622/#679 removed the
+    # synthetic-ID probes when EC2 began resolving instance existence before
+    # tag/CreateAction evaluation.
     #
     # It is not a phase gate; it is the credential path #176's ephemeral
     # qualified machines will ride. Like `p4-accumulate` it produces evidence
@@ -1223,7 +1224,7 @@ jobs:
     # workflow cannot drift apart.
     #
     # Cost: $0 in practice — STS and Describe* are free-tier calls, the
-    # four negative calls are refusals by construction, no instance exists
+    # three negative calls are refusals by construction, no instance exists
     # during any step, and the runner minutes are public-repository-free.
     runs-on: ubuntu-latest
     timeout-minutes: 10
