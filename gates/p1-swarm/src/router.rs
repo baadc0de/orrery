@@ -32,7 +32,7 @@
 //! control sharing a stream with 40 kB repairs went from a 54 ms median to
 //! 1154 ms. That is the effect this model exists to reproduce cheaply.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 use rand::{Rng, SeedableRng};
@@ -148,9 +148,46 @@ pub struct RouterCounters {
     pub bytes: u64,
 }
 
+/// One directed peer-to-peer link: who sent, and which seat receives.
+///
+/// Named rather than a bare `(NodeId, usize)` tuple because the two fields are
+/// not interchangeable and a tuple key says nothing about which is which at the
+/// use site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LinkId {
+    from: NodeId,
+    to: usize,
+}
+
+impl LinkId {
+    /// The impairment stream seed for this link, from the run seed and identity.
+    ///
+    /// A link's sequence is a function of the link alone, so traffic on one link
+    /// cannot shift the loss and jitter another link sees (#699, #700).
+    fn stream_seed(self, run_seed: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(run_seed, self.from, self.to), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
+}
+
 /// Carries packets between peers' session buffers.
 pub struct Router {
-    rng: ChaCha8Rng,
+    /// One impairment stream per directed link, never one shared stream.
+    ///
+    /// A single `ChaCha8Rng` draws loss and jitter in packet order across every
+    /// link and lane, so a change that alters how many packets one link sends
+    /// shifts the impairment realisation for all the others. That coupling is
+    /// not theoretical: it made #692's swept interest margin fail the
+    /// boundary-thrash clause by delaying an unrelated shot six ticks, causing
+    /// a collision that never happened on the baseline leg (#699). An A/B where
+    /// one side sends a different number of packets was comparing two
+    /// impairment realisations rather than two designs.
+    ///
+    /// Seeded from the run seed and the link identity, so a link draws the same
+    /// sequence regardless of what any other link did.
+    rng: BTreeMap<LinkId, ChaCha8Rng>,
+    seed: u64,
     impairment: Impairment,
     in_flight: VecDeque<InFlight>,
     /// The tick the last `Shared` message on each link is due.
@@ -168,7 +205,8 @@ impl Router {
     #[must_use]
     pub fn new(impairment: Impairment, seed: u64) -> Self {
         Self {
-            rng: ChaCha8Rng::seed_from_u64(seed),
+            rng: BTreeMap::new(),
+            seed,
             impairment,
             in_flight: VecDeque::new(),
             shared_tail: Vec::new(),
@@ -176,17 +214,26 @@ impl Router {
         }
     }
 
+    /// The impairment stream for one directed link, created on first use.
+    fn link_rng(&mut self, link: LinkId) -> &mut ChaCha8Rng {
+        let seed = self.seed;
+        self.rng
+            .entry(link)
+            .or_insert_with(|| ChaCha8Rng::seed_from_u64(link.stream_seed(seed)))
+    }
+
     /// Decide the fate of one packet: dropped, delayed, or delivered now.
     ///
     /// Separated from the buffer plumbing so the impairment model can be tested
     /// without standing up peers.
-    fn schedule(&mut self, tick: u64) -> Fate {
-        if self.impairment.loss > 0.0 && self.rng.random_bool(self.impairment.loss) {
+    fn schedule(&mut self, tick: u64, link: LinkId) -> Fate {
+        let impairment = self.impairment;
+        if impairment.loss > 0.0 && self.link_rng(link).random_bool(impairment.loss) {
             return Fate::Dropped;
         }
-        if self.impairment.jitter_ticks > 0
-            && self.impairment.jitter_rate > 0.0
-            && self.rng.random_bool(self.impairment.jitter_rate)
+        if impairment.jitter_ticks > 0
+            && impairment.jitter_rate > 0.0
+            && self.link_rng(link).random_bool(impairment.jitter_rate)
         {
             return Fate::Delayed(tick + u64::from(self.impairment.jitter_ticks));
         }
@@ -215,10 +262,13 @@ impl Router {
         // robust as a 120 B lease ack.
         let segments = (payload.len() as u64).div_ceil(MTU_BYTES).max(1);
         let mut due = tick + 1;
-        if self.impairment.loss > 0.0 {
+        let link = LinkId { from, to };
+        let loss = self.impairment.loss;
+        let jitter_rate = self.impairment.jitter_rate;
+        if loss > 0.0 {
             for _ in 0..segments {
                 let mut attempts = 0u32;
-                while self.rng.random_bool(self.impairment.loss) && attempts < MAX_RETRANSMITS {
+                while self.link_rng(link).random_bool(loss) && attempts < MAX_RETRANSMITS {
                     attempts += 1;
                 }
                 if attempts > 0 {
@@ -233,8 +283,8 @@ impl Router {
             }
         }
         if self.impairment.jitter_ticks > 0
-            && self.impairment.jitter_rate > 0.0
-            && self.rng.random_bool(self.impairment.jitter_rate)
+            && jitter_rate > 0.0
+            && self.link_rng(link).random_bool(jitter_rate)
         {
             due += u64::from(self.impairment.jitter_ticks);
         }
@@ -271,7 +321,7 @@ impl Router {
         payload: Bytes,
     ) -> DatagramDisposition {
         self.counters.bytes += payload.len() as u64 + DATAGRAM_OVERHEAD;
-        match self.schedule(tick) {
+        match self.schedule(tick, LinkId { from, to }) {
             Fate::Dropped => {
                 self.counters.dropped += 1;
                 DatagramDisposition::Dropped
