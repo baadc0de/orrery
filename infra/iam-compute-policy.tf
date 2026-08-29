@@ -109,11 +109,15 @@
 #
 # ## What is and is not pinned down, stated for the reviewer
 #
-# **The AMI publisher is pinned, the image id is discovered.** #176 resolves
-# the newest Ubuntu 24.04 image for each architecture from Canonical account
-# 099720109477. `UseCanonicalUbuntuImage` enforces that owner in IAM, closing
-# #173's recorded Windows/RHEL licence-cost exposure without hard-coding an AMI
-# id that would rot when Canonical publishes its next security refresh.
+# **The AMI ids are pinned and reviewed.** `UseCanonicalUbuntuImage` names the
+# exact images this credential may boot, from `var.compute_reviewed_image_ids`.
+# This replaced an owner condition that did not work: `ec2:Owner` evaluates to
+# an image's owner ALIAS when it has one, and Canonical's ubuntu-noble images
+# carry `ImageOwnerAlias amazon` beside `OwnerId 099720109477`, so the
+# condition matched nothing and every launch was denied. The pin costs a
+# refresh when Canonical publishes a security update -- a stale pin fails
+# closed, which is the right direction -- and it is strictly tighter than the
+# owner condition was, so #173's licence-cost exposure stays closed.
 #
 # **Subnet/security-group resources are account-scoped, not topology-scoped.**
 # Pinning them means reading pre-existing VPC data into this module, which
@@ -256,16 +260,20 @@ data "aws_iam_policy_document" "compute_access" {
     effect  = "Allow"
     actions = ["ec2:RunInstances"]
 
-    resources = [
-      "arn:aws:ec2:*::image/*",
-      "arn:aws:ec2:*::snapshot/*",
-    ]
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:Owner"
-      values   = ["099720109477"]
-    }
+    # Reviewed ids, not an owner condition. `ec2:Owner` evaluates to the
+    # image's owner ALIAS when it has one, and Canonical's ubuntu-noble
+    # images report `ImageOwnerAlias amazon` beside `OwnerId 099720109477` --
+    # so `ec2:Owner = "099720109477"` silently matched nothing and the gate
+    # was denied for five nights. Accepting `amazon` instead would have
+    # granted every Amazon-aliased public image.
+    #
+    # Snapshots stay a wildcard: RunInstances authorises the backing snapshot
+    # separately, its id is not knowable from the AMI id without a lookup this
+    # module may not make, and a snapshot cannot be booted on its own.
+    resources = concat(
+      [for id in var.compute_reviewed_image_ids : "arn:aws:ec2:*::image/${id}"],
+      ["arn:aws:ec2:*::snapshot/*"],
+    )
 
     condition {
       test     = "StringEquals"
