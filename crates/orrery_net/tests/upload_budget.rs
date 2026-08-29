@@ -19,11 +19,17 @@ use bevy_platform::time::Instant;
 
 use aeronet_iroh::stream::IrohStreamIo;
 use orrery_net::budget::{stream_wire_bytes, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES};
-use orrery_net::channels::Channel;
+use orrery_net::channels::{untag, Channel};
 use orrery_net::peer_link::{forget_departed_links, send_peer_packets, PeerLinkCounters};
 use orrery_net::plugin::Peer;
 use orrery_net::{SendPacket, StreamMode};
-use orrery_protocol::NodeId;
+use orrery_protocol::{
+    channels::{
+        encode_delta_patch, encode_replication, encode_replication_delta, ReplicationDelta,
+        TAG_REPLICATION, TAG_REPLICATION_DELTA,
+    },
+    NodeId, PersistId,
+};
 
 const MTU: usize = 1_200;
 const PAYLOAD: usize = 500;
@@ -97,6 +103,16 @@ fn allowance() -> usize {
         / WIRE) as usize
 }
 
+fn state_subtag(payload: &[u8]) -> Option<u8> {
+    let (_, body) = untag(payload)?;
+    body.first().copied()
+}
+
+fn replication_subtag(packet: &[u8]) -> Option<u8> {
+    let (_, payload) = untag(packet)?;
+    state_subtag(payload)
+}
+
 #[test]
 fn everything_flows_while_there_is_budget() {
     let peer = secret(1).public();
@@ -131,6 +147,75 @@ fn state_is_shed_once_the_window_is_spent() {
 }
 
 #[test]
+fn a_keyframe_is_shed_only_after_every_delta() {
+    // Put every delta *before* its keyframe. FIFO therefore admits the deltas
+    // and sheds the anchor; only the wire-sub-tag batch classifier can put the
+    // keyframe first. The payloads come from the real encoders, so this asserts
+    // what the send path reads from wire bytes rather than a pre-decided kind.
+    let peer = secret(1).public();
+    let mut app = app(&[peer]);
+    let absolute = (0..PAYLOAD)
+        .map(|index| ((index * 73 + 19) % 251) as u8)
+        .collect::<Vec<_>>();
+    let keyframe = bytes::Bytes::from(encode_replication(&absolute));
+    let delta = bytes::Bytes::from(encode_replication_delta(
+        &absolute,
+        &ReplicationDelta {
+            entity: PersistId::new(7),
+            tick: 60,
+            keyframe_age: 60,
+            cell: None,
+            patch: encode_delta_patch(&absolute, &absolute),
+        },
+    ));
+    assert_eq!(state_subtag(&keyframe), Some(TAG_REPLICATION));
+    assert_eq!(state_subtag(&delta), Some(TAG_REPLICATION_DELTA));
+
+    let budget = UploadBudget::default();
+    let limit = budget.sustained.bytes_over(Duration::from_secs(1));
+    let keyframe_wire = keyframe.len() as u64 + 1 + DATAGRAM_OVERHEAD_BYTES;
+    let delta_wire = delta.len() as u64 + 1 + DATAGRAM_OVERHEAD_BYTES;
+    // This many deltas fit before the keyframe under FIFO, but the keyframe
+    // plus all of them does not fit. The correct order sheds exactly one delta.
+    let delta_count = usize::try_from((limit - keyframe_wire) / delta_wire + 1).unwrap();
+    assert!(u64::try_from(delta_count).unwrap() * delta_wire <= limit);
+    assert!(keyframe_wire + u64::try_from(delta_count).unwrap() * delta_wire > limit);
+
+    let mut messages = app.world_mut().resource_mut::<Messages<SendPacket>>();
+    for _ in 0..delta_count {
+        messages.write(SendPacket::state(peer, delta.clone()));
+    }
+    messages.write(SendPacket::state(peer, keyframe));
+    app.update();
+
+    let sent = app
+        .world_mut()
+        .query::<&aeronet_io::Session>()
+        .iter(app.world())
+        .next()
+        .expect("test session")
+        .send
+        .iter()
+        .filter_map(|packet| replication_subtag(packet))
+        .collect::<Vec<_>>();
+    let keyframes = sent.iter().filter(|&&tag| tag == TAG_REPLICATION).count();
+    let deltas = sent
+        .iter()
+        .filter(|&&tag| tag == TAG_REPLICATION_DELTA)
+        .count();
+    assert_eq!(
+        keyframes, 1,
+        "the keyframe must survive before any delta sheds"
+    );
+    assert_eq!(deltas, delta_count - 1, "exactly one delta must be shed");
+    assert_eq!(
+        app.world().resource::<UploadMeter>().shed,
+        1,
+        "the overage must be the final delta, not the keyframe"
+    );
+}
+
+#[test]
 fn control_still_goes_out_when_state_is_being_shed() {
     // Shedding a gap repair or a lease operation turns one dropped datagram
     // into a permanent hole — a repair that never arrives is indistinguishable
@@ -149,8 +234,8 @@ fn control_still_goes_out_when_state_is_being_shed() {
     };
     assert!(shed > 0, "the state flood must actually be shed");
     assert_eq!(
-        control, 5,
-        "every control packet went out over budget, and was counted"
+        control, 0,
+        "unsheddable control must be admitted before the replication flood spends the window"
     );
     // Sent = whatever state fit, plus all five control packets.
     let sent = queued_for_io(&mut app);
