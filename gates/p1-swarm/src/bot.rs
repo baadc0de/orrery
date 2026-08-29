@@ -57,7 +57,8 @@ use orrery_protocol::channels::{
 };
 use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
 use orrery_protocol::{
-    CellId, NodeId, PersistId, RecordSource, StateClaim, Tick, UniverseSeed, DEFAULT_CELL_EDGE_M,
+    CellId, InterestCellCrossing, NodeId, PersistId, RecordSource, SeqPair, StateClaim, Tick,
+    UniverseSeed, DEFAULT_CELL_EDGE_M,
 };
 use orrery_spatial::hysteresis::GridPosition;
 use orrery_spatial::interest::{HighRate, InterestSelection, Proxy};
@@ -110,6 +111,13 @@ const DEFAULT_KEYFRAME_EVERY_SENDS: u64 = 20;
 /// demoted entity re-promotes without a visible stutter; anything that round
 /// trips inside a second never got the benefit of that ramp.
 const POP_WINDOW_TICKS: u64 = 60;
+
+/// A newly observed committed-cell edge before its wire coverage is attached.
+#[derive(Debug, Clone, Copy)]
+struct CommittedCellCrossing {
+    from: CellId,
+    to: CellId,
+}
 
 /// One interest-refresh period, the interval over which boundary returns can
 /// churn subscriptions and storage keys before the system observes them.
@@ -1393,16 +1401,29 @@ impl Bot {
         self.app.update();
     }
 
-    /// Record what changed this tick: cell crossings and interest churn.
+    /// Record what changed this tick without enabling host crossing emission.
     pub fn sample(&mut self) {
+        let _ = self.sample_with_interest_crossing(false, 0.0);
+    }
+
+    /// Record what changed this tick and emit an ordered interest crossing.
+    ///
+    /// The feature flag deliberately gates both #653 mechanisms in the harness:
+    /// the predictive swept margin covers where a craft can reach before the
+    /// next bulk refresh, while this reactive event corrects the roster after
+    /// the actual hysteresis commitment. Neither is redundant with the other,
+    /// and the one-hertz bulk refresh remains the repair path for lost events.
+    pub fn sample_with_interest_crossing(
+        &mut self,
+        swept_interest_margin: bool,
+        refresh_period_s: f64,
+    ) -> Option<InterestCellCrossing> {
         let committed_cell = {
             let world = self.app.world_mut();
             let mut cells = world.query_filtered::<&Cell, With<LocalPlayer>>();
             cells.single(world).ok().map(|cell| cell.0)
         };
-        if let Some(cell) = committed_cell {
-            self.record_cell_commitment(cell);
-        }
+        let committed_crossing = committed_cell.and_then(|cell| self.record_cell_commitment(cell));
 
         let world = self.app.world_mut();
         let high: Vec<Entity> = world.resource::<InterestSelection>().high_rate.clone();
@@ -1466,13 +1487,31 @@ impl Bot {
         self.demoted_at.retain(|(_, when, _)| *when >= horizon);
 
         self.last_high_rate = high;
+        let crossing = if swept_interest_margin {
+            committed_crossing.map(|committed| InterestCellCrossing {
+                tick: Tick::new(self.tick),
+                seq: SeqPair {
+                    // The harness gives each bot one stable authority tenure.
+                    own_seq: 1,
+                    auth_seq: u32::try_from(self.crossings)
+                        .expect("a harness run fits its crossing order in u32"),
+                },
+                from: committed.from,
+                to: committed.to,
+                covered_cells: self.swept_interest_cells(refresh_period_s),
+            })
+        } else {
+            None
+        };
         self.tick += 1;
+        crossing
     }
 
-    fn record_cell_commitment(&mut self, cell: CellId) {
+    fn record_cell_commitment(&mut self, cell: CellId) -> Option<CommittedCellCrossing> {
         if self.current_cell == Some(cell) {
-            return;
+            return None;
         }
+        let from = self.current_cell;
         self.crossings += 1;
         let is_return = self.previous_cell == Some(cell);
         if is_return {
@@ -1496,6 +1535,7 @@ impl Bot {
         if !self.visited.contains(&cell) {
             self.visited.push(cell);
         }
+        from.map(|from| CommittedCellCrossing { from, to: cell })
     }
 
     /// This peer's upload rate over the meter's window, in simulated time.
@@ -1597,6 +1637,25 @@ impl Bot {
             regime: TopologyRegime::Mesh,
             source: IslandSource::Coordinator,
         };
+    }
+
+    /// Apply one coordinator-ordered crossing to the roster this sender reads.
+    ///
+    /// Updating the existing entry in place is intentional: `peers` order feeds
+    /// deterministic link and audience behaviour in this harness. Rebuilding it
+    /// through a keyed collection would make an interest-only change perturb the
+    /// flags-off simulation.
+    /// A receiver that does not carry the author in its published roster has no
+    /// interest coverage to correct, so the event is not addressed to it. That
+    /// is a normal state for a peer in another island or one whose roster has
+    /// not been published yet -- it must not be fatal on a live campaign host,
+    /// where the same binary serves human seats.
+    pub fn apply_interest_crossing(&mut self, node: NodeId, crossing: &InterestCellCrossing) {
+        let membership = &mut *self.app.world_mut().resource_mut::<IslandMembership>();
+        let Some(entry) = membership.peers.iter_mut().find(|entry| entry.node == node) else {
+            return;
+        };
+        entry.cells.clone_from(&crossing.covered_cells);
     }
 
     /// Broadcasts every state this peer authors to island-mates whose interest
@@ -1884,7 +1943,39 @@ impl Bot {
     /// Records a captured committed-cell transition at an explicit tick.
     pub fn record_cell_commitment_for_test(&mut self, cell: CellId, tick: u64) {
         self.tick = tick;
-        self.record_cell_commitment(cell);
+        let _ = self.record_cell_commitment(cell);
+    }
+
+    #[cfg(test)]
+    /// Move the local player's spatial input without bypassing hysteresis.
+    pub fn move_local_player_for_test(&mut self, grid_position: Vec3) {
+        let world = self.app.world_mut();
+        let mut positions = world.query_filtered::<&mut GridPosition, With<LocalPlayer>>();
+        positions
+            .single_mut(world)
+            .expect("a bot has exactly one local player")
+            .0 = grid_position;
+    }
+
+    #[cfg(test)]
+    /// Place the authored player in a fixture cell before island formation.
+    pub fn place_local_player_for_test(&mut self, cell: CellId) {
+        let (coords, _) = cell.coords();
+        let position = Vec3::new(
+            coords.x as f32 + 0.5,
+            coords.y as f32 + 0.5,
+            coords.z as f32 + 0.5,
+        );
+        let world = self.app.world_mut();
+        let mut local = world.query_filtered::<(&mut GridPosition, &mut Cell), With<LocalPlayer>>();
+        let (mut grid, mut committed) = local
+            .single_mut(world)
+            .expect("a bot has exactly one local player");
+        grid.0 = position;
+        committed.0 = cell;
+        self.current_cell = Some(cell);
+        self.previous_cell = None;
+        self.visited = vec![cell];
     }
 
     #[cfg(test)]

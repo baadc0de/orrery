@@ -316,10 +316,16 @@ struct Args {
     #[arg(long)]
     budget_kbps: Option<u64>,
 
-    /// Feed #692's swept one-refresh-period interest cells into bot manifests.
+    /// Enable #653's two-part interest coverage: #692's swept one-refresh-period
+    /// cells in every bot manifest, plus the ordered crossing event that
+    /// corrects the host roster on the commitment instead of at the next 1 Hz
+    /// refresh.
     ///
-    /// This is intentionally minimal harness wiring. Production host/client
-    /// propagation remains a follow-up after this run prices the feature.
+    /// Both halves are deliberate and neither subsumes the other. At v18's
+    /// 480 m/s interceptor ceiling a craft clears the 460.8 m one-body AOI
+    /// guarantee in 0.96 s, inside one refresh period: the swept set covers
+    /// where it can get to, the event covers the tail when it gets somewhere
+    /// else, and the bulk refresh stays the repair path for a lost event.
     #[arg(long)]
     swept_interest_margin: bool,
 
