@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use orrery_core::CoreCodec;
 use orrery_games::game::Tamper;
+use orrery_games::regolith::order::Outcome;
 use orrery_games::regolith::state::RegolithState;
 use orrery_games::regolith::{campaign_rock_seeds, pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
 use orrery_net::peer_link::StreamMode;
@@ -24,6 +25,7 @@ use crate::exterior::{
 };
 
 use crate::router::{Impairment, Router, RouterCounters};
+use crate::shot_interest::{ShotInterestReport, ShotInterestStats};
 
 /// Five seconds at the fixed 60 Hz simulation cadence.
 ///
@@ -97,6 +99,8 @@ pub struct SwarmConfig {
     pub replica_scope_capture: bool,
     /// Observe changed canonical bytes at the existing replication send seam.
     pub delta_stats: bool,
+    /// Observe replica scope when target-authored shot verdicts resolve.
+    pub shot_interest_stats: bool,
 }
 
 impl Default for SwarmConfig {
@@ -116,6 +120,7 @@ impl Default for SwarmConfig {
             started_at_unix_secs: None,
             replica_scope_capture: false,
             delta_stats: false,
+            shot_interest_stats: false,
         }
     }
 }
@@ -337,6 +342,9 @@ pub struct SwarmReport {
     /// A19 changed-byte measurements, present only with `--delta-stats`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_stats: Option<DeltaStatsReport>,
+    /// Shot/interest measurements, present only with `--shot-interest-stats`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shot_interest_stats: Option<ShotInterestReport>,
     /// Highest peak upload across the swarm, bits per simulated second.
     pub worst_peak_upload_bits: u64,
     /// Highest p99 upload across the swarm.
@@ -574,6 +582,10 @@ pub struct Swarm {
     adjudicator: Adjudicator,
     /// Every verdict it reached.
     docket: Docket,
+    /// Opt-in shot/interest accumulator.
+    shot_interest_stats: Option<ShotInterestStats>,
+    /// Directed scope from the roster most recently installed on the bots.
+    shot_interest_scope: BTreeMap<(usize, usize), bool>,
 }
 
 /// One joined external peer, as far as the host ever knows it.
@@ -986,6 +998,11 @@ impl Swarm {
                 bot.enable_delta_stats(config.send_hz);
             }
         }
+        if config.shot_interest_stats {
+            for bot in &mut bots {
+                bot.enable_resolved_shot_capture();
+            }
+        }
         let index_of = bots
             .iter()
             .map(|bot| (bot.node, bot.index))
@@ -999,6 +1016,8 @@ impl Swarm {
             index_of,
             adjudicator: Adjudicator::new(seed),
             docket: Docket::default(),
+            shot_interest_stats: config.shot_interest_stats.then(ShotInterestStats::default),
+            shot_interest_scope: BTreeMap::new(),
             exteriors: BTreeMap::new(),
             hearsay_buffers: HearsayBuffers::default(),
             hearsay_fold_enabled: true,
@@ -1150,6 +1169,10 @@ impl Swarm {
             }
             bot.set_island(others);
         }
+        if self.shot_interest_stats.is_some() {
+            let roster = self.active_roster();
+            self.replace_shot_interest_scope(&roster);
+        }
     }
 
     /// Refresh every bot's roster with where the others actually are.
@@ -1189,7 +1212,72 @@ impl Swarm {
                 .collect();
             bot.set_island(others);
         }
+        self.replace_shot_interest_scope(&roster);
         capture
+    }
+
+    /// Retain the same directed decisions the replica-scope capture renders.
+    fn replace_shot_interest_scope(&mut self, roster: &[(usize, NodeId, CellId)]) {
+        if self.shot_interest_stats.is_none() {
+            return;
+        }
+        self.shot_interest_scope = scope_capture_records(roster)
+            .into_iter()
+            .map(|capture| {
+                (
+                    (capture.subject_seat, capture.receiver_seat),
+                    capture.in_scope,
+                )
+            })
+            .collect();
+    }
+
+    /// Classify target-authored shot verdicts against the last installed roster.
+    fn capture_shot_interest(&mut self) {
+        if self.shot_interest_stats.is_none() {
+            return;
+        }
+        let resolved: Vec<_> = self
+            .bots
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(victim_index, bot)| {
+                bot.take_resolved_shots()
+                    .into_iter()
+                    .map(move |event| (victim_index, event))
+            })
+            .collect();
+
+        for (victim_index, event) in resolved {
+            let Outcome::ShotResolved {
+                attacker,
+                target,
+                result,
+            } = event
+            else {
+                continue;
+            };
+            debug_assert_eq!(target, self.bots[victim_index].entity());
+            let attacker_index = self.bots.iter().position(|bot| bot.entity() == attacker);
+            let in_interest = attacker_index.and_then(|index| {
+                self.shot_interest_scope
+                    .get(&(index, victim_index))
+                    .copied()
+            });
+            let attacker_profile = attacker_index.map(|index| self.bots[index].profile.name());
+            let attacker_speed_mms = attacker_index.map(|index| self.bots[index].speed_mms());
+            let victim_speed_mms = self.bots[victim_index].speed_mms();
+            self.shot_interest_stats
+                .as_mut()
+                .expect("measurement enabled")
+                .observe(
+                    in_interest,
+                    result,
+                    attacker_profile,
+                    attacker_speed_mms,
+                    victim_speed_mms,
+                );
+        }
     }
 
     /// Rotate the five-second roster buffers and deliver only the preceding
@@ -1459,6 +1547,7 @@ impl Swarm {
         for index in 0..self.bots.len() {
             self.bots[index].step_core(tick, self.config.cell_edge_m);
         }
+        self.capture_shot_interest();
         let mut mark = std::time::Instant::now();
         phase[0] += mark.elapsed().as_nanos();
         // The last tick of each send window, not the first. Broadcasting at
@@ -1766,6 +1855,10 @@ impl Swarm {
             }
             total.report()
         });
+        let shot_interest_stats = self
+            .shot_interest_stats
+            .take()
+            .map(ShotInterestStats::report);
         let replication_wire = self.bots.iter().map(Bot::replication_wire_counters).fold(
             crate::bot::ReplicationWireCounters::default(),
             |mut total, peer| {
@@ -1796,6 +1889,7 @@ impl Swarm {
             seconds: self.config.seconds,
             ticks,
             delta_stats,
+            shot_interest_stats,
             worst_peak_upload_bits: per_peer
                 .iter()
                 .map(|p| p.peak_upload_bits)
@@ -2670,6 +2764,7 @@ mod tests {
             cheat: None,
             enforcing: false,
         });
+        target_bot.enable_resolved_shot_capture();
         let mut target_state = Craft::spawned(
             Archetype::Interceptor,
             orrery_core::QPos {
@@ -2770,6 +2865,7 @@ mod tests {
             ticks: 3_600 * TICK_HZ,
             per_peer: Vec::new(),
             delta_stats: None,
+            shot_interest_stats: None,
             worst_peak_upload_bits: 973_000,
             worst_p99_upload_bits: 906_000,
             min_cells_visited: 81,

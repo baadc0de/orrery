@@ -35,9 +35,7 @@ use bytes::Bytes;
 use orrery_core::{tick_rng, CoreCodec, Executor, InputLogProducer, QPos};
 use orrery_games::game::{Game, Tamper};
 use orrery_games::regolith::archetype::Archetype;
-use orrery_games::regolith::order::Order;
-#[cfg(test)]
-use orrery_games::regolith::order::Outcome;
+use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::weapon::WeaponKind;
 use orrery_games::regolith::{
@@ -198,9 +196,8 @@ pub struct Bot {
     replica_authorities: BTreeMap<PersistId, NodeId>,
     /// Canonical keyframes used by the direct core-observation receive seam.
     replica_keyframes: ReplicaKeyframes,
-    /// Target-authored shot verdicts retained only for live-path regression tests.
-    #[cfg(test)]
-    resolved_shots: Vec<Outcome>,
+    /// Target-authored shot verdicts retained only for an enabled measurement.
+    resolved_shots: Option<Vec<Outcome>>,
     /// Envelopes routed to this peer but naming another entity.
     foreign_deliveries: u64,
     /// First tick at which the tampered build produced a different state hash
@@ -785,8 +782,7 @@ impl Bot {
             replica_seen_at: BTreeMap::new(),
             replica_authorities: BTreeMap::new(),
             replica_keyframes: ReplicaKeyframes::default(),
-            #[cfg(test)]
-            resolved_shots: Vec::new(),
+            resolved_shots: None,
             foreign_deliveries: 0,
             first_tampered_tick: None,
             tamper: cheat,
@@ -913,6 +909,21 @@ impl Bot {
     #[must_use]
     pub fn delta_stats(&self) -> Option<&DeltaStats> {
         self.delta_stats.as_ref()
+    }
+
+    /// Enable target-authored shot-verdict capture at the core step seam.
+    pub fn enable_resolved_shot_capture(&mut self) {
+        self.resolved_shots = Some(Vec::new());
+    }
+
+    /// The bot's current exact quantized speed in millimetres per second.
+    #[must_use]
+    pub fn speed_mms(&self) -> u64 {
+        let velocity = self.craft().vel;
+        let squared = u128::from(velocity.x.unsigned_abs()).pow(2)
+            + u128::from(velocity.y.unsigned_abs()).pow(2)
+            + u128::from(velocity.z.unsigned_abs()).pow(2);
+        u64::try_from(squared.isqrt()).unwrap_or(u64::MAX)
     }
 
     /// The bot's current speed in metres per second.
@@ -1044,14 +1055,15 @@ impl Bot {
         if let Some(chain) = &mut self.chain {
             chain.log_neighbor_frames(tick, &outcome.neighbor_frames);
         }
-        #[cfg(test)]
-        self.resolved_shots.extend(
-            outcome
-                .events
-                .iter()
-                .filter(|event| matches!(event, Outcome::ShotResolved { .. }))
-                .cloned(),
-        );
+        if let Some(resolved_shots) = &mut self.resolved_shots {
+            resolved_shots.extend(
+                outcome
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Outcome::ShotResolved { .. }))
+                    .cloned(),
+            );
+        }
         for event in &outcome.events {
             if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
                 if recipient == self.entity {
@@ -1558,10 +1570,12 @@ impl Bot {
         self.delivered_inbox.push((from, order));
     }
 
-    #[cfg(test)]
     /// Drains target-authored shot verdicts observed at the real step boundary.
     pub fn take_resolved_shots(&mut self) -> Vec<Outcome> {
-        core::mem::take(&mut self.resolved_shots)
+        self.resolved_shots
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
     }
 
     /// Hands one delivered message from `from` to this bot's receive buffers.
