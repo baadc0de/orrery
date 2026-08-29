@@ -192,6 +192,7 @@ mod exterior;
 mod peer_runner;
 mod profile;
 mod router;
+mod shot_interest;
 mod swarm;
 
 use anyhow::{bail, Context, Result};
@@ -297,6 +298,11 @@ struct Args {
     /// 1 Hz keyframe, grouped by body type in the JSON report.
     #[arg(long)]
     delta_stats: bool,
+
+    /// Measure whether each shot's attacker was in the victim's replicated
+    /// interest scope at the resolution tick, including attacker-speed stats.
+    #[arg(long)]
+    shot_interest_stats: bool,
 
     /// Print the report and exit zero even if a clause failed.
     #[arg(long)]
@@ -683,6 +689,7 @@ fn main() -> Result<()> {
         }),
         replica_scope_capture: args.replica_scope_capture,
         delta_stats: args.delta_stats,
+        shot_interest_stats: args.shot_interest_stats,
     };
 
     eprintln!(
@@ -993,6 +1000,19 @@ fn main() -> Result<()> {
         "gates/p1-swarm: {} boundary flips, {} proxy pops out of {} churn events",
         report.total_boundary_flips, report.total_proxy_pops, report.total_interest_churn,
     );
+    if let Some(shots) = &report.shot_interest_stats {
+        eprintln!(
+            "gates/p1-swarm: shot interest — {} of {} resolved shots out of interest ({:.3}%); \
+             {} of {} against a slower victim ({:.3}%); {} scope unknown",
+            shots.attacker_out_of_interest,
+            shots.resolved_shots,
+            shots.out_of_interest_rate * 100.0,
+            shots.out_of_interest_against_slower_victim,
+            shots.resolved_against_slower_victim,
+            shots.slower_victim_out_of_interest_rate * 100.0,
+            shots.scope_unknown,
+        );
+    }
     if report.witnessing {
         eprintln!(
             "gates/p1-swarm: witness ran over {:.0} player-hours: {} chain gaps repaired, {} false positives",
