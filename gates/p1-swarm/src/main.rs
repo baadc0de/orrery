@@ -1104,8 +1104,8 @@ fn main() -> Result<()> {
     }
     if let Some(join) = &report.late_join {
         eprintln!(
-            "gates/p1-swarm: late joiner tracked {} of {} roster peers, {} of which were in its neighbourhood",
-            join.tracked, join.roster, join.in_neighbourhood,
+            "gates/p1-swarm: fresh late joiner started with {} replicas, then tracked {} of {} roster peers, {} of which were in its neighbourhood",
+            join.initial_replicas, join.tracked, join.roster, join.in_neighbourhood,
         );
     }
 
@@ -1169,6 +1169,7 @@ fn self_test() -> Result<()> {
         "an unmodified swarm files no report at all",
         "every witness can sign what it raises",
         "the link drains",
+        "the late joiner starts with no retained replicas",
         "the late-join check is not vacuous",
         "interest churn absorbed without visible proxy pops",
         "no entity thrashes cells at a boundary",

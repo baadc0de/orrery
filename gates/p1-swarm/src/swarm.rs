@@ -557,6 +557,11 @@ pub struct LateJoinReport {
     pub neighbourhood: usize,
     /// Peers the joiner's island roster named.
     pub roster: usize,
+    /// Replicas present before the join fixture delivers anything.
+    ///
+    /// Must be zero: a long-lived stand-in can retain replicas that a real
+    /// arrival could never have received.
+    pub initial_replicas: usize,
     /// Peers whose cell was inside that neighbourhood.
     pub in_neighbourhood: usize,
     /// Peers the joiner tracked — must not exceed `in_neighbourhood`.
@@ -1714,55 +1719,117 @@ impl Swarm {
 
     /// A peer arriving mid-run must see only its 27-cell neighbourhood.
     fn check_late_join(&mut self) -> LateJoinReport {
-        // Whichever peer currently has the most island-mates in its
-        // neighbourhood stands in for the joiner. Always picking the last bot
-        // made the check vacuous once the crowd sheared apart: `tracked ≤
-        // in_neighbourhood` is trivially true when both are zero, and the run
-        // reported a pass having proven nothing.
-        let cells: Vec<CellId> = (0..self.bots.len())
-            .map(|index| self.bots[index].cell().expect("committed"))
+        assert!(
+            self.bots.len() >= 2,
+            "a late-join scope check needs a joiner and a roster peer"
+        );
+
+        // Replace one population seat with a genuinely new peer, keeping the
+        // criterion population unchanged. The joiner gets a new identity and
+        // an empty receive world; the long-lived bot previously used here
+        // could retain replicas from any earlier point in the run.
+        let departing = self.bots.len() - 1;
+        let retained_cells: Vec<CellId> = self
+            .bots
+            .iter_mut()
+            .take(departing)
+            .map(|bot| bot.cell().expect("committed"))
             .collect();
-        let joiner = (0..self.bots.len())
+        let placement_peer = (0..departing)
             .max_by_key(|index| {
-                let neighbourhood = cells[*index].neighbors27();
-                cells
+                let neighbourhood = retained_cells[*index].neighbors27();
+                retained_cells
                     .iter()
                     .enumerate()
-                    .filter(|(other, cell)| other != index && neighbourhood.contains(cell))
+                    .filter(|(other, cell)| *other != *index && neighbourhood.contains(cell))
                     .count()
             })
-            .expect("a non-empty swarm");
-        let neighbourhood: Vec<CellId> = self.bots[joiner].cell().expect("committed").neighbors27();
+            .expect("the retained roster is non-empty");
+        let joiner_snapshot = self.bots[placement_peer].craft().clone();
+        let mut universe = [0u8; 32];
+        universe[0..8].copy_from_slice(&self.config.seed.to_le_bytes());
+        let fixture_count = self.bots.len() + 1;
+        let cell_edge_m = self.config.cell_edge_m;
+        let fixture_spec = |index| BotSpec {
+            index,
+            count: fixture_count,
+            seed: UniverseSeed(universe),
+            cell_edge_m,
+            witnessing: false,
+            cheat: None,
+            enforcing: false,
+        };
+        let mut joiner = Bot::from_craft_snapshot(
+            fixture_spec(self.bots.len()),
+            joiner_snapshot,
+            retained_cells[placement_peer],
+        );
+        let joiner_cell = joiner.cell().expect("the fresh joiner is committed");
+        let neighbourhood = joiner_cell.neighbors27();
 
-        let elsewhere: Vec<(NodeId, CellId)> = (0..self.bots.len())
-            .filter(|index| *index != joiner)
-            .map(|index| {
-                let node = self.bots[index].node;
-                (node, self.bots[index].cell().expect("committed"))
+        let elsewhere: Vec<(usize, NodeId, PersistId, CellId)> = self
+            .bots
+            .iter_mut()
+            .enumerate()
+            .filter(|(index, _)| *index != departing)
+            .map(|(index, bot)| {
+                (
+                    index,
+                    bot.node,
+                    bot.entity(),
+                    bot.cell().expect("committed"),
+                )
             })
             .collect();
-
         let in_neighbourhood = elsewhere
             .iter()
-            .filter(|(_, cell)| neighbourhood.contains(cell))
+            .filter(|(_, _, _, cell)| neighbourhood.contains(cell))
             .count();
-
         let roster: Vec<PeerEntry> = elsewhere
             .iter()
-            .map(|(node, cell)| PeerEntry {
+            .map(|(_, node, _, cell)| PeerEntry {
                 node: *node,
-                cells: vec![*cell],
+                cells: cell.neighbors27(),
             })
             .collect();
         let roster_len = roster.len();
-        self.bots[joiner].set_island(roster);
-        self.bots[joiner].update();
+        for (_, node, _, _) in &elsewhere {
+            joiner.link(*node, 1_200);
+        }
+        joiner.set_island(roster);
+        let initial_replicas = joiner.replicas();
+
+        // Exercise the same sender, peer-link and receiver systems as the hour,
+        // but in an isolated exchange so this diagnostic does not advance the
+        // live swarm an extra frame or change its budget counters. A new
+        // subscription receives an absolute keyframe before deltas.
+        for (index, node, entity, cell) in &elsewhere {
+            let mut sender = Bot::from_craft_snapshot(
+                fixture_spec(*index),
+                self.bots[*index].craft().clone(),
+                *cell,
+            );
+            sender.link(joiner.node, 1_200);
+            sender.set_island(vec![PeerEntry {
+                node: joiner.node,
+                cells: neighbourhood.clone(),
+            }]);
+            sender.broadcast_state(0);
+            sender.update();
+            for (to, stream, payload) in sender.drain_outbound() {
+                if to == joiner.node {
+                    joiner.receive_inbound(*node, *entity, stream, payload);
+                }
+            }
+        }
+        joiner.update();
 
         LateJoinReport {
             neighbourhood: neighbourhood.len(),
             roster: roster_len,
+            initial_replicas,
             in_neighbourhood,
-            tracked: self.bots[joiner].tracked(),
+            tracked: joiner.tracked(),
         }
     }
 
@@ -2406,6 +2473,15 @@ impl SwarmReport {
             });
         }
         if let Some(join) = &self.late_join {
+            if join.initial_replicas != 0 {
+                failures.push(CriterionFailure {
+                    clause: "the late joiner starts with no retained replicas",
+                    detail: format!(
+                        "{} replicas existed before any late-join delivery",
+                        join.initial_replicas
+                    ),
+                });
+            }
             if join.in_neighbourhood == 0 {
                 failures.push(CriterionFailure {
                     clause: "the late-join check is not vacuous",
@@ -2925,6 +3001,7 @@ mod tests {
             late_join: Some(LateJoinReport {
                 neighbourhood: 27,
                 roster: 31,
+                initial_replicas: 0,
                 in_neighbourhood: 15,
                 tracked: 15,
             }),
@@ -2943,6 +3020,19 @@ mod tests {
     #[test]
     fn a_witnessed_run_that_holds_raises_nothing() {
         assert!(clauses(&passing(), STRICT).is_empty());
+    }
+
+    #[test]
+    fn a_late_joiner_with_receive_history_fails_the_run() {
+        let mut report = passing();
+        report
+            .late_join
+            .as_mut()
+            .expect("the passing fixture has a late join")
+            .initial_replicas = 1;
+        assert!(
+            clauses(&report, STRICT).contains(&"the late joiner starts with no retained replicas")
+        );
     }
 
     // Clause: no false-positive discrepancy signal against an honest peer.
