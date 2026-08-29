@@ -3290,11 +3290,7 @@ mod tests {
             swept_interest_margin: false,
             ..SwarmConfig::default()
         });
-        let expected = swarm
-            .bots
-            .iter()
-            .map(|bot| bot.node)
-            .collect::<Vec<_>>();
+        let expected = swarm.bots.iter().map(|bot| bot.node).collect::<Vec<_>>();
 
         let actual = swarm
             .active_interest_coverage()
