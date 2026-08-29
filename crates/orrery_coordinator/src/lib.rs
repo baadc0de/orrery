@@ -28,7 +28,7 @@ pub mod server;
 pub mod witness;
 
 pub use client::{ClientError, CoordinatorClient};
-pub use interest::InterestIssuer;
+pub use interest::{InterestCrossingError, InterestIssuer, IssuedInterestCrossing};
 pub use registry::{CoordinatorConfig, IslandDrain, IslandRegistry, MembershipChange};
 pub use server::{
     CoordinatorServer, CoordinatorStats, FeedFailure, ServerConfig, ServerError,

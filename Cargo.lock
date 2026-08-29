@@ -7929,6 +7929,7 @@ dependencies = [
  "hkdf",
  "iroh",
  "iroh-base",
+ "orrery_games",
  "orrery_identity",
  "orrery_persistd",
  "orrery_protocol",

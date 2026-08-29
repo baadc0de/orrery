@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use orrery_protocol::channels::{decode_stream_frame, encode_stream_frame, untag, Channel};
-use orrery_protocol::{CellId, CoordMsg, IslandManifest, NodeId, COORD_ALPN};
+use orrery_protocol::{CellId, CoordMsg, InterestCellCrossing, IslandManifest, NodeId, COORD_ALPN};
 
 /// What went wrong talking to a coordinator.
 #[derive(Debug)]
@@ -104,6 +104,15 @@ impl CoordinatorClient {
     /// Report the cells this peer's interest covers.
     pub fn report_presence(&self, cells: Vec<CellId>) -> Result<(), ClientError> {
         self.send(&CoordMsg::Presence { cells })
+    }
+
+    /// Report a committed-cell crossing immediately.
+    ///
+    /// This does not replace the bulk presence cadence: the event corrects the
+    /// live roster at the boundary, while the next presence report repairs any
+    /// event lost with the session and republishes the complete current state.
+    pub fn report_crossing(&self, crossing: InterestCellCrossing) -> Result<(), ClientError> {
+        self.send(&CoordMsg::InterestCellCrossing { crossing })
     }
 
     /// Wait for the next interest grant, discarding manifests meanwhile.

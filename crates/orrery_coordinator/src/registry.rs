@@ -25,7 +25,7 @@ use orrery_protocol::coord::{
     CoordinatorInterestSnapshot, InterestGrantClaimsV1, IslandId, IslandManifest, PeerEntry,
     TopologyRegime,
 };
-use orrery_protocol::{CellId, Epoch, GridId, NodeId};
+use orrery_protocol::{CellId, Epoch, GridId, InterestCellCrossing, NodeId, SeqPair, Tick};
 
 /// Coordinator configuration (docs/10-crates.md §12).
 #[derive(Debug, Clone)]
@@ -113,6 +113,14 @@ struct Presence {
     /// A gateway keeps the highest epoch it has seen per peer, so this is what
     /// stops a peer replaying a stale, wider grant after moving away.
     interest_epoch: u32,
+    /// Last committed cell learned from an immediate crossing.
+    ///
+    /// Bulk presence predates the explicit centre and therefore cannot fill
+    /// this in. Once a crossing establishes it, later crossing events must
+    /// chain from it so reordering cannot walk the roster backwards.
+    committed_cell: Option<CellId>,
+    /// Ordering fence for the last immediate crossing applied.
+    last_crossing: Option<(SeqPair, Tick)>,
 }
 
 /// The in-memory island registry (P1).
@@ -186,6 +194,54 @@ impl IslandRegistry {
             .collect();
         covering.sort_by_key(|node| *node.as_bytes());
         covering
+    }
+
+    /// Whether `cell` is a valid source for `node`'s next crossing.
+    ///
+    /// Before the first event, bulk presence can establish only that the source
+    /// is covered. Afterwards, events must form an exact committed-cell chain;
+    /// this rejects a delayed crossing even when its old source remains inside
+    /// the wider swept set.
+    #[must_use]
+    pub fn accepts_crossing(&self, node: NodeId, crossing: &InterestCellCrossing) -> bool {
+        self.peers.get(&node).is_some_and(|presence| {
+            if !presence.cells.contains(&crossing.from)
+                || presence
+                    .last_crossing
+                    .is_some_and(|(known_seq, known_tick)| {
+                        crossing.seq <= known_seq || crossing.tick <= known_tick
+                    })
+            {
+                return false;
+            }
+            // Consecutive crossing sequences must chain exactly. A larger gap
+            // may mean an event was lost; bulk presence repairs the set, and
+            // coverage of `from` is then the recovery proof.
+            presence.last_crossing.is_none_or(|(known_seq, _)| {
+                crossing.seq.own_seq != known_seq.own_seq
+                    || crossing.seq.auth_seq != known_seq.auth_seq.saturating_add(1)
+                    || presence.committed_cell == Some(crossing.from)
+            })
+        })
+    }
+
+    /// Record post-crossing coverage and remember the new committed cell.
+    pub fn report_crossing(
+        &mut self,
+        node: NodeId,
+        crossing: &InterestCellCrossing,
+        cells: Vec<CellId>,
+    ) -> MembershipChange {
+        let change = self.report_presence(node, cells);
+        self.peers
+            .get_mut(&node)
+            .expect("report_presence records the peer")
+            .committed_cell = Some(crossing.to);
+        self.peers
+            .get_mut(&node)
+            .expect("report_presence records the peer")
+            .last_crossing = Some((crossing.seq, crossing.tick));
+        change
     }
 
     /// The island a peer currently belongs to, if any.

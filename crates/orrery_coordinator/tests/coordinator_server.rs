@@ -17,9 +17,10 @@ use orrery_coordinator::{
     StrikesMode, StrikesPosture, WitnessEpochIssuer, WitnessSeedConfig,
 };
 use orrery_protocol::{
-    verify_interest_grant, AccountId, AccountInvalidation, CellId, CoordMsg, GridId, IssuerKey,
-    IssuerKeyId, NodeId, SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1,
-    TokenClock, UnixMillis, MAX_SESSION_TOKEN_TTL_MS,
+    verify_interest_grant, AccountId, AccountInvalidation, CellId, CoordMsg, GridId,
+    InterestCellCrossing, IssuerKey, IssuerKeyId, NodeId, SeqPair, SessionStanding,
+    SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, Tick, TokenClock, UnixMillis,
+    MAX_SESSION_TOKEN_TTL_MS,
 };
 
 const NOW_MS: u64 = 1_000_000;
@@ -530,6 +531,71 @@ async fn presence_yields_a_grant_a_gateway_will_verify() {
     assert_eq!(stats.presence_reports, 1);
     assert_eq!(stats.islands, 1);
     assert_eq!(stats.connected_peers, 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn crossing_event_updates_the_grant_and_roster_before_the_next_bulk_report() {
+    let issuer = secret(200);
+    let interest = secret(201);
+    let server = coordinator(&issuer, &interest).await;
+    let client = CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(1), 60_000),
+        PATIENCE,
+    )
+    .await
+    .expect("peer admitted");
+    let from = cell(0);
+    let to = cell(1);
+    client
+        .report_presence(from.neighbors27())
+        .expect("initial bulk presence");
+    let initial_grant = client.next_grant(PATIENCE).await.expect("initial grant");
+    let trusted = [IssuerKey::new(IssuerKeyId::new(1), interest.public())];
+    let initial = verify_interest_grant(&initial_grant, &node(1), &trusted).expect("valid");
+    // `next_grant` may have discarded the initial manifest. Nothing below
+    // sends another Presence message: the crossing event is the only trigger.
+    let post_crossing = to.neighbors27();
+    client
+        .report_crossing(InterestCellCrossing {
+            tick: Tick(1),
+            seq: SeqPair {
+                own_seq: 1,
+                auth_seq: 1,
+            },
+            from,
+            to,
+            covered_cells: post_crossing.clone(),
+        })
+        .expect("send crossing");
+
+    let grant = client
+        .next_grant(PATIENCE)
+        .await
+        .expect("crossing immediately yields a replacement grant");
+    let claims = verify_interest_grant(&grant, &node(1), &trusted).expect("valid crossing grant");
+    assert!(
+        claims.epoch > initial.epoch,
+        "crossing must advance interest before the next one-hertz bulk report"
+    );
+    assert_eq!(claims.covered_cells, {
+        let mut expected = post_crossing;
+        expected.sort();
+        expected
+    });
+    let manifest = client
+        .next_manifest(PATIENCE)
+        .await
+        .expect("crossing immediately republishes the roster");
+    let mover = manifest
+        .peers
+        .iter()
+        .find(|entry| entry.node == node(1))
+        .expect("mover remains in its roster");
+    assert_eq!(mover.cells, claims.covered_cells);
+    assert_eq!(server.stats().await.interest_crossings, 1);
     server.shutdown().await;
 }
 
