@@ -39,12 +39,12 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use orrery_core::CoreCodec;
 use orrery_games::regolith::state::RegolithState;
@@ -53,7 +53,7 @@ use orrery_protocol::{NodeId, PersistId, StateClaim, Tick};
 
 use crate::exterior::{
     encode_frame, AnchorFrame, Frame, HostLink, JoinReply, JoinRequest, Lane, RemoteLink,
-    StartManifest, LINK_QUEUE_DEPTH, MAX_FRAME_BYTES,
+    StartManifest, TransportCloseReason, LINK_QUEUE_DEPTH, MAX_FRAME_BYTES,
 };
 
 /// The connection's application protocol. A grammar change bumps this as well
@@ -62,6 +62,23 @@ pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/4";
 
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connection-wide QUIC inactivity allowed before a vanished exterior closes.
+///
+/// iroh's five-second keep-alive stays enabled, so a reachable idle player is
+/// retained. Ten seconds spans two keep-alive intervals while bounding a
+/// dead path's seat release to this timeout plus the host's two-second grace.
+pub const EXTERIOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn exterior_transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            EXTERIOR_MAX_IDLE_TIMEOUT
+                .try_into()
+                .expect("ten seconds fits QUIC's idle-timeout varint"),
+        ))
+        .build()
+}
 
 /// Binds an endpoint for the exterior role, optionally at one exact socket.
 ///
@@ -73,7 +90,8 @@ pub async fn bind(secret: iroh::SecretKey, bind_addr: Option<SocketAddr>) -> Res
     let mut builder = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
         .alpns(vec![EXTERIOR_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
-        .secret_key(secret);
+        .secret_key(secret)
+        .transport_config(exterior_transport_config());
     if let Some(bind_addr) = bind_addr {
         builder = builder
             .clear_ip_transports()
@@ -361,22 +379,22 @@ impl PendingJoin {
         let (downlink_tx, downlink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
         let (meta_tx, meta_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
         let goodbye = Arc::new(AtomicBool::new(false));
+        let transport_close = Arc::new(Mutex::new(None));
+        watch_connection(
+            "host",
+            self.connection.clone(),
+            Arc::clone(&connected),
+            Some(Arc::clone(&transport_close)),
+        );
         pump_ordered_reader_to(
             "host",
-            Arc::clone(&connected),
             Arc::clone(&goodbye),
             self.connection.clone(),
             uplink_recv,
             uplink_tx,
             Some(meta_tx),
         );
-        pump_writer(
-            "host",
-            Arc::clone(&connected),
-            self.connection,
-            downlink_send,
-            downlink_rx,
-        );
+        pump_writer("host", self.connection, downlink_send, downlink_rx);
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok((
@@ -386,6 +404,7 @@ impl PendingJoin {
                 meta: std::sync::Mutex::new(meta_rx),
                 connected,
                 goodbye,
+                transport_close,
             },
             anchor,
             self.remote,
@@ -605,28 +624,58 @@ pub async fn remote_join(
     // queue. ACKs stay Meta frames so the remote can settle router outcomes
     // without confusing them with replicated state.
     let goodbye = Arc::new(AtomicBool::new(false));
+    watch_connection("remote", connection.clone(), Arc::clone(&connected), None);
     pump_ordered_reader_to(
         "remote",
-        Arc::clone(&connected),
         Arc::clone(&goodbye),
         connection.clone(),
         downlink_recv,
         inbound_tx,
         None,
     );
-    pump_writer(
-        "remote",
-        Arc::clone(&connected),
-        connection,
-        uplink_send,
-        outbound_rx,
-    );
+    pump_writer("remote", connection.clone(), uplink_send, outbound_rx);
 
     Ok(RemoteLink {
         downlink: std::sync::Mutex::new(inbound_rx),
         uplink: outbound_tx,
         connected,
+        connection: Some(connection),
     })
+}
+
+fn classify_close(error: &ConnectionError) -> TransportCloseReason {
+    match error {
+        ConnectionError::ApplicationClosed(_) => TransportCloseReason::ApplicationClose,
+        ConnectionError::Reset => TransportCloseReason::PeerReset,
+        ConnectionError::TimedOut => TransportCloseReason::IdleTimeout,
+        ConnectionError::ConnectionClosed(_) => TransportCloseReason::TransportClose,
+        ConnectionError::LocallyClosed => TransportCloseReason::LocalClose,
+        other => TransportCloseReason::Other(other.to_string()),
+    }
+}
+
+/// The transport, rather than a stream read or application-frame timer, is the
+/// sole broken-link signal. `closed()` also preserves the close classification
+/// the seat-release log needs.
+fn watch_connection(
+    side: &'static str,
+    connection: Connection,
+    connected: Arc<AtomicBool>,
+    close_reason: Option<Arc<Mutex<Option<TransportCloseReason>>>>,
+) {
+    tokio::spawn(async move {
+        let error = connection.closed().await;
+        let reason = classify_close(&error);
+        if let Some(close_reason) = close_reason {
+            *close_reason.lock().expect("transport-close lock") = Some(reason.clone());
+        }
+        if side == "host" {
+            eprintln!("gates/p1-swarm: exterior QUIC closed ({reason})");
+        } else if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
+            eprintln!("bridge[{side}]: QUIC connection closed ({reason})");
+        }
+        mark_dead(&connected);
+    });
 }
 
 /// Frame reader over the ordered stream: everything arriving is routed by
@@ -635,7 +684,6 @@ pub async fn remote_join(
 #[allow(clippy::too_many_arguments)]
 fn pump_ordered_reader_to(
     side: &'static str,
-    connected: Arc<AtomicBool>,
     goodbye: Arc<AtomicBool>,
     connection: Connection,
     mut recv: RecvStream,
@@ -672,7 +720,6 @@ fn pump_ordered_reader_to(
             }
             route_inbound(frame, &uplink_tx, meta_tx.as_ref()).await;
         }
-        mark_dead(&connected);
     });
 }
 
@@ -680,7 +727,6 @@ fn pump_ordered_reader_to(
 /// onto the stream in whatever order the queue holds.
 fn pump_writer(
     side: &'static str,
-    connected: Arc<AtomicBool>,
     connection: Connection,
     mut shared_send: SendStream,
     outbound_rx: tokio::sync::mpsc::Receiver<Frame>,
@@ -721,7 +767,6 @@ fn pump_writer(
                 }
             }
         }
-        mark_dead(&connected);
     });
 }
 

@@ -898,9 +898,7 @@ impl ExteriorSlot {
                 self.downlink_dropped += 1;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.link
-                    .connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.downlink_dropped += 1;
             }
         }
     }
@@ -1780,11 +1778,13 @@ impl Swarm {
                 released.push(*slot);
                 continue;
             }
-            if exterior
+            let transport_close = exterior
                 .link
-                .connected
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+                .transport_close
+                .lock()
+                .expect("transport-close lock")
+                .clone();
+            if transport_close.is_none() {
                 exterior.disconnected_at = None;
             } else {
                 let first = *exterior.disconnected_at.get_or_insert(tick);
@@ -1804,14 +1804,19 @@ impl Swarm {
             // with the new session's join-tick anchor.
             self.armed_external_watches
                 .retain(|(_watcher, subject)| *subject != slot);
-            eprintln!(
-                "gates/p1-swarm: live seat {slot} released at tick {tick} ({})",
-                if exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed) {
-                    "explicit goodbye"
-                } else {
-                    "transport close grace elapsed"
-                }
-            );
+            let release_cause = if exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed) {
+                "explicit goodbye".to_owned()
+            } else {
+                let reason = exterior
+                    .link
+                    .transport_close
+                    .lock()
+                    .expect("transport-close lock")
+                    .clone()
+                    .expect("transport close triggered this release");
+                format!("{reason}; transport close grace elapsed")
+            };
+            eprintln!("gates/p1-swarm: live seat {slot} released at tick {tick} ({release_cause})");
             if let (Some(live), Some(session)) = (&self.live_joins, exterior.session_id.as_ref()) {
                 let mut membership = live.membership.lock().expect("membership lock");
                 membership.active.remove(&slot);

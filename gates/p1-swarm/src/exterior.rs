@@ -58,7 +58,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// `std::sync::mpsc`, named so call sites read as deliberately std rather than
 /// accidentally unqualified.
@@ -69,6 +69,39 @@ use std::sync::Arc;
 /// MTU-bound. It exists to bound a hostile or desynced length field, not to
 /// police the senders, who never approach it.
 pub const MAX_FRAME_BYTES: u32 = 64 * 1_024;
+
+/// Why QUIC declared an exterior connection closed.
+///
+/// The host retains this classification through the two-second release grace
+/// so the unbind log says which transport event actually freed the seat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransportCloseReason {
+    /// The peer sent an application `CONNECTION_CLOSE` frame.
+    ApplicationClose,
+    /// The peer's UDP endpoint reset the connection.
+    PeerReset,
+    /// No packet arrived within the negotiated QUIC idle timeout.
+    IdleTimeout,
+    /// The peer's QUIC stack closed the connection for a transport reason.
+    TransportClose,
+    /// This process closed its side of the connection.
+    LocalClose,
+    /// Another transport failure, retaining iroh's diagnostic.
+    Other(String),
+}
+
+impl std::fmt::Display for TransportCloseReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplicationClose => formatter.write_str("application close"),
+            Self::PeerReset => formatter.write_str("peer reset"),
+            Self::IdleTimeout => formatter.write_str("idle timeout"),
+            Self::TransportClose => formatter.write_str("transport close"),
+            Self::LocalClose => formatter.write_str("local close"),
+            Self::Other(reason) => write!(formatter, "transport error: {reason}"),
+        }
+    }
+}
 
 /// Which lane a frame belongs to, matching what `collect_sends` drains and
 /// `deliver` refills for in-process peers — plus the meta lane only this leg
@@ -404,10 +437,12 @@ pub struct HostLink {
     pub downlink: tokio::sync::mpsc::Sender<Frame>,
     /// Cell updates carried on the meta lane, oldest first.
     pub meta: std::sync::Mutex<tokio::sync::mpsc::Receiver<u64>>,
-    /// False for as long as the pump believes the connection is alive.
+    /// True for as long as `Connection::closed()` has not resolved.
     pub connected: Arc<std::sync::atomic::AtomicBool>,
     /// Set by the reader when the runner's clean end-of-run marker arrived.
     pub goodbye: Arc<std::sync::atomic::AtomicBool>,
+    /// Set only by `Connection::closed()`, with iroh's close classification.
+    pub transport_close: Arc<Mutex<Option<TransportCloseReason>>>,
 }
 
 /// The remote-side mirror of [`HostLink`]: same queues, opposite directions.
@@ -421,8 +456,20 @@ pub struct RemoteLink {
     pub downlink: std::sync::Mutex<tokio::sync::mpsc::Receiver<Frame>>,
     /// Frames queued for transmission to the host, meta included.
     pub uplink: tokio::sync::mpsc::Sender<Frame>,
-    /// False for as long as the pump believes the connection is alive.
+    /// True for as long as `Connection::closed()` has not resolved.
     pub connected: Arc<std::sync::atomic::AtomicBool>,
+    /// The real connection, retained so graceful shutdown can send
+    /// `CONNECTION_CLOSE` instead of relying on runtime destruction.
+    pub connection: Option<iroh::endpoint::Connection>,
+}
+
+impl RemoteLink {
+    /// Close the live QUIC connection after the application goodbye is flushed.
+    pub fn close_transport(&self) {
+        if let Some(connection) = &self.connection {
+            connection.close(0u8.into(), b"external client shutdown");
+        }
+    }
 }
 
 /// A bounded queue pair's depth, chosen so a stalled pump is visible within a
@@ -441,6 +488,7 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
     let (_, meta_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
     let connected = Arc::new(AtomicBool::new(true));
     let goodbye = Arc::new(AtomicBool::new(false));
+    let transport_close = Arc::new(Mutex::new(None));
     (
         HostLink {
             uplink: std::sync::Mutex::new(uplink_rx),
@@ -448,6 +496,7 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
             meta: std::sync::Mutex::new(meta_rx),
             connected: Arc::clone(&connected),
             goodbye: Arc::clone(&goodbye),
+            transport_close,
         },
         RemoteLink {
             downlink: std::sync::Mutex::new(downlink_rx),
@@ -455,6 +504,7 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
             // The remote's own cell reports ride its uplink as Meta frames;
             // this channel would only exist for a symmetry nobody uses.
             connected,
+            connection: None,
         },
     )
 }

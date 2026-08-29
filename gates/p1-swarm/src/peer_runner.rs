@@ -275,6 +275,10 @@ pub fn run(run: &ExternalRun) -> Result<()> {
         // transport before the frame hits the wire, leaving the host with a
         // disconnect instead of a clean close.
         tokio::time::sleep(Duration::from_millis(200)).await;
+        remote_link.close_transport();
+        // QUIC is implemented in userspace: give the endpoint driver a turn to
+        // put CONNECTION_CLOSE on UDP before this process destroys its runtime.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
             eprintln!(
                 "bridge[remote]: {} inbound frames over the whole run; goodbye sent",

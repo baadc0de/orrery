@@ -327,8 +327,8 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
     );
     assert_eq!(
         report.get("peers").and_then(|v| v.as_u64()),
-        Some(5),
-        "four bots plus the external peer"
+        Some(4),
+        "the clean goodbye releases the exterior before the final active-peer census"
     );
 }
 
@@ -652,4 +652,279 @@ fn late_join_and_rejoin_after_goodbye_reuse_the_released_slot() {
         serde_json::json!(sessions),
         "both explicit goodbyes must release their exact allocator rows"
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DepartureMode {
+    Graceful,
+    Kill9,
+    NetworkVanish,
+}
+
+impl DepartureMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Kill9 => "kill-9",
+            Self::NetworkVanish => "network-vanish",
+        }
+    }
+}
+
+fn signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .expect("the Unix kill command runs");
+    assert!(status.success(), "kill {signal} {pid} failed");
+}
+
+struct DepartureMeasurement {
+    elapsed: Duration,
+    host_log: String,
+}
+
+fn measure_seat_release(mode: DepartureMode) -> DepartureMeasurement {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "p1-departure-{}-{}-{nonce}",
+        mode.label(),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let listening_path = dir.join("listening.txt");
+    let active_seats_path = dir.join("active-seats.json");
+    let journal_path = dir.join("slots.json");
+    let host_err_path = dir.join("host.err");
+    let runner_err_path = dir.join("runner.err");
+    let issuer = iroh_base::SecretKey::from_bytes(&[0x5b; 32]);
+    let key_id = 682;
+    let slot = 4usize;
+    let session = format!("departure-{}-{nonce}", mode.label());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock");
+    let rows = serde_json::json!([{
+        "attempt_id": "attempt-departure",
+        "slot": slot,
+        "session_id": session,
+        "node": slot_key(slot).public().to_string(),
+        "expires_at": now.as_secs() + 300,
+    }]);
+    std::fs::write(
+        &journal_path,
+        serde_json::to_vec(&rows).expect("journal serializes"),
+    )
+    .expect("journal written");
+
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve port");
+    let external_bind = reservation.local_addr().expect("reserved address");
+    drop(reservation);
+    let mut host = Command::new(bin())
+        .args([
+            "--peers",
+            "4",
+            "--external-slots",
+            "4",
+            "--lobby-seconds",
+            "0",
+            "--seconds",
+            "70",
+            "--min-cells",
+            "1",
+            "--external-peer",
+            "--report-only",
+            "--attempt-id",
+            "attempt-departure",
+            "--issuer-key",
+            &format!("{key_id}:{}", issuer.public()),
+        ])
+        .arg("--reservation-journal")
+        .arg(&journal_path)
+        .arg("--listening-file")
+        .arg(&listening_path)
+        .arg("--active-seats-file")
+        .arg(&active_seats_path)
+        .arg("--external-bind")
+        .arg(external_bind.to_string())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&host_err_path).expect("host err"))
+        .spawn()
+        .expect("host starts");
+    let (host_node, host_direct) = wait_for_listening(&listening_path);
+
+    let client_seconds = if matches!(mode, DepartureMode::Graceful) {
+        2
+    } else {
+        60
+    };
+    let mut remote = Command::new(bin())
+        .args([
+            "--external",
+            "--peers",
+            "4",
+            "--external-slots",
+            "4",
+            "--slot",
+            "4",
+            "--seconds",
+            &client_seconds.to_string(),
+            "--host-node",
+            &host_node,
+            "--host-direct",
+            &host_direct,
+            "--session-id",
+            &session,
+            "--session-token",
+            &token_hex(&issuer, key_id, slot, now.as_millis() as u64),
+        ])
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&runner_err_path).expect("runner err"))
+        .spawn()
+        .expect("client starts");
+
+    let membership_is = |expected: serde_json::Value| {
+        std::fs::read(&active_seats_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| value["active_slots"] == expected)
+    };
+    let occupied_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !membership_is(serde_json::json!([4])) {
+        if std::time::Instant::now() >= occupied_deadline {
+            let _ = remote.kill();
+            let _ = host.kill();
+            panic!(
+                "{} client never occupied its seat; host: {}; client: {}",
+                mode.label(),
+                std::fs::read_to_string(&host_err_path).unwrap_or_default(),
+                std::fs::read_to_string(&runner_err_path).unwrap_or_default(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let departure_at = match mode {
+        DepartureMode::Graceful => {
+            let occupied_at = std::time::Instant::now();
+            let status = remote.wait().expect("graceful client wait");
+            assert!(
+                status.success(),
+                "graceful client failed: {}",
+                std::fs::read_to_string(&runner_err_path).unwrap_or_default()
+            );
+            // The runner begins its goodbye after exactly `client_seconds` of
+            // paced ticks. Measuring from occupancy and subtracting that run
+            // duration includes the real wire scheduling while avoiding a
+            // probe-only protocol message.
+            occupied_at + Duration::from_secs(client_seconds)
+        }
+        DepartureMode::Kill9 => {
+            let departure_at = std::time::Instant::now();
+            signal(remote.id(), "-KILL");
+            let _ = remote.wait();
+            departure_at
+        }
+        DepartureMode::NetworkVanish => {
+            let departure_at = std::time::Instant::now();
+            signal(remote.id(), "-STOP");
+            departure_at
+        }
+    };
+
+    let release_deadline = std::time::Instant::now() + Duration::from_secs(50);
+    while !membership_is(serde_json::json!([])) {
+        if std::time::Instant::now() >= release_deadline {
+            if matches!(mode, DepartureMode::NetworkVanish) {
+                signal(remote.id(), "-CONT");
+            }
+            let _ = remote.kill();
+            let _ = remote.wait();
+            let _ = host.kill();
+            let _ = host.wait();
+            panic!(
+                "{} seat was not released within 50 seconds; host: {}",
+                mode.label(),
+                std::fs::read_to_string(&host_err_path).unwrap_or_default(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let elapsed = std::time::Instant::now().saturating_duration_since(departure_at);
+
+    if matches!(mode, DepartureMode::Graceful) {
+        let close_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !std::fs::read_to_string(&host_err_path)
+            .unwrap_or_default()
+            .contains("exterior QUIC closed")
+            && std::time::Instant::now() < close_deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    if matches!(mode, DepartureMode::NetworkVanish) {
+        signal(remote.id(), "-CONT");
+        remote.kill().expect("kill resumed client");
+        let _ = remote.wait();
+    }
+    host.kill().expect("stop measurement host");
+    let _ = host.wait();
+    let host_log = std::fs::read_to_string(&host_err_path).unwrap_or_default();
+    eprintln!(
+        "departure measurement {}: {:.3} seconds",
+        mode.label(),
+        elapsed.as_secs_f64()
+    );
+    DepartureMeasurement { elapsed, host_log }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "three real-process UDP departure modes at wall clock; run explicitly"]
+fn transport_departure_releases_the_seat_in_observed_time() {
+    let graceful = measure_seat_release(DepartureMode::Graceful);
+    let kill9 = measure_seat_release(DepartureMode::Kill9);
+    let network_vanish = measure_seat_release(DepartureMode::NetworkVanish);
+    eprintln!(
+        "departure measurements: graceful={:.3}s kill-9={:.3}s network-vanish={:.3}s",
+        graceful.elapsed.as_secs_f64(),
+        kill9.elapsed.as_secs_f64(),
+        network_vanish.elapsed.as_secs_f64(),
+    );
+    assert!(
+        graceful.host_log.contains("(explicit goodbye)"),
+        "graceful release must name the explicit goodbye; host log:\n{}",
+        graceful.host_log
+    );
+    assert!(
+        graceful
+            .host_log
+            .contains("exterior QUIC closed (application close)"),
+        "graceful shutdown must put CONNECTION_CLOSE on the wire; host log:\n{}",
+        graceful.host_log
+    );
+    assert!(
+        graceful.elapsed <= Duration::from_secs(1),
+        "graceful goodbye seat release took {:.3}s; it must bypass the transport grace",
+        graceful.elapsed.as_secs_f64(),
+    );
+    for (mode, measurement) in [("kill-9", &kill9), ("network-vanish", &network_vanish)] {
+        assert!(
+            measurement
+                .host_log
+                .contains("idle timeout; transport close grace elapsed"),
+            "{mode} release must be classified as QUIC idle timeout; host log:\n{}",
+            measurement.host_log
+        );
+        assert!(
+            (Duration::from_secs(11)..=Duration::from_secs(15))
+                .contains(&measurement.elapsed),
+            "{mode} seat release took {:.3}s; the pinned 10s QUIC idle timeout plus the real 2s grace must release in 11..=15s",
+            measurement.elapsed.as_secs_f64(),
+        );
+    }
 }

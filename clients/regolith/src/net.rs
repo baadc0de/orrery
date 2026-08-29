@@ -42,6 +42,22 @@ pub const MAX_FRAME_BYTES: u32 = 64 * 1_024;
 /// Bounded queue depth shared with the harness's links (`LINK_QUEUE_DEPTH`).
 pub const LINK_QUEUE_DEPTH: usize = 4_096;
 
+/// Connection-wide QUIC inactivity allowed before a vanished campaign peer closes.
+///
+/// This must match the host's pin. iroh negotiates the minimum of the two
+/// peers, so relying on either side alone would leave the contract incomplete.
+pub const EXTERIOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn exterior_transport_config() -> iroh::endpoint::QuicTransportConfig {
+    iroh::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            EXTERIOR_MAX_IDLE_TIMEOUT
+                .try_into()
+                .expect("ten seconds fits QUIC's idle-timeout varint"),
+        ))
+        .build()
+}
+
 /// Which lane a frame rides (`exterior::Lane`). Tags are wire bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
@@ -574,6 +590,7 @@ pub async fn bind(secret: iroh_base::SecretKey) -> Result<iroh::Endpoint, String
         .alpns(vec![EXTERIOR_ALPN.to_vec()])
         .relay_mode(iroh::RelayMode::Disabled)
         .secret_key(secret)
+        .transport_config(exterior_transport_config())
         .bind()
         .await
         .map_err(|error| format!("bind exterior endpoint: {error}"))?;
@@ -592,6 +609,7 @@ pub struct CampaignLink {
     uplink: tokio::sync::mpsc::Sender<Frame>,
     connected: Arc<AtomicBool>,
     closed_by_host: Arc<AtomicBool>,
+    connection: iroh::endpoint::Connection,
 }
 
 impl CampaignLink {
@@ -647,6 +665,11 @@ impl CampaignLink {
         let _ = self.try_uplink(goodbye);
         // The writer pump flushes each frame as it writes; this mirrors the
         // runner's grace period before dropping its runtime.
+        std::thread::sleep(Duration::from_millis(200));
+        self.connection
+            .close(0u8.into(), b"regolith client shutdown");
+        // QUIC close is userspace work. Keep the still-live campaign runtime
+        // available long enough for its endpoint driver to send the frame.
         std::thread::sleep(Duration::from_millis(200));
         self.connected.store(false, Ordering::Relaxed);
     }
@@ -785,12 +808,12 @@ where
 
     spawn_reader(
         connection.clone(),
-        Arc::clone(&connected),
         Arc::clone(&closed_by_host),
         downlink_recv,
         inbound_tx,
     );
-    spawn_writer(connection, Arc::clone(&connected), uplink_send, outbound_rx);
+    spawn_writer(connection.clone(), uplink_send, outbound_rx);
+    spawn_connection_watcher(connection.clone(), Arc::clone(&connected));
 
     // A freshly spawned task has not necessarily reached its first await; let
     // every pump park inside its socket read before traffic is produced
@@ -803,6 +826,7 @@ where
             uplink: outbound_tx,
             connected,
             closed_by_host,
+            connection,
         },
         accepted_start,
     ))
@@ -897,7 +921,6 @@ async fn write_stream_frame(
 
 fn spawn_reader(
     connection: iroh::endpoint::Connection,
-    connected: Arc<AtomicBool>,
     closed_by_host: Arc<AtomicBool>,
     mut recv: iroh::endpoint::RecvStream,
     inbound_tx: tokio::sync::mpsc::Sender<Frame>,
@@ -919,13 +942,11 @@ fn spawn_reader(
             // pauses the socket read; it never silently discards.
             let _ = inbound_tx.send(frame).await;
         }
-        connected.store(false, Ordering::Relaxed);
     });
 }
 
 fn spawn_writer(
     connection: iroh::endpoint::Connection,
-    connected: Arc<AtomicBool>,
     mut shared_send: iroh::endpoint::SendStream,
     mut outbound_rx: tokio::sync::mpsc::Receiver<Frame>,
 ) {
@@ -936,6 +957,18 @@ fn spawn_writer(
                 break;
             }
         }
+    });
+}
+
+fn spawn_connection_watcher(connection: iroh::endpoint::Connection, connected: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        let error = connection.closed().await;
+        if std::env::var_os("REGOLITH_NET_DEBUG").is_some() {
+            eprintln!(
+                "net[{}]: QUIC connection closed ({error})",
+                std::process::id()
+            );
+        }
         connected.store(false, Ordering::Relaxed);
     });
 }
@@ -943,6 +976,22 @@ fn spawn_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exterior_endpoint_applies_the_ten_second_idle_timeout_pin() {
+        assert_eq!(
+            EXTERIOR_MAX_IDLE_TIMEOUT,
+            Duration::from_secs(10),
+            "the Regolith endpoint's real QUIC idle timeout must remain pinned to ten seconds"
+        );
+        let source = include_str!("net.rs");
+        let applied = [".transport_", "config(exterior_", "transport_config())"].concat();
+        assert_eq!(
+            source.matches(&applied).count(),
+            1,
+            "the Regolith endpoint builder must apply the pinned transport config exactly once"
+        );
+    }
 
     /// The exact bytes the host reads. A plain `JoinRequest` v4 is
     /// `[ORRX][04 00][rev len][rev]`; if this vector and `gates/p1-swarm` ever
