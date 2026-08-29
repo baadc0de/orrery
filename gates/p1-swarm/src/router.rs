@@ -175,14 +175,17 @@ impl LinkId {
 pub struct Router {
     /// One impairment stream per directed link, never one shared stream.
     ///
-    /// A single `ChaCha8Rng` draws loss and jitter in packet order across every
-    /// link and lane, so a change that alters how many packets one link sends
-    /// shifts the impairment realisation for all the others. That coupling is
-    /// not theoretical: it made #692's swept interest margin fail the
-    /// boundary-thrash clause by delaying an unrelated shot six ticks, causing
-    /// a collision that never happened on the baseline leg (#699). An A/B where
-    /// one side sends a different number of packets was comparing two
-    /// impairment realisations rather than two designs.
+    /// The former single `ChaCha8Rng` drew loss and jitter in packet order
+    /// across every link, so a change that altered one link shifted every
+    /// other link's impairment realisation. Per-link streams remove that
+    /// cross-link coupling (#700).
+    ///
+    /// They deliberately do not isolate traffic classes on the *same* link:
+    /// state datagrams and control streams below both draw from this map entry.
+    /// #699's swept-margin A/B exposed that remaining insertion coupling. An
+    /// extra state audience on one directed link can shift a later control
+    /// retransmission on that same link even though unrelated links remain
+    /// byte-for-byte isolated. See `docs/spikes/swept-margin-audience.md`.
     ///
     /// Seeded from the run seed and the link identity, so a link draws the same
     /// sequence regardless of what any other link did.

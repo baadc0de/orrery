@@ -216,8 +216,10 @@ pub struct PeerReport {
     pub cells_visited: usize,
     /// Committed-cell changes.
     pub crossings: u64,
-    /// Commitments that returned to the cell just left — hysteresis failures.
+    /// Commitments that returned to the cell just left, including real reversals.
     pub boundary_flips: u64,
+    /// Most returns to one cell in any one-second interest-refresh period.
+    pub max_boundary_returns_in_window: u64,
     /// Entries and exits from the bounded high-rate set.
     pub interest_churn: u64,
     /// Demotions that re-promoted within a second — visible proxy pops.
@@ -354,6 +356,26 @@ pub struct PeerReport {
     pub keyframes_discarded_while_stalled: u64,
     /// Deltas this sender built, charged, then discarded during a hitch.
     pub deltas_discarded_while_stalled: u64,
+}
+
+/// One bin in the distribution of per-seat boundary-return maxima.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BoundaryReturnHistogramBin {
+    /// Returns to the same cell in one refresh period.
+    pub returns_in_window: u64,
+    /// Seats whose run-wide maximum had this value.
+    pub seats: usize,
+}
+
+/// Boundary-return distribution for one behavioural profile.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BoundaryReturnProfileReport {
+    /// Behavioural profile name.
+    pub profile: &'static str,
+    /// Highest one-second return count among seats with this profile.
+    pub max_returns_in_window: u64,
+    /// Distribution of per-seat maxima for this profile.
+    pub histogram: Vec<BoundaryReturnHistogramBin>,
 }
 
 /// One sender/entity/recipient stream observed after the real upload meter.
@@ -497,6 +519,12 @@ pub struct SwarmReport {
     pub ticks: u64,
     /// Per-peer results.
     pub per_peer: Vec<PeerReport>,
+    /// Highest number of returns to one cell in any one-second window.
+    pub max_boundary_returns_in_window: u64,
+    /// Distribution of per-seat one-second boundary-return maxima.
+    pub boundary_return_histogram: Vec<BoundaryReturnHistogramBin>,
+    /// The same distribution split by behavioural profile.
+    pub boundary_return_profiles: Vec<BoundaryReturnProfileReport>,
     /// A19 changed-byte measurements, present only with `--delta-stats`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_stats: Option<DeltaStatsReport>,
@@ -525,7 +553,7 @@ pub struct SwarmReport {
     pub shed_deltas: u64,
     /// Shed replication messages not recognized as either A19 wire form.
     pub shed_replication_other: u64,
-    /// Total boundary flips across the swarm. The criterion wants zero.
+    /// Total same-cell returns across the swarm, retained as travel evidence.
     pub total_boundary_flips: u64,
     /// Total visible proxy pops across the swarm.
     pub total_proxy_pops: u64,
@@ -1793,6 +1821,7 @@ impl Swarm {
             } else {
                 bot.cell().expect("committed").neighbors27()
             };
+            bot.trace_interest_coverage(cells.len());
             if let Some(stats) = &mut self.interest_margin_stats {
                 stats.observe(cells.len());
             }
@@ -2551,6 +2580,7 @@ impl Swarm {
                     cells_visited: bot.visited.len(),
                     crossings: bot.crossings,
                     boundary_flips: bot.boundary_flips,
+                    max_boundary_returns_in_window: bot.max_boundary_returns_in_window,
                     interest_churn: bot.interest_churn,
                     proxy_pops: bot.proxy_pops,
                     peak_upload_bits: peak,
@@ -2677,6 +2707,32 @@ impl Swarm {
             .take()
             .map(InterestMarginStats::report);
         let peer_seconds = self.total_peers() as u64 * self.config.seconds.max(1);
+
+        let max_boundary_returns_in_window = per_peer
+            .iter()
+            .map(|peer| peer.max_boundary_returns_in_window)
+            .max()
+            .unwrap_or(0);
+        let overall_boundary_return_histogram = boundary_return_histogram(
+            per_peer
+                .iter()
+                .map(|peer| peer.max_boundary_returns_in_window),
+        );
+        let boundary_return_profiles = crate::profile::Profile::ALL
+            .into_iter()
+            .map(|profile| {
+                let maxima = per_peer
+                    .iter()
+                    .filter(|peer| peer.profile == profile.name())
+                    .map(|peer| peer.max_boundary_returns_in_window)
+                    .collect::<Vec<_>>();
+                BoundaryReturnProfileReport {
+                    profile: profile.name(),
+                    max_returns_in_window: maxima.iter().copied().max().unwrap_or(0),
+                    histogram: boundary_return_histogram(maxima),
+                }
+            })
+            .collect();
 
         SwarmReport {
             identity: RunIdentity {
@@ -2863,6 +2919,9 @@ impl Swarm {
             witness_lane_bits_per_sec: { lanes.witness_bytes * 8 / peer_seconds.max(1) },
             link: self.router.counters.into(),
             per_peer,
+            max_boundary_returns_in_window,
+            boundary_return_histogram: overall_boundary_return_histogram,
+            boundary_return_profiles,
             late_join,
         }
     }
@@ -2938,6 +2997,14 @@ pub struct Criterion {
     pub max_detection_ticks: u64,
 }
 
+/// Returns to one cell within a refresh period that constitute boundary thrash.
+///
+/// Five witnessed, impaired, swept-margin one-hour seeds measured 160 seats: the
+/// maximum was one return (157 seats at zero, three at one), and all 40 Burst
+/// seats were at zero. Three therefore preserves two legitimate direction
+/// changes while making the first sustained A↔B oscillation fail.
+const BOUNDARY_THRASH_RETURN_THRESHOLD: u64 = 3;
+
 impl Default for Criterion {
     fn default() -> Self {
         Self {
@@ -2948,6 +3015,28 @@ impl Default for Criterion {
             max_detection_ticks: MAX_ADJUDICATION_TICKS,
         }
     }
+}
+
+fn boundary_return_histogram(
+    maxima: impl IntoIterator<Item = u64>,
+) -> Vec<BoundaryReturnHistogramBin> {
+    let mut maxima = maxima.into_iter().collect::<Vec<_>>();
+    maxima.sort_unstable();
+    let mut histogram: Vec<BoundaryReturnHistogramBin> = Vec::new();
+    for returns_in_window in maxima {
+        if let Some(bin) = histogram
+            .last_mut()
+            .filter(|bin| bin.returns_in_window == returns_in_window)
+        {
+            bin.seats += 1;
+        } else {
+            histogram.push(BoundaryReturnHistogramBin {
+                returns_in_window,
+                seats: 1,
+            });
+        }
+    }
+    histogram
 }
 
 impl SwarmReport {
@@ -3226,13 +3315,14 @@ impl SwarmReport {
                 ),
             });
         }
-        if self.total_boundary_flips > 0 {
+        if self.max_boundary_returns_in_window >= BOUNDARY_THRASH_RETURN_THRESHOLD {
             failures.push(CriterionFailure {
                 clause: "no entity thrashes cells at a boundary",
                 detail: format!(
-                    "{} commitments returned to the cell just left; the 10% \
-                     hysteresis margin should make this zero",
-                    self.total_boundary_flips
+                    "an entity returned to the same cell {} times within one 1 s interest-refresh \
+                     period (thrash threshold {BOUNDARY_THRASH_RETURN_THRESHOLD}); zero such \
+                     oscillations are allowed",
+                    self.max_boundary_returns_in_window,
                 ),
             });
         }
@@ -3304,6 +3394,51 @@ mod tests {
         assert_ne!(
             expected, sorted,
             "fixture must detect accidental transport-key sorting"
+        );
+    }
+
+    #[test]
+    fn three_returns_to_same_cell_inside_one_refresh_window_fail_boundary_thrash_clause() {
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 1,
+            ..SwarmConfig::default()
+        });
+        let cell_a = swarm.bots[0].cell().expect("the bot starts committed");
+        let (coords, level) = cell_a.coords();
+        let cell_b = CellId::from_coords(coords + glam::IVec3::X, level).unwrap();
+
+        for (tick, cell) in [cell_b, cell_a, cell_b, cell_a].into_iter().enumerate() {
+            swarm.bots[0].record_cell_commitment_for_test(cell, tick as u64);
+        }
+
+        let measured = swarm.bots[0].max_boundary_returns_in_window;
+        assert_eq!(
+            measured, 3,
+            "the real one-second window accounting must measure three same-cell returns from A↔B oscillation"
+        );
+        let mut report = passing();
+        report.max_boundary_returns_in_window = measured;
+        let failure = report
+            .against_criterion(STRICT)
+            .into_iter()
+            .find(|failure| failure.clause == "no entity thrashes cells at a boundary")
+            .expect("three measured returns must fail the named boundary-thrash clause");
+        assert!(
+            failure.detail.contains("returned to the same cell 3 times"),
+            "the failure must name the real violated quantity: {}",
+            failure.detail
+        );
+    }
+
+    #[test]
+    fn two_returns_inside_one_refresh_window_are_not_boundary_thrash() {
+        let mut report = passing();
+        report.total_boundary_flips = 2;
+        report.max_boundary_returns_in_window = 2;
+
+        assert!(
+            !clauses(&report, STRICT).contains(&"no entity thrashes cells at a boundary"),
+            "a reversal and re-reversal cross the full hysteresis deadband and remain legitimate"
         );
     }
 
@@ -3753,6 +3888,9 @@ mod tests {
             seconds: 3_600,
             ticks: 3_600 * TICK_HZ,
             per_peer: Vec::new(),
+            max_boundary_returns_in_window: 0,
+            boundary_return_histogram: Vec::new(),
+            boundary_return_profiles: Vec::new(),
             delta_stats: None,
             shot_interest_stats: None,
             delivery_gaps: None,

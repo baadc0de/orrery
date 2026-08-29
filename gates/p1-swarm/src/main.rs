@@ -1297,9 +1297,42 @@ fn main() -> Result<()> {
         );
     }
     eprintln!(
-        "gates/p1-swarm: {} boundary flips, {} proxy pops out of {} churn events",
+        "gates/p1-swarm: {} same-cell returns, {} proxy pops out of {} churn events",
         report.total_boundary_flips, report.total_proxy_pops, report.total_interest_churn,
     );
+    let seat_distribution = report
+        .per_peer
+        .iter()
+        .map(|peer| {
+            format!(
+                "{}/{}={}",
+                peer.index, peer.profile, peer.max_boundary_returns_in_window
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let histogram = report
+        .boundary_return_histogram
+        .iter()
+        .map(|bin| format!("{}:{}", bin.returns_in_window, bin.seats))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "gates/p1-swarm: boundary returns per 1 s refresh window: max {}; seats [{seat_distribution}]; histogram returns:seats [{histogram}]",
+        report.max_boundary_returns_in_window,
+    );
+    for profile in &report.boundary_return_profiles {
+        let histogram = profile
+            .histogram
+            .iter()
+            .map(|bin| format!("{}:{}", bin.returns_in_window, bin.seats))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "gates/p1-swarm: boundary returns profile {}: max {}; histogram returns:seats [{histogram}]",
+            profile.profile, profile.max_returns_in_window,
+        );
+    }
     if let Some(shots) = &report.shot_interest_stats {
         eprintln!(
             "gates/p1-swarm: shot interest — {} of {} resolved shots out of interest ({:.3}%); \
