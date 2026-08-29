@@ -199,8 +199,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use orrery_core::CoreCodec as _;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::str::FromStr;
+use std::sync::{mpsc, Arc, Mutex};
 
 use orrery_games::game::Tamper;
 use orrery_games::regolith::state::RegolithState;
@@ -394,13 +394,13 @@ struct Args {
     #[arg(long)]
     external_peer: bool,
 
-    /// Number of stable human seats offered during the lobby. The full seat
-    /// namespace is `peers + external_slots`; inactive seats are not reused.
+    /// Number of stable human seats offered during the campaign. The full seat
+    /// namespace is `peers + external_slots`; any unbound human seat may join.
     #[arg(long, default_value_t = 1)]
     external_slots: usize,
 
-    /// Seconds from endpoint publication until active membership freezes.
-    /// A full lobby freezes immediately.
+    /// Initial cohort-formation seconds after the first authenticated arrival.
+    /// Admission remains open after the run starts; a full cohort starts now.
     #[arg(long, default_value_t = 90)]
     lobby_seconds: u64,
 
@@ -415,9 +415,9 @@ struct Args {
     #[arg(long)]
     listening_file: Option<String>,
 
-    /// Atomically write the attempt id and human seats frozen into `StartV1`.
-    /// The co-located admission service reads this host-authored fact for its
-    /// waiting-room roster; no file is written before membership freezes.
+    /// Atomically publish the attempt id and currently bound human seats.
+    /// The co-located admission service reads this host-authored liveness fact;
+    /// every bind and release replaces it through a temporary file + rename.
     #[arg(long, value_name = "PATH")]
     active_seats_file: Option<std::path::PathBuf>,
 
@@ -566,31 +566,11 @@ struct ConnectedSeat {
     node: NodeId,
 }
 
-/// Publish the host's frozen membership without exposing a partial JSON file.
-fn write_active_seats(path: &Path, attempt_id: &str, connected: &[ConnectedSeat]) -> Result<()> {
-    let mut slots = connected.iter().map(|seat| seat.slot).collect::<Vec<_>>();
-    slots.sort_unstable();
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "attempt_id": attempt_id,
-        "active_slots": slots,
-    }))
-    .context("serialize frozen active seats")?;
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, bytes).with_context(|| {
-        format!(
-            "cannot write active seats temporary file {}",
-            temporary.display()
-        )
-    })?;
-    std::fs::rename(&temporary, path)
-        .with_context(|| format!("cannot publish active seats file {}", path.display()))
-}
-
-/// Freeze the one active roster and personalize only its witness recipients.
+/// Build one current roster snapshot and personalize its witness recipients.
 ///
-/// `connected` is the set admitted before the lobby deadline. Seats absent
-/// here stay absent for the whole attempt; this function never compacts or
-/// fills a gap in the configured seat namespace.
+/// `connected` is the set bound at this instant. This function never compacts
+/// or fills a gap in the configured seat namespace; later calls may bind a
+/// previously absent seat or omit one that has departed.
 fn build_start_manifests(
     attempt_id: &str,
     seed: u64,
@@ -598,6 +578,7 @@ fn build_start_manifests(
     bot_seats: usize,
     island_seats: usize,
     connected: &[ConnectedSeat],
+    tick: u64,
 ) -> Result<BTreeMap<usize, exterior::StartManifest>> {
     if bot_seats > island_seats {
         bail!("bot seats exceed the configured island seat namespace");
@@ -613,8 +594,8 @@ fn build_start_manifests(
         .collect::<Vec<_>>();
     occupied.extend(0..bot_seats);
 
-    // Load-bearing lobby stage: every admitted human is copied into the
-    // frozen active roster. The mutation proof removes one entry here and
+    // Load-bearing membership stage: every admitted human is copied into the
+    // active roster snapshot. The mutation proof removes one entry here and
     // `start_manifest_names_all_three_connected_humans` must fail.
     for seat in connected {
         if seat.slot < bot_seats || seat.slot >= usize::from(island_seats) {
@@ -647,7 +628,7 @@ fn build_start_manifests(
             let manifest = exterior::StartManifest {
                 attempt_id: attempt_id.to_owned(),
                 seed,
-                tick: 0,
+                tick,
                 island_seats,
                 active: active.clone(),
                 witness_recipients: swarm::witness_recipients(&active_slots, seat.slot),
@@ -656,6 +637,146 @@ fn build_start_manifests(
             Ok((seat.slot, manifest))
         })
         .collect()
+}
+
+fn decode_join_anchor(
+    anchor: Option<exterior::AnchorFrame>,
+) -> Result<Option<(orrery_protocol::StateClaim, RegolithState)>> {
+    anchor
+        .map(|bytes| {
+            let claim = serde_json::from_slice(&bytes.claim_json)
+                .context("external anchor claim did not decode")?;
+            let state = RegolithState::decode(&bytes.state)
+                .context("external anchor state did not decode")?;
+            Ok((claim, state))
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn accept_live_join(
+    endpoint: &iroh::Endpoint,
+    admission: &exterior::Admission,
+    membership: &Arc<Mutex<swarm::LiveMembership>>,
+    joined_tx: &mpsc::Sender<swarm::JoinedExternal>,
+    seed: u64,
+    seconds: u64,
+    bot_seats: usize,
+    island_seats: usize,
+    witnessing: bool,
+) -> Result<()> {
+    let prepared = bridge::host_prepare(endpoint, None, admission).await?;
+    let slot = prepared.index();
+    let node = prepared.remote();
+    let Some(session_id) = prepared.session_id().map(ToOwned::to_owned) else {
+        let _ = prepared
+            .refuse("reservation_missing_session: no invite session id was presented".to_owned())
+            .await;
+        return Ok(());
+    };
+    if slot < bot_seats || slot >= island_seats {
+        let _ = prepared
+            .refuse(format!(
+                "reservation_slot_out_of_range: requested slot {slot}, human seats are {bot_seats}..{island_seats}"
+            ))
+            .await;
+        return Ok(());
+    }
+    let snapshot = {
+        let mut live = membership.lock().expect("membership lock");
+        if live.active.contains_key(&slot) || !live.pending.insert(slot) {
+            None
+        } else {
+            Some((
+                live.attempt_id.clone(),
+                live.tick,
+                live.active
+                    .iter()
+                    .map(|(slot, (node, _session))| ConnectedSeat {
+                        slot: *slot,
+                        node: *node,
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        }
+    };
+    let Some((attempt_id, tick, mut connected)) = snapshot else {
+        let _ = prepared
+            .refuse(format!(
+                "reservation_slot_occupied: slot {slot} is already bound"
+            ))
+            .await;
+        return Ok(());
+    };
+    connected.push(ConnectedSeat { slot, node });
+    connected.sort_by_key(|seat| seat.slot);
+    let manifest = build_start_manifests(
+        &attempt_id,
+        seed,
+        seconds,
+        bot_seats,
+        island_seats,
+        &connected,
+        tick,
+    )
+    .and_then(|mut manifests| {
+        manifests
+            .remove(&slot)
+            .context("live join manifest did not include its subject")
+    });
+    let manifest = match manifest {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            membership
+                .lock()
+                .expect("membership lock")
+                .pending
+                .remove(&slot);
+            return Err(error);
+        }
+    };
+    let finished = prepared.finish(Some(manifest), witnessing).await;
+    let (link, anchor, joined_node, joined_slot) = match finished {
+        Ok(joined) => joined,
+        Err(error) => {
+            membership
+                .lock()
+                .expect("membership lock")
+                .pending
+                .remove(&slot);
+            return Err(error);
+        }
+    };
+    let anchor = match decode_join_anchor(anchor) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            membership
+                .lock()
+                .expect("membership lock")
+                .pending
+                .remove(&slot);
+            return Err(error);
+        }
+    };
+    {
+        let mut live = membership.lock().expect("membership lock");
+        live.pending.remove(&joined_slot);
+        live.active
+            .insert(joined_slot, (joined_node, session_id.clone()));
+        if let Err(error) = live.publish() {
+            live.active.remove(&joined_slot);
+            return Err(error).context("republish active seats after bind");
+        }
+    }
+    joined_tx
+        .send(swarm::JoinedExternal {
+            slot: joined_slot,
+            node: joined_node,
+            session_id,
+            anchor,
+            link,
+        })
+        .map_err(|_| anyhow::anyhow!("swarm stopped before the joined seat was installed"))
 }
 
 fn main() -> Result<()> {
@@ -809,7 +930,7 @@ fn main() -> Result<()> {
                 "a standing token-gated host requires --reservation-journal and --attempt-id; refusing to run with unverified seats"
             );
         }
-        let reopen_empty_lobby = admission.reservation_journal.is_some();
+        let standing = admission.reservation_journal.is_some();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -824,7 +945,7 @@ fn main() -> Result<()> {
         if args.external_slots > 1 && island_seats > 8 {
             bail!("the P1 campaign lobby is capped at eight total seats");
         }
-        let (endpoint, joined) = rt.block_on(async {
+        let (endpoint, joined, live_joins) = rt.block_on(async {
             let endpoint = bridge::bind(secret, args.external_bind).await?;
             eprintln!(
                 "gates/p1-swarm: exterior seats {}..{} listening, node {}, direct {:?}",
@@ -845,26 +966,23 @@ fn main() -> Result<()> {
                 );
                 std::fs::write(path, line).context("cannot write the exterior listening file")?;
             }
-            let lobby_seconds = if args.external_slots == 1 && args.attempt_id.is_none() {
-                args.join_timeout_secs
-            } else {
-                args.lobby_seconds
-            };
             let mut pending = Vec::new();
+            let fixed_legacy_seat =
+                (!standing).then(|| (config.peers, bot::bot_key(config.peers).public()));
+            // A standing empty host waits indefinitely (#592). The initial
+            // cohort delay begins only after the first authenticated arrival.
             loop {
-                let deadline = tokio::time::Instant::now()
-                    + std::time::Duration::from_secs(lobby_seconds.max(1));
-                while pending.len() < args.external_slots {
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
+                let prepared = if standing {
+                    match bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission).await {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            eprintln!("gates/p1-swarm: refused pending join: {error:#}");
+                            continue;
+                        }
                     }
-                    let fixed_legacy_seat = (args.external_slots == 1
-                        && admission.reservation_journal.is_none())
-                    .then(|| (config.peers, bot::bot_key(config.peers).public()));
-                    let prepared = match tokio::time::timeout(
-                        remaining,
+                } else {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(args.join_timeout_secs.max(1)),
                         bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission),
                     )
                     .await
@@ -874,43 +992,73 @@ fn main() -> Result<()> {
                             eprintln!("gates/p1-swarm: refused pending join: {error:#}");
                             continue;
                         }
-                        Err(_) => break,
-                    };
-                    if prepared.index() < config.peers || prepared.index() >= island_seats {
-                        let reason = format!(
-                            "reservation_slot_out_of_range: requested slot {}, human seats are {}..{}",
-                            prepared.index(),
-                            config.peers,
-                            island_seats
-                        );
-                        let _ = prepared.refuse(reason).await;
-                        continue;
+                        Err(_) => bail!("the lobby closed without an admitted human"),
                     }
-                    if pending
-                        .iter()
-                        .any(|joined: &bridge::PendingJoin| joined.index() == prepared.index())
-                    {
-                        let reason = format!(
-                            "reservation_slot_occupied: slot {} already joined this lobby",
-                            prepared.index()
-                        );
-                        let _ = prepared.refuse(reason).await;
-                        continue;
-                    }
-                    eprintln!(
-                        "gates/p1-swarm: reservation seat {} connected as {}",
-                        prepared.index(),
-                        prepared.remote()
+                };
+                if prepared.index() < config.peers || prepared.index() >= island_seats {
+                    let reason =
+                        format!(
+                        "reservation_slot_out_of_range: requested slot {}, human seats are {}..{}",
+                        prepared.index(), config.peers, island_seats
                     );
-                    pending.push(prepared);
+                    let _ = prepared.refuse(reason).await;
+                    continue;
                 }
-                if !pending.is_empty() || !reopen_empty_lobby {
+                eprintln!(
+                    "gates/p1-swarm: reservation seat {} connected as {}",
+                    prepared.index(),
+                    prepared.remote()
+                );
+                pending.push(prepared);
+                break;
+            }
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(args.lobby_seconds);
+            while pending.len() < args.external_slots {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
                     break;
                 }
-                eprintln!("gates/p1-swarm: standing lobby stayed empty; reopening");
-            }
-            if pending.is_empty() {
-                bail!("the lobby closed without an admitted human");
+                let prepared = match tokio::time::timeout(
+                    remaining,
+                    bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission),
+                )
+                .await
+                {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(error)) => {
+                        eprintln!("gates/p1-swarm: refused pending join: {error:#}");
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                if prepared.index() < config.peers || prepared.index() >= island_seats {
+                    let reason = format!(
+                        "reservation_slot_out_of_range: requested slot {}, human seats are {}..{}",
+                        prepared.index(),
+                        config.peers,
+                        island_seats
+                    );
+                    let _ = prepared.refuse(reason).await;
+                    continue;
+                }
+                if pending
+                    .iter()
+                    .any(|joined: &bridge::PendingJoin| joined.index() == prepared.index())
+                {
+                    let reason = format!(
+                        "reservation_slot_occupied: slot {} is already bound",
+                        prepared.index()
+                    );
+                    let _ = prepared.refuse(reason).await;
+                    continue;
+                }
+                eprintln!(
+                    "gates/p1-swarm: reservation seat {} connected as {}",
+                    prepared.index(),
+                    prepared.remote()
+                );
+                pending.push(prepared);
             }
 
             let connected = pending
@@ -931,46 +1079,101 @@ fn main() -> Result<()> {
                         config.peers,
                         island_seats,
                         &connected,
+                        0,
                     )
                 })
                 .transpose()?;
-            if let (Some(path), Some(attempt_id)) = (&args.active_seats_file, args.attempt_id.as_deref()) {
-                write_active_seats(path, attempt_id, &connected)?;
-            }
             eprintln!(
-                "gates/p1-swarm: StartV1 freezes {} active humans across {} seats",
+                "gates/p1-swarm: StartV1 begins with {} active humans across {} seats",
                 pending.len(),
                 island_seats
             );
 
             let mut finished = Vec::with_capacity(pending.len());
+            let membership = args.attempt_id.as_ref().map(|attempt_id| {
+                Arc::new(Mutex::new(swarm::LiveMembership {
+                    attempt_id: attempt_id.clone(),
+                    active: BTreeMap::new(),
+                    pending: BTreeSet::new(),
+                    released_sessions: BTreeSet::new(),
+                    tick: 0,
+                    running: false,
+                    path: args.active_seats_file.clone(),
+                }))
+            });
             for prepared in pending {
+                let session_id = prepared.session_id().map(ToOwned::to_owned);
                 let manifest = manifests
                     .as_ref()
                     .and_then(|by_slot| by_slot.get(&prepared.index()))
                     .cloned();
-                finished.push(prepared.finish(manifest, config.witnessing).await?);
+                let joined = prepared.finish(manifest, config.witnessing).await?;
+                if let (Some(live), Some(session_id)) = (&membership, &session_id) {
+                    let mut live = live.lock().expect("membership lock");
+                    live.active.insert(joined.3, (joined.2, session_id.clone()));
+                    live.publish()
+                        .context("republish active seats after initial bind")?;
+                }
+                finished.push((joined, session_id));
             }
-            anyhow::Ok((endpoint, finished))
+            let live_joins = if let Some(membership) = membership {
+                {
+                    let mut live = membership.lock().expect("membership lock");
+                    live.running = true;
+                    live.publish()
+                        .context("publish the running membership boundary")?;
+                }
+                let (joined_tx, joined_rx) = mpsc::channel();
+                let accept_endpoint = endpoint.clone();
+                let accept_admission = admission.clone();
+                let accept_membership = Arc::clone(&membership);
+                tokio::spawn(async move {
+                    loop {
+                        if let Err(error) = accept_live_join(
+                            &accept_endpoint,
+                            &accept_admission,
+                            &accept_membership,
+                            &joined_tx,
+                            config.seed,
+                            config.seconds,
+                            config.peers,
+                            island_seats,
+                            config.witnessing,
+                        )
+                        .await
+                        {
+                            eprintln!("gates/p1-swarm: refused live join: {error:#}");
+                        }
+                    }
+                });
+                Some((joined_rx, membership))
+            } else {
+                None
+            };
+            anyhow::Ok((endpoint, finished, live_joins))
         })?;
         // Held for their lifetime: dropping the endpoint closes the
         // connection, and dropping the runtime waits on the pump tasks.
         _endpoint_guard = endpoint;
         _runtime_guard = rt;
 
-        for (link, anchor_bytes, joined_node, slot) in joined {
-            let anchor = match anchor_bytes {
-                Some(bytes) => {
-                    let claim: orrery_protocol::StateClaim =
-                        serde_json::from_slice(&bytes.claim_json)
-                            .context("external anchor claim did not decode")?;
-                    let state = RegolithState::decode(&bytes.state)
-                        .context("external anchor state did not decode")?;
-                    Some((claim, state))
-                }
-                None => None,
+        for ((link, anchor_bytes, joined_node, slot), session_id) in joined {
+            let anchor = decode_join_anchor(anchor_bytes)?;
+            swarm = if let Some(session_id) = session_id {
+                swarm.with_external_session_at(
+                    slot,
+                    island_seats,
+                    joined_node,
+                    session_id,
+                    anchor,
+                    link,
+                )
+            } else {
+                swarm.with_external_at(slot, island_seats, joined_node, anchor, link)
             };
-            swarm = swarm.with_external_at(slot, island_seats, joined_node, anchor, link);
+        }
+        if let Some((receiver, membership)) = live_joins {
+            swarm = swarm.with_live_joins(receiver, membership, island_seats);
         }
     }
 
@@ -1311,7 +1514,7 @@ mod session_geometry_tests {
                 node: bot::bot_key(6).public(),
             },
         ];
-        let manifests = build_start_manifests("attempt-1", 17, 20, 5, 8, &connected)
+        let manifests = build_start_manifests("attempt-1", 17, 20, 5, 8, &connected, 0)
             .expect("valid frozen roster");
 
         assert_eq!(manifests.keys().copied().collect::<Vec<_>>(), vec![5, 6, 7]);

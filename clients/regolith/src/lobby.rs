@@ -109,7 +109,7 @@ pub enum SeatState {
     Connected,
     /// Nobody has taken it.
     Empty,
-    /// Someone took it and left; it is not reused this attempt.
+    /// Someone took it and left; admission may reserve it again.
     Vacant,
     /// A state this build does not know, or none at all.
     Other(String),
@@ -132,8 +132,8 @@ impl SeatState {
 
     /// Whether a person is counted as holding this seat.
     ///
-    /// `vacant` deliberately is not held: the seat is spent for this attempt,
-    /// but nobody is in it, and saying "3 of 4 taken" about a seat whose
+    /// `vacant` deliberately is not held: nobody is in it, and saying "3 of 4
+    /// taken" about a seat whose
     /// player left would misdescribe the room.
     #[must_use]
     pub const fn is_held(&self) -> bool {
@@ -159,9 +159,9 @@ pub struct Seat {
 pub enum LobbyPhase {
     /// Seats are reservable and no cohort is forming yet.
     Open,
-    /// A cohort is forming; membership freezes at Start.
+    /// The initial cohort is forming.
     Lobby,
-    /// The attempt has started; membership is frozen.
+    /// The attempt has started and unbound seats remain joinable.
     Running,
     /// Every seat is taken.
     Full,
@@ -388,13 +388,13 @@ pub struct ActiveSeat {
     pub entity: u64,
 }
 
-/// `StartV1`, the frozen active membership the host sends at lobby close.
+/// `StartV1`, the active membership the host sends at bind and on each change.
 ///
 /// Field-for-field the manifest specified in
 /// `docs/plans/multi-human-campaign.md` §3.2. #574 owns the host half and is
 /// not landed at the time of writing, so what is fixed here is that
 /// specification's *shape*, decoded from JSON carried on the handshake stream
-/// — the same encoding the tick-zero claim beside it already uses, chosen so
+/// — the same encoding the join-tick claim beside it already uses, chosen so
 /// this does not become a second spelling of a wire #574 has yet to write.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StartManifest {
@@ -405,7 +405,7 @@ pub struct StartManifest {
     /// Carried, not compared: the client's universe seed is its own constant
     /// and is not the same number, so an equality here would be theatre.
     pub seed: u64,
-    /// The tick membership froze at. Always zero in this cut.
+    /// The host tick at which this membership snapshot applies.
     pub tick: u64,
     /// The configured island size every spawn pose is computed against.
     pub island_seats: u16,
@@ -436,12 +436,11 @@ impl StartManifest {
     }
 }
 
-/// What this client committed to before the manifest arrived.
+/// What this client can validate before adopting the manifest.
 ///
 /// Every field is something already spent: the entity was inserted into the
-/// executor, the pose was computed from `island_seats`, and the tick-zero
-/// claim was signed over both. That is why disagreement is fatal rather than
-/// adjustable — the anchor cannot be re-signed once it has been authored.
+/// executor and the pose was computed from `island_seats`. The signed witness
+/// anchor is authored only after this validation, at the manifest's tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartExpectation {
     /// The seat admission reserved for this client.
@@ -457,11 +456,6 @@ pub struct StartExpectation {
 /// Why a manifest was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestMismatch {
-    /// Membership froze at a tick this client cannot enter at.
-    NotTickZero {
-        /// The tick the manifest named.
-        tick: u64,
-    },
     /// The island is a different size than the spawn pose assumed.
     SeatCount {
         /// What the manifest named.
@@ -519,9 +513,6 @@ impl ManifestMismatch {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            Self::NotTickZero { tick } => format!(
-                "the host froze membership at tick {tick}; this client can only start at tick 0"
-            ),
             Self::SeatCount { manifest, expected } => format!(
                 "the host says the island has {manifest} seats; this client spawned for {expected}"
             ),
@@ -573,6 +564,8 @@ pub struct AcceptedStart {
     pub attempt_id: String,
     /// The island size, confirmed against the spawn pose.
     pub island_seats: u16,
+    /// Host tick at which this membership snapshot applies.
+    pub tick: u64,
     /// Every active seat, in the order the manifest named them.
     pub active_slots: Vec<usize>,
     /// The frozen witness ring for this subject.
@@ -592,16 +585,11 @@ pub struct AcceptedStart {
 ///
 /// # Errors
 /// Every disagreement in [`ManifestMismatch`]. There is no partial acceptance
-/// and no repair: the tick-zero claim is already signed.
+/// and no repair after validation: the claim is signed at `manifest.tick`.
 pub fn accept_start(
     manifest: &StartManifest,
     expect: &StartExpectation,
 ) -> Result<AcceptedStart, ManifestMismatch> {
-    if manifest.tick != 0 {
-        return Err(ManifestMismatch::NotTickZero {
-            tick: manifest.tick,
-        });
-    }
     if manifest.island_seats != expect.island_seats {
         return Err(ManifestMismatch::SeatCount {
             manifest: manifest.island_seats,
@@ -648,6 +636,7 @@ pub fn accept_start(
     Ok(AcceptedStart {
         attempt_id: plain_ascii(&manifest.attempt_id).unwrap_or_default(),
         island_seats: manifest.island_seats,
+        tick: manifest.tick,
         active_slots: seen,
         witness_recipients: manifest.witness_recipients.clone(),
         duration_ticks: manifest.duration_ticks,
@@ -704,13 +693,14 @@ mod tests {
     fn a_matching_manifest_is_adopted() {
         let accepted = accept_start(&manifest(), &expectation()).expect("manifest agrees");
         assert_eq!(accepted.island_seats, 8);
+        assert_eq!(accepted.tick, 0);
         assert_eq!(accepted.active_slots, vec![0, 4, 5]);
         assert_eq!(accepted.witness_recipients, vec![0, 5]);
         assert_eq!(accepted.duration_ticks, 216_000);
     }
 
     /// **The fail-closed property.** Every way a manifest can disagree with
-    /// what this client already spent on its tick-zero anchor must refuse the
+    /// what this client will spend on its join-tick anchor must refuse the
     /// attempt. Proceeding would sign witness frames the host cannot
     /// reconcile, which is worse than not playing.
     #[test]
@@ -720,9 +710,11 @@ mod tests {
         let mut late = manifest();
         late.tick = 900;
         assert_eq!(
-            accept_start(&late, &expect),
-            Err(ManifestMismatch::NotTickZero { tick: 900 }),
-            "a manifest that froze after tick zero cannot be entered"
+            accept_start(&late, &expect)
+                .expect("late start is valid")
+                .tick,
+            900,
+            "a late join adopts the host's current tick"
         );
 
         let mut resized = manifest();

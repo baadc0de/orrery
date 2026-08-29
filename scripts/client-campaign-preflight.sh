@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Prove that one built Regolith binary can join the deployed campaign three
-# times and that each seated client receives both other replicated crafts
-# (#587, #601).
+# Prove that one built Regolith binary can join the deployed campaign after its
+# initial cohort delay, that every seated client receives the other replicated
+# crafts, and that closing those clients leaves a seat reusable (#587, #601,
+# #681).
 #
 #   scripts/client-campaign-preflight.sh --binary PATH --campaign ID
 #   scripts/client-campaign-preflight.sh --self-test
@@ -19,6 +20,8 @@ readonly NAME=client-campaign-preflight
 BINARY=
 CAMPAIGN=
 TIMEOUT_SECS=1020
+LATE_JOIN_DELAY_SECS=185
+REJOIN_DELAY_SECS=3
 XVFB_RUN_BIN="${CLIENT_CAMPAIGN_PREFLIGHT_XVFB_RUN:-xvfb-run}"
 PYTHON_BIN="${CLIENT_CAMPAIGN_PREFLIGHT_PYTHON:-python3}"
 failures=0
@@ -50,11 +53,13 @@ run_preflight() {
     [[ -n $CAMPAIGN ]] || die '--campaign is required'
     [[ -x $BINARY ]] || die "binary is not executable: $BINARY"
     [[ $TIMEOUT_SECS =~ ^[1-9][0-9]*$ ]] || die '--timeout-secs needs a positive integer'
+    [[ $LATE_JOIN_DELAY_SECS =~ ^[0-9]+$ ]] || die '--late-join-delay-secs needs a non-negative integer'
+    [[ $REJOIN_DELAY_SECS =~ ^[0-9]+$ ]] || die '--rejoin-delay-secs needs a non-negative integer'
     command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "required command is unavailable: $PYTHON_BIN"
     command -v "$XVFB_RUN_BIN" >/dev/null 2>&1 || die "required command is unavailable: $XVFB_RUN_BIN"
     command -v timeout >/dev/null 2>&1 || die 'required command is unavailable: timeout'
 
-    local dir build_info origin run_suffix nickname_a nickname_b nickname_c outer_timeout
+    local dir build_info origin run_suffix nickname_a nickname_b nickname_c nickname_d outer_timeout
     dir="$(mktemp -d)"
     # shellcheck disable=SC2064 # Expand the validated mktemp path now.
     trap "rm -rf '$dir'" EXIT
@@ -85,6 +90,7 @@ print(origin.rstrip("/"))
     nickname_a="preflight-$run_suffix-a"
     nickname_b="preflight-$run_suffix-b"
     nickname_c="preflight-$run_suffix-c"
+    nickname_d="preflight-$run_suffix-d"
     outer_timeout=$((TIMEOUT_SECS * 2 + 60))
 
     run_client() { # side, nickname, expected peers...
@@ -127,11 +133,19 @@ print(origin.rstrip("/"))
 
     run_client a "$nickname_a" "$nickname_b" "$nickname_c" & local pid_a=$!
     run_client b "$nickname_b" "$nickname_a" "$nickname_c" & local pid_b=$!
+    sleep "$LATE_JOIN_DELAY_SECS"
     run_client c "$nickname_c" "$nickname_a" "$nickname_b" & local pid_c=$!
     local status_a=0 status_b=0 status_c=0
     wait "$pid_a" || status_a=$?
     wait "$pid_b" || status_b=$?
     wait "$pid_c" || status_c=$?
+
+    # All three binaries have sent their explicit goodbye before wait returns.
+    # Give the host's transport-close fallback grace room as well, then prove a
+    # fourth process can bind one of the released seats in the same attempt.
+    sleep "$REJOIN_DELAY_SECS"
+    local status_d=0
+    run_client d "$nickname_d" || status_d=$?
 
     if ((status_a == 0)); then result PASS client-a-exit 'binary exited 0';
     else result FAIL client-a-exit "binary exited $status_a (log: $dir/a.log)"; fi
@@ -139,19 +153,25 @@ print(origin.rstrip("/"))
     else result FAIL client-b-exit "binary exited $status_b (log: $dir/b.log)"; fi
     if ((status_c == 0)); then result PASS client-c-exit 'binary exited 0';
     else result FAIL client-c-exit "binary exited $status_c (log: $dir/c.log)"; fi
+    if ((status_d == 0)); then result PASS client-d-rejoin-exit 'binary exited 0';
+    else result FAIL client-d-rejoin-exit "binary exited $status_d (log: $dir/d.log)"; fi
 
     require_marker client-a-origin "$dir/a.log" "PREFLIGHT PASS admission-origin origin=$origin"
     require_marker client-b-origin "$dir/b.log" "PREFLIGHT PASS admission-origin origin=$origin"
     require_marker client-c-origin "$dir/c.log" "PREFLIGHT PASS admission-origin origin=$origin"
+    require_marker client-d-rejoin-origin "$dir/d.log" "PREFLIGHT PASS admission-origin origin=$origin"
     require_marker client-a-joinable "$dir/a.log" "PREFLIGHT PASS campaign-joinable campaign=$CAMPAIGN"
     require_marker client-b-joinable "$dir/b.log" "PREFLIGHT PASS campaign-joinable campaign=$CAMPAIGN"
     require_marker client-c-joinable "$dir/c.log" "PREFLIGHT PASS campaign-joinable campaign=$CAMPAIGN"
+    require_marker client-d-rejoin-joinable "$dir/d.log" "PREFLIGHT PASS campaign-joinable campaign=$CAMPAIGN"
     require_marker client-a-admitted "$dir/a.log" "PREFLIGHT PASS admission-accepted campaign=$CAMPAIGN"
     require_marker client-b-admitted "$dir/b.log" "PREFLIGHT PASS admission-accepted campaign=$CAMPAIGN"
     require_marker client-c-admitted "$dir/c.log" "PREFLIGHT PASS admission-accepted campaign=$CAMPAIGN"
+    require_marker client-d-rejoin-admitted "$dir/d.log" "PREFLIGHT PASS admission-accepted campaign=$CAMPAIGN"
     require_marker client-a-seated "$dir/a.log" 'PREFLIGHT PASS handshake-seated '
     require_marker client-b-seated "$dir/b.log" 'PREFLIGHT PASS handshake-seated '
     require_marker client-c-seated "$dir/c.log" 'PREFLIGHT PASS handshake-seated '
+    require_marker client-d-rejoin-seated "$dir/d.log" 'PREFLIGHT PASS handshake-seated '
     require_marker client-a-peer-b "$dir/a.log" "PREFLIGHT PASS peer-observed nickname=$nickname_b "
     require_marker client-a-peer-c "$dir/a.log" "PREFLIGHT PASS peer-observed nickname=$nickname_c "
     require_marker client-b-peer-a "$dir/b.log" "PREFLIGHT PASS peer-observed nickname=$nickname_a "
@@ -252,7 +272,8 @@ SH
     st_run() {
         CLIENT_CAMPAIGN_PREFLIGHT_XVFB_RUN="$dir/bin/xvfb-run" \
             CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE="$1" \
-            "$0" --binary "$dir/bin/client" --campaign fixture --timeout-secs 1 2>&1
+            "$0" --binary "$dir/bin/client" --campaign fixture --timeout-secs 1 \
+                --late-join-delay-secs 0 --rejoin-delay-secs 0 2>&1
     }
 
     status=0; output="$(st_run good)" || status=$?
@@ -261,8 +282,8 @@ SH
         || die 'self-test baseline emitted no passing summary'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
-    [[ $pass_count == 22 && $fail_count == 0 ]] \
-        || die "self-test baseline counted $pass_count pass / $fail_count fail, expected 22 / 0"
+    [[ $pass_count == 27 && $fail_count == 0 ]] \
+        || die "self-test baseline counted $pass_count pass / $fail_count fail, expected 27 / 0"
     ((passing += 1))
 
     status=0; output="$(st_run wrapper-cleanup-error)" || status=$?
@@ -273,10 +294,12 @@ SH
         || die 'self-test wrapper-cleanup regression did not retain client-b-exit success'
     grep -Fq 'PASS client-c-exit binary exited 0' <<<"$output" \
         || die 'self-test wrapper-cleanup regression did not retain client-c-exit success'
+    grep -Fq 'PASS client-d-rejoin-exit binary exited 0' <<<"$output" \
+        || die 'self-test wrapper-cleanup regression did not retain client-d-rejoin-exit success'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
-    [[ $pass_count == 22 && $fail_count == 0 ]] \
-        || die "self-test wrapper-cleanup regression counted $pass_count pass / $fail_count fail, expected 22 / 0"
+    [[ $pass_count == 27 && $fail_count == 0 ]] \
+        || die "self-test wrapper-cleanup regression counted $pass_count pass / $fail_count fail, expected 27 / 0"
     ((passing += 1))
 
     status=0; output="$(st_run client-error)" || status=$?
@@ -287,10 +310,12 @@ SH
         || die 'self-test client-error mutation did not fail named check client-b-exit'
     grep -Fq 'FAIL client-c-exit binary exited 7' <<<"$output" \
         || die 'self-test client-error mutation did not fail named check client-c-exit'
+    grep -Fq 'FAIL client-d-rejoin-exit binary exited 7' <<<"$output" \
+        || die 'self-test client-error mutation did not fail named check client-d-rejoin-exit'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
-    [[ $pass_count == 19 && $fail_count == 3 ]] \
-        || die "self-test client-error mutation counted $pass_count pass / $fail_count fail, expected 19 / 3"
+    [[ $pass_count == 23 && $fail_count == 4 ]] \
+        || die "self-test client-error mutation counted $pass_count pass / $fail_count fail, expected 23 / 4"
     ((mutations += 1))
 
     status=0; output="$(st_run not-seated)" || status=$?
@@ -301,10 +326,12 @@ SH
         || die 'self-test no-seat mutation did not fail named check client-b-seated'
     grep -Fq 'FAIL client-c-seated ' <<<"$output" \
         || die 'self-test no-seat mutation did not fail named check client-c-seated'
+    grep -Fq 'FAIL client-d-rejoin-seated ' <<<"$output" \
+        || die 'self-test no-seat mutation did not fail named check client-d-rejoin-seated'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
-    [[ $pass_count == 19 && $fail_count == 3 ]] \
-        || die "self-test no-seat mutation counted $pass_count pass / $fail_count fail, expected 19 / 3"
+    [[ $pass_count == 23 && $fail_count == 4 ]] \
+        || die "self-test no-seat mutation counted $pass_count pass / $fail_count fail, expected 23 / 4"
     ((mutations += 1))
 
     status=0; output="$(st_run one-seated)" || status=$?
@@ -315,10 +342,12 @@ SH
         || die 'self-test one-seat mutation did not fail named check client-b-seated'
     grep -Fq 'FAIL client-c-seated ' <<<"$output" \
         || die 'self-test one-seat mutation did not fail named check client-c-seated'
+    grep -Fq 'FAIL client-d-rejoin-seated ' <<<"$output" \
+        || die 'self-test one-seat mutation did not fail named check client-d-rejoin-seated'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
-    [[ $pass_count == 20 && $fail_count == 2 ]] \
-        || die "self-test one-seat mutation counted $pass_count pass / $fail_count fail, expected 20 / 2"
+    [[ $pass_count == 24 && $fail_count == 3 ]] \
+        || die "self-test one-seat mutation counted $pass_count pass / $fail_count fail, expected 24 / 3"
     ((mutations += 1))
 
     status=0; output="$(st_run one-peer)" || status=$?
@@ -333,8 +362,8 @@ SH
         || die 'self-test one-peer mutation did not fail named check client-c-peer-a'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
-    [[ $pass_count == 18 && $fail_count == 4 ]] \
-        || die "self-test one-peer mutation counted $pass_count pass / $fail_count fail, expected 18 / 4"
+    [[ $pass_count == 23 && $fail_count == 4 ]] \
+        || die "self-test one-peer mutation counted $pass_count pass / $fail_count fail, expected 23 / 4"
     ((mutations += 1))
 
     status=0; output="$(st_run third-peer-hidden)" || status=$?
@@ -349,11 +378,11 @@ SH
         || die 'self-test third-peer mutation did not retain client-c-peer-b pass'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
-    [[ $pass_count == 20 && $fail_count == 2 ]] \
-        || die "self-test third-peer mutation counted $pass_count pass / $fail_count fail, expected 20 / 2"
+    [[ $pass_count == 25 && $fail_count == 2 ]] \
+        || die "self-test third-peer mutation counted $pass_count pass / $fail_count fail, expected 25 / 2"
     ((mutations += 1))
 
-    echo "$NAME: self-test passed ($passing baselines: ordinary + wrapper-cleanup each 22 pass / 0 fail; client-error mutation 19 pass / 3 fail at client-a-exit + client-b-exit + client-c-exit; $mutations total mutations: no-seat 19 pass / 3 fail at all seated checks, one-seat 20 pass / 2 fail at client-b-seated + client-c-seated, one-peer 18 pass / 4 fail at every B/C observation, third-peer-hidden 20 pass / 2 fail at client-a-peer-c + client-b-peer-c)"
+    echo "$NAME: self-test passed ($passing baselines: ordinary + wrapper-cleanup each 27 pass / 0 fail; client-error mutation 23 pass / 4 fail at client-a-exit + client-b-exit + client-c-exit + client-d-rejoin-exit; $mutations total mutations: no-seat 23 pass / 4 fail at all seated checks, one-seat 24 pass / 3 fail at client-b-seated + client-c-seated + client-d-rejoin-seated, one-peer 23 pass / 4 fail at every B/C observation, third-peer-hidden 25 pass / 2 fail at client-a-peer-c + client-b-peer-c)"
 }
 
 while (($#)); do
@@ -361,6 +390,8 @@ while (($#)); do
         --binary) shift; (($#)) || die '--binary needs a path'; BINARY=$1 ;;
         --campaign) shift; (($#)) || die '--campaign needs an id'; CAMPAIGN=$1 ;;
         --timeout-secs) shift; (($#)) || die '--timeout-secs needs a value'; TIMEOUT_SECS=$1 ;;
+        --late-join-delay-secs) shift; (($#)) || die '--late-join-delay-secs needs a value'; LATE_JOIN_DELAY_SECS=$1 ;;
+        --rejoin-delay-secs) shift; (($#)) || die '--rejoin-delay-secs needs a value'; REJOIN_DELAY_SECS=$1 ;;
         --self-test) self_test; exit $? ;;
         --help|-h) usage; exit 0 ;;
         *) die "unknown argument '$1'" ;;

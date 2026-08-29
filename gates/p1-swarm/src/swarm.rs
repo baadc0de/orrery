@@ -1,8 +1,10 @@
 //! The swarm: N bots, a router between them, and the criterion they must meet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -20,8 +22,8 @@ use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{Bot, BotSpec, TICK_HZ};
 use crate::delta_stats::{DeltaStats, DeltaStatsReport};
 use crate::exterior::{
-    Frame, HearsayContact, HearsayContacts, HearsaySource, Lane, UplinkAck, UplinkDatagram,
-    UplinkOutcome,
+    ActiveSeat, Frame, HearsayContact, HearsayContacts, HearsaySource, Lane, StartManifest,
+    UplinkAck, UplinkDatagram, UplinkOutcome,
 };
 
 use crate::router::{Impairment, Router, RouterCounters};
@@ -32,6 +34,64 @@ use crate::shot_interest::{ShotInterestReport, ShotInterestStats};
 /// Serving the preceding buffer makes every delivered fold at least this old;
 /// the current buffer is never a serving source.
 const HEARSAY_FOLD_TICKS: u64 = 5 * TICK_HZ;
+
+/// A broken transport is allowed this long to recover before its seat is freed.
+/// Explicit goodbye bypasses the grace. No application-frame timer exists.
+pub(crate) const TRANSPORT_CLOSE_GRACE_TICKS: u64 = 2 * TICK_HZ;
+
+fn transport_close_grace_elapsed(first_closed_tick: u64, tick: u64) -> bool {
+    tick.saturating_sub(first_closed_tick) >= TRANSPORT_CLOSE_GRACE_TICKS
+}
+
+/// One completed QUIC bind delivered by the asynchronous accept loop.
+pub(crate) struct JoinedExternal {
+    pub(crate) slot: usize,
+    pub(crate) node: NodeId,
+    pub(crate) session_id: String,
+    pub(crate) anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+    pub(crate) link: crate::exterior::HostLink,
+}
+
+/// Host-authored membership shared with admission and the live accept loop.
+pub(crate) struct LiveMembership {
+    pub(crate) attempt_id: String,
+    pub(crate) active: BTreeMap<usize, (NodeId, String)>,
+    pub(crate) pending: BTreeSet<usize>,
+    pub(crate) released_sessions: BTreeSet<String>,
+    pub(crate) tick: u64,
+    pub(crate) running: bool,
+    pub(crate) path: Option<PathBuf>,
+}
+
+impl LiveMembership {
+    /// Atomically republish the generation-bound binding feed.
+    pub(crate) fn publish(&self) -> std::io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "attempt_id": self.attempt_id,
+            "active_slots": self.active.keys().copied().collect::<Vec<_>>(),
+            "released_sessions": self.released_sessions,
+            "running": self.running,
+        }))?;
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+struct LiveJoins {
+    receiver: mpsc::Receiver<JoinedExternal>,
+    membership: Arc<Mutex<LiveMembership>>,
+    island_seats: usize,
+}
 
 /// The harness's modified clients: which cheat, and how many peers run it.
 ///
@@ -334,7 +394,7 @@ pub struct ExteriorReport {
     /// Downlink frames refused because the queue was full. Zero at criterion
     /// rates; non-zero means the pump fell behind the swarm's clock.
     pub downlink_dropped: u64,
-    /// Whether the peer shipped a tick-zero witness anchor at join. `false`
+    /// Whether the peer shipped a witness anchor at its join tick. `false`
     /// for a rendered client (#387): its slot is seated unwitnessed, and the
     /// witnessed clauses of this report cover the bot cohort only.
     pub witness_anchored: bool,
@@ -617,6 +677,12 @@ pub struct Swarm {
     index_of: BTreeMap<NodeId, usize>,
     /// Connected external peers, keyed by their swarm slots (#385, #571).
     exteriors: BTreeMap<usize, ExteriorSlot>,
+    /// Completed participants retained after their seat was released.
+    departed_exteriors: Vec<ExteriorReport>,
+    /// Continuous admission for a reservation-backed standing campaign.
+    live_joins: Option<LiveJoins>,
+    /// Host-side watch edges already armed, `(watcher, subject)`.
+    armed_external_watches: BTreeSet<(usize, usize)>,
     /// The two roster snapshots which enforce hearsay's age floor.
     hearsay_buffers: HearsayBuffers,
     /// Test seam for H2's required on/off replication diff.
@@ -636,7 +702,7 @@ pub struct Swarm {
 /// Deliberately less than a [`Bot`]: no executor, no Bevy app, no pilot. The
 /// remote process owns all of that; the host holds only what routing and
 /// witnessing require — where to send its traffic, what it committed to at
-/// tick zero, and which cell it last said it was in.
+/// its join tick, and which cell it last said it was in.
 pub struct ExteriorSlot {
     /// The stable human-seat slot this peer occupies.
     pub index: usize,
@@ -650,7 +716,11 @@ pub struct ExteriorSlot {
     cell: CellId,
     /// Host tick at which the current cell fact was read from a Meta report.
     cell_fact_tick: u64,
-    /// The tick-zero claim the peer shipped after joining, with the state it
+    /// Admission session released when this binding ends.
+    session_id: Option<String>,
+    /// First host tick at which QUIC reported the connection closed.
+    disconnected_at: Option<u64>,
+    /// The join-tick claim the peer shipped after joining, with the state it
     /// commits to — what watchers arm against instead of reading a local
     /// `Chain`. Present when witnessing is on and the peer authors a witness
     /// log (the headless runner does; a rendered client does not, #387).
@@ -799,6 +869,25 @@ fn public_hearsay_record(snapshot: &HearsaySnapshot) -> HearsayContacts {
 }
 
 impl ExteriorSlot {
+    fn report(&self) -> ExteriorReport {
+        ExteriorReport {
+            index: self.index,
+            node: self.node,
+            connected: self
+                .link
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            connected_ticks: self.connected_ticks,
+            uplink_frames: self.uplink_frames,
+            uplink_delivered: self.uplink_delivered,
+            uplink_dropped: self.uplink_dropped,
+            downlink_frames: self.downlink_frames,
+            downlink_dropped: self.downlink_dropped,
+            said_goodbye: self.goodbye.load(std::sync::atomic::Ordering::Relaxed),
+            witness_anchored: self.witness_anchored,
+        }
+    }
+
     /// Queues one frame on the established synchronous side of the bridge.
     /// `try_send` performs the send immediately; unlike `Sender::send`, it
     /// creates no future that could be dropped without being polled.
@@ -809,9 +898,7 @@ impl ExteriorSlot {
                 self.downlink_dropped += 1;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.link
-                    .connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.downlink_dropped += 1;
             }
         }
     }
@@ -1066,6 +1153,9 @@ impl Swarm {
             shot_interest_stats: config.shot_interest_stats.then(ShotInterestStats::default),
             shot_interest_scope: BTreeMap::new(),
             exteriors: BTreeMap::new(),
+            departed_exteriors: Vec::new(),
+            live_joins: None,
+            armed_external_watches: BTreeSet::new(),
             hearsay_buffers: HearsayBuffers::default(),
             hearsay_fold_enabled: true,
         }
@@ -1103,6 +1193,52 @@ impl Swarm {
         anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
         link: crate::exterior::HostLink,
     ) -> Self {
+        self.attach_external_at(index, island_seats, node, None, 0, anchor, link);
+        self
+    }
+
+    /// Enable the receiver used by a standing host after the initial cohort starts.
+    #[must_use]
+    pub(crate) fn with_live_joins(
+        mut self,
+        receiver: mpsc::Receiver<JoinedExternal>,
+        membership: Arc<Mutex<LiveMembership>>,
+        island_seats: usize,
+    ) -> Self {
+        self.live_joins = Some(LiveJoins {
+            receiver,
+            membership,
+            island_seats,
+        });
+        self
+    }
+
+    /// Attach an initial standing-campaign participant with its release key.
+    #[must_use]
+    pub(crate) fn with_external_session_at(
+        mut self,
+        index: usize,
+        island_seats: usize,
+        node: NodeId,
+        session_id: String,
+        anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+        link: crate::exterior::HostLink,
+    ) -> Self {
+        self.attach_external_at(index, island_seats, node, Some(session_id), 0, anchor, link);
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_external_at(
+        &mut self,
+        index: usize,
+        island_seats: usize,
+        node: NodeId,
+        session_id: Option<String>,
+        tick: u64,
+        anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+        link: crate::exterior::HostLink,
+    ) {
         assert!(
             index >= self.bots.len(),
             "an exterior cannot replace a bot seat"
@@ -1129,7 +1265,9 @@ impl Swarm {
                 node,
                 entity,
                 cell,
-                cell_fact_tick: 0,
+                cell_fact_tick: tick,
+                session_id,
+                disconnected_at: None,
                 anchor,
                 witness_anchored,
                 link,
@@ -1142,7 +1280,6 @@ impl Swarm {
                 goodbye: goodbye_flag,
             },
         );
-        self
     }
 
     #[cfg(test)]
@@ -1495,12 +1632,210 @@ impl Swarm {
                         .map(|exterior| exterior.entity)
                 })
                 .unwrap_or(PersistId::new(0));
-            self.bots[delivery.to].receive_inbound(
+            let Some(bot) = self.bots.get_mut(delivery.to) else {
+                // A packet already in flight for a seat that has since been
+                // unbound is stale traffic, not a bot-vector index.
+                continue;
+            };
+            bot.receive_inbound(
                 delivery.from,
                 from_entity,
                 delivery.stream,
                 delivery.payload,
             );
+        }
+    }
+
+    fn membership_manifest(&self, subject: usize, tick: u64, attempt_id: &str) -> StartManifest {
+        let mut active = self
+            .bots
+            .iter()
+            .map(|bot| ActiveSeat {
+                slot: bot.index,
+                node: bot.node.to_string(),
+                entity: bot.entity().0,
+            })
+            .collect::<Vec<_>>();
+        active.extend(self.exteriors.values().map(|seat| ActiveSeat {
+            slot: seat.index,
+            node: seat.node.to_string(),
+            entity: seat.entity.0,
+        }));
+        active.sort_by_key(|seat| seat.slot);
+        let active_slots = active.iter().map(|seat| seat.slot).collect::<Vec<_>>();
+        StartManifest {
+            attempt_id: attempt_id.to_owned(),
+            seed: self.config.seed,
+            tick,
+            island_seats: u16::try_from(
+                self.live_joins
+                    .as_ref()
+                    .map_or(self.total_peers(), |live| live.island_seats),
+            )
+            .expect("campaign seat namespace fits u16"),
+            active,
+            witness_recipients: witness_recipients(&active_slots, subject),
+            duration_ticks: self.config.seconds.saturating_mul(TICK_HZ),
+        }
+    }
+
+    fn publish_live_manifests(&mut self, tick: u64) {
+        let Some(live) = &self.live_joins else {
+            return;
+        };
+        let attempt_id = live
+            .membership
+            .lock()
+            .expect("membership lock")
+            .attempt_id
+            .clone();
+        let manifests = self
+            .exteriors
+            .keys()
+            .copied()
+            .map(|slot| (slot, self.membership_manifest(slot, tick, &attempt_id)))
+            .collect::<Vec<_>>();
+        for (slot, manifest) in manifests {
+            if let Some(exterior) = self.exteriors.get_mut(&slot) {
+                exterior.queue_downlink(Frame {
+                    peer: u32::MAX,
+                    lane: Lane::Meta,
+                    // Live membership is the existing StartV1 JSON on the
+                    // existing Meta lane; no second wire schema is invented.
+                    payload: Bytes::from(
+                        serde_json::to_vec(&manifest).expect("StartV1 serializes"),
+                    ),
+                });
+            }
+        }
+    }
+
+    fn refresh_live_witnesses(&mut self) {
+        if !self.config.witnessing {
+            return;
+        }
+        let active_slots: Vec<usize> = (0..self.bots.len())
+            .chain(self.exteriors.keys().copied())
+            .collect();
+        for index in 0..self.bots.len() {
+            let members = witness_recipients(&active_slots, index)
+                .into_iter()
+                .map(|slot| self.node_of(slot))
+                .collect();
+            self.bots[index].set_witness_set(members);
+        }
+        let subjects = self
+            .exteriors
+            .iter()
+            .filter_map(|(slot, exterior)| {
+                exterior
+                    .anchor
+                    .clone()
+                    .map(|(claim, state)| (*slot, exterior.entity, exterior.node, claim, state))
+            })
+            .collect::<Vec<_>>();
+        for (subject, entity, node, claim, state) in subjects {
+            for watcher in witness_recipients(&active_slots, subject) {
+                if watcher < self.bots.len()
+                    && self.armed_external_watches.insert((watcher, subject))
+                {
+                    self.bots[watcher].watch(entity, node, claim.clone(), state.clone());
+                }
+            }
+        }
+    }
+
+    fn process_live_membership(&mut self, tick: u64) {
+        let joined = self.live_joins.as_ref().map_or_else(Vec::new, |live| {
+            let mut joined = Vec::new();
+            while let Ok(seat) = live.receiver.try_recv() {
+                joined.push(seat);
+            }
+            joined
+        });
+        let island_seats = self.live_joins.as_ref().map_or(0, |live| live.island_seats);
+        let mut changed = false;
+        for seat in joined {
+            eprintln!(
+                "gates/p1-swarm: live seat {} bound as {} at tick {}",
+                seat.slot, seat.node, tick
+            );
+            self.attach_external_at(
+                seat.slot,
+                island_seats,
+                seat.node,
+                Some(seat.session_id),
+                tick,
+                seat.anchor,
+                seat.link,
+            );
+            changed = true;
+        }
+
+        let mut released = Vec::new();
+        for (slot, exterior) in &mut self.exteriors {
+            if exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed) {
+                released.push(*slot);
+                continue;
+            }
+            let transport_close = exterior
+                .link
+                .transport_close
+                .lock()
+                .expect("transport-close lock")
+                .clone();
+            if transport_close.is_none() {
+                exterior.disconnected_at = None;
+            } else {
+                let first = *exterior.disconnected_at.get_or_insert(tick);
+                if transport_close_grace_elapsed(first, tick) {
+                    released.push(*slot);
+                }
+            }
+        }
+        for slot in released {
+            let exterior = self
+                .exteriors
+                .remove(&slot)
+                .expect("release names a live seat");
+            self.index_of.remove(&exterior.node);
+            // A later session may reuse this entity id, but it is a new
+            // authority and chain. Permit every bot to replace its old watch
+            // with the new session's join-tick anchor.
+            self.armed_external_watches
+                .retain(|(_watcher, subject)| *subject != slot);
+            let release_cause = if exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed) {
+                "explicit goodbye".to_owned()
+            } else {
+                let reason = exterior
+                    .link
+                    .transport_close
+                    .lock()
+                    .expect("transport-close lock")
+                    .clone()
+                    .expect("transport close triggered this release");
+                format!("{reason}; transport close grace elapsed")
+            };
+            eprintln!("gates/p1-swarm: live seat {slot} released at tick {tick} ({release_cause})");
+            if let (Some(live), Some(session)) = (&self.live_joins, exterior.session_id.as_ref()) {
+                let mut membership = live.membership.lock().expect("membership lock");
+                membership.active.remove(&slot);
+                membership.released_sessions.insert(session.clone());
+                membership
+                    .publish()
+                    .expect("republish active seats after unbind");
+            }
+            self.departed_exteriors.push(exterior.report());
+            changed = true;
+        }
+
+        if let Some(live) = &self.live_joins {
+            live.membership.lock().expect("membership lock").tick = tick;
+        }
+        if changed {
+            let _ = self.refresh_rosters(tick);
+            self.refresh_live_witnesses();
+            self.publish_live_manifests(tick);
         }
     }
 
@@ -1527,6 +1862,7 @@ impl Swarm {
         let mut phase = [0u128; 6];
         for tick in 0..ticks {
             let tick_start = std::time::Instant::now();
+            self.process_live_membership(tick);
             self.tick_once(tick, send_every, &mut phase);
 
             // Once a simulated second, sample each peer's rate and re-publish
@@ -1704,7 +2040,7 @@ impl Swarm {
             let index = exterior.index;
             let entity = exterior.entity;
             let node = exterior.node;
-            match exterior.anchor.take() {
+            match exterior.anchor.clone() {
                 Some((claim, state)) => {
                     anchors.insert(index, (entity, node, claim, state));
                 }
@@ -1750,6 +2086,7 @@ impl Swarm {
                     continue;
                 };
                 self.bots[*watcher].watch(entity, node, anchor, state);
+                self.armed_external_watches.insert((*watcher, *index));
             }
         }
     }
@@ -2053,26 +2390,16 @@ impl Swarm {
             deltas_discarded_while_stalled: replication_wire.deltas_discarded_while_stalled,
             total_replicas: per_peer.iter().map(|p| p.replicas).sum(),
             witnessing: self.config.witnessing,
-            external: self
-                .exteriors
-                .values()
-                .map(|exterior| ExteriorReport {
-                    index: exterior.index,
-                    node: exterior.node,
-                    connected: exterior
-                        .link
-                        .connected
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    connected_ticks: exterior.connected_ticks,
-                    uplink_frames: exterior.uplink_frames,
-                    uplink_delivered: exterior.uplink_delivered,
-                    uplink_dropped: exterior.uplink_dropped,
-                    downlink_frames: exterior.downlink_frames,
-                    downlink_dropped: exterior.downlink_dropped,
-                    said_goodbye: exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed),
-                    witness_anchored: exterior.witness_anchored,
-                })
-                .collect(),
+            external: {
+                let mut external = self
+                    .departed_exteriors
+                    .iter()
+                    .cloned()
+                    .chain(self.exteriors.values().map(ExteriorSlot::report))
+                    .collect::<Vec<_>>();
+                external.sort_by_key(|seat| seat.index);
+                external
+            },
             player_hours: self.total_peers() as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
             total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
@@ -2585,6 +2912,18 @@ impl SwarmReport {
 mod tests {
     use super::*;
     use orrery_games::regolith::{archetype::Archetype, CAMPAIGN_CELL_EDGE_M};
+
+    #[test]
+    fn transport_close_releases_only_after_the_two_second_grace() {
+        assert!(
+            !transport_close_grace_elapsed(700, 700 + TRANSPORT_CLOSE_GRACE_TICKS - 1),
+            "a transient QUIC close report must keep the seat through the grace"
+        );
+        assert!(
+            transport_close_grace_elapsed(700, 700 + TRANSPORT_CLOSE_GRACE_TICKS),
+            "the real two-second transport-close boundary must release the seat"
+        );
+    }
 
     fn hearsay_test_swarm(
         bot_seats: usize,
