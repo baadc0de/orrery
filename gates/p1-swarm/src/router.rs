@@ -35,8 +35,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 
 use orrery_net::peer_link::StreamMode;
@@ -153,27 +151,79 @@ pub struct RouterCounters {
 /// Named rather than a bare `(NodeId, usize)` tuple because the two fields are
 /// not interchangeable and a tuple key says nothing about which is which at the
 /// use site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct LinkId {
     from: NodeId,
     to: usize,
 }
 
-impl LinkId {
-    /// The impairment stream seed for this link, from the run seed and identity.
+/// Draw indices, so independent decisions about one packet never share a value.
+const DRAW_LOSS: u64 = 0;
+const DRAW_JITTER: u64 = 1;
+const DRAW_SEGMENT_BASE: u64 = 16;
+/// Retransmit attempts per segment, bounded by `MAX_RETRANSMITS`.
+const MAX_DRAWS_PER_SEGMENT: u64 = 64;
+
+/// The bucket an occurrence index is counted within.
+///
+/// Named rather than a `(LinkId, FateLane, u64)` tuple: the fields are not
+/// interchangeable and a tuple key says nothing about which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FateSlot {
+    link: LinkId,
+    lane: FateLane,
+    tick: u64,
+}
+
+/// The identity a packet's impairment fate is a function of.
+///
+/// Deliberately not a position in a sequence: `link` and `lane` say where it
+/// travels, `tick` when it was offered, and `payload` what it carries. Adding
+/// or removing other traffic changes none of those, so no other packet's fate
+/// moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PacketFate {
+    link: LinkId,
+    lane: FateLane,
+    tick: u64,
+    payload: u64,
+    /// Which identical packet this is, within one link, lane and tick.
     ///
-    /// A link's sequence is a function of the link alone, so traffic on one link
-    /// cannot shift the loss and jitter another link sees (#699, #700).
-    fn stream_seed(self, run_seed: u64) -> u64 {
+    /// Without it, ten thousand identical payloads offered in one tick share a
+    /// single identity and therefore a single fate -- all dropped or none, which
+    /// makes the loss *rate* meaningless. This restores an order dependence,
+    /// but a strictly bounded one: inserting a packet can only move the fate of
+    /// packets in the *same tick* on the *same link and lane*. The failure this
+    /// whole change exists to kill was unbounded — one inserted keyframe moved
+    /// a shot by a retransmission interval and the divergence ran for 180,000
+    /// ticks (#699).
+    occurrence: u32,
+}
+
+/// Which lane a fate draw belongs to, so the two never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum FateLane {
+    Datagram,
+    Stream,
+}
+
+impl PacketFate {
+    fn of(link: LinkId, lane: FateLane, tick: u64, payload: &[u8], occurrence: u32) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&(run_seed, self.from, self.to), &mut hasher);
-        std::hash::Hasher::finish(&hasher)
+        std::hash::Hash::hash(payload, &mut hasher);
+        Self {
+            link,
+            lane,
+            tick,
+            payload: std::hash::Hasher::finish(&hasher),
+            occurrence,
+        }
     }
 }
 
 /// Carries packets between peers' session buffers.
 pub struct Router {
-    /// One impairment stream per directed link, never one shared stream.
+    /// Impairment is a pure function of packet identity, not a stream.
     ///
     /// The former single `ChaCha8Rng` drew loss and jitter in packet order
     /// across every link, so a change that altered one link shifted every
@@ -189,8 +239,10 @@ pub struct Router {
     ///
     /// Seeded from the run seed and the link identity, so a link draws the same
     /// sequence regardless of what any other link did.
-    rng: BTreeMap<LinkId, ChaCha8Rng>,
     seed: u64,
+    /// Per (link, lane, tick) offer counts, so identical packets differ.
+    /// Pruned as ticks retire; it never holds more than one tick's worth.
+    occurrences: BTreeMap<FateSlot, u32>,
     impairment: Impairment,
     in_flight: VecDeque<InFlight>,
     /// The tick the last `Shared` message on each link is due.
@@ -198,7 +250,7 @@ pub struct Router {
     /// One stream is one ordered byte sequence: a message cannot be delivered
     /// before the one in front of it, however lucky its own segments were. This
     /// is that ordering, and it is the whole difference between the two modes.
-    shared_tail: Vec<((NodeId, usize), u64)>,
+    shared_tail: Vec<(LinkId, u64)>,
     /// Counters, exposed for the report.
     pub counters: RouterCounters,
 }
@@ -208,8 +260,8 @@ impl Router {
     #[must_use]
     pub fn new(impairment: Impairment, seed: u64) -> Self {
         Self {
-            rng: BTreeMap::new(),
             seed,
+            occurrences: BTreeMap::new(),
             impairment,
             in_flight: VecDeque::new(),
             shared_tail: Vec::new(),
@@ -218,26 +270,61 @@ impl Router {
     }
 
     /// The impairment stream for one directed link, created on first use.
-    fn link_rng(&mut self, link: LinkId) -> &mut ChaCha8Rng {
-        let seed = self.seed;
-        self.rng
-            .entry(link)
-            .or_insert_with(|| ChaCha8Rng::seed_from_u64(link.stream_seed(seed)))
+    /// The identity of the next packet offered on this link, lane and tick.
+    fn next_fate(&mut self, link: LinkId, lane: FateLane, tick: u64, payload: &[u8]) -> PacketFate {
+        self.occurrences.retain(|slot, _| slot.tick >= tick);
+        let slot = self
+            .occurrences
+            .entry(FateSlot { link, lane, tick })
+            .or_insert(0);
+        let occurrence = *slot;
+        *slot = slot.saturating_add(1);
+        PacketFate::of(link, lane, tick, payload, occurrence)
+    }
+
+    /// Whether one draw for one logical packet comes up inside `probability`.
+    ///
+    /// Stateless on purpose. A per-link *stream* is consumed in packet order,
+    /// so inserting a packet shifts the fate of every packet behind it on that
+    /// link -- which is how #692's swept margin came to fail an unrelated
+    /// boundary-thrash clause (#699): eight extra keyframes moved a later
+    /// `ShotResolved` by one retransmission interval, and the collision that
+    /// followed was real. Keying the draw on what the packet *is* means adding
+    /// traffic cannot move anyone else's fate.
+    ///
+    /// `draw` separates independent decisions about the same packet (loss from
+    /// jitter, one segment's retransmits from another's), so they do not share
+    /// a value.
+    ///
+    /// Known limit, stated rather than hidden: two byte-identical payloads on
+    /// the same link and lane in the same tick are one identity here and share
+    /// a fate. That is the price of order-independence, and it is the right
+    /// trade -- a duplicate packet arguably *should* share the original's luck,
+    /// whereas order-dependence silently corrupts every A/B comparison.
+    fn draws(&self, packet: PacketFate, draw: u64, probability: f64) -> bool {
+        if probability <= 0.0 {
+            return false;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(self.seed, packet, draw), &mut hasher);
+        // Top 53 bits give a uniform f64 in [0, 1) without rounding surprises.
+        let bits = std::hash::Hasher::finish(&hasher) >> 11;
+        #[allow(clippy::cast_precision_loss)]
+        let unit = bits as f64 / (1u64 << 53) as f64;
+        unit < probability
     }
 
     /// Decide the fate of one packet: dropped, delayed, or delivered now.
     ///
     /// Separated from the buffer plumbing so the impairment model can be tested
     /// without standing up peers.
-    fn schedule(&mut self, tick: u64, link: LinkId) -> Fate {
+    fn schedule(&mut self, tick: u64, link: LinkId, payload: &[u8]) -> Fate {
         let impairment = self.impairment;
-        if impairment.loss > 0.0 && self.link_rng(link).random_bool(impairment.loss) {
+        let packet = self.next_fate(link, FateLane::Datagram, tick, payload);
+        if self.draws(packet, DRAW_LOSS, impairment.loss) {
             return Fate::Dropped;
         }
-        if impairment.jitter_ticks > 0
-            && impairment.jitter_rate > 0.0
-            && self.link_rng(link).random_bool(impairment.jitter_rate)
-        {
+        if impairment.jitter_ticks > 0 && self.draws(packet, DRAW_JITTER, impairment.jitter_rate) {
             return Fate::Delayed(tick + u64::from(self.impairment.jitter_ticks));
         }
         Fate::Now(tick)
@@ -268,10 +355,16 @@ impl Router {
         let link = LinkId { from, to };
         let loss = self.impairment.loss;
         let jitter_rate = self.impairment.jitter_rate;
+        let packet = self.next_fate(link, FateLane::Stream, tick, &payload);
         if loss > 0.0 {
-            for _ in 0..segments {
+            for segment in 0..segments {
                 let mut attempts = 0u32;
-                while self.link_rng(link).random_bool(loss) && attempts < MAX_RETRANSMITS {
+                while self.draws(
+                    packet,
+                    DRAW_SEGMENT_BASE + segment * MAX_DRAWS_PER_SEGMENT + u64::from(attempts),
+                    loss,
+                ) && attempts < MAX_RETRANSMITS
+                {
                     attempts += 1;
                 }
                 if attempts > 0 {
@@ -285,15 +378,12 @@ impl Router {
                 }
             }
         }
-        if self.impairment.jitter_ticks > 0
-            && jitter_rate > 0.0
-            && self.link_rng(link).random_bool(jitter_rate)
-        {
+        if self.impairment.jitter_ticks > 0 && self.draws(packet, DRAW_JITTER, jitter_rate) {
             due += u64::from(self.impairment.jitter_ticks);
         }
 
         if mode == StreamMode::Shared {
-            let key = (from, to);
+            let key = link;
             let tail = self.shared_tail.iter_mut().find(|(held, _)| *held == key);
             let blocked_until = tail.as_ref().map_or(0, |(_, due)| *due);
             if blocked_until > due {
@@ -324,7 +414,7 @@ impl Router {
         payload: Bytes,
     ) -> DatagramDisposition {
         self.counters.bytes += payload.len() as u64 + DATAGRAM_OVERHEAD;
-        match self.schedule(tick, LinkId { from, to }) {
+        match self.schedule(tick, LinkId { from, to }, &payload) {
             Fate::Dropped => {
                 self.counters.dropped += 1;
                 DatagramDisposition::Dropped
