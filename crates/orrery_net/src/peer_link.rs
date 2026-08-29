@@ -40,7 +40,8 @@ use bytes::Bytes;
 use aeronet_iroh::stream::{IrohStreamIo, SendMessage};
 
 use crate::budget::{
-    datagram_wire_bytes, is_sheddable, lane_of, stream_wire_bytes, UploadBudget, UploadMeter,
+    batch_priority, datagram_wire_bytes, is_sheddable, lane_of, stream_wire_bytes, UploadBudget,
+    UploadMeter,
 };
 use crate::channels::{tag, untag, Channel};
 use crate::plugin::Peer;
@@ -214,8 +215,14 @@ pub fn send_peer_packets(
     time: Res<Time<Real>>,
 ) {
     let now = time.elapsed();
+    let mut batch = outbound.read().collect::<Vec<_>>();
+    // The backstop sees one update's messages together. Preserve arrival order
+    // within a class, but make the loss asymmetry explicit across classes:
+    // unsheddable traffic, then absolute replication anchors, then deltas.
+    batch.sort_by_key(|packet| batch_priority(packet.channel, &packet.payload));
+
     let mut over = false;
-    for packet in outbound.read() {
+    for packet in batch {
         let Some((_, mut session, streams)) =
             sessions.iter_mut().find(|(peer, ..)| peer.id == packet.to)
         else {

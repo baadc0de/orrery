@@ -40,7 +40,7 @@ use core::time::Duration;
 use bevy_ecs::prelude::*;
 
 use crate::channels::{untag, Channel, TAG_WITNESS, TAG_WITNESS_COMPRESSED};
-use orrery_protocol::NodeId;
+use orrery_protocol::{channels::TAG_REPLICATION_DELTA, NodeId};
 
 /// Per-datagram wire overhead: IP+UDP 28 B, QUIC short header + AEAD ≈ 32 B.
 ///
@@ -433,6 +433,42 @@ pub const fn is_sheddable(lane: Lane) -> bool {
     matches!(lane, Lane::Replication)
 }
 
+/// The order in which one send tick admits packets to the upload meter.
+///
+/// The backstop cannot drop control or witness traffic. Within replication,
+/// an absolute keyframe is an anchor for subsequent deltas, so it is admitted
+/// before deltas. The delta distinction is read from the packet's wire
+/// sub-tag, not supplied by the caller as a second piece of metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BatchPriority {
+    /// Control and witness packets, which are never shed.
+    Unsheddable,
+    /// Absolute replication state, including keyframes.
+    Keyframe,
+    /// A replication delta that references a keyframe.
+    Delta,
+}
+
+/// Classify a packet for admission within this update's send batch.
+///
+/// A state payload with no valid replication-delta wire sub-tag remains an
+/// absolute replication packet. In particular, omitting a sub-tag cannot
+/// reclassify state traffic as control or witness, and a caller has no
+/// caller-provided priority to lie about.
+#[must_use]
+pub(crate) fn batch_priority(channel: Channel, payload: &[u8]) -> BatchPriority {
+    if !is_sheddable(lane_of(channel, payload)) {
+        return BatchPriority::Unsheddable;
+    }
+
+    match untag(payload) {
+        Some((Channel::State, body)) if body.first() == Some(&TAG_REPLICATION_DELTA) => {
+            BatchPriority::Delta
+        }
+        _ => BatchPriority::Keyframe,
+    }
+}
+
 /// Which kind of traffic a packet carries, for accounting and shedding order.
 ///
 /// Read *off the wire* rather than declared by the sender. `Channel::State`
@@ -687,8 +723,13 @@ mod tests {
             lane_of(Channel::Control, &encode_witness(&[1u8, 2, 3])),
             Lane::Control
         );
-        // An untagged state payload is charged to replication rather than
-        // discounted: no caller gets cheaper bytes by omitting the tag.
+    }
+
+    #[test]
+    fn an_untagged_state_payload_is_still_charged_to_replication() {
+        // State traffic is replication unless its actual wire bytes positively
+        // identify it as witness traffic. Omitting the tag never makes it
+        // cheaper by moving it onto an unsheddable lane.
         assert_eq!(lane_of(Channel::State, &[]), Lane::Replication);
         assert_eq!(lane_of(Channel::State, &[0, 99, 1]), Lane::Replication);
     }
