@@ -843,6 +843,35 @@ impl Bot {
         }
     }
 
+    /// Build a peer with a current craft snapshot but no receive history.
+    ///
+    /// The late-join fixture uses this for both sides of its isolated exchange:
+    /// authorities retain their current simulated pose, while the arriving
+    /// peer starts with an empty Bevy world and replica store. Constructing a
+    /// new [`Bot`] here is the load-bearing part of that proof; copying a
+    /// long-lived bot would also copy replicas that arrived before the join.
+    pub(crate) fn from_craft_snapshot(spec: BotSpec, craft: Craft, committed_cell: CellId) -> Self {
+        let cell_edge_m = spec.cell_edge_m;
+        let mut bot = Self::new(spec);
+        let grid = grid_of(&craft.pos, cell_edge_m);
+        bot.executor
+            .insert(bot.entity, RegolithState::Craft(craft.clone()));
+        if let Some(shadow) = &mut bot.honest_shadow {
+            shadow.insert(bot.entity, RegolithState::Craft(craft));
+        }
+        let world = bot.app.world_mut();
+        let mut query = world.query_filtered::<(&mut GridPosition, &mut Cell), With<LocalPlayer>>();
+        let (mut position, mut committed) = query
+            .single_mut(world)
+            .expect("a bot has exactly one local player");
+        position.0 = grid;
+        committed.0 = committed_cell;
+        bot.current_cell = Some(committed_cell);
+        bot.previous_cell = None;
+        bot.visited = vec![committed_cell];
+        bot
+    }
+
     /// This bot's authored craft.
     #[must_use]
     pub fn craft(&self) -> &Craft {
@@ -2054,6 +2083,45 @@ mod tests {
             cheat: None,
             enforcing: false,
         })
+    }
+
+    /// A snapshot-built peer really starts with no replicas.
+    ///
+    /// The late-join clause reports `initial_replicas` and refuses to pass
+    /// when it is non-zero, but that guard reads a number this constructor
+    /// produces. Replacing the measurement with a literal `0` left the whole
+    /// suite green -- the clause was asserting on its own input rather than
+    /// on the world. The freshness has to be proved where it is created.
+    #[test]
+    fn a_snapshot_built_peer_starts_with_no_replicas() {
+        let spec = BotSpec {
+            index: 3,
+            count: 32,
+            seed: UniverseSeed([0xA1; 32]),
+            cell_edge_m: default_cell_edge_m(),
+            witnessing: false,
+            cheat: None,
+            enforcing: false,
+        };
+        let craft = Craft::spawned(
+            orrery_games::regolith::archetype::Archetype::Interceptor,
+            orrery_core::QPos::default(),
+            0,
+        );
+        let cell = cell_of(grid_of(&craft.pos, spec.cell_edge_m));
+
+        let mut fresh = Bot::from_craft_snapshot(spec, craft, cell);
+        assert_eq!(
+            fresh.replicas(),
+            0,
+            "a peer built from a craft snapshot carries no receive history; \
+             a long-lived bot would bring replicas that arrived before the join"
+        );
+        assert_eq!(
+            fresh.cell(),
+            Some(cell),
+            "and it keeps the committed cell the snapshot was taken at"
+        );
     }
 
     fn audience_entry(sender: &mut Bot, peer: NodeId) -> PeerEntry {
