@@ -32,7 +32,7 @@ use bevy_math::Vec3;
 use bevy_time::{Real, Time};
 use bytes::Bytes;
 
-use orrery_core::{tick_rng, CoreCodec, Executor, InputLogProducer, QPos};
+use orrery_core::{state_hash, tick_rng, CoreCodec, Executor, InputLogProducer, QPos};
 use orrery_games::game::{Game, Tamper};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{Order, Outcome};
@@ -252,6 +252,12 @@ pub struct Bot {
     demoted_at: Vec<(Entity, u64, f32)>,
     /// Ticks elapsed, for the pop window.
     tick: u64,
+    /// Whether this seat emits the opt-in #699 receive/decision trace.
+    ///
+    /// Selected by `P1_SWARM_AUDIENCE_TRACE_SEAT=<stable seat>`. The probe is
+    /// receiver-side only: it observes decoded replicas, delivered inputs and
+    /// cell commitments without changing manifests, audiences or send order.
+    audience_trace: bool,
     /// This bot's behavioural profile.
     pub profile: Profile,
     /// The signed log this bot authors, when witnessing is on.
@@ -914,6 +920,10 @@ impl Bot {
             last_high_rate: Vec::new(),
             demoted_at: Vec::new(),
             tick: 0,
+            audience_trace: std::env::var("P1_SWARM_AUDIENCE_TRACE_SEAT")
+                .ok()
+                .and_then(|seat| seat.parse::<usize>().ok())
+                == Some(index),
         }
     }
 
@@ -1081,6 +1091,7 @@ impl Bot {
         // D46 clause (d): deliveries from prior ticks precede this tick's
         // pilot orders. This vector is also exactly what the witness logs.
         let delivered = core::mem::take(&mut self.delivered_inbox);
+        let traced_delivered = self.audience_trace.then(|| delivered.clone());
         let mut orders: Vec<_> = delivered.iter().map(|(_, order)| order.clone()).collect();
         if std::env::var_os("ORRERY_GEOMETRY_CAPTURE").is_some() {
             self.capture_adjudication_geometry(tick, &orders);
@@ -1097,7 +1108,7 @@ impl Bot {
             &mut rng,
             &mut orders,
         );
-        if let Some(other) = self.executor.state(self.entity).and_then(|own| {
+        let collision_candidate = self.executor.state(self.entity).and_then(|own| {
             collision_candidate(
                 self.entity,
                 own,
@@ -1110,7 +1121,14 @@ impl Bot {
                             .map(|state| (*candidate, state))
                     }),
             )
-        }) {
+        });
+        if let Some(other) = collision_candidate {
+            if self.audience_trace {
+                eprintln!(
+                    "audience_trace kind=collision_candidate seat={} tick={tick} entity={} other={}",
+                    self.index, self.entity.0, other.0,
+                );
+            }
             // Detection is an untrusted input-source concern. The ruleset reads
             // the installed snapshot as a recorded frame and alone decides
             // whether this nomination can apply either body's force.
@@ -1155,6 +1173,33 @@ impl Bot {
             .executor
             .step_entity(self.entity, at, &orders)
             .expect("entity present");
+        if self.audience_trace
+            && (traced_delivered
+                .as_ref()
+                .is_some_and(|items| !items.is_empty())
+                || outcome
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Outcome::Collision { .. })))
+        {
+            let traced_state = self
+                .executor
+                .state(self.entity)
+                .expect("entity remains present");
+            let RegolithState::Craft(traced_craft) = traced_state else {
+                unreachable!("the player entity is always a craft")
+            };
+            eprintln!(
+                "audience_trace kind=canonical_step seat={} tick={tick} entity={} delivered={:?} events={:?} state_hash={:?} pos={:?} vel={:?}",
+                self.index,
+                self.entity.0,
+                traced_delivered.unwrap_or_default(),
+                outcome.events,
+                state_hash(traced_state),
+                traced_craft.pos,
+                traced_craft.vel,
+            );
+        }
         if let Some(chain) = &mut self.chain {
             chain.log_neighbor_frames(tick, &outcome.neighbor_frames);
         }
@@ -1317,8 +1362,20 @@ impl Bot {
                 self.crossings += 1;
                 // Returning to the cell committed *before* the last one is the
                 // boundary flip the hysteresis margin exists to prevent.
-                if self.previous_cell == Some(cell.0) {
+                let is_flip = self.previous_cell == Some(cell.0);
+                if is_flip {
                     self.boundary_flips += 1;
+                }
+                if self.audience_trace {
+                    eprintln!(
+                        "audience_trace kind=cell_commitment seat={} tick={} entity={} previous={:?} current={:?} next={:?} flip={is_flip}",
+                        self.index,
+                        self.tick,
+                        self.entity.0,
+                        self.previous_cell,
+                        self.current_cell,
+                        cell.0,
+                    );
                 }
                 self.previous_cell = self.current_cell;
                 self.current_cell = Some(cell.0);
@@ -1801,8 +1858,16 @@ impl Bot {
         payload: Bytes,
     ) {
         if stream.is_none() {
-            let replication = orrery_net::channels::untag(&payload)
-                .filter(|(channel, _)| *channel == Channel::State)
+            let tagged = orrery_net::channels::untag(&payload)
+                .filter(|(channel, _)| *channel == Channel::State);
+            let wire_kind = tagged.map_or("unknown", |(_, inner)| {
+                if is_delta_payload(inner) {
+                    "delta"
+                } else {
+                    "keyframe"
+                }
+            });
+            let replication = tagged
                 .and_then(|(_, inner)| decode_replica(inner, &mut self.replica_keyframes).ok());
             if let Some(replication) = replication {
                 let entity = replication.entity;
@@ -1812,6 +1877,22 @@ impl Bot {
                     .is_none_or(|authority| *authority == from);
                 if entity != self.entity && !self.authors(entity) && authority_matches {
                     if let Ok(state) = RegolithState::decode(&replication.canonical) {
+                        if self.audience_trace {
+                            let (pos, vel) = match &state {
+                                RegolithState::Craft(craft) => (Some(craft.pos), Some(craft.vel)),
+                                _ => (None, None),
+                            };
+                            eprintln!(
+                                "audience_trace kind=replica_arrival seat={} receive_tick={} sender_entity={} replica_entity={} state_tick={} wire_kind={wire_kind} cell={:?} state_hash={:?} pos={pos:?} vel={vel:?}",
+                                self.index,
+                                self.tick,
+                                from_entity.0,
+                                entity.0,
+                                replication.tick,
+                                replication.cell,
+                                state_hash(&state),
+                            );
+                        }
                         self.replica_authorities.entry(entity).or_insert(from);
                         self.executor.insert_observed(
                             entity,
@@ -1842,6 +1923,15 @@ impl Bot {
             if !sender_matches || !self.authors(delivered.recipient) {
                 self.foreign_deliveries += 1;
             } else if let Ok(order) = Order::decode(&delivered.input) {
+                if self.audience_trace && delivered.recipient == self.entity {
+                    eprintln!(
+                        "audience_trace kind=delivered_input seat={} receive_tick={} from_entity={} recipient={} order={order:?}",
+                        self.index,
+                        self.tick,
+                        delivered.from.0,
+                        delivered.recipient.0,
+                    );
+                }
                 if delivered.recipient == self.entity {
                     self.delivered_inbox.push((delivered.from, order));
                 } else {
@@ -2154,6 +2244,20 @@ impl Bot {
             .iter()
             .map(|(entity, audience)| (*entity, audience.iter().copied().collect()))
             .collect()
+    }
+
+    /// Record the coverage installed for this seat when the #699 trace is on.
+    ///
+    /// Called after the swarm has selected the cells and observes only their
+    /// count. `next_tick` is zero during island formation and otherwise the
+    /// tick after the just-completed roster-refresh boundary.
+    pub fn trace_interest_coverage(&self, cells: usize) {
+        if self.audience_trace {
+            eprintln!(
+                "audience_trace kind=interest_coverage seat={} next_tick={} cells={cells}",
+                self.index, self.tick,
+            );
+        }
     }
 
     /// Replica entities this peer holds, tagged or not.

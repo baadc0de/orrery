@@ -1793,6 +1793,7 @@ impl Swarm {
             } else {
                 bot.cell().expect("committed").neighbors27()
             };
+            bot.trace_interest_coverage(cells.len());
             if let Some(stats) = &mut self.interest_margin_stats {
                 stats.observe(cells.len());
             }
