@@ -309,6 +309,24 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     keyframe_every_sends: u64,
 
+    /// Override the send path's sustained allowance, in decimal kilobits/s.
+    ///
+    /// A20's pressure sweep changes only this meter input. The P1 criterion
+    /// remains fixed at 1 Mbps, so a failed clause is reported as a finding.
+    #[arg(long)]
+    budget_kbps: Option<u64>,
+
+    /// Feed #692's swept one-refresh-period interest cells into bot manifests.
+    ///
+    /// This is intentionally minimal harness wiring. Production host/client
+    /// propagation remains a follow-up after this run prices the feature.
+    #[arg(long)]
+    swept_interest_margin: bool,
+
+    /// Report post-meter per-(entity, link) replication delivery gaps.
+    #[arg(long)]
+    delivery_gaps: bool,
+
     /// Write the full report as JSON to this path.
     #[arg(long)]
     json: Option<String>,
@@ -794,6 +812,14 @@ fn main() -> Result<()> {
         .context("--cheat")?;
 
     let late_join_tick = args.late_join_at.map(|second| second * bot::TICK_HZ);
+    let upload_budget_bits = args
+        .budget_kbps
+        .unwrap_or(BUDGET_BITS / 1_000)
+        .checked_mul(1_000)
+        .context("--budget-kbps overflows bits/s")?;
+    if upload_budget_bits == 0 {
+        bail!("--budget-kbps must be greater than zero");
+    }
 
     let config = SwarmConfig {
         peers: args.peers,
@@ -801,6 +827,9 @@ fn main() -> Result<()> {
         cell_edge_m: cell_edge_m_for_session(args.external, args.external_peer),
         send_hz: 20,
         keyframe_every_sends: args.keyframe_every_sends.max(1),
+        upload_budget_bits,
+        swept_interest_margin: args.swept_interest_margin,
+        delivery_gap_instrumentation: args.delivery_gaps,
         impairment: if args.impaired {
             args.loss
                 .map_or_else(Impairment::p4_profile, Impairment::p4_profile_at_loss)
@@ -1179,6 +1208,17 @@ fn main() -> Result<()> {
 
     let report = swarm.run();
 
+    // Mutation guard for A20 lane 1: parsing a pressure value without replacing
+    // every bot's real resource must fail by name, not merely produce a
+    // suspiciously flat curve an operator has to notice.
+    if report.meter_budget_bits != upload_budget_bits {
+        bail!(
+            "pressure override did not reach every UploadBudget meter: requested {} bits/s, meters report {}",
+            upload_budget_bits,
+            report.meter_budget_bits,
+        );
+    }
+
     // Printed as well as serialized: a nightly log is often all that survives a
     // failed job, and a figure that cannot be traced to a seed and a commit is
     // not evidence.
@@ -1194,15 +1234,18 @@ fn main() -> Result<()> {
     );
 
     eprintln!(
-        "gates/p1-swarm: worst peak upload {} kbps (budget {} kbps), worst p99 {} kbps",
+        "gates/p1-swarm: worst peak upload {} kbps (meter {} kbps; criterion {} kbps), worst p99 {} kbps",
         report.worst_peak_upload_bits / 1_000,
+        report.meter_budget_bits / 1_000,
         BUDGET_BITS / 1_000,
         report.worst_p99_upload_bits / 1_000,
     );
     eprintln!(
-        "gates/p1-swarm: witness lane {} kbps per peer against its {} kbps share ({:.0}% of all bytes sent); \
-         replication {} kB, witness {} kB, control {} kB",
+        "gates/p1-swarm: mean lane cost per peer: replication {} kbps, witness {} kbps, control {} kbps; \
+         witness share target {} kbps ({:.0}% of all bytes sent); totals replication {} kB, witness {} kB, control {} kB",
+        report.replication_bits_per_sec / 1_000,
         report.witness_lane_bits_per_sec / 1_000,
+        report.control_bits_per_sec / 1_000,
         BUDGET_BITS * orrery_witness::plugin::WITNESS_LANE_SHARE_PCT / 100 / 1_000,
         report.witness_lane_share * 100.0,
         report.replication_bytes / 1_000,
@@ -1227,9 +1270,32 @@ fn main() -> Result<()> {
         report.deltas_discarded_while_stalled,
     );
     eprintln!(
-        "gates/p1-swarm: least-travelled peer visited {} cells; {} packets shed; link carried {} delivered / {} dropped",
-        report.min_cells_visited, report.total_shed, report.link.delivered, report.link.dropped,
+        "gates/p1-swarm: least-travelled peer visited {} cells; {} packets shed ({} keyframes, {} deltas, {} other replication); link carried {} delivered / {} dropped",
+        report.min_cells_visited,
+        report.total_shed,
+        report.shed_keyframes,
+        report.shed_deltas,
+        report.shed_replication_other,
+        report.link.delivered,
+        report.link.dropped,
     );
+    if let Some(margin) = &report.interest_margin {
+        eprintln!(
+            "gates/p1-swarm: swept interest margin installed {:.2} cells mean ({} min, {} max) across {} peer-refresh samples",
+            margin.mean_cells, margin.min_cells, margin.max_cells, margin.samples,
+        );
+    }
+    if let Some(gaps) = &report.delivery_gaps {
+        eprintln!(
+            "gates/p1-swarm: delivery gaps across {} entity-links / {} completed intervals: p50 {} ticks, p95 {}, p99 {}, max {} including trailing silence",
+            gaps.pairs.len(),
+            gaps.completed_gaps,
+            gaps.p50_gap_ticks,
+            gaps.p95_gap_ticks,
+            gaps.p99_gap_ticks,
+            gaps.max_gap_ticks,
+        );
+    }
     eprintln!(
         "gates/p1-swarm: {} boundary flips, {} proxy pops out of {} churn events",
         report.total_boundary_flips, report.total_proxy_pops, report.total_interest_churn,

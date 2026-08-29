@@ -15,6 +15,7 @@ use orrery_games::regolith::order::Outcome;
 use orrery_games::regolith::state::RegolithState;
 use orrery_games::regolith::{campaign_rock_seeds, pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
 use orrery_net::peer_link::StreamMode;
+use orrery_protocol::channels::{decode_replication, decode_replication_delta};
 use orrery_protocol::coord::PeerEntry;
 use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_TICKS};
 
@@ -92,6 +93,8 @@ struct LiveJoins {
     membership: Arc<Mutex<LiveMembership>>,
     island_seats: usize,
 }
+/// The coordinator's bulk interest refresh remains 1 Hz (#653/#692).
+const INTEREST_REFRESH_PERIOD_S: f64 = 1.0;
 
 /// The harness's modified clients: which cheat, and how many peers run it.
 ///
@@ -120,6 +123,12 @@ pub struct SwarmConfig {
     pub send_hz: u64,
     /// State-send opportunities between sender-clocked keyframes.
     pub keyframe_every_sends: u64,
+    /// Sustained upload ceiling installed in every real `UploadBudget` resource.
+    pub upload_budget_bits: u64,
+    /// Use #692's directional one-refresh-period interest coverage in manifests.
+    pub swept_interest_margin: bool,
+    /// Observe admitted per-(entity, link) replication delivery gaps.
+    pub delivery_gap_instrumentation: bool,
     /// Link conditions.
     pub impairment: Impairment,
     /// Seed for impairment and the universe.
@@ -179,6 +188,9 @@ impl Default for SwarmConfig {
             cell_edge_m: crate::bot::default_cell_edge_m(),
             send_hz: 20,
             keyframe_every_sends: 20,
+            upload_budget_bits: 1_000_000,
+            swept_interest_margin: false,
+            delivery_gap_instrumentation: false,
             impairment: Impairment::default(),
             seed: 1,
             campaign: false,
@@ -344,6 +356,62 @@ pub struct PeerReport {
     pub deltas_discarded_while_stalled: u64,
 }
 
+/// One sender/entity/recipient stream observed after the real upload meter.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryGapPairReport {
+    /// Authority transport identity.
+    pub sender: NodeId,
+    /// Canonical entity being replicated.
+    pub entity: PersistId,
+    /// Outgoing link recipient.
+    pub recipient: NodeId,
+    /// Replication messages admitted to this link.
+    pub deliveries: u64,
+    /// Largest completed gap between admitted messages, in simulation ticks.
+    pub max_inter_delivery_gap_ticks: u64,
+    /// Longest silence while this pair remained in the sender's audience.
+    /// Includes leading and closing censored intervals.
+    pub max_active_silence_ticks: u64,
+    /// Right-censored gap from the final admitted message to the run end.
+    ///
+    /// Keeping this separate prevents a governor that goes silent after one
+    /// delivery from disappearing from an inter-delivery-only statistic.
+    pub trailing_gap_ticks: u64,
+}
+
+/// Degradation-honesty evidence for the sender-side governor lanes.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryGapReport {
+    /// Sender/entity/recipient streams that were active, including streams
+    /// whose sender never admitted a message.
+    pub pairs: Vec<DeliveryGapPairReport>,
+    /// Completed inter-delivery intervals observed.
+    pub completed_gaps: u64,
+    /// Exact completed-gap distribution, keyed by simulation ticks.
+    pub completed_gap_histogram: BTreeMap<u64, u64>,
+    /// Median completed gap.
+    pub p50_gap_ticks: u64,
+    /// 95th-percentile completed gap.
+    pub p95_gap_ticks: u64,
+    /// 99th-percentile completed gap.
+    pub p99_gap_ticks: u64,
+    /// Worst completed or right-censored gap.
+    pub max_gap_ticks: u64,
+}
+
+/// Cell-set size actually installed by #692's swept-margin primitive.
+#[derive(Debug, Clone, Serialize)]
+pub struct InterestMarginReport {
+    /// Peer-refresh samples included.
+    pub samples: u64,
+    /// Smallest installed set.
+    pub min_cells: usize,
+    /// Arithmetic mean installed set size.
+    pub mean_cells: f64,
+    /// Largest installed set.
+    pub max_cells: usize,
+}
+
 /// Everything needed to reproduce a run, and to say which code produced it.
 ///
 /// Deliberately free of wall clock. The harness's whole claim is that a run is
@@ -360,6 +428,10 @@ pub struct RunIdentity {
     pub impairment: Impairment,
     /// State-send opportunities between keyframes in this run.
     pub keyframe_every_sends: u64,
+    /// Sustained ceiling installed in the send path for this run.
+    pub upload_budget_bits: u64,
+    /// Whether #692's swept interest coverage fed the roster.
+    pub swept_interest_margin: bool,
     /// Whether the four-profile witness stress mix was dealt.
     pub varied_profiles: bool,
     /// Target triple the harness was compiled for. P4's 500 hours are counted
@@ -431,6 +503,14 @@ pub struct SwarmReport {
     /// Shot/interest measurements, present only with `--shot-interest-stats`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shot_interest_stats: Option<ShotInterestReport>,
+    /// A20's post-meter degradation-honesty measurement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_gaps: Option<DeliveryGapReport>,
+    /// Actual swept-cell sizes, present only on the swept-margin leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interest_margin: Option<InterestMarginReport>,
+    /// Ceiling read back from every bot's real `UploadBudget` resource.
+    pub meter_budget_bits: u64,
     /// Highest peak upload across the swarm, bits per simulated second.
     pub worst_peak_upload_bits: u64,
     /// Highest p99 upload across the swarm.
@@ -439,6 +519,12 @@ pub struct SwarmReport {
     pub min_cells_visited: usize,
     /// Total packets shed across the swarm.
     pub total_shed: u64,
+    /// FIFO-shed replication anchors.
+    pub shed_keyframes: u64,
+    /// FIFO-shed keyframe-referenced deltas.
+    pub shed_deltas: u64,
+    /// Shed replication messages not recognized as either A19 wire form.
+    pub shed_replication_other: u64,
     /// Total boundary flips across the swarm. The criterion wants zero.
     pub total_boundary_flips: u64,
     /// Total visible proxy pops across the swarm.
@@ -539,6 +625,8 @@ pub struct SwarmReport {
     pub observation_coverage: f64,
     /// Wire bytes the swarm spent on replicated entity state.
     pub replication_bytes: u64,
+    /// Mean replication-lane cost per peer over the run.
+    pub replication_bits_per_sec: u64,
     /// Absolute keyframes offered to the send path, per recipient.
     pub keyframe_messages: u64,
     /// Keyframe-referenced deltas offered to the send path, per recipient.
@@ -556,6 +644,8 @@ pub struct SwarmReport {
     pub witness_bytes: u64,
     /// Wire bytes the swarm spent on the reliable lane, gap repairs included.
     pub control_bytes: u64,
+    /// Mean reliable-control-lane cost per peer over the run.
+    pub control_bits_per_sec: u64,
     /// The witness lane's share of everything sent, 0.0–1.0.
     ///
     /// A share of *traffic*, not of budget — informative about the mix, and not
@@ -666,6 +756,146 @@ pub struct LateJoinReport {
     pub tracked: usize,
 }
 
+#[derive(Debug, Default)]
+struct DeliveryGapPair {
+    deliveries: u64,
+    last_tick: Option<u64>,
+    active_since: u64,
+    active: bool,
+    max_inter_delivery_gap_ticks: u64,
+    max_active_silence_ticks: u64,
+}
+
+#[derive(Debug, Default)]
+struct DeliveryGapTracker {
+    pairs: BTreeMap<(NodeId, PersistId, NodeId), DeliveryGapPair>,
+    completed_gap_histogram: BTreeMap<u64, u64>,
+}
+
+impl DeliveryGapTracker {
+    fn set_active(&mut self, sender: NodeId, entity: PersistId, recipients: &[NodeId], tick: u64) {
+        for ((pair_sender, pair_entity, pair_recipient), pair) in &mut self.pairs {
+            if *pair_sender == sender
+                && *pair_entity == entity
+                && pair.active
+                && !recipients.contains(pair_recipient)
+            {
+                let since = pair.last_tick.unwrap_or(pair.active_since);
+                pair.max_active_silence_ticks = pair
+                    .max_active_silence_ticks
+                    .max(tick.saturating_sub(since));
+                pair.active = false;
+            }
+        }
+        for recipient in recipients {
+            let pair = self.pairs.entry((sender, entity, *recipient)).or_default();
+            if !pair.active {
+                pair.active = true;
+                pair.active_since = tick;
+                pair.last_tick = None;
+            }
+        }
+    }
+
+    fn observe(&mut self, sender: NodeId, entity: PersistId, recipient: NodeId, tick: u64) {
+        let pair = self.pairs.entry((sender, entity, recipient)).or_default();
+        if !pair.active {
+            // Defensive for traffic classes introduced without updating the
+            // audience snapshot seam: count the delivery, but start an active
+            // interval here rather than manufacturing a gap from tick zero.
+            pair.active = true;
+            pair.active_since = tick;
+        }
+        let since = pair.last_tick.unwrap_or(pair.active_since);
+        let gap = tick.saturating_sub(since);
+        pair.max_active_silence_ticks = pair.max_active_silence_ticks.max(gap);
+        if pair.last_tick.is_some() {
+            pair.max_inter_delivery_gap_ticks = pair.max_inter_delivery_gap_ticks.max(gap);
+            *self.completed_gap_histogram.entry(gap).or_default() += 1;
+        }
+        pair.deliveries += 1;
+        pair.last_tick = Some(tick);
+    }
+
+    fn report(self, end_tick: u64) -> DeliveryGapReport {
+        let completed_gaps = self.completed_gap_histogram.values().sum();
+        let p50_gap_ticks = histogram_percentile(&self.completed_gap_histogram, 50);
+        let p95_gap_ticks = histogram_percentile(&self.completed_gap_histogram, 95);
+        let p99_gap_ticks = histogram_percentile(&self.completed_gap_histogram, 99);
+        let pairs = self
+            .pairs
+            .into_iter()
+            .map(
+                |((sender, entity, recipient), pair)| DeliveryGapPairReport {
+                    sender,
+                    entity,
+                    recipient,
+                    deliveries: pair.deliveries,
+                    max_inter_delivery_gap_ticks: pair.max_inter_delivery_gap_ticks,
+                    max_active_silence_ticks: pair.max_active_silence_ticks,
+                    trailing_gap_ticks: if pair.active {
+                        end_tick.saturating_sub(pair.last_tick.unwrap_or(pair.active_since))
+                    } else {
+                        0
+                    },
+                },
+            )
+            .collect::<Vec<_>>();
+        let max_gap_ticks = pairs
+            .iter()
+            .map(|pair| {
+                pair.max_inter_delivery_gap_ticks
+                    .max(pair.max_active_silence_ticks)
+                    .max(pair.trailing_gap_ticks)
+            })
+            .max()
+            .unwrap_or(0);
+        DeliveryGapReport {
+            pairs,
+            completed_gaps,
+            completed_gap_histogram: self.completed_gap_histogram,
+            p50_gap_ticks,
+            p95_gap_ticks,
+            p99_gap_ticks,
+            max_gap_ticks,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct InterestMarginStats {
+    samples: u64,
+    total_cells: u64,
+    min_cells: usize,
+    max_cells: usize,
+}
+
+impl InterestMarginStats {
+    fn observe(&mut self, cells: usize) {
+        if self.samples == 0 {
+            self.min_cells = cells;
+        } else {
+            self.min_cells = self.min_cells.min(cells);
+        }
+        self.max_cells = self.max_cells.max(cells);
+        self.total_cells += cells as u64;
+        self.samples += 1;
+    }
+
+    fn report(self) -> InterestMarginReport {
+        InterestMarginReport {
+            samples: self.samples,
+            min_cells: self.min_cells,
+            mean_cells: if self.samples == 0 {
+                0.0
+            } else {
+                self.total_cells as f64 / self.samples as f64
+            },
+            max_cells: self.max_cells,
+        }
+    }
+}
+
 /// Runs the swarm and produces its report.
 pub struct Swarm {
     config: SwarmConfig,
@@ -695,6 +925,13 @@ pub struct Swarm {
     shot_interest_stats: Option<ShotInterestStats>,
     /// Directed scope from the roster most recently installed on the bots.
     shot_interest_scope: BTreeMap<(usize, usize), bool>,
+    /// A20's admitted per-(entity, link) cadence measurement.
+    delivery_gaps: Option<DeliveryGapTracker>,
+    /// Actual cell counts installed by the swept-margin load point.
+    interest_margin_stats: Option<InterestMarginStats>,
+    /// Replication messages admitted by the meter, split by A19 wire kind.
+    admitted_keyframes: u64,
+    admitted_deltas: u64,
 }
 
 /// One joined external peer, as far as the host ever knows it.
@@ -833,6 +1070,23 @@ fn scope_capture_records(roster: &[(usize, NodeId, CellId)]) -> Vec<ScopeCapture
                 })
         })
         .collect()
+}
+
+/// Classify one datagram after `send_peer_packets` admitted it to a session.
+///
+/// There are two channel envelopes here: the send path's outer tag and A19's
+/// encoded replication payload. Looking through both at this seam is what makes
+/// the shed split exact: offered minus stalled minus admitted, by wire kind.
+fn admitted_replication(payload: &[u8]) -> Option<(PersistId, bool)> {
+    let (channel, replication) = orrery_net::channels::untag(payload)?;
+    if channel != orrery_net::channels::Channel::State {
+        return None;
+    }
+    if let Some(delta) = decode_replication_delta(replication) {
+        return Some((delta.entity, true));
+    }
+    decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(replication)
+        .map(|(_, _, entity, _)| (entity, false))
 }
 
 /// Render the exact opt-in scope diagnostic bytes written by the host.
@@ -1117,6 +1371,7 @@ impl Swarm {
             .collect();
         for bot in &mut bots {
             bot.profile = crate::profile::Profile::for_index(bot.index, varied_profiles);
+            bot.set_upload_budget_bits(config.upload_budget_bits);
         }
         if config.campaign && !bots.is_empty() {
             for seeded in campaign_rock_seeds(seed, bots.len()) {
@@ -1152,6 +1407,14 @@ impl Swarm {
             docket: Docket::default(),
             shot_interest_stats: config.shot_interest_stats.then(ShotInterestStats::default),
             shot_interest_scope: BTreeMap::new(),
+            delivery_gaps: config
+                .delivery_gap_instrumentation
+                .then(DeliveryGapTracker::default),
+            interest_margin_stats: config
+                .swept_interest_margin
+                .then(InterestMarginStats::default),
+            admitted_keyframes: 0,
+            admitted_deltas: 0,
             exteriors: BTreeMap::new(),
             departed_exteriors: Vec::new(),
             live_joins: None,
@@ -1327,25 +1590,15 @@ impl Swarm {
 
     /// Wire every bot to every other: the mesh regime the criterion runs in.
     fn form_island(&mut self) {
-        let mut roster: Vec<(NodeId, CellId)> = self
-            .bots
-            .iter_mut()
-            .map(|bot| (bot.node, bot.cell().expect("seeded")))
-            .collect();
-        // The external peer is an island-mate like any other: it takes the
-        // slot's deterministic spawn pose (`with_external`), so the host knows
-        // its starting cell without asking.
-        for exterior in self.exteriors.values() {
-            roster.push((exterior.node, exterior.cell()));
-        }
+        let coverage = self.active_interest_coverage();
 
         for bot in &mut self.bots {
-            let others: Vec<PeerEntry> = roster
+            let others: Vec<PeerEntry> = coverage
                 .iter()
-                .filter(|(node, _)| *node != bot.node)
-                .map(|(node, cell)| PeerEntry {
+                .filter(|entry| entry.0 != bot.node)
+                .map(|(node, cells)| PeerEntry {
                     node: *node,
-                    cells: cell.neighbors27(),
+                    cells: cells.clone(),
                 })
                 .collect();
             for entry in &others {
@@ -1376,6 +1629,7 @@ impl Swarm {
             }
         }
         let roster = self.active_roster();
+        let coverage = self.active_interest_coverage();
         self.fold_hearsay_contacts(tick);
         let capture = if self.config.replica_scope_capture {
             scope_capture_output(tick, &roster)
@@ -1386,12 +1640,12 @@ impl Swarm {
             eprint!("{capture}");
         }
         for bot in &mut self.bots {
-            let others: Vec<PeerEntry> = roster
+            let others: Vec<PeerEntry> = coverage
                 .iter()
-                .filter(|(_, node, _)| *node != bot.node)
-                .map(|(_, node, cell)| PeerEntry {
+                .filter(|entry| entry.0 != bot.node)
+                .map(|(node, cells)| PeerEntry {
                     node: *node,
-                    cells: cell.neighbors27(),
+                    cells: cells.clone(),
                 })
                 .collect();
             bot.set_island(others);
@@ -1520,6 +1774,40 @@ impl Swarm {
         roster
     }
 
+    /// Coverage each active recipient asks senders to use for audience gating.
+    ///
+    /// The ordinary arm is byte-for-byte the old `neighbors27()` roster. The
+    /// swept arm is deliberately confined to this harness seam: #692 landed
+    /// the primitive, while production host/client propagation remains a
+    /// separate follow-up after this measurement says whether it is affordable.
+    fn active_interest_coverage(&mut self) -> Vec<(NodeId, Vec<CellId>)> {
+        let swept = self.config.swept_interest_margin;
+        // Preserve the old manifest order: bots by stable seat, followed by
+        // exteriors by stable seat. `set_island` installs links and audiences
+        // in this order, so sorting by transport identity changes simulation
+        // behaviour even when every measurement flag is off.
+        let mut coverage = Vec::with_capacity(self.total_peers());
+        for bot in &mut self.bots {
+            let cells = if swept {
+                bot.swept_interest_cells(INTEREST_REFRESH_PERIOD_S)
+            } else {
+                bot.cell().expect("committed").neighbors27()
+            };
+            if let Some(stats) = &mut self.interest_margin_stats {
+                stats.observe(cells.len());
+            }
+            coverage.push((bot.node, cells));
+        }
+        for exterior in self.exteriors.values() {
+            let cells = exterior.cell().neighbors27();
+            if let Some(stats) = &mut self.interest_margin_stats {
+                stats.observe(cells.len());
+            }
+            coverage.push((exterior.node, cells));
+        }
+        coverage
+    }
+
     /// Queue this bot's state to the island-mates whose interest covers it.
     ///
     /// **Gated by the manifest, not broadcast.** An authority sends to a peer
@@ -1535,6 +1823,12 @@ impl Swarm {
     /// the size the real thing would be rather than a guess.
     fn broadcast(&mut self, index: usize, tick: u64) {
         self.bots[index].broadcast_state(tick);
+        if let Some(gaps) = &mut self.delivery_gaps {
+            let sender = self.bots[index].node;
+            for (entity, recipients) in self.bots[index].replication_audience_snapshot() {
+                gaps.set_active(sender, entity, &recipients, tick + 1);
+            }
+        }
     }
 
     /// Drain what each bot's send path handed the IO layer into the router.
@@ -1554,9 +1848,31 @@ impl Swarm {
                 // leaves the peer's own log intact so it can still answer for
                 // itself when its witnesses come asking.
                 self.bots[index].stall();
+                if let Some(gaps) = &mut self.delivery_gaps {
+                    let sender = self.bots[index].node;
+                    for (entity, recipients) in self.bots[index].replication_audience_snapshot() {
+                        gaps.set_active(sender, entity, &recipients, tick + 1);
+                    }
+                }
                 continue;
             }
             for (to, stream, payload) in self.bots[index].drain_outbound() {
+                if stream.is_none() {
+                    if let Some((entity, is_delta)) = admitted_replication(&payload) {
+                        if is_delta {
+                            self.admitted_deltas += 1;
+                        } else {
+                            self.admitted_keyframes += 1;
+                        }
+                        if let Some(gaps) = &mut self.delivery_gaps {
+                            // Wire ticks name the post-step state as `tick + 1`.
+                            // Cached keyframes sent to a new audience carry an
+                            // older state tick, so delivery time must come from
+                            // this seam rather than from their payload.
+                            gaps.observe(node, entity, to, tick + 1);
+                        }
+                    }
+                }
                 let Some(target) = self.index_of.get(&to).copied() else {
                     self.router.counters.misaddressed += 1;
                     continue;
@@ -2330,12 +2646,45 @@ impl Swarm {
             replication_wire.keyframe_messages + replication_wire.delta_messages;
         let measured_replication_bytes =
             replication_wire.keyframe_bytes + replication_wire.delta_bytes;
+        let total_shed: u64 = per_peer.iter().map(|peer| peer.shed).sum();
+        let shed_keyframes = replication_wire
+            .keyframe_messages
+            .saturating_sub(replication_wire.keyframes_discarded_while_stalled)
+            .saturating_sub(self.admitted_keyframes);
+        let shed_deltas = replication_wire
+            .delta_messages
+            .saturating_sub(replication_wire.deltas_discarded_while_stalled)
+            .saturating_sub(self.admitted_deltas);
+        let shed_replication_other = total_shed.saturating_sub(shed_keyframes + shed_deltas);
+        let mut meter_budgets = self
+            .bots
+            .iter()
+            .map(Bot::upload_budget_bits)
+            .collect::<Vec<_>>();
+        meter_budgets.sort_unstable();
+        meter_budgets.dedup();
+        let meter_budget_bits = match meter_budgets.as_slice() {
+            [] => self.config.upload_budget_bits,
+            [budget] => *budget,
+            _ => 0,
+        };
+        let delivery_gaps = self
+            .delivery_gaps
+            .take()
+            .map(|tracker| tracker.report(ticks));
+        let interest_margin = self
+            .interest_margin_stats
+            .take()
+            .map(InterestMarginStats::report);
+        let peer_seconds = self.total_peers() as u64 * self.config.seconds.max(1);
 
         SwarmReport {
             identity: RunIdentity {
                 seed: self.config.seed,
                 impairment: self.config.impairment,
                 keyframe_every_sends: self.config.keyframe_every_sends,
+                upload_budget_bits: self.config.upload_budget_bits,
+                swept_interest_margin: self.config.swept_interest_margin,
                 varied_profiles: self
                     .config
                     .varied_profiles
@@ -2352,6 +2701,9 @@ impl Swarm {
             ticks,
             delta_stats,
             shot_interest_stats,
+            delivery_gaps,
+            interest_margin,
+            meter_budget_bits,
             worst_peak_upload_bits: per_peer
                 .iter()
                 .map(|p| p.peak_upload_bits)
@@ -2363,7 +2715,10 @@ impl Swarm {
                 .max()
                 .unwrap_or(0),
             min_cells_visited: per_peer.iter().map(|p| p.cells_visited).min().unwrap_or(0),
-            total_shed: per_peer.iter().map(|p| p.shed).sum(),
+            total_shed,
+            shed_keyframes,
+            shed_deltas,
+            shed_replication_other,
             total_boundary_flips: per_peer.iter().map(|p| p.boundary_flips).sum(),
             total_proxy_pops: per_peer.iter().map(|p| p.proxy_pops).sum(),
             total_interest_churn: per_peer.iter().map(|p| p.interest_churn).sum(),
@@ -2486,6 +2841,7 @@ impl Swarm {
                 }
             },
             replication_bytes: lanes.replication_bytes,
+            replication_bits_per_sec: lanes.replication_bytes * 8 / peer_seconds.max(1),
             keyframe_messages: replication_wire.keyframe_messages,
             delta_messages: replication_wire.delta_messages,
             keyframe_bytes: replication_wire.keyframe_bytes,
@@ -2502,11 +2858,9 @@ impl Swarm {
             },
             witness_bytes: lanes.witness_bytes,
             control_bytes: lanes.control_bytes,
+            control_bits_per_sec: lanes.control_bytes * 8 / peer_seconds.max(1),
             witness_lane_share: lanes.witness_share(),
-            witness_lane_bits_per_sec: {
-                let peer_seconds = self.total_peers() as u64 * self.config.seconds.max(1);
-                lanes.witness_bytes * 8 / peer_seconds.max(1)
-            },
+            witness_lane_bits_per_sec: { lanes.witness_bytes * 8 / peer_seconds.max(1) },
             link: self.router.counters.into(),
             per_peer,
             late_join,
@@ -2522,6 +2876,22 @@ fn percentile(sorted: &[u64], p: usize) -> u64 {
     }
     let index = (sorted.len() * p).div_ceil(100).saturating_sub(1);
     sorted[index.min(sorted.len() - 1)]
+}
+
+fn histogram_percentile(histogram: &BTreeMap<u64, u64>, p: u64) -> u64 {
+    let count: u64 = histogram.values().sum();
+    if count == 0 {
+        return 0;
+    }
+    let rank = count.saturating_mul(p).div_ceil(100).max(1);
+    let mut seen = 0u64;
+    for (value, occurrences) in histogram {
+        seen += occurrences;
+        if seen >= rank {
+            return *value;
+        }
+    }
+    histogram.last_key_value().map_or(0, |(value, _)| *value)
 }
 
 /// Why a run failed the P1 criterion (docs/11-roadmap.md §P1).
@@ -2912,6 +3282,30 @@ impl SwarmReport {
 mod tests {
     use super::*;
     use orrery_games::regolith::{archetype::Archetype, CAMPAIGN_CELL_EDGE_M};
+
+    #[test]
+    fn ordinary_interest_coverage_preserves_stable_seat_order() {
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 8,
+            swept_interest_margin: false,
+            ..SwarmConfig::default()
+        });
+        let expected = swarm.bots.iter().map(|bot| bot.node).collect::<Vec<_>>();
+
+        let actual = swarm
+            .active_interest_coverage()
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected, "flags-off manifests retain main's order");
+        let mut sorted = expected.clone();
+        sorted.sort_unstable();
+        assert_ne!(
+            expected, sorted,
+            "fixture must detect accidental transport-key sorting"
+        );
+    }
 
     #[test]
     fn transport_close_releases_only_after_the_two_second_grace() {
@@ -3345,6 +3739,8 @@ mod tests {
                 seed: 1,
                 impairment: Impairment::p4_profile(),
                 keyframe_every_sends: 20,
+                upload_budget_bits: 1_000_000,
+                swept_interest_margin: false,
                 varied_profiles: true,
                 target: "test",
                 commit: "test",
@@ -3359,10 +3755,16 @@ mod tests {
             per_peer: Vec::new(),
             delta_stats: None,
             shot_interest_stats: None,
+            delivery_gaps: None,
+            interest_margin: None,
+            meter_budget_bits: 1_000_000,
             worst_peak_upload_bits: 973_000,
             worst_p99_upload_bits: 906_000,
             min_cells_visited: 81,
             total_shed: 0,
+            shed_keyframes: 0,
+            shed_deltas: 0,
+            shed_replication_other: 0,
             total_boundary_flips: 0,
             total_proxy_pops: 0,
             total_interest_churn: 8_426,
@@ -3405,6 +3807,7 @@ mod tests {
             deferral_ledger_balances: true,
             observation_coverage: 0.96,
             replication_bytes: 0,
+            replication_bits_per_sec: 0,
             keyframe_messages: 0,
             delta_messages: 0,
             keyframe_bytes: 0,
@@ -3413,6 +3816,7 @@ mod tests {
             keyframe_byte_share: 0.0,
             witness_bytes: 0,
             control_bytes: 0,
+            control_bits_per_sec: 0,
             witness_lane_share: 0.45,
             witness_lane_bits_per_sec: 194_000,
             link: LinkReport {
@@ -3461,6 +3865,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             crate::profile::Profile::ALL,
             "the profile load could not be measured without witness traffic"
+        );
+    }
+
+    #[test]
+    fn budget_override_reaches_every_peers_real_upload_meter() {
+        let requested = 700_000;
+        let swarm = Swarm::new(SwarmConfig {
+            peers: 4,
+            upload_budget_bits: requested,
+            ..SwarmConfig::default()
+        });
+        assert!(
+            swarm
+                .bots
+                .iter()
+                .all(|bot| bot.upload_budget_bits() == requested),
+            "A20 pressure was parsed but did not reach an UploadBudget resource"
+        );
+    }
+
+    #[test]
+    fn delivery_gap_report_counts_trailing_silence() {
+        let sender = crate::bot::bot_key(0).public();
+        let recipient = crate::bot::bot_key(1).public();
+        let entity = PersistId::new(1);
+        let mut tracker = DeliveryGapTracker::default();
+        tracker.observe(sender, entity, recipient, 3);
+        tracker.observe(sender, entity, recipient, 6);
+
+        let report = tracker.report(60);
+        assert_eq!(report.completed_gap_histogram.get(&3), Some(&1));
+        assert_eq!(report.p99_gap_ticks, 3);
+        assert_eq!(report.pairs[0].trailing_gap_ticks, 54);
+        assert_eq!(
+            report.max_gap_ticks, 54,
+            "a sender that stops after one ordinary interval must not look healthy"
         );
     }
 

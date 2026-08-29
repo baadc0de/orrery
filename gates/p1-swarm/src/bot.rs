@@ -41,7 +41,7 @@ use orrery_games::regolith::weapon::WeaponKind;
 use orrery_games::regolith::{
     collision_candidate, distance_mm, firing_arc_measurement, Regolith, REGOLITH_RULESET,
 };
-use orrery_net::budget::{datagram_wire_bytes, UploadBudget, UploadMeter};
+use orrery_net::budget::{datagram_wire_bytes, Bandwidth, UploadBudget, UploadMeter};
 #[cfg(test)]
 use orrery_net::channels::encode_replication;
 use orrery_net::channels::{encode_replication_compressed, Channel};
@@ -1402,6 +1402,55 @@ impl Bot {
         rate
     }
 
+    /// Override the shipping upload meter's sustained ceiling for a pressure run.
+    ///
+    /// The averaging window is deliberately retained. A20 varies the allowance,
+    /// not the definition of "sustained", and changing both would make points on
+    /// the pressure curve incomparable.
+    pub fn set_upload_budget_bits(&mut self, bits_per_sec: u64) {
+        self.app
+            .world_mut()
+            .resource_mut::<UploadBudget>()
+            .sustained = Bandwidth::from_bits_per_sec(bits_per_sec);
+    }
+
+    /// The ceiling currently installed in this bot's real upload meter.
+    #[must_use]
+    pub fn upload_budget_bits(&self) -> u64 {
+        self.app
+            .world()
+            .resource::<UploadBudget>()
+            .sustained
+            .bits_per_sec()
+    }
+
+    /// The directional one-refresh-period interest coverage #692 added.
+    ///
+    /// This is harness-only host wiring. The production coordinator/client seam
+    /// remains a follow-up; the measurement nevertheless exercises the exact
+    /// protocol primitive with the bot's committed cell, exact offset and
+    /// canonical velocity rather than manufacturing an audience-size multiplier.
+    #[must_use]
+    pub fn swept_interest_cells(&mut self, refresh_period_s: f64) -> Vec<CellId> {
+        let cell = self.cell().expect("a bot has one committed cell");
+        let edge_m = f64::from(self.app.world().resource::<CellEdge>().0);
+        let (cell_coords, _) = cell.coords();
+        let (x, y, z) = self.craft().pos.to_metres();
+        let (vx, vy, vz) = self.craft().vel.to_metres_per_sec();
+        let minimum = glam::DVec3::new(
+            f64::from(cell_coords.x) * edge_m,
+            f64::from(cell_coords.y) * edge_m,
+            f64::from(cell_coords.z) * edge_m,
+        );
+        let offset = glam::DVec3::new(x, y, z) - minimum;
+        cell.swept_neighbors27(
+            offset,
+            glam::DVec3::new(vx, vy, vz),
+            refresh_period_s,
+            edge_m,
+        )
+    }
+
     /// How many entities are currently proxied rather than high-rate.
     #[must_use]
     pub fn proxies(&self) -> usize {
@@ -2094,6 +2143,19 @@ impl Bot {
         self.replication_wire
     }
 
+    /// Current sender-side audience per authored entity.
+    ///
+    /// Exposed only to the harness's delivery-gap observer. The returned copy
+    /// cannot affect recipient selection, which remains inside
+    /// [`Self::broadcast_state`].
+    #[must_use]
+    pub fn replication_audience_snapshot(&self) -> Vec<(PersistId, Vec<NodeId>)> {
+        self.replication_audiences
+            .iter()
+            .map(|(entity, audience)| (*entity, audience.iter().copied().collect()))
+            .collect()
+    }
+
     /// Replica entities this peer holds, tagged or not.
     #[must_use]
     pub fn replicas(&mut self) -> usize {
@@ -2253,6 +2315,34 @@ mod tests {
             fresh.cell(),
             Some(cell),
             "and it keeps the committed cell the snapshot was taken at"
+        );
+    }
+
+    #[test]
+    fn swept_interest_cells_use_the_committed_cell_offset_and_canonical_velocity() {
+        let mut bot = replication_test_bot(0);
+        let cell = bot.cell().expect("committed cell");
+        let (coords, _) = cell.coords();
+        let edge = f64::from(default_cell_edge_m());
+        let mut craft = bot.craft().clone();
+        craft.pos = QPos::from_metres(
+            f64::from(coords.x) * edge + edge - 1.0,
+            f64::from(coords.y) * edge + edge / 2.0,
+            f64::from(coords.z) * edge + edge / 2.0,
+        );
+        craft.vel = orrery_core::QVel::from_metres_per_sec(64.0, 0.0, 0.0);
+        bot.replace_craft_for_test(craft);
+
+        let baseline = cell.neighbors27();
+        let swept = bot.swept_interest_cells(1.0);
+        assert!(
+            baseline.iter().all(|candidate| swept.contains(candidate)),
+            "#692's primitive may widen but never narrow the baseline AOI"
+        );
+        assert!(
+            swept.len() > baseline.len(),
+            "a craft one metre from the positive-x boundary and moving 64 m/s \
+             must add the next neighborhood face"
         );
     }
 
