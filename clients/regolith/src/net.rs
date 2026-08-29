@@ -710,9 +710,9 @@ pub async fn remote_join<F>(
 where
     F: FnOnce(u64) -> AnchorFrame,
 {
-    // A correct lobby may hold the accept until its 90-second membership
-    // freeze. Ten seconds made the client abandon every production lobby.
-    const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(120);
+    // The host holds the reply until its lobby closes, so this waits out the
+    // lobby rather than a round trip. See `CAMPAIGN_LOBBY_HOLD`.
+    const HANDSHAKE_READ_TIMEOUT: Duration = crate::JOIN_HANDSHAKE_READ_TIMEOUT;
     let debug = std::env::var_os("REGOLITH_NET_DEBUG").is_some();
     let step = |stage: &str| {
         if debug {

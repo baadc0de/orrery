@@ -24,6 +24,10 @@ from pathlib import Path
 
 LOBBY_SECONDS = 180
 CHILD_EXIT_GRACE_SECONDS = 30
+# `CAMPAIGN_LOBBY_HOLD` in clients/regolith/src/lib.rs: the longest lobby a
+# shipped client will sit through. The host answers a join only when the lobby
+# closes, so a longer lobby is a campaign nobody can join.
+CLIENT_LOBBY_HOLD_SECONDS = 180
 
 
 def lobby_seconds(campaign_config: dict[str, str]) -> int:
@@ -31,6 +35,17 @@ def lobby_seconds(campaign_config: dict[str, str]) -> int:
     value = int(campaign_config.get("lobby_seconds", str(LOBBY_SECONDS)))
     if value < 0:
         raise ValueError("lobby_seconds must not be negative")
+    # A lobby the shipped client cannot outwait is not a slow campaign, it is a
+    # campaign nobody can join: admission accepts the seat, then every client
+    # that arrives early fails with `handshake read timed out`. That is exactly
+    # how the 180-second lobby broke the standing campaign against a client
+    # built for a 90-second freeze, so refuse it here rather than discover it
+    # from a playtester.
+    if value > CLIENT_LOBBY_HOLD_SECONDS:
+        raise ValueError(
+            f"lobby_seconds {value} exceeds {CLIENT_LOBBY_HOLD_SECONDS}, "
+            "the shipped client's join patience"
+        )
     return value
 
 
@@ -227,6 +242,16 @@ def parse_args() -> argparse.Namespace:
 
 
 class Tests(unittest.TestCase):
+    def test_a_lobby_longer_than_the_client_can_outwait_is_refused(self) -> None:
+        budget = CLIENT_LOBBY_HOLD_SECONDS
+        # The shipped default must be joinable, or the standing campaign is
+        # open to reservations nobody can complete.
+        self.assertLessEqual(LOBBY_SECONDS, budget)
+        self.assertEqual(lobby_seconds({"lobby_seconds": str(budget)}), budget)
+        with self.assertRaises(ValueError) as refused:
+            lobby_seconds({"lobby_seconds": str(budget + 1)})
+        self.assertIn("join patience", str(refused.exception))
+
     def test_command_passes_shared_journal_attempt_and_lobby_shape(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

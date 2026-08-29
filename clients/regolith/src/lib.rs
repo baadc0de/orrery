@@ -30,6 +30,30 @@ pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
 /// Public campaign-admission origin used by a no-argument volunteer launch.
 pub const DEFAULT_ADMISSION_URL: &str = "https://campaigns.distopik.com";
 
+/// The longest lobby this client will sit through before it abandons a join.
+///
+/// The host answers a join request only when its lobby closes and the initial
+/// cohort is frozen, so every client-side join bound is really a bound on the
+/// lobby, not on a round trip. Both bounds below were written against a
+/// 90-second freeze and were never revisited when the standing campaign moved
+/// to a 180-second lobby: admission accepted the seat, the client then gave up
+/// mid-lobby, and the host lost the connection at `StartV1`. Deriving them from
+/// one number is what stops that drifting apart again.
+///
+/// `lobby_seconds` in `scripts/p1-swarm-always-on.py` refuses to configure a
+/// lobby longer than this, so a control-file edit cannot outrun shipped clients.
+pub const CAMPAIGN_LOBBY_HOLD: Duration = Duration::from_secs(180);
+
+/// Lobby hold plus the slack a join needs around it: the handshake read waits
+/// out the lobby, and the outer deadline additionally covers dial and bind.
+pub const JOIN_HANDSHAKE_READ_TIMEOUT: Duration =
+    CAMPAIGN_LOBBY_HOLD.saturating_add(Duration::from_secs(30));
+/// The whole join attempt's bound, which must outlast the handshake read so a
+/// lobby that never closes is reported as the handshake timing out, not as an
+/// unattributed dial failure.
+pub const JOIN_DEADLINE: Duration =
+    JOIN_HANDSHAKE_READ_TIMEOUT.saturating_add(Duration::from_secs(30));
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

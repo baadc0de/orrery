@@ -110,9 +110,9 @@ const WITNESS_FRAME_TICKS: u16 = 10;
 const MAX_WITNESS_LINKS: usize = 7;
 
 /// How long the dial may take before the join attempt is declared failed.
-/// The handshake may wait through the host's 90-second lobby; this adds dial
-/// and bind slack around that inner bound.
-const JOIN_DEADLINE_SECS: u64 = 125;
+/// The handshake waits out the host's lobby; this adds dial and bind slack
+/// around that inner bound. See `CAMPAIGN_LOBBY_HOLD`.
+const JOIN_DEADLINE_SECS: u64 = crate::JOIN_DEADLINE.as_secs();
 
 /// Launch material for a joined campaign session.
 ///
