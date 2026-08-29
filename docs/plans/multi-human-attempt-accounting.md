@@ -157,8 +157,8 @@ with all four of these holding:
 ### The non-constant denominator, stated rather than assumed
 
 A human seated for part of an attempt makes the per-attempt denominator
-non-constant. That is not a rounding concern; it is the ordinary case for a
-one-hour attempt with a 90-second lobby and no post-start rejoin. **Per-slot
+non-constant. That is not a rounding concern; it is the ordinary case when
+players may join or leave throughout a one-hour attempt. **Per-session
 connected spans are the answer**, and this contract makes them a refusal rather
 than a comment:
 

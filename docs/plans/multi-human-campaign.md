@@ -1,7 +1,8 @@
-# Multi-human campaign proposal (#563)
+# Multi-human campaign proposal (#563), amended by join-while-running (#681)
 
-Status: design proposal only. This document proposes an implementation shape; it
-does not accept an ADR, amend an accepted record, or authorize deployment.
+Status: the original proposal remains design history; #681 reverses its
+lobby-only product decision. This document does not accept or amend an ADR and
+does not authorize deployment.
 
 ## 1. Recommendation
 
@@ -11,27 +12,25 @@ Build one bounded, cohort-started campaign attempt with exactly eight seat ids:
 island_seats = 8
 human_seats  = 4                 # slots 4, 5, 6, 7
 bot_seats    = island_seats - human_seats = 4   # slots 0, 1, 2, 3
-lobby        = 90 s from the first reservation, or until all 4 humans connect
+lobby        = 90 s from the first authenticated arrival, or until all 4 humans connect
 run          = 3,600 s after Start
 restart      = 5 s after the attempt exits
 ```
 
-Humans join one standing host during the lobby. At lobby close the host freezes
-the active membership, sends one `StartV1` manifest to every connected human,
-collects their tick-zero witness anchors, and runs the ordinary real-time swarm
-for one hour. A human slot which is not occupied at `StartV1` remains empty for
-that attempt; a slot which disconnects after `StartV1` becomes vacant and is not
-reused until the next attempt.
+Humans may join one standing host whenever a human seat is unbound. The lobby
+duration only forms the initial cohort: its clock starts after the first
+authenticated arrival, a full cohort starts immediately, and an empty host
+waits indefinitely. Each join receives a `StartV1` membership snapshot at the
+host's current tick. Existing clients receive the same current-tick shape when
+membership changes, so outbound replication and witness recipients follow the
+live set in both directions.
 
-This is deliberately not hot join. The present exterior attaches before
-`Swarm::run`, island formation and witness seeding happen before tick zero, and
-the client has no authoritative snapshot plus witness-chain continuation with
-which to enter at tick N (`gates/p1-swarm/src/swarm.rs:779-783`,
-`gates/p1-swarm/src/swarm.rs:1067-1084`,
-`gates/p1-swarm/src/swarm.rs:1220-1309`). Calling a second socket "late join"
-without those operations would create a craft whose state and evidence history
-the other peers cannot establish. A 90-second lobby buys actual same-world play
-now without silently inventing that protocol.
+An unbound slot has no pre-join simulation history. The joining client adopts
+the manifest tick and its slot's deterministic spawn snapshot, signs an
+epoch-zero anchor at that tick, and continues the same input-log chain locally.
+Host bot witnesses arm from that claim and state. This uses the existing
+`StartV1.tick` field and Meta lane; #681 changes semantics but adds no wire
+field, frame, protocol crate type, ALPN, or ruleset behavior.
 
 The eight-seat ceiling is a campaign invariant, not a claim that every attempt
 contains eight live peers. D6 puts populations through eight in the full-mesh
@@ -201,12 +200,14 @@ EMPTY
 RESERVED -- 45 s without authenticated dial --> EMPTY
   | QUIC NodeId + token + sid match reservation
   v
-CONNECTED_LOBBY -- clean disconnect before Start --> RESERVED (15 s grace)
-  | same sid+node redials                         --> CONNECTED_LOBBY
-  | grace expires                                --> EMPTY
+CONNECTED -- explicit goodbye ---------------------> EMPTY
+  | transport reports close; two-second grace       --> EMPTY
   | StartV1
   v
-ACTIVE -- disconnect --> VACANT
+ACTIVE -- explicit goodbye / close grace --> EMPTY
+  | another reservation may bind the same slot
+  v
+ACTIVE under a new session
   | attempt ends
   v
 EMPTY in the next generation
@@ -223,15 +224,11 @@ the opposite order from two HTTP replies.
 repeat before `StartV1` returns the same session id and slot and may mint a fresh
 token for the already-recorded account; it must not append a second invite-ledger
 allocation. A different NodeId cannot claim that reservation. After `StartV1`,
-the same request gets `409 session_started` with the next-attempt ETA.
-
-After start there is no slot reuse and no rejoin in this first implementation.
-That is a correctness rule, not punishment: replacing a NodeId at one entity id
-would splice authority and signed witness chains, while restoring the same human
-needs a tick-N snapshot and continuation anchor that do not exist. A disconnected
-craft ages out visually under the existing 120-tick replica TTL
-(`clients/regolith/src/campaign.rs:74-92`); the host drops later traffic to the
-vacant slot and counts it as `inactive_recipient` rather than misrouting it.
+new requests remain admissible while any human slot is unbound. Each new
+session begins a distinct authority and witness chain at the current host tick;
+it does not splice or continue the departed session's chain. Existing clients
+remove the departing entity when the live manifest omits it and may install the
+new session's later keyframe under that stable seat entity.
 
 ### 4.3 Roster is a complete seat map
 
@@ -409,8 +406,8 @@ contribution based on that attempt; those are properties of the shared evidence
 | Two admission requests race for the last seat | Host-side reservation transaction gives one seat; loser gets `409 campaign_full`. |
 | Admission dies after mint but before reserve reply | Retry by NodeId returns the persisted reservation and same session; no second ledger allocation. |
 | Reservation never dials | Host expires it after 45 s and returns the slot to the lobby free-list. |
-| Human disconnects in lobby | Same sid/node gets 15 s to redial; then the seat becomes empty and may be reassigned before start. |
-| Human disconnects after start | Seat becomes vacant, roster label clears, no reuse or rejoin; that human interval ends. |
+| Human sends explicit goodbye | Host releases and atomically republishes the seat immediately; admission may reassign it. |
+| QUIC reports the transport closed | Host preserves the binding for a two-second grace, then releases it. No application-frame silence timer exists. |
 | Human sends to an empty/vacant slot | Host drops and counts `inactive_recipient`; it never indexes a bot vector with that slot. |
 | One exterior queue fills | Count a failure for that exterior; do not block the synchronous tick or other connections. Existing one-slot behavior already counts full downlink queues (`gates/p1-swarm/src/swarm.rs:565-580`). |
 | One pump dies | Mark that link dead only. Do not clear a shared liveness flag or end other links. |
@@ -533,27 +530,14 @@ become architecture rather than campaign policy: eight seats permanently fixed
 for all games; lobby-only membership as a product rule; or the P1 harness
 becoming a production island host. This proposal makes none of those decisions.
 
-## 12. Strongest argument against
+## 12. Reversal implemented by #681
 
-The proposal optimizes for a correct cohort this week by rejecting hot join and
-post-start rejoin. That means "always on" still does not mean "join friends at
-any moment": a late friend can wait almost an hour, and one Wi-Fi drop can exile
-a player from the rest of the fight. A real multiplayer host would install a
-tick-N snapshot, transfer current witness heads, reissue an active manifest and
-resume the same identity; building that now would produce the durable shape
-instead of a lobby-shaped intermediate.
-
-That objection is strong because pieces 2, 3 and 6 already pay for a protocol
-revision and active manifest. The incremental cost of hot join may look smaller
-while those files are open. It is not small in correctness terms: the current
-late-join check only tests neighborhood visibility by selecting an existing bot,
-not by adding a process or evidence chain (`gates/p1-swarm/src/swarm.rs:1317-1320`),
-and current witness anchors are tick-zero claims collected before anyone steps
-(`gates/p1-swarm/src/swarm.rs:1241-1268`). Without a specified continuation
-proof, hot join would be the most consequential part and the least tested part.
-For the stated one-week goal, a visible 90-second appointment and one-hour game
-is the honest trade. The design should be rejected if the owner's actual
-requirement is drop-in/drop-out play rather than planned play with friends.
+The owner chose drop-in/drop-out play over the lobby-shaped intermediate. The
+guarded proof is now an ignored multi-process integration test which joins a
+process after the run starts, observes its host-authored binding, closes it,
+observes the atomic release, and binds that same slot under a second session.
+The client transport fixture separately proves a tick-900 join authors a
+tick-900 signed anchor and continues sending witness claims from it.
 
 ## 13. Findings and items not verified
 

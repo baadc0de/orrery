@@ -421,11 +421,11 @@ pub enum JoinReply {
     /// Reservation-bound join (#574) makes the *reply* the authority on which
     /// seat this client holds, rather than the client deriving one and
     /// insisting the host agrees. A reply that also carries a `StartV1`
-    /// manifest states the frozen membership of the attempt as well.
+    /// manifest states the current membership of the attempt as well.
     Accept {
         /// The swarm slot assigned to this peer.
         index: usize,
-        /// The frozen active membership, when the host sends one. `None` from
+        /// The current active membership, when the host sends one. `None` from
         /// every host older than #574, whose accept is the bare index.
         manifest: Option<crate::lobby::StartManifest>,
     },
@@ -436,7 +436,7 @@ pub enum JoinReply {
     },
 }
 
-/// The signed tick-zero claim and canonical state sent after join acceptance.
+/// The signed join-tick claim and canonical state sent after join acceptance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorFrame {
     /// JSON-encoded [`orrery_protocol::StateClaim`].
@@ -654,15 +654,16 @@ impl CampaignLink {
 
 /// Dials the host and runs the client half of slice 1's handshake.
 ///
-/// `anchor` is the caller-authored tick-zero commitment. `None` retains #387's
-/// explicit empty-anchor convention for clients that legitimately have no log.
+/// `anchor` authors the joining commitment after `StartV1` has been accepted,
+/// at the tick it names. `None` retains the explicit empty-anchor convention
+/// for clients that legitimately have no log.
 ///
 /// `expect` is everything the caller already spent on that anchor: the seat
 /// admission reserved, the entity spawned into it, this client's transport
 /// identity and the island size the spawn pose was computed against. When the
 /// host sends a `StartV1` manifest it is checked against all of it and
 /// **adopted**; when it disagrees the join is refused rather than repaired,
-/// because the tick-zero claim is already signed and a session played against
+/// because the join-tick claim is already signed and a session played against
 /// a manifest the client does not match is evidence nobody can reconcile.
 ///
 /// A host that sends no manifest — every host older than #574 — still has its
@@ -676,13 +677,16 @@ impl CampaignLink {
 /// A rendered string for every refusal: dial failure, handshake timeout or
 /// truncation, reject reply, slot mismatch, manifest mismatch, stream setup
 /// failure.
-pub async fn remote_join(
+pub async fn remote_join<F>(
     endpoint: &iroh::Endpoint,
     address: iroh::EndpointAddr,
     request: &JoinRequest,
     expect: &crate::lobby::StartExpectation,
-    anchor: Option<AnchorFrame>,
-) -> Result<(CampaignLink, Option<crate::lobby::AcceptedStart>), String> {
+    anchor: Option<F>,
+) -> Result<(CampaignLink, Option<crate::lobby::AcceptedStart>), String>
+where
+    F: FnOnce(u64) -> AnchorFrame,
+{
     // A correct lobby may hold the accept until its 90-second membership
     // freeze. Ten seconds made the client abandon every production lobby.
     const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -740,11 +744,13 @@ pub async fn remote_join(
     // Two separately framed messages, exactly as the headless producer ships:
     // signed claim first, then the canonical state it commits to. The empty
     // pair remains an explicit, supported unanchored join.
+    let anchor_tick = accepted_start.as_ref().map_or(0, |start| start.tick);
+    let anchor = anchor.map(|author| author(anchor_tick));
     let (claim, state) = anchor.as_ref().map_or((&[][..], &[][..]), |anchor| {
         (anchor.claim_json.as_slice(), anchor.state.as_slice())
     });
     step(if anchor.is_some() {
-        "tick-zero witness anchor"
+        "join-tick witness anchor"
     } else {
         "empty anchor pair"
     });
@@ -1177,7 +1183,7 @@ mod tests {
         assert_eq!(JoinReply::decode(&[0, 1, 2]), Err("accept truncated"));
     }
 
-    /// Reservation-bound join: the accept is where the frozen membership
+    /// Reservation-bound join: the accept is where the current membership
     /// arrives, and the client takes it from the reply rather than deriving
     /// one. Trailing bytes that are not a manifest are a broken reply, not a
     /// manifest to ignore — ignoring one would leave the client playing with

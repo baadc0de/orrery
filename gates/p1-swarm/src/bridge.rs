@@ -26,7 +26,7 @@
 //! # Handshake order
 //!
 //! The remote opens the first bidirectional stream and drives it: join
-//! request, then — when the run witnesses — its tick-zero anchor. The host
+//! request, then — when the run witnesses — its anchor at the manifest tick. The host
 //! answers with the accept between the two reads. Only after that does either
 //! side start pumping frames, so "the slot exists" and "the slot carries
 //! traffic" cannot be reordered.
@@ -265,6 +265,7 @@ pub struct PendingJoin {
     recv: RecvStream,
     remote: NodeId,
     index: usize,
+    session_id: Option<String>,
 }
 
 impl PendingJoin {
@@ -278,6 +279,12 @@ impl PendingJoin {
     #[must_use]
     pub const fn remote(&self) -> NodeId {
         self.remote
+    }
+
+    /// Admission session whose reservation authorized this connection.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Send a named lobby refusal before dropping the pending connection.
@@ -295,13 +302,14 @@ impl PendingJoin {
         bail!("join refused: {reason}")
     }
 
-    /// Freeze this accepted seat, send its personalized `StartV1`, receive its
-    /// already-authored anchor, and arm the data pumps.
+    /// Bind this accepted seat, send its personalized current `StartV1`,
+    /// receive its join-tick anchor, and arm the data pumps.
     pub async fn finish(
         mut self,
         manifest: Option<StartManifest>,
         wants_anchor: bool,
     ) -> Result<(HostLink, Option<AnchorFrame>, NodeId, usize)> {
+        let anchor_tick = manifest.as_ref().map_or(0, |start| start.tick);
         write_message(
             &mut self.send,
             &JoinReply::Accept {
@@ -325,7 +333,7 @@ impl PendingJoin {
                     claim_json: claim,
                     state,
                 };
-                verify_join_anchor(&frame, self.remote, self.index)?;
+                verify_join_anchor(&frame, self.remote, self.index, anchor_tick)?;
                 Some(frame)
             }
         } else {
@@ -464,6 +472,7 @@ pub async fn host_prepare(
         recv,
         remote,
         index,
+        session_id: request.session_id,
     })
 }
 
@@ -487,7 +496,12 @@ pub async fn host_accept(
 }
 
 /// Verify the signed commitment before the caller can seat the exterior slot.
-fn verify_join_anchor(anchor: &AnchorFrame, subject: NodeId, index: usize) -> Result<()> {
+fn verify_join_anchor(
+    anchor: &AnchorFrame,
+    subject: NodeId,
+    index: usize,
+    expected_tick: u64,
+) -> Result<()> {
     let claim: StateClaim = serde_json::from_slice(&anchor.claim_json)
         .context("witness anchor claim did not decode")?;
     let state =
@@ -500,8 +514,8 @@ fn verify_join_anchor(anchor: &AnchorFrame, subject: NodeId, index: usize) -> Re
             expected_entity
         );
     }
-    if claim.tick != Tick::new(0) || claim.chain_epoch != 0 {
-        bail!("witness anchor is not the slot's tick-zero epoch-zero claim");
+    if claim.tick != Tick::new(expected_tick) || claim.chain_epoch != 0 {
+        bail!("witness anchor is not the slot's tick-{expected_tick} epoch-zero claim");
     }
     if claim.ruleset != REGOLITH_RULESET {
         bail!("witness anchor names a different ruleset");
@@ -509,7 +523,7 @@ fn verify_join_anchor(anchor: &AnchorFrame, subject: NodeId, index: usize) -> Re
     orrery_core::log::verify_claim(&claim, subject)
         .context("witness anchor signature does not verify for the joined node")?;
     if orrery_core::state_hash(&state) != claim.state_hash {
-        bail!("witness anchor state does not match its signed tick-zero hash");
+        bail!("witness anchor state does not match its signed join-tick hash");
     }
     Ok(())
 }
@@ -1045,10 +1059,10 @@ mod tests {
         let error = host_task
             .await
             .expect("accept task")
-            .expect_err("mismatched tick-zero state must not seat")
+            .expect_err("mismatched join-tick state must not seat")
             .to_string();
         assert!(
-            error.contains("state does not match its signed tick-zero hash"),
+            error.contains("state does not match its signed join-tick hash"),
             "named state-hash refusal, got: {error}"
         );
     }

@@ -2,8 +2,9 @@
 
 This is a deployment runbook, not an instruction to deploy from this change.
 The unit runs a sequence of ordinary `p1-swarm --external-peer` processes.
-The harness offers the campaign's configured human-seat count during a lobby,
-then each attempt still ends after `seconds`; trying to make one process host
+The harness offers the campaign's configured human-seat count for the entire
+run, with an initial cohort delay before simulation starts. Each attempt still
+ends after `seconds`; trying to make one process host
 indefinitely would contradict that interface. The supervisor waits for the
 child, preserving no child process or socket across a restart, then starts the
 next attempt after five seconds. Its reports are stored in a new
@@ -65,17 +66,28 @@ uses the same `always_on` flag: it mints the ordinary token bound to the
 client's transport key, reads that listening record from the co-located host
 state, and returns it instead of launching a second harness. For a multi-human
 campaign, admission reads the supervisor-written `attempt.json` in that same
-directory and uses its generation and `expires_at` as the reservation lease:
-the short allocation lock assigns the earliest free human slot, and all leases
-expire together at the attempt boundary. `expires_at` covers the 90-second
-lobby plus `seconds`. While a lobby remains empty, the harness keeps its bound
-endpoint and reopens another lobby window; the supervisor advances `started`
-and `expires_at` only while that generation has no reservations. Configure the
+directory and uses its generation to reject stale rows. The short allocation
+lock assigns the earliest free human slot. An unbound reservation has a 45
+second arrival lease; a bound seat remains live until the host republishes its
+release. `expires_at` covers the configured initial delay plus `seconds` and is
+the supervisor's child-process boundary, not every reservation's lease. While
+the host remains empty it keeps its bound endpoint; the supervisor advances
+`started` and `expires_at` without changing generation. Configure the
 friends campaign so `peers + humans = 8`; human seats extend the bot count,
-rather than consuming it. The first 90 seconds are the lobby. A full lobby starts immediately; at
-the deadline the host sends the same frozen `StartV1` active roster to every
-connected human. After that membership is frozen until the next attempt: a
-seat that was empty at Start remains empty, and a vacated seat is not reused.
+rather than consuming it. The configured lobby duration begins at the first
+authenticated arrival and only delays the initial start; a full initial cohort
+starts immediately. Admission keeps the released-client-compatible state
+`open` while the run has an unbound seat. The host sends a current-tick
+`StartV1` snapshot to a late joiner and republishes `StartV1` to existing
+clients whenever a player joins or leaves.
+
+`active-seats.json` is the host-authored liveness boundary. It is replaced
+atomically (temporary file, fsync, rename, directory fsync) on every bind and
+unbind and retains the supervisor's `attempt_id`. Admission fails capacity
+closed when that generation mismatches or the file is malformed. An explicit
+goodbye releases immediately; a transport-reported close releases after two
+seconds. There is deliberately no application-frame silence timeout: QUIC's
+close and idle handling remain responsible for broken links.
 
 A restart ends the in-progress client session.  The client must rejoin after
 the next listening record appears; the partial report is retained but is not a

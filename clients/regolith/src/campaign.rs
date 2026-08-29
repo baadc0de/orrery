@@ -182,7 +182,7 @@ impl CampaignConfig {
     }
 
     /// What the host's `StartV1` manifest must agree with before this client
-    /// will play. Every field is already spent on the tick-zero anchor.
+    /// will play. Every field is spent on the join-tick anchor.
     #[must_use]
     pub fn start_expectation(&self) -> crate::lobby::StartExpectation {
         crate::lobby::StartExpectation {
@@ -431,8 +431,8 @@ pub struct CampaignRuntime {
     link: Option<Arc<CampaignLink>>,
     pending_join: PendingJoin,
     net: Option<NetGuard>,
-    /// The host's frozen membership, once it has been checked against what
-    /// this client already anchored. `None` against a host that sends no
+    /// The host's latest membership, once checked against what this client
+    /// anchored. `None` against a host that sends no
     /// manifest, which is every host until #574 lands.
     start: Option<crate::lobby::AcceptedStart>,
 
@@ -443,6 +443,8 @@ pub struct CampaignRuntime {
     cell_edge_m: f64,
 
     tick: Tick,
+    /// Number of ticks this process actually drove, independent of join tick.
+    ticks_driven: u64,
     started_at: Instant,
     uplink_sequence: u64,
     uplink_sent: u64,
@@ -502,6 +504,8 @@ enum MetaFrame {
     Ack(UplinkAck),
     /// A host hearsay fold (#608).
     Hearsay(HearsayContacts),
+    /// Host-authored live membership, using the existing StartV1 shape.
+    Membership(crate::lobby::StartManifest),
     /// Some other member of the Meta grammar, not ours to interpret.
     Ignored,
 }
@@ -513,6 +517,8 @@ fn classify_meta(payload: &[u8]) -> MetaFrame {
         MetaFrame::Ack(ack)
     } else if let Some(contacts) = HearsayContacts::decode(payload) {
         MetaFrame::Hearsay(contacts)
+    } else if let Ok(manifest) = crate::lobby::StartManifest::decode(payload) {
+        MetaFrame::Membership(manifest)
     } else {
         MetaFrame::Ignored
     }
@@ -543,7 +549,7 @@ impl CampaignRuntime {
         let mut executor = Executor::new(game, seed);
         let entity = PersistId::new(config.slot as u64 + 1);
         // The exterior is the last participant in the host's crowd. Its
-        // signed tick-zero state must use the same campaign pose as the host's
+        // signed join snapshot must use the same campaign pose as the host's
         // headless peers; the compact scenario ring is a different world and
         // leaves every host-owned target kilometres outside weapon reach.
         let (pos, yaw_urad) = campaign_spawn_pose(config.slot, usize::from(config.island_seats()));
@@ -556,7 +562,7 @@ impl CampaignRuntime {
             )),
         );
         let pipeline = IntentPipeline::new(seed, entity, config.slot as u64, Vec::new());
-        let mut witness_log = InputLogProducer::new(
+        let witness_log = InputLogProducer::new(
             config.transport_secret.clone(),
             entity,
             REGOLITH_RULESET,
@@ -565,11 +571,6 @@ impl CampaignRuntime {
             WITNESS_FRAME_TICKS,
         );
         let anchor_state = executor.state(entity).expect("spawn inserted").clone();
-        let anchor_claim = witness_log.anchor(0, &anchor_state);
-        let anchor = net::AnchorFrame {
-            claim_json: serde_json::to_vec(&anchor_claim).expect("StateClaim serializes"),
-            state: anchor_state.to_canonical(),
-        };
         let campaign = CampaignSession::new(
             config.session_id.clone(),
             config.wall_start_utc.clone(),
@@ -618,7 +619,8 @@ impl CampaignRuntime {
             let transport_secret = config.transport_secret.clone();
             let client_rev = crate::BUILD_REV.to_owned();
             let session_id = config.session_id.clone();
-            let anchor = anchor.clone();
+            let anchor_secret = transport_secret.clone();
+            let anchor_state = anchor_state.clone();
             // A malformed token hex is a named join failure, not a silently
             // tokenless join the host would refuse with a confusing reason.
             let token = match config.session_token_hex.as_deref().map(decode_hex) {
@@ -642,7 +644,28 @@ impl CampaignRuntime {
                         let deadline = std::time::Duration::from_secs(JOIN_DEADLINE_SECS);
                         let (link, start) = tokio::time::timeout(
                             deadline,
-                            net::remote_join(&endpoint, addr, &request, &expectation, Some(anchor)),
+                            net::remote_join(
+                                &endpoint,
+                                addr,
+                                &request,
+                                &expectation,
+                                Some(move |tick| {
+                                    let mut log = InputLogProducer::new(
+                                        anchor_secret,
+                                        entity,
+                                        REGOLITH_RULESET,
+                                        tick,
+                                        CLAIM_EVERY_TICKS,
+                                        WITNESS_FRAME_TICKS,
+                                    );
+                                    let claim = log.anchor(tick, &anchor_state);
+                                    net::AnchorFrame {
+                                        claim_json: serde_json::to_vec(&claim)
+                                            .expect("StateClaim serializes"),
+                                        state: anchor_state.to_canonical(),
+                                    }
+                                }),
+                            ),
                         )
                         .await
                         .map_err(|_| format!("the join did not complete within {deadline:?}"))??;
@@ -687,6 +710,7 @@ impl CampaignRuntime {
             launched_at,
             cell_edge_m: CAMPAIGN_CELL_EDGE_M,
             tick: Tick::new(0),
+            ticks_driven: 0,
             started_at: Instant::now(),
             uplink_sequence: 0,
             uplink_sent: 0,
@@ -747,6 +771,26 @@ impl CampaignRuntime {
                         start.witness_recipients
                     );
                 }
+                let join_tick = start.as_ref().map_or(0, |start| start.tick);
+                self.tick = Tick::new(join_tick);
+                self.witness_log = InputLogProducer::new(
+                    self.config.transport_secret.clone(),
+                    self.entity,
+                    REGOLITH_RULESET,
+                    join_tick,
+                    CLAIM_EVERY_TICKS,
+                    WITNESS_FRAME_TICKS,
+                );
+                let state = self
+                    .executor
+                    .state(self.entity)
+                    .expect("joining entity remains installed")
+                    .clone();
+                // Reproduce the exact signed anchor sent after StartV1. The
+                // network thread could not hand its mutable producer across;
+                // Ed25519 signing is deterministic, so this producer begins
+                // from the same claim hash and continues that witnessed chain.
+                let _ = self.witness_log.anchor(join_tick, &state);
                 self.start = start;
                 self.link = Some(link);
                 self.state = JoinState::Joined;
@@ -785,7 +829,7 @@ impl CampaignRuntime {
     /// ticks. Zero until [`JoinState::Joined`].
     #[must_use]
     pub fn joined_ticks(&self) -> u64 {
-        self.tick.0
+        self.ticks_driven
     }
 
     /// Launch material, including the configured profile shown *beside* the
@@ -795,7 +839,7 @@ impl CampaignRuntime {
         &self.config
     }
 
-    /// The host's frozen membership, when it sent one.
+    /// The host's most recently accepted membership snapshot.
     #[must_use]
     pub fn accepted_start(&self) -> Option<&crate::lobby::AcceptedStart> {
         self.start.as_ref()
@@ -1182,6 +1226,12 @@ impl CampaignRuntime {
                         );
                     }
                     MetaFrame::Hearsay(contacts) => self.hearsay.accept(contacts, tick.0),
+                    MetaFrame::Membership(manifest) => {
+                        if let Err(reason) = self.adopt_live_membership(&manifest) {
+                            bevy::log::error!("campaign: refusing live membership: {reason}");
+                            self.state = JoinState::Failed(reason);
+                        }
+                    }
                     // Anything else on meta is not ours to interpret.
                     MetaFrame::Ignored => {}
                 },
@@ -1337,6 +1387,7 @@ impl CampaignRuntime {
         // ── The accumulator, fed by reality ───────────────────────────────
         self.campaign.observe_tick(intents);
         self.tick = Tick::new(tick.0.saturating_add(1));
+        self.ticks_driven = self.ticks_driven.saturating_add(1);
         report
     }
 
@@ -1378,6 +1429,49 @@ impl CampaignRuntime {
                 self.uplink_shed += 1;
             }
         }
+    }
+
+    fn adopt_live_membership(
+        &mut self,
+        manifest: &crate::lobby::StartManifest,
+    ) -> Result<(), String> {
+        let accepted = crate::lobby::accept_start(manifest, &self.config.start_expectation())
+            .map_err(|mismatch| mismatch.player_sentence())?;
+        if let Some(current) = &self.start {
+            if accepted.attempt_id != current.attempt_id {
+                return Err("the host changed attempt generation on a live connection".to_owned());
+            }
+            if accepted.island_seats != current.island_seats
+                || accepted.duration_ticks != current.duration_ticks
+            {
+                return Err("the host changed the live attempt shape".to_owned());
+            }
+            if accepted.tick < current.tick {
+                return Err("the host sent an older membership snapshot".to_owned());
+            }
+            let departed = current
+                .active_slots
+                .iter()
+                .copied()
+                .filter(|slot| !accepted.active_slots.contains(slot))
+                .collect::<Vec<_>>();
+            for slot in departed {
+                let entity = PersistId::new(slot as u64 + 1);
+                if entity != self.entity {
+                    self.executor.take_state(entity);
+                }
+                self.replica_freshness.remove(&entity);
+                self.replica_keyframes.remove(&entity);
+                self.settled_broadcast_recipients.remove(&slot);
+                self.pending_broadcast_recipients
+                    .retain(|_, recipient| *recipient != slot);
+                if self.focus == Some(entity) {
+                    self.focus = None;
+                }
+            }
+        }
+        self.start = Some(accepted);
+        Ok(())
     }
 
     /// Route a ruleset-produced delivery without ever applying foreign state
@@ -1989,6 +2083,7 @@ mod tests {
         let start = crate::lobby::AcceptedStart {
             attempt_id: "attempt-601".to_owned(),
             island_seats: 8,
+            tick: 0,
             active_slots: vec![0, 1, 2, 3, 4, 5, 6, 7],
             witness_recipients: Vec::new(),
             duration_ticks: 216_000,
@@ -2005,6 +2100,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn live_membership_adds_and_removes_outbound_recipients_in_both_directions() {
+        let manifest = |tick, human_slots: &[usize], subject| {
+            let active_slots = (0..4)
+                .chain(human_slots.iter().copied())
+                .collect::<Vec<_>>();
+            crate::lobby::AcceptedStart {
+                attempt_id: "attempt-681".to_owned(),
+                island_seats: 8,
+                tick,
+                active_slots: active_slots.clone(),
+                witness_recipients: active_slots
+                    .iter()
+                    .copied()
+                    .filter(|slot| *slot != subject)
+                    .take(MAX_WITNESS_LINKS)
+                    .collect(),
+                duration_ticks: 216_000,
+            }
+        };
+
+        let before_join = manifest(600, &[4], 4);
+        assert!(!broadcast_recipients(Some(&before_join), 4).contains(&5));
+
+        let after_join = manifest(601, &[4, 5], 4);
+        assert!(
+            broadcast_recipients(Some(&after_join), 4).contains(&5),
+            "an already-connected player must start sending to the late joiner"
+        );
+
+        let after_departure = manifest(602, &[5], 5);
+        assert!(
+            !broadcast_recipients(Some(&after_departure), 5).contains(&4),
+            "a remaining player must stop sending to the departed slot"
+        );
     }
 
     #[test]

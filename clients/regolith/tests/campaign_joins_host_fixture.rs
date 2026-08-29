@@ -198,6 +198,8 @@ impl HostFixture {
 #[derive(Clone, Copy)]
 enum Mode {
     Join,
+    /// Join an already-running attempt and anchor at its current tick.
+    LateJoin,
     MaterialisedRock,
     TargetDestroyedBeforeDamage,
     Reject,
@@ -266,22 +268,37 @@ async fn pump(
     };
     let mut reply = vec![0u8];
     reply.extend_from_slice(&(assigned as u64).to_le_bytes());
-    if matches!(mode, Mode::MismatchedManifest) {
-        // The seat is right, the identity is right, and the entity is not.
-        // The client already signed a tick-zero claim over `CLIENT_SLOT + 1`,
-        // so this manifest describes a game it cannot produce evidence for.
+    if matches!(mode, Mode::MismatchedManifest | Mode::LateJoin) {
+        // The late-join arm is a valid current membership. The mismatch arm
+        // changes only the own entity, so only fail-closed validation can stop it.
+        let own_entity = if matches!(mode, Mode::MismatchedManifest) {
+            CLIENT_SLOT as u64 + 99
+        } else {
+            CLIENT_SLOT as u64 + 1
+        };
         reply.extend_from_slice(
             &orrery_regolith_client::lobby::StartManifest {
                 attempt_id: "0192f0a0-0000-7000-8000-00000000000f".to_owned(),
                 seed: 1,
-                tick: 0,
+                tick: if matches!(mode, Mode::LateJoin) {
+                    900
+                } else {
+                    0
+                },
                 island_seats: (CLIENT_SLOT + 1) as u16,
-                active: vec![orrery_regolith_client::lobby::ActiveSeat {
-                    slot: CLIENT_SLOT,
-                    node: net::slot_secret(CLIENT_SLOT).public().to_string(),
-                    entity: CLIENT_SLOT as u64 + 99,
-                }],
-                witness_recipients: Vec::new(),
+                active: vec![
+                    orrery_regolith_client::lobby::ActiveSeat {
+                        slot: 0,
+                        node: net::slot_secret(0).public().to_string(),
+                        entity: 1,
+                    },
+                    orrery_regolith_client::lobby::ActiveSeat {
+                        slot: CLIENT_SLOT,
+                        node: net::slot_secret(CLIENT_SLOT).public().to_string(),
+                        entity: own_entity,
+                    },
+                ],
+                witness_recipients: vec![0],
                 duration_ticks: 216_000,
             }
             .encode(),
@@ -291,7 +308,7 @@ async fn pump(
 
     if matches!(
         mode,
-        Mode::Join | Mode::MaterialisedRock | Mode::TargetDestroyedBeforeDamage
+        Mode::Join | Mode::LateJoin | Mode::MaterialisedRock | Mode::TargetDestroyedBeforeDamage
     ) {
         let claim_bytes = read_message(&mut recv).await?;
         let state_bytes = read_message(&mut recv).await?;
@@ -300,13 +317,18 @@ async fn pump(
         let state = orrery_games::regolith::state::RegolithState::decode(&state_bytes)
             .map_err(|error| error.to_string())?;
         assert_eq!(claim.entity, PersistId::new(CLIENT_SLOT as u64 + 1));
-        assert_eq!(claim.tick, Tick::new(0));
+        let expected_tick = if matches!(mode, Mode::LateJoin) {
+            900
+        } else {
+            0
+        };
+        assert_eq!(claim.tick, Tick::new(expected_tick));
         orrery_core::log::verify_claim(&claim, expected_client)
             .expect("the rendered client signs its anchor with its transport identity");
         assert_eq!(
             orrery_core::state_hash(&state),
             claim.state_hash,
-            "the rendered client's tick-zero state matches its signed claim"
+            "the rendered client's join snapshot matches its signed claim"
         );
     }
 
@@ -926,6 +948,38 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
     assert!(
         !shots.banner().is_empty(),
         "the authoritative shot result must remain visible to the player"
+    );
+}
+
+#[test]
+fn a_nonzero_tick_join_adopts_the_snapshot_and_arms_its_witness_chain() {
+    let fixture = HostFixture::spawn(Mode::LateJoin);
+    let mut sink = sink_for("regolith-campaign-late-join");
+    let mut runtime = CampaignRuntime::launch(fixture.config("late-join"), crate_seed());
+    drive_until_joined(&mut runtime, &mut sink, 35);
+
+    let start = runtime.accepted_start().expect("the host sent StartV1");
+    assert_eq!(
+        start.tick, 900,
+        "the client must adopt the host's live tick"
+    );
+    assert_eq!(
+        runtime.joined_ticks(),
+        35,
+        "only locally driven ticks are counted"
+    );
+    let truth = fixture.truth();
+    assert!(
+        truth.witness_frames_verified > 0,
+        "the join-tick anchor must continue into verifiable witness frames"
+    );
+    assert!(
+        truth.witness_claims_verified > 0,
+        "the join-tick chain must cut a later signed claim"
+    );
+    assert!(
+        runtime.shutdown().is_some(),
+        "a late-joined interval remains recordable"
     );
 }
 

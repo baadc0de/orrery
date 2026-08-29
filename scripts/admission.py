@@ -37,6 +37,7 @@ NODE = re.compile(r"[0-9a-f]{64}\Z")
 SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 DISPLAY_LABEL_MAX_CHARS = 32
 LOBBY_SECONDS = 180
+ARRIVAL_LEASE_SECONDS = 45
 RESTART_DELAY_SECONDS = 5
 
 
@@ -55,7 +56,7 @@ class Refusal(Exception):
 class Campaign:
     ident: str; title: str; open: bool; host: str; peers: int; seconds: int
     loss_pct: int; jitter_ms: int; external_port: int; client_rev: str | None; ruleset_version: int | None
-    always_on: bool; humans: int
+    always_on: bool; humans: int; lobby_seconds: int
 
 
 class Admission:
@@ -100,12 +101,15 @@ class Admission:
                 got[ident] = Campaign(ident, s["title"], s.get("open", "").lower() == "yes", host,
                     s.getint("peers"), s.getint("seconds"), s.getint("loss_pct"), s.getint("jitter_ms"),
                     external_port, s.get("client_rev") or None, ruleset_version,
-                    s.get("always_on", "").lower() == "yes", s.getint("humans", fallback=1))
+                    s.get("always_on", "").lower() == "yes", s.getint("humans", fallback=1),
+                    s.getint("lobby_seconds", fallback=LOBBY_SECONDS))
                 # Existing one-human configuration predates `humans` and may
                 # use peers=8.  The explicit multi-human shape is bounded by
                 # D6's eight-peer full-mesh regime.
                 if got[ident].humans < 1 or ("humans" in s and got[ident].peers + got[ident].humans > 8):
                     raise ValueError(f"{ident!r}: peers + humans must be between 1 and 8")
+                if got[ident].lobby_seconds < 0:
+                    raise ValueError(f"{ident!r}: lobby_seconds must not be negative")
             self.last_good, self.last_note = got, None
             return got, None
         except (OSError, ValueError, configparser.Error, KeyError) as e:
@@ -133,7 +137,7 @@ class Admission:
             # must say "open" here or every released binary refuses to offer the
             # campaign. The finer phase travels in `phase`, which the roster
             # endpoint has always carried and a lobby-aware client reads.
-            phase_state = "open" if phase == "lobby" else phase
+            phase_state = "open" if phase in ("lobby", "running") else phase
             state = "paused" if c.open and paused else (phase_state if c.always_on else ("busy" if c.ident in self.children else ("open" if c.open else "closed")))
             rows.append({"id": c.ident, "title": c.title, "state": state, "phase": phase, "peers": c.peers, "seconds": c.seconds,
                          "loss_pct": c.loss_pct, "jitter_ms": c.jitter_ms, "client_rev": c.client_rev,
@@ -187,23 +191,51 @@ class Admission:
             return None
         return listening if listening.strip() else None
 
-    def _standing_host_active_slots(self, campaign: Campaign, attempt: dict[str, Any] | None) -> set[int]:
-        """Return only the host's frozen human seats for this generation."""
+    def _standing_host_membership(self, campaign: Campaign, attempt: dict[str, Any] | None
+                                  ) -> tuple[set[int], set[str], bool] | None:
+        """Read the host-authored binding feed, failing closed on bad bytes."""
         if attempt is None:
-            return set()
+            return set(), set(), False
         path = self.standing_host_state / campaign.ident / "active-seats.json"
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             slots = value["active_slots"]
+            released = value.get("released_sessions", [])
+            running = value["running"]
+        except FileNotFoundError:
+            return set(), set(), False
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            return set()
-        if value.get("attempt_id") != attempt["attempt_id"] or not isinstance(slots, list):
-            return set()
+            return None
+        if (value.get("attempt_id") != attempt["attempt_id"] or not isinstance(slots, list)
+                or not isinstance(released, list)
+                or not isinstance(running, bool)
+                or any(not isinstance(session, str) or not SESSION.fullmatch(session)
+                       for session in released)):
+            return None
         if (any(not isinstance(slot, int) or isinstance(slot, bool)
                 or not campaign.peers <= slot < campaign.peers + campaign.humans for slot in slots)
                 or len(set(slots)) != len(slots)):
-            return set()
-        return set(slots)
+            return None
+        return set(slots), set(released), running
+
+    def _current_slots(self, campaign: Campaign, attempt: dict[str, Any], *, persist: bool
+                       ) -> tuple[list[dict[str, Any]], set[int]] | None:
+        """Return active or unexpired reservations for one host generation."""
+        membership = self._standing_host_membership(campaign, attempt)
+        if membership is None:
+            return None
+        active_slots, released_sessions, _running = membership
+        now = int(time.time())
+        generation = [row for row in self._read_slots(campaign)
+                      if row.get("attempt_id") == attempt["attempt_id"]]
+        current = [row for row in generation
+                   if row.get("session_id") not in released_sessions
+                   and (row.get("slot") in active_slots
+                        or (isinstance(row.get("expires_at"), int)
+                            and row["expires_at"] > now))]
+        if persist and current != generation:
+            self._write_slots(campaign, current)
+        return current, active_slots
 
     def _campaign_phase(self, campaign: Campaign, attempt: dict[str, Any] | None) -> tuple[str, int]:
         if not campaign.open:
@@ -213,17 +245,21 @@ class Admission:
         now = int(time.time())
         if now >= attempt["expires_at"]:
             return "restarting", 0
-        slots = [row for row in self._read_slots(campaign) if row.get("attempt_id") == attempt["attempt_id"]]
+        current = self._current_slots(campaign, attempt, persist=False)
+        if current is None:
+            return "restarting", 0
+        slots, _active_slots = current
         free = campaign.humans - len({row.get("slot") for row in slots})
         # A standing host reopens empty lobby windows without respawning. Its
         # supervisor advances `started` at the same boundary, but this clause
         # also keeps the listing joinable during that atomic hand-off.
         if not slots:
             return "lobby", max(free, 0)
-        if now >= attempt["started"] + LOBBY_SECONDS:
-            return "running", 0
         if not free:
             return "full", 0
+        membership = self._standing_host_membership(campaign, attempt)
+        if membership is not None and membership[2]:
+            return "running", max(free, 0)
         return "lobby", max(free, 0)
 
     def session_roster(self, campaign: Campaign, attempt: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -232,7 +268,8 @@ class Admission:
             row.get("slot"): row for row in self._read_slots(campaign)
             if row.get("attempt_id") == attempt["attempt_id"]
         }
-        active_slots = self._standing_host_active_slots(campaign, attempt)
+        membership = self._standing_host_membership(campaign, attempt)
+        active_slots = set() if membership is None else membership[0]
         roster: list[dict[str, Any]] = []
         for slot in range(campaign.peers):
             suffix = f"-{slot + 1}"
@@ -293,18 +330,18 @@ class Admission:
         lock = (directory / "lock").open("a+")
         try:
             if c.always_on:
-                # The short flock is an allocation transaction, not a session lease.
-                # `attempt.json` is written by the supervisor at child spawn, so all
-                # reservations for a generation expire together at its boundary.
+                # The short flock is an allocation transaction. A reservation
+                # proves only that its holder is arriving, so it expires after
+                # 45 seconds unless the host has published that slot as bound.
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 attempt = self._always_on_attempt(c)
                 phase, _ = self._campaign_phase(c, attempt)
                 if attempt is None or phase == "restarting":
                     raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.")
-                if phase not in ("lobby", "full"):
-                    retry = max(1, attempt["expires_at"] - int(time.time()) + RESTART_DELAY_SECONDS)
-                    raise Refusal(409, "session_started", "This attempt has started; the next lobby opens shortly.", retry_after_s=retry)
-                slots = [row for row in self._read_slots(c) if row.get("attempt_id") == attempt["attempt_id"]]
+                current_slots = self._current_slots(c, attempt, persist=True)
+                if current_slots is None:
+                    raise Refusal(503, "host_failed", "The always-on host membership is invalid — try again shortly.")
+                slots, _active_slots = current_slots
                 existing = next((row for row in slots if row.get("node") == node), None)
                 slot = existing.get("slot") if existing else None
                 granted_nickname = existing.get("nickname") if existing else None
@@ -312,8 +349,8 @@ class Admission:
                     occupied = {row.get("slot") for row in slots}
                     free_slots = [candidate for candidate in range(c.peers, c.peers + c.humans) if candidate not in occupied]
                     if not free_slots:
-                        raise Refusal(409, "campaign_full", f"All {c.humans} player seats are full; try the next lobby.",
-                                      retry_after_s=max(1, attempt["expires_at"] - int(time.time()) + RESTART_DELAY_SECONDS))
+                        raise Refusal(409, "campaign_full", f"All {c.humans} player seats are currently occupied.",
+                                      retry_after_s=ARRIVAL_LEASE_SECONDS)
                     slot = free_slots[0]
                     try:
                         minted = self.output([self.invite, "mint", "--ledger", str(directory / "ledger.tsv"), "--label", nickname])
@@ -321,7 +358,7 @@ class Admission:
                         granted_nickname = display_label(nickname)
                         slots.append({"attempt_id": attempt["attempt_id"], "slot": slot, "session_id": sid,
                                       "account": int(account), "node": node, "nickname": granted_nickname,
-                                      "expires_at": attempt["expires_at"]})
+                                      "expires_at": int(time.time()) + ARRIVAL_LEASE_SECONDS})
                         # A generation may turn over while minting.  Do not let a
                         # stale answer reserve a seat in the next attempt.
                         current = self._always_on_attempt(c)
@@ -532,7 +569,17 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     p = argparse.ArgumentParser(); p.add_argument("--control", type=Path, default=Path("/etc/orrery/campaigns.conf")); p.add_argument("--state", type=Path, default=Path("/var/lib/orrery-admission")); p.add_argument("--invite", default="orrery-invite"); p.add_argument("--ssh", default="ssh"); p.add_argument("--ssh-key", type=Path, default=Path("/var/lib/orrery-admission/campaign_ssh_key")); p.add_argument("--issuer", type=Path, default=Path("/var/lib/orrery-admission/issuer.cred")); p.add_argument("--swarm", default="p1-swarm"); p.add_argument("--standing-host-state", type=Path, default=Path("/var/lib/orrery-p1-swarm")); p.add_argument("--listen", default="127.0.0.1:8323"); p.add_argument("--self-test", action="store_true"); a = p.parse_args()
-    if a.self_test: unittest.main(argv=[sys.argv[0]] + ([os.environ["ADMISSION_TEST"]] if "ADMISSION_TEST" in os.environ else [])); return
+    if a.self_test:
+        loader = unittest.TestLoader()
+        selected = os.environ.get("ADMISSION_TEST")
+        suite = (loader.loadTestsFromName(selected, module=sys.modules[__name__])
+                 if selected else loader.loadTestsFromTestCase(AdmissionTests))
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        if result.testsRun == 0:
+            raise SystemExit("admission self-test ran zero tests")
+        if len(result.skipped) == result.testsRun:
+            raise SystemExit(f"admission self-test skipped all {result.testsRun} tests")
+        raise SystemExit(0 if result.wasSuccessful() else 1)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     host, port = a.listen.rsplit(":", 1); Handler.service = Admission(a.control, a.state, a.invite, a.ssh, a.ssh_key, a.issuer, a.swarm, a.standing_host_state)
     ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
@@ -707,7 +754,7 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(Refusal) as caught: self.service.join("test", request)
         self.assertEqual((caught.exception.status, caught.exception.error), (409, "campaign_full"))
 
-    def test_always_on_roster_marks_only_host_frozen_seats_active(self) -> None:
+    def test_always_on_roster_marks_only_host_bound_seats_active(self) -> None:
         attempt = self.enable_always_on()
         first = self.service.join("test", self.request())
         second_request = self.request(); second_request.update({"nickname": "lin", "node": "b" * 64})
@@ -717,27 +764,82 @@ class AdmissionTests(unittest.TestCase):
                          "a reservation alone is not a connection claim")
         (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
             "attempt_id": attempt["attempt_id"], "active_slots": [first["join"]["slot"]],
+            "running": False,
         }))
         self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
                          ["active", "reserved", "empty", "empty"],
-                         "only the seat frozen by the host is active")
+                         "only the seat bound by the host is active")
         (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
             "attempt_id": "stale-attempt", "active_slots": [first["join"]["slot"], second["join"]["slot"]],
+            "running": False,
         }))
         self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
                          ["reserved", "reserved", "empty", "empty"],
                          "a prior generation must not assert present membership")
 
-    def test_always_on_lobby_freezes_reservations_after_start(self) -> None:
+    def test_running_campaign_stays_joinable_while_a_slot_is_unbound(self) -> None:
+        self.control.write_text(self.control.read_text() + "lobby_seconds = 12\n")
         attempt = self.enable_always_on()
-        attempt["started"] -= LOBBY_SECONDS + 1
+        attempt["started"] -= 13
         (self.standing_host_state / "test" / "attempt.json").write_text(json.dumps(attempt))
         (self.state / "test").mkdir(parents=True, exist_ok=True)
         (self.state / "test" / "slots.json").write_text(json.dumps([{
             "attempt_id": attempt["attempt_id"], "slot": 4,
+            "session_id": "018f8f4e-5c90-7abc-8123-0000000000ab",
+            "node": "b" * 64, "expires_at": int(time.time()) + ARRIVAL_LEASE_SECONDS,
         }]))
-        with self.assertRaises(Refusal) as caught: self.service.join("test", self.request())
-        self.assertEqual((caught.exception.status, caught.exception.error), (409, "session_started"))
+        (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [4],
+            "released_sessions": [], "running": True,
+        }))
+        listing = self.service.listing()["campaigns"][0]
+        self.assertEqual((listing["state"], listing["phase"], listing["slots_free"]),
+                         ("open", "running", 3),
+                         "a running campaign with an unbound slot must remain joinable")
+        self.assertEqual(self.service.campaigns()[0]["test"].lobby_seconds, 12,
+                         "admission must use the same configured initial delay as the host")
+        answer = self.service.join("test", self.request())
+        self.assertEqual(answer["join"]["slot"], 5)
+
+    def test_no_show_reservation_expires_after_the_arrival_lease(self) -> None:
+        attempt = self.enable_always_on()
+        directory = self.state / "test"; directory.mkdir(parents=True, exist_ok=True)
+        (directory / "slots.json").write_text(json.dumps([{
+            "attempt_id": attempt["attempt_id"], "slot": 4,
+            "session_id": "018f8f4e-5c90-7abc-8123-0000000000ab",
+            "node": "b" * 64, "expires_at": int(time.time()) - 1,
+        }]))
+        answer = self.service.join("test", self.request())
+        self.assertEqual(answer["join"]["slot"], 4,
+                         "an expired no-show must not consume the earliest free slot")
+        rows = json.loads((directory / "slots.json").read_text())
+        self.assertEqual(len(rows), 1, "the expired no-show row must be removed")
+
+    def test_host_release_makes_the_departed_slot_immediately_reservable(self) -> None:
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        active = self.standing_host_state / "test" / "active-seats.json"
+        active.write_text(json.dumps({"attempt_id": attempt["attempt_id"],
+                                      "active_slots": [4], "released_sessions": [],
+                                      "running": True}))
+        active.write_text(json.dumps({"attempt_id": attempt["attempt_id"],
+                                      "active_slots": [],
+                                      "released_sessions": [first["join"]["session_id"]],
+                                      "running": True}))
+        second_request = self.request(); second_request.update({"nickname": "lin", "node": "b" * 64})
+        second = self.service.join("test", second_request)
+        self.assertEqual(second["join"]["slot"], 4,
+                         "the host's unbind publication must release the real allocator row")
+
+    def test_malformed_host_membership_fails_capacity_closed(self) -> None:
+        self.enable_always_on()
+        active = self.standing_host_state / "test" / "active-seats.json"
+        active.write_text("{broken")
+        listing = self.service.listing()["campaigns"][0]
+        self.assertEqual((listing["state"], listing["slots_free"]), ("restarting", 0))
+        with self.assertRaises(Refusal) as caught:
+            self.service.join("test", self.request())
+        self.assertEqual((caught.exception.status, caught.exception.error), (503, "host_failed"))
 
     def test_the_roster_forgets_a_session_when_it_ends(self) -> None:
         # A label that outlives its session names a player who is not there.

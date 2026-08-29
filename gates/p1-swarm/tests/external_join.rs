@@ -476,13 +476,180 @@ fn two_reserved_clients_join_in_reverse_reservation_order() {
         "arrival order must not renumber reserved seats"
     );
     let active_seats: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&active_seats_path).expect("frozen active seats written"),
+        &std::fs::read(&active_seats_path).expect("live active seats written"),
     )
     .expect("active seats record parses");
     assert_eq!(active_seats["attempt_id"], "attempt-reverse");
     assert_eq!(
         active_seats["active_slots"],
-        serde_json::json!([4, 5]),
-        "the host must publish every connected seat at StartV1 freeze"
+        serde_json::json!([]),
+        "both clean closes must leave both human seats unbound"
+    );
+    assert_eq!(
+        active_seats["released_sessions"],
+        serde_json::json!(sessions.map(|(_slot, session)| session)),
+        "each clean close must release its allocator row"
+    );
+}
+
+#[test]
+#[ignore = "four real processes at wall clock; run explicitly for late-join/rejoin proof"]
+fn late_join_and_rejoin_after_goodbye_reuse_the_released_slot() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("p1-live-join-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let listening_path = dir.join("listening.txt");
+    let active_seats_path = dir.join("active-seats.json");
+    let journal_path = dir.join("slots.json");
+    let host_err_path = dir.join("host.err");
+    let issuer = iroh_base::SecretKey::from_bytes(&[0x5a; 32]);
+    let key_id = 681;
+    let slot = 4usize;
+    let sessions = [
+        "018f8f4e-5c90-7abc-8123-000000000204",
+        "018f8f4e-5c90-7abc-8123-000000000304",
+    ];
+    let write_reservation = |session: &str| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock")
+            .as_secs();
+        let row = serde_json::json!([{
+            "attempt_id": "attempt-live",
+            "slot": slot,
+            "session_id": session,
+            "node": slot_key(slot).public().to_string(),
+            "expires_at": now + 45,
+        }]);
+        std::fs::write(
+            &journal_path,
+            serde_json::to_vec(&row).expect("journal serializes"),
+        )
+        .expect("journal written");
+    };
+    write_reservation(sessions[0]);
+
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve port");
+    let external_bind = reservation.local_addr().expect("reserved address");
+    drop(reservation);
+    let mut host = Command::new(bin())
+        .args([
+            "--peers",
+            "4",
+            "--external-slots",
+            "4",
+            "--lobby-seconds",
+            "0",
+            "--seconds",
+            "8",
+            "--min-cells",
+            "1",
+            "--external-peer",
+            "--report-only",
+            "--attempt-id",
+            "attempt-live",
+            "--issuer-key",
+            &format!("{key_id}:{}", issuer.public()),
+        ])
+        .arg("--reservation-journal")
+        .arg(&journal_path)
+        .arg("--listening-file")
+        .arg(&listening_path)
+        .arg("--active-seats-file")
+        .arg(&active_seats_path)
+        .arg("--external-bind")
+        .arg(external_bind.to_string())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&host_err_path).expect("host err"))
+        .spawn()
+        .expect("host starts");
+    let (host_node, host_direct) = wait_for_listening(&listening_path);
+
+    let run = |session: &str| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        Command::new(bin())
+            .args([
+                "--external",
+                "--peers",
+                "4",
+                "--external-slots",
+                "4",
+                "--slot",
+                "4",
+                "--seconds",
+                "2",
+                "--host-node",
+                &host_node,
+                "--host-direct",
+                &host_direct,
+                "--session-id",
+                session,
+                "--session-token",
+                &token_hex(&issuer, key_id, slot, now_ms),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("client starts")
+    };
+    let wait_membership = |expected: serde_json::Value| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(bytes) = std::fs::read(&active_seats_path) {
+                if serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .is_ok_and(|value| value["active_slots"] == expected)
+                {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "active-seats.json never published active_slots={expected}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let mut first = run(sessions[0]);
+    wait_membership(serde_json::json!([4]));
+    assert!(
+        first.wait().expect("first wait").success(),
+        "initial client failed"
+    );
+    wait_membership(serde_json::json!([]));
+
+    write_reservation(sessions[1]);
+    let mut late = run(sessions[1]);
+    wait_membership(serde_json::json!([4]));
+    assert!(
+        late.wait().expect("late wait").success(),
+        "late client failed"
+    );
+    wait_membership(serde_json::json!([]));
+
+    let host_status = host.wait().expect("host wait");
+    if !host_status.success() {
+        eprintln!(
+            "{}",
+            std::fs::read_to_string(&host_err_path).unwrap_or_default()
+        );
+    }
+    assert!(
+        host_status.success(),
+        "standing host failed the live join proof"
+    );
+    let published: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&active_seats_path).expect("active seats published"))
+            .expect("active seats parse");
+    assert_eq!(
+        published["released_sessions"],
+        serde_json::json!(sessions),
+        "both explicit goodbyes must release their exact allocator rows"
     );
 }
