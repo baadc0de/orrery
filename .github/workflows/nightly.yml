@@ -1138,6 +1138,27 @@ jobs:
 
   p2-kill9:
     name: P2 kill-9 gate (FoundationDB)
+    # ── PARKED, 2026-08-29 ────────────────────────────────────────────────
+    #
+    # Owner decision: AWS validation is off while no persistd work is running.
+    # It can resume whenever — delete the `if: false` line below and nothing
+    # else changes.
+    #
+    # It is parked, not deleted, because the reason is external and temporary:
+    # AWS account 590561279276 is under an account-verification hold and
+    # cannot launch EC2 instances at all —
+    #
+    #   An error occurred (Blocked) when calling RunInstances: This account is
+    #   currently blocked and not recognized as a valid account.
+    #
+    # so this job fails identically whatever the repository does (#623). Every
+    # cause that WAS ours is fixed: the instance-type policy width (#677) and
+    # the ec2:Owner alias mismatch (#684, applied to the deployed role). Reads
+    # still work; it is specifically instance creation that is blocked.
+    #
+    # A permanently red job teaches people to ignore the nightly, which is the
+    # failure #620 was actually about.
+    if: false
     runs-on: ubuntu-latest
     # The role credential lasts 60 minutes. Stop the job at 55 so the final
     # tagged teardown still has a five-minute credential window.
@@ -1184,6 +1205,16 @@ jobs:
 
   compute-identity-smoke:
     name: cloud identity smoke (assume orrery-ci-compute via OIDC)
+    # ── PARKED, 2026-08-29 ────────────────────────────────────────────────
+    #
+    # Parked with `p2-kill9` under the same owner decision: AWS validation is
+    # off while no persistd work is running. Delete the `if: false` to resume.
+    #
+    # NOTE this job was GREEN when parked — #680's policy-shape assertions and
+    # the #684 apply fixed it. It is parked only because it is the other half
+    # of the same AWS surface, not because it is failing. Whoever resumes
+    # should expect it to pass.
+    if: false
     # ── What this job is ───────────────────────────────────────────────────
     #
     # #173's demonstration: a workflow job authenticates to AWS with NO
