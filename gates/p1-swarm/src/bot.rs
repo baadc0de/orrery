@@ -270,8 +270,12 @@ pub struct Bot {
     delta_stats: Option<DeltaStats>,
     /// Last authored keyframe and its byte-identical cached wire form.
     sender_keyframes: BTreeMap<PersistId, SenderKeyframe>,
+    /// Previous anchors held until the newly built keyframe leaves the app.
+    sender_keyframe_rollbacks: BTreeMap<PersistId, Option<SenderKeyframe>>,
     /// Audience seen on the preceding send, per authored entity.
     replication_audiences: BTreeMap<PersistId, BTreeSet<NodeId>>,
+    /// Previous audiences held until the current send leaves the app.
+    replication_audience_rollbacks: BTreeMap<PersistId, Option<BTreeSet<NodeId>>>,
     /// Number of state-send opportunities this authority has processed.
     replication_send_index: u64,
     /// State sends per 1 Hz keyframe interval.
@@ -315,8 +319,21 @@ pub(crate) struct DecodedReplica {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplicaDecodeError {
     NotReplication,
-    UnanchoredDelta,
+    UnanchoredDelta(UnanchoredDeltaCause),
     BadPatch,
+}
+
+/// Why a delta's exact sender-clocked anchor was unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnanchoredDeltaCause {
+    /// No keyframe for this entity has ever reached the receiver.
+    NoKeyframe,
+    /// The receiver has an older anchor, so the referenced keyframe never arrived.
+    MissingNewerKeyframe,
+    /// A newer keyframe arrived first and replaced the referenced one.
+    SupersededKeyframe,
+    /// The delta's age points before tick zero.
+    InvalidReference,
 }
 
 /// Keyframe/delta traffic offered to the shipping send path.
@@ -330,6 +347,10 @@ pub struct ReplicationWireCounters {
     pub keyframe_bytes: u64,
     /// Delta wire bytes including datagram overhead.
     pub delta_bytes: u64,
+    /// Keyframe messages built and charged, then discarded by a simulated hitch.
+    pub keyframes_discarded_while_stalled: u64,
+    /// Delta messages built and charged, then discarded by a simulated hitch.
+    pub deltas_discarded_while_stalled: u64,
 }
 
 impl ReplicationWireCounters {
@@ -467,6 +488,14 @@ pub struct ReplicaCounters {
     pub bad_body: u64,
     /// Deltas whose referenced keyframe has not arrived on this link.
     pub deltas_unanchored: u64,
+    /// Unanchored deltas seen before any keyframe for their entity.
+    pub deltas_without_any_keyframe: u64,
+    /// Unanchored deltas referring to a newer keyframe than the one retained.
+    pub deltas_missing_newer_keyframe: u64,
+    /// Unanchored deltas referring to an older, already-superseded keyframe.
+    pub deltas_with_superseded_keyframe: u64,
+    /// Unanchored deltas whose age underflowed their tick.
+    pub deltas_with_invalid_reference: u64,
     /// Replicas spawned.
     pub spawned: u64,
     /// Replicas updated.
@@ -509,12 +538,26 @@ pub(crate) fn decode_replica(
     let referenced_tick = delta
         .tick
         .checked_sub(u64::from(delta.keyframe_age))
-        .ok_or(ReplicaDecodeError::UnanchoredDelta)?;
-    let anchor = keyframes
-        .anchors
-        .get(&delta.entity)
-        .filter(|anchor| anchor.tick == referenced_tick)
-        .ok_or(ReplicaDecodeError::UnanchoredDelta)?;
+        .ok_or(ReplicaDecodeError::UnanchoredDelta(
+            UnanchoredDeltaCause::InvalidReference,
+        ))?;
+    let anchor =
+        keyframes
+            .anchors
+            .get(&delta.entity)
+            .ok_or(ReplicaDecodeError::UnanchoredDelta(
+                UnanchoredDeltaCause::NoKeyframe,
+            ))?;
+    if anchor.tick < referenced_tick {
+        return Err(ReplicaDecodeError::UnanchoredDelta(
+            UnanchoredDeltaCause::MissingNewerKeyframe,
+        ));
+    }
+    if anchor.tick > referenced_tick {
+        return Err(ReplicaDecodeError::UnanchoredDelta(
+            UnanchoredDeltaCause::SupersededKeyframe,
+        ));
+    }
     let canonical =
         apply_delta_patch(&anchor.canonical, &delta.patch).ok_or(ReplicaDecodeError::BadPatch)?;
     Ok(DecodedReplica {
@@ -553,8 +596,37 @@ pub fn apply_replicas(
         // constantly and stop meaning anything.
         let decoded = match decode_replica(&packet.payload, &mut receive.keyframes) {
             Ok(decoded) => decoded,
-            Err(ReplicaDecodeError::UnanchoredDelta) => {
+            Err(ReplicaDecodeError::UnanchoredDelta(cause)) => {
                 receive.counters.deltas_unanchored += 1;
+                if std::env::var_os("P1_SWARM_TRACE_UNANCHORED").is_some() {
+                    if let Some(delta) = decode_replication_delta(&packet.payload) {
+                        let referenced_tick = delta.tick.checked_sub(u64::from(delta.keyframe_age));
+                        let retained_tick = receive
+                            .keyframes
+                            .anchors
+                            .get(&delta.entity)
+                            .map(|anchor| anchor.tick);
+                        eprintln!(
+                            "unanchored entity={} delta_tick={} referenced_tick={referenced_tick:?} retained_tick={retained_tick:?} cause={cause:?}",
+                            delta.entity.0,
+                            delta.tick,
+                        );
+                    }
+                }
+                match cause {
+                    UnanchoredDeltaCause::NoKeyframe => {
+                        receive.counters.deltas_without_any_keyframe += 1;
+                    }
+                    UnanchoredDeltaCause::MissingNewerKeyframe => {
+                        receive.counters.deltas_missing_newer_keyframe += 1;
+                    }
+                    UnanchoredDeltaCause::SupersededKeyframe => {
+                        receive.counters.deltas_with_superseded_keyframe += 1;
+                    }
+                    UnanchoredDeltaCause::InvalidReference => {
+                        receive.counters.deltas_with_invalid_reference += 1;
+                    }
+                }
                 continue;
             }
             Err(ReplicaDecodeError::BadPatch) => {
@@ -833,7 +905,9 @@ impl Bot {
             tampered_subjects: Vec::new(),
             delta_stats: None,
             sender_keyframes: BTreeMap::new(),
+            sender_keyframe_rollbacks: BTreeMap::new(),
             replication_audiences: BTreeMap::new(),
+            replication_audience_rollbacks: BTreeMap::new(),
             replication_send_index: 0,
             keyframe_every_sends: DEFAULT_KEYFRAME_EVERY_SENDS,
             replication_wire: ReplicationWireCounters::default(),
@@ -929,9 +1003,9 @@ impl Bot {
         self.delta_stats = Some(DeltaStats::new(send_hz));
     }
 
-    /// Keep the sender-clocked keyframe cadence at one simulated second.
-    pub fn set_replication_send_hz(&mut self, send_hz: u64) {
-        self.keyframe_every_sends = send_hz.max(1);
+    /// Set the sender-clocked keyframe interval in state-send opportunities.
+    pub fn set_keyframe_every_sends(&mut self, sends: u64) {
+        self.keyframe_every_sends = sends.max(1);
     }
 
     /// This authority's completed changed-byte observations.
@@ -1444,7 +1518,7 @@ impl Bot {
                     entity,
                     observed_tick,
                 ));
-                self.sender_keyframes.insert(
+                let previous = self.sender_keyframes.insert(
                     entity,
                     SenderKeyframe {
                         canonical,
@@ -1453,6 +1527,7 @@ impl Bot {
                         payload: payload.clone(),
                     },
                 );
+                self.sender_keyframe_rollbacks.insert(entity, previous);
                 sends.extend(
                     audience
                         .iter()
@@ -1500,7 +1575,8 @@ impl Bot {
                     // the larger delta is never sent.
                 }
             }
-            self.replication_audiences.insert(entity, audience);
+            let previous = self.replication_audiences.insert(entity, audience);
+            self.replication_audience_rollbacks.insert(entity, previous);
         }
         self.replication_send_index += 1;
 
@@ -1547,9 +1623,60 @@ impl Bot {
             &mut aeronet_io::Session,
             &mut IrohStreamIo,
         )>();
+        let mut discarded_keyframes = 0;
+        let mut discarded_deltas = 0;
         for (_, mut session, mut streams) in query.iter_mut(world) {
+            for payload in &session.send {
+                let Some((Channel::State, inner)) = orrery_net::channels::untag(payload) else {
+                    continue;
+                };
+                if is_delta_payload(inner) {
+                    discarded_deltas += 1;
+                } else if orrery_net::channels::decode_replication::<(
+                    Vec<u8>,
+                    CellId,
+                    PersistId,
+                    u64,
+                )>(inner)
+                .is_some()
+                {
+                    discarded_keyframes += 1;
+                }
+            }
             session.send.clear();
             streams.send.clear();
+        }
+        self.replication_wire.keyframes_discarded_while_stalled += discarded_keyframes;
+        self.replication_wire.deltas_discarded_while_stalled += discarded_deltas;
+        for (entity, previous) in core::mem::take(&mut self.sender_keyframe_rollbacks) {
+            // The sender clock advanced when `broadcast_state` built this
+            // keyframe, but the simulated hitch proves no recipient could have
+            // received it. Restore the last anchor that did leave the app, so
+            // post-hitch deltas remain decodable without an off-phase keyframe
+            // burst. With no predecessor, remove the phantom first anchor and
+            // let the first post-hitch send be absolute.
+            match previous {
+                Some(previous) => {
+                    self.sender_keyframes.insert(entity, previous);
+                }
+                None => {
+                    self.sender_keyframes.remove(&entity);
+                }
+            }
+        }
+        for (entity, previous) in core::mem::take(&mut self.replication_audience_rollbacks) {
+            // No packet from this send left the app, including the cached
+            // keyframe offered to a newly interested peer. Restore the prior
+            // audience so that peer remains "added" and is offered the anchor
+            // again on the first post-hitch send.
+            match previous {
+                Some(audience) => {
+                    self.replication_audiences.insert(entity, audience);
+                }
+                None => {
+                    self.replication_audiences.remove(&entity);
+                }
+            }
         }
     }
 
@@ -1575,6 +1702,11 @@ impl Bot {
                 outbound.push((peer.id, Some(message.mode), message.payload));
             }
         }
+        // Keyframes in `outbound` have crossed the seam at which `stall` could
+        // discard them. Router loss from here is the ordinary A19 §5.5 case;
+        // the sender deliberately receives no per-link feedback for it.
+        self.sender_keyframe_rollbacks.clear();
+        self.replication_audience_rollbacks.clear();
         outbound
     }
 
@@ -2241,6 +2373,46 @@ mod tests {
     }
 
     #[test]
+    fn a_hitch_retries_the_new_subscribers_immediate_keyframe() {
+        let mut sender = replication_test_bot(19);
+        let established = bot_key(30).public();
+        let joining = bot_key(31).public();
+        sender.link(established, 1_200);
+        sender.link(joining, 1_200);
+        let established_entry = audience_entry(&mut sender, established);
+        sender.set_island(vec![established_entry]);
+        for tick in 0..3 {
+            let _ = step_and_send(&mut sender, tick);
+        }
+
+        let established_entry = audience_entry(&mut sender, established);
+        let joining_entry = audience_entry(&mut sender, joining);
+        sender.set_island(vec![established_entry, joining_entry]);
+        for tick in 3..6 {
+            sender.step_core(tick, default_cell_edge_m());
+            if tick % 3 == 2 {
+                sender.broadcast_state(tick);
+            }
+            sender.update();
+            if tick % 3 == 2 {
+                sender.stall();
+            }
+        }
+
+        let first_after_hitch = (6..9)
+            .flat_map(|tick| step_and_send(&mut sender, tick))
+            .find(|(peer, _)| *peer == joining)
+            .expect("the newly interested peer is retried after the hitch");
+        assert!(
+            orrery_net::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(
+                &first_after_hitch.1
+            )
+            .is_some(),
+            "the retried first packet to a new subscriber must still be a keyframe"
+        );
+    }
+
+    #[test]
     fn a_shed_or_lost_delta_is_fully_superseded_by_the_next() {
         let mut sender = replication_test_bot(19);
         let receiver = bot_key(31).public();
@@ -2276,6 +2448,157 @@ mod tests {
         let converged = decode_replica(&updates[2], &mut keyframes)
             .expect("the following delta remains independently decodable");
         assert_eq!(converged.canonical, expected[2]);
+    }
+
+    #[test]
+    fn unanchored_delta_causes_distinguish_missing_from_superseded_anchors() {
+        let entity = PersistId::new(7);
+        let cell = CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL).expect("origin cell");
+        let canonical = vec![0; 128];
+        let keyframe =
+            |tick: u64| encode_replication_compressed(&(canonical.clone(), cell, entity, tick));
+        let delta = |tick: u64, referenced_tick: u64| {
+            let payload = encode_replication_delta(
+                &(canonical.clone(), cell, entity, tick),
+                &ReplicationDelta {
+                    entity,
+                    tick,
+                    keyframe_age: u16::try_from(tick - referenced_tick).expect("small age"),
+                    cell: None,
+                    patch: encode_delta_patch(&canonical, &canonical),
+                },
+            );
+            assert!(
+                is_delta_payload(&payload),
+                "fixture must exercise the delta decoder"
+            );
+            payload
+        };
+
+        let mut none = ReplicaKeyframes::default();
+        assert_eq!(
+            decode_replica(&delta(23, 20), &mut none),
+            Err(ReplicaDecodeError::UnanchoredDelta(
+                UnanchoredDeltaCause::NoKeyframe
+            ))
+        );
+
+        let mut older = ReplicaKeyframes::default();
+        decode_replica(&keyframe(20), &mut older).expect("older anchor installs");
+        assert_eq!(
+            decode_replica(&delta(43, 40), &mut older),
+            Err(ReplicaDecodeError::UnanchoredDelta(
+                UnanchoredDeltaCause::MissingNewerKeyframe
+            ))
+        );
+
+        let mut newer = ReplicaKeyframes::default();
+        decode_replica(&keyframe(40), &mut newer).expect("newer anchor installs");
+        assert_eq!(
+            decode_replica(&delta(23, 20), &mut newer),
+            Err(ReplicaDecodeError::UnanchoredDelta(
+                UnanchoredDeltaCause::SupersededKeyframe
+            ))
+        );
+
+        let invalid = ReplicationDelta {
+            entity,
+            tick: 1,
+            keyframe_age: 2,
+            cell: None,
+            patch: encode_delta_patch(&canonical, &canonical),
+        };
+        let invalid = encode_replication_delta(&(canonical, cell, entity, 1), &invalid);
+        assert_eq!(
+            decode_replica(&invalid, &mut newer),
+            Err(ReplicaDecodeError::UnanchoredDelta(
+                UnanchoredDeltaCause::InvalidReference
+            ))
+        );
+    }
+
+    #[test]
+    fn a_simulated_hitch_reanchors_after_discarding_a_keyframe() {
+        let mut sender = replication_test_bot(19);
+        let receiver = bot_key(31).public();
+        sender.link(receiver, 1_200);
+        let receiver_entry = audience_entry(&mut sender, receiver);
+        sender.set_island(vec![receiver_entry]);
+
+        for tick in 0..3 {
+            sender.step_core(tick, default_cell_edge_m());
+            if tick % 3 == 2 {
+                sender.broadcast_state(tick);
+            }
+            sender.update();
+            if tick % 3 == 2 {
+                sender.stall();
+            }
+        }
+
+        let wire = sender.replication_wire_counters();
+        assert_eq!(wire.keyframes_discarded_while_stalled, 1);
+        assert_eq!(wire.deltas_discarded_while_stalled, 0);
+
+        let first_after_hitch = (3..6)
+            .flat_map(|tick| step_and_send(&mut sender, tick))
+            .find(|(peer, _)| *peer == receiver)
+            .expect("the sender resumes on its next send opportunity");
+        assert!(
+            orrery_net::channels::decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(
+                &first_after_hitch.1
+            )
+            .is_some(),
+            "the first post-hitch packet must reanchor after a discarded keyframe"
+        );
+    }
+
+    #[test]
+    fn a_simulated_hitch_restores_the_last_delivered_anchor() {
+        let mut sender = replication_test_bot(19);
+        sender.set_keyframe_every_sends(2);
+        let receiver = bot_key(31).public();
+        sender.link(receiver, 1_200);
+        let receiver_entry = audience_entry(&mut sender, receiver);
+        sender.set_island(vec![receiver_entry]);
+        let mut receiver_keyframes = ReplicaKeyframes::default();
+
+        let first = (0..3)
+            .flat_map(|tick| step_and_send(&mut sender, tick))
+            .find(|(peer, _)| *peer == receiver)
+            .expect("initial keyframe leaves the app");
+        decode_replica(&first.1, &mut receiver_keyframes).expect("initial keyframe anchors");
+
+        let delta = (3..6)
+            .flat_map(|tick| step_and_send(&mut sender, tick))
+            .find(|(peer, _)| *peer == receiver)
+            .expect("the next state send leaves the app");
+        decode_replica(&delta.1, &mut receiver_keyframes).expect("pre-hitch delta decodes");
+
+        for tick in 6..9 {
+            sender.step_core(tick, default_cell_edge_m());
+            if tick % 3 == 2 {
+                sender.broadcast_state(tick);
+            }
+            sender.update();
+            if tick % 3 == 2 {
+                sender.stall();
+            }
+        }
+        assert_eq!(
+            sender
+                .replication_wire_counters()
+                .keyframes_discarded_while_stalled,
+            1,
+            "the guarded stage must discard a replacement keyframe"
+        );
+
+        let resumed = (9..12)
+            .flat_map(|tick| step_and_send(&mut sender, tick))
+            .find(|(peer, _)| *peer == receiver)
+            .expect("the sender resumes on its next send opportunity");
+        decode_replica(&resumed.1, &mut receiver_keyframes)
+            .expect("the first post-hitch delta must reference the last delivered anchor");
     }
 
     #[test]

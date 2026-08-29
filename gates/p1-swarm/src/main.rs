@@ -196,7 +196,7 @@ mod shot_interest;
 mod swarm;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use orrery_core::CoreCodec as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -210,6 +210,17 @@ use swarm::{CheatSpec, Criterion, Swarm, SwarmConfig};
 
 /// The D6/D16 peer upload budget.
 const BUDGET_BITS: u64 = 1_000_000;
+
+/// Which honest bot profiles a measurement deals.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProfileMode {
+    /// Preserve the gate posture: varied with witnessing, cruise otherwise.
+    Auto,
+    /// Deal only smooth cruising bots, even while witnessing.
+    Cruise,
+    /// Deal cruise, idle, burst and stall profiles, even without witnessing.
+    Varied,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -289,6 +300,14 @@ struct Args {
     /// Simulated second at which to run the late-join check.
     #[arg(long)]
     late_join_at: Option<u64>,
+
+    /// Bot profile mix, independently of whether witness traffic is enabled.
+    #[arg(long, value_enum, default_value_t = ProfileMode::Auto)]
+    profile_mode: ProfileMode,
+
+    /// State-send opportunities between sender-clocked keyframes.
+    #[arg(long, default_value_t = 20)]
+    keyframe_every_sends: u64,
 
     /// Write the full report as JSON to this path.
     #[arg(long)]
@@ -653,16 +672,14 @@ fn main() -> Result<()> {
         .transpose()
         .context("--cheat")?;
 
-    let late_join_tick = args
-        .late_join_at
-        .or(Some(args.seconds / 2))
-        .map(|second| second * bot::TICK_HZ);
+    let late_join_tick = args.late_join_at.map(|second| second * bot::TICK_HZ);
 
     let config = SwarmConfig {
         peers: args.peers,
         seconds: args.seconds,
         cell_edge_m: cell_edge_m_for_session(args.external, args.external_peer),
         send_hz: 20,
+        keyframe_every_sends: args.keyframe_every_sends.max(1),
         impairment: if args.impaired {
             args.loss
                 .map_or_else(Impairment::p4_profile, Impairment::p4_profile_at_loss)
@@ -677,6 +694,11 @@ fn main() -> Result<()> {
         // would fail for want of a detector rather than for want of a
         // conviction.
         witnessing: args.witness || cheats.is_some(),
+        varied_profiles: match args.profile_mode {
+            ProfileMode::Auto => None,
+            ProfileMode::Cruise => Some(false),
+            ProfileMode::Varied => Some(true),
+        },
         cheats,
         // Implied by `--cheat` for the same reason `--witness` is: a modified
         // client every witness is forbidden to file against is detected and
@@ -985,12 +1007,21 @@ fn main() -> Result<()> {
         report.control_bytes / 1_000,
     );
     eprintln!(
-        "gates/p1-swarm: replication wire {} keyframes / {} deltas, keyframes {:.1}% of messages and {:.1}% of bytes; {} deltas_unanchored",
+        "gates/p1-swarm: replication wire {} keyframes / {} deltas, keyframes {:.1}% of messages and {:.1}% of bytes; {} deltas_unanchored ({} no anchor, {} missing newer, {} superseded, {} invalid)",
         report.keyframe_messages,
         report.delta_messages,
         report.keyframe_message_share * 100.0,
         report.keyframe_byte_share * 100.0,
         report.deltas_unanchored,
+        report.deltas_without_any_keyframe,
+        report.deltas_missing_newer_keyframe,
+        report.deltas_with_superseded_keyframe,
+        report.deltas_with_invalid_reference,
+    );
+    eprintln!(
+        "gates/p1-swarm: simulated hitches discarded {} keyframes / {} deltas after sender accounting",
+        report.keyframes_discarded_while_stalled,
+        report.deltas_discarded_while_stalled,
     );
     eprintln!(
         "gates/p1-swarm: least-travelled peer visited {} cells; {} packets shed; link carried {} delivered / {} dropped",

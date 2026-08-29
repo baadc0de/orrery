@@ -58,6 +58,8 @@ pub struct SwarmConfig {
     pub cell_edge_m: f32,
     /// Send cadence in Hz (D8: 20 Hz default against the 60 Hz sim tick).
     pub send_hz: u64,
+    /// State-send opportunities between sender-clocked keyframes.
+    pub keyframe_every_sends: u64,
     /// Link conditions.
     pub impairment: Impairment,
     /// Seed for impairment and the universe.
@@ -69,6 +71,12 @@ pub struct SwarmConfig {
     /// Run the witness pipeline: every peer watches its witness set's entities
     /// and re-executes their signed logs (P4's input).
     pub witnessing: bool,
+    /// Override whether bots use the four-profile witness stress mix.
+    ///
+    /// `None` preserves the shipping harness posture: witness runs are varied,
+    /// unwitnessed runs are cruise-only. `Some` exists to separate those two
+    /// variables in measurements.
+    pub varied_profiles: Option<bool>,
     /// The modified clients to field, if any.
     pub cheats: Option<CheatSpec>,
     /// Take every peer's witness out of shadow mode, so a raised window is
@@ -110,11 +118,13 @@ impl Default for SwarmConfig {
             seconds: 3_600,
             cell_edge_m: crate::bot::default_cell_edge_m(),
             send_hz: 20,
+            keyframe_every_sends: 20,
             impairment: Impairment::default(),
             seed: 1,
             campaign: false,
             late_join_tick: None,
             witnessing: false,
+            varied_profiles: None,
             cheats: None,
             enforcing: false,
             started_at_unix_secs: None,
@@ -260,6 +270,18 @@ pub struct PeerReport {
     pub undecodable: u64,
     /// Deltas dropped because their referenced keyframe was absent.
     pub deltas_unanchored: u64,
+    /// Of those, deltas seen before any keyframe for their entity.
+    pub deltas_without_any_keyframe: u64,
+    /// Of those, deltas whose newer referenced keyframe never arrived.
+    pub deltas_missing_newer_keyframe: u64,
+    /// Of those, deltas whose anchor had already been superseded.
+    pub deltas_with_superseded_keyframe: u64,
+    /// Of those, deltas whose keyframe age underflowed their tick.
+    pub deltas_with_invalid_reference: u64,
+    /// Keyframes this sender built, charged, then discarded during a hitch.
+    pub keyframes_discarded_while_stalled: u64,
+    /// Deltas this sender built, charged, then discarded during a hitch.
+    pub deltas_discarded_while_stalled: u64,
 }
 
 /// Everything needed to reproduce a run, and to say which code produced it.
@@ -276,6 +298,10 @@ pub struct RunIdentity {
     pub seed: u64,
     /// The link conditions the run was carried over, in full.
     pub impairment: Impairment,
+    /// State-send opportunities between keyframes in this run.
+    pub keyframe_every_sends: u64,
+    /// Whether the four-profile witness stress mix was dealt.
+    pub varied_profiles: bool,
     /// Target triple the harness was compiled for. P4's 500 hours are counted
     /// *across* platforms, so a report that does not name its own is unusable
     /// for the gate it is evidence for.
@@ -365,6 +391,18 @@ pub struct SwarmReport {
     pub total_undecodable: u64,
     /// Deltas no receiver could apply for want of their exact keyframe.
     pub deltas_unanchored: u64,
+    /// Unanchored deltas seen before any keyframe for their entity.
+    pub deltas_without_any_keyframe: u64,
+    /// Unanchored deltas whose newer referenced keyframe never arrived.
+    pub deltas_missing_newer_keyframe: u64,
+    /// Unanchored deltas whose referenced anchor had already been superseded.
+    pub deltas_with_superseded_keyframe: u64,
+    /// Unanchored deltas carrying an impossible keyframe reference.
+    pub deltas_with_invalid_reference: u64,
+    /// Keyframes built and charged, then discarded during simulated hitches.
+    pub keyframes_discarded_while_stalled: u64,
+    /// Deltas built and charged, then discarded during simulated hitches.
+    pub deltas_discarded_while_stalled: u64,
     /// Replica entities held across the swarm at the end of the run.
     pub total_replicas: usize,
     /// Whether the witness pipeline ran.
@@ -969,6 +1007,7 @@ impl Swarm {
             .map(|cheats| tampered_indices(config.peers, cheats.count))
             .unwrap_or_default();
 
+        let varied_profiles = config.varied_profiles.unwrap_or(config.witnessing);
         let mut bots: Vec<Bot> = (0..config.peers)
             .map(|index| {
                 Bot::new(BotSpec {
@@ -989,6 +1028,9 @@ impl Swarm {
                 })
             })
             .collect();
+        for bot in &mut bots {
+            bot.profile = crate::profile::Profile::for_index(bot.index, varied_profiles);
+        }
         if config.campaign && !bots.is_empty() {
             for seeded in campaign_rock_seeds(seed, bots.len()) {
                 bots[seeded.owner_slot]
@@ -996,7 +1038,7 @@ impl Swarm {
             }
         }
         for bot in &mut bots {
-            bot.set_replication_send_hz(config.send_hz);
+            bot.set_keyframe_every_sends(config.keyframe_every_sends);
         }
         if config.delta_stats {
             for bot in &mut bots {
@@ -1846,6 +1888,8 @@ impl Swarm {
                 let tagged = bot.tracked();
                 let proxied = bot.proxies();
                 let undecodable = bot.replica_counters().undecodable;
+                let replica = bot.replica_counters();
+                let replication_wire = bot.replication_wire_counters();
                 let witness = bot.witness_counters();
                 let links = bot.link_counters();
                 let convicted_at_tick = docket.first_conviction(bot.node);
@@ -1897,7 +1941,14 @@ impl Swarm {
                     tagged,
                     proxied,
                     undecodable,
-                    deltas_unanchored: bot.replica_counters().deltas_unanchored,
+                    deltas_unanchored: replica.deltas_unanchored,
+                    deltas_without_any_keyframe: replica.deltas_without_any_keyframe,
+                    deltas_missing_newer_keyframe: replica.deltas_missing_newer_keyframe,
+                    deltas_with_superseded_keyframe: replica.deltas_with_superseded_keyframe,
+                    deltas_with_invalid_reference: replica.deltas_with_invalid_reference,
+                    keyframes_discarded_while_stalled: replication_wire
+                        .keyframes_discarded_while_stalled,
+                    deltas_discarded_while_stalled: replication_wire.deltas_discarded_while_stalled,
                 }
             })
             .collect();
@@ -1933,6 +1984,8 @@ impl Swarm {
                 total.delta_messages += peer.delta_messages;
                 total.keyframe_bytes += peer.keyframe_bytes;
                 total.delta_bytes += peer.delta_bytes;
+                total.keyframes_discarded_while_stalled += peer.keyframes_discarded_while_stalled;
+                total.deltas_discarded_while_stalled += peer.deltas_discarded_while_stalled;
                 total
             },
         );
@@ -1945,6 +1998,11 @@ impl Swarm {
             identity: RunIdentity {
                 seed: self.config.seed,
                 impairment: self.config.impairment,
+                keyframe_every_sends: self.config.keyframe_every_sends,
+                varied_profiles: self
+                    .config
+                    .varied_profiles
+                    .unwrap_or(self.config.witnessing),
                 target: env!("P1_SWARM_TARGET"),
                 commit: env!("P1_SWARM_COMMIT"),
             },
@@ -1975,6 +2033,24 @@ impl Swarm {
             stranded_in_flight: self.router.in_flight(),
             total_undecodable: per_peer.iter().map(|p| p.undecodable).sum(),
             deltas_unanchored: per_peer.iter().map(|p| p.deltas_unanchored).sum(),
+            deltas_without_any_keyframe: per_peer
+                .iter()
+                .map(|p| p.deltas_without_any_keyframe)
+                .sum(),
+            deltas_missing_newer_keyframe: per_peer
+                .iter()
+                .map(|p| p.deltas_missing_newer_keyframe)
+                .sum(),
+            deltas_with_superseded_keyframe: per_peer
+                .iter()
+                .map(|p| p.deltas_with_superseded_keyframe)
+                .sum(),
+            deltas_with_invalid_reference: per_peer
+                .iter()
+                .map(|p| p.deltas_with_invalid_reference)
+                .sum(),
+            keyframes_discarded_while_stalled: replication_wire.keyframes_discarded_while_stalled,
+            deltas_discarded_while_stalled: replication_wire.deltas_discarded_while_stalled,
             total_replicas: per_peer.iter().map(|p| p.replicas).sum(),
             witnessing: self.config.witnessing,
             external: self
@@ -2929,6 +3005,8 @@ mod tests {
             identity: RunIdentity {
                 seed: 1,
                 impairment: Impairment::p4_profile(),
+                keyframe_every_sends: 20,
+                varied_profiles: true,
                 target: "test",
                 commit: "test",
             },
@@ -2952,6 +3030,12 @@ mod tests {
             stranded_in_flight: 0,
             total_undecodable: 0,
             deltas_unanchored: 0,
+            deltas_without_any_keyframe: 0,
+            deltas_missing_newer_keyframe: 0,
+            deltas_with_superseded_keyframe: 0,
+            deltas_with_invalid_reference: 0,
+            keyframes_discarded_while_stalled: 0,
+            deltas_discarded_while_stalled: 0,
             total_replicas: 992,
             witnessing: true,
             external: Vec::new(),
@@ -3006,6 +3090,39 @@ mod tests {
                 tracked: 15,
             }),
         }
+    }
+
+    #[test]
+    fn profile_mix_can_be_measured_independently_of_witness_traffic() {
+        let cruise = Swarm::new(SwarmConfig {
+            peers: 4,
+            witnessing: true,
+            varied_profiles: Some(false),
+            ..SwarmConfig::default()
+        });
+        assert!(
+            cruise
+                .bots
+                .iter()
+                .all(|bot| bot.profile == crate::profile::Profile::Cruise),
+            "witness traffic could not be isolated from the stall profile"
+        );
+
+        let varied = Swarm::new(SwarmConfig {
+            peers: 4,
+            witnessing: false,
+            varied_profiles: Some(true),
+            ..SwarmConfig::default()
+        });
+        assert_eq!(
+            varied
+                .bots
+                .iter()
+                .map(|bot| bot.profile)
+                .collect::<Vec<_>>(),
+            crate::profile::Profile::ALL,
+            "the profile load could not be measured without witness traffic"
+        );
     }
 
     /// Clauses `report` raises, by name.
