@@ -16,6 +16,7 @@ import base64
 import concurrent.futures
 import csv
 import datetime as dt
+import fnmatch
 import gzip
 import json
 import os
@@ -36,6 +37,8 @@ IDS_FILE = Path(os.environ.get("P2_EPHEMERAL_INSTANCE_IDS", "/tmp/orrery-p2-inst
 SHA = os.environ.get("GITHUB_SHA", "")
 MAX_PARALLEL = int(os.environ.get("P2_QUALIFICATION_PARALLEL", "8"))
 RETRIES = int(os.environ.get("P2_SPOT_RETRIES", "2"))
+THROTTLE_RETRIES = int(os.environ.get("P2_RUN_INSTANCES_THROTTLE_RETRIES", "4"))
+THROTTLE_BACKOFF_SECONDS = float(os.environ.get("P2_RUN_INSTANCES_THROTTLE_BACKOFF_SECONDS", "2"))
 TAG_KEY = "orrery-ci-ephemeral"
 TAG_VALUE = "true"
 QUAL_MARKER = "ORRERY_P2_QUALIFICATION="
@@ -52,11 +55,29 @@ class ControllerError(RuntimeError):
     pass
 
 
+class RunInstancesThrottled(ControllerError):
+    """The EC2 launch control plane rate-limited every bounded retry."""
+
+
+def command_for_error(argv: list[str]) -> str:
+    """Render an AWS command without burying its error behind user data."""
+    rendered: list[str] = []
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            rendered.append(f"<redacted {len(arg)}-byte user data>")
+            redact_next = False
+        else:
+            rendered.append(arg)
+            redact_next = arg == "--user-data"
+    return " ".join(rendered)
+
+
 def run(argv: list[str], *, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     proc = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
     if check and proc.returncode:
         detail = proc.stderr.strip() or proc.stdout.strip()
-        raise ControllerError(f"{' '.join(argv)} failed ({proc.returncode}): {detail}")
+        raise ControllerError(f"failed ({proc.returncode}): {detail}; command: {command_for_error(argv)}")
     return proc
 
 
@@ -111,6 +132,81 @@ def signal_handler(signum: int, _frame: Any) -> None:
     raise SystemExit(128 + signum)
 
 
+def terraform_statement(code: str, sid: str) -> str:
+    """Return one policy statement without relying on a whole-file grep."""
+    for match in re.finditer(r"\bstatement\s*\{", code):
+        start = match.start()
+        depth = 0
+        for index in range(match.end() - 1, len(code)):
+            if code[index] == "{":
+                depth += 1
+            elif code[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    statement = code[start:index + 1]
+                    if re.search(rf'\bsid\s*=\s*"{re.escape(sid)}"', statement):
+                        return statement
+                    break
+    raise ControllerError(f"compute policy has no {sid} statement")
+
+
+def terraform_variable_default(code: str, name: str) -> list[str]:
+    """Read the checked-out default used by the policy's referenced variable."""
+    variable = re.search(rf'\bvariable\s+"{re.escape(name)}"\s*\{{', code)
+    if not variable:
+        raise ControllerError(f"variables.tf has no {name} variable referenced by compute policy")
+    depth = 0
+    block = ""
+    for index in range(variable.end() - 1, len(code)):
+        if code[index] == "{":
+            depth += 1
+        elif code[index] == "}":
+            depth -= 1
+        block += code[index]
+        if depth == 0:
+            break
+    default = re.search(r"\bdefault\s*=\s*\[(?P<values>.*?)\]", block, flags=re.DOTALL)
+    if not default:
+        raise ControllerError(f"variables.tf {name} has no literal list default")
+    values = re.findall(r'"([^"\\]+)"', default.group("values"))
+    if not values:
+        raise ControllerError(f"variables.tf {name} default has no launch patterns")
+    return values
+
+
+def policy_instance_type_patterns() -> tuple[list[str], list[str]]:
+    """Derive the allowed and denied EC2 type globs from the launch policy."""
+    policy = (Path(__file__).parent / "iam-compute-policy.tf").read_text(encoding="utf-8")
+    variables = (Path(__file__).parent / "variables.tf").read_text(encoding="utf-8")
+    launch = terraform_statement(policy, "LaunchTaggedInstance")
+    if '"ec2:RunInstances"' not in launch or 'variable = "ec2:InstanceType"' not in launch:
+        raise ControllerError("LaunchTaggedInstance does not constrain ec2:RunInstances by ec2:InstanceType")
+    source = re.search(r"\bvalues\s*=\s*var\.([A-Za-z][A-Za-z0-9_]*)", launch)
+    if not source:
+        raise ControllerError("LaunchTaggedInstance must derive its instance-type patterns from a Terraform variable")
+    deny = terraform_statement(policy, "NoMetalSizes")
+    if '"ec2:RunInstances"' not in deny or 'variable = "ec2:InstanceType"' not in deny:
+        raise ControllerError("NoMetalSizes does not constrain ec2:RunInstances by ec2:InstanceType")
+    deny_values = re.search(r"\bvalues\s*=\s*\[(?P<values>.*?)\]", deny, flags=re.DOTALL)
+    if not deny_values:
+        raise ControllerError("NoMetalSizes has no literal instance-type pattern list")
+    denied = re.findall(r'"([^"\\]+)"', deny_values.group("values"))
+    if not denied:
+        raise ControllerError("NoMetalSizes has no denied instance-type patterns")
+    return terraform_variable_default(variables, source.group(1)), denied
+
+
+def filter_launchable_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Intersect capability discovery with the exact checked-out launch policy."""
+    allowed, denied = policy_instance_type_patterns()
+    return [
+        candidate
+        for candidate in candidates
+        if any(fnmatch.fnmatchcase(candidate["instance_type"], pattern) for pattern in allowed)
+        and not any(fnmatch.fnmatchcase(candidate["instance_type"], pattern) for pattern in denied)
+    ]
+
+
 def discover_candidates() -> list[dict[str, Any]]:
     data = aws_json(
         "ec2",
@@ -141,9 +237,10 @@ def discover_candidates() -> list[dict[str, Any]]:
                 "local_nvme_gb": storage["TotalSizeInGB"],
             }
         )
+    candidates = filter_launchable_candidates(candidates)
     candidates.sort(key=lambda row: row["instance_type"])
     if not candidates:
-        raise ControllerError("capability discovery returned no 8-vCPU local-NVMe SSD candidates")
+        raise ControllerError("policy-constrained capability discovery returned no 8-vCPU local-NVMe SSD candidates")
     return candidates
 
 
@@ -342,27 +439,49 @@ fi
 '''
 
 
+def is_run_instances_throttled(exc: ControllerError) -> bool:
+    return "(RequestLimitExceeded)" in str(exc) and "RunInstances" in str(exc)
+
+
 def launch(instance_type: str, ami: str, user_data: str, label: str) -> str:
     tags = f"ResourceType=instance,Tags=[{{Key={TAG_KEY},Value={TAG_VALUE}}},{{Key=Name,Value=orrery-p2-{label}}}]"
     volume_tags = f"ResourceType=volume,Tags=[{{Key={TAG_KEY},Value={TAG_VALUE}}}]"
     network_tags = f"ResourceType=network-interface,Tags=[{{Key={TAG_KEY},Value={TAG_VALUE}}}]"
     request_tags = f"ResourceType=spot-instances-request,Tags=[{{Key={TAG_KEY},Value={TAG_VALUE}}}]"
-    data = aws_json(
-        "ec2", "run-instances",
-        "--image-id", ami,
-        "--instance-type", instance_type,
-        "--count", "1",
-        "--instance-market-options", "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}",
-        "--instance-initiated-shutdown-behavior", "terminate",
-        "--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
-        "--block-device-mappings", "DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true,Encrypted=true}",
-        "--tag-specifications", tags, volume_tags, network_tags, request_tags,
-        "--user-data", user_data,
-        timeout=180,
-    )
-    instance_id = data["Instances"][0]["InstanceId"]
-    remember(instance_id)
-    return instance_id
+    for attempt in range(1, THROTTLE_RETRIES + 2):
+        try:
+            data = aws_json(
+                "ec2", "run-instances",
+                "--image-id", ami,
+                "--instance-type", instance_type,
+                "--count", "1",
+                "--instance-market-options", "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}",
+                "--instance-initiated-shutdown-behavior", "terminate",
+                "--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
+                "--block-device-mappings", "DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true,Encrypted=true}",
+                "--tag-specifications", tags, volume_tags, network_tags, request_tags,
+                "--user-data", user_data,
+                timeout=180,
+            )
+        except ControllerError as exc:
+            if not is_run_instances_throttled(exc):
+                raise
+            if attempt > THROTTLE_RETRIES:
+                raise RunInstancesThrottled(
+                    f"RunInstances RequestLimitExceeded after {attempt} bounded attempts for {instance_type}: {exc}"
+                ) from exc
+            delay = THROTTLE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(
+                f"RunInstances RequestLimitExceeded for {instance_type}; retrying in {delay:g}s "
+                f"({attempt}/{THROTTLE_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            continue
+        instance_id = data["Instances"][0]["InstanceId"]
+        remember(instance_id)
+        return instance_id
+    raise ControllerError("unreachable RunInstances retry exhaustion")
 
 
 def state_and_reason(instance_id: str) -> tuple[str, str]:
@@ -439,6 +558,8 @@ def qualify_once(candidate: dict[str, Any], amis: dict[str, str], attempt: int) 
         )
         payload["status"] = "qualified" if payload.get("qualified") else "rejected"
         return payload
+    except RunInstancesThrottled as exc:
+        return {**candidate, "status": "throttled", "qualified": False, "reason": str(exc)}
     except Exception as exc:  # noqa: BLE001 - each loser must remain in the table
         return {**candidate, "status": "error", "qualified": False, "reason": str(exc)}
     finally:
@@ -530,6 +651,21 @@ def write_nonverdict(
                 "reason": "the D16 latency verdict was not evaluated because no selected device passed fio job A",
             },
         }
+    if result == "throttled":
+        throttled_count = sum(row.get("status") == "throttled" for row in rows)
+        proofs = {
+            "device_qualification": {
+                "qualified": None,
+                "candidate_count": len(rows),
+                "qualified_count": qualified_count,
+                "throttled_count": throttled_count,
+                "selected": None,
+            },
+            "latency": {
+                "gate": "not_evaluated",
+                "reason": "the D16 latency verdict was not evaluated because RunInstances throttling prevented a complete qualification pass",
+            },
+        }
     artifact = {
         "kind": "p2_two_process_kill9_gate",
         "created_at": dt.datetime.now(dt.UTC).isoformat(),
@@ -570,6 +706,14 @@ def select_gate_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         )
         write_nonverdict("interrupted", reason, rows)
         return None
+    throttled_count = sum(row.get("status") == "throttled" for row in rows)
+    if throttled_count:
+        reason = (
+            f"device qualification could not complete: {throttled_count} of {len(rows)} candidates exhausted "
+            "bounded RunInstances RequestLimitExceeded retries; the D16 latency verdict was not evaluated"
+        )
+        write_nonverdict("throttled", reason, rows)
+        raise ControllerError(reason)
     if qualified_count == 0:
         reason = (
             f"device qualification failed: zero of {len(rows)} candidates qualified; "
@@ -652,6 +796,130 @@ def controller() -> int:
 
 def self_test() -> int:
     candidate = {"instance_type": "synthetic.2xlarge", "architecture": "x86_64", "vcpus": 8, "memory_mib": 16384, "local_nvme_gb": 474}
+
+    def capability_item(instance_type: str) -> dict[str, Any]:
+        return {
+            "InstanceType": instance_type,
+            "InstanceStorageInfo": {"NvmeSupport": "required", "TotalSizeInGB": 474, "Disks": [{"Type": "ssd"}]},
+            "VCpuInfo": {"DefaultVCpus": 8},
+            "MemoryInfo": {"SizeInMiB": 16384},
+            "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+        }
+
+    # Discovery must apply the policy, not a second hand-written type list.
+    # Two synthetic types exercise both sides of the policy: t3 is absent from
+    # LaunchTaggedInstance's allow-list, while c6gd.metal matches that list but
+    # is refused by NoMetalSizes.
+    original_aws_json = aws_json
+
+    def discovery_fixture(*args: str, **_kwargs: Any) -> Any:
+        if args[:2] == ("ec2", "describe-instance-types"):
+            return {"InstanceTypes": [
+                capability_item("c6gd.2xlarge"),
+                capability_item("t3.2xlarge"),
+                capability_item("c6gd.metal"),
+            ]}
+        raise AssertionError(f"unexpected self-test AWS call: {args}")
+
+    globals()["aws_json"] = discovery_fixture
+    try:
+        discovered = discover_candidates()
+    finally:
+        globals()["aws_json"] = original_aws_json
+    discovered_types = [row["instance_type"] for row in discovered]
+    if discovered_types != ["c6gd.2xlarge"]:
+        unlaunchable = sorted(set(discovered_types) - {"c6gd.2xlarge"})
+        raise ControllerError(
+            "self-test: policy intersection retained "
+            f"{len(unlaunchable)} unlaunchable candidate(s): {','.join(unlaunchable) or 'none'}"
+        )
+
+    echoed = command_for_error(["aws", "ec2", "run-instances", "--user-data", "x" * 2048])
+    if "x" * 32 in echoed or "<redacted 2048-byte user data>" not in echoed:
+        raise ControllerError("self-test: RunInstances error echo no longer redacts the 2048-byte user-data argument")
+
+    # RequestLimitExceeded is a controller outcome, not a hardware verdict:
+    # it retries with exponential backoff and, after exhaustion, keeps its own
+    # type through qualify_once rather than falling into the generic error row.
+    original_remember = remember
+    original_sleep = time.sleep
+    original_throttle_retries = THROTTLE_RETRIES
+    original_backoff = THROTTLE_BACKOFF_SECONDS
+    throttle_calls: list[tuple[str, ...]] = []
+    sleeps: list[float] = []
+
+    def throttled_then_success(*args: str, **_kwargs: Any) -> Any:
+        throttle_calls.append(args)
+        if len(throttle_calls) == 1:
+            raise ControllerError("failed (254): aws: (RequestLimitExceeded) RunInstances request limit exceeded")
+        return {"Instances": [{"InstanceId": "i-self-test"}]}
+
+    globals()["aws_json"] = throttled_then_success
+    globals()["remember"] = lambda _instance_id: None
+    globals()["THROTTLE_RETRIES"] = 1
+    globals()["THROTTLE_BACKOFF_SECONDS"] = 0.25
+    time.sleep = sleeps.append
+    retry_failure = ""
+    instance_id = ""
+    try:
+        instance_id = launch("c6gd.2xlarge", "ami-self-test", "self-test", "retry")
+    except ControllerError as exc:
+        retry_failure = str(exc)
+    finally:
+        globals()["aws_json"] = original_aws_json
+        globals()["remember"] = original_remember
+        globals()["THROTTLE_RETRIES"] = original_throttle_retries
+        globals()["THROTTLE_BACKOFF_SECONDS"] = original_backoff
+        time.sleep = original_sleep
+    if retry_failure or instance_id != "i-self-test" or len(throttle_calls) != 2 or sleeps != [0.25]:
+        raise ControllerError(
+            "self-test: RequestLimitExceeded retry count was "
+            f"{len(throttle_calls)} with backoffs {sleeps}; expected 2 launch attempts and [0.25]; "
+            f"launch outcome was {retry_failure or instance_id!r}"
+        )
+
+    exhausted_calls = 0
+
+    def always_throttled(*_args: str, **_kwargs: Any) -> Any:
+        nonlocal exhausted_calls
+        exhausted_calls += 1
+        raise ControllerError("failed (254): aws: (RequestLimitExceeded) RunInstances request limit exceeded")
+
+    globals()["aws_json"] = always_throttled
+    globals()["THROTTLE_RETRIES"] = 1
+    globals()["THROTTLE_BACKOFF_SECONDS"] = 0
+    original_sleep = time.sleep
+    time.sleep = lambda _seconds: None
+    try:
+        launch("c6gd.2xlarge", "ami-self-test", "self-test", "exhausted")
+    except RunInstancesThrottled:
+        pass
+    else:
+        raise ControllerError("self-test: exhausted RequestLimitExceeded did not produce RunInstancesThrottled")
+    finally:
+        globals()["aws_json"] = original_aws_json
+        globals()["THROTTLE_RETRIES"] = original_throttle_retries
+        globals()["THROTTLE_BACKOFF_SECONDS"] = original_backoff
+        time.sleep = original_sleep
+    if exhausted_calls != 2:
+        raise ControllerError(
+            f"self-test: exhausted RequestLimitExceeded made {exhausted_calls} launch attempts; expected 2"
+        )
+
+    original_launch = launch
+    globals()["launch"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RunInstancesThrottled("RunInstances RequestLimitExceeded after 2 bounded attempts")
+    )
+    try:
+        throttled = qualify_once(candidate, {"x86_64": "ami-self-test"}, 1)
+    finally:
+        globals()["launch"] = original_launch
+    if throttled.get("status") != "throttled":
+        raise ControllerError(
+            "self-test: exhausted RequestLimitExceeded was recorded as "
+            f"{throttled.get('status')!r}, not the distinct throttled outcome"
+        )
+
     q = qualification_user_data(candidate)
     g = gate_user_data("a" * 40)
     required_q = [
