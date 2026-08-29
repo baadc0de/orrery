@@ -15,11 +15,11 @@
 
 use bevy_ecs::prelude::*;
 use bevy_replicon::server::uplink::ComponentDiff;
-use orrery_protocol::{DiffUplink, GridId, RecordKind, Tick};
+use orrery_protocol::{DiffUplink, GridId, RecordKind};
 use orrery_spatial::plugin::Cell;
 
 pub use orrery_authority::LocallyAuthoritative;
-use orrery_authority::{Authority, AuthorityPhase};
+use orrery_authority::{Authority, AuthorityPhase, ContactTick};
 
 use crate::config::PersistClientConfig;
 use crate::uplink::UplinkScheduler;
@@ -40,7 +40,7 @@ impl PersistId {
     }
 }
 
-/// Per-entity diff sequence, for idempotent `(entity, tick)`-keyed records.
+/// Per-entity client sequence, independent of the universe tick carried on the wire.
 #[derive(Debug, Default, Resource)]
 pub struct UplinkSeq {
     /// The next diff sequence per entity.
@@ -57,6 +57,7 @@ pub fn feed_uplink(
     cfg: Res<PersistClientConfig>,
     mut scheduler: ResMut<UplinkScheduler>,
     mut seq: ResMut<UplinkSeq>,
+    universe_tick: Res<ContactTick>,
     mut diffs: MessageReader<ComponentDiff>,
     entities: Query<(Entity, &PersistId, &Cell, &Authority, &AuthorityPhase)>,
     authorities: Query<(), With<LocallyAuthoritative>>,
@@ -79,17 +80,17 @@ pub fn feed_uplink(
         scheduler.register(persist_id.0, *cfg.uplink_hz.end());
 
         let seq_num = seq.next.entry(entity).or_insert(0);
-        let tick = *seq_num;
+        let sequence = *seq_num;
         *seq_num += 1;
 
         scheduler.queue(DiffUplink {
             cell: cell.0,
             grid: GridId::ROOT,
             entity: persist_id.0,
-            tick: Tick::new(tick),
+            tick: universe_tick.tick,
             kind: RecordKind::ComponentDiff,
             payload: diff.payload.clone(),
-            seq: tick,
+            seq: sequence,
             lease_id: Some(lease_id),
             authority_seq: Some(authority.seq),
         });
@@ -101,13 +102,15 @@ mod tests {
     use super::*;
     use bevy_app::prelude::*;
     use bevy_replicon::shared::replication::registry::FnsId;
-    use orrery_protocol::CellId;
+    use orrery_protocol::{CellId, Tick};
+    use std::time::Duration;
 
     fn app() -> App {
         let mut app = App::new();
         app.init_resource::<UplinkSeq>()
             .init_resource::<UplinkScheduler>()
             .init_resource::<PersistClientConfig>()
+            .init_resource::<ContactTick>()
             .add_message::<ComponentDiff>()
             .add_systems(Update, feed_uplink);
         app
@@ -147,6 +150,86 @@ mod tests {
         assert!(scheduler.has_pending(orrery_protocol::PersistId::new(1)));
         let seq = app.world().resource::<UplinkSeq>();
         assert_eq!(seq.next.get(&entity), Some(&1));
+    }
+
+    #[test]
+    fn diff_uplink_wire_carries_the_executors_universe_tick() {
+        let mut app = app();
+        app.init_resource::<bevy_time::Time>()
+            .init_resource::<crate::gateway::GatewaySession>()
+            .add_systems(Update, crate::uplink::flush_uplink.after(feed_uplink));
+
+        let session_entity = app
+            .world_mut()
+            .spawn(aeronet_io::Session::new(
+                bevy_platform::time::Instant::now(),
+                1024,
+            ))
+            .id();
+        {
+            let mut session = app
+                .world_mut()
+                .resource_mut::<crate::gateway::GatewaySession>();
+            session.session = Some(session_entity);
+            session.state = crate::gateway::GatewayState::Connected;
+        }
+
+        let entity = app
+            .world_mut()
+            .spawn((
+                PersistId::new(9),
+                Cell(CellId::ROOT),
+                LocallyAuthoritative,
+                Authority {
+                    holder: None,
+                    seq: Default::default(),
+                },
+                AuthorityPhase::LocalGranted {
+                    lease_id: orrery_protocol::LeaseId(1),
+                    expires_at_ms: 10_000,
+                },
+            ))
+            .id();
+        let executor_tick = Tick::new(8_675_309);
+        app.world_mut().resource_mut::<ContactTick>().tick = executor_tick;
+        app.world_mut()
+            .resource_mut::<Messages<ComponentDiff>>()
+            .write(ComponentDiff {
+                entity,
+                fns_id: FnsId::new(0),
+                payload: bytes::Bytes::from_static(b"hp=50"),
+            });
+
+        // The first flush establishes the scheduler's elapsed-time baseline;
+        // the second gives a 4 Hz entity one send credit and puts the diff on
+        // the real datagram wire path.
+        app.update();
+        app.world_mut()
+            .resource_mut::<bevy_time::Time>()
+            .advance_by(Duration::from_millis(250));
+        app.update();
+
+        let sent = &app
+            .world()
+            .get::<aeronet_io::Session>(session_entity)
+            .expect("connected session")
+            .send;
+        assert_eq!(sent.len(), 1, "one diff reached the datagram wire");
+        let (channel, payload) = orrery_net::channels::untag(&sent[0]).expect("tagged datagram");
+        assert_eq!(channel, orrery_net::channels::Channel::State);
+        let message: orrery_protocol::GatewayMsg =
+            postcard::from_bytes(payload).expect("DiffUplink wire frame");
+        let orrery_protocol::GatewayMsg::Diff { diff } = message else {
+            panic!("datagram was not a DiffUplink");
+        };
+        assert_eq!(
+            diff.tick, executor_tick,
+            "DiffUplink.tick on the wire is not the executor's universe tick"
+        );
+        assert_eq!(
+            diff.seq, 0,
+            "DiffUplink.seq no longer starts with the per-entity client sequence"
+        );
     }
 
     #[test]
