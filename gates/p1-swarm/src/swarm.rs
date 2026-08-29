@@ -1595,7 +1595,7 @@ impl Swarm {
         for bot in &mut self.bots {
             let others: Vec<PeerEntry> = coverage
                 .iter()
-                .filter(|(node, _)| **node != bot.node)
+                .filter(|entry| entry.0 != bot.node)
                 .map(|(node, cells)| PeerEntry {
                     node: *node,
                     cells: cells.clone(),
@@ -1642,7 +1642,7 @@ impl Swarm {
         for bot in &mut self.bots {
             let others: Vec<PeerEntry> = coverage
                 .iter()
-                .filter(|(node, _)| **node != bot.node)
+                .filter(|entry| entry.0 != bot.node)
                 .map(|(node, cells)| PeerEntry {
                     node: *node,
                     cells: cells.clone(),
@@ -1780,9 +1780,13 @@ impl Swarm {
     /// swept arm is deliberately confined to this harness seam: #692 landed
     /// the primitive, while production host/client propagation remains a
     /// separate follow-up after this measurement says whether it is affordable.
-    fn active_interest_coverage(&mut self) -> BTreeMap<NodeId, Vec<CellId>> {
+    fn active_interest_coverage(&mut self) -> Vec<(NodeId, Vec<CellId>)> {
         let swept = self.config.swept_interest_margin;
-        let mut coverage = BTreeMap::new();
+        // Preserve the old manifest order: bots by stable seat, followed by
+        // exteriors by stable seat. `set_island` installs links and audiences
+        // in this order, so sorting by transport identity changes simulation
+        // behaviour even when every measurement flag is off.
+        let mut coverage = Vec::with_capacity(self.total_peers());
         for bot in &mut self.bots {
             let cells = if swept {
                 bot.swept_interest_cells(INTEREST_REFRESH_PERIOD_S)
@@ -1792,14 +1796,14 @@ impl Swarm {
             if let Some(stats) = &mut self.interest_margin_stats {
                 stats.observe(cells.len());
             }
-            coverage.insert(bot.node, cells);
+            coverage.push((bot.node, cells));
         }
         for exterior in self.exteriors.values() {
             let cells = exterior.cell().neighbors27();
             if let Some(stats) = &mut self.interest_margin_stats {
                 stats.observe(cells.len());
             }
-            coverage.insert(exterior.node, cells);
+            coverage.push((exterior.node, cells));
         }
         coverage
     }
@@ -3278,6 +3282,34 @@ impl SwarmReport {
 mod tests {
     use super::*;
     use orrery_games::regolith::{archetype::Archetype, CAMPAIGN_CELL_EDGE_M};
+
+    #[test]
+    fn ordinary_interest_coverage_preserves_stable_seat_order() {
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 8,
+            swept_interest_margin: false,
+            ..SwarmConfig::default()
+        });
+        let expected = swarm
+            .bots
+            .iter()
+            .map(|bot| bot.node)
+            .collect::<Vec<_>>();
+
+        let actual = swarm
+            .active_interest_coverage()
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected, "flags-off manifests retain main's order");
+        let mut sorted = expected.clone();
+        sorted.sort_unstable();
+        assert_ne!(
+            expected, sorted,
+            "fixture must detect accidental transport-key sorting"
+        );
+    }
 
     #[test]
     fn transport_close_releases_only_after_the_two_second_grace() {
