@@ -314,6 +314,95 @@ impl CellId {
         out
     }
 
+    /// The 27-cell AOI swept from this cell through one interest-refresh
+    /// period, along the peer's velocity vector.
+    ///
+    /// `offset_m` is the peer's position relative to this committed cell's
+    /// minimum corner. Hysteresis may put it just outside the cell. The
+    /// projected destination is
+    ///
+    /// `offset_m + velocity_mps * refresh_period_s`.
+    ///
+    /// The returned set is the union of the 27-cell neighbourhoods along the
+    /// segment's voxel path. It always contains [`CellId::neighbors27`], grows
+    /// only on axes the velocity can cross during the period, and is clamped
+    /// at the encoded volume edge.
+    /// Supplying the real offset is what lets a slow craft that
+    /// cannot reach a boundary pay no extra cells; a position-free bound would
+    /// have to add a whole layer for any non-zero velocity.
+    ///
+    /// This predictive margin and immediate `InterestCellCrossing` delivery
+    /// solve different parts of #653: the sweep pages cells in before a likely
+    /// crossing, while the event corrects the roster at the actual crossing
+    /// instead of waiting for the bulk refresh. Neither makes the other
+    /// redundant.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless all vector components and `refresh_period_s` are finite,
+    /// `refresh_period_s >= 0`, and `cell_edge_m` is finite and positive.
+    #[must_use]
+    pub fn swept_neighbors27(
+        self,
+        offset_m: glam::DVec3,
+        velocity_mps: glam::DVec3,
+        refresh_period_s: f64,
+        cell_edge_m: f64,
+    ) -> Vec<Self> {
+        assert!(cell_edge_m.is_finite() && cell_edge_m > 0.0);
+        assert!(refresh_period_s.is_finite() && refresh_period_s >= 0.0);
+        assert!(offset_m.is_finite() && velocity_mps.is_finite());
+
+        let destination_offset = offset_m + velocity_mps * refresh_period_s;
+        assert!(destination_offset.is_finite());
+        let origin_geometric = IVec3::new(
+            (offset_m.x / cell_edge_m).floor() as i32,
+            (offset_m.y / cell_edge_m).floor() as i32,
+            (offset_m.z / cell_edge_m).floor() as i32,
+        );
+        let destination_geometric = IVec3::new(
+            (destination_offset.x / cell_edge_m).floor() as i32,
+            (destination_offset.y / cell_edge_m).floor() as i32,
+            (destination_offset.z / cell_edge_m).floor() as i32,
+        );
+        let (origin, level) = self.coords();
+        let mut crossings = Vec::new();
+        for axis in 0..3 {
+            let start = origin_geometric[axis];
+            let end = destination_geometric[axis];
+            let speed = velocity_mps[axis];
+            if end > start {
+                for boundary in (start + 1)..=end {
+                    let at = (f64::from(boundary) * cell_edge_m - offset_m[axis]) / speed;
+                    crossings.push((at, axis, 1));
+                }
+            } else if end < start {
+                for boundary in ((end + 1)..=start).rev() {
+                    let at = (f64::from(boundary) * cell_edge_m - offset_m[axis]) / speed;
+                    crossings.push((at, axis, -1));
+                }
+            }
+        }
+        crossings.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
+
+        let mut out = self.neighbors27();
+        let mut geometric = origin_geometric;
+        for (_, axis, step) in crossings {
+            geometric[axis] += step;
+            let relative = geometric - origin_geometric;
+            let centre = origin.saturating_add(relative);
+            let Ok(centre) = Self::from_coords(centre, level) else {
+                continue;
+            };
+            for cell in centre.neighbors27() {
+                if !out.contains(&cell) {
+                    out.push(cell);
+                }
+            }
+        }
+        out
+    }
+
     /// The contiguous u64 range of every cell in this cell's subtree (itself
     /// included) — the storage range-scan key span (D5, D11).
     ///
@@ -533,6 +622,60 @@ mod tests {
         assert!(n.contains(&cell));
         for c in n {
             assert_eq!(c.level(), 21);
+        }
+    }
+
+    #[test]
+    fn a_stationary_sweep_is_exactly_neighbors27() {
+        let cell = CellId::from_coords(IVec3::new(2, -1, 8), INTEREST_LEVEL).unwrap();
+        let edge_m = DEFAULT_CELL_EDGE_M;
+        // The offset is deliberately outside the committed cell: hysteresis
+        // can hold that state, and zero velocity must still cost nothing.
+        let offset_m = glam::DVec3::splat(edge_m * 1.05);
+
+        assert_eq!(
+            cell.swept_neighbors27(offset_m, glam::DVec3::ZERO, 1.0, edge_m),
+            cell.neighbors27(),
+            "zero velocity must add zero interest cells"
+        );
+    }
+
+    #[test]
+    fn every_sweep_is_a_superset_of_neighbors27() {
+        let cell = CellId::from_coords(IVec3::new(2, -1, 8), INTEREST_LEVEL).unwrap();
+        let edge_m = DEFAULT_CELL_EDGE_M;
+        let offsets = [edge_m * 0.01, edge_m / 2.0, edge_m * 0.99];
+        let velocities = [
+            -4.0 * edge_m,
+            -edge_m / 2.0,
+            0.0,
+            edge_m / 2.0,
+            4.0 * edge_m,
+        ];
+
+        for x in offsets {
+            for y in offsets {
+                for z in offsets {
+                    for vx in velocities {
+                        for vy in velocities {
+                            for vz in velocities {
+                                let swept = cell.swept_neighbors27(
+                                    glam::DVec3::new(x, y, z),
+                                    glam::DVec3::new(vx, vy, vz),
+                                    1.0,
+                                    edge_m,
+                                );
+                                for baseline in cell.neighbors27() {
+                                    assert!(
+                                        swept.contains(&baseline),
+                                        "sweep at offset ({x}, {y}, {z}) and velocity ({vx}, {vy}, {vz}) removed baseline cell {baseline}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{IssuerKey, IssuerKeyId, Signature};
-use crate::{AccountId, CellId, Epoch, GridId, NodeId};
+use crate::{AccountId, CellId, Epoch, GridId, NodeId, SeqPair, Tick};
 
 /// A coordinator-allocated island identifier (docs/02-networking.md §3).
 ///
@@ -151,9 +151,10 @@ pub const INTEREST_GRANT_V1_VERSION: u8 = 1;
 pub const MAX_INTEREST_GRANT_BYTES: usize = 1024;
 /// The most cells one grant may cover.
 ///
-/// The 27-cell neighbourhood is the interest set (D5); the allowance here is
-/// deliberately larger so a grant can span a boundary crossing, and finite so
-/// a signed grant cannot be inflated into an unbounded membership test.
+/// The 27-cell neighbourhood is the baseline interest set (D5). A one-period
+/// directional sweep at Regolith v18's campaign ceiling is bounded at 54
+/// cells; keeping the wire allowance finite prevents a signed grant becoming
+/// an unbounded membership test. The allowance remains 64 for compatibility.
 pub const MAX_INTEREST_GRANT_CELLS: usize = 64;
 /// The longest interest-grant lifetime a verifier accepts.
 pub const MAX_INTEREST_GRANT_TTL_MS: u64 = 300_000;
@@ -981,11 +982,36 @@ pub const COORD_ALPN: &[u8] = b"orrery/coord/0";
 pub const COORD_PROTOCOL_VERSION: u16 = 0;
 /// The most cells one presence report may carry.
 ///
-/// Presence is the peer's active interest set, which D5 bounds at the 27-cell
-/// neighbourhood. The allowance matches [`MAX_INTEREST_GRANT_CELLS`] because a
-/// presence report is what a grant is minted from — a coordinator that
-/// accepted more than it could sign would be storing an unusable set.
+/// Presence is the peer's active interest set: D5's 27-cell baseline plus the
+/// bounded directional sweep. The allowance matches
+/// [`MAX_INTEREST_GRANT_CELLS`] because a presence report is what a grant is
+/// minted from — a coordinator that accepted more than it could sign would be
+/// storing an unusable set.
 pub const MAX_PRESENCE_CELLS: usize = MAX_INTEREST_GRANT_CELLS;
+
+/// An immediate committed-cell crossing and the interest coverage after it.
+///
+/// Bulk [`CoordMsg::Presence`] reports remain the low-rate source of complete
+/// state. This event closes the interval between them: as soon as hysteresis
+/// commits a different cell, the peer sends the new swept coverage and the
+/// coordinator can replace the grant and island roster immediately. The swept
+/// margin remains necessary because this event is reactive and spends a
+/// network round trip after the boundary was crossed; the event remains
+/// necessary because prediction is only a bound and must eventually converge
+/// on the actual crossing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterestCellCrossing {
+    /// Simulation tick at which the authority committed the crossing.
+    pub tick: Tick,
+    /// Entity authority order at which the crossing was committed.
+    pub seq: SeqPair,
+    /// The peer's previously committed interest cell.
+    pub from: CellId,
+    /// The newly committed interest cell.
+    pub to: CellId,
+    /// The complete swept interest coverage after the crossing.
+    pub covered_cells: Vec<CellId>,
+}
 
 /// A coordinator message (docs/10-crates.md §12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1051,6 +1077,15 @@ pub enum CoordMsg {
     WitnessEpoch {
         /// A postcard-encoded [`WitnessEpochV1`].
         announcement: Vec<u8>,
+    },
+    /// Immediate committed-cell crossing.
+    ///
+    /// Appended after every older variant because postcard keys variants
+    /// positionally. Hosts emit this on the crossing edge; the ordinary
+    /// [`CoordMsg::Presence`] cadence still republishes the complete state.
+    InterestCellCrossing {
+        /// The crossing and the full post-crossing swept coverage.
+        crossing: InterestCellCrossing,
     },
 }
 
@@ -1712,6 +1747,26 @@ mod tests {
     fn witness_epoch_message_roundtrips() {
         let message = CoordMsg::WitnessEpoch {
             announcement: signed_epoch(epoch_claims(&[7u8; 32], 4, pool(12)), &secret(9)),
+        };
+        let bytes = postcard::to_stdvec(&message).unwrap();
+        assert_eq!(postcard::from_bytes::<CoordMsg>(&bytes).unwrap(), message);
+    }
+
+    #[test]
+    fn interest_cell_crossing_message_roundtrips() {
+        let from = CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL).unwrap();
+        let to = CellId::from_coords(glam::IVec3::X, CellId::MAX_LEVEL).unwrap();
+        let message = CoordMsg::InterestCellCrossing {
+            crossing: InterestCellCrossing {
+                tick: Tick(7),
+                seq: SeqPair {
+                    own_seq: 3,
+                    auth_seq: 11,
+                },
+                from,
+                to,
+                covered_cells: to.neighbors27(),
+            },
         };
         let bytes = postcard::to_stdvec(&message).unwrap();
         assert_eq!(postcard::from_bytes::<CoordMsg>(&bytes).unwrap(), message);

@@ -717,6 +717,7 @@ struct Shared {
     /// on the same 1 s tick. Terminating half above, in-place half here.
     standing_updates: Arc<AccountStandings>,
     presence_reports: AtomicU64,
+    interest_crossings: AtomicU64,
     grants_issued: AtomicU64,
     manifests_pushed: AtomicU64,
     drains_issued: AtomicU64,
@@ -757,6 +758,11 @@ impl Shared {
             // worth pushing an empty grant for: a verifier refuses one.
             return;
         };
+        self.deliver_interest(node, grant).await;
+    }
+
+    /// Deliver one already-signed interest grant and account it once.
+    async fn deliver_interest(&self, node: NodeId, grant: Vec<u8>) {
         if self.notify(node, &CoordMsg::InterestGrant { grant }).await {
             self.grants_issued.fetch_add(1, Ordering::Relaxed);
         }
@@ -885,6 +891,8 @@ impl Shared {
 pub struct CoordinatorStats {
     /// Presence reports accepted.
     pub presence_reports: u64,
+    /// Immediate committed-cell crossings accepted.
+    pub interest_crossings: u64,
     /// Interest grants signed and delivered.
     pub grants_issued: u64,
     /// Island manifests delivered.
@@ -955,6 +963,7 @@ impl CoordinatorServer {
             standing: Arc::clone(&standing),
             standing_updates: config.standing_updates,
             presence_reports: AtomicU64::new(0),
+            interest_crossings: AtomicU64::new(0),
             grants_issued: AtomicU64::new(0),
             manifests_pushed: AtomicU64::new(0),
             drains_issued: AtomicU64::new(0),
@@ -1001,6 +1010,7 @@ impl CoordinatorServer {
     pub async fn stats(&self) -> CoordinatorStats {
         CoordinatorStats {
             presence_reports: self.shared.presence_reports.load(Ordering::Relaxed),
+            interest_crossings: self.shared.interest_crossings.load(Ordering::Relaxed),
             grants_issued: self.shared.grants_issued.load(Ordering::Relaxed),
             manifests_pushed: self.shared.manifests_pushed.load(Ordering::Relaxed),
             drains_issued: self.shared.drains_issued.load(Ordering::Relaxed),
@@ -1360,6 +1370,59 @@ async fn handle_connection(
                     // announcement naming peers in it means anything, and because
                     // most reports seed nothing at all — the reseed floor makes
                     // this a hash lookup per cell in the common case.
+                    shared.seed_witness_epochs(&covered).await;
+                }
+                CoordMsg::InterestCellCrossing { crossing } => {
+                    if !admitted {
+                        continue;
+                    }
+                    if crossing.covered_cells.is_empty()
+                        || crossing.covered_cells.len() > MAX_PRESENCE_CELLS
+                    {
+                        debug!(
+                            %remote,
+                            count = crossing.covered_cells.len(),
+                            "coordinator: unusable crossing coverage"
+                        );
+                        continue;
+                    }
+                    // Crossings share the presence bucket: the event is
+                    // immediate relative to the one-hertz bulk clock, not an
+                    // unmetered way to force island evaluation and signing.
+                    let now_ms = shared.presence_clock.now_ms();
+                    {
+                        let mut peers = shared.peers.lock().await;
+                        let Some(session) = peers.get_mut(&remote) else {
+                            break;
+                        };
+                        if !session.budget.take(now_ms) {
+                            debug!(%remote, "coordinator: crossing rate limited");
+                            continue;
+                        }
+                    }
+                    let covered = crossing.covered_cells.clone();
+                    let (issued, grace_ms) = {
+                        let mut registry = shared.registry.lock().await;
+                        let grace_ms = registry.config.drain_grace_ms;
+                        (
+                            shared.issuer.apply_crossing(
+                                &mut registry,
+                                remote,
+                                shared.grid,
+                                crossing,
+                            ),
+                            grace_ms,
+                        )
+                    };
+                    let Ok(issued) = issued else {
+                        debug!(%remote, error = %issued.unwrap_err(), "coordinator: refused crossing");
+                        continue;
+                    };
+                    shared.interest_crossings.fetch_add(1, Ordering::Relaxed);
+                    // Same ordering as bulk presence, but on the crossing
+                    // edge: grant before roster, witness set after both.
+                    shared.deliver_interest(remote, issued.grant).await;
+                    shared.apply(issued.membership, grace_ms).await;
                     shared.seed_witness_epochs(&covered).await;
                 }
                 // Everything else is coordinator→peer. A peer sending one is

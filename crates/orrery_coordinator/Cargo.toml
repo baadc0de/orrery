@@ -54,3 +54,4 @@ bytes = { workspace = true }
 # with it for the strike-row types the scorer reads.
 orrery_identity = { path = "../orrery_identity" }
 orrery_persistd = { path = "../orrery_persistd" }
+orrery_games = { path = "../orrery_games" }
