@@ -167,6 +167,61 @@ variable "compute_instance_type_patterns" {
   }
 }
 
+variable "compute_reviewed_image_ids" {
+  description = <<-EOT
+    The exact AMI ids `orrery-ci-compute` may launch, reviewed before they are
+    pinned.
+
+    Owner decision, 2026-08-29, after the gate failed for five nights on a
+    denial nobody could explain from the policy text.
+
+    `ec2:Owner` does NOT evaluate to the owning account id when the image
+    carries an owner alias -- it evaluates to the alias. Canonical's
+    ubuntu-noble images published through the Amazon-managed channel report
+    `OwnerId 099720109477` and `ImageOwnerAlias amazon`, so a condition
+    written as `ec2:Owner = "099720109477"` never matches them. Proved by
+    `aws iam simulate-principal-policy` against this very role: the same
+    request is `allowed` with the account id and `implicitDeny` with `amazon`.
+
+    Widening the condition to accept `amazon` was rejected: that value covers
+    every Amazon-aliased public image, which is far more than a Canonical
+    Ubuntu base and the opposite of what this grant is for. Pinning ids is
+    tighter than the owner condition ever was -- it names exactly what may
+    boot -- at the cost of a refresh when Canonical publishes a security
+    update.
+
+    Refreshing is a conscious act, and deliberately so. Resolve the newest
+    image per architecture, READ WHAT IT IS, then update this list:
+
+      aws ec2 describe-images --region eu-central-1 --owners 099720109477 \
+        --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
+                  Name=state,Values=available Name=architecture,Values=x86_64 \
+        --query 'reverse(sort_by(Images,&CreationDate))[:1].[ImageId,OwnerId,Name]'
+
+    A stale pin fails closed: the launch is refused and the gate goes red,
+    which is the direction this should fail in.
+  EOT
+  type        = list(string)
+  default = [
+    # ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260828
+    "ami-030732eb9042f469b",
+    # ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-20260828
+    "ami-0468ccea1407a0357",
+  ]
+
+  validation {
+    condition     = length(var.compute_reviewed_image_ids) > 0
+    error_message = "At least one reviewed AMI id must be pinned, or the gate can launch nothing."
+  }
+
+  validation {
+    condition = alltrue([
+      for id in var.compute_reviewed_image_ids : can(regex("^ami-[0-9a-f]{8,17}$", id))
+    ])
+    error_message = "Each entry must be an AMI id, so a name or ARN cannot be pinned by mistake."
+  }
+}
+
 variable "cache_bucket_name" {
   description = <<-EOT
     S3 bucket for the kache remote. S3 bucket names are global across all AWS

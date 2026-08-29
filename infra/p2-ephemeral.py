@@ -174,6 +174,21 @@ def terraform_variable_default(code: str, name: str) -> list[str]:
     return values
 
 
+def reviewed_image_ids() -> set[str]:
+    """The AMI ids the deployed policy actually permits.
+
+    Read from the Terraform rather than copied here. A copy would drift from
+    the policy, and the failure mode of that drift is a launch denied by IAM
+    with a message that says nothing about a stale list -- which is exactly
+    the five nights #623 cost. Deriving it means a pin refresh is one edit.
+    """
+    variables = (Path(__file__).parent / "variables.tf").read_text(encoding="utf-8")
+    ids = set(terraform_variable_default(variables, "compute_reviewed_image_ids"))
+    if not ids:
+        raise ControllerError("variables.tf pins no reviewed AMI ids; the gate can launch nothing")
+    return ids
+
+
 def policy_instance_type_patterns() -> tuple[list[str], list[str]]:
     """Derive the allowed and denied EC2 type globs from the launch policy."""
     policy = (Path(__file__).parent / "iam-compute-policy.tf").read_text(encoding="utf-8")
@@ -256,9 +271,19 @@ def resolve_ami(architecture: str) -> str:
         "Name=state,Values=available",
         f"Name=architecture,Values={architecture}",
     )
-    images = sorted(data.get("Images", []), key=lambda image: image.get("CreationDate", ""))
+    reviewed = reviewed_image_ids()
+    images = sorted(
+        (image for image in data.get("Images", []) if image.get("ImageId") in reviewed),
+        key=lambda image: image.get("CreationDate", ""),
+    )
     if not images:
-        raise ControllerError(f"no Canonical Ubuntu 24.04 image resolved for {architecture}")
+        raise ControllerError(
+            f"no reviewed Canonical Ubuntu 24.04 image resolved for {architecture}. "
+            "The policy pins exact AMI ids (var.compute_reviewed_image_ids) because "
+            "ec2:Owner evaluates to the owner alias, not the account id; launching an "
+            "unpinned image would be denied. Refresh the pin in infra/variables.tf "
+            "after reviewing what Canonical has published."
+        )
     return images[-1]["ImageId"]
 
 
@@ -920,6 +945,22 @@ def self_test() -> int:
             f"{throttled.get('status')!r}, not the distinct throttled outcome"
         )
 
+    # The resolver may only select what the policy names, and both sides read
+    # the same list. A copy on either side drifts into an IAM denial whose
+    # message says nothing about a stale pin.
+    pinned = reviewed_image_ids()
+    if not pinned:
+        raise ControllerError("self-test: no reviewed AMI ids are pinned")
+    if any(not re.fullmatch(r"ami-[0-9a-f]{8,17}", image) for image in pinned):
+        raise ControllerError(f"self-test: reviewed image pin holds a non-AMI value: {sorted(pinned)}")
+    policy_text = (Path(__file__).parent / "iam-compute-policy.tf").read_text(encoding="utf-8")
+    policy_ids = "image/${id}" in policy_text
+    if not policy_ids:
+        raise ControllerError(
+            "self-test: UseCanonicalUbuntuImage no longer derives its resources from "
+            "var.compute_reviewed_image_ids, so the pin and the resolver can drift"
+        )
+
     q = qualification_user_data(candidate)
     g = gate_user_data("a" * 40)
     required_q = [
@@ -984,7 +1025,11 @@ def self_test() -> int:
     code = "\n".join(line for line in tf.splitlines() if not line.lstrip().startswith("#"))
     policy_stages = {
         "metal deny": (code[code.index('sid       = "NoMetalSizes"'):code.index('sid    = "DiscoveryReadOnly"')], ('effect    = "Deny"', '"*.metal"')),
-        "Canonical image pin": (code[code.index('sid     = "UseCanonicalUbuntuImage"'):code.index('sid     = "UseVpcLaunchInputs"')], ('ec2:Owner', '"099720109477"')),
+        # Reviewed ids, not an owner condition: `ec2:Owner` evaluates to the
+        # image's owner alias when it has one, so the old assertion passed
+        # while every launch was denied (#623). Asserting the id list keeps
+        # the check aligned with what IAM actually evaluates.
+        "Canonical image pin": (code[code.index('sid     = "UseCanonicalUbuntuImage"'):code.index('sid     = "UseVpcLaunchInputs"')], ('var.compute_reviewed_image_ids', 'arn:aws:ec2:*::image/')),
         "tagged launch": (code[code.index('sid     = "LaunchTaggedInstance"'):code.index('sid       = "ReadTaggedConsoleEvidence"')], ('"ec2:RunInstances"', 'aws:RequestTag/')),
         "tagged console": (code[code.index('sid       = "ReadTaggedConsoleEvidence"'):code.index('sid       = "TagOnlyAtLaunch"')], ('"ec2:GetConsoleOutput"', 'aws:ResourceTag/')),
         "tagged teardown": (code[code.index('sid       = "TerminateTaggedOnly"'):], ('"ec2:TerminateInstances"', 'aws:ResourceTag/')),
