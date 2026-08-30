@@ -35,6 +35,10 @@ pub struct Case {
     /// Whether entities attack each other, exercising the discrete path and
     /// the cross-entity event flow.
     pub combat: bool,
+    /// The order in which the starting population is inserted into the
+    /// executor. Canonical execution and projection must remain independent
+    /// of this order (D48 WP-2).
+    pub spawn_order: SpawnOrder,
     /// Execute each entity in its own single-entity [`Executor`], the shape
     /// `orrery_games::scenario::adjudicate_isolated` gives an adjudicator.
     ///
@@ -49,6 +53,24 @@ pub struct Case {
     pub isolated: bool,
 }
 
+/// How a case inserts its starting population into the executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnOrder {
+    /// Insert entities in ascending [`PersistId`] order.
+    Ascending,
+    /// Insert the 16-entity projection fixture in its committed fixed
+    /// permutation.
+    ProjectionPermutation,
+}
+
+/// The committed insertion order for `projection-order-permuted`.
+///
+/// It is the same population as `kinematic-swarm`, but it is visibly not
+/// sorted (`9` precedes `1`). Keeping the values explicit makes the fixture's
+/// permutation reviewable rather than relying on a generator that could drift.
+const PROJECTION_ORDER_PERMUTATION: [u64; 16] =
+    [9, 1, 14, 3, 16, 6, 11, 2, 15, 8, 4, 13, 5, 12, 7, 10];
+
 /// The corpus.
 ///
 /// Deliberately small and fast — this runs on every commit, on every target.
@@ -62,6 +84,7 @@ pub const CASES: &[Case] = &[
         ticks: 180,
         seed_byte: 0x11,
         combat: false,
+        spawn_order: SpawnOrder::Ascending,
         isolated: false,
     },
     Case {
@@ -70,6 +93,30 @@ pub const CASES: &[Case] = &[
         ticks: 180,
         seed_byte: 0x22,
         combat: false,
+        spawn_order: SpawnOrder::Ascending,
+        isolated: false,
+    },
+    // The exact twin of `kinematic-swarm`, except that its starting population
+    // is inserted in the committed fixed permutation above. D48 WP-2 requires
+    // both projections to fold in ascending `PersistId` order regardless.
+    Case {
+        name: "projection-order-permuted",
+        entities: 16,
+        ticks: 180,
+        seed_byte: 0x22,
+        combat: false,
+        spawn_order: SpawnOrder::ProjectionPermutation,
+        isolated: false,
+    },
+    // A10 B-1's scale point: large enough to measure per-entity mirror and
+    // fold cost while retaining the ordinary three-second corpus window.
+    Case {
+        name: "swarm-large",
+        entities: 256,
+        ticks: 180,
+        seed_byte: 0x55,
+        combat: false,
+        spawn_order: SpawnOrder::Ascending,
         isolated: false,
     },
     Case {
@@ -78,6 +125,7 @@ pub const CASES: &[Case] = &[
         ticks: 180,
         seed_byte: 0x33,
         combat: true,
+        spawn_order: SpawnOrder::Ascending,
         isolated: false,
     },
     Case {
@@ -86,6 +134,7 @@ pub const CASES: &[Case] = &[
         ticks: 600,
         seed_byte: 0x44,
         combat: true,
+        spawn_order: SpawnOrder::Ascending,
         isolated: false,
     },
     // Same axes as `combat-island`, executed one entity per executor. Its
@@ -98,6 +147,7 @@ pub const CASES: &[Case] = &[
         ticks: 600,
         seed_byte: 0x44,
         combat: true,
+        spawn_order: SpawnOrder::Ascending,
         isolated: true,
     },
 ];
@@ -213,6 +263,24 @@ fn seed_world(case: &Case) -> BTreeMap<PersistId, Body> {
     world
 }
 
+/// The case's insertion order, separate from the canonical projection order.
+fn spawn_order(case: &Case) -> Vec<PersistId> {
+    match case.spawn_order {
+        SpawnOrder::Ascending => (1..=case.entities).map(PersistId::new).collect(),
+        SpawnOrder::ProjectionPermutation => {
+            assert_eq!(
+                case.entities,
+                PROJECTION_ORDER_PERMUTATION.len() as u64,
+                "the projection permutation is committed for exactly 16 entities"
+            );
+            PROJECTION_ORDER_PERMUTATION
+                .into_iter()
+                .map(PersistId::new)
+                .collect()
+        }
+    }
+}
+
 /// The commands one entity issues on one tick.
 ///
 /// Driven by its own ChaCha8 stream keyed on `(seed, entity, tick)`, so the
@@ -257,48 +325,71 @@ fn commands_for(case: &Case, entity: u64, tick: u64) -> Vec<Command> {
 /// `ReplayHarness::load_claimed_snapshot` installs exactly one entity. Running
 /// both and requiring the same chain is how a neighbour read stops being
 /// invisible.
-enum Stage {
+enum StageStorage {
     /// One executor over the whole world.
     Shared(Executor<Reference>),
     /// One single-entity executor per entity, in `PersistId` order.
     Isolated(BTreeMap<PersistId, Executor<Reference>>),
 }
 
+/// A case's executor storage and the order used to populate it.
+struct Stage {
+    storage: StageStorage,
+    spawn_order: Vec<PersistId>,
+}
+
 impl Stage {
     /// Build the case's world into the requested arrangement.
     fn new(case: &Case) -> Self {
         let seed = UniverseSeed([case.seed_byte; 32]);
-        let world = seed_world(case);
-        if case.isolated {
+        let mut world = seed_world(case);
+        let spawn_order = spawn_order(case);
+        let storage = if case.isolated {
             let mut executors = BTreeMap::new();
-            for (id, body) in world {
+            for id in &spawn_order {
+                let body = world
+                    .remove(id)
+                    .expect("spawn order names every entity exactly once");
                 let mut executor = Executor::new(Reference, seed);
-                executor.insert(id, body);
-                executors.insert(id, executor);
+                executor.insert(*id, body);
+                executors.insert(*id, executor);
             }
-            Stage::Isolated(executors)
+            StageStorage::Isolated(executors)
         } else {
             let mut executor = Executor::new(Reference, seed);
-            for (id, body) in world {
-                executor.insert(id, body);
+            for id in &spawn_order {
+                let body = world
+                    .remove(id)
+                    .expect("spawn order names every entity exactly once");
+                executor.insert(*id, body);
             }
-            Stage::Shared(executor)
+            StageStorage::Shared(executor)
+        };
+        assert!(
+            world.is_empty(),
+            "spawn order must name every entity exactly once"
+        );
+        Self {
+            storage,
+            spawn_order,
         }
     }
 
     /// Every entity, in `PersistId` order (VC-4: a BTreeMap walk either way).
     fn entities(&self) -> Vec<PersistId> {
-        match self {
-            Stage::Shared(executor) => executor.entities().copied().collect(),
-            Stage::Isolated(executors) => executors.keys().copied().collect(),
-        }
+        let entities: Vec<PersistId> = match &self.storage {
+            StageStorage::Shared(executor) => executor.entities().copied().collect(),
+            StageStorage::Isolated(executors) => executors.keys().copied().collect(),
+        };
+        debug_assert_eq!(entities.len(), self.spawn_order.len());
+        entities
     }
 
     /// Advance one entity by one tick.
     fn step(&mut self, id: PersistId, tick: Tick, inputs: &[Command]) -> TickOutcome<Outcome> {
-        match self {
-            Stage::Shared(executor) => executor.step_entity(id, tick, inputs),
-            Stage::Isolated(executors) => executors
+        match &mut self.storage {
+            StageStorage::Shared(executor) => executor.step_entity(id, tick, inputs),
+            StageStorage::Isolated(executors) => executors
                 .get_mut(&id)
                 .and_then(|executor| executor.step_entity(id, tick, inputs)),
         }
@@ -307,9 +398,11 @@ impl Stage {
 
     /// An entity's current state.
     fn state(&self, id: PersistId) -> &Body {
-        match self {
-            Stage::Shared(executor) => executor.state(id),
-            Stage::Isolated(executors) => executors.get(&id).and_then(|e| e.state(id)),
+        match &self.storage {
+            StageStorage::Shared(executor) => executor.state(id),
+            StageStorage::Isolated(executors) => {
+                executors.get(&id).and_then(|executor| executor.state(id))
+            }
         }
         .expect("entity present")
     }
@@ -432,4 +525,47 @@ pub fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn case(name: &str) -> &'static Case {
+        CASES
+            .iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("corpus case {name} is present"))
+    }
+
+    #[test]
+    fn projection_order_permutation_is_complete_and_not_already_sorted() {
+        let permuted = case("projection-order-permuted");
+        let actual = spawn_order(permuted);
+        let mut sorted = actual.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let expected: Vec<_> = (1..=permuted.entities).map(PersistId::new).collect();
+        assert_eq!(
+            sorted, expected,
+            "the permutation must cover the same population"
+        );
+        assert_ne!(
+            actual, expected,
+            "the permuted fixture must not already be PersistId-sorted"
+        );
+    }
+
+    #[test]
+    fn projection_order_permuted_matches_its_forward_twin() {
+        let forward = run_case(case("kinematic-swarm"), false);
+        let permuted = run_case(case("projection-order-permuted"), false);
+
+        assert_eq!(
+            permuted.chain, forward.chain,
+            "projection-order-permuted diverged from its forward twin kinematic-swarm"
+        );
+        assert_eq!(permuted.final_states, forward.final_states);
+    }
 }
