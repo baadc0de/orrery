@@ -300,6 +300,7 @@ fn main() {
         app.insert_resource(HeadlessJoinProbe {
             expected_peers,
             observed_peers: std::collections::BTreeSet::new(),
+            all_observed_at: None,
             started_at: std::time::Instant::now(),
             timeout: headless_timeout,
             seated_reported: false,
@@ -330,7 +331,24 @@ struct HeadlessJoinProbe {
     started_at: std::time::Instant,
     timeout: Duration,
     seated_reported: bool,
+    /// When every expected peer had been observed, if that has happened.
+    ///
+    /// Observation is mutual and the two sides do not reach it at the same
+    /// instant: a client that has been in the attempt since the lobby sees a
+    /// late joiner within seconds of its arrival, while the joiner needs a
+    /// little longer to accumulate the other side. Exiting the moment this
+    /// client is satisfied therefore removes the very craft its peers are
+    /// still trying to observe -- measured, the established clients left about
+    /// nine seconds after the joiner arrived, before its window even opened,
+    /// and the joiner then failed a clause about a peer that no longer
+    /// existed. Linger so the proof is of the campaign, not of exit order.
+    all_observed_at: Option<std::time::Instant>,
 }
+
+/// How long a satisfied probe stays in the attempt so its peers can finish
+/// observing it. Comfortably longer than the few seconds a late joiner needs,
+/// and far below any run's timeout.
+const MUTUAL_OBSERVATION_LINGER: Duration = Duration::from_secs(30);
 
 fn transport_is_seated(state: &orrery_regolith_client::campaign::JoinState, ticks: u64) -> bool {
     matches!(state, orrery_regolith_client::campaign::JoinState::Joined) && ticks > 0
@@ -409,8 +427,13 @@ fn monitor_headless_join(
                 .iter()
                 .all(|peer| probe.observed_peers.contains(peer))
             {
-                exit.write(AppExit::Success);
-                return;
+                let since = *probe
+                    .all_observed_at
+                    .get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= MUTUAL_OBSERVATION_LINGER {
+                    exit.write(AppExit::Success);
+                    return;
+                }
             }
         }
         state => {
