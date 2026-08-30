@@ -121,6 +121,29 @@ is to run it, not to push and wait:
 ./scripts/check.sh doctor       # delegates to dev-cache.sh: is the cache working?
 ```
 
+### The push is the gate
+
+**`./scripts/check.sh` is always run before pushing a branch for a pull
+request.** Cutting commits locally without it is fine — the gate is the push,
+not the commit, and not the merge.
+
+The only exception is a documentation chore: prose, a plan, an ADR update.
+Those need no lane.
+
+This is a rule rather than a habit because two of pull-request CI's checks do
+not exist. `static gates` and `workspace tests` moved to nightly on 2026-08-28
+to cut roughly twenty minutes of merge latency, and they are the only lanes
+that build `clients/regolith` and the standalone gate workspaces. **A pull
+request can therefore be green on every required check while `main` does not
+compile.** That happened twice on 2026-08-30: once from a targeted
+`cargo test -p` standing in for the script (#718, fixed by #719), and once
+structurally, when adding a public field to a struct in `crates/orrery_games`
+broke a consumer in `clients/regolith` that the writing lane was correctly
+scoped away from and could not have seen (#728, fixed by #729).
+
+Read the script's final line. `check: fmt clippy gates test passed` is the
+claim; anything else is not.
+
 **Scope the claim, because overclaiming it is how it stops being trusted.**
 The script is the body of those four jobs and nothing else. `determinism` and
 `determinism-verdict` keep four more cargo commands — a cross-platform matrix
