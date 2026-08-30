@@ -1,0 +1,419 @@
+{
+  "schema": 1,
+  "programme": "a18",
+  "captured_at": "2026-08-30T18:44:46Z",
+  "environment": {
+    "commit": "01e039eb94e7453137226090d77e1e0b48806e9a",
+    "tree_dirty": false,
+    "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "target_triple": "x86_64-unknown-linux-gnu",
+    "build_profile": "release",
+    "cpu": {
+      "model": "AMD Ryzen 9 9950X3D 16-Core Processor",
+      "cores": 32
+    },
+    "ram_gib": 46.19004821777344,
+    "os": "linux 7.2.0-1-cachyos",
+    "cargo_lock_blake3": "4e92cf42620c72dcb7ec87dba5d4aceae345e1b4e287151c19a2253222cbaaa5",
+    "rulesets": {
+      "reference": {
+        "version": 2,
+        "digest": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+      },
+      "regolith": {
+        "version": 18,
+        "digest": "6868686868686868686868686868686868686868686868686868686868686868"
+      },
+      "skirmish": {
+        "version": 2,
+        "digest": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+      }
+    },
+    "captured_with": "0.1.0"
+  },
+  "metrics": {
+    "b1_corpus": [
+      {
+        "name": "kinematic-single",
+        "entities": 1,
+        "ticks": 180,
+        "reps": 31,
+        "tick_us": {
+          "p50": 0.6232222222222222,
+          "p99": 0.6519944444444444
+        },
+        "entity_tick_us": {
+          "p50": 0.6232222222222222,
+          "p99": 0.6519944444444444
+        }
+      },
+      {
+        "name": "kinematic-swarm",
+        "entities": 16,
+        "ticks": 180,
+        "reps": 31,
+        "tick_us": {
+          "p50": 10.192172222222222,
+          "p99": 10.540988888888888
+        },
+        "entity_tick_us": {
+          "p50": 0.6370107638888889,
+          "p99": 0.6588118055555555
+        }
+      },
+      {
+        "name": "combat-pair",
+        "entities": 2,
+        "ticks": 180,
+        "reps": 31,
+        "tick_us": {
+          "p50": 1.2910833333333331,
+          "p99": 1.3145166666666666
+        },
+        "entity_tick_us": {
+          "p50": 0.6455416666666666,
+          "p99": 0.6572583333333333
+        }
+      },
+      {
+        "name": "combat-island",
+        "entities": 8,
+        "ticks": 600,
+        "reps": 31,
+        "tick_us": {
+          "p50": 5.294785,
+          "p99": 5.426481666666667
+        },
+        "entity_tick_us": {
+          "p50": 0.661848125,
+          "p99": 0.6783102083333333
+        }
+      },
+      {
+        "name": "combat-isolated",
+        "entities": 8,
+        "ticks": 600,
+        "reps": 31,
+        "tick_us": {
+          "p50": 5.1813400000000005,
+          "p99": 5.359523333333334
+        },
+        "entity_tick_us": {
+          "p50": 0.6476675000000001,
+          "p99": 0.6699404166666667
+        }
+      }
+    ],
+    "b1_battery": [
+      {
+        "game": "skirmish",
+        "scenario": "solo",
+        "entities": 1,
+        "ticks": 180,
+        "reps": 11,
+        "events": 0,
+        "tick_us": {
+          "p50": 0.7225722222222223,
+          "p99": 0.7361
+        },
+        "entity_tick_us": {
+          "p50": 0.7225722222222223,
+          "p99": 0.7361
+        }
+      },
+      {
+        "game": "skirmish",
+        "scenario": "duel",
+        "entities": 2,
+        "ticks": 180,
+        "reps": 11,
+        "events": 8,
+        "tick_us": {
+          "p50": 1.4795444444444443,
+          "p99": 1.5109888888888887
+        },
+        "entity_tick_us": {
+          "p50": 0.7397722222222222,
+          "p99": 0.7554944444444444
+        }
+      },
+      {
+        "game": "skirmish",
+        "scenario": "island",
+        "entities": 8,
+        "ticks": 600,
+        "reps": 11,
+        "events": 75,
+        "tick_us": {
+          "p50": 5.987615,
+          "p99": 6.007199999999999
+        },
+        "entity_tick_us": {
+          "p50": 0.748451875,
+          "p99": 0.7508999999999999
+        }
+      },
+      {
+        "game": "skirmish",
+        "scenario": "island-lossy",
+        "entities": 8,
+        "ticks": 600,
+        "reps": 11,
+        "events": 84,
+        "tick_us": {
+          "p50": 6.012693333333333,
+          "p99": 6.0689166666666665
+        },
+        "entity_tick_us": {
+          "p50": 0.7515866666666666,
+          "p99": 0.7586145833333333
+        }
+      },
+      {
+        "game": "regolith",
+        "scenario": "solo",
+        "entities": 1,
+        "ticks": 180,
+        "reps": 11,
+        "events": 182,
+        "tick_us": {
+          "p50": 1.0776833333333333,
+          "p99": 1.1012833333333334
+        },
+        "entity_tick_us": {
+          "p50": 1.0776833333333333,
+          "p99": 1.1012833333333334
+        }
+      },
+      {
+        "game": "regolith",
+        "scenario": "duel",
+        "entities": 2,
+        "ticks": 180,
+        "reps": 11,
+        "events": 281,
+        "tick_us": {
+          "p50": 2.0916333333333337,
+          "p99": 2.115788888888889
+        },
+        "entity_tick_us": {
+          "p50": 1.0458166666666668,
+          "p99": 1.0578944444444445
+        }
+      },
+      {
+        "game": "regolith",
+        "scenario": "island",
+        "entities": 8,
+        "ticks": 600,
+        "reps": 11,
+        "events": 5272,
+        "tick_us": {
+          "p50": 8.892663333333335,
+          "p99": 9.03513
+        },
+        "entity_tick_us": {
+          "p50": 1.1115829166666669,
+          "p99": 1.12939125
+        }
+      },
+      {
+        "game": "regolith",
+        "scenario": "island-lossy",
+        "entities": 8,
+        "ticks": 600,
+        "reps": 11,
+        "events": 5270,
+        "tick_us": {
+          "p50": 8.8585,
+          "p99": 8.915088333333333
+        },
+        "entity_tick_us": {
+          "p50": 1.1073125,
+          "p99": 1.1143860416666667
+        }
+      }
+    ],
+    "b3_memory": {
+      "case": "kinematic-swarm",
+      "entities": 16,
+      "reps": 9,
+      "rss_delta_kib_high_water": 0,
+      "bytes_per_entity": 0.0
+    },
+    "b4_snapshot": [
+      {
+        "game": "skirmish",
+        "scenario": "solo",
+        "snapshots": 180,
+        "encode_us": {
+          "p50": 0.07,
+          "p99": 0.15
+        },
+        "bytes_p50": 79.0
+      },
+      {
+        "game": "skirmish",
+        "scenario": "duel",
+        "snapshots": 360,
+        "encode_us": {
+          "p50": 0.07,
+          "p99": 0.111
+        },
+        "bytes_p50": 79.0
+      },
+      {
+        "game": "skirmish",
+        "scenario": "island",
+        "snapshots": 4800,
+        "encode_us": {
+          "p50": 0.07,
+          "p99": 0.09
+        },
+        "bytes_p50": 79.0
+      },
+      {
+        "game": "skirmish",
+        "scenario": "island-lossy",
+        "snapshots": 4800,
+        "encode_us": {
+          "p50": 0.07,
+          "p99": 0.09
+        },
+        "bytes_p50": 79.0
+      },
+      {
+        "game": "regolith",
+        "scenario": "solo",
+        "snapshots": 180,
+        "encode_us": {
+          "p50": 0.09,
+          "p99": 0.16999999999999998
+        },
+        "bytes_p50": 158.0
+      },
+      {
+        "game": "regolith",
+        "scenario": "duel",
+        "snapshots": 360,
+        "encode_us": {
+          "p50": 0.091,
+          "p99": 0.171
+        },
+        "bytes_p50": 158.0
+      },
+      {
+        "game": "regolith",
+        "scenario": "island",
+        "snapshots": 4800,
+        "encode_us": {
+          "p50": 0.09,
+          "p99": 0.22999999999999998
+        },
+        "bytes_p50": 158.0
+      },
+      {
+        "game": "regolith",
+        "scenario": "island-lossy",
+        "snapshots": 4800,
+        "encode_us": {
+          "p50": 0.08,
+          "p99": 0.13
+        },
+        "bytes_p50": 158.0
+      }
+    ],
+    "b5_claim": [
+      {
+        "game": "skirmish",
+        "claims": 180,
+        "claim_us": {
+          "p50": 0.22,
+          "p99": 0.29
+        }
+      },
+      {
+        "game": "skirmish",
+        "claims": 360,
+        "claim_us": {
+          "p50": 0.211,
+          "p99": 0.26
+        }
+      },
+      {
+        "game": "skirmish",
+        "claims": 4800,
+        "claim_us": {
+          "p50": 0.22,
+          "p99": 0.251
+        }
+      },
+      {
+        "game": "skirmish",
+        "claims": 4800,
+        "claim_us": {
+          "p50": 0.21,
+          "p99": 0.23099999999999998
+        }
+      },
+      {
+        "game": "regolith",
+        "claims": 180,
+        "claim_us": {
+          "p50": 0.301,
+          "p99": 0.38
+        }
+      },
+      {
+        "game": "regolith",
+        "claims": 360,
+        "claim_us": {
+          "p50": 0.301,
+          "p99": 0.381
+        }
+      },
+      {
+        "game": "regolith",
+        "claims": 4800,
+        "claim_us": {
+          "p50": 0.31,
+          "p99": 0.36
+        }
+      },
+      {
+        "game": "regolith",
+        "claims": 4800,
+        "claim_us": {
+          "p50": 0.291,
+          "p99": 0.33099999999999996
+        }
+      }
+    ]
+  },
+  "absent": [
+    {
+      "leg": "b1.swarm-large",
+      "reason": "the 256-entity corpus case is S1.c's fixture (F-5) and does not exist yet; B-1 records the five committed corpus cases"
+    },
+    {
+      "leg": "b2.structural-change",
+      "reason": "the instrument is a materialization-heavy Split-storm scenario; none exists in the committed battery, and the fixture's home is crates/orrery_games, outside this lane's file list"
+    },
+    {
+      "leg": "b4.corpus-checkpoint",
+      "reason": "run_case does not expose its final executor states, so a corpus-final checkpoint encode is not drivable without editing crates/orrery_conformance (outside this lane's file list); B-4 is measured over the battery's logged CoreStates instead — the same canonical encode, different population"
+    },
+    {
+      "leg": "b4.feed-uplink-diff",
+      "reason": "no committed feed_uplink-shaped diff instrument; the leg waits with its crate"
+    },
+    {
+      "leg": "b6.startup",
+      "reason": "composition-root assembly lands with Phase 2 (A10 §8.2); recorded absent, as the record itself specifies"
+    },
+    {
+      "leg": "b7.compile-and-binary-size",
+      "reason": "an honest clean-build timing needs an isolated, cold target directory; this box shares one kache cache and one disk with live lanes, so a warm-cache number would be about the cache. The leg waits for a quiet box and the --with-compile capture it needs"
+    }
+  ]
+}
