@@ -1108,6 +1108,28 @@ pub struct UploadManager {
     state_path: PathBuf,
 }
 
+impl UploadManager {
+    /// Build the uploader for a session joined through `origin`.
+    #[must_use]
+    pub fn for_origin(origin: String, telemetry_path: &Path) -> Self {
+        Self {
+            origin,
+            state_path: upload_state_path(telemetry_path),
+        }
+    }
+}
+
+/// The service origin a roster URL was built from.
+///
+/// The roster URL is the one place a joined session records where it came
+/// from, so it is also the only honest source for where its record goes back.
+#[must_use]
+pub fn origin_of_roster_url(roster_url: &str) -> Option<String> {
+    let rest = roster_url.split_once("://")?.1;
+    let authority_len = rest.find('/')?;
+    Some(roster_url[..roster_url.len() - rest.len() + authority_len].to_owned())
+}
+
 #[cfg(test)]
 impl UploadManager {
     pub(crate) fn for_test(origin: String, telemetry_path: &Path) -> Self {
@@ -1468,6 +1490,26 @@ mod tests {
                 dialog: None,
             } if campaigns.is_empty()
         ));
+    }
+
+    /// #711: a headless session installs its uploader from the roster URL it
+    /// joined through. Every one of the service's 131 session directories was
+    /// a headless client, and not one had uploaded, because only the lobby's
+    /// join gate ever installed an `UploadManager`.
+    #[test]
+    fn a_roster_url_yields_the_origin_its_session_reports_back_to() {
+        assert_eq!(
+            origin_of_roster_url("https://campaigns.distopik.com/v1/campaigns/shakedown/roster"),
+            Some("https://campaigns.distopik.com".to_owned())
+        );
+        assert_eq!(
+            origin_of_roster_url("http://127.0.0.1:8323/v1/campaigns/x/roster"),
+            Some("http://127.0.0.1:8323".to_owned())
+        );
+        // No path after the authority is not a roster URL, and guessing an
+        // origin from one would send a player's record somewhere unintended.
+        assert_eq!(origin_of_roster_url("https://campaigns.distopik.com"), None);
+        assert_eq!(origin_of_roster_url("not-a-url"), None);
     }
 
     #[test]

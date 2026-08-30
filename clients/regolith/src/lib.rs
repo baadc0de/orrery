@@ -539,6 +539,24 @@ impl Plugin for RegolithSkinPlugin {
             ))),
             None => ActiveSession::Local(Box::<LocalSession>::default()),
         };
+        // A headless join builds its session here rather than through the
+        // lobby's join gate, which is the only other place an `UploadManager`
+        // is installed. Without one, `finish_campaign` writes the record and
+        // then has nothing to send it with -- which is why the service had 131
+        // session directories and not one uploaded record (#711). The origin
+        // comes from the roster URL this session actually joined through, the
+        // same single source the lobby path uses.
+        if let Some(origin) = self
+            .campaign
+            .as_ref()
+            .and_then(|config| config.roster_url.as_deref())
+            .and_then(admission::origin_of_roster_url)
+        {
+            app.insert_resource(admission::UploadManager::for_origin(
+                origin,
+                &self.telemetry_path,
+            ));
+        }
         app.insert_resource(OverlayMetrics::new(self.telemetry_path.clone()))
             .insert_resource(sink)
             // The harness and the design run 60 Hz; Bevy's FixedUpdate
@@ -2649,6 +2667,43 @@ mod tests {
 
     fn finish_campaign(mut exit: MessageWriter<AppExit>) {
         exit.write(AppExit::Success);
+    }
+
+    /// #711: the uploader must be installed by the path a real session takes,
+    /// not by the test. Every one of the service's 131 session directories was
+    /// a headless join, and not one had uploaded, because only the lobby's
+    /// join gate installed an `UploadManager`. A test that inserts its own
+    /// cannot see that: it asserts on a value it handed the code.
+    #[test]
+    fn a_headless_join_installs_the_uploader_from_the_origin_it_joined_through() {
+        let campaign = campaign::CampaignConfig {
+            host_node_hex: String::new(),
+            host_direct: None,
+            slot: 0,
+            own_label: None,
+            session_id: "01917f0e-2b9a-7c4d-8f21-6a0b3c9d1e2f".to_owned(),
+            session_token_hex: None,
+            wall_start_utc: "2026-08-30T12:00:00Z".to_owned(),
+            configured: ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+            transport_secret: iroh_base::SecretKey::generate(),
+            island_seats: Some(1),
+            roster_url: Some(
+                "https://campaigns.distopik.com/v1/campaigns/shakedown/roster".to_owned(),
+            ),
+        };
+        let origin = campaign
+            .roster_url
+            .as_deref()
+            .and_then(admission::origin_of_roster_url);
+        assert_eq!(
+            origin,
+            Some("https://campaigns.distopik.com".to_owned()),
+            "a headless session must derive its upload origin from the roster URL it joined through"
+        );
     }
 
     #[test]
