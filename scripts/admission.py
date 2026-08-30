@@ -59,6 +59,15 @@ class Campaign:
     always_on: bool; humans: int; lobby_seconds: int
 
 
+@dataclass(frozen=True)
+class StandingHostMembership:
+    """One generation's host-authored seat bindings."""
+    attempt_id: str
+    active_slots: frozenset[int]
+    released_sessions: frozenset[str]
+    running: bool
+
+
 class Admission:
     def __init__(self, control: Path, state: Path, invite: str, ssh: str, ssh_key: Path,
                  issuer: Path, swarm: str, standing_host_state: Path, statvfs=os.statvfs):
@@ -191,22 +200,21 @@ class Admission:
             return None
         return listening if listening.strip() else None
 
-    def _standing_host_membership(self, campaign: Campaign, attempt: dict[str, Any] | None
-                                  ) -> tuple[set[int], set[str], bool] | None:
-        """Read the host-authored binding feed, failing closed on bad bytes."""
-        if attempt is None:
-            return set(), set(), False
+    def _published_standing_host_membership(self, campaign: Campaign
+                                            ) -> StandingHostMembership | None:
+        """Read whichever generation the host says is actually bound."""
         path = self.standing_host_state / campaign.ident / "active-seats.json"
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             slots = value["active_slots"]
             released = value.get("released_sessions", [])
             running = value["running"]
+            attempt_id = value.get("attempt_id")
         except FileNotFoundError:
-            return set(), set(), False
+            raise
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
             return None
-        if (value.get("attempt_id") != attempt["attempt_id"] or not isinstance(slots, list)
+        if (not isinstance(attempt_id, str) or not isinstance(slots, list)
                 or not isinstance(released, list)
                 or not isinstance(running, bool)
                 or any(not isinstance(session, str) or not SESSION.fullmatch(session)
@@ -216,7 +224,18 @@ class Admission:
                 or not campaign.peers <= slot < campaign.peers + campaign.humans for slot in slots)
                 or len(set(slots)) != len(slots)):
             return None
-        return set(slots), set(released), running
+        return StandingHostMembership(attempt_id, frozenset(slots), frozenset(released), running)
+
+    def _standing_host_membership(self, campaign: Campaign, attempt: dict[str, Any]
+                                  ) -> StandingHostMembership | None:
+        """Read the expected generation's binding feed, failing closed on mismatch."""
+        try:
+            membership = self._published_standing_host_membership(campaign)
+        except FileNotFoundError:
+            return StandingHostMembership(attempt["attempt_id"], frozenset(), frozenset(), False)
+        if membership is None or membership.attempt_id != attempt["attempt_id"]:
+            return None
+        return membership
 
     def _current_slots(self, campaign: Campaign, attempt: dict[str, Any], *, persist: bool
                        ) -> tuple[list[dict[str, Any]], set[int]] | None:
@@ -224,18 +243,17 @@ class Admission:
         membership = self._standing_host_membership(campaign, attempt)
         if membership is None:
             return None
-        active_slots, released_sessions, _running = membership
         now = int(time.time())
         generation = [row for row in self._read_slots(campaign)
                       if row.get("attempt_id") == attempt["attempt_id"]]
         current = [row for row in generation
-                   if row.get("session_id") not in released_sessions
-                   and (row.get("slot") in active_slots
+                   if row.get("session_id") not in membership.released_sessions
+                   and (row.get("slot") in membership.active_slots
                         or (isinstance(row.get("expires_at"), int)
                             and row["expires_at"] > now))]
         if persist and current != generation:
             self._write_slots(campaign, current)
-        return current, active_slots
+        return current, set(membership.active_slots)
 
     def _campaign_phase(self, campaign: Campaign, attempt: dict[str, Any] | None) -> tuple[str, int]:
         if not campaign.open:
@@ -258,26 +276,45 @@ class Admission:
         if not free:
             return "full", 0
         membership = self._standing_host_membership(campaign, attempt)
-        if membership is not None and membership[2]:
+        if membership is not None and membership.running:
             return "running", max(free, 0)
         return "lobby", max(free, 0)
 
     def session_roster(self, campaign: Campaign, attempt: dict[str, Any] | None) -> list[dict[str, Any]]:
         """Return every configured seat; a reservation is not a liveness claim."""
-        reservations = {} if attempt is None else {
-            row.get("slot"): row for row in self._read_slots(campaign)
-            if row.get("attempt_id") == attempt["attempt_id"]
+        rows = self._read_slots(campaign)
+        try:
+            bound = self._published_standing_host_membership(campaign)
+        except FileNotFoundError:
+            bound = None
+        # The host publication, not admission's independently moving attempt
+        # pointer, defines a binding's lifetime. Matching both its generation
+        # and active slot keeps a bound player's label across the pointer
+        # hand-off without letting an old reservation name a reused slot.
+        bound_rows = {} if bound is None else {
+            row.get("slot"): row for row in rows
+            if row.get("attempt_id") == bound.attempt_id
+            and row.get("slot") in bound.active_slots
+            and row.get("session_id") not in bound.released_sessions
         }
-        membership = self._standing_host_membership(campaign, attempt)
-        active_slots = set() if membership is None else membership[0]
+        released = (bound.released_sessions if bound is not None and attempt is not None
+                    and bound.attempt_id == attempt["attempt_id"] else frozenset())
+        now = int(time.time())
+        reservations = {} if attempt is None else {
+            row.get("slot"): row for row in rows
+            if row.get("attempt_id") == attempt["attempt_id"]
+            and row.get("session_id") not in released
+            and isinstance(row.get("expires_at"), int) and row["expires_at"] > now
+        }
         roster: list[dict[str, Any]] = []
         for slot in range(campaign.peers):
             suffix = f"-{slot + 1}"
             roster.append({"slot": slot, "kind": "bot", "state": "active",
                            "nickname": display_label(campaign.ident[:DISPLAY_LABEL_MAX_CHARS - len(suffix)] + suffix)})
         for slot in range(campaign.peers, campaign.peers + campaign.humans):
-            row = reservations.get(slot)
-            roster.append({"slot": slot, "kind": "human", "state": "active" if row and slot in active_slots else ("reserved" if row else "empty"),
+            bound_row = bound_rows.get(slot)
+            row = bound_row or reservations.get(slot)
+            roster.append({"slot": slot, "kind": "human", "state": "active" if bound_row else ("reserved" if row else "empty"),
                            "nickname": row.get("nickname") if row else None})
         return roster
 
@@ -776,6 +813,48 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
                          ["reserved", "reserved", "empty", "empty"],
                          "a prior generation must not assert present membership")
+
+    def test_a_bound_seat_keeps_its_label_when_the_attempt_pointer_moves(self) -> None:
+        attempt = self.enable_always_on()
+        joined = self.service.join("test", self.request())
+        active = self.standing_host_state / "test" / "active-seats.json"
+        active.write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [joined["join"]["slot"]],
+            "released_sessions": [], "running": True,
+        }))
+
+        moved = dict(attempt)
+        moved["attempt_id"] = "next-attempt"
+        (self.standing_host_state / "test" / "attempt.json").write_text(json.dumps(moved))
+        seat = self.service.roster("test")["roster"][joined["join"]["slot"]]
+        self.assertEqual((seat["state"], seat["nickname"]), ("active", "ada"),
+                         "a bound seat keeps its label across an attempt-pointer hand-off")
+
+        slots_path = self.state / "test" / "slots.json"
+        rows = json.loads(slots_path.read_text())
+        rows.append({
+            "attempt_id": moved["attempt_id"], "slot": joined["join"]["slot"],
+            "session_id": "018f8f4e-5c90-7abc-8123-0000000000ab",
+            "node": "b" * 64, "nickname": "lin",
+            "expires_at": int(time.time()) + ARRIVAL_LEASE_SECONDS,
+        })
+        slots_path.write_text(json.dumps(rows))
+        seat = self.service.roster("test")["roster"][joined["join"]["slot"]]
+        self.assertEqual((seat["state"], seat["nickname"]), ("active", "ada"),
+                         "another generation cannot rename the seat the host still binds")
+
+        (self.standing_host_state / "test" / "attempt.json").unlink()
+        seat = self.service.roster("test")["roster"][joined["join"]["slot"]]
+        self.assertEqual((seat["state"], seat["nickname"]), ("active", "ada"),
+                         "a transiently absent pointer must not blank a bound seat")
+
+        active.write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [],
+            "released_sessions": [joined["join"]["session_id"]], "running": True,
+        }))
+        seat = self.service.roster("test")["roster"][joined["join"]["slot"]]
+        self.assertEqual((seat["state"], seat["nickname"]), ("empty", None),
+                         "the label disappears when the host releases the binding")
 
     def test_running_campaign_stays_joinable_while_a_slot_is_unbound(self) -> None:
         self.control.write_text(self.control.read_text() + "lobby_seconds = 12\n")

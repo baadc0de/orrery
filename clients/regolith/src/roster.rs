@@ -229,9 +229,12 @@ impl ShipRoster {
 
     /// Replaces the public labels from one roster answer and reapplies `own`.
     ///
-    /// Wholesale replacement, not a merge: the service's answer is the set of
-    /// players who are live *now*, so a row that stopped being sent means that
-    /// player left, and merging would keep labelling a ship nobody is flying.
+    /// Wholesale replacement, not a merge: a successful answer is the complete
+    /// seat map *now*. Admission keeps a bound label across its attempt-pointer
+    /// hand-off (#706), so an absent label in a successful answer means the seat
+    /// is no longer reserved or bound. Merging would retain a departed player's
+    /// label on an empty or reused slot. Fetch failures take [`Self::fail`]
+    /// instead and deliberately keep the last good map.
     pub fn accept(&mut self, response: &RosterResponse, own: Option<OwnLabelGrant<'_>>) {
         self.labels = response
             .roster
@@ -450,9 +453,10 @@ mod tests {
         );
     }
 
-    /// The roster is the live set, so a player who left stops being drawn.
+    /// A complete successful answer clears a departed player's old label. This
+    /// is why `accept` cannot merge even though a failed fetch keeps old labels.
     #[test]
-    fn a_roster_answer_replaces_the_labels_rather_than_merging_them() {
+    fn a_departed_players_label_disappears_on_the_next_authoritative_answer() {
         let mut roster = ShipRoster::default();
         roster.accept(
             &RosterResponse {
@@ -467,7 +471,15 @@ mod tests {
         assert_eq!(roster.len(), 2);
         roster.accept(
             &RosterResponse {
-                roster: vec![RosterRow::labelled(8, "ada")],
+                roster: vec![
+                    RosterRow::labelled(8, "ada"),
+                    RosterRow {
+                        slot: 2,
+                        nickname: None,
+                        kind: Some("human".to_owned()),
+                        state: Some("empty".to_owned()),
+                    },
+                ],
                 ..Default::default()
             },
             None,
