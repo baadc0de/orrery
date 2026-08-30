@@ -1,6 +1,6 @@
 //! Integer stage-1 checks for Regolith's craft and rock tables.
 use super::{
-    state::{RegolithState, TAU_URAD},
+    state::{RegolithState, PITCH_LIMIT_URAD, TAU_URAD},
     weapon::WeaponKind,
     BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_MAX_LIVE_ROCKS, DRAG_PER_SEC_PER_MILLE,
     ISLAND_CRAFT_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, LOCK_ACQUISITION_TICKS,
@@ -185,7 +185,7 @@ fn value_range(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invari
                 || craft.cooldown > weapon.cooldown_ticks
                 || craft.yaw_urad < 0
                 || craft.yaw_urad >= TAU_URAD
-                || craft.pitch_urad != 0
+                || craft.pitch_urad.abs() > PITCH_LIMIT_URAD
                 || craft.respawn_in > RESPAWN_TICKS
                 || craft.lock_progress > LOCK_ACQUISITION_TICKS
                 || craft.lock_decay_progress >= LOCK_ACQUISITION_TICKS

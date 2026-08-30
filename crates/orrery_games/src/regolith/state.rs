@@ -33,7 +33,24 @@ impl LockClass {
 
 /// Full turn in micro-radians.
 pub const TAU_URAD: i32 = 6_283_185;
-/// The inherited schema limit; Regolith's pilot always supplies zero pitch.
+/// Elevation limit, micro-radians: a quarter turn either side of level.
+///
+/// Symmetric by construction, and π/2 rather than any smaller angle because
+/// ±π/2 *is* the whole elevation range — straight up to straight down. A
+/// larger bound would not buy a new direction, it would alias: pitch beyond a
+/// quarter turn re-enters the same range with the yaw flipped by π, so the
+/// same heading would have two encodings and the canonical state would stop
+/// being canonical.
+///
+/// The value is π/2 truncated to the micro-radian lattice, 1.5707960 rad
+/// against a true 1.5707963. That truncation is load-bearing rather than
+/// sloppy: it leaves `cos(PITCH_LIMIT_URAD / 1e6) ≈ 3.3e-7`, strictly
+/// positive, so the horizontal thrust factor never collapses to exactly zero
+/// and yaw stays observable even at full elevation.
+///
+/// Shared with Skirmish's limit of the same name and value; both games feed
+/// one client control mapping, and a player who pitches to the stop in one
+/// must not find a different stop in the other.
 pub const PITCH_LIMIT_URAD: i32 = 1_570_796;
 
 /// Maximum number of sampled positions retained behind a craft.
@@ -206,7 +223,7 @@ pub struct Craft {
     pub trail: Trail,
     /// Heading.
     pub yaw_urad: i32,
-    /// Retained schema field; input discipline locks it to zero.
+    /// Elevation, micro-radians, clamped to ±[`PITCH_LIMIT_URAD`].
     pub pitch_urad: i32,
     /// Hull, floored at zero.
     pub hull: i32,

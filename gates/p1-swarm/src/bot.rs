@@ -1215,12 +1215,16 @@ impl Bot {
         if let Some(Order::Thrust {
             accel_mmss,
             yaw_urad,
-            pitch_urad,
+            ..
         }) = orders.first_mut()
         {
             // Input-source adaptation, parallel to the skin gating thrust and
             // choosing a yaw sign. The pilot still owns the Order vocabulary,
-            // scenario direction, held trigger, targets and pitch lock.
+            // scenario direction, held trigger, targets and elevation. Pitch
+            // is deliberately *not* rewritten here: since v19 it is a live
+            // axis, and overriding it would make the harness's honest bot
+            // disagree with `Game::honest_inputs` on a rule rather than on an
+            // input source.
             *accel_mmss = if speed_probe {
                 // A modified cruiser must ask beyond its honest acceleration
                 // ceiling or a raised ceiling is inert at the 32 m/s roam.
@@ -1229,7 +1233,6 @@ impl Bot {
                 profile.accel_mmss(tick, speed, *accel_mmss, CRUISE_MPS)
             };
             *yaw_urad = yaw_urad.signum() * turn_urad.abs();
-            *pitch_urad = 0;
         }
         // Log *before* executing, and log exactly what is about to be applied.
         // A log written from what happened rather than what was asked would
