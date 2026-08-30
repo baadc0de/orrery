@@ -21,3 +21,15 @@ rand_chacha = "0.9"
 rand_core = "0.9"
 # The chain digest over per-tick state hashes.
 blake3 = "1.8"
+# F-4 class D-4's cross-replay leg signs with the same transport identity the
+# production authority path uses (D3): `InputLogProducer` takes an
+# `iroh_base::SecretKey`, so building the evidence a witness adjudicates needs
+# one here. Key material is a fixed constant, never generated — no OS entropy,
+# no clock, nothing that could differ across the determinism matrix.
+iroh-base = { workspace = true }
+# F-4 class D-3 frames at-rest component slots exactly as
+# `orrery_persistd::schema::ComponentBag` does, and encodes the journal records
+# a `feed_uplink`-shaped producer would queue. Same encoder, same bytes.
+bytes = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }

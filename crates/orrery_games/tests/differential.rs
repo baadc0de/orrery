@@ -13,6 +13,12 @@
 //! | ruleset bump classifies | §4.3's migration-fixture arm, and the D-3/D-4 half named as unmet |
 //! | schema/projection bumps route | the unimplemented D-3/D-4 arms named rather than treated as equal |
 //! | D-2 compares bytes | a comparator comparing chain length instead of chain bytes |
+//! | a slot subset is not parity | a D-3 comparator that compares slot payloads and ignores the slot SET |
+//! | a slot's bytes are compared | a D-3 comparator that compares the slot set and ignores the bytes |
+//! | the journal is compared | a D-3 comparator blind to *when* a write happened |
+//! | the claim is over quantized state | a D-4 projection that hashes the wrong bytes (the A7 X-C class, #738) |
+//! | sub-lattice residue is not deviation | the same mutation seen from the false-conviction side |
+//! | the adjudicator convicts a diverging candidate | a D-4 that merely diffs instead of adjudicating |
 //!
 //! Both sides of every run here are the same implementation driven twice —
 //! the deliberate self-differential of S7.1: it proves the runner, the
@@ -28,21 +34,38 @@
 
 use std::collections::BTreeMap;
 
-use orrery_core::{ComponentTypeId, Ruleset};
+use orrery_core::{state_hash, CodecError, ComponentTypeId, CoreCodec, Quantized, Ruleset};
 use orrery_games::diff::{
-    collect_artifacts, compare, run_differential, Baseline, Class, Difference, Refusal, Side, Skew,
-    Subject, Verdict, VersionAxes,
+    claim_value, collect_artifacts, compare, cross_replay, run_differential, Baseline, Class,
+    CrossReplay, Crossing, Difference, Refusal, Side, SideArtifacts, Skew, SlotKey, Subject,
+    Verdict, VersionAxes,
 };
 use orrery_games::golden;
 use orrery_games::regolith::{Regolith, REGOLITH_COMPOSITION};
 use orrery_games::scenario::{play, Scenario, SCENARIOS};
 use orrery_games::{game::Tamper, Game};
 use orrery_protocol::atrest::SchemaVersion;
+use orrery_protocol::{UniverseSeed, Verdict as AdjudicatedVerdict};
 
-/// The campaign's composition manifest carries no component schemas yet, so
-/// the schema-bump arms are exercised with one declared component. When S7.2
-/// populates the table, these tests switch to a real row.
-const DECLARED_COMPONENT: ComponentTypeId = ComponentTypeId(0x5353_1001);
+/// Regolith's one reviewed component-type allocation, at the bootstrap schema
+/// version.
+///
+/// `REGOLITH_COMPOSITION.component_schemas` is still empty — the manifest's
+/// schema table has not been populated from
+/// `orrery_compose::registry::regolith`, which is a gap in the manifest and
+/// not in this harness — so the axes below are handed the reviewed registry
+/// row directly. This is the real row S7.1 said these tests would switch to:
+/// `Regolith::classify_component` returns `CoreClass::Core` for it, so D-3
+/// frames a real slot per entity-tick and the class is not vacuous.
+const DECLARED_COMPONENT: ComponentTypeId = orrery_compose::registry::regolith::STATE;
+
+/// A second declared component, classified `Cosmetic` by Regolith and so
+/// never persisted, held only so the schema-**membership** arm has a row it
+/// can remove without taking the game's whole at-rest artifact with it.
+/// Removing the persisted row instead would refuse on the missing D-3
+/// artifact before the axes were ever compared, which is a different
+/// refusal answering a different question.
+const UNPERSISTED_COMPONENT: ComponentTypeId = ComponentTypeId(0x5353_1001);
 
 fn regolith_axes() -> VersionAxes {
     let mut schema_versions: BTreeMap<ComponentTypeId, SchemaVersion> = REGOLITH_COMPOSITION
@@ -50,12 +73,55 @@ fn regolith_axes() -> VersionAxes {
         .iter()
         .map(|schema| (schema.id.component, schema.id.version))
         .collect();
-    schema_versions.insert(DECLARED_COMPONENT, 0);
+    schema_versions.insert(DECLARED_COMPONENT, orrery_protocol::atrest::SCHEMA_V0);
+    schema_versions.insert(UNPERSISTED_COMPONENT, orrery_protocol::atrest::SCHEMA_V0);
     VersionAxes {
         ruleset_version: Regolith::META.ruleset.version,
         projection_version: REGOLITH_COMPOSITION.projection_version.0,
         schema_versions,
     }
+}
+
+/// Both sides' artifacts for one scenario, played twice from the same build.
+///
+/// The pair a comparator test needs: identical by construction, so any
+/// difference a test then introduces is the only difference there is.
+fn honest_pair(name: &str) -> (SideArtifacts, SideArtifacts) {
+    let scenario = scenario(name);
+    let legacy_played = play(Regolith::honest(), scenario);
+    let candidate_played = play(Regolith::honest(), scenario);
+    (
+        collect_artifacts(
+            &Regolith::honest(),
+            &legacy_played,
+            Side::Legacy,
+            regolith_axes(),
+        ),
+        collect_artifacts(
+            &Regolith::honest(),
+            &candidate_played,
+            Side::Candidate,
+            regolith_axes(),
+        ),
+    )
+}
+
+/// The D-4 cross-replay for a pair of artifact sets, under the builds that
+/// produced them.
+fn crossing(
+    name: &str,
+    legacy_game: &Regolith,
+    candidate_game: &Regolith,
+    legacy: &SideArtifacts,
+    candidate: &SideArtifacts,
+) -> CrossReplay {
+    cross_replay(
+        legacy_game,
+        candidate_game,
+        legacy.d4.as_ref().expect("legacy produced D-4"),
+        candidate.d4.as_ref().expect("candidate produced D-4"),
+        UniverseSeed([scenario(name).seed_byte; 32]),
+    )
 }
 
 fn regolith_baseline() -> Baseline {
@@ -94,8 +160,13 @@ fn a_self_differential_from_identical_sealed_inputs_reports_parity() {
         assert_eq!(
             verdict,
             Verdict::Parity {
-                compared: vec![Class::D1State, Class::D2Outcome],
-                not_compared: vec![Class::D3Persistence, Class::D4Witness],
+                compared: vec![
+                    Class::D1State,
+                    Class::D2Outcome,
+                    Class::D3Persistence,
+                    Class::D4Witness,
+                ],
+                not_compared: vec![],
             },
             "{}/{}: the self-differential did not report parity",
             "regolith",
@@ -173,32 +244,31 @@ fn a_differential_without_a_baseline_refuses_to_produce_a_verdict() {
 /// partial-matrix pass this harness exists to refuse.
 #[test]
 fn a_side_that_produced_only_one_class_refuses_rather_than_passes() {
-    let scenario = scenario("solo");
-    let legacy_played = play(Regolith::honest(), scenario);
-    let candidate_played = play(Regolith::honest(), scenario);
-
-    let mut partial = collect_artifacts(&candidate_played, Side::Candidate, regolith_axes());
-    partial.d2 = None;
-    let verdict = compare(
-        collect_artifacts(&legacy_played, Side::Legacy, regolith_axes()),
-        partial,
+    let (legacy, candidate) = honest_pair("solo");
+    let cross = crossing(
+        "solo",
+        &Regolith::honest(),
+        &Regolith::honest(),
+        &legacy,
+        &candidate,
     );
+
+    let mut partial = candidate.clone();
+    partial.d2 = None;
+    let verdict = compare(legacy.clone(), partial, Some(&cross));
     assert_eq!(
         verdict,
         Verdict::Refused(Refusal::PartialArtifacts {
             side: Side::Candidate,
             missing: vec![Class::D2Outcome],
         }),
-        "a one-class comparison was reported as a verdict"
+        "a three-class comparison was reported as a verdict"
     );
 
     // The same refusal on the legacy side, by symmetry.
-    let mut partial = collect_artifacts(&legacy_played, Side::Legacy, regolith_axes());
+    let mut partial = legacy.clone();
     partial.d1 = None;
-    let verdict = compare(
-        partial,
-        collect_artifacts(&candidate_played, Side::Candidate, regolith_axes()),
-    );
+    let verdict = compare(partial, candidate.clone(), Some(&cross));
     assert_eq!(
         verdict,
         Verdict::Refused(Refusal::PartialArtifacts {
@@ -206,6 +276,30 @@ fn a_side_that_produced_only_one_class_refuses_rather_than_passes() {
             missing: vec![Class::D1State],
         }),
         "a legacy side missing its state chain produced a verdict"
+    );
+
+    // A side that persists nothing produced no D-3 artifact at all, and the
+    // refusal names D-3 rather than reading two empty slot tables as
+    // agreement.
+    let mut partial = candidate.clone();
+    partial.d3 = None;
+    let verdict = compare(legacy.clone(), partial, Some(&cross));
+    assert_eq!(
+        verdict,
+        Verdict::Refused(Refusal::PartialArtifacts {
+            side: Side::Candidate,
+            missing: vec![Class::D3Persistence],
+        }),
+        "a side with no at-rest artifact produced a verdict"
+    );
+
+    // D-4 is two halves, and half a class is no class: the claim values alone
+    // are not a D-4 comparison while the cross-replay has not run.
+    let verdict = compare(legacy, candidate, None);
+    assert_eq!(
+        verdict,
+        Verdict::Refused(Refusal::CrossReplayNotRun),
+        "a comparison without the cross-replay leg produced a verdict"
     );
 }
 
@@ -232,11 +326,34 @@ fn a_genuinely_diverging_candidate_fails_under_equal_axes() {
     let Verdict::Failure { differences } = verdict else {
         panic!("a tampered candidate produced {verdict:?} instead of failing");
     };
-    for class in [Class::D1State, Class::D2Outcome] {
+    for class in [
+        Class::D1State,
+        Class::D2Outcome,
+        Class::D3Persistence,
+        Class::D4Witness,
+    ] {
         assert!(
             differences.iter().any(|(found, _)| *found == class),
             "{} did not differ for a damage-inflated candidate: {differences:?}",
             class.name()
+        );
+    }
+    // And the conviction: the *existing* adjudicator, not this harness,
+    // returned a non-exonerating verdict in both directions.
+    for crossing in [
+        Crossing::LegacyClaimsCandidateLogs,
+        Crossing::CandidateClaimsLegacyLogs,
+    ] {
+        assert!(
+            differences
+                .iter()
+                .any(|(class, difference)| *class == Class::D4Witness
+                    && matches!(
+                        difference,
+                        Difference::CrossReplay { crossing: found, .. } if *found == crossing
+                    )),
+            "{} did not convict a damage-inflated candidate: {differences:?}",
+            crossing.name()
         );
     }
 }
@@ -268,7 +385,7 @@ fn version_skew_without_a_bump_is_unclassifiable() {
         (
             "schema membership changed",
             Box::new(|axes: &mut VersionAxes| {
-                axes.schema_versions.remove(&DECLARED_COMPONENT);
+                axes.schema_versions.remove(&UNPERSISTED_COMPONENT);
             }),
         ),
         (
@@ -321,7 +438,9 @@ fn a_ruleset_bump_classifies_d1_d2_differences_as_migration_fixtures() {
         Verdict::MigrationFixture {
             d1_differs: true,
             d2_differs: true,
-            unmet: vec![Class::D3Persistence, Class::D4Witness],
+            d3_differs: true,
+            d4_differs: true,
+            unmet: vec![],
         },
         "a ruleset bump with differences was not classified as a migration fixture"
     );
@@ -338,10 +457,18 @@ fn a_ruleset_bump_classifies_d1_d2_differences_as_migration_fixtures() {
         Verdict::MigrationFixture {
             d1_differs: false,
             d2_differs: false,
-            unmet: vec![Class::D3Persistence, Class::D4Witness],
+            d3_differs: false,
+            // Nothing moved: the axes are *declared* build identity, while
+            // both sides here are one build. A real ruleset bump would carry
+            // a different `RulesetId` into every claim and frame, and the
+            // adjudicator would refuse the crossing as `UnknownRuleset` —
+            // which is the same signal by a different route, and why this
+            // arm classifies rather than passing.
+            d4_differs: false,
+            unmet: vec![],
         },
         "a ruleset bump without differences was reported as something other than \
-         a fixture classification with unmet classes"
+         a fixture classification"
     );
 }
 
@@ -363,9 +490,9 @@ fn a_schema_bump_keeps_d1_d2_differences_failures_and_names_d3() {
     assert_eq!(
         verdict,
         Verdict::Refused(Refusal::ClassNotImplemented {
-            classes: vec![Class::D3Persistence, Class::D4Witness],
+            classes: vec![Class::D3Persistence],
         }),
-        "a schema bump without differences was not refused to the unimplemented arm"
+        "a schema bump without differences was not refused to the F-6 round-trip arm"
     );
 
     // Differences under the bump: D-1/D-2 unchanged, so still failures.
@@ -402,10 +529,11 @@ fn a_projection_bump_refuses_cross_version_claims() {
     );
     assert_eq!(
         verdict,
-        Verdict::Refused(Refusal::ClassNotImplemented {
-            classes: vec![Class::D4Witness],
+        Verdict::Refused(Refusal::CrossVersionClaims {
+            legacy: REGOLITH_COMPOSITION.projection_version.0,
+            candidate: REGOLITH_COMPOSITION.projection_version.0 + 1,
         }),
-        "a projection bump was not refused to the unimplemented D-4 arm"
+        "a projection bump was not refused as a cross-version claim comparison"
     );
 }
 
@@ -414,16 +542,13 @@ fn a_projection_bump_refuses_cross_version_claims() {
 /// different runs, and the verdict must say so.
 #[test]
 fn the_d2_comparator_compares_bytes_not_lengths() {
-    let scenario = scenario("solo");
-    let legacy = collect_artifacts(
-        &play(Regolith::honest(), scenario),
-        Side::Legacy,
-        regolith_axes(),
-    );
-    let mut candidate = collect_artifacts(
-        &play(Regolith::honest(), scenario),
-        Side::Candidate,
-        regolith_axes(),
+    let (legacy, mut candidate) = honest_pair("solo");
+    let cross = crossing(
+        "solo",
+        &Regolith::honest(),
+        &Regolith::honest(),
+        &legacy,
+        &candidate,
     );
 
     // The materials are identical bytes; flip one payload byte. Same length,
@@ -446,7 +571,7 @@ fn the_d2_comparator_compares_bytes_not_lengths() {
         );
     }
 
-    let verdict = compare(legacy, candidate);
+    let verdict = compare(legacy, candidate, Some(&cross));
     let Verdict::Failure { differences } = verdict else {
         panic!("byte-different, length-equal chains produced {verdict:?} instead of failing");
     };
@@ -456,4 +581,402 @@ fn the_d2_comparator_compares_bytes_not_lengths() {
             .any(|(class, _)| *class == Class::D2Outcome),
         "the D-2 difference was not named: {differences:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// D-3 — persistence
+// ---------------------------------------------------------------------------
+
+/// D-3's slot-set half, and the failure it exists to catch: **a candidate that
+/// writes a correct subset of slots is not at parity.**
+///
+/// The fixture is built so a *payload-only* comparator provably cannot see
+/// it. Every slot the candidate still holds is asserted byte-identical to the
+/// legacy side's, and the journal is untouched — so the only observable
+/// difference in the whole class is the missing key. A comparator that walked
+/// the slots both sides hold and compared their bytes would report parity
+/// over a persistence layer that silently dropped a row.
+#[test]
+fn a_candidate_producing_a_subset_of_slots_is_not_parity() {
+    let (legacy, mut candidate) = honest_pair("solo");
+    let cross = crossing(
+        "solo",
+        &Regolith::honest(),
+        &Regolith::honest(),
+        &legacy,
+        &candidate,
+    );
+
+    let legacy_slots = &legacy.d3.as_ref().expect("legacy produced D-3").slots;
+    let dropped: SlotKey = *legacy_slots
+        .keys()
+        .nth(legacy_slots.len() / 2)
+        .expect("the run wrote at least one slot");
+
+    {
+        let persistence = candidate.d3.as_mut().expect("candidate produced D-3");
+        assert!(
+            persistence.slots.remove(&dropped).is_some(),
+            "the fixture removed a slot the candidate never wrote"
+        );
+        assert_eq!(
+            persistence.slots.len() + 1,
+            legacy_slots.len(),
+            "the fixture must differ by exactly one slot or it is not a subset"
+        );
+        // Vacuity, stated: everything the candidate still holds agrees
+        // byte-for-byte, so nothing but the slot SET distinguishes the sides.
+        for (slot, bytes) in &persistence.slots {
+            assert_eq!(
+                legacy_slots.get(slot),
+                Some(bytes),
+                "{slot:?}: the fixture perturbed a payload; the test would not be \
+                 isolating the slot-set half"
+            );
+        }
+    }
+    assert_eq!(
+        legacy.d3.as_ref().expect("legacy produced D-3").journal,
+        candidate
+            .d3
+            .as_ref()
+            .expect("candidate produced D-3")
+            .journal,
+        "the fixture perturbed the journal; the test would not be isolating the \
+         slot-set half"
+    );
+
+    let verdict = compare(legacy, candidate, Some(&cross));
+    let Verdict::Failure { differences } = verdict else {
+        panic!("a candidate writing a subset of slots produced {verdict:?} instead of failing");
+    };
+    assert!(
+        differences
+            .iter()
+            .any(|(class, difference)| *class == Class::D3Persistence
+                && matches!(
+                    difference,
+                    Difference::SlotSet { missing, extra }
+                        if missing.contains(&dropped) && extra.is_empty()
+                )),
+        "the missing slot was not named on the D-3 class: {differences:?}"
+    );
+}
+
+/// D-3's per-slot half: the framed bytes are compared, not merely the set of
+/// keys, and not their lengths.
+///
+/// The fixture flips one byte inside one slot's framed bytes. The slot sets
+/// are equal, the framed lengths are equal, and the journal is untouched — so
+/// a comparator that checked set equality alone, or lengths, provably cannot
+/// distinguish the sides. This is D-3's own reason to exist: an encoding
+/// change that leaves semantics alone produces identical D-1/D-2 chains and
+/// incompatible stored bytes (A10 §4.2).
+#[test]
+fn the_d3_comparator_compares_slot_bytes_not_only_the_slot_set() {
+    let (legacy, mut candidate) = honest_pair("solo");
+    let cross = crossing(
+        "solo",
+        &Regolith::honest(),
+        &Regolith::honest(),
+        &legacy,
+        &candidate,
+    );
+
+    let touched: SlotKey = *legacy
+        .d3
+        .as_ref()
+        .expect("legacy produced D-3")
+        .slots
+        .keys()
+        .next()
+        .expect("the run wrote at least one slot");
+    {
+        let persistence = candidate.d3.as_mut().expect("candidate produced D-3");
+        let bytes = persistence
+            .slots
+            .get_mut(&touched)
+            .expect("both sides wrote this slot");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+    }
+
+    let legacy_slots = &legacy.d3.as_ref().expect("legacy produced D-3").slots;
+    let candidate_slots = &candidate.d3.as_ref().expect("candidate produced D-3").slots;
+    assert!(
+        legacy_slots.keys().eq(candidate_slots.keys()),
+        "the fixture must keep the slot sets equal or the test is vacuous"
+    );
+    assert_eq!(
+        legacy_slots[&touched].len(),
+        candidate_slots[&touched].len(),
+        "the fixture must differ at equal length or a length comparator would pass"
+    );
+    assert_ne!(
+        legacy_slots[&touched], candidate_slots[&touched],
+        "the fixture must differ in bytes or the test is vacuous"
+    );
+
+    let verdict = compare(legacy, candidate, Some(&cross));
+    let Verdict::Failure { differences } = verdict else {
+        panic!("byte-different, set-equal slots produced {verdict:?} instead of failing");
+    };
+    assert!(
+        differences
+            .iter()
+            .any(|(class, difference)| *class == Class::D3Persistence
+                && matches!(difference, Difference::SlotBytes { slot, .. } if *slot == touched)),
+        "the differing slot was not named: {differences:?}"
+    );
+}
+
+/// D-3's second artifact: the journal a `feed_uplink`-shaped producer would
+/// have queued.
+///
+/// The fixture drops one queued record while leaving every slot in place, so
+/// the slot table — set and bytes — is identical on both sides. A comparator
+/// that stopped at the slots would call this parity, and it is not: the
+/// journal carries *when* a write happened, which the slot table does not.
+#[test]
+fn the_d3_journal_is_compared_and_not_only_the_slots() {
+    let (legacy, mut candidate) = honest_pair("solo");
+    let cross = crossing(
+        "solo",
+        &Regolith::honest(),
+        &Regolith::honest(),
+        &legacy,
+        &candidate,
+    );
+
+    {
+        let persistence = candidate.d3.as_mut().expect("candidate produced D-3");
+        assert!(
+            persistence.journal.len() > 1,
+            "the fixture needs a journal with something in it"
+        );
+        persistence.journal.remove(persistence.journal.len() / 2);
+    }
+
+    let legacy_persistence = legacy.d3.as_ref().expect("legacy produced D-3");
+    let candidate_persistence = candidate.d3.as_ref().expect("candidate produced D-3");
+    assert_eq!(
+        legacy_persistence.slots, candidate_persistence.slots,
+        "the fixture must leave the slots identical or it is not isolating the journal"
+    );
+    assert_ne!(
+        legacy_persistence.journal, candidate_persistence.journal,
+        "the fixture must change the journal or the test is vacuous"
+    );
+
+    let verdict = compare(legacy, candidate, Some(&cross));
+    let Verdict::Failure { differences } = verdict else {
+        panic!("a short journal produced {verdict:?} instead of failing");
+    };
+    assert!(
+        differences
+            .iter()
+            .any(|(class, difference)| *class == Class::D3Persistence
+                && matches!(difference, Difference::JournalRecords { .. })),
+        "the journal difference was not named: {differences:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-4 — witness
+// ---------------------------------------------------------------------------
+
+/// A state deliberately **off** the millimetre lattice until `quantize()`
+/// snaps it.
+///
+/// Every `CoreState` in this workspace already stores lattice integers, which
+/// is exactly why #738 got through: with canonical `quantize()` broken, both
+/// of Regolith's committed golden chains stayed green, because the snap is a
+/// no-op on every shipped fixture and the scenarios structurally cannot reach
+/// the stage. A D-4 pin written against a shipped game would inherit that
+/// blindness, so the projection is pinned against a state that is off the
+/// lattice by construction — the same device
+/// `orrery_conformance/tests/quantize_pin.rs` uses, applied to the
+/// differential harness's own projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OffLattice {
+    /// Micrometres. The lattice is millimetres, so anything that is not a
+    /// multiple of 1000 sits between two lattice points.
+    x_um: i64,
+}
+
+impl OffLattice {
+    const LATTICE_UM: i64 = 1_000;
+}
+
+impl CoreCodec for OffLattice {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.x_um.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let raw: [u8; 8] = bytes.try_into().map_err(|_| CodecError("bad length"))?;
+        Ok(Self {
+            x_um: i64::from_le_bytes(raw),
+        })
+    }
+}
+
+impl Quantized for OffLattice {
+    fn quantize(&mut self) {
+        self.x_um = self.x_um.div_euclid(Self::LATTICE_UM) * Self::LATTICE_UM;
+    }
+}
+
+/// D-4's projection is `blake3(CoreCodec(quantize(state)))` — WP-1's unit,
+/// WP-4's order — and the quantization is part of the projection rather than
+/// an assumption about the state handed in.
+///
+/// This is the A7 X-C class stated as a test: a projection that hashes the
+/// wrong bytes while the run persists the right ones. The vacuity self-check
+/// is the load-bearing half — a fixture that happened to sit on the lattice
+/// would make raw and quantized bytes identical and the assertion below would
+/// hold for a comparator that never quantized at all.
+#[test]
+fn the_d4_claim_is_over_the_quantized_state_not_the_raw_one() {
+    let raw = OffLattice { x_um: 1_567 };
+    let mut snapped = raw.clone();
+    snapped.quantize();
+
+    assert_ne!(
+        raw.to_canonical(),
+        snapped.to_canonical(),
+        "the fixture is on the lattice, so this test would pin nothing"
+    );
+    assert_eq!(
+        claim_value(&raw),
+        state_hash(&snapped),
+        "the claim is not the hash of the quantized state"
+    );
+    assert_ne!(
+        claim_value(&raw),
+        state_hash(&raw),
+        "the claim hashed the raw state — the A7 X-C failure, live"
+    );
+}
+
+/// The same mutation seen from the side that would convict an honest peer.
+///
+/// Two states that differ only *below* the lattice are the same state as far
+/// as the canonical projection is concerned: they quantize to one point, and
+/// a claim commits to what replication and persistence saw (VC-7, WP-4). A
+/// D-4 comparator that hashed raw bytes would report these as a deviation —
+/// IV-2's false-deviation hazard, and a false conviction discovered in the
+/// field rather than here.
+#[test]
+fn d4_reads_sub_lattice_residue_as_agreement_not_deviation() {
+    let left = OffLattice { x_um: 1_567 };
+    let right = OffLattice { x_um: 1_099 };
+
+    assert_ne!(
+        state_hash(&left),
+        state_hash(&right),
+        "the two fixtures have identical raw bytes, so this test would pin nothing"
+    );
+    assert_eq!(
+        claim_value(&left),
+        claim_value(&right),
+        "sub-lattice residue was read as a claim difference"
+    );
+}
+
+/// D-4's second half, on an honest self-differential: the **existing
+/// adjudicator** — `orrery_core::verify_bundle`, the function `persistd`
+/// reaches real verdicts with — exonerates in both directions.
+///
+/// The vacuity guard is the count: a cross-replay that adjudicated nothing at
+/// all would trivially have no unclean verdict, and would be the "our
+/// fixtures cannot tell" result this harness exists to distinguish from
+/// parity.
+#[test]
+fn the_existing_adjudicator_exonerates_an_honest_self_differential() {
+    let (legacy, candidate) = honest_pair("duel");
+    let cross = crossing(
+        "duel",
+        &Regolith::honest(),
+        &Regolith::honest(),
+        &legacy,
+        &candidate,
+    );
+
+    // Two entities in `duel`, two crossings each.
+    assert_eq!(
+        cross.verdicts.len(),
+        4,
+        "the cross-replay did not adjudicate both entities in both directions: {:?}",
+        cross.verdicts
+    );
+    for crossing in [
+        Crossing::LegacyClaimsCandidateLogs,
+        Crossing::CandidateClaimsLegacyLogs,
+    ] {
+        assert_eq!(
+            cross
+                .verdicts
+                .iter()
+                .filter(|(found, _, _)| *found == crossing)
+                .count(),
+            2,
+            "{} adjudicated the wrong number of entities",
+            crossing.name()
+        );
+    }
+    for (crossing, entity, verdict) in &cross.verdicts {
+        assert_eq!(
+            *verdict,
+            AdjudicatedVerdict::Exonerates,
+            "{}: entity {entity:?} was not exonerated on an honest self-differential",
+            crossing.name()
+        );
+    }
+    assert!(
+        cross.unclean().is_empty(),
+        "an honest self-differential produced unclean verdicts: {:?}",
+        cross.unclean()
+    );
+}
+
+/// A diverging candidate is **convicted**, not merely diffed: the adjudicator
+/// returns `Confirms` on the crossed evidence, which is the same verdict a
+/// witness would carry into a real dispute.
+#[test]
+fn the_existing_adjudicator_convicts_a_diverging_candidate() {
+    let tampered = Regolith::tampered(Tamper::DamageInflation).expect("regolith has this tamper");
+    let scenario = scenario("duel");
+    let legacy_played = play(Regolith::honest(), scenario);
+    let candidate_played = play(tampered, scenario);
+    let legacy = collect_artifacts(
+        &Regolith::honest(),
+        &legacy_played,
+        Side::Legacy,
+        regolith_axes(),
+    );
+    let candidate = collect_artifacts(
+        &tampered,
+        &candidate_played,
+        Side::Candidate,
+        regolith_axes(),
+    );
+
+    let cross = crossing("duel", &Regolith::honest(), &tampered, &legacy, &candidate);
+    let unclean = cross.unclean();
+    assert!(
+        !unclean.is_empty(),
+        "a damage-inflating candidate was exonerated by the adjudicator"
+    );
+    for crossing in [
+        Crossing::LegacyClaimsCandidateLogs,
+        Crossing::CandidateClaimsLegacyLogs,
+    ] {
+        assert!(
+            unclean.iter().any(|(found, _, verdict)| *found == crossing
+                && matches!(verdict, AdjudicatedVerdict::Confirms { .. })),
+            "{} did not confirm a deviation: {unclean:?}",
+            crossing.name()
+        );
+    }
 }

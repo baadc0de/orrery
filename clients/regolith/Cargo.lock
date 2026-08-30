@@ -7042,12 +7042,16 @@ name = "orrery_games"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
+ "iroh-base",
  "libm",
  "orrery_compose",
  "orrery_core",
  "orrery_protocol",
+ "postcard",
  "rand_chacha",
  "rand_core 0.9.5",
+ "serde",
 ]
 
 [[package]]
