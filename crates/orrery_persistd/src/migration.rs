@@ -468,7 +468,35 @@ mod tests {
     use crate::schema::ComponentSlot;
 
     const COMPONENT: ComponentTypeId = ComponentTypeId(17);
+    const REMOVED_COMPONENT: ComponentTypeId = ComponentTypeId(18);
     const ENTITY: PersistId = PersistId::new(9);
+
+    const COMPONENT_V0_BYTES: &str = include_str!("../goldens/component-17-v0.postcard.hex");
+    const COMPONENT_V1_BYTES: &str = include_str!("../goldens/component-17-v1.postcard.hex");
+    const COMPONENT_V2_BYTES: &str = include_str!("../goldens/component-17-v2.postcard.hex");
+    const REMOVED_COMPONENT_V0_BYTES: &str =
+        include_str!("../goldens/component-18-v0.postcard.hex");
+
+    /// Decode a reviewable hexadecimal representation of committed wire bytes.
+    ///
+    /// The fixture files deliberately contain no data made by the current
+    /// encoder. See `goldens/README.md` for the writer provenance of each one.
+    fn fixture_bytes(hex: &str) -> Bytes {
+        let hex = hex.trim();
+        assert_eq!(
+            hex.len() % 2,
+            0,
+            "fixture hexadecimal must have complete bytes"
+        );
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|offset| {
+                u8::from_str_radix(&hex[offset..offset + 2], 16)
+                    .expect("fixture contains hexadecimal bytes")
+            })
+            .collect();
+        Bytes::from(bytes)
+    }
 
     fn append_version(payload: Bytes, from: SchemaVersion) -> Result<Bytes, &'static str> {
         let mut bytes = payload.to_vec();
@@ -515,6 +543,50 @@ mod tests {
         registry.declare(COMPONENT, 1);
         registry.register(COMPONENT, 0, append_version);
         registry
+    }
+
+    #[test]
+    fn v0_bytes_migrate_reencode_and_match_the_committed_golden() {
+        let migrated = registry_with_step()
+            .migrate_bag(&fixture_bytes(COMPONENT_V0_BYTES))
+            .expect("the registered migration chain accepts the older fixture");
+
+        assert_eq!(
+            migrated.encode().expect("migrated bag re-encodes"),
+            fixture_bytes(COMPONENT_V1_BYTES),
+            "the migration chain must reproduce the committed v1 bytes"
+        );
+    }
+
+    #[test]
+    fn v1_future_bytes_refuse_per_slot() {
+        let error = registry_with_step()
+            .migrate_bag(&fixture_bytes(COMPONENT_V2_BYTES))
+            .expect_err("a reader at v1 must refuse a v2 component slot");
+
+        assert!(matches!(
+            error,
+            MigrationError::FutureVersion {
+                component: COMPONENT,
+                found: 2,
+                current: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn removed_module_bytes_refuse_naming_the_persisted_component() {
+        let error = registry_with_step()
+            .migrate_bag(&fixture_bytes(REMOVED_COMPONENT_V0_BYTES))
+            .expect_err("a component without a composed module must refuse");
+
+        assert!(matches!(
+            error,
+            MigrationError::UnregisteredComponent {
+                component: REMOVED_COMPONENT,
+                found: 0,
+            }
+        ));
     }
 
     #[tokio::test]
