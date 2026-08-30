@@ -7904,6 +7904,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_compose"
+version = "0.1.0"
+dependencies = [
+ "orrery_core",
+ "orrery_protocol",
+]
+
+[[package]]
 name = "orrery_conformance"
 version = "0.1.0"
 dependencies = [

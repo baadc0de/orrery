@@ -1,0 +1,10 @@
+[package]
+name = "orrery_compose"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Link-time composition manifest for Orrery rulesets"
+
+[dependencies]
+orrery_core = { path = "../orrery_core" }
+orrery_protocol = { path = "../orrery_protocol" }
