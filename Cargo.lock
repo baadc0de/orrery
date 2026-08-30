@@ -8155,6 +8155,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_sim_host"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "blake3",
+ "orrery_core",
+ "orrery_games",
+ "orrery_protocol",
+]
+
+[[package]]
 name = "orrery_spatial"
 version = "0.1.0"
 dependencies = [

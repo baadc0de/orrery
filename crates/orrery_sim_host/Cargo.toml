@@ -1,0 +1,16 @@
+[package]
+name = "orrery_sim_host"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-neutral fixed-step host seam for Orrery Rulesets"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+orrery_core = { path = "../orrery_core" }
+orrery_protocol = { path = "../orrery_protocol" }
+
+[dev-dependencies]
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+blake3 = "1.8"
+orrery_games = { path = "../orrery_games" }
