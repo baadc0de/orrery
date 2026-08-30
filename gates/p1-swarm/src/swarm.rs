@@ -110,6 +110,21 @@ struct HostInterestCrossing {
     crossing: InterestCellCrossing,
 }
 
+/// How many times a freshly bound seat is re-sent its own membership.
+///
+/// One second apart, so a joiner that is still finishing its handshake when the
+/// first copy goes out still gets one it can read.
+const DEFERRED_MANIFEST_PUBLISHES: u8 = 5;
+
+/// A newly bound seat's own membership, still owed to it.
+#[derive(Debug, Clone, Copy)]
+struct DeferredManifest {
+    /// Copies still to send, including the one due at `next_tick`.
+    publishes_left: u8,
+    /// The tick the next copy is due at.
+    next_tick: u64,
+}
+
 /// The last crossing order the host accepted for one stable bot seat.
 #[derive(Debug, Clone, Copy)]
 struct AppliedInterestCrossing {
@@ -964,7 +979,7 @@ pub struct Swarm {
     /// Continuous admission for a reservation-backed standing campaign.
     live_joins: Option<LiveJoins>,
     /// New links get a second manifest after their downlink writer is live.
-    deferred_live_manifest_slots: BTreeSet<usize>,
+    deferred_live_manifests: BTreeMap<usize, DeferredManifest>,
     /// Host-side watch edges already armed, `(watcher, subject)`.
     armed_external_watches: BTreeSet<(usize, usize)>,
     /// The two roster snapshots which enforce hearsay's age floor.
@@ -1475,7 +1490,7 @@ impl Swarm {
             exteriors: BTreeMap::new(),
             departed_exteriors: Vec::new(),
             live_joins: None,
-            deferred_live_manifest_slots: BTreeSet::new(),
+            deferred_live_manifests: BTreeMap::new(),
             armed_external_watches: BTreeSet::new(),
             hearsay_buffers: HearsayBuffers::default(),
             hearsay_fold_enabled: true,
@@ -2166,7 +2181,19 @@ impl Swarm {
     }
 
     fn process_live_membership(&mut self, tick: u64) {
-        let deferred_manifest_slots = core::mem::take(&mut self.deferred_live_manifest_slots);
+        let due_manifest_slots = {
+            let mut due = Vec::new();
+            self.deferred_live_manifests.retain(|slot, deferred| {
+                if tick < deferred.next_tick {
+                    return true;
+                }
+                due.push(*slot);
+                deferred.publishes_left -= 1;
+                deferred.next_tick = tick + TICK_HZ;
+                deferred.publishes_left > 0
+            });
+            due
+        };
         let joined = self.live_joins.as_ref().map_or_else(Vec::new, |live| {
             let mut joined = Vec::new();
             while let Ok(seat) = live.receiver.try_recv() {
@@ -2190,9 +2217,23 @@ impl Swarm {
                 seat.anchor,
                 seat.link,
             );
-            // The first all-seat refresh is for established peers. Send the
-            // joiner a second, swarm-derived manifest after its writer is live.
-            self.deferred_live_manifest_slots.insert(seat.slot);
+            // The all-seat refresh below is for the peers already established;
+            // the joiner cannot use it, because at this instant it is still
+            // completing its own handshake and is not yet reading Meta.
+            //
+            // One retry is not enough: measured against the live campaign, the
+            // last seat to bind received zero membership frames and kept a
+            // bots-only roster for the whole session, because nothing joined
+            // after it to trigger another all-seat publish. Repeat for a few
+            // seconds so the joiner's own membership does not depend on a
+            // stranger arriving later.
+            self.deferred_live_manifests.insert(
+                seat.slot,
+                DeferredManifest {
+                    publishes_left: DEFERRED_MANIFEST_PUBLISHES,
+                    next_tick: tick + 1,
+                },
+            );
             changed = true;
         }
 
@@ -2269,8 +2310,8 @@ impl Swarm {
             self.refresh_live_witnesses();
             self.publish_live_manifests(tick);
         }
-        if !deferred_manifest_slots.is_empty() {
-            self.publish_live_manifests_for(tick, deferred_manifest_slots.into_iter().collect());
+        if !due_manifest_slots.is_empty() {
+            self.publish_live_manifests_for(tick, due_manifest_slots);
         }
     }
 
