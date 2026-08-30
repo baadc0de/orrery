@@ -23,6 +23,23 @@ rules — the intent validator (`Ruleset::validate_intent` behind
 workers), and parked-cell catch-up when it arrives — and all three need the
 rules *in process*.
 
+> **Correction, 2026-08-30 (#629).** The parenthetical above describes an
+> unbuilt member. `Ruleset::validate_intent` is not, and has never been, a
+> member of the trait. The trait is `crates/orrery_core/src/ruleset.rs:267-368`
+> and its surface is `CoreState`, `CoreInput`, `CoreEvent`, `id`,
+> `max_neighbor_reads`, `max_neighbor_staleness_ticks`, `step`, `materialize`,
+> `classify_component` and `invariants` — the last six defaulted. The only
+> `validate_intent` occurrences in first-party Rust are two doc comments
+> recording its absence (`crates/orrery_core/src/lib.rs:66`,
+> `crates/orrery_core/src/ruleset.rs:9`), both attributing it to the docs/03
+> §3 sketch rather than to the trait.
+>
+> This corrects the *Context*, not the Decision: the argument that the
+> adjudication cluster needs the rules in process rests on the executor and
+> on parked-cell catch-up, and stands without this example. Recorded as an
+> addition so the original text stays readable; the normative text is
+> unchanged, which is the owner's to edit.
+
 The consequence a game team lives with is that **every `Ruleset` change is a
 persistd redeploy**, and the game repo owns the deployed artifact. The
 question the roadmap left open was whether that is acceptable for 1.0, or
