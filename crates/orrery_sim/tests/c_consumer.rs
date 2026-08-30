@@ -16,8 +16,12 @@ struct CExamplePaths {
     library_dir: PathBuf,
 }
 
+/// A C caller creates the mirror, applies one replication datagram and reads
+/// a transform back, using nothing but the header. This deliberately does NOT
+/// cover `orrery_sim_step`; the test below owns that, because a name that
+/// claims stepping while never calling it is worse than no name at all.
 #[test]
-fn a_c_caller_steps_the_simulation_without_linking_rust_types() {
+fn a_c_caller_drives_the_abi_without_linking_rust_types() {
     let paths = prepare_c_example();
     build_cdylib(&paths.library_dir);
     compile_c_example(&paths);
@@ -109,4 +113,82 @@ fn compile_c_example(paths: &CExamplePaths) {
         .status()
         .expect("compile C example");
     assert!(status.success(), "compile C example with a C compiler");
+}
+
+/// Stepping must advance the mirror, and the ABI must be how a caller does it.
+///
+/// The rename above exposed the hole: the C example never calls
+/// `orrery_sim_step`, so turning `step` into a no-op left every test green.
+/// This asserts the property rather than a copied constant -- a craft carrying
+/// positive x velocity must have a larger x after stepping than before, which
+/// is false for any no-op and cannot be satisfied by echoing the input.
+#[test]
+fn stepping_advances_a_moving_craft_through_the_abi() {
+    use orrery_core::QVel;
+
+    let mut craft = Craft::spawned(Archetype::Interceptor, QPos { x: 0, y: 0, z: 0 }, 0);
+    craft.vel = QVel {
+        x: 40_000,
+        y: 0,
+        z: 0,
+    };
+    let entity = PersistId::new(7);
+    let cell = CellId::from_coords(IVec3::ZERO, INTEREST_LEVEL).expect("origin cell is valid");
+    let datagram = encode_replication(&(
+        RegolithState::Craft(craft).to_canonical(),
+        cell,
+        entity,
+        0_u64,
+    ));
+
+    let mut sim: *mut orrery_sim::OrrerySim = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            orrery_sim::orrery_sim_create(&mut sim),
+            orrery_sim::OrrerySimResult::Ok
+        );
+        assert_eq!(
+            orrery_sim::orrery_sim_apply_replication(sim, datagram.as_ptr(), datagram.len()),
+            orrery_sim::OrrerySimResult::Ok
+        );
+        let before = read_one(sim);
+        assert_eq!(
+            orrery_sim::orrery_sim_step(sim, 60),
+            orrery_sim::OrrerySimResult::Ok
+        );
+        let after = read_one(sim);
+        assert!(
+            after.x_mm > before.x_mm,
+            "a craft with positive x velocity must advance: before {} after {}",
+            before.x_mm,
+            after.x_mm
+        );
+        assert_eq!(
+            orrery_sim::orrery_sim_destroy(sim),
+            orrery_sim::OrrerySimResult::Ok
+        );
+    }
+}
+
+unsafe fn read_one(sim: *mut orrery_sim::OrrerySim) -> orrery_sim::OrrerySimCraftTransform {
+    let mut out = [orrery_sim::OrrerySimCraftTransform {
+        craft_id: 0,
+        x_mm: 0,
+        y_mm: 0,
+        z_mm: 0,
+        yaw_urad: 0,
+        pitch_urad: 0,
+    }; 4];
+    let mut written: usize = 0;
+    assert_eq!(
+        orrery_sim::orrery_sim_copy_craft_transforms(
+            sim,
+            out.as_mut_ptr(),
+            out.len(),
+            &mut written
+        ),
+        orrery_sim::OrrerySimResult::Ok
+    );
+    assert_eq!(written, 1, "the fixture holds exactly one craft");
+    out[0]
 }
