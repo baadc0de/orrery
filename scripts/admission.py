@@ -60,6 +60,13 @@ class Campaign:
 
 
 @dataclass(frozen=True)
+class SeatOccupancy:
+    """Why one human seat counts as taken: its row, and whether it is bound."""
+    row: dict[str, Any]
+    bound: bool
+
+
+@dataclass(frozen=True)
 class StandingHostMembership:
     """One generation's host-authored seat bindings."""
     attempt_id: str
@@ -263,11 +270,12 @@ class Admission:
         now = int(time.time())
         if now >= attempt["expires_at"]:
             return "restarting", 0
-        current = self._current_slots(campaign, attempt, persist=False)
-        if current is None:
+        if self._current_slots(campaign, attempt, persist=False) is None:
             return "restarting", 0
-        slots, _active_slots = current
-        free = campaign.humans - len({row.get("slot") for row in slots})
+        # Counted from the same definition the roster renders, so the listing
+        # can never answer `full` while the roster draws an empty seat (#713).
+        slots = self._occupied_human_seats(campaign, attempt)
+        free = campaign.humans - len(slots)
         # A standing host reopens empty lobby windows without respawning. Its
         # supervisor advances `started` at the same boundary, but this clause
         # also keeps the listing joinable during that atomic hand-off.
@@ -280,42 +288,58 @@ class Admission:
             return "running", max(free, 0)
         return "lobby", max(free, 0)
 
-    def session_roster(self, campaign: Campaign, attempt: dict[str, Any] | None) -> list[dict[str, Any]]:
-        """Return every configured seat; a reservation is not a liveness claim."""
+    def _occupied_human_seats(self, campaign: Campaign, attempt: dict[str, Any] | None
+                             ) -> dict[int, SeatOccupancy]:
+        """The one definition of a taken human seat, for counting and rendering.
+
+        A seat is taken when the host says it is bound, or when an unexpired
+        reservation still holds it.  Both readers must agree: the listing's
+        `slots_free` and the roster's per-seat state used to answer this from
+        different sources -- the count keyed on admission's attempt pointer
+        while the roster keyed on the host's published generation, and only the
+        roster required an unexpired lease.  During a generation hand-off a
+        bound-but-expired row was then counted as taken and drawn as empty, so
+        the lobby showed free seats while admission answered `full` (#713).
+        """
         rows = self._read_slots(campaign)
         try:
             bound = self._published_standing_host_membership(campaign)
         except FileNotFoundError:
             bound = None
+        occupied: dict[int, SeatOccupancy] = {}
         # The host publication, not admission's independently moving attempt
-        # pointer, defines a binding's lifetime. Matching both its generation
-        # and active slot keeps a bound player's label across the pointer
-        # hand-off without letting an old reservation name a reused slot.
-        bound_rows = {} if bound is None else {
-            row.get("slot"): row for row in rows
-            if row.get("attempt_id") == bound.attempt_id
-            and row.get("slot") in bound.active_slots
-            and row.get("session_id") not in bound.released_sessions
-        }
+        # pointer, defines a binding's lifetime (#706).
+        if bound is not None:
+            for row in rows:
+                if (row.get("attempt_id") == bound.attempt_id
+                        and row.get("slot") in bound.active_slots
+                        and row.get("session_id") not in bound.released_sessions):
+                    occupied[row["slot"]] = SeatOccupancy(row=row, bound=True)
         released = (bound.released_sessions if bound is not None and attempt is not None
                     and bound.attempt_id == attempt["attempt_id"] else frozenset())
         now = int(time.time())
-        reservations = {} if attempt is None else {
-            row.get("slot"): row for row in rows
-            if row.get("attempt_id") == attempt["attempt_id"]
-            and row.get("session_id") not in released
-            and isinstance(row.get("expires_at"), int) and row["expires_at"] > now
-        }
+        if attempt is not None:
+            for row in rows:
+                if (row.get("slot") not in occupied
+                        and row.get("attempt_id") == attempt["attempt_id"]
+                        and row.get("session_id") not in released
+                        and isinstance(row.get("expires_at"), int) and row["expires_at"] > now):
+                    occupied[row["slot"]] = SeatOccupancy(row=row, bound=False)
+        return occupied
+
+    def session_roster(self, campaign: Campaign, attempt: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Return every configured seat; a reservation is not a liveness claim."""
+        occupied = self._occupied_human_seats(campaign, attempt)
         roster: list[dict[str, Any]] = []
         for slot in range(campaign.peers):
             suffix = f"-{slot + 1}"
             roster.append({"slot": slot, "kind": "bot", "state": "active",
                            "nickname": display_label(campaign.ident[:DISPLAY_LABEL_MAX_CHARS - len(suffix)] + suffix)})
         for slot in range(campaign.peers, campaign.peers + campaign.humans):
-            bound_row = bound_rows.get(slot)
-            row = bound_row or reservations.get(slot)
-            roster.append({"slot": slot, "kind": "human", "state": "active" if bound_row else ("reserved" if row else "empty"),
-                           "nickname": row.get("nickname") if row else None})
+            seat = occupied.get(slot)
+            roster.append({"slot": slot, "kind": "human",
+                           "state": "active" if seat and seat.bound else ("reserved" if seat else "empty"),
+                           "nickname": seat.row.get("nickname") if seat else None})
         return roster
 
     @staticmethod
@@ -813,6 +837,56 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
                          ["reserved", "reserved", "empty", "empty"],
                          "a prior generation must not assert present membership")
+
+    def test_the_listing_and_the_roster_agree_on_which_seats_are_taken(self) -> None:
+        # `slots_free` and the roster answered "is this seat taken" from
+        # different sources, so the listing could report a seat taken that the
+        # roster drew empty and refuse a player the lobby had just offered a
+        # seat to (#713). They now share one definition, and this pins that
+        # they cannot drift apart again while the campaign is joinable.
+        #
+        # `restarting` is deliberately exempt: it reports zero free seats by
+        # design, whatever the roster last knew, because there is no host
+        # generation to admit anyone into.
+        attempt = self.enable_always_on()
+        c = self.service.campaigns()[0]["test"]
+
+        def agree(note: str) -> None:
+            listing = self.service.listing()["campaigns"][0]
+            if listing["phase"] == "restarting":
+                return
+            drawn_taken = sum(1 for seat in self.service.roster("test")["roster"]
+                              if seat["kind"] == "human" and seat["state"] != "empty")
+            self.assertEqual(listing["slots_free"], c.humans - drawn_taken, note)
+
+        agree("an empty lobby agrees")
+        joined = self.service.join("test", self.request())
+        slot = joined["join"]["slot"]
+        agree("a reserved seat agrees")
+
+        active = self.standing_host_state / "test" / "active-seats.json"
+        active.write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [slot],
+            "released_sessions": [], "running": True,
+        }))
+        agree("a bound seat agrees while the attempt runs")
+
+        # Bound, and its arrival lease long gone: the count used to keep this
+        # row through the bound branch while the roster's reservation filter
+        # dropped it for being expired.
+        slots_path = self.state / "test" / "slots.json"
+        rows = json.loads(slots_path.read_text())
+        for row in rows:
+            if row.get("slot") == slot:
+                row["expires_at"] = int(time.time()) - 1
+        slots_path.write_text(json.dumps(rows))
+        agree("a bound seat whose lease expired agrees")
+
+        active.write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [],
+            "released_sessions": [], "running": True,
+        }))
+        agree("a released seat agrees")
 
     def test_a_bound_seat_keeps_its_label_when_the_attempt_pointer_moves(self) -> None:
         attempt = self.enable_always_on()
