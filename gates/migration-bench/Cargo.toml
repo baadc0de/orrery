@@ -1,0 +1,37 @@
+# A10 F-12, stage S1.e of the #626 programme: the migration benchmark
+# harness and the baseline-refusal rule it enforces.
+#
+# Its own `[workspace]`, and role `check` in scripts/check.sh — the
+# p2-journal-bench precedent: CI compiles it, so it cannot rot, and never
+# executes it, so it cannot flake. Execution is A10 §8.3's procedure:
+# `capture` emits a candidate baseline, a human commits it under
+# docs/plans/baselines/, and `compare` refuses to produce a differential
+# number without a committed, environment-matched baseline. A comparison
+# against nothing is worse than no comparison, because it produces a number.
+#
+# Benches observe; gates refuse. No threshold is asserted anywhere in this
+# crate — ratios are reported, evaluated by a human at phase exit (A10 §8.4),
+# never by CI.
+[workspace]
+
+[package]
+name = "migration-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The measured crates are the conformance population itself (A10 §8.2): the
+# corpus cases and the scenario battery are the benchmark population, so a
+# number produced here is about a workload the fixtures actually cover. Path
+# dependencies only, and nothing depends on this crate — it is a measurement
+# tool, not a dependency of the system.
+[dependencies]
+orrery_core = { path = "../../crates/orrery_core" }
+orrery_protocol = { path = "../../crates/orrery_protocol" }
+orrery_conformance = { path = "../../crates/orrery_conformance" }
+orrery_games = { path = "../../crates/orrery_games" }
+# Claim assembly is measured through the same blake3 the executor and claims
+# use; the harness folds nothing of its own.
+blake3 = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
