@@ -271,6 +271,33 @@ coverage 86.5%, 84 false accusations of an honest peer. These
 projections are derivations from #683's measured ratios, not
 measurements; lane 1 replaces them with numbers.
 
+> **Measured, 2026-08-30 (#687, delivered by #698).** The pressured sweep
+> against `main` *including* #688's anchors-shed-last:
+>
+> | Budget | Peak | Shed kf/delta | Clause failures |
+> |---|---:|---:|---|
+> | 1,000 | 829.784 kbps | 0 / 0 | none |
+> | 900 | 829.784 kbps | 0 / 65 | none |
+> | 700 | 699.824 kbps | 303 / 5,295 | shed; boundary thrash |
+> | 500 | 531.048 kbps | 1,789 / 29,049 | shed; 89 false positives; coverage 94.2% |
+>
+> Two of this section's inputs did not survive it:
+>
+> * **The 8.5 stranded-deltas-per-lost-keyframe ratio above does not hold
+>   across the curve** — 14.38 at 700, 8.79 at 500 — and at 900 kbps
+>   unanchored deltas rose 8,551 with **zero** shed keyframes. It is an
+>   aggregate coincidence, not a causal pairing, so the ~150,000 projection
+>   built on it does not follow.
+> * **The swept margin costs nothing**, measured −4.328 kbps, not the
+>   +829 kbps increment quoted as the pressure that makes f > 1 likely.
+>
+> FIFO survives 900 kbps and the real swept-margin load with #688 alone,
+> failing only under synthetic pressure at ~1.19x offered peak. As of
+> 2026-08-30 the measured peak is 806–808 kbps against a 1,000 kbps budget
+> with the swept margin live. Section 5's own case for declining lane 3 on
+> exactly this evidence therefore stands, and #687's lane recommended
+> declining it. **Whether to decline remains the owner's call.**
+
 **Governor.** Skips lowest-priority deltas first, per tick. At the same
 f = 1.19: skip 129 kbps of deltas = ~134 deltas/s = ~4.3/s/link spread
 over the 24 non-witness links - the farthest entities drop from 20 Hz
