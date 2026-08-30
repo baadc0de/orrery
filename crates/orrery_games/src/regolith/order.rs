@@ -121,7 +121,7 @@ pub enum Order {
         accel_mmss: i32,
         /// Yaw delta.
         yaw_urad: i32,
-        /// Pitch delta (honest input is zero).
+        /// Pitch delta, applied to the craft's elevation and clamped there.
         pitch_urad: i32,
     },
     /// Acquire or sustain a lock on one target without firing.

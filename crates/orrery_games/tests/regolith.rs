@@ -16,7 +16,7 @@ use orrery_games::regolith::{
     projectile_flight_ticks,
     state::{
         BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
-        TRAIL_CAPACITY, TRAIL_MAX_ENCODED_BYTES, TRAIL_SAMPLE_TICKS,
+        PITCH_LIMIT_URAD, TRAIL_CAPACITY, TRAIL_MAX_ENCODED_BYTES, TRAIL_SAMPLE_TICKS,
     },
     weapon::{WeaponKind, MAX_WEAPON_REACH_MM},
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
@@ -471,8 +471,12 @@ fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
 }
 
 #[test]
-fn v18_speed_trail_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 18);
+fn v19_pitch_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 19);
+    assert_eq!(
+        PITCH_LIMIT_URAD, 1_570_796,
+        "a quarter turn either side of level, on the micro-radian lattice"
+    );
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 240_000);
@@ -729,7 +733,7 @@ fn pilot_scenario_table_covers_the_four_durable_surfaces() {
         );
         assert!(matches!(
             orders.first(),
-            Some(Order::Thrust { pitch_urad: 0, .. })
+            Some(Order::Thrust { pitch_urad, .. }) if pitch_urad.abs() <= PITCH_LIMIT_URAD
         ));
         for order in orders {
             assert_eq!(Order::decode(&order.to_canonical()).unwrap(), order);
@@ -1307,23 +1311,98 @@ fn split_replay_uses_derived_ids_not_creation_order() {
     assert_eq!(alone.materialized, vec![expected(0), expected(1)]);
 }
 
+/// The honest pilot flies elevation, and stays inside the declared bound.
+///
+/// Pre-v19 this test asserted the opposite — `pitch_urad: 0` exactly. The
+/// unlock is the whole point of the change, so the assertion inverts: what is
+/// still forbidden is only leaving the bound.
 #[test]
-fn honest_pilot_keeps_pitch_locked_to_zero() {
+fn honest_pilot_flies_pitch_within_the_declared_limit() {
     let game = Regolith::honest();
-    let mut orders = Vec::new();
     let mut rng = orrery_core::TickRng::from_seed([1; 32]);
-    game.honest_inputs(
-        PersistId::new(1),
-        0,
-        Tick::new(1),
-        &[],
-        &mut rng,
-        &mut orders,
-    );
-    assert!(matches!(
-        orders.first(),
-        Some(Order::Thrust { pitch_urad: 0, .. })
-    ));
+    let mut pitched = false;
+    for tick in 1..=64 {
+        let mut orders = Vec::new();
+        game.honest_inputs(
+            PersistId::new(1),
+            0,
+            Tick::new(tick),
+            &[],
+            &mut rng,
+            &mut orders,
+        );
+        let Some(Order::Thrust { pitch_urad, .. }) = orders.first() else {
+            panic!("the pilot leads with a thrust");
+        };
+        assert!(
+            pitch_urad.abs() <= PITCH_LIMIT_URAD,
+            "tick {tick}: pilot asked for {pitch_urad} urad of pitch, past the limit"
+        );
+        pitched |= *pitch_urad != 0;
+    }
+    assert!(pitched, "the pilot must actually use the elevation axis");
+}
+
+/// The clamp lives in the canonical step, so it is inside `hash(e, t)`.
+///
+/// Drive one craft with a pitch delta far past the limit for many ticks and
+/// the stored elevation must sit exactly on the stop, both signs. Removing the
+/// `.clamp(-PITCH_LIMIT_URAD, PITCH_LIMIT_URAD)` from `Regolith::step` fails
+/// this by name.
+#[test]
+fn pitch_saturates_at_the_declared_limit_in_the_canonical_step() {
+    for (direction, expected) in [(1, PITCH_LIMIT_URAD), (-1, -PITCH_LIMIT_URAD)] {
+        let entity = PersistId::new(1);
+        let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x19; 32]));
+        executor.insert(entity, RegolithState::Craft(craft_at(0)));
+        let thrust = Order::Thrust {
+            accel_mmss: 0,
+            yaw_urad: 0,
+            pitch_urad: direction * (PITCH_LIMIT_URAD / 4),
+        };
+        for tick in 1..=16 {
+            executor
+                .step_entity(entity, Tick::new(tick), core::slice::from_ref(&thrust))
+                .expect("craft exists");
+            let pitch = match executor.state(entity) {
+                Some(RegolithState::Craft(craft)) => craft.pitch_urad,
+                _ => panic!("craft remains a craft"),
+            };
+            assert!(
+                pitch.abs() <= PITCH_LIMIT_URAD,
+                "tick {tick}: pitch {pitch} left the +/-{PITCH_LIMIT_URAD} urad bound"
+            );
+        }
+        let settled = match executor.state(entity) {
+            Some(RegolithState::Craft(craft)) => craft.pitch_urad,
+            _ => panic!("craft remains a craft"),
+        };
+        assert_eq!(
+            settled, expected,
+            "sustained pitch must settle on the stop, not past it"
+        );
+    }
+}
+
+/// The value-range invariant is the second guard, independent of the clamp.
+#[test]
+fn value_range_rejects_pitch_past_the_limit_and_admits_pitch_within_it() {
+    let inside = {
+        let mut craft = craft_at(0);
+        craft.pitch_urad = PITCH_LIMIT_URAD;
+        craft
+    };
+    let outside = {
+        let mut craft = craft_at(0);
+        craft.pitch_urad = PITCH_LIMIT_URAD + 1;
+        craft
+    };
+    evaluate(INVARIANTS, &sample(None, &RegolithState::Craft(inside)))
+        .expect("pitch exactly on the stop is legal");
+    let violation = evaluate(INVARIANTS, &sample(None, &RegolithState::Craft(outside)))
+        .expect_err("pitch past the stop must be refused");
+    assert_eq!(violation.kind, InvariantKind::ValueRange);
+    assert_eq!(violation.validator, "regolith/value-range");
 }
 
 fn resolved_hits(

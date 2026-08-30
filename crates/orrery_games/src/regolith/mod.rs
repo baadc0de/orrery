@@ -248,14 +248,19 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
-/// Regolith v18's rules identity: v17's staleness-cap execution, plus higher
-/// chassis speed ceilings and the bounded, quantized craft trail.
+/// Regolith v19's rules identity: v18's execution with the elevation axis
+/// unlocked — `pitch_urad` may now be non-zero, bounded by
+/// [`PITCH_LIMIT_URAD`], and the honest pilot flies it.
 ///
-/// Both changes alter canonical state hashes and movement outcomes. A mixed
-/// session would disagree even before combat, so it must fail ruleset identity
-/// matching rather than trying to interpolate across the change.
+/// This is a canonical behaviour change, not a schema migration: the field was
+/// already declared, encoded and replicated, and the step already applied and
+/// clamped it. What v18 forbade was the *value*, in the value-range invariant.
+/// Lifting that admits vertical thrust, which moves velocity, position and
+/// therefore every state hash downstream of a thrusting craft. A v18 peer and
+/// a v19 peer would disagree on the first tick anyone pitches, so the mismatch
+/// must fail ruleset identity matching rather than try to interpolate.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 18,
+    version: 19,
     digest: [0x68; 32],
 };
 

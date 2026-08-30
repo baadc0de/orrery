@@ -1,4 +1,4 @@
-//! Deterministic honest Regolith pilot; pitch remains exactly zero.
+//! Deterministic honest Regolith pilot, flying all three axes.
 //!
 //! This is the input-source-independent half of both the swarm bot and the
 //! human client. It produces [`Order`] values; both callers use that type's
@@ -14,6 +14,20 @@ use rand_core::RngCore;
 const BASE_TURN_URAD: i32 = 12_000;
 const TURN_SPREAD_URAD: i32 = 1_500;
 const YAW_JITTER_URAD: i32 = 2_000;
+/// Per-tick elevation jitter, micro-radians, applied symmetrically about zero.
+///
+/// Smaller than the yaw jitter because pitch integrates against a hard stop
+/// while yaw wraps: a zero-mean walk of this size needs on the order of a
+/// million ticks to reach the limit, so the honest pilot exercises the
+/// elevation axis continuously without ever parking against the clamp.
+///
+/// That it flies at all is the point. With pitch pinned at zero, `sin(phi)`
+/// and `cos(phi)` in the step were only ever evaluated at their two exact
+/// points, and the four-platform determinism matrix never tested the
+/// transcendentals it exists to test.
+///
+/// [`PITCH_LIMIT_URAD`]: super::state::PITCH_LIMIT_URAD
+const PITCH_JITTER_URAD: i32 = 1_500;
 /// Duration of one input-diversity scenario before the table advances.
 pub const SCENARIO_TICKS: u64 = 180;
 
@@ -73,6 +87,7 @@ pub fn honest_orders(
     let scenario = scenario_at(tick);
     let limits = Archetype::for_slot(slot).limits();
     let jitter = (rng.next_u32() % (YAW_JITTER_URAD as u32 * 2 + 1)) as i32 - YAW_JITTER_URAD;
+    let pitch_jitter = signed(rng.next_u32(), PITCH_JITTER_URAD);
     let direction = if slot.is_multiple_of(2) { 1 } else { -1 };
     let scenario_turn = match scenario {
         PilotScenario::Combat => direction * (BASE_TURN_URAD + jitter),
@@ -83,7 +98,7 @@ pub fn honest_orders(
     out.push(Order::Thrust {
         accel_mmss: i32::try_from(limits.max_accel_mmss).unwrap_or(i32::MAX),
         yaw_urad: scenario_turn + (slot % 4) as i32 * TURN_SPREAD_URAD,
-        pitch_urad: 0,
+        pitch_urad: pitch_jitter,
     });
 
     // A held lock is sustained every tick without producing an outcome. Only
@@ -106,6 +121,14 @@ pub fn honest_orders(
             pickup: contested_pickup(slot, tick),
         });
     }
+}
+
+/// One draw folded into `[-magnitude, magnitude]`, inclusive of both ends.
+fn signed(draw: u32, magnitude: i32) -> i32 {
+    let span = magnitude.saturating_mul(2).saturating_add(1);
+    #[allow(clippy::cast_possible_wrap)]
+    let value = (draw % span as u32) as i32;
+    value - magnitude
 }
 
 fn combat_target(entity: PersistId) -> PersistId {

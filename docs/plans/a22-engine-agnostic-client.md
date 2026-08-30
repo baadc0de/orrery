@@ -71,6 +71,18 @@ This is worth separating from the engine question entirely: it can ship on
 the Bevy skin, on the existing playtest cadence, before any Unreal work
 lands.
 
+**Landed, #744.** Track C did exactly the above and nothing more. The lock
+was one clause of the value-range invariant, `craft.pitch_urad != 0`; it is
+now `craft.pitch_urad.abs() > PITCH_LIMIT_URAD`, against the ±π/2 limit the
+step was already clamping to. `REGOLITH_RULESET.version` went 18 -> 19 and
+the honest pilot now flies a small zero-mean elevation jitter, so the
+four-platform matrix evaluates `sin`/`cos` off their exact points for the
+first time. All four Regolith state-chain goldens moved; all eight Skirmish
+chains did not, and neither did Regolith's `solo` *outcome* chain — `solo` is
+the one-entity control, so no craft position reaches an event there. The
+quoted comment above is therefore now historical: `state.rs` reads
+*"Elevation, micro-radians, clamped to ±`PITCH_LIMIT_URAD`"*.
+
 ## 4. Plugin, bootstrap, or neither: what actually differs
 
 The owner's refinement - a C++ bootstrap using Unreal as a game would,

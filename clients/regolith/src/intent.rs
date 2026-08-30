@@ -80,7 +80,7 @@ impl IntentPipeline {
     ///
     /// This deliberately starts with [`Game::honest_inputs`]. The skin only
     /// gates acceleration/trigger and chooses the sign of the pilot's yaw;
-    /// acceleration, yaw magnitude, pitch lock, target choice, order shape and
+    /// acceleration, yaw magnitude, elevation, target choice, order shape and
     /// encoding remain owned by the headless game path.
     #[must_use]
     pub fn human_orders(&self, tick: Tick, controls: Controls) -> Vec<Order> {
@@ -233,12 +233,16 @@ mod tests {
     fn arrows_only_select_pilot_values() {
         let pipeline = pipeline();
         let tick = Tick::new(91);
-        let bot_yaw = match pipeline
+        let (bot_yaw, bot_pitch) = match pipeline
             .bot_orders(tick)
             .first()
             .expect("pilot always thrusts")
         {
-            Order::Thrust { yaw_urad, .. } => *yaw_urad,
+            Order::Thrust {
+                yaw_urad,
+                pitch_urad,
+                ..
+            } => (*yaw_urad, *pitch_urad),
             _ => panic!("pilot's first order is thrust"),
         };
         let left = pipeline.human_orders(
@@ -249,10 +253,12 @@ mod tests {
                 ..Controls::default()
             },
         );
+        // Elevation passes through the skin untouched: the ruleset owns it
+        // (v19), and the keyboard has no pitch control to gate it with.
         assert!(matches!(
             left.first(),
-            Some(Order::Thrust { accel_mmss: 60_000, yaw_urad, pitch_urad: 0 })
-                if *yaw_urad == -bot_yaw.abs()
+            Some(Order::Thrust { accel_mmss: 60_000, yaw_urad, pitch_urad })
+                if *yaw_urad == -bot_yaw.abs() && *pitch_urad == bot_pitch
         ));
     }
 
