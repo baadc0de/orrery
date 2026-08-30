@@ -116,6 +116,17 @@ gate's 128 m edge (`DEFAULT_CELL_EDGE_M`,
 `crates/orrery_protocol/src/cell.rs:58`) the same craft crosses 3.75/s and
 the addition is +172 kbps - the entire measured headroom.
 
+> **Measured, 2026-08-30 (#696).** Cell size does not scale audience churn
+> the way `v/edge` predicts. Join events at a 128 m edge versus a 512 m edge
+> came out at **1.17x** (mine) and **1.31x** (the implementing lane's
+> roaming legs), not the ~4x this geometry implies.
+>
+> A cell crossing is not an audience change: interest is a radius, and
+> subdividing cells rearranges the same neighbourhood without changing who
+> is in range. `v/edge` therefore overstates cell-size sensitivity by
+> roughly threefold, and the +172 kbps figure for the gate's 128 m edge
+> below rests on it.
+
 The peak column is the load-bearing one. Three facts compound:
 
 1. **The budget grades the worst 1-second window**, sampled from a sliding
@@ -124,6 +135,16 @@ The peak column is the load-bearing one. Three facts compound:
    is k audience-change events in the same window. Under P-broadcast that is
    `k x 46.1` kbit; under P-join it is `k x 1.5` kbit - a factor of 31, or
    `31/k` if a coalescing rule collapses the burst to one broadcast.
+> **Measured, 2026-08-30 (#696).** Point 2 holds and is the load-bearing
+> one: the joiner-cluster distribution has a real tail on every leg, out to
+> 13 joiners in a single one-second window.
+>
+> Point 3's projection does not. The swept margin's cost was measured at
+> **-4.328 kbps** -- peak is slightly *lower* with it on (#687) -- not the
+> "up to 829 kbps of increment" quoted below, which scaled peak by cell
+> count and assumed the newly covered cells hold authored entities. Most do
+> not. Treat the contention claim as unquantified rather than as costed.
+
 3. **#692 makes those windows the contended ones.** Crossings now propagate
    immediately (`crates/orrery_coordinator/src/interest.rs:126`,
    `apply_crossing`), and the swept margin's own cost is projected at up to
@@ -190,6 +211,14 @@ fraction of links inside a stale window is ~1.7-2%. A P-broadcast event
 therefore spends 31 x 186 B to early-close an *expected* ~0.55 links'
 windows by ~0.25 s each - about 42 kB per second-of-staleness saved, and
 only when a presence event happens to occur at all.
+
+> **Measured, 2026-08-30 (#696).** The instantaneous stranded fraction is
+> **worse** than this derivation: 2.851-3.195% mean and ~5% at its
+> instantaneous peak, across three impaired hours at 32 peers, against the
+> ~1.7-2% derived here. Clean legs measure exactly 0%, which is the control:
+> no loss, no missing-newer window. The argument in this section is
+> unaffected in direction -- a bigger wound does not make an uncorrelated
+> trigger a repair -- but the number above is superseded.
 
 Two alternatives dominate it, both already named:
 
