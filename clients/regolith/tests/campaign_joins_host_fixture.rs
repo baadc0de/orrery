@@ -968,7 +968,19 @@ fn a_nonzero_tick_join_adopts_the_snapshot_and_arms_its_witness_chain() {
         35,
         "only locally driven ticks are counted"
     );
-    let truth = fixture.truth();
+    // The witness counters are written by the fixture's pump thread, not by
+    // this one, and a claim is only cut once enough uplink has reached it.
+    // Every other assertion in this file that reads across that boundary
+    // polls under a deadline; this one used to read once and race the pump.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut truth = fixture.truth();
+    while Instant::now() < deadline
+        && !(truth.witness_frames_verified > 0 && truth.witness_claims_verified > 0)
+    {
+        let _ = runtime.advance(Controls::default(), &mut sink);
+        std::thread::sleep(Duration::from_millis(2));
+        truth = fixture.truth();
+    }
     assert!(
         truth.witness_frames_verified > 0,
         "the join-tick anchor must continue into verifiable witness frames"
@@ -1213,12 +1225,19 @@ fn a_client_joins_measures_and_applies_replicated_state() {
 
     // Driving the client to the terminal downlink can produce another uplink;
     // settle that traffic too before taking the fixture's final ledger cut.
+    // The witness counters below are cut by the pump thread from traffic that
+    // may still be in flight, so settle them on the same terms as the uplink.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while runtime.uplink_acks().0 < runtime.uplink_sent() && Instant::now() < deadline {
+    let mut truth = fixture.truth();
+    while Instant::now() < deadline
+        && (runtime.uplink_acks().0 < runtime.uplink_sent()
+            || truth.witness_frames_verified == 0
+            || truth.witness_claims_verified == 0)
+    {
         let _ = runtime.advance(Controls::default(), &mut sink);
         std::thread::sleep(Duration::from_millis(2));
+        truth = fixture.truth();
     }
-    let truth = fixture.truth();
     assert_eq!(
         runtime.downlink_last_tick(0),
         Some(terminal_broadcast * STRIDE),

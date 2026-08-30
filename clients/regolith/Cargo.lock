@@ -7015,6 +7015,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_compose"
+version = "0.1.0"
+dependencies = [
+ "orrery_core",
+ "orrery_protocol",
+]
+
+[[package]]
 name = "orrery_core"
 version = "0.1.0"
 dependencies = [
@@ -7035,6 +7043,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "libm",
+ "orrery_compose",
  "orrery_core",
  "orrery_protocol",
  "rand_chacha",
