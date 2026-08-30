@@ -3998,6 +3998,10 @@ mod tests {
             // it asserts nothing about either: an empty seal and a zero chain
             // are the honest values for a record that was never played.
             outcome_chain: [0; 32],
+            // #745 added the per-tick outcome records for the differential
+            // harness. Same reasoning: this log was hand-built, never played,
+            // so it has no outcome records to retain.
+            outcome_entries: Vec::new(),
             sealed: SealedScenario {
                 seed: UniverseSeed([0; 32]),
                 tick_window: TickWindow {

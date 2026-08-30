@@ -230,6 +230,10 @@ pub struct Play<G: Game> {
     pub sealed: SealedScenario<G>,
     /// The log an authority would have streamed, one record per tick.
     pub log: Vec<TickRecord<G>>,
+    /// The per-tick outcome records, in tick order: the same material the
+    /// outcome chain folds, retained unbinned so a differential harness can
+    /// compare the bytes and not only the digest (F-4 class D-2, A10 §4.1).
+    pub outcome_entries: Vec<Vec<OutcomeEntry<G::CoreInput>>>,
     /// Stage-1 checks that failed. Empty is the expected result for honest
     /// rules, and the reason this harness exists.
     pub flags: Vec<Flag>,
@@ -282,6 +286,8 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
     let mut outcome_chain = [0u8; 32];
     let mut log = Vec::with_capacity(scenario.ticks as usize);
     let mut input_log = Vec::with_capacity(scenario.ticks as usize);
+    let mut outcome_material: Vec<Vec<OutcomeEntry<G::CoreInput>>> =
+        Vec::with_capacity(scenario.ticks as usize);
     let mut flags = Vec::new();
     let mut events = 0u64;
     let mut pending: BTreeMap<PersistId, Vec<G::CoreInput>> = BTreeMap::new();
@@ -356,7 +362,13 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
             });
         }
 
-        outcome_chain = fold_outcome_tick(outcome_chain, &outcome_entries);
+        outcome_material.push(outcome_entries);
+        outcome_chain = fold_outcome_tick(
+            outcome_chain,
+            outcome_material
+                .last()
+                .expect("one outcome record per tick"),
+        );
         pending = delivered;
         log.push(TickRecord::<G> { tick, entries });
         input_log.push(SealedTick {
@@ -389,6 +401,7 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
             input_log,
         },
         log,
+        outcome_entries: outcome_material,
         flags,
         events,
     }
@@ -425,6 +438,8 @@ pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
     let mut outcome_chain = [0u8; 32];
     let mut events = 0u64;
     let mut log = Vec::with_capacity(sealed.input_log.len());
+    let mut outcome_entries_kept: Vec<Vec<OutcomeEntry<G::CoreInput>>> =
+        Vec::with_capacity(sealed.input_log.len());
     for (offset, record) in sealed.input_log.iter().enumerate() {
         let expected_tick = Tick::new(
             sealed.tick_window.first.0 + u64::try_from(offset).expect("input log length fits u64"),
@@ -474,6 +489,7 @@ pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
             });
         }
         outcome_chain = fold_outcome_tick(outcome_chain, &outcome_entries);
+        outcome_entries_kept.push(outcome_entries);
         log.push(TickRecord {
             tick: record.tick,
             entries,
@@ -485,6 +501,7 @@ pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
         outcome_chain,
         sealed: sealed.clone(),
         log,
+        outcome_entries: outcome_entries_kept,
         flags: Vec::new(),
         events,
     }
