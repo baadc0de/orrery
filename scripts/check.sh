@@ -99,6 +99,7 @@ readonly WORKSPACES=(
     'gates/p5-dupe-gauntlet test'
     'gates/p4-streams-bench test'
     'gates/p2-journal-bench check'
+    'gates/migration-bench  check'
     'clients/regolith test'
 )
 
