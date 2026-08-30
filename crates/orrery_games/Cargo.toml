@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 orrery_core = { path = "../orrery_core" }
 orrery_protocol = { path = "../orrery_protocol" }
+orrery_compose = { path = "../orrery_compose" }
 # VC-6: continuous math goes through libm, never std transcendentals.
 libm = "0.2"
 # The harness's pilot and its sample-loss model are seeded ChaCha8 — harness

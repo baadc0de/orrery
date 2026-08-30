@@ -4,16 +4,23 @@
 //! monotone split counter in its own state, so materialization is adjudicable.
 
 pub mod archetype;
+mod craft;
 pub mod invariants;
 pub mod order;
 pub mod pilot;
 pub mod state;
 mod visibility;
 pub mod weapon;
+mod world;
 
 use crate::game::{Game, GameMeta, Tamper};
 use archetype::Archetype;
 use order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult};
+use orrery_compose::{
+    AmbiguityDetection, CanonicalSchedule, CompatibilityManifest, ExecutorPolicy, GameId,
+    ManifestFormatVersion, ModuleId, ModuleManifest, ModuleVersion, ProfileId, ProjectionVersion,
+    StateSectionId,
+};
 use orrery_core::{
     ComponentTypeId, CoreClass, EntityMaterialization, Invariant, OrderedInputs, QPos, QVel,
     Ruleset, StateView, StepOutput, TickRng, TICK_HZ,
@@ -252,6 +259,69 @@ pub const REGOLITH_RULESET: RulesetId = RulesetId {
     digest: [0x68; 32],
 };
 
+/// Regolith's two statically linked rule domains.
+///
+/// The table is deliberately an assembled description rather than a second
+/// dispatcher: [`Ruleset::step`] remains the sole executor entry point. The
+/// craft module owns `Craft` state and player/combat orders; the world module
+/// owns rocks, pickups, and the bloom director. Their only coupling is the
+/// existing ordered `Outcome` -> next-tick `Order` delivery channel owned by
+/// [`Game::deliver`].
+pub const REGOLITH_MODULES: &[ModuleManifest] = &[
+    ModuleManifest {
+        id: ModuleId("regolith.craft"),
+        version: ModuleVersion(1),
+        dependencies: &[ModuleId("regolith.world")],
+        state_sections: &[StateSectionId("craft")],
+        inputs: &[orrery_compose::InputVocabularyId(
+            "craft-control-and-resolution",
+        )],
+        events: &[orrery_compose::EventVocabularyId(
+            "craft-requests-and-credit",
+        )],
+        schedule_stages: &[],
+    },
+    ModuleManifest {
+        id: ModuleId("regolith.world"),
+        version: ModuleVersion(1),
+        dependencies: &[],
+        state_sections: &[
+            StateSectionId("rock"),
+            StateSectionId("pickup"),
+            StateSectionId("bloom-director"),
+        ],
+        inputs: &[orrery_compose::InputVocabularyId(
+            "world-resolution-and-lifecycle",
+        )],
+        events: &[orrery_compose::EventVocabularyId(
+            "world-responses-and-materialization",
+        )],
+        schedule_stages: &[],
+    },
+];
+
+/// The assembled, validated-at-registration composition manifest for Regolith.
+pub const REGOLITH_COMPOSITION: CompatibilityManifest = CompatibilityManifest {
+    game_id: GameId("regolith"),
+    manifest_format_version: ManifestFormatVersion(1),
+    protocol_version: 6,
+    toolchain_stamp: "rust-2024",
+    ruleset: REGOLITH_RULESET,
+    modules: REGOLITH_MODULES,
+    component_schemas: &[],
+    schedule: CanonicalSchedule {
+        stages: &[],
+        ordering_edges: &[],
+        ambiguities: &[],
+        ambiguity_detection: AmbiguityDetection::Error,
+        executor_policy: ExecutorPolicy::SingleThreaded,
+    },
+    canonical_constants: &[],
+    projection_version: ProjectionVersion(1),
+    profile_id: ProfileId("d9"),
+    removed_components: &[],
+};
+
 /// One canonical rock installed by the campaign composition root.
 ///
 /// `owner_slot` is content, not a transport guess: it gives every seeded
@@ -325,7 +395,7 @@ pub fn campaign_rock_seeds(
 pub mod components {
     use orrery_core::ComponentTypeId;
     /// Verifiable Regolith state for every entity-window variant.
-    pub const STATE: ComponentTypeId = ComponentTypeId(1);
+    pub const STATE: ComponentTypeId = orrery_compose::registry::regolith::STATE;
 }
 
 /// Regolith rules, optionally carrying one deliberate P4 tamper.
@@ -412,19 +482,19 @@ impl Ruleset for Regolith {
         let claims = visibility::verify_claims(view, inputs);
         let (mut state, mut events) = match view.own().clone() {
             RegolithState::Craft(craft) => {
-                let (craft, events) = self.step_craft(me, craft, inputs, claims.collision, rng);
+                let (craft, events) = craft::step(self, me, craft, inputs, claims.collision, rng);
                 (RegolithState::Craft(craft), events)
             }
             RegolithState::Rock(rock) => {
-                let (rock, events) = self.step_rock(me, rock, inputs, rng);
+                let (rock, events) = world::step_rock(self, me, rock, inputs, rng);
                 (RegolithState::Rock(rock), events)
             }
             RegolithState::Pickup(pickup) => {
-                let (pickup, events) = Self::step_pickup(me, pickup, inputs);
+                let (pickup, events) = world::step_pickup(me, pickup, inputs);
                 (RegolithState::Pickup(pickup), events)
             }
             RegolithState::BloomDirector(director) => {
-                let (director, events) = Self::step_director(me, director, inputs, rng);
+                let (director, events) = world::step_director(me, director, inputs, rng);
                 (RegolithState::BloomDirector(director), events)
             }
         };
@@ -500,7 +570,7 @@ impl Ruleset for Regolith {
 }
 
 impl Regolith {
-    fn step_craft(
+    pub(crate) fn step_craft(
         &self,
         me: PersistId,
         own: Craft,
@@ -937,7 +1007,7 @@ impl Regolith {
         };
         (next, events)
     }
-    fn step_rock(
+    pub(crate) fn step_rock(
         &self,
         me: PersistId,
         mut rock: Rock,
@@ -1131,7 +1201,7 @@ impl Regolith {
         (rock, events)
     }
 
-    fn step_pickup(
+    pub(crate) fn step_pickup(
         me: PersistId,
         mut pickup: Pickup,
         inputs: &OrderedInputs<'_, Order>,
@@ -1172,7 +1242,7 @@ impl Regolith {
         (pickup, events)
     }
 
-    fn step_director(
+    pub(crate) fn step_director(
         me: PersistId,
         mut director: BloomDirector,
         inputs: &OrderedInputs<'_, Order>,
@@ -1943,4 +2013,14 @@ pub fn campaign_spawn_pose(slot: usize, count: usize) -> (QPos, i32) {
 pub fn campaign_orbit_radius_m(slot: usize, count: usize) -> f64 {
     let share = slot as f64 / count.max(1) as f64;
     CAMPAIGN_ORBIT_RADIUS_M * (1.0 + CAMPAIGN_RADIAL_SPREAD * (share - 0.5))
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::REGOLITH_COMPOSITION;
+
+    #[test]
+    fn assembled_regolith_manifest_validates() {
+        assert_eq!(orrery_compose::validate(&REGOLITH_COMPOSITION), Ok(()));
+    }
 }
