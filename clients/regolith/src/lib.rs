@@ -2605,7 +2605,7 @@ mod tests {
     use crate::session::ConfiguredImpairment;
     use bevy::asset::AssetPlugin;
     use orrery_core::state_hash;
-    use orrery_games::scenario::{Entry, Play, Scenario, TickRecord};
+    use orrery_games::scenario::{Entry, Play, Scenario, SealedScenario, TickRecord, TickWindow};
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
@@ -3862,6 +3862,20 @@ mod tests {
         }
         let play = Play {
             chain: [0; 32],
+            // #630 added the outcome chain and the sealed inputs to `Play`.
+            // This fixture exercises the adjudicator over a hand-built log, so
+            // it asserts nothing about either: an empty seal and a zero chain
+            // are the honest values for a record that was never played.
+            outcome_chain: [0; 32],
+            sealed: SealedScenario {
+                seed: UniverseSeed([0; 32]),
+                tick_window: TickWindow {
+                    first: Tick::new(0),
+                    end_exclusive: Tick::new(log.len() as u64),
+                },
+                initial_entities: 1,
+                input_log: Vec::new(),
+            },
             log,
             flags: Vec::new(),
             events: 0,
