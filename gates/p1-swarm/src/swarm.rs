@@ -56,10 +56,16 @@ pub(crate) struct JoinedExternal {
     pub(crate) link: crate::exterior::HostLink,
 }
 
+/// One active campaign seat's transport identity and release key.
+pub(crate) struct LiveSeatBinding {
+    pub(crate) node: NodeId,
+    pub(crate) session_id: String,
+}
+
 /// Host-authored membership shared with admission and the live accept loop.
 pub(crate) struct LiveMembership {
     pub(crate) attempt_id: String,
-    pub(crate) active: BTreeMap<usize, (NodeId, String)>,
+    pub(crate) active: BTreeMap<usize, LiveSeatBinding>,
     pub(crate) pending: BTreeSet<usize>,
     pub(crate) released_sessions: BTreeSet<String>,
     pub(crate) tick: u64,
@@ -957,6 +963,8 @@ pub struct Swarm {
     departed_exteriors: Vec<ExteriorReport>,
     /// Continuous admission for a reservation-backed standing campaign.
     live_joins: Option<LiveJoins>,
+    /// New links get a second manifest after their downlink writer is live.
+    deferred_live_manifest_slots: BTreeSet<usize>,
     /// Host-side watch edges already armed, `(watcher, subject)`.
     armed_external_watches: BTreeSet<(usize, usize)>,
     /// The two roster snapshots which enforce hearsay's age floor.
@@ -1467,6 +1475,7 @@ impl Swarm {
             exteriors: BTreeMap::new(),
             departed_exteriors: Vec::new(),
             live_joins: None,
+            deferred_live_manifest_slots: BTreeSet::new(),
             armed_external_watches: BTreeSet::new(),
             hearsay_buffers: HearsayBuffers::default(),
             hearsay_fold_enabled: true,
@@ -2087,6 +2096,11 @@ impl Swarm {
     }
 
     fn publish_live_manifests(&mut self, tick: u64) {
+        let slots = self.exteriors.keys().copied().collect();
+        self.publish_live_manifests_for(tick, slots);
+    }
+
+    fn publish_live_manifests_for(&mut self, tick: u64, slots: Vec<usize>) {
         let Some(live) = &self.live_joins else {
             return;
         };
@@ -2096,10 +2110,9 @@ impl Swarm {
             .expect("membership lock")
             .attempt_id
             .clone();
-        let manifests = self
-            .exteriors
-            .keys()
-            .copied()
+        let manifests = slots
+            .into_iter()
+            .filter(|slot| self.exteriors.contains_key(slot))
             .map(|slot| (slot, self.membership_manifest(slot, tick, &attempt_id)))
             .collect::<Vec<_>>();
         for (slot, manifest) in manifests {
@@ -2153,6 +2166,7 @@ impl Swarm {
     }
 
     fn process_live_membership(&mut self, tick: u64) {
+        let deferred_manifest_slots = core::mem::take(&mut self.deferred_live_manifest_slots);
         let joined = self.live_joins.as_ref().map_or_else(Vec::new, |live| {
             let mut joined = Vec::new();
             while let Ok(seat) = live.receiver.try_recv() {
@@ -2176,6 +2190,9 @@ impl Swarm {
                 seat.anchor,
                 seat.link,
             );
+            // The first all-seat refresh is for established peers. Send the
+            // joiner a second, swarm-derived manifest after its writer is live.
+            self.deferred_live_manifest_slots.insert(seat.slot);
             changed = true;
         }
 
@@ -2226,7 +2243,15 @@ impl Swarm {
             eprintln!("gates/p1-swarm: live seat {slot} released at tick {tick} ({release_cause})");
             if let (Some(live), Some(session)) = (&self.live_joins, exterior.session_id.as_ref()) {
                 let mut membership = live.membership.lock().expect("membership lock");
-                membership.active.remove(&slot);
+                let binding = membership
+                    .active
+                    .remove(&slot)
+                    .expect("release names an active membership binding");
+                assert_eq!(
+                    binding.session_id.as_str(),
+                    session.as_str(),
+                    "release session must match the active membership binding"
+                );
                 membership.released_sessions.insert(session.clone());
                 membership
                     .publish()
@@ -2243,6 +2268,9 @@ impl Swarm {
             let _ = self.refresh_rosters(tick);
             self.refresh_live_witnesses();
             self.publish_live_manifests(tick);
+        }
+        if !deferred_manifest_slots.is_empty() {
+            self.publish_live_manifests_for(tick, deferred_manifest_slots.into_iter().collect());
         }
     }
 
@@ -3444,6 +3472,73 @@ impl SwarmReport {
 mod tests {
     use super::*;
     use orrery_games::regolith::{archetype::Archetype, CAMPAIGN_CELL_EDGE_M};
+
+    fn next_membership(remote: &crate::exterior::RemoteLink) -> StartManifest {
+        let frame = remote
+            .downlink
+            .lock()
+            .expect("downlink lock")
+            .try_recv()
+            .expect("membership manifest queued");
+        assert_eq!(frame.lane, Lane::Meta);
+        serde_json::from_slice(&frame.payload).expect("Meta frame is a membership manifest")
+    }
+
+    #[test]
+    fn a_peer_that_joins_a_running_attempt_is_given_every_seat_already_bound() {
+        let (existing_host, _existing_remote) = crate::exterior::link_pair();
+        let (joined_host, joined_remote) = crate::exterior::link_pair();
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let membership = Arc::new(Mutex::new(LiveMembership {
+            attempt_id: "attempt-live".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeSet::new(),
+            tick: 0,
+            running: true,
+            path: None,
+        }));
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: 2,
+                ..SwarmConfig::default()
+            },
+            4,
+        )
+        .with_external_session_at(
+            2,
+            4,
+            crate::bot::bot_key(2).public(),
+            "session-two".to_owned(),
+            None,
+            existing_host,
+        )
+        .with_live_joins(joined_rx, membership, 4);
+        joined_tx
+            .send(JoinedExternal {
+                slot: 3,
+                node: crate::bot::bot_key(3).public(),
+                session_id: "session-three".to_owned(),
+                anchor: None,
+                link: joined_host,
+            })
+            .expect("join reaches the standing swarm");
+
+        swarm.process_live_membership(120);
+        let _early_manifest = next_membership(&joined_remote);
+        swarm.process_live_membership(121);
+        let corrected_manifest = next_membership(&joined_remote);
+
+        assert_eq!(
+            corrected_manifest
+                .active
+                .iter()
+                .map(|seat| seat.slot)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "the joiner's post-link membership must name every already bound seat"
+        );
+    }
 
     #[test]
     fn ordinary_interest_coverage_preserves_stable_seat_order() {

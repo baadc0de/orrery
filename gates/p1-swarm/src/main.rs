@@ -677,6 +677,42 @@ fn decode_join_anchor(
         .transpose()
 }
 
+fn reserve_live_join(
+    live: &mut swarm::LiveMembership,
+    slot: usize,
+) -> Option<(String, u64, Vec<ConnectedSeat>)> {
+    if live.active.contains_key(&slot) || !live.pending.insert(slot) {
+        return None;
+    }
+    Some((
+        live.attempt_id.clone(),
+        live.tick,
+        live.active
+            .iter()
+            .map(|(slot, binding)| ConnectedSeat {
+                slot: *slot,
+                node: binding.node,
+            })
+            .collect(),
+    ))
+}
+
+fn record_live_binding(
+    live: &mut swarm::LiveMembership,
+    slot: usize,
+    node: NodeId,
+    session_id: String,
+) -> Result<()> {
+    live.pending.remove(&slot);
+    live.active
+        .insert(slot, swarm::LiveSeatBinding { node, session_id });
+    if let Err(error) = live.publish() {
+        live.active.remove(&slot);
+        return Err(error).context("republish active seats after bind");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn accept_live_join(
     endpoint: &iroh::Endpoint,
@@ -708,21 +744,7 @@ async fn accept_live_join(
     }
     let snapshot = {
         let mut live = membership.lock().expect("membership lock");
-        if live.active.contains_key(&slot) || !live.pending.insert(slot) {
-            None
-        } else {
-            Some((
-                live.attempt_id.clone(),
-                live.tick,
-                live.active
-                    .iter()
-                    .map(|(slot, (node, _session))| ConnectedSeat {
-                        slot: *slot,
-                        node: *node,
-                    })
-                    .collect::<Vec<_>>(),
-            ))
-        }
+        reserve_live_join(&mut live, slot)
     };
     let Some((attempt_id, tick, mut connected)) = snapshot else {
         let _ = prepared
@@ -784,13 +806,7 @@ async fn accept_live_join(
     };
     {
         let mut live = membership.lock().expect("membership lock");
-        live.pending.remove(&joined_slot);
-        live.active
-            .insert(joined_slot, (joined_node, session_id.clone()));
-        if let Err(error) = live.publish() {
-            live.active.remove(&joined_slot);
-            return Err(error).context("republish active seats after bind");
-        }
+        record_live_binding(&mut live, joined_slot, joined_node, session_id.clone())?;
     }
     joined_tx
         .send(swarm::JoinedExternal {
@@ -1145,8 +1161,7 @@ fn main() -> Result<()> {
                 let joined = prepared.finish(manifest, config.witnessing).await?;
                 if let (Some(live), Some(session_id)) = (&membership, &session_id) {
                     let mut live = live.lock().expect("membership lock");
-                    live.active.insert(joined.3, (joined.2, session_id.clone()));
-                    live.publish()
+                    record_live_binding(&mut live, joined.3, joined.2, session_id.clone())
                         .context("republish active seats after initial bind")?;
                 }
                 finished.push((joined, session_id));
@@ -1647,5 +1662,37 @@ mod session_geometry_tests {
                 Some(bot::bot_key(*subject).public().to_string())
             );
         }
+    }
+
+    #[test]
+    fn a_live_bound_seat_is_recorded_so_the_next_joiner_inherits_it() {
+        let mut membership = swarm::LiveMembership {
+            attempt_id: "attempt-live".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeSet::new(),
+            tick: 240,
+            running: true,
+            path: None,
+        };
+        record_live_binding(
+            &mut membership,
+            5,
+            bot::bot_key(5).public(),
+            "session-five".to_owned(),
+        )
+        .expect("live seat binding records");
+
+        let (_, _, inherited) =
+            reserve_live_join(&mut membership, 6).expect("next live join reserves its slot");
+        assert_eq!(
+            inherited.iter().map(|seat| seat.slot).collect::<Vec<_>>(),
+            vec![5],
+            "the next joiner's manifest snapshot must inherit the already live seat"
+        );
+        assert_eq!(
+            membership.active[&5].session_id, "session-five",
+            "the active binding retains the release key for the live seat"
+        );
     }
 }
