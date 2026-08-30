@@ -52,19 +52,24 @@ require_marker() { # check, log, exact marker
     fi
 }
 
-# Whether a fresh lobby has just opened, given the previous and current phase.
+# Whether this phase is one the scenario below can actually start from.
 #
-# The scenario below is written against one attempt: two clients join the lobby,
-# a third joins 185 s later so it lands just after the cohort freezes, and a
-# fourth reuses a released seat. Launched at an arbitrary point in a standing
-# host's 180 s lobby / 900 s attempt cycle, none of that is true -- a run can
-# start with seconds left in an attempt, and one measured today banked 9.6 s
-# before everything ended underneath it. That is the difference between a gate
-# and a coin toss, and it is why this waits for the transition rather than for
-# the word "lobby", which is equally true one second before the lobby closes.
-fresh_lobby_reached() { # previous phase, current phase
-    local previous=$1 current=$2
-    [[ $current == lobby && -n $previous && $previous != lobby ]]
+# The scenario is written against one attempt: two clients join the lobby, a
+# third joins 185 s later so it lands just after the cohort freezes, and a
+# fourth reuses a released seat. Starting mid-attempt gets none of that -- one
+# run measured today banked 9.6 s before the attempt ended underneath it, and
+# another had all three clients join live rather than through the lobby, which
+# silently changes which path is being tested.
+#
+# A lobby is the whole requirement. An earlier version of this waited for the
+# *transition* into one, on the theory that a lobby about to close is as bad as
+# an attempt; that is true in principle and useless in practice, because a
+# standing host with nobody on it reopens its empty lobby without ever leaving
+# the phase. The transition never came, every run paid the full timeout, and
+# the wait then proceeded anyway -- twenty minutes for nothing, on the idle
+# campaign that is the normal case for CI.
+lobby_is_joinable() { # phase
+    [[ $1 == lobby ]]
 }
 
 campaign_phase() { # campaign id, origin
@@ -81,7 +86,7 @@ PHASE
 
 # Wait for a lobby that has just opened, so the whole scenario fits one attempt.
 wait_for_fresh_lobby() { # campaign id, origin
-    local campaign=$1 origin=$2 previous= current= waited=0
+    local campaign=$1 origin=$2 current= waited=0
     while ((waited < FRESH_LOBBY_TIMEOUT_SECS)); do
         current="$(campaign_phase "$campaign" "$origin")"
         # An origin we cannot poll tells us nothing about the cycle, so waiting
@@ -91,11 +96,10 @@ wait_for_fresh_lobby() { # campaign id, origin
             printf 'NOTE fresh-lobby %s is not reachable; not waiting for a lobby\n' "$origin"
             return 0
         fi
-        if fresh_lobby_reached "$previous" "$current"; then
-            result PASS fresh-lobby "a new lobby opened after ${waited}s"
+        if lobby_is_joinable "$current"; then
+            result PASS fresh-lobby "started from a lobby after ${waited}s"
             return 0
         fi
-        previous="$current"
         sleep "$FRESH_LOBBY_POLL_SECS"
         waited=$((waited + FRESH_LOBBY_POLL_SECS))
     done
@@ -259,12 +263,11 @@ self_test() {
     # "lobby" -- which is equally true one second before it closes, and that is
     # the difference between running the scenario and running whatever is left
     # of an attempt.
-    fresh_lobby_reached running lobby || die 'self-test: running -> lobby is a fresh lobby'
-    fresh_lobby_reached restarting lobby || die 'self-test: restarting -> lobby is a fresh lobby'
-    ! fresh_lobby_reached lobby lobby || die 'self-test: a lobby already seen is not fresh'
-    ! fresh_lobby_reached '' lobby || die 'self-test: the first sight of a lobby says nothing about its age'
-    ! fresh_lobby_reached running running || die 'self-test: a running attempt is not a lobby'
-    ! fresh_lobby_reached lobby running || die 'self-test: leaving a lobby is not entering one'
+    lobby_is_joinable lobby || die 'self-test: a lobby is where this scenario starts'
+    ! lobby_is_joinable running || die 'self-test: an attempt already under way is not a start'
+    ! lobby_is_joinable restarting || die 'self-test: a restarting campaign has nothing to join'
+    ! lobby_is_joinable full || die 'self-test: a full campaign has no seat for the cohort'
+    ! lobby_is_joinable unreachable || die 'self-test: an unpollable origin is not a lobby'
     dir="$(mktemp -d)"
     # shellcheck disable=SC2064 # Expand the validated mktemp path now.
     trap "rm -rf '$dir'" EXIT
