@@ -64,6 +64,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod diff;
 pub mod game;
 pub mod golden;
 pub mod regolith;
