@@ -1160,13 +1160,21 @@ fn upload_state_path(telemetry_path: &Path) -> PathBuf {
 }
 
 /// Persist an exact upload body, attempt it, and leave a visible retry artifact on failure.
+///
+/// `telemetry_start` is the byte offset this session's rows begin at, from
+/// [`crate::telemetry::JsonlTelemetry::session_start`]. Only the bytes from
+/// there on are uploaded: the record describes one session, so a stream
+/// spanning every session the binary ever played is not its evidence, and it
+/// grows without bound until the service refuses the body (#735). The player's
+/// own file is left whole.
 pub fn upload_finished_session(
     manager: &UploadManager,
     record: &SessionRecord,
     record_path: &Path,
     telemetry_path: &Path,
+    telemetry_start: u64,
 ) {
-    let telemetry = match std::fs::read_to_string(telemetry_path) {
+    let telemetry = match read_session_telemetry(telemetry_path, telemetry_start) {
         Ok(value) => value,
         Err(error) => {
             error!(
@@ -1236,6 +1244,23 @@ pub fn upload_finished_session(
             body_path.display()
         ),
     }
+}
+
+/// Read the telemetry this session appended, from `start` to end of file.
+///
+/// A `start` beyond the file's end means the player rotated or replaced the
+/// stream under us; the honest answer then is the whole of what is there
+/// rather than a silent nothing.
+fn read_session_telemetry(path: &Path, start: u64) -> std::io::Result<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if start <= length {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut telemetry = String::new();
+    file.read_to_string(&mut telemetry)?;
+    Ok(telemetry)
 }
 
 struct UploadBody {

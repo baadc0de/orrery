@@ -452,13 +452,23 @@ JSON body:
 ```json
 {
   "records": [ { "session_id": "01917f0e-…", "actor": "human", "…": "…" } ],
-  "telemetry_jsonl": "<the client's session.jsonl, as text>"
+  "telemetry_jsonl": "<this session's rows of the client's session.jsonl, as text>"
 }
 ```
+
+The client's stream is append-only across every session that binary plays, so
+only the rows *this* session appended travel — the slice from the byte offset
+the stream stood at when the session opened it. Uploading the whole file made
+the body grow with the number of sessions played while the session it
+describes did not, until the service refused it (#735). The player keeps the
+whole local file.
 
 Handler:
 
 ```text
+0  every refusal below is logged on the host: a refused upload is a
+      session that went unrecorded, and admission is the only party
+      that can see it (the client's report reaches the player's log alone)
 1  session_id appears in some <campaign>/joins.jsonl   else 404 unknown_session
 2  body ≤ 64 MiB (nginx enforces; service re-checks)   else 413 too_large
 3  every row in records has .session_id == session_id  else 422 wrong_session
