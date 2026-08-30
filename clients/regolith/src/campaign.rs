@@ -1577,6 +1577,14 @@ impl CampaignRuntime {
         self.finish_record()
     }
 
+    #[cfg(test)]
+    pub(crate) fn finished_for_test(config: CampaignConfig, seed: UniverseSeed) -> Self {
+        let mut runtime = Self::launch(config, seed);
+        runtime.campaign.observe_tick(1);
+        runtime.ticks_driven = 1;
+        runtime
+    }
+
     /// Diagnostics for the F3 pane's session line.
     #[must_use]
     pub fn summary_line(&self) -> String {
