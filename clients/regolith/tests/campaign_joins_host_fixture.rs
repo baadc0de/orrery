@@ -1278,12 +1278,23 @@ fn a_client_joins_measures_and_applies_replicated_state() {
     assert!(progress.banked_minutes > 0.0);
     assert!(progress.joined_session_ran);
 
-    // The finished row carries the measurements and flags the declared
-    // profile as wrong rather than echoing it.
+    // The finished row carries the measurements rather than echoing the
+    // declared profile, which this fixture sets to a deliberate 25%.
+    //
+    // The `impairment_mismatch` flag is deliberately NOT asserted here. It now
+    // requires a sample large enough to judge (#718), and this fixture's few
+    // dozen datagrams cannot establish that a declared rate is wrong -- which
+    // is the point of the floor, not an exemption from it. The flag's
+    // semantics are owned by the named tests in `session.rs`; what belongs
+    // here is that the row reports what the link actually did.
     let record = runtime.shutdown().expect("one row per session");
     assert_eq!(record.session_id, "it-session");
     assert!(record.observed_loss_pct > 0.0);
-    assert!(record.impairment_mismatch, "the declared profile was a lie");
+    assert_ne!(
+        record.observed_loss_pct,
+        configured().loss_pct,
+        "the row must report the measured rate, not the declared one"
+    );
 
     drop(sink);
 }
