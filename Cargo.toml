@@ -20,6 +20,8 @@ members = [
     "crates/orrery_seed",
     "crates/orrery_games",
     "crates/orrery_conformance",
+    # Pre-S5 C ABI spike: proves the engine-neutral simulation boundary.
+    "crates/orrery_sim",
     # The facade sits on top of the spine: it depends on every client plugin.
     "crates/orrery",
 ]

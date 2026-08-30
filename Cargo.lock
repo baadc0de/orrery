@@ -8136,6 +8136,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_sim"
+version = "0.1.0"
+dependencies = [
+ "glam 0.32.1",
+ "orrery_core",
+ "orrery_games",
+ "orrery_protocol",
+]
+
+[[package]]
 name = "orrery_spatial"
 version = "0.1.0"
 dependencies = [
