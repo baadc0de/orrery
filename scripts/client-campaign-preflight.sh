@@ -22,6 +22,10 @@ CAMPAIGN=
 TIMEOUT_SECS=1020
 LATE_JOIN_DELAY_SECS=185
 REJOIN_DELAY_SECS=3
+# A full lobby plus an attempt, so a wait that starts just after one closes
+# still reaches the next.
+FRESH_LOBBY_TIMEOUT_SECS=${CLIENT_CAMPAIGN_PREFLIGHT_FRESH_LOBBY_TIMEOUT:-1200}
+FRESH_LOBBY_POLL_SECS=5
 XVFB_RUN_BIN="${CLIENT_CAMPAIGN_PREFLIGHT_XVFB_RUN:-xvfb-run}"
 PYTHON_BIN="${CLIENT_CAMPAIGN_PREFLIGHT_PYTHON:-python3}"
 failures=0
@@ -46,6 +50,61 @@ require_marker() { # check, log, exact marker
     else
         result FAIL "$check" "missing marker: $marker (log: $log)"
     fi
+}
+
+# Whether a fresh lobby has just opened, given the previous and current phase.
+#
+# The scenario below is written against one attempt: two clients join the lobby,
+# a third joins 185 s later so it lands just after the cohort freezes, and a
+# fourth reuses a released seat. Launched at an arbitrary point in a standing
+# host's 180 s lobby / 900 s attempt cycle, none of that is true -- a run can
+# start with seconds left in an attempt, and one measured today banked 9.6 s
+# before everything ended underneath it. That is the difference between a gate
+# and a coin toss, and it is why this waits for the transition rather than for
+# the word "lobby", which is equally true one second before the lobby closes.
+fresh_lobby_reached() { # previous phase, current phase
+    local previous=$1 current=$2
+    [[ $current == lobby && -n $previous && $previous != lobby ]]
+}
+
+campaign_phase() { # campaign id, origin
+    "$PYTHON_BIN" - "$1" "$2" <<'PHASE' 2>/dev/null
+import json, sys, urllib.request
+campaign, origin = sys.argv[1], sys.argv[2]
+try:
+    with urllib.request.urlopen(f"{origin}/v1/campaigns/{campaign}/roster", timeout=10) as answer:
+        print(json.load(answer).get("phase") or "unknown")
+except Exception:
+    print("unreachable")
+PHASE
+}
+
+# Wait for a lobby that has just opened, so the whole scenario fits one attempt.
+wait_for_fresh_lobby() { # campaign id, origin
+    local campaign=$1 origin=$2 previous= current= waited=0
+    while ((waited < FRESH_LOBBY_TIMEOUT_SECS)); do
+        current="$(campaign_phase "$campaign" "$origin")"
+        # An origin we cannot poll tells us nothing about the cycle, so waiting
+        # buys nothing and costs the whole timeout. The fixtures in this
+        # script's own self-test are exactly that case.
+        if [[ $current == unreachable ]]; then
+            printf 'NOTE fresh-lobby %s is not reachable; not waiting for a lobby\n' "$origin"
+            return 0
+        fi
+        if fresh_lobby_reached "$previous" "$current"; then
+            result PASS fresh-lobby "a new lobby opened after ${waited}s"
+            return 0
+        fi
+        previous="$current"
+        sleep "$FRESH_LOBBY_POLL_SECS"
+        waited=$((waited + FRESH_LOBBY_POLL_SECS))
+    done
+    # Not fatal, and deliberately not a `result`: every non-PASS verdict there
+    # counts as a failure, and an operator running this by hand against an idle
+    # campaign should still get a run. The clauses below report what happened.
+    printf 'NOTE fresh-lobby no new lobby within %ss; running from phase %s\n' \
+        "$FRESH_LOBBY_TIMEOUT_SECS" "$current"
+    return 0
 }
 
 run_preflight() {
@@ -131,6 +190,8 @@ print(origin.rstrip("/"))
         return "$wrapper_status"
     }
 
+    wait_for_fresh_lobby "$CAMPAIGN" "$origin"
+
     run_client a "$nickname_a" "$nickname_b" "$nickname_c" & local pid_a=$!
     run_client b "$nickname_b" "$nickname_a" "$nickname_c" & local pid_b=$!
     sleep "$LATE_JOIN_DELAY_SECS"
@@ -193,6 +254,17 @@ summary() {
 
 self_test() {
     local dir output status passing=0 mutations=0 pass_count fail_count
+
+    # The gate must start on a lobby that has just opened, not on the word
+    # "lobby" -- which is equally true one second before it closes, and that is
+    # the difference between running the scenario and running whatever is left
+    # of an attempt.
+    fresh_lobby_reached running lobby || die 'self-test: running -> lobby is a fresh lobby'
+    fresh_lobby_reached restarting lobby || die 'self-test: restarting -> lobby is a fresh lobby'
+    ! fresh_lobby_reached lobby lobby || die 'self-test: a lobby already seen is not fresh'
+    ! fresh_lobby_reached '' lobby || die 'self-test: the first sight of a lobby says nothing about its age'
+    ! fresh_lobby_reached running running || die 'self-test: a running attempt is not a lobby'
+    ! fresh_lobby_reached lobby running || die 'self-test: leaving a lobby is not entering one'
     dir="$(mktemp -d)"
     # shellcheck disable=SC2064 # Expand the validated mktemp path now.
     trap "rm -rf '$dir'" EXIT
