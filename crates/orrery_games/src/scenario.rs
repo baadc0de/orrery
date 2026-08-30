@@ -67,6 +67,90 @@ pub struct Scenario {
     pub sample_loss_pct: u32,
 }
 
+/// The absolute, half-open tick range a sealed scenario covers.
+///
+/// This is recorded with the inputs rather than inferred from a later
+/// scenario table: a differential run must know exactly which ticks its
+/// legacy input log sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickWindow {
+    /// First tick in the run.
+    pub first: Tick,
+    /// First tick outside the run.
+    pub end_exclusive: Tick,
+}
+
+/// One entity's inputs as sealed before it stepped.
+#[derive(Clone)]
+pub struct SealedEntry<I> {
+    /// Entity receiving the inputs.
+    pub entity: PersistId,
+    /// Inputs in the authority's log order.
+    pub inputs: Vec<I>,
+}
+
+/// The sealed inputs for one absolute tick.
+#[derive(Clone)]
+pub struct SealedTick<I> {
+    /// Absolute tick the entries apply to.
+    pub tick: Tick,
+    /// Entries in ascending [`PersistId`] order.
+    pub entries: Vec<SealedEntry<I>>,
+}
+
+/// A reproducible scenario input artifact.
+///
+/// It is deliberately the inputs, not a copy of the scenario recipe.  A
+/// later implementation receives this seed, this tick window, and these
+/// already-ordered inputs; it cannot silently replace the baseline's pilot or
+/// delivery history while claiming a differential comparison.
+pub struct SealedScenario<G: Game> {
+    /// Universe seed used by the executor.
+    pub seed: UniverseSeed,
+    /// Exact tick range covered by [`Self::input_log`].
+    pub tick_window: TickWindow,
+    /// Population installed before the first tick.
+    pub initial_entities: u64,
+    /// Inputs sealed before each step, in tick and entity order.
+    pub input_log: Vec<SealedTick<G::CoreInput>>,
+}
+
+impl<G: Game> Clone for SealedScenario<G> {
+    fn clone(&self) -> Self {
+        Self {
+            seed: self.seed,
+            tick_window: self.tick_window,
+            initial_entities: self.initial_entities,
+            input_log: self.input_log.clone(),
+        }
+    }
+}
+
+/// One routed event input, retained in delivery order for the outcome fold.
+///
+/// A named type makes the target/input relationship available to a future
+/// differential consumer without relying on a positional tuple.
+#[derive(Clone)]
+pub struct DeliveryPair<I> {
+    /// Entity that receives the input on the following tick.
+    pub target: PersistId,
+    /// Input produced by the game's delivery rule.
+    pub input: I,
+}
+
+/// One stepped entity's outcome-facing artifacts for an outcome-chain tick.
+#[derive(Clone)]
+pub struct OutcomeEntry<I> {
+    /// The emitter, used to impose WP-2 order across entities.
+    pub entity: PersistId,
+    /// Canonical event bytes in the order the step emitted them.
+    pub events: Vec<Vec<u8>>,
+    /// Successfully installed identifiers in executor installation order.
+    pub materialized: Vec<PersistId>,
+    /// Routed target/input pairs in delivery order.
+    pub delivered: Vec<DeliveryPair<I>>,
+}
+
 /// The scenarios every game in the catalogue is run through.
 ///
 /// Breadth comes from the axes that break things — population size, window
@@ -140,6 +224,10 @@ pub struct TickRecord<G: Game> {
 pub struct Play<G: Game> {
     /// The chain over every per-tick state hash, in execution order.
     pub chain: [u8; 32],
+    /// The chain over outcomes that state hashes cannot observe.
+    pub outcome_chain: [u8; 32],
+    /// The exact inputs this run sealed before execution.
+    pub sealed: SealedScenario<G>,
     /// The log an authority would have streamed, one record per tick.
     pub log: Vec<TickRecord<G>>,
     /// Stage-1 checks that failed. Empty is the expected result for honest
@@ -191,7 +279,9 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
     }
 
     let mut chain = [0u8; 32];
+    let mut outcome_chain = [0u8; 32];
     let mut log = Vec::with_capacity(scenario.ticks as usize);
+    let mut input_log = Vec::with_capacity(scenario.ticks as usize);
     let mut flags = Vec::new();
     let mut events = 0u64;
     let mut pending: BTreeMap<PersistId, Vec<G::CoreInput>> = BTreeMap::new();
@@ -205,6 +295,8 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
         let tick_entities: Vec<PersistId> = executor.entities().copied().collect();
         let mut delivered: BTreeMap<PersistId, Vec<G::CoreInput>> = BTreeMap::new();
         let mut entries = Vec::with_capacity(tick_entities.len());
+        let mut sealed_entries = Vec::with_capacity(tick_entities.len());
+        let mut outcome_entries = Vec::with_capacity(tick_entities.len());
 
         for entity in &tick_entities {
             // Events delivered from the previous tick come first, then what
@@ -234,11 +326,25 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
                 .expect("every scenario entity is installed in the executor");
             chain = fold(chain, &outcome.state_hash);
             events += outcome.events.len() as u64;
+            let mut outcome_events = Vec::with_capacity(outcome.events.len());
+            let mut delivery_pairs = Vec::new();
             for event in &outcome.events {
+                outcome_events.push(event.to_canonical());
                 if let Some((target, input)) = executor.ruleset().deliver(event) {
-                    delivered.entry(target).or_default().push(input);
+                    delivered.entry(target).or_default().push(input.clone());
+                    delivery_pairs.push(DeliveryPair { target, input });
                 }
             }
+            outcome_entries.push(OutcomeEntry {
+                entity: *entity,
+                events: outcome_events,
+                materialized: outcome.materialized,
+                delivered: delivery_pairs,
+            });
+            sealed_entries.push(SealedEntry {
+                entity: *entity,
+                inputs: inputs.clone(),
+            });
             entries.push(Entry::<G> {
                 entity: *entity,
                 inputs,
@@ -250,8 +356,13 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
             });
         }
 
+        outcome_chain = fold_outcome_tick(outcome_chain, &outcome_entries);
         pending = delivered;
         log.push(TickRecord::<G> { tick, entries });
+        input_log.push(SealedTick {
+            tick,
+            entries: sealed_entries,
+        });
 
         if offset.is_multiple_of(SAMPLE_PERIOD) {
             sample_stage_one(
@@ -267,8 +378,114 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
 
     Play {
         chain,
+        outcome_chain,
+        sealed: SealedScenario {
+            seed,
+            tick_window: TickWindow {
+                first: Tick::new(T0),
+                end_exclusive: Tick::new(T0 + scenario.ticks),
+            },
+            initial_entities: scenario.entities,
+            input_log,
+        },
         log,
         flags,
+        events,
+    }
+}
+
+/// Replay a previously sealed run under `game`.
+///
+/// This is the input side of differential parity: callers capture
+/// [`Play::sealed`] immediately before a refactor, then give the changed
+/// implementation precisely the same initial population, seed, tick window,
+/// and log-ordered inputs.  Sampling is intentionally absent because it is an
+/// observer concern, not one of the sealed simulation inputs.
+#[must_use]
+pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
+    let entities: Vec<PersistId> = (1..=sealed.initial_entities).map(PersistId::new).collect();
+    let spawned: Vec<(PersistId, G::CoreState)> = entities
+        .iter()
+        .enumerate()
+        .map(|(slot, entity)| (*entity, game.spawn(*entity, slot as u64)))
+        .collect();
+    let mut executor = Executor::new(game, sealed.seed);
+    for (entity, state) in spawned {
+        executor.insert(entity, state);
+    }
+
+    let expected_ticks = sealed.tick_window.end_exclusive.0 - sealed.tick_window.first.0;
+    assert_eq!(
+        sealed.input_log.len(),
+        usize::try_from(expected_ticks).expect("scenario tick window fits usize"),
+        "sealed input log does not fill its tick window"
+    );
+
+    let mut chain = [0u8; 32];
+    let mut outcome_chain = [0u8; 32];
+    let mut events = 0u64;
+    let mut log = Vec::with_capacity(sealed.input_log.len());
+    for (offset, record) in sealed.input_log.iter().enumerate() {
+        let expected_tick = Tick::new(
+            sealed.tick_window.first.0 + u64::try_from(offset).expect("input log length fits u64"),
+        );
+        assert_eq!(
+            record.tick, expected_tick,
+            "sealed input log has a tick gap"
+        );
+        let installed: Vec<PersistId> = executor.entities().copied().collect();
+        let sealed_entities: Vec<PersistId> =
+            record.entries.iter().map(|entry| entry.entity).collect();
+        assert_eq!(
+            sealed_entities, installed,
+            "sealed input log does not match the replay population at {expected_tick:?}"
+        );
+
+        let mut entries = Vec::with_capacity(record.entries.len());
+        let mut outcome_entries = Vec::with_capacity(record.entries.len());
+        for sealed_entry in &record.entries {
+            let outcome = executor
+                .step_entity(sealed_entry.entity, record.tick, &sealed_entry.inputs)
+                .expect("sealed input names an installed entity");
+            chain = fold(chain, &outcome.state_hash);
+            events += outcome.events.len() as u64;
+            let mut outcome_events = Vec::with_capacity(outcome.events.len());
+            let mut delivered = Vec::new();
+            for event in &outcome.events {
+                outcome_events.push(event.to_canonical());
+                if let Some((target, input)) = executor.ruleset().deliver(event) {
+                    delivered.push(DeliveryPair { target, input });
+                }
+            }
+            outcome_entries.push(OutcomeEntry {
+                entity: sealed_entry.entity,
+                events: outcome_events,
+                materialized: outcome.materialized,
+                delivered,
+            });
+            entries.push(Entry {
+                entity: sealed_entry.entity,
+                inputs: sealed_entry.inputs.clone(),
+                hash: outcome.state_hash,
+                state: executor
+                    .state(sealed_entry.entity)
+                    .expect("the entity was just stepped")
+                    .clone(),
+            });
+        }
+        outcome_chain = fold_outcome_tick(outcome_chain, &outcome_entries);
+        log.push(TickRecord {
+            tick: record.tick,
+            entries,
+        });
+    }
+
+    Play {
+        chain,
+        outcome_chain,
+        sealed: sealed.clone(),
+        log,
+        flags: Vec::new(),
         events,
     }
 }
@@ -516,6 +733,52 @@ fn fold(chain: [u8; 32], hash: &[u8; 32]) -> [u8; 32] {
     hasher.update(&chain);
     hasher.update(hash);
     *hasher.finalize().as_bytes()
+}
+
+/// Fold one tick's non-state outcomes into an outcome chain.
+///
+/// The function imposes WP-2's ascending [`PersistId`] order across emitters;
+/// it preserves the executor's event and materialization order and the
+/// harness's delivery order within each emitter.  Lengths are `u64`
+/// little-endian, which makes empty and variable-width canonical payloads
+/// unambiguous without giving the payloads a second encoding.
+#[must_use]
+pub fn fold_outcome_tick<I: CoreCodec>(chain: [u8; 32], entries: &[OutcomeEntry<I>]) -> [u8; 32] {
+    let mut ordered: Vec<&OutcomeEntry<I>> = entries.iter().collect();
+    ordered.sort_by_key(|entry| entry.entity);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&chain);
+    for entry in ordered {
+        hasher.update(&entry.entity.0.to_le_bytes());
+        fold_count(&mut hasher, entry.events.len());
+        for event in &entry.events {
+            fold_bytes(&mut hasher, event);
+        }
+        fold_count(&mut hasher, entry.materialized.len());
+        for entity in &entry.materialized {
+            hasher.update(&entity.0.to_le_bytes());
+        }
+        fold_count(&mut hasher, entry.delivered.len());
+        for delivery in &entry.delivered {
+            hasher.update(&delivery.target.0.to_le_bytes());
+            fold_bytes(&mut hasher, &delivery.input.to_canonical());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn fold_count(hasher: &mut blake3::Hasher, count: usize) {
+    hasher.update(
+        &u64::try_from(count)
+            .expect("scenario item count fits u64")
+            .to_le_bytes(),
+    );
+}
+
+fn fold_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    fold_count(hasher, bytes.len());
+    hasher.update(bytes);
 }
 
 /// The pilot's RNG.

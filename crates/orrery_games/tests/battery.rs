@@ -19,8 +19,16 @@
 //! | every tamper is adjudicable | a cheat the pipeline cannot reach |
 //! | chains match the golden | an unintended rules change, and cross-platform drift |
 
+use orrery_core::{OrderedInputs, QPos};
 use orrery_games::game::{for_each_game, Game, GameVisitor, Tamper, CATALOGUE};
-use orrery_games::scenario::{adjudicate, adjudicate_isolated, check_codec, play, SCENARIOS};
+use orrery_games::regolith::{
+    archetype::Archetype as RegolithArchetype, order::Outcome as RegolithOutcome,
+    weapon::WeaponKind, Regolith,
+};
+use orrery_games::scenario::{
+    adjudicate, adjudicate_isolated, check_codec, play, replay, SCENARIOS,
+};
+use orrery_protocol::PersistId;
 
 /// Declare a test that runs over every game in the catalogue.
 macro_rules! game_test {
@@ -62,6 +70,30 @@ game_test!(a_run_is_reproducible, Reproducible, {
             first.chain,
             second.chain,
             "{}/{}: two runs of the same scenario disagreed",
+            G::META.name,
+            scenario.name
+        );
+    }
+});
+
+game_test!(sealed_inputs_replay_the_same_run, SealedReplay, {
+    // A refactor's candidate must receive the exact run the legacy path saw,
+    // rather than a newly generated pilot stream.  This asserts the sealed
+    // seed, absolute window and log-ordered inputs are sufficient to replay.
+    for scenario in SCENARIOS {
+        let original = play(G::honest(), scenario);
+        let replayed = replay(G::honest(), &original.sealed);
+        assert_eq!(
+            replayed.chain,
+            original.chain,
+            "{}/{}: sealed inputs did not reproduce the state chain",
+            G::META.name,
+            scenario.name
+        );
+        assert_eq!(
+            replayed.outcome_chain,
+            original.outcome_chain,
+            "{}/{}: sealed inputs did not reproduce the outcome chain",
             G::META.name,
             scenario.name
         );
@@ -247,6 +279,67 @@ game_test!(chains_match_the_committed_golden, Golden, {
     }
 });
 
+game_test!(outcome_chains_match_the_committed_golden, OutcomeGolden, {
+    let mut mismatches = Vec::new();
+    for scenario in SCENARIOS {
+        let expected = outcome_goldens(G::META.name)
+            .iter()
+            .find(|(name, _)| *name == scenario.name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no outcome golden for scenario {} — regenerate the table",
+                    G::META.name,
+                    scenario.name
+                )
+            })
+            .1;
+        let actual = play(G::honest(), scenario).outcome_chain;
+        if actual != expected {
+            mismatches.push(format!(
+                "{}/{}: actual {}, expected {}",
+                G::META.name,
+                scenario.name,
+                hex(&actual),
+                hex(&expected)
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "outcome chain changed. If the rules changed on purpose, bump the ruleset version and \
+         regenerate; if they did not, this is drift.\n{}",
+        mismatches.join("\n")
+    );
+});
+
+#[test]
+fn damage_delivery_targets_the_event_target() {
+    let attacker = PersistId::new(41);
+    let target = PersistId::new(99);
+    let event = RegolithOutcome::DamageDealt {
+        attacker,
+        target,
+        amount: 7,
+        attacker_pos: QPos::default(),
+        attacker_vel: Default::default(),
+        attacker_yaw_urad: 0,
+        attacker_archetype: RegolithArchetype::Interceptor,
+        attacker_weapon: WeaponKind::Stock,
+        flight_ticks: None,
+    };
+    let (delivered_to, _) = Regolith::honest()
+        .deliver(&event)
+        .expect("damage is delivered to its target");
+    assert_eq!(delivered_to, target);
+}
+
+#[test]
+fn ordered_inputs_iterates_in_log_order() {
+    let logged = [17u8, 3, 42, 9];
+    let observed: Vec<u8> = OrderedInputs::new(&logged).iter().copied().collect();
+    assert_eq!(observed, logged);
+}
+
 /// Print the golden table as Rust source. Run with:
 ///
 /// ```sh
@@ -277,6 +370,22 @@ fn emit_goldens() {
                 println!("    ]),");
             }
             println!("];");
+            println!("// {} outcomes", G::META.name);
+            println!(
+                "pub const {}_OUTCOMES: [(&str, [u8; 32]); {}] = [",
+                G::META.name.to_uppercase().replace('-', "_"),
+                SCENARIOS.len()
+            );
+            for scenario in SCENARIOS {
+                let chain = play(G::honest(), scenario).outcome_chain;
+                let bytes: Vec<String> = chain.iter().map(|b| format!("0x{b:02x}")).collect();
+                println!("    (\"{}\", [", scenario.name);
+                for row in bytes.chunks(8) {
+                    println!("        {},", row.join(", "));
+                }
+                println!("    ]),");
+            }
+            println!("];\n");
         }
     }
     for_each_game(&mut Emit);
@@ -284,4 +393,12 @@ fn emit_goldens() {
 
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn outcome_goldens(game: &str) -> &'static [(&'static str, [u8; 32])] {
+    match game {
+        "regolith" => &orrery_games::golden::REGOLITH_OUTCOMES,
+        "skirmish" => &orrery_games::golden::SKIRMISH_OUTCOMES,
+        _ => panic!("{game}: no outcome golden table"),
+    }
 }
