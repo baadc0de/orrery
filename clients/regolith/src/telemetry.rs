@@ -92,6 +92,7 @@ impl OverlayMetrics {
 #[derive(Resource)]
 pub struct JsonlTelemetry {
     writer: BufWriter<File>,
+    session_start: u64,
 }
 
 impl JsonlTelemetry {
@@ -101,9 +102,24 @@ impl JsonlTelemetry {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // The stream is append-only across every session this binary ever
+        // plays, so the file already holds earlier sessions' rows. The offset
+        // the first append of *this* run lands at is the only boundary
+        // separating them, and the upload is scoped to it (#735).
+        let session_start = file.metadata()?.len();
         Ok(Self {
             writer: BufWriter::new(file),
+            session_start,
         })
+    }
+
+    /// Byte offset in the stream at which this session's rows begin.
+    ///
+    /// Rows before it belong to earlier sessions of the same binary. They stay
+    /// on disk for the player; they are not this session's evidence.
+    #[must_use]
+    pub const fn session_start(&self) -> u64 {
+        self.session_start
     }
 
     /// Append and flush one snapshot so tailing processes see it immediately.

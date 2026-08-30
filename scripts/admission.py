@@ -582,6 +582,18 @@ class Admission:
         fd = os.open(path.parent, os.O_DIRECTORY); os.fsync(fd); os.close(fd)
 
     def upload(self, sid: str, body: bytes) -> None:
+        """Store one session's client evidence, and say so out loud when it is refused."""
+        try: self._store_upload(sid, body)
+        except Refusal as e:
+            # A refused upload is a session that went unrecorded, and the only
+            # other report of it is a line in the player's own log. Admission
+            # is the one party that can see it at all, so it says so here
+            # (#735); silence here is indistinguishable from a player who
+            # never played, which is the blind spot #711 existed to close.
+            logging.error("upload refused for session %s: %d %s (%d bytes)", sid, e.status, e.error, len(body))
+            raise
+
+    def _store_upload(self, sid: str, body: bytes) -> None:
         if not self.known_session(sid): raise Refusal(404, "unknown_session", "That session is not known to this service.")
         if len(body) > MAX_UPLOAD_BYTES: raise Refusal(413, "too_large", "The upload is too large.")
         try: payload = json.loads(body)
@@ -1032,6 +1044,26 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(Refusal) as x: self.service.upload(sid, body)
         self.assertEqual(x.exception.error, "wrong_session")
         self.assertFalse((self.state / "sessions" / sid / "telemetry.jsonl").exists())
+    def test_every_refused_upload_is_logged_where_an_operator_can_see_it(self) -> None:
+        # #735: a client whose upload is refused writes one line to the
+        # player's own log and the service writes nothing, so an unrecorded
+        # session is indistinguishable here from a player who never played.
+        # Every refusal path must say so on the host, not just the size one.
+        sid = self.service.join("test", self.request())["join"]["session_id"]
+        refusals = {
+            "too_large": json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "x" * MAX_UPLOAD_BYTES}).encode(),
+            "bad_upload": b"not json",
+            "wrong_session": json.dumps({"records": [{"session_id": "018f8f4e-5c90-7abc-8123-0000000000ab"}], "telemetry_jsonl": "x"}).encode(),
+        }
+        for error, body in refusals.items():
+            with self.assertLogs(level=logging.ERROR) as logs, self.assertRaises(Refusal):
+                self.service.upload(sid, body)
+            line = "\n".join(logs.output)
+            self.assertIn("upload refused", line, f"a {error} refusal is silent on the host")
+            self.assertIn(sid, line, f"a {error} refusal does not name its session")
+            self.assertIn(error, line)
+        # An upload that is accepted stays quiet on the error channel.
+        self.service.upload(sid, json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "x"}).encode())
     def test_the_mint_floor_refuses_new_admissions_below_10gb(self) -> None:
         self.service.statvfs = lambda _: type("V", (), {"f_bavail": MINT_FLOOR_BYTES - 1, "f_frsize": 1})()
         with self.assertRaises(Refusal) as x: self.service.join("test", self.request())
