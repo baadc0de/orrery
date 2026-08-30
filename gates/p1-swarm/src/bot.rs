@@ -302,6 +302,8 @@ pub struct Bot {
     /// receiver-side only: it observes decoded replicas, delivered inputs and
     /// cell commitments without changing manifests, audiences or send order.
     audience_trace: bool,
+    /// Opt-in copies of the exact audience diffs that feed the join rule.
+    audience_changes: Option<Vec<AudienceChange>>,
     /// This bot's behavioural profile.
     pub profile: Profile,
     /// The signed log this bot authors, when witnessing is on.
@@ -355,6 +357,22 @@ struct ReceiverKeyframe {
 #[derive(Resource, Debug, Default, Clone)]
 pub struct ReplicaKeyframes {
     anchors: BTreeMap<PersistId, ReceiverKeyframe>,
+    /// Entities whose receiver holds an older anchor than an arrived delta
+    /// names. A subsequent keyframe for the entity closes the window.
+    missing_newer: BTreeSet<PersistId>,
+}
+
+/// One sender-side audience diff, captured without changing the join rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudienceChange {
+    /// Entity whose audience changed.
+    pub(crate) entity: PersistId,
+    /// Newly interested recipients.
+    pub(crate) joins: u64,
+    /// Recipients no longer in the audience.
+    pub(crate) leaves: u64,
+    /// Half-open simulated one-second window containing the diff.
+    pub(crate) window: u64,
 }
 
 /// A reconstructed absolute replication state.
@@ -574,6 +592,7 @@ pub(crate) fn decode_replica(
                 tick,
             },
         );
+        keyframes.missing_newer.remove(&entity);
         return Ok(DecodedReplica {
             canonical,
             cell,
@@ -599,6 +618,7 @@ pub(crate) fn decode_replica(
                 UnanchoredDeltaCause::NoKeyframe,
             ))?;
     if anchor.tick < referenced_tick {
+        keyframes.missing_newer.insert(delta.entity);
         return Err(ReplicaDecodeError::UnanchoredDelta(
             UnanchoredDeltaCause::MissingNewerKeyframe,
         ));
@@ -970,6 +990,7 @@ impl Bot {
                 .ok()
                 .and_then(|seat| seat.parse::<usize>().ok())
                 == Some(index),
+            audience_changes: None,
         }
     }
 
@@ -1720,6 +1741,23 @@ impl Bot {
                 .unwrap_or_default();
             let added: BTreeSet<NodeId> =
                 audience.difference(&previous_audience).copied().collect();
+            let removed: BTreeSet<NodeId> =
+                previous_audience.difference(&audience).copied().collect();
+            if let Some(changes) = &mut self.audience_changes {
+                // The first roster snapshot establishes a baseline. It is not
+                // a roaming transition and would turn startup into a false
+                // correlation burst.
+                if self.replication_audiences.contains_key(&entity)
+                    && (!added.is_empty() || !removed.is_empty())
+                {
+                    changes.push(AudienceChange {
+                        entity,
+                        joins: added.len() as u64,
+                        leaves: removed.len() as u64,
+                        window: tick / TICK_HZ,
+                    });
+                }
+            }
             let existing: BTreeSet<NodeId> = audience.difference(&added).copied().collect();
             let observed_tick = tick + 1;
             let due = !self.sender_keyframes.contains_key(&entity)
@@ -2393,6 +2431,36 @@ impl Bot {
             .collect()
     }
 
+    /// Enable capture of the sender's audience changes for a measurement run.
+    pub fn enable_presence_stats(&mut self) {
+        self.audience_changes = Some(Vec::new());
+    }
+
+    /// Drain the exact audience diffs observed at [`Self::broadcast_state`].
+    pub(crate) fn drain_audience_changes(&mut self) -> Vec<AudienceChange> {
+        self.audience_changes
+            .as_mut()
+            .map_or_else(Vec::new, core::mem::take)
+    }
+
+    /// Number of receiver links currently inside a missing-newer window.
+    pub(crate) fn missing_newer_anchor_count(&self) -> usize {
+        self.app
+            .world()
+            .resource::<ReplicaKeyframes>()
+            .missing_newer
+            .len()
+    }
+
+    /// Number of receiver-side replicated links with an anchor to judge.
+    pub(crate) fn receiver_anchor_count(&self) -> usize {
+        self.app
+            .world()
+            .resource::<ReplicaKeyframes>()
+            .anchors
+            .len()
+    }
+
     /// Record the coverage installed for this seat when the #699 trace is on.
     ///
     /// Called after the swarm has selected the cells and observes only their
@@ -2728,6 +2796,46 @@ mod tests {
             .find(|(peer, _)| *peer == joining)
             .expect("the joining peer receives the following update");
         assert!(is_delta_payload(&next.1));
+    }
+
+    #[test]
+    fn presence_stats_are_deterministic_over_a_boundary_join_with_an_existing_audience() {
+        let measure = || {
+            let mut sender = replication_test_bot(19);
+            let first = bot_key(29).public();
+            let second = bot_key(30).public();
+            let crossing_joiner = bot_key(31).public();
+            sender.enable_presence_stats();
+            for peer in [first, second, crossing_joiner] {
+                sender.link(peer, 1_200);
+            }
+
+            // This is the post-crossing roster shape: two peers already see
+            // the author and one peer has just crossed into its audience.
+            // The diff must be one, not the resulting audience size of three.
+            let first_entry = audience_entry(&mut sender, first);
+            let second_entry = audience_entry(&mut sender, second);
+            sender.set_island(vec![first_entry, second_entry]);
+            sender.broadcast_state(2);
+            sender.update();
+            let _ = sender.drain_outbound();
+            let _ = sender.drain_audience_changes();
+
+            let first_entry = audience_entry(&mut sender, first);
+            let second_entry = audience_entry(&mut sender, second);
+            let joiner_entry = audience_entry(&mut sender, crossing_joiner);
+            sender.set_island(vec![first_entry, second_entry, joiner_entry]);
+            sender.broadcast_state(5);
+            sender.update();
+            sender.drain_audience_changes()
+        };
+
+        let first = measure();
+        let second = measure();
+        assert_eq!(first, second, "one boundary-join seed must be reproducible");
+        assert_eq!(first.len(), 1, "the changed audience yields one event");
+        assert_eq!(first[0].joins, 1, "one crossing peer joined the audience");
+        assert_eq!(first[0].leaves, 0, "the crossing did not remove a peer");
     }
 
     #[test]

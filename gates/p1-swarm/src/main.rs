@@ -297,6 +297,14 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     seed: u64,
 
+    /// Override the interest-cell edge for an in-process measurement leg.
+    ///
+    /// `128` is the gate default and Regolith's campaign uses `512`; the
+    /// presence observer needs both without turning a measurement into an
+    /// external-peer session.
+    #[arg(long)]
+    cell_edge_m: Option<f32>,
+
     /// Simulated second at which to run the late-join check.
     #[arg(long)]
     late_join_at: Option<u64>,
@@ -346,6 +354,12 @@ struct Args {
     /// interest scope at the resolution tick, including attacker-speed stats.
     #[arg(long)]
     shot_interest_stats: bool,
+
+    /// Measure roaming audience churn and missing-newer anchor windows.
+    ///
+    /// This observer changes no presence policy or criterion.
+    #[arg(long)]
+    presence_stats: bool,
 
     /// Print the report and exit zero even if a clause failed.
     #[arg(long)]
@@ -842,11 +856,19 @@ fn main() -> Result<()> {
     if upload_budget_bits == 0 {
         bail!("--budget-kbps must be greater than zero");
     }
+    if args
+        .cell_edge_m
+        .is_some_and(|edge| !edge.is_finite() || edge <= 0.0)
+    {
+        bail!("--cell-edge-m must be finite and greater than zero");
+    }
 
     let config = SwarmConfig {
         peers: args.peers,
         seconds: args.seconds,
-        cell_edge_m: cell_edge_m_for_session(args.external, args.external_peer),
+        cell_edge_m: args
+            .cell_edge_m
+            .unwrap_or_else(|| cell_edge_m_for_session(args.external, args.external_peer)),
         send_hz: 20,
         keyframe_every_sends: args.keyframe_every_sends.max(1),
         upload_budget_bits,
@@ -884,6 +906,7 @@ fn main() -> Result<()> {
         replica_scope_capture: args.replica_scope_capture,
         delta_stats: args.delta_stats,
         shot_interest_stats: args.shot_interest_stats,
+        presence_stats: args.presence_stats,
     };
 
     eprintln!(
@@ -1285,6 +1308,15 @@ fn main() -> Result<()> {
         report.deltas_with_superseded_keyframe,
         report.deltas_with_invalid_reference,
     );
+    if let Some(presence) = &report.presence_stats {
+        eprintln!(
+            "gates/p1-swarm: presence stats: {} entities, {} joiner-cluster bins; stranded anchors mean {:.3}% (max {:.3}%)",
+            presence.entities.len(),
+            presence.joiner_cluster_size_distribution.len(),
+            presence.stranded_anchor_fraction.mean_fraction * 100.0,
+            presence.stranded_anchor_fraction.max_fraction * 100.0,
+        );
+    }
     eprintln!(
         "gates/p1-swarm: simulated hitches discarded {} keyframes / {} deltas after sender accounting",
         report.keyframes_discarded_while_stalled,

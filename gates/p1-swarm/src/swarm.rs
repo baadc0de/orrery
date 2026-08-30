@@ -23,7 +23,7 @@ use orrery_protocol::{
 };
 
 use crate::adjudicate::{Adjudicator, Docket};
-use crate::bot::{Bot, BotSpec, TICK_HZ};
+use crate::bot::{AudienceChange, Bot, BotSpec, TICK_HZ};
 use crate::delta_stats::{DeltaStats, DeltaStatsReport};
 use crate::exterior::{
     ActiveSeat, Frame, HearsayContact, HearsayContacts, HearsaySource, Lane, StartManifest,
@@ -217,6 +217,8 @@ pub struct SwarmConfig {
     pub delta_stats: bool,
     /// Observe replica scope when target-authored shot verdicts resolve.
     pub shot_interest_stats: bool,
+    /// Observe audience diffs and missing-newer anchor windows.
+    pub presence_stats: bool,
 }
 
 impl Default for SwarmConfig {
@@ -242,6 +244,7 @@ impl Default for SwarmConfig {
             replica_scope_capture: false,
             delta_stats: false,
             shot_interest_stats: false,
+            presence_stats: false,
         }
     }
 }
@@ -570,6 +573,9 @@ pub struct SwarmReport {
     /// Shot/interest measurements, present only with `--shot-interest-stats`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shot_interest_stats: Option<ShotInterestReport>,
+    /// A21's roaming presence measurement, present only with `--presence-stats`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_stats: Option<PresenceStatsReport>,
     /// A20's post-meter degradation-honesty measurement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_gaps: Option<DeliveryGapReport>,
@@ -963,6 +969,161 @@ impl InterestMarginStats {
     }
 }
 
+/// A21's opt-in measurements of roaming audience churn.
+#[derive(Debug, Clone, Serialize)]
+pub struct PresenceStatsReport {
+    /// Interest-cell edge used by this measurement leg, in metres.
+    pub cell_edge_m: f32,
+    /// Audience transitions, separately counted per authored entity.
+    pub entities: Vec<PresenceEntityReport>,
+    /// Every sender/window's joiner count, including quiet windows.
+    pub joiner_cluster_size_distribution: Vec<JoinerClusterSizeBin>,
+    /// Time-weighted state of receiver links holding a stale anchor.
+    pub stranded_anchor_fraction: StrandedAnchorFractionReport,
+}
+
+/// One entity's audience transitions over the measured run.
+#[derive(Debug, Clone, Serialize)]
+pub struct PresenceEntityReport {
+    /// Stable entity discriminator.
+    pub entity: u64,
+    /// Newly interested links.
+    pub joins: u64,
+    /// Links that left the audience.
+    pub leaves: u64,
+    /// Join transitions per simulated second.
+    pub joins_per_second: f64,
+    /// Leave transitions per simulated second.
+    pub leaves_per_second: f64,
+}
+
+/// One bin in the distribution of joiners landing in a sender's one-second window.
+#[derive(Debug, Clone, Serialize)]
+pub struct JoinerClusterSizeBin {
+    /// Joiners observed in one sender/window.
+    pub joiners: u64,
+    /// Number of sender/windows with this many joiners.
+    pub windows: u64,
+}
+
+/// Instantaneous receiver-anchor stranding, sampled after each delivery tick.
+#[derive(Debug, Clone, Serialize)]
+pub struct StrandedAnchorFractionReport {
+    /// Post-delivery samples taken at the fixed simulation cadence.
+    pub samples: u64,
+    /// Sum of links inside missing-newer windows across samples.
+    pub stranded_link_samples: u64,
+    /// Sum of receiver links carrying an anchor across samples.
+    pub anchored_link_samples: u64,
+    /// Time-weighted instantaneous stranded fraction.
+    pub mean_fraction: f64,
+    /// Largest instantaneous stranded fraction observed.
+    pub max_fraction: f64,
+}
+
+#[derive(Debug, Default)]
+struct PresenceEntityCounters {
+    joins: u64,
+    leaves: u64,
+}
+
+/// One sender's half-open one-second measurement window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PresenceWindow {
+    sender: usize,
+    window: u64,
+}
+
+/// Measurement-only accumulator. Its keys are named domain identifiers, not
+/// transport iteration order, so it cannot perturb the sender's audience map.
+#[derive(Debug, Default)]
+struct PresenceStats {
+    entities: BTreeMap<PersistId, PresenceEntityCounters>,
+    joiners_by_window: BTreeMap<PresenceWindow, u64>,
+    samples: u64,
+    stranded_link_samples: u64,
+    anchored_link_samples: u64,
+    max_fraction: f64,
+}
+
+impl PresenceStats {
+    fn observe_change(&mut self, sender: usize, change: AudienceChange) {
+        let counters = self.entities.entry(change.entity).or_default();
+        counters.joins += change.joins;
+        counters.leaves += change.leaves;
+        *self
+            .joiners_by_window
+            .entry(PresenceWindow {
+                sender,
+                window: change.window,
+            })
+            .or_default() += change.joins;
+    }
+
+    fn observe_stranded(&mut self, stranded: usize, anchored: usize) {
+        self.samples += 1;
+        self.stranded_link_samples += stranded as u64;
+        self.anchored_link_samples += anchored as u64;
+        let fraction = if anchored == 0 {
+            0.0
+        } else {
+            stranded as f64 / anchored as f64
+        };
+        self.max_fraction = self.max_fraction.max(fraction);
+    }
+
+    fn report(
+        mut self,
+        seconds: u64,
+        sender_count: usize,
+        cell_edge_m: f32,
+    ) -> PresenceStatsReport {
+        let mut clusters = BTreeMap::<u64, u64>::new();
+        for window in 0..seconds {
+            for sender in 0..sender_count {
+                // A sender is identified by its own dedicated window total;
+                // adding quiet windows makes the distribution a distribution,
+                // not only a list of bursts.
+                let joiners = self
+                    .joiners_by_window
+                    .remove(&PresenceWindow { sender, window })
+                    .unwrap_or(0);
+                *clusters.entry(joiners).or_default() += 1;
+            }
+        }
+        let seconds = seconds.max(1) as f64;
+        PresenceStatsReport {
+            cell_edge_m,
+            entities: self
+                .entities
+                .into_iter()
+                .map(|(entity, counters)| PresenceEntityReport {
+                    entity: entity.0,
+                    joins: counters.joins,
+                    leaves: counters.leaves,
+                    joins_per_second: counters.joins as f64 / seconds,
+                    leaves_per_second: counters.leaves as f64 / seconds,
+                })
+                .collect(),
+            joiner_cluster_size_distribution: clusters
+                .into_iter()
+                .map(|(joiners, windows)| JoinerClusterSizeBin { joiners, windows })
+                .collect(),
+            stranded_anchor_fraction: StrandedAnchorFractionReport {
+                samples: self.samples,
+                stranded_link_samples: self.stranded_link_samples,
+                anchored_link_samples: self.anchored_link_samples,
+                mean_fraction: if self.anchored_link_samples == 0 {
+                    0.0
+                } else {
+                    self.stranded_link_samples as f64 / self.anchored_link_samples as f64
+                },
+                max_fraction: self.max_fraction,
+            },
+        }
+    }
+}
+
 /// Runs the swarm and produces its report.
 pub struct Swarm {
     config: SwarmConfig,
@@ -998,6 +1159,8 @@ pub struct Swarm {
     delivery_gaps: Option<DeliveryGapTracker>,
     /// Actual cell counts installed by the swept-margin load point.
     interest_margin_stats: Option<InterestMarginStats>,
+    /// A21's opt-in observer; it never feeds recipient selection.
+    presence_stats: Option<PresenceStats>,
     /// Ordered crossing fence per stable bot seat.
     applied_interest_crossings: Vec<Option<AppliedInterestCrossing>>,
     /// Replication messages admitted by the meter, split by A19 wire kind.
@@ -1463,6 +1626,11 @@ impl Swarm {
                 bot.enable_resolved_shot_capture();
             }
         }
+        if config.presence_stats {
+            for bot in &mut bots {
+                bot.enable_presence_stats();
+            }
+        }
         let index_of = bots
             .iter()
             .map(|bot| (bot.node, bot.index))
@@ -1484,6 +1652,7 @@ impl Swarm {
             interest_margin_stats: config
                 .swept_interest_margin
                 .then(InterestMarginStats::default),
+            presence_stats: config.presence_stats.then(PresenceStats::default),
             applied_interest_crossings: vec![None; config.peers],
             admitted_keyframes: 0,
             admitted_deltas: 0,
@@ -1938,6 +2107,12 @@ impl Swarm {
     /// the size the real thing would be rather than a guess.
     fn broadcast(&mut self, index: usize, tick: u64) {
         self.bots[index].broadcast_state(tick);
+        let changes = self.bots[index].drain_audience_changes();
+        if let Some(stats) = &mut self.presence_stats {
+            for change in changes {
+                stats.observe_change(index, change);
+            }
+        }
         if let Some(gaps) = &mut self.delivery_gaps {
             let sender = self.bots[index].node;
             for (entity, recipients) in self.bots[index].replication_audience_snapshot() {
@@ -2472,6 +2647,11 @@ impl Swarm {
         phase[4] += mark.elapsed().as_nanos();
         mark = std::time::Instant::now();
         self.deliver(tick);
+        if let Some(stats) = &mut self.presence_stats {
+            let stranded = self.bots.iter().map(Bot::missing_newer_anchor_count).sum();
+            let anchored = self.bots.iter().map(Bot::receiver_anchor_count).sum();
+            stats.observe_stranded(stranded, anchored);
+        }
         phase[5] += mark.elapsed().as_nanos();
     }
 
@@ -2801,6 +2981,13 @@ impl Swarm {
             .shot_interest_stats
             .take()
             .map(ShotInterestStats::report);
+        let presence_stats = self.presence_stats.take().map(|stats| {
+            stats.report(
+                self.config.seconds,
+                self.bots.len(),
+                self.config.cell_edge_m,
+            )
+        });
         let replication_wire = self.bots.iter().map(Bot::replication_wire_counters).fold(
             crate::bot::ReplicationWireCounters::default(),
             |mut total, peer| {
@@ -2898,6 +3085,7 @@ impl Swarm {
             ticks,
             delta_stats,
             shot_interest_stats,
+            presence_stats,
             delivery_gaps,
             interest_margin,
             meter_budget_bits,
@@ -4179,6 +4367,7 @@ mod tests {
             boundary_return_profiles: Vec::new(),
             delta_stats: None,
             shot_interest_stats: None,
+            presence_stats: None,
             delivery_gaps: None,
             interest_margin: None,
             meter_budget_bits: 1_000_000,
