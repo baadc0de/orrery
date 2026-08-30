@@ -45,6 +45,22 @@ pub struct ImpairmentMeasurement {
     jitter_ms: Vec<u64>,
 }
 
+/// Packets a session must have accounted for before its measured impairment is
+/// worth comparing to the configured profile.
+///
+/// One second of play at the 20 Hz send cadence, across a small audience. Below
+/// this a single drop moves the rate by whole percentage points.
+const MIN_IMPAIRMENT_SAMPLES: u64 = 200;
+
+/// How far the measured loss may sit from the configured rate before it is a
+/// disagreement rather than sampling noise, in percentage points.
+///
+/// The width of the criterion's own 3-5% band (`gates/p1-swarm`'s `--loss`).
+const LOSS_TOLERANCE_PCT: f64 = 2.0;
+
+/// How far a measured jitter percentile may sit from the configured one.
+const JITTER_TOLERANCE_MS: u64 = 40;
+
 impl ImpairmentMeasurement {
     /// Record one observed transport outcome; this is not configuration echo.
     pub fn observe(&mut self, dropped: bool, jitter_ms: u64) {
@@ -324,9 +340,23 @@ impl CampaignSession {
         let observed_loss_pct = self.measurement.loss_pct();
         let observed_jitter_p50_ms = self.measurement.percentile(50);
         let observed_jitter_p99_ms = self.measurement.percentile(99);
-        let mismatch = (observed_loss_pct - self.configured.loss_pct).abs() > f64::EPSILON
-            || observed_jitter_p50_ms != self.configured.jitter_p50_ms
-            || observed_jitter_p99_ms != self.configured.jitter_p99_ms;
+        // A measured rate never lands exactly on its configured one, so an
+        // exact comparison flagged every session ever recorded -- including a
+        // seventeen-millisecond one whose 15.6% "loss" was four dropped
+        // packets. A flag that is always true is not a signal, and the first
+        // playtest records would have taught their reader to ignore it.
+        //
+        // Flag a real disagreement instead: a sample large enough to mean
+        // anything, and a gap wider than sampling noise at these rates. The
+        // loss tolerance is the width of the criterion's own 3-5% band, so a
+        // profile inside the band the gate accepts is not reported as a
+        // mismatch against the band's floor.
+        let mismatch = self.measurement.sent >= MIN_IMPAIRMENT_SAMPLES
+            && ((observed_loss_pct - self.configured.loss_pct).abs() > LOSS_TOLERANCE_PCT
+                || observed_jitter_p50_ms.abs_diff(self.configured.jitter_p50_ms)
+                    > JITTER_TOLERANCE_MS
+                || observed_jitter_p99_ms.abs_diff(self.configured.jitter_p99_ms)
+                    > JITTER_TOLERANCE_MS);
         SessionRecord {
             session_id: self.session_id.clone(),
             wall_start: self.wall_start.clone(),
@@ -386,8 +416,9 @@ mod tests {
     #[test]
     fn measured_impairment_mismatch_is_flagged_in_the_completed_row() {
         let mut session = session();
-        for index in 0..100 {
-            session.observe_transport(index < 2, 100);
+        // Far outside the configured 3%, over a sample worth believing.
+        for index in 0..400 {
+            session.observe_transport(index < 100, 100);
         }
         let record = session.finish(
             "2026-08-23T12:01:00Z".into(),
@@ -397,9 +428,62 @@ mod tests {
         );
         assert!(
             record.impairment_mismatch,
-            "2% observed loss must not echo configured 3%"
+            "25% observed loss must not echo configured 3%"
         );
-        assert_eq!(record.observed_loss_pct, 2.0);
+        assert_eq!(record.observed_loss_pct, 25.0);
+    }
+
+    /// The row records what was measured whether or not it is a disagreement:
+    /// the flag is a judgement about the gap, never a substitute for the
+    /// numbers, and a reader must be able to see 2% against a configured 3%.
+    #[test]
+    fn a_measurement_close_to_the_configured_profile_is_recorded_but_not_flagged() {
+        let mut session = session();
+        for index in 0..400 {
+            session.observe_transport(index < 8, 100);
+        }
+        let record = session.finish(
+            "2026-08-23T12:01:00Z".into(),
+            "x86_64-unknown-linux-gnu".into(),
+            "deadbeef".into(),
+            "pipeline".into(),
+        );
+        assert_eq!(
+            record.observed_loss_pct, 2.0,
+            "the measurement is still recorded"
+        );
+        assert!(
+            !record.impairment_mismatch,
+            "2% against a configured 3% is sampling noise, not a disagreement"
+        );
+    }
+
+    /// #711 found this in the first real uploads: every record ever written
+    /// carried `impairment_mismatch: true`, including a seventeen-millisecond
+    /// session whose 15.6% "loss" was four dropped packets. A flag that is
+    /// always true teaches its reader to ignore it, which is worse than not
+    /// having it at all.
+    #[test]
+    fn a_sample_too_small_to_mean_anything_is_not_a_mismatch() {
+        let mut session = session();
+        for index in 0..26 {
+            session.observe_transport(index < 4, 100);
+        }
+        let record = session.finish(
+            "2026-08-23T12:01:00Z".into(),
+            "x86_64-unknown-linux-gnu".into(),
+            "deadbeef".into(),
+            "pipeline".into(),
+        );
+        assert!(
+            record.observed_loss_pct > 15.0,
+            "the measured rate is wild on a tiny sample: {}",
+            record.observed_loss_pct
+        );
+        assert!(
+            !record.impairment_mismatch,
+            "a handful of packets cannot disagree with a configured profile"
+        );
     }
 
     /// The two live entry points must land in the same accumulator the row is
@@ -437,10 +521,9 @@ mod tests {
             "pipeline".into(),
         );
         assert_eq!(record.observed_loss_pct, expected_loss);
-        assert!(
-            record.impairment_mismatch,
-            "{expected_loss}% is not the configured 3%"
-        );
+        // Whether this sample is big enough to *judge* against the configured
+        // profile is a different question, and the tests named for it own it.
+        // This one is about both entry points reaching the accumulator.
     }
 
     /// A zero-loss link measures zero — the accumulator cannot be fed by
@@ -449,7 +532,10 @@ mod tests {
     #[test]
     fn a_clean_link_measures_clean() {
         let mut session = session();
-        for _ in 0..20 {
+        // A session's worth of acks, not a handful: the flag now asks whether
+        // the sample is large enough to disagree with the profile at all, and
+        // an unimpaired *hour* is the case this protects against.
+        for _ in 0..400 {
             session.observe_uplink_ack(false);
         }
         session.observe_arrival(0, Some(0));
