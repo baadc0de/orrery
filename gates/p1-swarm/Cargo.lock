@@ -3491,6 +3491,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "orrery_compose"
+version = "0.1.0"
+dependencies = [
+ "orrery_core",
+ "orrery_protocol",
+]
+
+[[package]]
 name = "orrery_core"
 version = "0.1.0"
 dependencies = [
@@ -3511,6 +3519,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "libm",
+ "orrery_compose",
  "orrery_core",
  "orrery_protocol",
  "rand_chacha",
