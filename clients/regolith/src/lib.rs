@@ -660,7 +660,6 @@ impl Plugin for RegolithSkinPlugin {
                     .run_if(resource_exists::<GeometryCapture>)
                     .run_if(on_timer(Duration::from_secs(1))),
             )
-            .add_systems(Update, write_campaign_record_on_exit)
             .add_systems(
                 Update,
                 stream_metrics.run_if(on_timer(Duration::from_secs(1))),
@@ -682,8 +681,26 @@ impl Plugin for RegolithSkinPlugin {
                     .after(zoom_camera)
                     .run_if(resource_exists::<FrameCapture>),
             );
+        install_campaign_finalization(app);
     }
 }
+
+/// Install the final session write after every frame's exit producers.
+fn install_campaign_finalization(app: &mut App) {
+    // `AppExit` is commonly emitted by an Update system (the headless
+    // preflight does exactly that). The runner observes it immediately after
+    // this frame, so another Update reader can lose the final record to
+    // scheduler order. Last still belongs to the same frame, after every
+    // Update exit producer and before the runner decides to tear the app
+    // down.
+    app.add_systems(
+        Last,
+        write_campaign_record_on_exit.in_set(CampaignFinalization),
+    );
+}
+
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CampaignFinalization;
 
 fn setup_scene(
     mut commands: Commands,
@@ -2567,9 +2584,123 @@ fn write_campaign_record_on_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::ConfiguredImpairment;
     use bevy::asset::AssetPlugin;
     use orrery_core::state_hash;
     use orrery_games::scenario::{Entry, Play, Scenario, TickRecord};
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::time::Duration;
+
+    struct UploadEndpoint {
+        origin: String,
+        received: Receiver<Vec<u8>>,
+    }
+
+    fn upload_endpoint() -> UploadEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload service");
+        let address = listener.local_addr().expect("upload service address");
+        let (sent, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept upload");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set upload read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let body_start = loop {
+                let count = stream.read(&mut buffer).expect("read upload headers");
+                assert_ne!(count, 0, "client closed upload before its headers");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..body_start]).expect("ASCII headers");
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim())
+                    })
+                })
+                .expect("content length")
+                .parse::<usize>()
+                .expect("numeric content length");
+            while request.len() < body_start + length {
+                let count = stream.read(&mut buffer).expect("read upload body");
+                assert_ne!(count, 0, "client closed upload before its body");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            sent.send(request).expect("return upload request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("acknowledge upload");
+        });
+        UploadEndpoint {
+            origin: format!("http://{address}"),
+            received,
+        }
+    }
+
+    fn finish_campaign(mut exit: MessageWriter<AppExit>) {
+        exit.write(AppExit::Success);
+    }
+
+    #[test]
+    fn a_finished_campaign_session_reaches_the_service() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let telemetry_path = temporary.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, "{\"kind\":\"overlay\"}\n").expect("write telemetry");
+        let endpoint = upload_endpoint();
+        let session_id = "01917f0e-2b9a-7c4d-8f21-6a0b3c9d1e2f".to_owned();
+        let config = campaign::CampaignConfig {
+            host_node_hex: String::new(),
+            host_direct: None,
+            slot: 0,
+            own_label: Some("ada".to_owned()),
+            session_id: session_id.clone(),
+            session_token_hex: None,
+            wall_start_utc: "2026-08-30T12:00:00Z".to_owned(),
+            configured: ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+            transport_secret: iroh_base::SecretKey::generate(),
+            island_seats: Some(1),
+            roster_url: None,
+        };
+        let runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
+        let mut app = App::new();
+        app.insert_resource(ActiveSession::Campaign(Box::new(runtime)))
+            .insert_resource(OverlayMetrics::new(telemetry_path.clone()))
+            .insert_resource(admission::UploadManager::for_test(
+                endpoint.origin.clone(),
+                &telemetry_path,
+            ));
+        install_campaign_finalization(&mut app);
+        app.add_systems(Update, finish_campaign.after(CampaignFinalization));
+        app.update();
+
+        let request = endpoint
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("finished session reaches service");
+        let body_start = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("request headers")
+            + 4;
+        let upload: serde_json::Value =
+            serde_json::from_slice(&request[body_start..]).expect("valid upload JSON");
+        assert_eq!(upload["records"][0]["session_id"], session_id);
+        assert_eq!(upload["telemetry_jsonl"], "{\"kind\":\"overlay\"}\n");
+    }
 
     /// #521: the camera is centred on the player, and nothing else in the
     /// world may move it. The old `frame_camera` averaged every body and rose

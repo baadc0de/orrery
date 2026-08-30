@@ -1108,6 +1108,16 @@ pub struct UploadManager {
     state_path: PathBuf,
 }
 
+#[cfg(test)]
+impl UploadManager {
+    pub(crate) fn for_test(origin: String, telemetry_path: &Path) -> Self {
+        Self {
+            origin,
+            state_path: upload_state_path(telemetry_path),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct UploadState {
     sessions: BTreeMap<String, UploadEntry>,
