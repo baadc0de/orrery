@@ -11,7 +11,7 @@
 //! logged inputs and claimed outcomes cannot be seen any other way.
 
 use orrery_core::invariants::checks;
-use orrery_core::log::{claim_hash, sign_claim, sign_frame, HeadTransition};
+use orrery_core::log::{claim_hash, fold_all, sign_claim, sign_frame, HeadTransition};
 use orrery_core::store::AuthorityLog;
 use orrery_core::{
     state_hash, CodecError, CoreCodec, Executor, Invariant, InvariantKind, InvariantSample,
@@ -990,6 +990,125 @@ fn a_resume_is_refused_unless_the_state_matches_what_the_subject_signed() {
     assert!(
         witness.catching_up(ENTITY).is_some(),
         "still blind, which is the honest state to be in"
+    );
+}
+
+#[test]
+fn a_redelivered_range_is_not_counted_twice_in_coverage() {
+    // `shown_ticks` is charged before a frame can be deferred, because a
+    // witness that cannot yet fold a frame was still shown that portion of the
+    // subject's timeline. The high-water mark is consequently the only thing
+    // that keeps a repair re-serving an already seen range from inflating the
+    // coverage denominator.
+
+    // Leg 1: an ordinary first delivery charges exactly the frame's span.
+    let mut fresh_authority = Authority::new(1);
+    let mut fresh_witness = watching(WitnessConfig::default(), &mut fresh_authority);
+    let fresh = fresh_authority.send(T0);
+    let before_fresh = fresh_witness.counters().shown_ticks;
+    fresh_witness
+        .ingest_frame(&fresh.frame, &[])
+        .expect("the first range chains from the anchor");
+    assert_eq!(
+        fresh_witness.counters().shown_ticks - before_fresh,
+        u64::from(fresh.frame.tick_count),
+        "deliver: a fresh range advances coverage by exactly its span"
+    );
+
+    // Leave the opening range on the floor. The next range therefore opens a
+    // repair and remains ahead of the fold, which ensures its re-delivery
+    // reaches the coverage fold rather than the already-folded-duplicate
+    // fast-path.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    let lost = authority.send(T0);
+    let range = authority.send(T0 + 3);
+    let opened = witness
+        .ingest_frame(&range.frame, &[])
+        .expect("a gap is held");
+    assert!(
+        matches!(opened.as_slice(), [WitnessSignal::Gap(_)]),
+        "fixture must open a repair, got {opened:?}"
+    );
+    assert!(
+        witness.catching_up(ENTITY).is_some(),
+        "fixture must keep the range ahead of the fold"
+    );
+
+    // Leg 2: the same held range contributes no second denominator charge.
+    let before_redelivery = witness.counters().shown_ticks;
+    witness
+        .ingest_frame(&range.frame, &[])
+        .expect("the held range can be re-delivered while repair is pending");
+    assert_eq!(
+        witness.counters().shown_ticks - before_redelivery,
+        0,
+        "re-deliver unchanged: a range already counted as shown advances coverage by zero"
+    );
+
+    // Leg 3: a repair response may start inside an already shown range and
+    // extend beyond it. Build a valid signed [T0 + 3, T0 + 8] range from the
+    // already shown frame plus its immediate continuation. Only ticks 6..=8
+    // are new; charging all six ticks would double-count 3..=5.
+    let continuation = authority.send(T0 + 6);
+    let mut records = range.frame.entities[0].records.clone();
+    let first_range_ticks = u16::try_from(records.len()).expect("three records fit in u16");
+    records.extend(
+        continuation.frame.entities[0]
+            .records
+            .iter()
+            .cloned()
+            .map(|mut record| {
+                record.tick_off += first_range_ticks;
+                record
+            }),
+    );
+    let predecessor = fold_all(ChainHash::EMPTY, &lost.frame.entities[0].records);
+    let extended_head = fold_all(predecessor, &records);
+    let extended_ticks = range.frame.tick_count + continuation.frame.tick_count;
+    let extended = LogFrame {
+        ruleset: RULESET,
+        first_tick: range.frame.first_tick,
+        tick_count: extended_ticks,
+        entities: vec![EntitySlice {
+            entity: ENTITY,
+            chain_epoch: 0,
+            prev_head: predecessor.rolling(),
+            records,
+            head: extended_head.rolling(),
+        }],
+        sig: sign_frame(
+            &authority.key,
+            RULESET,
+            range.frame.first_tick,
+            extended_ticks,
+            &[HeadTransition {
+                entity: ENTITY,
+                prev_head: predecessor,
+                head: extended_head,
+            }],
+        ),
+    };
+    let newest_seen = range.frame.first_tick.0 + u64::from(range.frame.tick_count) - 1;
+    let extended_last = extended.first_tick.0 + u64::from(extended.tick_count) - 1;
+    let new_span = extended_last - newest_seen;
+    assert!(
+        extended.first_tick.0 <= newest_seen && newest_seen < extended_last,
+        "fixture must make the extended range overlap the newest seen tick"
+    );
+    assert!(
+        new_span < u64::from(extended.tick_count),
+        "fixture must distinguish the new span from the whole extended range"
+    );
+
+    let before_extension = witness.counters().shown_ticks;
+    witness
+        .ingest_frame(&extended, &[])
+        .expect("the overlapping repair range remains held");
+    assert_eq!(
+        witness.counters().shown_ticks - before_extension,
+        new_span,
+        "extend: an overlapping range advances coverage by only its new span"
     );
 }
 
