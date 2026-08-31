@@ -9,6 +9,7 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use orrery_replicon::uplink::ComponentDiff;
 
 use crate::area::{drive_area_loader, sync_aoi_to_loader, AreaLoader};
 use crate::config::PersistClientConfig;
@@ -56,7 +57,7 @@ impl Plugin for OrreryPersistClientPlugin {
             // tick first. Initializing it here too keeps this plugin runnable
             // on its own; the host still owns advancing the value.
             .init_resource::<orrery_authority::ContactTick>()
-            .add_message::<bevy_replicon::server::uplink::ComponentDiff>()
+            .add_message::<ComponentDiff>()
             // The net plugin normally owns these message resources. Declaring
             // them here too keeps this plugin independently runnable in tests
             // and is idempotent when both plugins are installed.

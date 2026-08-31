@@ -278,6 +278,52 @@ done
 (( ${#bevy_scanned[@]} > 0 )) || die "Bevy-free clause scanned no crates"
 note "Bevy-free: ${bevy_scanned[*]} (permitted: ${BEVY_PERMITTED_CRATES[*]})"
 
+# OD-26 / IV-7: `orrery_replicon` is the visibility boundary around replicon's
+# unguarded payload-registration API. Rust does not put transitive dependencies
+# in a crate's extern prelude, so every other first-party crate must depend on
+# the facade and must not declare the underlying package under any key. Cargo
+# metadata reports the real package name even when a dependency is renamed;
+# scanning manifests by spelling would miss that bypass.
+readonly BEVY_REPLICON_PERMITTED_CRATES=(orrery_replicon)
+
+replicon_declarers="$({
+  cd "$ROOT"
+  cargo metadata --no-deps --format-version 1
+} | python3 -c '
+import json
+import sys
+
+metadata = json.load(sys.stdin)
+members = set(metadata["workspace_members"])
+for package in sorted(metadata["packages"], key=lambda item: item["name"]):
+    if package["id"] not in members:
+        continue
+    if any(dependency["name"] == "bevy_replicon" for dependency in package["dependencies"]):
+        print(package["name"])
+')" || die "could not read direct bevy_replicon declarations from cargo metadata"
+
+replicon_scanned=()
+while IFS= read -r crate; do
+  if printf '%s\n' "${BEVY_REPLICON_PERMITTED_CRATES[@]}" | grep -Fxq "$crate"; then
+    continue
+  fi
+  replicon_scanned+=("$crate")
+  if grep -Fxq "$crate" <<<"$replicon_declarers"; then
+    die "$crate declares bevy_replicon directly; depend on orrery_replicon instead"
+  fi
+done < <(printf '%s\n' "${!CRATE_DIRS[@]}" | sort)
+
+# An exemption that no longer names both a workspace crate and a real direct
+# declaration silently weakens this boundary, so treat either shape as stale.
+for crate in "${BEVY_REPLICON_PERMITTED_CRATES[@]}"; do
+  [[ -n ${CRATE_DIRS[$crate]:-} ]] \
+    || die "stale bevy_replicon exemption '$crate' — it is not a workspace library crate"
+  grep -Fxq "$crate" <<<"$replicon_declarers" \
+    || die "stale bevy_replicon exemption '$crate' — it no longer declares bevy_replicon"
+done
+(( ${#replicon_scanned[@]} > 0 )) || die "bevy_replicon declaration clause scanned no crates"
+note "bevy_replicon direct-dependency boundary: ${replicon_scanned[*]} (permitted: ${BEVY_REPLICON_PERMITTED_CRATES[*]})"
+
 # D43(d)(4): canonical execution stays synchronous. This is structural on the
 # current tree, but making it a dependency check prevents a future role crate
 # from quietly introducing an async runtime.
@@ -675,15 +721,42 @@ echo "$NAME: verifiable-core static gates pass"
 make_discovery_fixture() {
   local fixture=$1 host_mode=$2 conformance_violation=$3 tier_h_app_dep=${4:-no}
   mkdir -p \
+    "$fixture/crates/bevy_replicon/src" \
     "$fixture/crates/orrery_core/src" \
     "$fixture/crates/orrery_games/src/regolith" \
     "$fixture/crates/orrery_conformance/src" \
+    "$fixture/crates/orrery_replicon/src" \
     "$fixture/crates/orrery_persistd/src"
 
   cat >"$fixture/Cargo.toml" <<'EOF'
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+EOF
+  # Keep OD-26's one-declarer invariant armed inside every synthetic
+  # workspace. Without the legitimate declarer these fixtures would stop at
+  # the boundary's stale-exemption check, masking the clause they intend to
+  # mutate below.
+  cat >"$fixture/crates/bevy_replicon/Cargo.toml" <<'EOF'
+[package]
+name = "bevy_replicon"
+version = "0.0.0"
+edition = "2024"
+EOF
+  cat >"$fixture/crates/bevy_replicon/src/lib.rs" <<'EOF'
+pub struct Replicon;
+EOF
+  cat >"$fixture/crates/orrery_replicon/Cargo.toml" <<'EOF'
+[package]
+name = "orrery_replicon"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+bevy_replicon = { path = "../bevy_replicon" }
+EOF
+  cat >"$fixture/crates/orrery_replicon/src/lib.rs" <<'EOF'
+pub use bevy_replicon::Replicon;
 EOF
   cat >"$fixture/crates/orrery_core/Cargo.toml" <<'EOF'
 [package]

@@ -14,8 +14,8 @@
 //! write its durable state (single-writer per entity, D11).
 
 use bevy_ecs::prelude::*;
-use bevy_replicon::server::uplink::ComponentDiff;
 use orrery_protocol::{DiffUplink, GridId, RecordKind};
+use orrery_replicon::uplink::ComponentDiff;
 use orrery_spatial::plugin::Cell;
 
 pub use orrery_authority::LocallyAuthoritative;
@@ -101,8 +101,8 @@ pub fn feed_uplink(
 mod tests {
     use super::*;
     use bevy_app::prelude::*;
-    use bevy_replicon::shared::replication::registry::FnsId;
     use orrery_protocol::{CellId, Tick};
+    use orrery_replicon::uplink::FnsId;
     use std::time::Duration;
 
     fn app() -> App {

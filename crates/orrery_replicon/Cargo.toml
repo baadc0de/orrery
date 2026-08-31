@@ -1,0 +1,24 @@
+[package]
+name = "orrery_replicon"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery's engine-handle-free facade over bevy_replicon"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+uplink = ["bevy_replicon/uplink"]
+
+[dependencies]
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_replicon = { workspace = true }
+orrery_protocol = { path = "../orrery_protocol" }
+serde = { workspace = true }
+variadics_please = "2.0"
+
+[dev-dependencies]
+trybuild = "1"
+
+[lints]
+workspace = true
