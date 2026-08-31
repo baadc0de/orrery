@@ -127,3 +127,64 @@ Two things follow for agents sharing this machine:
   The dependency graph is the part kache can pay for, and it is the overwhelming
   majority of a cold build.
 
+
+### Reclaiming dead lanes (#781)
+
+`prune` is the deliberate, manual lever and stays exactly as it is. It is also
+*only accidentally safe*: it deletes every `target/` its `find -maxdepth 3`
+returns, with no liveness check at all, and the worktree targets it would
+otherwise delete out from under a running build sit at depth 4. Widening that
+depth would be a disk-space fix that corrupts four concurrent builds.
+
+`reclaim` is the automatic half, and it earns the wider scope rather than
+inheriting the accident:
+
+```console
+$ ./scripts/dev-cache.sh reclaim              # report only
+$ ./scripts/dev-cache.sh reclaim --apply      # and delete
+```
+
+It looks only at `.claude/worktrees/`, and every tree passes two independent
+gates before anything is deleted. Both fail closed: anything unreadable,
+unresolvable or unfetchable is reported and kept.
+
+- **Liveness.** No `cargo`/`rustc`/`kache`/linker process has its working
+  directory inside the tree, and no process at all holds an open descriptor
+  under its `target/` (cargo keeps `target/*/.cargo-lock` open for the whole of
+  a build, which catches helpers this script has never heard of). The working
+  directory is read from `/proc/<pid>/cwd`. It is deliberately **not** a grep of
+  the command line: `pgrep -f <path>` matches a string in `argv`, which says
+  nothing about where a process is running, and a build in tree A whose argv
+  happens to name tree B is attributed to B and missed in A.
+  Process liveness is the signal — a finished lane and a stalled one have
+  identical file counts and identical mtimes.
+- **Content on main.** Deliberately **not** `git merge-base --is-ancestor`. PRs
+  here are squash-merged, so a lane's own commits are never ancestors of `main`
+  and an ancestry test reports every landed lane as unmerged — a reclaimer that
+  reclaims nothing. Instead the files the branch changed are compared against a
+  freshly fetched `main` by content. The question is asked **from the primary
+  checkout**, never from inside the worktree: an orphaned worktree's own
+  `origin` can point at a local filesystem path, so its `origin/main` is stale
+  and `git log origin/main..HEAD` run there reports landed work as unlanded.
+
+What it then does depends on what the tree is:
+
+| tree | reclaimed |
+|---|---|
+| **orphan** — a directory under `.claude/worktrees/` that `git worktree list` does not know about | the whole directory. No lane can build there again, and `git worktree remove` refuses it, which is why both of #781's 100 GiB incidents survived. |
+| **registered** — a live worktree whose branch content has landed | its `target/` only. The checkout belongs to an agent and is not this script's to remove. |
+
+A registered worktree with a warm heartbeat in the agent-lane ledger is also
+left alone — not a safety gate (liveness is), but deleting a live agent's
+`target/` between two of its builds costs it a cold rebuild for nothing.
+
+**The trigger is `SessionEnd`**, via `scripts/agent-lane-hook.sh`, which invokes
+the *primary* checkout's copy detached from the hook's 10 s budget. A lane whose
+PR has landed no longer needs its target, and session end is when a lane stops
+needing its outputs. It is not a systemd timer: a timer fires on wall-clock
+time, which is unrelated to whether anything landed, and it would have to live
+outside this repository as a user unit nobody clones.
+
+Every deletion appends a line to `<git-common-dir>/dev-cache-reclaim.log`.
+`./scripts/dev-cache.sh --self-test` pins both gates functionally, in both
+directions, and runs per commit in `check.sh gates`.
