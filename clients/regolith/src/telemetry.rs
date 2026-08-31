@@ -89,9 +89,17 @@ impl OverlayMetrics {
 }
 
 /// Append-only telemetry output. It runs whether or not the F3 pane is open.
+///
+/// The writer is optional because an unwritable path is a **degradable**
+/// condition: a game that cannot record telemetry can still be played, and
+/// panicking during plugin registration turned a recoverable annoyance into a
+/// process that died before its first frame, with nothing on screen for the
+/// volunteer to read (#772). A sink without a writer accepts every append and
+/// keeps nothing; what the player is owed is being *told*, which the scope
+/// banner does.
 #[derive(Resource)]
 pub struct JsonlTelemetry {
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
     session_start: u64,
 }
 
@@ -108,9 +116,34 @@ impl JsonlTelemetry {
         // separating them, and the upload is scoped to it (#735).
         let session_start = file.metadata()?.len();
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: Some(BufWriter::new(file)),
             session_start,
         })
+    }
+
+    /// Open the stream, or carry on without one and say why.
+    ///
+    /// The second element is `None` while recording works and otherwise the
+    /// human sentence describing what failed, for the player-visible notice.
+    /// No launch may die of this: see the type's own note (#772).
+    #[must_use]
+    pub fn open_or_unavailable(path: &Path) -> (Self, Option<String>) {
+        match Self::open(path) {
+            Ok(sink) => (sink, None),
+            Err(error) => (
+                Self {
+                    writer: None,
+                    session_start: 0,
+                },
+                Some(format!("{}: {error}", path.display())),
+            ),
+        }
+    }
+
+    /// Whether this sink is keeping anything at all.
+    #[must_use]
+    pub const fn is_recording(&self) -> bool {
+        self.writer.is_some()
     }
 
     /// Byte offset in the stream at which this session's rows begin.
@@ -124,16 +157,19 @@ impl JsonlTelemetry {
 
     /// Append and flush one snapshot so tailing processes see it immediately.
     pub fn append(&mut self, metrics: &OverlayMetrics) -> io::Result<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
         serde_json::to_writer(
-            &mut self.writer,
+            &mut *writer,
             &serde_json::json!({
                 "kind": "overlay",
                 "session_scope": metrics.session_scope,
                 "values": metrics,
             }),
         )?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()
+        writer.write_all(b"\n")?;
+        writer.flush()
     }
 
     /// Append the exact core bytes emitted for one human-controlled tick.
@@ -142,16 +178,19 @@ impl JsonlTelemetry {
         packet: &OrderPacket,
         session_scope: SessionScope,
     ) -> io::Result<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
         serde_json::to_writer(
-            &mut self.writer,
+            &mut *writer,
             &serde_json::json!({
                 "kind": "orders",
                 "session_scope": session_scope,
                 "packet": packet,
             }),
         )?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()
+        writer.write_all(b"\n")?;
+        writer.flush()
     }
 
     /// Append one human-readable canonical collision delivery.
@@ -163,8 +202,11 @@ impl JsonlTelemetry {
         velocity: QVel,
         session_scope: SessionScope,
     ) -> io::Result<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
         serde_json::to_writer(
-            &mut self.writer,
+            &mut *writer,
             &serde_json::json!({
                 "kind": "CollisionResolved",
                 "session_scope": session_scope,
@@ -176,8 +218,8 @@ impl JsonlTelemetry {
                 },
             }),
         )?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()
+        writer.write_all(b"\n")?;
+        writer.flush()
     }
 }
 

@@ -169,6 +169,25 @@ pub struct CampaignConfig {
 }
 
 impl CampaignConfig {
+    /// How the scope banner names this campaign (#769).
+    ///
+    /// The campaign id when the roster URL names one, and otherwise the head
+    /// of the coordinator-issued session id — a join-from-file launch without
+    /// `--roster-campaign` knows a host and a seat but not a campaign name,
+    /// and the session it was granted is then the only identity it honestly
+    /// has. Never empty: a player in campaign scope must be able to tell the
+    /// two states apart positively.
+    #[must_use]
+    pub fn campaign_label(&self) -> String {
+        self.roster_url
+            .as_deref()
+            .and_then(crate::admission::campaign_id_of_roster_url)
+            .unwrap_or_else(|| {
+                let head = self.session_id.get(..8).unwrap_or(&self.session_id);
+                format!("session {head}")
+            })
+    }
+
     /// The island size the spawn pose is computed against.
     ///
     /// The host's number when admission published one, and otherwise the

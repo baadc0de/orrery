@@ -93,12 +93,21 @@ struct CampaignsResponse {
     operator_note: Option<String>,
 }
 
+/// The seat material an admission service grants, as the join artifact stores it.
+///
+/// Public so the read-only-launch-directory proof in
+/// `tests/read_only_launch_directory.rs` can drive the real
+/// [`write_join_artifact`] rather than a copy of it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct JoinObject {
-    host_node: String,
-    slot: usize,
-    session_id: String,
-    session_token: String,
+pub struct JoinObject {
+    /// Hex node id of the hosting process.
+    pub host_node: String,
+    /// The swarm slot this seat occupies.
+    pub slot: usize,
+    /// Coordinator-issued session identity.
+    pub session_id: String,
+    /// Hex-encoded session token presented at join.
+    pub session_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -700,7 +709,7 @@ fn rebuild_ui(
     commands
         .spawn((
             JoinUiRoot,
-            GlobalZIndex(1000),
+            GlobalZIndex(JOIN_GATE_Z),
             Node {
                 position_type: PositionType::Absolute,
                 width: percent(100),
@@ -1085,7 +1094,15 @@ fn spawn_button<M: Component>(
     }
 }
 
-fn write_join_artifact(telemetry_path: &Path, join: &JoinObject) -> std::io::Result<PathBuf> {
+/// Save the granted seat beside the telemetry stream, and report where.
+///
+/// The directory is the telemetry path's, which since #766 resolves to the
+/// per-user application-data directory rather than to `target/` under whatever
+/// the volunteer's working directory happened to be. Deliberately without a
+/// fallback: this write failing is what stops a player at the door, so the one
+/// thing that keeps it working must be resolving a writable directory in the
+/// first place, and a rescue path here would hide that.
+pub fn write_join_artifact(telemetry_path: &Path, join: &JoinObject) -> std::io::Result<PathBuf> {
     let directory = telemetry_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(directory)?;
     let path = directory.join(format!("{}.join.json", join.session_id));
@@ -1117,6 +1134,26 @@ impl UploadManager {
             state_path: upload_state_path(telemetry_path),
         }
     }
+}
+
+/// Depth of the full-screen join gate.
+///
+/// Named so the scope banner can be placed above it on purpose
+/// (`SESSION_BANNER_Z`) rather than by two unrelated literals happening to
+/// order correctly.
+pub const JOIN_GATE_Z: i32 = 1000;
+
+/// The campaign id a roster URL was built for.
+///
+/// The roster URL is `{origin}/v1/campaigns/{id}/roster`, and it is the one
+/// thing a joined session carries that names the campaign rather than the
+/// seat, so it is also the only honest source for what the scope banner calls
+/// the campaign a player is in (#769).
+#[must_use]
+pub fn campaign_id_of_roster_url(roster_url: &str) -> Option<String> {
+    let rest = roster_url.split_once("/v1/campaigns/")?.1;
+    let id = rest.split('/').next()?;
+    (!id.is_empty()).then(|| id.to_owned())
 }
 
 /// The service origin a roster URL was built from.
