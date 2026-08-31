@@ -1,3 +1,7 @@
+use orrery_compose::{
+    AmbiguityDetection, CanonicalSchedule, CompatibilityManifest, ExecutorPolicy, GameId,
+    ManifestFormatVersion, ProfileId, ProjectionVersion,
+};
 use orrery_core::{
     CodecError, CoreCodec, EntityMaterialization, OrderedInputs, QPos, QVel, Quantized, Ruleset,
     StateView, StepOutput, TickRng,
@@ -9,6 +13,35 @@ use orrery_protocol::{PersistId, RulesetId, Tick};
 const RULESET: RulesetId = RulesetId {
     version: 1,
     digest: [0xA4; 32],
+};
+
+/// The fixture's composition manifest: no modules, no component schemas.
+///
+/// Spelled out rather than defaulted because #761 made the manifest the single
+/// source of component classification, and a `Game` that declares nothing
+/// should have to say so. Declaring nothing is the fail-closed answer D45
+/// clause (c) asks for — no declaration, no capability — and it is correct
+/// here: this fixture exists to exercise entity materialization, and nothing
+/// in it is persisted, replicated or witnessed.
+const COMPOSITION: CompatibilityManifest = CompatibilityManifest {
+    game_id: GameId("materialization-fixture"),
+    manifest_format_version: ManifestFormatVersion(1),
+    protocol_version: 6,
+    toolchain_stamp: "rust-2024",
+    ruleset: RULESET,
+    modules: &[],
+    component_schemas: &[],
+    schedule: CanonicalSchedule {
+        stages: &[],
+        ordering_edges: &[],
+        ambiguities: &[],
+        ambiguity_detection: AmbiguityDetection::Error,
+        executor_policy: ExecutorPolicy::SingleThreaded,
+    },
+    canonical_constants: &[],
+    projection_version: ProjectionVersion(1),
+    profile_id: ProfileId("d9"),
+    removed_components: &[],
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +161,8 @@ impl Game for Growing {
         summary: "a source creates one autonomous child",
         ruleset: RULESET,
     };
+
+    const COMPOSITION: CompatibilityManifest = COMPOSITION;
 
     fn honest() -> Self {
         Self

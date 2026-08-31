@@ -107,8 +107,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use orrery_core::store::AuthorityLog;
 use orrery_core::{
-    state_hash, verify_bundle, ComponentTypeId, CoreClass, CoreCodec, Executor, InputLogProducer,
-    Quantized, TickBackend,
+    state_hash, verify_bundle, ComponentTypeId, CoreCodec, Executor, InputLogProducer, Quantized,
+    TickBackend,
 };
 use orrery_protocol::atrest::SchemaVersion;
 use orrery_protocol::{
@@ -657,16 +657,29 @@ const REPORTED_DIFFERENCES: usize = 8;
 /// The components a side actually writes at rest, in `ComponentTypeId`
 /// ascending order (WP-3).
 ///
-/// `Cosmetic` components are never persisted (`CoreClass`'s own contract), so
-/// they contribute no slot. Everything else does.
+/// **Read from the declaration, not from the build** (#761). The predicate is
+/// the `P` dimension `G::COMPOSITION.component_schemas` states for the
+/// component: `P0` writes no at-rest slot, `P1` and `P2` each write one. A
+/// component present in the side's schema axis but *undeclared* by the
+/// manifest writes nothing either — D45 clause (c)'s fail-closed zeros, which
+/// is the same answer the retired `Ruleset::classify_component` default gave
+/// by returning `Cosmetic`.
+///
+/// This used to call `game.classify_component`, which made classification two
+/// statements of one truth — the trait method and the manifest — cross-checked
+/// by review in the one place a disagreement is a persistence-classification
+/// error that D-3 is badly placed to catch, being the thing consuming it. The
+/// method is retired and the manifest is the single source; there is now no
+/// second statement for the first to disagree with.
 fn persisted_components<G: Game>(
-    game: &G,
     schemas: &BTreeMap<ComponentTypeId, SchemaVersion>,
 ) -> Vec<(ComponentTypeId, SchemaVersion)> {
     schemas
         .iter()
         .filter(|(component, _)| {
-            !matches!(game.classify_component(**component), CoreClass::Cosmetic)
+            G::COMPOSITION
+                .declaration(**component)
+                .is_some_and(|schema| schema.capabilities.is_persisted())
         })
         .map(|(component, version)| (*component, *version))
         .collect()
@@ -690,11 +703,10 @@ fn persisted_components<G: Game>(
 /// not.
 #[must_use]
 pub fn collect_persistence<G: Game>(
-    game: &G,
     played: &Play<G>,
     schemas: &BTreeMap<ComponentTypeId, SchemaVersion>,
 ) -> Option<PersistenceArtifact> {
-    let components = persisted_components(game, schemas);
+    let components = persisted_components::<G>(schemas);
     if components.is_empty() {
         return None;
     }
@@ -1639,7 +1651,7 @@ pub fn collect_artifacts<G: Game + Clone>(
     } else {
         None
     };
-    let d3 = collect_persistence(game, played, &axes.schema_versions);
+    let d3 = collect_persistence::<G>(played, &axes.schema_versions);
     let d4 = collect_witness(game, played);
     SideArtifacts {
         side,

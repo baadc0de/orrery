@@ -19,8 +19,17 @@
 //! readable by a consumer that has the manifest and not the game. The
 //! duplication of the pair itself is accepted, and it is guarded rather than
 //! trusted: a game's manifest table must agree with its row here, asserted by
-//! a named test beside the manifest (for Regolith,
-//! `regolith::composition_tests::the_manifest_schema_table_agrees_with_the_reviewed_registry`).
+//! a named test beside each game's manifest —
+//! `regolith::composition_tests::the_manifest_schema_table_agrees_with_the_reviewed_registry`
+//! and its `skirmish::composition_tests` twin.
+//!
+//! # Why every game is here now (#761)
+//!
+//! #761 retired `Ruleset::classify_component`. With the method gone, a game's
+//! classification facts exist **only** as manifest declarations, so a game
+//! whose component ids were not reviewed here would be stating capabilities
+//! over identifiers nobody had allocated. Both shipped games are therefore in
+//! this table.
 
 use orrery_core::ComponentTypeId;
 use orrery_protocol::SchemaVersion;
@@ -61,4 +70,52 @@ pub mod regolith {
             schema_version: SCHEMA_V0,
             name: "STATE",
         }];
+}
+
+/// Skirmish's reviewed component-type allocations.
+///
+/// Added by #761, which retired `Ruleset::classify_component`: with the method
+/// gone, Skirmish's three classification facts have to be *declarations*, and
+/// a declaration whose identifiers nothing reviews is the shape #750 refused
+/// for Regolith. So the ids move here, `skirmish::components` aliases them,
+/// and `SKIRMISH_COMPOSITION.component_schemas` states them with owner and
+/// capabilities attached — checked both directions by
+/// `skirmish::composition_tests::the_manifest_schema_table_agrees_with_the_reviewed_registry`.
+///
+/// The values are the ones Skirmish has always used, unchanged: this is a
+/// move of where a fact is stated, not of what it is.
+pub mod skirmish {
+    use super::{ComponentTypeId, ComponentTypeIdRegistryEntry};
+    use orrery_protocol::atrest::SCHEMA_V0;
+
+    /// The craft's verifiable state: position, velocity, hull, shield, counters.
+    pub const CRAFT: ComponentTypeId = ComponentTypeId(1);
+
+    /// Cumulative hull scarring — persisted, never adjudicated.
+    pub const HULL_WEAR: ComponentTypeId = ComponentTypeId(2);
+
+    /// Engine trail. Never persisted, never verified.
+    pub const ENGINE_TRAIL: ComponentTypeId = ComponentTypeId(3);
+
+    /// The permanent reviewed allocation table for Skirmish.
+    ///
+    /// All three are still at the at-rest bootstrap version: no Skirmish
+    /// schema has ever been migrated, so nothing has earned a bump.
+    pub const COMPONENT_TYPE_IDS: &[ComponentTypeIdRegistryEntry] = &[
+        ComponentTypeIdRegistryEntry {
+            id: CRAFT,
+            schema_version: SCHEMA_V0,
+            name: "CRAFT",
+        },
+        ComponentTypeIdRegistryEntry {
+            id: HULL_WEAR,
+            schema_version: SCHEMA_V0,
+            name: "HULL_WEAR",
+        },
+        ComponentTypeIdRegistryEntry {
+            id: ENGINE_TRAIL,
+            schema_version: SCHEMA_V0,
+            name: "ENGINE_TRAIL",
+        },
+    ];
 }

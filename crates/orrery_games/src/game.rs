@@ -35,6 +35,7 @@
 //! cheater claims to be running the rules; the claim is what the witness holds
 //! it to.
 
+use orrery_compose::CompatibilityManifest;
 use orrery_core::{QPos, QVel, Ruleset, TickRng};
 use orrery_protocol::{PersistId, RulesetId, Tick};
 
@@ -116,6 +117,22 @@ impl Tamper {
 pub trait Game: Ruleset + Sized {
     /// This game's card in the [`CATALOGUE`].
     const META: GameMeta;
+
+    /// This build's link-time composition manifest.
+    ///
+    /// **The single source of component classification** since #761 retired
+    /// `Ruleset::classify_component`. Its `component_schemas` table states,
+    /// per `(ComponentTypeId, SchemaVersion)`, D45's five independent
+    /// capability dimensions; a harness that wants to know whether a
+    /// component is persisted, rolled back, witnessed, replicated, or who may
+    /// write it, reads the declaration rather than calling into the build to
+    /// learn a static fact.
+    ///
+    /// It sits on [`Game`] rather than on [`Ruleset`] because
+    /// [`orrery_compose`] is a layer above `orrery_core` and the manifest is
+    /// build description, not rules: `orrery_core` neither knows nor needs to
+    /// know that a composition root exists.
+    const COMPOSITION: CompatibilityManifest;
 
     /// The committed chain digest per scenario name (`docs/06` §8's golden,
     /// per game). Empty is legal for a game still being brought up; the

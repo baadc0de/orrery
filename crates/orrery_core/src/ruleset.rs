@@ -58,7 +58,24 @@ impl core::fmt::Display for CodecError {
 
 impl core::error::Error for CodecError {}
 
-/// Where a replicated component sits in the §2 classification.
+/// Where a replicated component sits in the §2 classification — **derived
+/// vocabulary, never an authored datum**.
+///
+/// ADR-0045 clause (g) and A5 §6.2: "Core", "Bulk" and "Cosmetic" stay the
+/// names of the load-bearing macro-profiles the documentation set speaks, but
+/// the enum stopped being a source of truth when #761 retired
+/// `Ruleset::classify_component`. Classification is now declared as data in a
+/// build's `orrery_compose::CompatibilityManifest::component_schemas` —
+/// five independent capability dimensions per `(ComponentTypeId,
+/// SchemaVersion)` — and a value of this enum is *computed* from those five
+/// by `orrery_compose::profile_of(..).and_then(CapabilityProfile::core_class)`.
+///
+/// **Nothing in the tree authors, persists, hashes or routes on this enum.**
+/// D-3 persistence, for instance, reads the declared `P` dimension directly
+/// (`ComponentCapabilities::is_persisted`) rather than deriving a class and
+/// branching on it, because one three-valued name cannot carry five
+/// independent dimensions and two of clause (d)'s five profiles have no
+/// `CoreClass` value at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CoreClass {
     /// Outcomes touch persistent value: full determinism rules, logged,
@@ -339,16 +356,6 @@ pub trait Ruleset: Send + Sync + 'static {
         out: &mut Vec<EntityMaterialization<Self::CoreState>>,
     ) {
         let _ = (event, out);
-    }
-
-    /// Core, Bulk or Cosmetic for a replicated component (§2).
-    ///
-    /// The default is the conservative one: an unclassified component is
-    /// `Cosmetic`, so a game that forgets to classify gets a component that is
-    /// never persisted rather than one silently admitted to adjudication.
-    fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
-        let _ = component;
-        CoreClass::Cosmetic
     }
 
     /// The stateless stage-1 checks (D10 stage 1, docs/06 §3).

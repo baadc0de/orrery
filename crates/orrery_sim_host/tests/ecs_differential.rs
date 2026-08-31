@@ -34,8 +34,8 @@
 use std::collections::BTreeMap;
 
 use orrery_core::{
-    ComponentTypeId, CoreClass, EntityMaterialization, Executor, Invariant, OrderedInputs, QPos,
-    QVel, Ruleset, StateView, StepOutput, TickBackend, TickRng,
+    ComponentTypeId, EntityMaterialization, Executor, Invariant, OrderedInputs, QPos, QVel,
+    Ruleset, StateView, StepOutput, TickBackend, TickRng,
 };
 use orrery_games::diff::{
     run_differential_on, Backends, Baseline, Class, Subject, Verdict, VersionAxes,
@@ -45,7 +45,7 @@ use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState, Rock, RockTier};
 use orrery_games::regolith::{archetype::Archetype, Regolith, REGOLITH_COMPOSITION};
 use orrery_games::scenario::{play_with, Scenario, SCENARIOS, T0, WORLD_SCENARIO};
-use orrery_games::{Game, GameMeta, Tamper};
+use orrery_games::{CompatibilityManifest, Game, GameMeta, Tamper};
 use orrery_protocol::atrest::SchemaVersion;
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use orrery_sim_host::ecs::EcsBackend;
@@ -177,10 +177,6 @@ impl Ruleset for WithinTickVisibility {
         Regolith::honest().materialize(event, out);
     }
 
-    fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
-        Regolith::honest().classify_component(component)
-    }
-
     fn invariants(&self) -> &[Invariant<Self::CoreState>] {
         orrery_games::regolith::invariants::INVARIANTS
     }
@@ -192,6 +188,12 @@ impl Game for WithinTickVisibility {
         summary: "F-4 fixture for live within-tick neighbour visibility",
         ruleset: Regolith::META.ruleset,
     };
+
+    // A Regolith build: it declares Regolith's components, with Regolith's
+    // capabilities. Delegating the manifest is the same move the `Ruleset`
+    // bodies above make, and since #761 it is also how D-3 learns what this
+    // fixture persists.
+    const COMPOSITION: CompatibilityManifest = REGOLITH_COMPOSITION;
 
     fn honest() -> Self {
         Self

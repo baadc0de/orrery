@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use orrery_core::ComponentTypeId;
+use orrery_core::{ComponentTypeId, CoreClass};
 use orrery_protocol::{RulesetId, SchemaVersion};
 
 pub mod registry;
@@ -132,6 +132,101 @@ pub struct ComponentCapabilities {
     pub replication: ReplicationCapability,
     /// Write authority policy.
     pub write_authority: WriteAuthorityCapability,
+}
+
+impl ComponentCapabilities {
+    /// Whether the declaration says this component reaches durable storage.
+    ///
+    /// The one question D-3 persistence asks of a declaration, and the reason
+    /// the differential harness no longer needs a trait method: `P0` writes
+    /// no at-rest slot, `P1` and `P2` each write one. An **undeclared**
+    /// component has no capabilities at all and so writes nothing either —
+    /// D45 clause (c)'s "no declaration, no capability", which is the same
+    /// fail-closed answer the retired `classify_component` default gave.
+    #[must_use]
+    pub const fn is_persisted(self) -> bool {
+        !matches!(self.persistence, PersistenceCapability::None)
+    }
+}
+
+/// One of D45 clause (d)'s named capability profiles.
+///
+/// **Derived vocabulary, never an authored datum** (ADR-0045 clause (g), A5
+/// §6.2). A profile is *computed* from the five declared dimensions by
+/// [`profile_of`]; nothing in the tree authors, persists, hashes or routes on
+/// it. It exists so a reviewer and a refusal message can keep speaking the
+/// names the documentation set speaks, and so a validator has a cheap
+/// tripwire for a typo'd policy: a declaration matching no profile is
+/// [`None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityProfile {
+    /// `P1`/`P2` · R per R6 · `W2` · `N1` · `A1` — verifiable core state.
+    Core,
+    /// `P1` · `R0` · `W1` · `N1` · `A1` — persisted, invariant-checked only.
+    Bulk,
+    /// All zeros — never persisted, never verified, never replicated.
+    CosmeticLocal,
+    /// `P0` · `R0` · `W0` · `N1` · `A2` — replicated in-island, never stored.
+    EphemeralShared,
+    /// `P2` · `R0` · `W0` · `N0` · `A3` — transaction-final ledger rows.
+    CriticalLedger,
+}
+
+impl CapabilityProfile {
+    /// This profile's [`CoreClass`] name, where the three-valued enum has one.
+    ///
+    /// [`None`] for [`CapabilityProfile::EphemeralShared`] and
+    /// [`CapabilityProfile::CriticalLedger`], which is not an omission: those
+    /// are the two rows ADR-0045 clause (d) names as the demonstration that
+    /// `CoreClass` "files an ephemeral projectile and a local UI component
+    /// under the same value, and gives a ledger row no value at all".
+    #[must_use]
+    pub const fn core_class(self) -> Option<CoreClass> {
+        match self {
+            CapabilityProfile::Core => Some(CoreClass::Core),
+            CapabilityProfile::Bulk => Some(CoreClass::Bulk),
+            CapabilityProfile::CosmeticLocal => Some(CoreClass::Cosmetic),
+            CapabilityProfile::EphemeralShared | CapabilityProfile::CriticalLedger => None,
+        }
+    }
+}
+
+/// The profile a declaration's five dimensions name, or [`None`] for a
+/// combination ADR-0045 clause (d) does not name.
+#[must_use]
+pub const fn profile_of(capabilities: ComponentCapabilities) -> Option<CapabilityProfile> {
+    use PersistenceCapability as P;
+    use ReplicationCapability as N;
+    use RollbackCapability as R;
+    use WitnessCapability as W;
+    use WriteAuthorityCapability as A;
+
+    match (
+        capabilities.persistence,
+        capabilities.rollback,
+        capabilities.witness,
+        capabilities.replication,
+        capabilities.write_authority,
+    ) {
+        // Rollback membership is R6's to decide for core state, so the Core
+        // profile is deliberately free in that dimension.
+        (P::Bulk | P::Critical, _, W::ReplayAdjudicated, N::InterestReplicated, A::LeaseHolder) => {
+            Some(CapabilityProfile::Core)
+        }
+        (P::Bulk, R::Excluded, W::InvariantChecked, N::InterestReplicated, A::LeaseHolder) => {
+            Some(CapabilityProfile::Bulk)
+        }
+        (P::None, R::Excluded, W::Unwatched, N::None, A::Local) => {
+            Some(CapabilityProfile::CosmeticLocal)
+        }
+        (P::None, R::Excluded, W::Unwatched, N::InterestReplicated, A::IslandWeak) => {
+            Some(CapabilityProfile::EphemeralShared)
+        }
+        (P::Critical, R::Excluded, W::Unwatched, N::None, A::ClusterTransaction) => {
+            Some(CapabilityProfile::CriticalLedger)
+        }
+        _ => None,
+    }
 }
 
 /// One component-schema declaration in the manifest's schema table.
@@ -265,6 +360,22 @@ pub struct CompatibilityManifest {
     pub profile_id: ProfileId,
     /// Explicitly retired component schemas.
     pub removed_components: &'static [RemovedComponentSchema],
+}
+
+impl CompatibilityManifest {
+    /// The schema row this build declares for `component`, if it declares one.
+    ///
+    /// The single source every classification consumer reads. An undeclared
+    /// component returns [`None`] and therefore has no capabilities — D45
+    /// clause (c)'s fail-closed zeros — rather than falling back to a second
+    /// statement of the same fact somewhere else.
+    #[must_use]
+    pub fn declaration(&self, component: ComponentTypeId) -> Option<ComponentSchemaManifest> {
+        self.component_schemas
+            .iter()
+            .copied()
+            .find(|schema| schema.id.component == component)
+    }
 }
 
 /// A composition-time refusal.
@@ -683,6 +794,128 @@ mod tests {
         }];
         populated.stages = ONE;
         assert_ne!(schedule_digest(&empty), schedule_digest(&populated));
+    }
+
+    const CORE_CAPABILITIES: ComponentCapabilities = ComponentCapabilities {
+        persistence: PersistenceCapability::Bulk,
+        rollback: RollbackCapability::Included,
+        witness: WitnessCapability::ReplayAdjudicated,
+        replication: ReplicationCapability::InterestReplicated,
+        write_authority: WriteAuthorityCapability::LeaseHolder,
+    };
+
+    const COSMETIC_CAPABILITIES: ComponentCapabilities = ComponentCapabilities {
+        persistence: PersistenceCapability::None,
+        rollback: RollbackCapability::Excluded,
+        witness: WitnessCapability::Unwatched,
+        replication: ReplicationCapability::None,
+        write_authority: WriteAuthorityCapability::Local,
+    };
+
+    /// The one question D-3 asks a declaration, in both directions.
+    #[test]
+    fn persistence_is_read_from_the_declared_p_dimension() {
+        assert!(CORE_CAPABILITIES.is_persisted());
+        assert!(!COSMETIC_CAPABILITIES.is_persisted());
+        assert!(
+            ComponentCapabilities {
+                persistence: PersistenceCapability::Critical,
+                ..COSMETIC_CAPABILITIES
+            }
+            .is_persisted()
+        );
+    }
+
+    /// ADR-0045 clause (d)'s five named profiles, and the `CoreClass` names
+    /// derived from them — including the two rows that have none.
+    #[test]
+    fn profiles_derive_the_core_class_vocabulary() {
+        assert_eq!(profile_of(CORE_CAPABILITIES), Some(CapabilityProfile::Core));
+        assert_eq!(
+            profile_of(CORE_CAPABILITIES).and_then(CapabilityProfile::core_class),
+            Some(CoreClass::Core)
+        );
+
+        let bulk = ComponentCapabilities {
+            rollback: RollbackCapability::Excluded,
+            witness: WitnessCapability::InvariantChecked,
+            ..CORE_CAPABILITIES
+        };
+        assert_eq!(profile_of(bulk), Some(CapabilityProfile::Bulk));
+        assert_eq!(
+            profile_of(bulk).and_then(CapabilityProfile::core_class),
+            Some(CoreClass::Bulk)
+        );
+
+        assert_eq!(
+            profile_of(COSMETIC_CAPABILITIES),
+            Some(CapabilityProfile::CosmeticLocal)
+        );
+        assert_eq!(
+            profile_of(COSMETIC_CAPABILITIES).and_then(CapabilityProfile::core_class),
+            Some(CoreClass::Cosmetic)
+        );
+
+        let ephemeral = ComponentCapabilities {
+            replication: ReplicationCapability::InterestReplicated,
+            write_authority: WriteAuthorityCapability::IslandWeak,
+            ..COSMETIC_CAPABILITIES
+        };
+        assert_eq!(
+            profile_of(ephemeral),
+            Some(CapabilityProfile::EphemeralShared)
+        );
+        let ledger = ComponentCapabilities {
+            persistence: PersistenceCapability::Critical,
+            write_authority: WriteAuthorityCapability::ClusterTransaction,
+            ..COSMETIC_CAPABILITIES
+        };
+        assert_eq!(profile_of(ledger), Some(CapabilityProfile::CriticalLedger));
+        // The demonstration that the enum could not carry the space: these
+        // two profiles have no `CoreClass` name at all.
+        assert_eq!(
+            profile_of(ephemeral).and_then(CapabilityProfile::core_class),
+            None
+        );
+        assert_eq!(
+            profile_of(ledger).and_then(CapabilityProfile::core_class),
+            None
+        );
+    }
+
+    /// A typo'd dimension lands on no named profile — A5 §6.2's tripwire.
+    #[test]
+    fn an_unnamed_capability_combination_has_no_profile() {
+        assert_eq!(
+            profile_of(ComponentCapabilities {
+                write_authority: WriteAuthorityCapability::Local,
+                ..CORE_CAPABILITIES
+            }),
+            None
+        );
+    }
+
+    /// The manifest answers for the components it declares, and fails closed
+    /// for the ones it does not.
+    #[test]
+    fn declaration_lookup_fails_closed_for_undeclared_components() {
+        const COMPONENT_SCHEMAS: &[ComponentSchemaManifest] = &[ComponentSchemaManifest {
+            owner: MODULE_A,
+            id: ComponentSchemaId {
+                component: regolith::STATE,
+                version: orrery_protocol::atrest::SCHEMA_V0,
+            },
+            capabilities: CORE_CAPABILITIES,
+        }];
+        const MODULES: &[ModuleManifest] = &[MODULE_A_MANIFEST];
+        let manifest = manifest(MODULES, COMPONENT_SCHEMAS, EMPTY_AMBIGUITIES);
+        assert_eq!(
+            manifest
+                .declaration(regolith::STATE)
+                .map(|schema| schema.capabilities),
+            Some(CORE_CAPABILITIES)
+        );
+        assert_eq!(manifest.declaration(ComponentTypeId(0xDEAD_BEEF)), None);
     }
 
     #[test]
