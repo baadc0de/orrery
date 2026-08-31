@@ -153,6 +153,18 @@ The canonical store of record for verifiable state is the `Executor`'s
 (`crates/orrery_core/src/executor.rs:48-52`), owned by whatever hosts the
 simulation. This ratifies the shipped topology; it changes no code.
 
+> **Amended 2026-08-31 (owner-authorised), against the admission recorded in
+> clause (d).** The sentence above named one store because one store existed.
+> Since #757 a second substrate satisfies the same contract: during an
+> ECS-backend tick the store of record is that backend's `Canonical`
+> component. **What is normative is not the container but the seam** — every
+> committed byte is produced by `orrery_core::canonical_step`, which both
+> backends call, and `orrery_core` carries no Bevy dependency. Read this
+> paragraph as naming that seam. The clause's load-bearing sentence below —
+> canonical truth never lives in a Bevy *application* world — is unchanged and
+> unbreached: the admitted world is dedicated, reachable only through the
+> backend, with no `bevy_app` and no `&World` accessor.
+
 The boundary form is A9's B-1, absorbed here verbatim in substance:
 **canonical truth never lives in a Bevy application world.** Application
 worlds hold only *mirrors* — presentation and replication components keyed by
@@ -218,6 +230,33 @@ this record reopens it. Clause (e)'s reversal path explicitly does not lead
 here.
 
 ### (d) A dedicated `bevy_ecs::World` is admitted only behind the host seam, on pre-registered triggers
+
+> **Amended 2026-08-31 (owner-authorised). The host is admitted, and no
+> trigger fired.** On 2026-08-30 the owner sanctioned `bevy_ecs` adoption
+> directly; on 2026-08-31 it landed as `orrery_sim_host`'s `EcsBackend`
+> (#757), at four-class F-4 parity, with `scripts/core-gates.sh` at exit 0.
+> This clause prescribed its own amendment mechanism — *"amendment is an owner
+> decision recorded against this clause, not a silent edit"* — and this is that
+> record.
+>
+> **What the admission did not do.** It did not fire T1, T2 or T3, and it did
+> not discharge the precondition package below. Read the trigger list as the
+> conditions under which adoption would have been *automatic*; the owner
+> retains the separate power to admit a host directly, which is what happened.
+>
+> **The package ledger, as of this amendment:**
+>
+> | Item | State |
+> |---|---|
+> | the differential parity harness beyond goldens | **met** — all four A10 §4.1 classes, generalised across substrates |
+> | A5's component-policy registry | **partial** — declaration data plane live; IV-7's engine-handle refusal, the `classify_component` restatement and the persistd linkage remain open |
+> | A4's Tier-H gate bundle (T3) | **not met** — see the open question below |
+> | capacity-scale mirror-cost numbers | **not met, and partly overtaken** — the admitted backend does not mirror into an application world, so A3's two-world-hop question is not the one now in front of us |
+>
+> **T3's status is narrowed, not retired.** It no longer gates admission,
+> because admission has happened. It remains binding on *canonical bytes
+> moving*: no golden may be regenerated on the ECS path, and no second host may
+> be admitted, until [D43] clause (e)'s battery is enforced.
 
 A dedicated canonical `bevy_ecs::World` — same per-entity topology, different
 substrate behind the seam — is neither adopted nor foreclosed. It becomes a
