@@ -1322,3 +1322,193 @@ rig the same 3 % default mix at 140 k diffs/s asks for ~4 000 intents/s, which
 is three times the intent path's saturation point (§11.7) and turns a bulk
 sweep into an intent sweep. Set `P2_CAP_INTENT_MIX` low when what you want is
 the bulk path.
+
+## 12. Canonical-host and output-byte cost at the stated entity scale
+
+D42 clause (d)'s last unmet precondition asked for capacity-scale mirror-cost
+numbers replacing A3 P4's indicative 10k `(PersistId, Pos)` row copy. The
+question changed when the ECS backend landed: it is a dedicated canonical
+store behind `SimulationHost`, not an application-world mirror. Re-running
+A3's copy loop at a larger N would therefore measure a hop neither admitted
+backend performs.
+
+The question this run answers instead is:
+
+> At the repository's stated entity scale, what does one real canonical host
+> tick cost on the executor and ECS substrates, and what does the source half
+> of a future Bevy or Unreal mirror cost through the public byte seam that
+> exists now — full `collect_output_bytes`, targeted `state_bytes`, and no
+> invented presentation API?
+
+This is the right present-tense question because both stores call the same
+`canonical_step` and expose the same owned canonical bytes. Their tick delta is
+the substrate/schedule cost under otherwise identical work; their output-byte
+cost is work an actual foreign or application-world consumer must pay before
+it can decode or insert anything.
+
+### 12.1 What “capacity scale” means here
+
+No new population was invented for this measurement. The points come from
+this document's own sizing conversions:
+
+- **10,000** entities is §9's comfortable 2 Hz point and retains A3's reference
+  population;
+- **20,000** is §6.1/§9's 2 Hz service-knee conversion;
+- **24,000** is the upper end of §6.2's 4,000-player implication (4 hot world
+  entities plus 1–2 authored core entities per player).
+
+Those are the last stated entity-sizing points, but they are not a current
+post-#86 knee. This document's own opening says the current bulk path has no
+located knee below ~143k delivered records/s, and D19's indexed-journal knee
+has not been re-measured. The 20k–24k range is therefore the repository's
+published demo-sizing population, not a claim that current persistence still
+fails immediately above it. That distinction limits the precondition verdict
+in §12.6.
+
+### 12.2 Machine, load, profile, and method
+
+Measured 2026-08-31 on `fortyninety`: AMD Ryzen 9 9950X3D, 16 physical cores /
+32 threads, 46 GiB RAM, Linux 7.2.0-1-cachyos, rustc 1.96.0, x86-64, release
+profile, tree based on `6ddd6f9` plus this benchmark. Five independent process
+captures were pinned to logical CPU 0. Each configuration contains 11 timed
+samples, so each table cell summarises 55 samples as the median of the five run
+medians followed by the min–max of those run medians.
+
+Other lanes were active. Before recording, the host had a build/I/O burst:
+load average peaked above 139 with swap and 30+ blocked tasks. A smoke capture
+from that window was discarded. At the five recorded starts, `vmstat` showed
+zero blocked tasks and 92–96% CPU idle; the one-minute load average decayed
+from 17.15 to 10.33 while the five-minute value still reflected the preceding
+burst (49.86 to 44.54). The sandbox's PID namespace showed no Cargo or rustc
+process, but could not enumerate processes in the other lanes. Pinning and the
+five-run spread make interference visible rather than claiming the box was
+exclusive.
+
+All reported operation timings are **warm**, not cold. Each host first runs 48
+untimed ticks, enough to fill every craft's four-point canonical trail, and
+each output operation receives three untimed calls before measurement. Every
+output call still allocates and owns a fresh result buffer; no destination
+buffer is retained. Host construction, installation, binary/page-cache first
+use, and the first output call are excluded. No cold number was taken.
+
+The workload is 100% `RegolithState::Craft`, no input and no emitted event.
+The trail matters, but not in the way a stale description might imply:
+`Craft::trail` is an inline `[TrailPoint; 4]` in this tree, **not a `Vec`**, so
+cloning canonical state performs no per-entity trail heap allocation. A full
+craft encodes to 158 payload bytes; full output adds 12 bytes of stable-id and
+length framing, for 170 bytes/entity. The canonical encoder and output buffer
+do perform their real heap allocations, and those are inside the timings.
+
+### 12.3 One canonical tick and full output
+
+Times are milliseconds. Parentheses are the range of the five run medians.
+
+| entities | backend | `step(1)` | `collect_output_bytes` | output bytes |
+|---:|---|---:|---:|---:|
+| 10,000 | executor | 6.263 (6.195–6.341) | 1.175 (1.159–1.197) | 1,700,000 |
+| 10,000 | ECS | 7.136 (7.102–7.241) | 1.364 (1.356–1.480) | 1,700,000 |
+| **20,000** | **executor** | **12.604 (12.462–12.797)** | **2.382 (2.357–2.412)** | **3,400,000** |
+| **20,000** | **ECS** | **14.428 (14.260–14.644)** | **2.862 (2.781–3.004)** | **3,400,000** |
+| **24,000** | **executor** | **15.266 (14.993–15.492)** | **2.894 (2.846–2.936)** | **4,080,000** |
+| **24,000** | **ECS** | **17.462 (17.080–18.998)** | **3.331 (3.262–3.462)** | **4,080,000** |
+
+The full 55-sample envelopes at the two capacity points were: executor 20k
+tick 12.394–12.867 ms and output 2.317–2.482 ms; ECS 20k tick
+14.186–15.093 ms and output 2.732–3.071 ms; executor 24k tick
+14.934–15.800 ms and output 2.793–3.048 ms; ECS 24k tick
+17.021–26.375 ms and output 3.222–5.104 ms. The last row caught one external
+interference episode; it is reported, not trimmed.
+
+Against the fixed 16.667 ms 60 Hz budget, the median tick consumed 75.6% /
+86.6% at 20k and 91.6% / 104.8% at 24k (executor / ECS). Full byte collection
+alone consumed another 14.3% / 17.2% at 20k and 17.4% / 20.0% at 24k if done
+on every simulation tick. The ECS backend was 14.0–14.5% slower per tick and
+15.1–20.1% slower on full collection across the three populations. This does
+not demonstrate D42's T2 (`BTreeMap` dominating); on this workload the admitted
+alternative is slower.
+
+The executor/ECS output hashes matched at every population, as did byte counts:
+the benchmark refuses its own run if they differ. This is a same-run workload
+check, not a new golden, and no canonical byte was changed.
+
+### 12.4 Full `state_bytes` sweep and an already-known 24-entity AOI
+
+The full sweep calls `state_bytes` once per installed entity. The AOI-shaped
+leg calls it for 24 evenly spaced ids after the caller already knows its
+interest set; it measures neither spatial query nor AOI-set maintenance.
+
+| entities | backend | full sweep, ms | 24 targeted lookups, µs |
+|---:|---|---:|---:|
+| 10,000 | executor | 1.115 (1.106–1.138) | 2.755 (2.735–2.796) |
+| 10,000 | ECS | 1.312 (1.299–1.380) | 3.166 (3.126–3.206) |
+| **20,000** | **executor** | **2.254 (2.237–2.636)** | **2.835 (2.815–2.836)** |
+| **20,000** | **ECS** | **2.787 (2.725–2.853)** | **3.337 (3.266–3.376)** |
+| **24,000** | **executor** | **2.756 (2.667–2.840)** | **2.856 (2.795–2.865)** |
+| **24,000** | **ECS** | **3.167 (3.145–3.252)** | **3.236 (3.196–3.326)** |
+
+Targeted lookup stays roughly flat with backing population because it does 24
+tree/index lookups and encodes 24 states. Its microsecond samples are easy to
+pre-empt: the largest single sample was 19.356 µs, while the five run medians
+remain in the ranges shown. Full collection is the material cost when a
+consumer requests every canonical row.
+
+### 12.5 What this does not cover
+
+- No application/presentation world exists in the path, so this does not time
+  canonical-byte decoding, FFI copying, component insertion/update, stale
+  entity removal, or render/replication systems in Bevy or Unreal.
+- The full export has no AOI or change-detection filter. The targeted leg starts
+  after interest selection and holds the 24 ids fixed: no AOI churn, spatial
+  query, joins/leaves, archetype churn, fragmentation, or materialization.
+- The all-Craft, no-input population is a deliberately large-row, steady-state
+  workload, not the 4–6 core-entity mix behind §6.2 and not a recorded live
+  gameplay trace. It emits no events and does no destination-side work.
+- `step(1)` is the public host cost: canonical arithmetic, hashing, backend
+  storage/schedule, and allocation of the returned per-entity hash report. It
+  does not isolate the percentage attributable only to `BTreeMap` operations,
+  so it cannot by itself fire or refute T2 for every real host workload.
+- Only one CPU model, one logical core, release mode, and warm state were
+  measured. The recorded interference spread is real; it is not a substitute
+  for a quiet dedicated capacity box or a second hardware class.
+
+### 12.6 D42(d) judgement, bench home, and reproduction
+
+**Judgement: partly discharged.** This replaces A3's indicative row copy with
+capacity-population numbers for the real source-side byte seam and measures
+both admitted canonical stores. That answers the present-tense question D42's
+amendment leaves behind. It does **not** yet establish end-to-end “mirror cost”
+for a future client, because the consumer half and real AOI churn do not exist,
+and the repository's current post-#86/D19 capacity population is itself not
+located. To close the item without qualification requires (1) a committed
+AOI/change-set presentation frame, (2) a Bevy or Unreal consumer applying it
+under join/leave and archetype churn, and (3) a refreshed current-build
+capacity population to run both sides against. Until those exist, marking the
+whole item “met” would turn a measured source half into an unmeasured whole.
+
+The bench belongs in `gates/migration-bench`. A10 §8.2 names presentation
+extraction as B-5 and §8.2 assigns B-1..B-7 to that workspace; the public host
+byte path now supplies the instrument A10 said was absent. A new standalone
+workspace would duplicate its environment manifest and evade the existing
+baseline-refusal rule.
+
+That rule remains intact. `compare` against a missing baseline exited 3 and
+wrote zero stdout bytes. The committed A18 baseline also refused before any
+measurement (exit 3, zero stdout) because its pre-existing B-4/B-5 rows lack
+the `scenario` field now required by schema-1 code. The historical artifact
+was not rewritten and no ratio against it is reported; these five runs are
+absolute `capture` candidates plus same-tree executor/ECS comparisons. Repairing
+that baseline-schema drift is separate work: silently filling a performance
+baseline after ECS adoption would violate A10 §8.3 more seriously than leaving
+the refusal visible.
+
+Reproduce the measurement (the five-run command pins the same logical CPU):
+
+```bash
+cd gates/migration-bench
+cargo build --release
+for run in 1 2 3 4 5; do
+  taskset -c 0 ./target/release/migration-bench capture \
+    --out "/tmp/capacity-run-${run}.json"
+done
+jq '.metrics.b5_capacity_mirror' /tmp/capacity-run-*.json
+```

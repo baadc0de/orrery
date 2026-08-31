@@ -24,6 +24,8 @@ use orrery_core::{CoreCodec, Quantized, state_hash};
 use orrery_games::game::{Game, GameVisitor, for_each_game};
 use orrery_games::scenario::{SCENARIOS, play};
 
+use crate::capacity::CapacityMirrorBench;
+
 /// Whole-case runs per corpus leg before the timed repetitions.
 const CORPUS_WARMUP: u32 = 3;
 /// Timed whole-case runs per corpus leg. Odd, so p50 is a real sample.
@@ -49,6 +51,12 @@ pub struct SuiteMetrics {
     pub b4_snapshot: Vec<SnapshotBench>,
     /// B-5, claim assembly (quantize + encode + blake3) per logged state.
     pub b5_claim: Vec<ClaimBench>,
+    /// B-5, capacity-scale canonical tick and presentation-byte extraction
+    /// through the public simulation-host seam, on both admitted substrates.
+    /// Default keeps pre-extraction schema-1 baselines readable: absence there
+    /// is historical fact, not a zero measurement.
+    #[serde(default)]
+    pub b5_capacity_mirror: Vec<CapacityMirrorBench>,
 }
 
 /// B-1 for one corpus case: the tick cost of the conformance population.
@@ -136,8 +144,8 @@ pub struct SnapshotBench {
 
 /// B-5 for one game over one scenario: claim assembly per entity-tick —
 /// clone, quantize, canonical encode, blake3, the exact path a `StateClaim`
-/// commits to. The extraction half of B-5 waits for Phase 6 and is recorded
-/// absent.
+/// commits to. The capacity-scale extraction half is measured separately by
+/// [`CapacityMirrorBench`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimBench {
     /// The game's catalogue name.
@@ -182,12 +190,14 @@ pub fn run() -> SuiteMetrics {
     let b4_snapshot = std::mem::take(&mut runner.snapshot);
     let b5_claim = std::mem::take(&mut runner.claim);
     let b3_memory = memory_leg();
+    let b5_capacity_mirror = crate::capacity::run();
     SuiteMetrics {
         b1_corpus: corpus,
         b1_battery,
         b3_memory,
         b4_snapshot,
         b5_claim,
+        b5_capacity_mirror,
     }
 }
 
@@ -472,6 +482,25 @@ pub fn metric_map(metrics: &SuiteMetrics) -> BTreeMap<String, f64> {
         let prefix = format!("b5.claim.{}.{}.", leg.game, leg.scenario);
         out.insert(format!("{prefix}claim_us_p50"), leg.claim_us.p50);
         out.insert(format!("{prefix}claim_us_p99"), leg.claim_us.p99);
+    }
+    for leg in &metrics.b5_capacity_mirror {
+        let prefix = format!("b5.capacity-mirror.{}.{}.", leg.backend, leg.entities);
+        for (metric, spread) in [
+            ("tick_us", leg.tick_us),
+            ("collect_output_us", leg.collect_output_us),
+            ("state_bytes_sweep_us", leg.state_bytes_sweep_us),
+            ("state_bytes_aoi_us", leg.state_bytes_aoi_us),
+        ] {
+            out.insert(format!("{prefix}{metric}_min"), spread.min);
+            out.insert(format!("{prefix}{metric}_p50"), spread.p50);
+            out.insert(format!("{prefix}{metric}_p99"), spread.p99);
+            out.insert(format!("{prefix}{metric}_max"), spread.max);
+        }
+        out.insert(format!("{prefix}output_bytes"), leg.output_bytes as f64);
+        out.insert(
+            format!("{prefix}state_payload_bytes"),
+            leg.state_payload_bytes as f64,
+        );
     }
     out
 }

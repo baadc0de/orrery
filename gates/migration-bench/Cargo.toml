@@ -30,6 +30,7 @@ orrery_core = { path = "../../crates/orrery_core" }
 orrery_protocol = { path = "../../crates/orrery_protocol" }
 orrery_conformance = { path = "../../crates/orrery_conformance" }
 orrery_games = { path = "../../crates/orrery_games" }
+orrery_sim_host = { path = "../../crates/orrery_sim_host" }
 # Claim assembly is measured through the same blake3 the executor and claims
 # use; the harness folds nothing of its own.
 blake3 = "1.8"
