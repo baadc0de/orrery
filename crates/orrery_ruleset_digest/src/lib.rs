@@ -1,27 +1,29 @@
 //! The one D49 source-closure encoder used to generate `RulesetId.digest`.
 //!
-//! This crate intentionally lives only on `orrery_games`' build-dependency
-//! path. It asks Cargo for the resolved normal-dependency closure, then hashes
-//! normalized production Rust sources from its first-party members.
+//! This crate intentionally lives only on the ruleset build-dependency paths.
+//! It derives the normal first-party path-dependency closure directly from the
+//! workspace manifests, then hashes normalized production Rust sources from
+//! its members. Build scripts must never invoke Cargo: the outer Cargo process
+//! owns the package-cache lock while they run.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, Package};
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens;
+use toml::Value;
 
 const DOMAIN: &[u8] = b"orrery-ruleset-digest-v1\0";
 
 /// A result produced by the source-closure encoder.
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-/// A metadata-derived D49 source closure.
+/// A manifest-derived D49 source closure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DigestClosure {
     manifest_path: PathBuf,
@@ -43,15 +45,16 @@ struct SourceUnit {
 }
 
 impl DigestClosure {
-    /// Resolve the normal first-party dependency closure rooted at `manifest`.
-    ///
-    /// Metadata is deliberately locked and offline: a build identity cannot
-    /// depend on a network lookup or on Cargo silently selecting a new graph.
+    /// Resolve the normal first-party path-dependency closure rooted at
+    /// `manifest` without invoking Cargo.
     pub fn from_manifest(manifest: &Path) -> Result<Self> {
         let manifest_path = manifest.canonicalize()?;
-        let metadata = metadata_for(&manifest_path)?;
-        let packages = contributing_crates(&metadata, &manifest_path)?;
+        let workspace_manifest = workspace_manifest_for(&manifest_path)?;
+        let workspace_members = workspace_members(&workspace_manifest)?;
+        let packages =
+            contributing_crates(&manifest_path, &workspace_manifest, &workspace_members)?;
         let mut rerun_inputs = BTreeSet::new();
+        rerun_inputs.insert(workspace_manifest);
         for package in &packages {
             rerun_inputs.insert(package.manifest_path.clone());
             rerun_inputs.extend(
@@ -61,11 +64,6 @@ impl DigestClosure {
                     .map(|source| source.disk_path.clone()),
             );
         }
-        let lockfile = metadata.workspace_root.as_std_path().join("Cargo.lock");
-        if lockfile.is_file() {
-            rerun_inputs.insert(lockfile);
-        }
-
         Ok(Self {
             manifest_path,
             packages,
@@ -74,15 +72,15 @@ impl DigestClosure {
     }
 
     /// Check that the encoded sources and Cargo rerun inputs still exactly
-    /// match a fresh Cargo-metadata closure.
+    /// match a fresh manifest-derived closure.
     ///
     /// This is intentionally independent from digest calculation. A future
     /// accidental omission cannot yield a plausible old digest: the build
     /// script stops before generating its Rust constant.
-    pub fn verify_metadata_closure(&self) -> Result<()> {
+    pub fn verify_manifest_closure(&self) -> Result<()> {
         let fresh = Self::from_manifest(&self.manifest_path)?;
         if self.packages != fresh.packages || self.rerun_inputs != fresh.rerun_inputs {
-            return Err("metadata closure and encoded/rerun input sets differ".into());
+            return Err("manifest closure and encoded/rerun input sets differ".into());
         }
         Ok(())
     }
@@ -115,13 +113,13 @@ impl DigestClosure {
 /// Generate the Rust constant and Cargo rerun directives for the package
 /// whose build script calls this function.
 ///
-/// The helper is shared so every build-script user has the same metadata
+/// The helper is shared so every build-script user has the same manifest
 /// validation, source encoder, and fail-closed output path.
 pub fn generate_build_output() -> Result<()> {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing CARGO_MANIFEST_DIR")?);
     let closure = DigestClosure::from_manifest(&manifest_dir.join("Cargo.toml"))?;
-    closure.verify_metadata_closure()?;
+    closure.verify_manifest_closure()?;
     for input in closure.rerun_inputs() {
         println!("cargo:rerun-if-changed={}", input.display());
     }
@@ -135,73 +133,161 @@ pub fn generate_build_output() -> Result<()> {
     Ok(())
 }
 
-fn metadata_for(manifest: &Path) -> Result<Metadata> {
-    MetadataCommand::new()
-        .manifest_path(manifest)
-        .other_options(vec!["--locked".into(), "--offline".into()])
-        .exec()
-        .map_err(Into::into)
-}
-
-fn contributing_crates(metadata: &Metadata, manifest: &Path) -> Result<Vec<ContributingCrate>> {
-    let root = metadata
-        .packages
-        .iter()
-        .find(|package| package.manifest_path.as_std_path() == manifest)
-        .ok_or("the digest manifest is absent from cargo metadata")?;
-    let workspace_members: BTreeSet<_> = metadata.workspace_members.iter().cloned().collect();
-    let packages: HashMap<_, _> = metadata
-        .packages
-        .iter()
-        .map(|package| (package.id.clone(), package))
-        .collect();
-    let nodes: HashMap<_, _> = metadata
-        .resolve
-        .as_ref()
-        .ok_or("cargo metadata did not return a resolve graph")?
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), node))
-        .collect();
-
-    let mut pending = VecDeque::from([root.id.clone()]);
-    let mut selected = BTreeSet::new();
-    while let Some(package_id) = pending.pop_front() {
-        if !workspace_members.contains(&package_id) || !selected.insert(package_id.clone()) {
-            continue;
-        }
-        let node = nodes
-            .get(&package_id)
-            .ok_or("workspace package is absent from the resolve graph")?;
-        for dependency in &node.deps {
-            if dependency
-                .dep_kinds
-                .iter()
-                .any(|kind| kind.kind == DependencyKind::Normal)
-                && workspace_members.contains(&dependency.pkg)
-            {
-                pending.push_back(dependency.pkg.clone());
+fn workspace_manifest_for(manifest: &Path) -> Result<PathBuf> {
+    let mut directory = manifest.parent();
+    while let Some(candidate_directory) = directory {
+        let candidate = candidate_directory.join("Cargo.toml");
+        if candidate.is_file() {
+            let document = read_manifest(&candidate)?;
+            if document.get("workspace").is_some() {
+                return Ok(candidate);
             }
         }
+        directory = candidate_directory.parent();
+    }
+    Err(format!("no workspace manifest found above {}", manifest.display()).into())
+}
+
+fn workspace_members(workspace_manifest: &Path) -> Result<BTreeSet<PathBuf>> {
+    let document = read_manifest(workspace_manifest)?;
+    let members = document
+        .get("workspace")
+        .and_then(Value::as_table)
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(Value::as_array)
+        .ok_or("workspace manifest has no explicit members array")?;
+    let workspace_root = workspace_manifest
+        .parent()
+        .ok_or("workspace manifest has no parent")?;
+    members
+        .iter()
+        .map(|member| {
+            let member = member.as_str().ok_or("workspace member is not a string")?;
+            if member.contains(['*', '?', '[', ']']) {
+                return Err(format!("workspace member {member:?} uses an unsupported glob").into());
+            }
+            Ok(workspace_root
+                .join(member)
+                .join("Cargo.toml")
+                .canonicalize()?)
+        })
+        .collect()
+}
+
+fn contributing_crates(
+    manifest: &Path,
+    workspace_manifest: &Path,
+    workspace_members: &BTreeSet<PathBuf>,
+) -> Result<Vec<ContributingCrate>> {
+    let mut pending = VecDeque::from([manifest.to_path_buf()]);
+    let mut selected = BTreeSet::new();
+    while let Some(manifest_path) = pending.pop_front() {
+        if !workspace_members.contains(&manifest_path) {
+            return Err(format!(
+                "first-party path dependency {} is not a workspace member",
+                manifest_path.display()
+            )
+            .into());
+        }
+        if !selected.insert(manifest_path.clone()) {
+            continue;
+        }
+        pending.extend(path_dependencies(&manifest_path, workspace_manifest)?);
     }
 
     let mut closure = selected
         .iter()
-        .map(|id| {
-            package_inputs(
-                packages
-                    .get(id)
-                    .copied()
-                    .ok_or("resolve package missing metadata")?,
-            )
-        })
+        .map(|manifest_path| package_inputs(manifest_path))
         .collect::<Result<Vec<_>>>()?;
     closure.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(closure)
 }
 
-fn package_inputs(package: &Package) -> Result<ContributingCrate> {
-    let manifest_path = package.manifest_path.as_std_path().to_path_buf();
+fn path_dependencies(manifest: &Path, workspace_manifest: &Path) -> Result<Vec<PathBuf>> {
+    let document = read_manifest(manifest)?;
+    let mut dependency_tables = Vec::new();
+    if let Some(dependencies) = document.get("dependencies").and_then(Value::as_table) {
+        dependency_tables.push(dependencies);
+    }
+    if let Some(targets) = document.get("target").and_then(Value::as_table) {
+        for target in targets.values() {
+            if let Some(dependencies) = target.get("dependencies").and_then(Value::as_table) {
+                dependency_tables.push(dependencies);
+            }
+        }
+    }
+
+    let manifest_directory = manifest.parent().ok_or("package manifest has no parent")?;
+    let mut paths = Vec::new();
+    for dependencies in dependency_tables {
+        for (name, dependency) in dependencies {
+            let Some(dependency) = dependency.as_table() else {
+                continue;
+            };
+            let direct_path = dependency
+                .get("path")
+                .map(|path| path.as_str().ok_or("dependency path is not a string"))
+                .transpose()?
+                .map(PathBuf::from);
+            let path = if direct_path.is_some() {
+                direct_path
+            } else if dependency
+                .get("workspace")
+                .and_then(Value::as_bool)
+                .is_some_and(|workspace| workspace)
+            {
+                workspace_dependency_path(workspace_manifest, name)?
+            } else {
+                None
+            };
+            if let Some(path) = path {
+                let base = if dependency.get("path").is_some() {
+                    manifest_directory
+                } else {
+                    workspace_manifest
+                        .parent()
+                        .ok_or("workspace manifest has no parent")?
+                };
+                paths.push(base.join(path).join("Cargo.toml").canonicalize()?);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn workspace_dependency_path(workspace_manifest: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let document = read_manifest(workspace_manifest)?;
+    let dependency = document
+        .get("workspace")
+        .and_then(Value::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(Value::as_table)
+        .and_then(|dependencies| dependencies.get(name));
+    let Some(dependency) = dependency else {
+        return Err(format!("workspace dependency {name:?} is not declared").into());
+    };
+    let Some(dependency) = dependency.as_table() else {
+        return Ok(None);
+    };
+    Ok(dependency
+        .get("path")
+        .map(|path| {
+            path.as_str()
+                .ok_or("workspace dependency path is not a string")
+        })
+        .transpose()
+        .map(|path| path.map(PathBuf::from))?)
+}
+
+fn package_inputs(manifest_path: &Path) -> Result<ContributingCrate> {
+    let document = read_manifest(manifest_path)?;
+    let name = document
+        .get("package")
+        .and_then(Value::as_table)
+        .and_then(|package| package.get("name"))
+        .and_then(Value::as_str)
+        .ok_or("package manifest has no package.name")?
+        .to_owned();
     let source_root = manifest_path
         .parent()
         .ok_or("package manifest has no parent")?
@@ -222,10 +308,14 @@ fn package_inputs(package: &Package) -> Result<ContributingCrate> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ContributingCrate {
-        name: package.name.to_string(),
-        manifest_path,
+        name,
+        manifest_path: manifest_path.to_path_buf(),
         sources,
     })
+}
+
+fn read_manifest(path: &Path) -> Result<Value> {
+    Ok(toml::from_str(&fs::read_to_string(path)?)?)
 }
 
 fn collect_rust_sources(directory: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
@@ -333,8 +423,6 @@ fn is_doc_attribute(group: &Group) -> bool {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
-
     use tempfile::TempDir;
 
     use super::DigestClosure;
@@ -365,21 +453,15 @@ mod tests {
             directory.path().join("games/tests/rules.rs"),
             "#[test] fn integration() {}\n",
         );
-        let status = Command::new(env!("CARGO"))
-            .args(["generate-lockfile", "--offline"])
-            .current_dir(directory.path())
-            .status()
-            .expect("run cargo generate-lockfile");
-        assert!(status.success(), "fixture lockfile generation failed");
         directory
     }
 
     fn digest(directory: &TempDir) -> [u8; 32] {
         let closure = DigestClosure::from_manifest(&directory.path().join("games/Cargo.toml"))
-            .expect("derive metadata closure");
+            .expect("derive manifest closure");
         closure
-            .verify_metadata_closure()
-            .expect("metadata closure check");
+            .verify_manifest_closure()
+            .expect("manifest closure check");
         closure.digest().expect("hash closure")
     }
 
@@ -389,13 +471,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_closure_and_rerun_inputs_are_complete() {
+    fn manifest_closure_and_rerun_inputs_are_complete() {
         let directory = fixture();
         let closure = DigestClosure::from_manifest(&directory.path().join("games/Cargo.toml"))
-            .expect("derive metadata closure");
+            .expect("derive manifest closure");
         closure
-            .verify_metadata_closure()
-            .expect("metadata closure check");
+            .verify_manifest_closure()
+            .expect("manifest closure check");
         let inputs = closure
             .rerun_inputs()
             .map(Path::to_path_buf)
@@ -406,17 +488,19 @@ mod tests {
         assert!(inputs
             .iter()
             .any(|input| input.ends_with("core/src/lib.rs")));
-        assert!(inputs.iter().any(|input| input.ends_with("Cargo.lock")));
+        assert!(inputs
+            .iter()
+            .any(|input| input == &directory.path().join("Cargo.toml")));
         assert!(!inputs
             .iter()
             .any(|input| input.ends_with("games/tests/rules.rs")));
     }
 
     #[test]
-    fn metadata_check_rejects_a_stale_rerun_set() {
+    fn manifest_check_rejects_a_stale_rerun_set() {
         let directory = fixture();
         let mut closure = DigestClosure::from_manifest(&directory.path().join("games/Cargo.toml"))
-            .expect("derive metadata closure");
+            .expect("derive manifest closure");
         let omitted = closure
             .rerun_inputs
             .iter()
@@ -424,7 +508,43 @@ mod tests {
             .cloned()
             .expect("game source is an explicit rerun input");
         closure.rerun_inputs.remove(&omitted);
-        assert!(closure.verify_metadata_closure().is_err());
+        assert!(closure.verify_manifest_closure().is_err());
+    }
+
+    #[test]
+    fn manifest_derivation_rejects_a_path_dependency_outside_the_workspace() {
+        let directory = fixture();
+        write(
+            directory.path().join("other/Cargo.toml"),
+            "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            directory.path().join("other/src/lib.rs"),
+            "pub const OTHER: u32 = 1;\n",
+        );
+        write(
+            directory.path().join("games/Cargo.toml"),
+            "[package]\nname = \"orrery_games\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\norrery_core = { path = \"../core\" }\nother = { path = \"../other\" }\n",
+        );
+        assert!(DigestClosure::from_manifest(&directory.path().join("games/Cargo.toml")).is_err());
+    }
+
+    #[test]
+    fn manifest_derivation_follows_workspace_path_dependencies() {
+        let directory = fixture();
+        write(
+            directory.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\nmembers = [\"games\", \"core\"]\n\n[workspace.dependencies]\nlocal_core = { path = \"core\" }\n",
+        );
+        write(
+            directory.path().join("games/Cargo.toml"),
+            "[package]\nname = \"orrery_games\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlocal_core = { workspace = true }\n",
+        );
+        let closure = DigestClosure::from_manifest(&directory.path().join("games/Cargo.toml"))
+            .expect("derive workspace path dependency");
+        assert!(closure
+            .rerun_inputs()
+            .any(|input| input.ends_with("core/src/lib.rs")));
     }
 
     #[test]
