@@ -40,6 +40,14 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 blake3 = "1.8"
+# The archive object format (#807 fixed it, #808 writes it). `default-features
+# = false` is doing the work: the `arrow` feature is what would pull
+# arrow-array/-buffer/-data/-schema, and `async` is what would pull a second
+# runtime. Off, the whole addition is 20 crates (ahash, chrono, half,
+# hashbrown, num-bigint/-integer/-traits, seq-macro, twox-hash and leaves) with
+# no Arrow, no tokio and no compression codecs, and the low-level
+# `SerializedFileWriter` is the API the archive encoder uses.
+parquet = { version = "59", default-features = false }
 iroh = { workspace = true }
 async-trait = "0.1"
 clap = { workspace = true }

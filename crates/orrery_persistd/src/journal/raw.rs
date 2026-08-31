@@ -23,7 +23,6 @@ use crate::journal::{
 };
 
 const PUBLISH_CAPACITY: usize = 4096;
-const SEGMENT_SIZE: u64 = 128 * 1024 * 1024;
 const WAL_SUBDIR: &str = "raw-wal";
 #[cfg(feature = "chain-grpc")]
 const MAX_U64_VARINT_LEN: usize = 10;
@@ -187,12 +186,44 @@ pub struct Journal {
 impl Journal {
     /// Open or recover a raw wal-db journal and start its group committer.
     pub fn open(config: &JournalConfig) -> Result<Self, JournalError> {
+        Self::open_with_segment_size(config, crate::journal::DEFAULT_SEGMENT_SIZE)
+    }
+
+    /// [`Journal::open`] with an explicit logical segment span.
+    ///
+    /// One width for both the physical wal-db segment and the logical
+    /// `Lsn::segment` this journal mints, because the archive tailer's object
+    /// granularity is the logical one and #807's
+    /// `jarchive/{node_id}/{segment_seq}` key is that number
+    /// (docs/08-persistence.md §11.6).
+    ///
+    /// **Every production caller wants [`DEFAULT_SEGMENT_SIZE`].** This entry
+    /// point exists so the archive tests can seal segments without writing
+    /// 128 MiB per segment, and so an operator who has measured the tailer's
+    /// per-segment footprint (§11.6's memory bound) has a way to trade it
+    /// against object count. `0` is read as the default rather than as a
+    /// segment that can hold nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Journal::open`].
+    ///
+    /// [`DEFAULT_SEGMENT_SIZE`]: crate::journal::DEFAULT_SEGMENT_SIZE
+    pub fn open_with_segment_size(
+        config: &JournalConfig,
+        segment_size: u64,
+    ) -> Result<Self, JournalError> {
         let opened_at = std::time::Instant::now();
+        let segment_size = if segment_size == 0 {
+            crate::journal::DEFAULT_SEGMENT_SIZE
+        } else {
+            segment_size
+        };
         let wal_dir = prepare_wal_dir(&config.dir)?;
         let wal = Arc::new(
             Wal::open_segmented_with(
                 &wal_dir,
-                SEGMENT_SIZE,
+                segment_size,
                 WalConfig::new().with_max_record_size(u32::MAX),
             )
             .map_err(|error| JournalError::Store(format!("open raw wal: {error}")))?,
@@ -225,7 +256,7 @@ impl Journal {
         let next_lsn = match recovered.records.last_key_value() {
             Some((lsn, location)) => {
                 let record = read_record_at(&wal, *lsn, location.physical)?;
-                successor(*lsn, encoded_len(&record.record), SEGMENT_SIZE)
+                successor(*lsn, encoded_len(&record.record), segment_size)
             }
             None => Lsn::new(0, 0),
         }
@@ -323,7 +354,7 @@ impl Journal {
             wal_dir,
             index,
             cursor: std::sync::Mutex::new(next_lsn),
-            segment_size: SEGMENT_SIZE,
+            segment_size,
             committer,
             closed: std::sync::atomic::AtomicBool::new(false),
             metrics,
@@ -455,7 +486,13 @@ impl Journal {
         self.committer.committed()
     }
 
-    pub(crate) fn segment_size(&self) -> u64 {
+    /// The logical segment span this journal mints LSNs within.
+    ///
+    /// The archive tailer's object granularity and memory bound
+    /// (docs/08-persistence.md §11.6), and the multiplier
+    /// [`Journal::archive_gap`] turns a segment count into bytes with.
+    #[must_use]
+    pub fn segment_size(&self) -> u64 {
         self.segment_size
     }
 
@@ -812,6 +849,58 @@ impl Journal {
         if let Some(claim) = floor.as_mut() {
             claim.watermark = Some(claim.watermark.map_or(watermark, |c| c.max(watermark)));
         }
+    }
+
+    /// The archive claim's state: whether a tailer has registered, and how far
+    /// it has verified.
+    ///
+    /// The read half of [`Journal::register_archive`] and
+    /// [`Journal::note_archive_watermark`]. The tailer uses it to reconcile a
+    /// recovered watermark against the one already in force; the checkpoint
+    /// scheduler uses it to turn a blocked release into the §15 alarm.
+    pub fn archive_claim(&self) -> crate::journal::ArchiveClaimState {
+        use crate::journal::ArchiveClaimState;
+        match *self.archive_floor.lock().expect("archive floor lock") {
+            None => ArchiveClaimState::Unregistered,
+            Some(ArchiveClaim { watermark: None }) => ArchiveClaimState::Registered,
+            Some(ArchiveClaim {
+                watermark: Some(watermark),
+            }) => ArchiveClaimState::Verified { watermark },
+        }
+    }
+
+    /// How far the archive is behind a proposed retention floor.
+    ///
+    /// `None` when no tailer has claimed this journal — there is no gap to
+    /// report and the archive term is not what is holding the floor.
+    ///
+    /// The distance is measured on the accounted-byte axis the journal's own
+    /// cursor advances on: `segment` counts whole
+    /// [`JournalConfig::segment_size`](crate::journal::JournalConfig::segment_size)
+    /// spans and `offset` the bytes within one, so
+    /// `segments * segment_size + offset` is directly comparable with the
+    /// journal disk an operator is watching fill. An unregistered *watermark*
+    /// (a tailer that has verified nothing) is reported as the whole distance
+    /// from `0:0`, because that is exactly how much the journal must keep.
+    pub fn archive_gap(&self, proposed: Lsn) -> Option<crate::journal::JournalArchiveGap> {
+        use crate::journal::{ArchiveClaimState, JournalArchiveGap};
+        let claim = self.archive_claim();
+        let watermark = match claim {
+            ArchiveClaimState::Unregistered => return None,
+            ArchiveClaimState::Registered => Lsn::new(0, 0),
+            ArchiveClaimState::Verified { watermark } => watermark,
+        };
+        let segments_behind = proposed.segment.saturating_sub(watermark.segment);
+        let bytes_behind = segments_behind
+            .saturating_mul(self.segment_size)
+            .saturating_add(proposed.offset)
+            .saturating_sub(watermark.offset);
+        Some(JournalArchiveGap {
+            proposed,
+            claim,
+            segments_behind,
+            bytes_behind,
+        })
     }
 
     /// Record the retention floor a mirrored chain's **primary** has reached,
@@ -1573,10 +1662,10 @@ fn decode_envelope(bytes: &[u8], lsn: Option<Lsn>) -> Result<RawEnvelope, Journa
 fn decode_record(local_lsn: Lsn, bytes: &[u8]) -> Result<StoredRecord, JournalError> {
     // A frame written before journals were self-describing carries no version
     // trailer, and the bootstrap rule reads it as encoding v0 rather than
-    // refusing it (D38 (d)(1), `orrery_protocol::atrest`). Nothing here acts on
-    // the version — consuming it is W2's job (#281); this reader only proves it
-    // survived the round trip.
-    let (record, _encoding) =
+    // refusing it (D38 (d)(1), `orrery_protocol::atrest`). The version travels
+    // out on the `StoredRecord`: the archive's `encoding_version` column must
+    // say what was on disk, not what this binary would write today.
+    let (record, encoding) =
         JournalRecord::decode_frame(bytes).map_err(|error| JournalError::Corrupt {
             lsn: local_lsn,
             msg: format!("decode journal record: {error}"),
@@ -1584,6 +1673,7 @@ fn decode_record(local_lsn: Lsn, bytes: &[u8]) -> Result<StoredRecord, JournalEr
     Ok(StoredRecord {
         lsn: local_lsn,
         record,
+        encoding,
     })
 }
 

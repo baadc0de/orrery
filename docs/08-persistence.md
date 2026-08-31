@@ -3620,12 +3620,13 @@ and ~95 bytes per record, linearly, which at the P2 gate's own arrival rate is
 a 94 GB journal and a 4.3-minute restart after one hour of run time. The floor
 a node releases to is now the minimum of what its shards have checkpointed and
 what its chain follower has mirrored, so condition (a) above holds and
-condition (b) does not yet: **the archive tailer is a P6 deliverable and
-released records are not archived anywhere.** That is the journal disk holding
-minutes-to-hours, as this section always specified — but anything that needs
-the full event history has to land the tailer first, and when it does it
-contributes one more watermark to the same minimum rather than needing a
-different mechanism. The P2 kill-9 gate holds with retention on: four
+condition (b) is now built too: **the archive tailer landed in §11.6 (#808)**,
+and it contributes one more watermark to the same minimum rather than needing a
+different mechanism, exactly as this section predicted. That is the journal
+disk holding minutes-to-hours, as this section always specified. What is *not*
+built is a real object-store client: the tailer publishes through an in-tree
+`ArchiveStore` trait whose one implementation writes to a local directory, and
+an S3 backend is a separate change against that trait. The P2 kill-9 gate holds with retention on: four
 alternating arms on a qualified `c4d-standard-32-lssd` passed 4/4, retention
 releasing 13 and 17 times inside its two arms' 30-second load phases, with
 `journal_commit_ms` p99 at 1 ms in every arm and every pre-crash
@@ -3685,6 +3686,144 @@ analysis.
 - **Desync forensics and adjudication context** (07-witnessing.md), and
   analytics export (Parquet is directly queryable by the telemetry stack, D12).
 
+### 11.6 The tailer
+
+`orrery_persistd::archive`. One pass is: find the next **sealed** segment, read
+the locally originated records in it, re-sort into §11.1's `(grid, cell, lsn)`
+order, encode one Parquet object, upload it, **re-read and verify it**, commit
+the `jarchive/{node_id}/{segment_seq}` row, and only then advance the archive
+watermark through `Journal::note_archive_watermark` (#806). Enabled by
+`persistd --archive-dir <DIR>`, which implies `--archive-retention` and
+requires `--secret-key` and `--fdb-cluster-file`.
+
+**Sealed segments come from the logical scan, not from wal-db.** There is no
+"list sealed segments" API and the tailer does not add one. `Lsn::segment` *is*
+a segment sequence number minted by this journal: `raw.rs`'s append cursor rolls
+it forward by one whenever a record's accounted span would carry `offset` past
+the segment width, so it is the journal's own number and it is exactly the
+number #807 put in the metadata key. Segment `s` is **sealed** when
+`Journal::committed()` — the highest position through a group durability
+barrier — has a `segment` strictly greater than `s`. The cursor is monotone, so
+a sealed segment is closed for good and the tailer cannot read one the writer is
+still appending to. Reading wal-db's physical files instead would mean
+re-deriving that mapping from a framing layer wal-db owns (`raw.rs:3`), and
+putting a second reader on files the writer truncates underneath.
+
+**The memory bound.** An object cannot be emitted until its input range is
+complete, so the tailer buffers one segment. A segment spans `segment_size`
+*accounted* bytes, where a record's accounted span is `payload.len() + 64`.
+Peak resident memory for one pass is
+
+```text
+  payload bytes (≤ segment_size)
++ per-record struct overhead (152 B × record count, count ≤ segment_size / 64)
++ the encoded Parquet object (≈ payload bytes + ~30 B/row; objects are uncompressed)
+```
+
+At D19's 128 MiB the record count is bounded by **2 097 152** (128 MiB / 64 B, a
+zero-length payload being the smallest accounted span) and the buffer by
+**432 MiB**, with the encoded object on top of that. The two figures are
+arithmetic over `size_of::<StoredRecord>()` and are pinned by
+`archive::tailer::bound_tests`, so the struct cannot grow past this paragraph
+in silence. `Journal::open_with_segment_size` is what makes the width — and
+therefore the bound — settable: halving it halves the footprint and doubles the
+object count.
+
+**Ordering, which is the whole of the crash-safety argument.** D20 rule 6's
+discipline on the archive axis: the durable marker always precedes the thing it
+describes, and the window between costs a retry rather than a record.
+
+| Crash point | What survives | What the restart does |
+|---|---|---|
+| before the upload completes | nothing | re-archives the segment |
+| between the upload and the `jarchive/` row | the object, no row | re-derives the watermark from the rows, re-reads the same records, re-encodes the **same bytes**, re-uploads to the **same key** — one row results, no duplicate |
+| between the row and the watermark | the row | derives the higher watermark from it; nothing is repeated |
+
+Three properties make that work. The **object key is deterministic** in
+`(node_id, segment_seq)` and nothing else — no timestamp, no attempt counter —
+so a retry overwrites. The **encoding is deterministic** in its input: the sort
+key `(grid, cell, lsn)` is total because an `Lsn` is unique within a journal,
+and the writer properties are pinned rather than defaulted per build. And
+**verification re-reads the store** (§11.3): the tailer hashes what it encoded,
+uploads, then fetches the key back and hashes *those* bytes. Re-hashing its own
+buffer would pass against a store that dropped the object on the floor.
+
+**Failure is surfaced, not swallowed.** A failed pass returns a named stage —
+`upload`, `verify`, `metadata`, `journal`, `encode` — carrying the store's own
+message, retries with exponential backoff to a bounded ceiling (every second of
+backoff is a second of journal the clamp will not release), and after three
+consecutive failures logs at `warn` with the segment count and byte count the
+journal is being asked to hold. See §15 and
+[09-services-and-ops.md](09-services-and-ops.md) §10 for the alarm this feeds.
+
+**Startup watermark recovery.** Nothing persists the watermark as a number of
+its own — a second durable fact could disagree with the rows, and the
+disagreement would surface as either a re-archive or a permanently blocked
+release. A restarting node scans its own `jarchive/{node_id}` range, takes
+`max(segment_seq) + 1`, and reports `Lsn::new(next, 0)`. The retention floor is
+the second term of that maximum, for the case the flag was off and is now on:
+a journal released past its archive resumes where its journal still starts,
+rather than re-scanning a released range or starting at zero and blocking
+release forever.
+
+**Node identity (the rule, not an assumption).** `jarchive/{node_id}/…` is per
+node and LSNs are node-local, and D20 rule 3 refuses to compare a
+promotion-adopted chain's watermark with this journal's. The same refusal
+governs the archive:
+
+1. **A tailer archives only what its own node originated** — `scan_originated_from`,
+   not `scan_from`. The journal overwrites `record.lsn` with the local position
+   for an originated record and *restores the origin's* for a mirrored one, so
+   mirrored records carry a foreign LSN space in the very column §11.1 sorts and
+   prunes on. Archiving them under this node's `node_id` would file two
+   incomparable LSN spaces under one key prefix.
+2. **Recovery reads only this node's rows**, by construction: the range bounds
+   are `jarchive_node_range_start/_end(node_id)`.
+3. **A sealed segment with no originated records still advances the
+   watermark**, publishing no object and writing no row. Without this a passive
+   chain follower — which originates nothing (D23) — would register a claim it
+   could never satisfy and block its mirror's release forever. `persistd`
+   therefore refuses `--archive-dir` on a follower outright.
+
+The consequence, stated rather than hidden: **a record is archived by the node
+that originated it, or not at all.** A promoted node inherits the source's
+history in its journal but not in its archive; the source's own
+`jarchive/{source}` rows cover it. If the source never ran a tailer, those
+records reached the durable tier through the checkpoints that released them and
+are absent from the archive — a gap in the *source's* coverage, not something a
+promoted node can repair by relabelling another node's LSNs as its own.
+
+**One reader rule about `cell_ranges`.** The entries are half-open
+`[start, end)` intervals over `CellId` bits, coalesced across contiguous cells
+in one grid. `end` is itself a `CellId`, so the largest exclusive bound
+representable is `u64::MAX` — which does not cover the cell whose own encoding
+*is* `u64::MAX` (reachable: a level-21 cell with every Morton bit set under the
+sentinel at bit 63). The tailer saturates rather than dropping that cell from
+the coverage of an object it is in, so **a range whose `end` is `u64::MAX` is
+read as covering `u64::MAX` too**. It is the only place `cell_ranges` is not a
+plain half-open interval.
+
+**Object store.** `ArchiveStore` is an in-tree trait — `put` (atomic and
+idempotent by key), `get` (reads the store, never a writer-side cache) — with
+one implementation, `FsArchiveStore`, over a local directory. A real client
+(`object_store`, or the AWS SDK) brings its own async runtime, credential chain
+and retry layer competing with the tailer's, plus a region/endpoint
+configuration surface; none of that is what #808 is about, and every property
+above is testable against any store that can put and get by key. The S3 backend
+is a later change against a trait whose contract this change's tests already
+pin.
+
+**Format.** `parquet = "59"` with `default-features = false`, through the
+low-level `SerializedFileWriter` rather than the Arrow bridge. Turning the
+default features off is what makes this small: `arrow` is what pulls
+arrow-array/-buffer/-data/-schema and `async` is what pulls a second runtime.
+Without them the addition is 20 crates and no Arrow, no tokio, no compression
+codecs — the cost being uncompressed objects. Parquet has no unsigned integer
+physical types, so §11.1's `u64` columns ride INT64 and its `u32`/`u8` columns
+ride INT32, with the same bit patterns; `kind` discriminants are pinned in
+source rather than derived, because a variant inserted in the middle would
+otherwise silently re-number every object ever written.
+
 ## 12. Hotspot management
 
 Two tiers of defense against the crowd-event failure mode ([FDB issue #11510](https://github.com/apple/foundationdb/issues/11510): continuous-keyspace write hotspots cause storage-server queue growth):
@@ -3742,6 +3881,7 @@ Every column is linear in players — no quadratic terms — and the 100 k colum
 | FDB unavailable (netsplit posture, D12) | bulk path keeps journaling and acking (durability window widens to journal+follower); checkpoints and intents queue; P2P sim continues — degraded, not dead |
 | Gateway ingress backlog (burst, or a stalled receive loop) | diffs older than 25 ms in the inbound queue, diffs arriving with every route slot busy, and diffs the router cannot admit to a journal within 25 ms of arrival, are dropped un-acked and counted (`gateway_ingress` counters — `shed_stale`, `shed_saturated`, `shed_slow_route` — with `WARN` totals); the client's pending diff is re-offered on its next flush (§2.1) |
 | Journal disk full / fsync stall | bulk acks shed first (clients buffer unacked diffs); intents unaffected (FDB path); alarm before shed via watermark telemetry |
+| Archive unreachable, with the retention clamp on | the archive watermark stops, the retention floor stops with it, and the journal grows at the arrival rate (~26 MB/s at the P2 gate's load, D20) — the slow path into the row above. Two `warn` alarms fire long before the disk does: the tailer's own, after three consecutive failed passes, naming the stage (`upload`/`verify`/`metadata`) and the store's message; and the checkpoint scheduler's, once the floor-to-watermark gap passes four segments (512 MiB). Runbook: [09-services-and-ops.md](09-services-and-ops.md) §10, "archive unreachable" |
 | Checkpoint > 10 MB | multi-transaction batches; watermark row commits last → partial checkpoint is invisible and re-run idempotently |
 | Entity > 100 KB | row sharding `world/{cell}/{entity}/{k}`; read as one range |
 | Duplicate/replayed intent | `intent/{intent_id}` idempotency row returns the recorded outcome |

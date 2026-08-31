@@ -204,6 +204,7 @@ mislocates it sends an operator to the wrong process on the worst day.
 | Discrepancy report rate | `orrery_witness` → audit | baseline per CCU | spike = cheat wave or bad tolerance bands |
 | False-positive strike rate | adjudication outcomes | ≈ 0 (shadow mode first, D17.3) | any confirmed FP |
 | Journal commit (server-internal) | persistd (`journal_commit_ms`, both primary and follower — each reports its *own* journal) | **< 2 ms** (adaptive group commit: fsync-when-idle, ~0.5 ms batching under load) | commit p99 > 2 ms |
+| Archive lag (floor − archive watermark) | persistd — `Journal::archive_gap`, reported on the checkpoint round's blocked-release line (`segments_behind`, `bytes_behind`), and by the tailer's own `ArchiveTailerStatus` | 0–1 segments | `warn` at ≥ 4 segments (512 MiB) behind, or any tailer with 3 consecutive failed passes — see §10 |
 | Chain-follower lag | persistd, **in-process only** — `ChainSnapshot` carries `lag_bytes`, `progress_age_ms`, `failed_pushes` and `behind`; `orrery_protocol::metrics::CHAIN_SERIES` names the wire spellings and nothing writes them to the artifact yet | ≤ 100 ms | follower lag > 1 s |
 | FDB load ratio | FDB metrics | < 75% | > 75% |
 | Lease-expiry orphan rate | lease registrar | baseline | spike = peer-crash wave or netsplit |
@@ -228,6 +229,48 @@ metrics" means "restart with `--metrics-jsonl`".
 **FDB degraded.** Single node loss: FDB self-heals, brief commit-latency blip, no action. Quorum loss / cluster unavailable: every FDB call **fails within a bounded time** rather than blocking — persistd opens each database handle through `orrery_persistd::fdb::FdbContext::connect`, which sets a transaction timeout (10 s by default, `ORRERY_FDB_TRANSACTION_TIMEOUT_MS`) and a retry limit, so an unreachable cluster surfaces as a store error at the adapter instead of a call that never returns. That bound is the precondition for everything else in this runbook: nothing can queue behind, pause, or fall back to a call with no end. Intents then queue **client-side** (the offline queue in `orrery_persist_client`), checkpoints pause, lease CAS operations pause (existing leases honored by TTL semantics; expiry processing resumes on recovery) — and the bulk path continues: cell actors keep applying diffs and journaling locally, so the hot tier keeps absorbing gameplay. Recovery: restore quorum, drain queued intents in order, resume checkpoints. RPO for bulk state remains journal-bounded, not FDB-bounded.
 
 *Gap:* the **gateway-side bounded intent queue** this posture also calls for is not implemented. Today a client that reaches the gateway during a quorum loss gets the adapter's store error back and must fall back to its own offline queue; an intent already accepted by the gateway is not held for the cluster's return.
+
+**Archive unreachable (`--archive-dir` / `--archive-retention`).** Symptom: a
+`warn` line from the checkpoint round — *"the archive is not keeping up; the
+journal cannot reclaim and will fill"* — carrying `segments_behind` and
+`bytes_behind`, and/or the tailer's own *"archive tailer is stalled"* naming a
+`stage` of `upload`, `verify` or `metadata`. What is happening: the retention
+clamp (D20, #806) holds the journal floor behind the verified archive
+watermark, so an archive that has stopped means a journal that has stopped
+reclaiming, growing at the arrival rate (~26 MB/s at the P2 gate's load). This
+is the correct trade — bulk state is the shed-able class and history is not
+re-creatable — but it is a countdown to
+[08-persistence.md](08-persistence.md) §15's "journal disk full → bulk acks
+shed". **Player impact is nil until the disk fills**, so there is real time to
+act; `bytes_behind` against free disk is how much.
+
+Triage, in order:
+
+1. **Read the `stage`.** `upload` is the object store or the path to it;
+   `verify` means the upload was accepted and read back wrong — a truncated or
+   silently-dropped object, which is a store problem, not a tailer bug;
+   `metadata` is FoundationDB, so check the FDB runbook above first, since the
+   `jarchive/` rows live in the same cluster as the checkpoints.
+2. **Is it a follower?** A chain follower originates nothing, so a follower
+   started with `--archive-retention` and no tailer blocks its mirror
+   permanently — its archive term can never be satisfied. `--archive-dir` is
+   refused on a follower for exactly this reason; the fix is to drop
+   `--archive-retention` there. The follower's mirror is bounded by the
+   primary's own floor (D23), not by an archive.
+3. **Buy time if the disk is close.** Restarting without `--archive-retention`
+   lets the floor advance again on checkpoints alone. **This is destructive of
+   history**: records released while the clamp is off are gone from the journal
+   and were never archived, and the tailer cannot go back for them — on restart
+   it resumes at the new retention floor rather than re-scanning a released
+   range. Prefer adding disk. Take this only against an imminent full disk, and
+   record the LSN range it costs.
+4. **Recovery is automatic.** The tailer retries with bounded backoff and needs
+   no intervention once the store answers: it re-uploads to the same
+   deterministic key, so a partial upload from before the outage is overwritten
+   rather than duplicated, and the watermark then advances and the floor
+   follows on the next checkpoint round. Verify: the tailer's `warn` stops, the
+   `released journal below the checkpoint floor` line returns, and
+   `segments_behind` goes to zero.
 
 **Coordinator loss.** §6: standby CAS-acquires the leader lease, peers re-report, < 30 s to full topology knowledge. Player-visible impact: newly-arriving players wait for island assignment; ongoing play unaffected. If both instances die, running islands continue indefinitely — the system degrades to "no new matchmaking," which is the designed posture.
 

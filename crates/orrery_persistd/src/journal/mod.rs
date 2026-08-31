@@ -51,6 +51,23 @@ pub struct JournalConfig {
     pub commit: GroupCommitConfig,
 }
 
+/// The logical segment span, in accounted bytes (D19, 128 MiB).
+///
+/// This is the width of one `Lsn::segment`: the journal's append cursor rolls
+/// to `segment + 1` when a record's accounted span would carry the offset past
+/// it. It is therefore also the archive tailer's object granularity and its
+/// memory bound — the tailer buffers one segment in order to re-sort it into
+/// `(grid, cell, lsn)` order (docs/08-persistence.md §11.6).
+///
+/// It is a constructor argument
+/// ([`Journal::open_with_segment_size`](crate::journal::Journal::open_with_segment_size))
+/// rather than a [`JournalConfig`] field, deliberately: it is a property of the
+/// backing store's framing rather than of a deployment's tuning, every
+/// production caller wants this value, and adding a field would have meant a
+/// mechanical edit to fifty unrelated call sites for a parameter only the
+/// archive tests vary.
+pub const DEFAULT_SEGMENT_SIZE: u64 = 128 * 1024 * 1024;
+
 impl Default for JournalConfig {
     fn default() -> Self {
         Self {
@@ -192,6 +209,56 @@ impl Default for JournalRetention {
         }
     }
 }
+
+/// Whether an archive tailer has claimed this journal, and how far it has
+/// verified (D20 rule 3's shape, on the archive axis).
+///
+/// Three states rather than an `Option<Lsn>`, because "no tailer" and "a
+/// tailer that has verified nothing yet" have opposite meanings for
+/// retention: the first abstains from the floor entirely, the second blocks
+/// release with [`ReleaseBlocked::ArchiveLag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveClaimState {
+    /// No tailer registered. The archive term abstains from the floor.
+    Unregistered,
+    /// A tailer registered but has verified nothing yet. Release is blocked.
+    Registered,
+    /// A tailer has verified through `watermark`.
+    Verified {
+        /// The highest position whose archive object is verified and recorded.
+        watermark: Lsn,
+    },
+}
+
+/// The distance between a proposed retention floor and the archive watermark
+/// that is holding it back — the number §15's "alarm before shed" is about.
+///
+/// With the clamp registered and the archive unreachable, the floor stops
+/// advancing and the journal grows at the arrival rate. This is that growth,
+/// measured on the axis the operator can act on, and it is why
+/// [`ReleaseBlocked::ArchiveLag`] is escalated rather than logged at `trace`
+/// like every other blocked release (docs/09-services-and-ops.md §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalArchiveGap {
+    /// The floor the checkpoint scheduler proposed.
+    pub proposed: Lsn,
+    /// The archive claim's state when the gap was taken.
+    pub claim: ArchiveClaimState,
+    /// Whole logical segments the archive is behind the proposal.
+    pub segments_behind: u64,
+    /// Accounted journal bytes the archive is behind the proposal — the
+    /// quantity that fills the journal disk.
+    pub bytes_behind: u64,
+}
+
+/// Segments of archive lag at which a blocked release stops being routine and
+/// becomes the §15 alarm.
+///
+/// Four segments is 512 MiB of accounted journal at the default
+/// [`DEFAULT_SEGMENT_SIZE`] — about 20 s of the P2 gate's own arrival rate
+/// (~26 MB/s, D20), so one lagging round does not alarm and a tailer that has
+/// actually stopped does so within seconds.
+pub const ARCHIVE_LAG_ALARM_SEGMENTS: u64 = 4;
 
 /// A handle representing one pending journal append.
 ///
@@ -390,6 +457,16 @@ pub struct StoredRecord {
     pub lsn: Lsn,
     /// The record itself.
     pub record: JournalRecord,
+    /// The at-rest encoding version the frame carried (D38 (d)(5)).
+    ///
+    /// A frame written before journals were self-describing carries no
+    /// trailer and reads back as
+    /// [`ENCODING_V0`](orrery_protocol::atrest::ENCODING_V0) under the
+    /// bootstrap rule. The archive schema has an `encoding_version` column
+    /// (docs/08-persistence.md §11.1) and it must record what was *on disk*,
+    /// not what this binary would write today — so the reader carries the
+    /// version out instead of dropping it.
+    pub encoding: orrery_protocol::atrest::EncodingVersion,
 }
 
 /// A journal read: iterate records at or after a starting LSN.

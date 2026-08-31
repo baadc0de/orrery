@@ -116,9 +116,94 @@ fn release_journal(journal: &crate::journal::Journal, floor: Lsn) {
                 bytes_after = release.bytes_after,
                 "released journal below the checkpoint floor"
             ),
+            // Every blocked release but one is routine and stays at `trace`.
+            // `ArchiveLag` is the exception, because it is the only reason
+            // whose cost *grows*: the other clamps are held by a peer that is
+            // catching up on the same journal, while an unreachable archive
+            // holds the floor while records keep arriving. See
+            // [`report_archive_lag`].
+            Some(crate::journal::ReleaseBlocked::ArchiveLag) => {
+                report_archive_lag(journal, floor);
+            }
             Some(reason) => tracing::trace!(floor = %floor, %reason, "journal release did nothing"),
         },
         Err(error) => tracing::warn!(floor = %floor, %error, "journal release failed"),
+    }
+}
+
+/// Whether an archive gap has passed the point where a blocked release stops
+/// being routine and becomes the §15 alarm.
+///
+/// Split out from [`report_archive_lag`]'s logging so the escalation itself is
+/// assertable: a log level is not something a test can read back, and "the
+/// alarm fires" is the property, not "a `warn!` macro was reached".
+///
+/// A gap with no verified watermark at all always alarms. A tailer that has
+/// registered and verified nothing is either starting up — in which case the
+/// journal has nothing to release yet and this costs one line — or it has
+/// never once succeeded, which is the worst version of the countdown rather
+/// than a lesser one.
+#[must_use]
+fn archive_lag_alarms(gap: &crate::journal::JournalArchiveGap) -> bool {
+    use crate::journal::{ArchiveClaimState, ARCHIVE_LAG_ALARM_SEGMENTS};
+    match gap.claim {
+        ArchiveClaimState::Unregistered => false,
+        ArchiveClaimState::Registered => true,
+        ArchiveClaimState::Verified { .. } => gap.segments_behind >= ARCHIVE_LAG_ALARM_SEGMENTS,
+    }
+}
+
+/// The §15 alarm: a release blocked on the archive, escalated by how far
+/// behind the archive is.
+///
+/// docs/08-persistence.md §15 promises "alarm before shed via watermark
+/// telemetry" for the journal-disk-full failure mode, and #806's clamp is what
+/// makes an unreachable archive a path to it: the floor stops advancing, the
+/// journal stops reclaiming, and it grows at the arrival rate the P2 gate
+/// measures (~18 000 records/s, ~26 MB/s — D20). Logging that at `trace` like
+/// any other blocked release would be shipping a silent countdown.
+///
+/// The escalation is a pure function of the gap rather than a rate limiter,
+/// which is what lets it live in this stateless helper: below
+/// [`ARCHIVE_LAG_ALARM_SEGMENTS`] the tailer is merely behind — one slow
+/// upload on a 20 s cadence — and above it the journal is holding more than
+/// half a gigabyte it cannot let go of. Either way this runs at most once per
+/// checkpoint round, which is the same budget the `info` arm above is written
+/// to.
+///
+/// [`ARCHIVE_LAG_ALARM_SEGMENTS`]: crate::journal::ARCHIVE_LAG_ALARM_SEGMENTS
+fn report_archive_lag(journal: &crate::journal::Journal, floor: Lsn) {
+    use crate::journal::ArchiveClaimState;
+
+    let Some(gap) = journal.archive_gap(floor) else {
+        // No archive claim, so `ArchiveLag` cannot be the reason. Unreachable
+        // via `release_before`, which only returns the variant under a
+        // registered claim; reported rather than assumed away.
+        tracing::trace!(floor = %floor, "journal release did nothing");
+        return;
+    };
+    let watermark = match gap.claim {
+        ArchiveClaimState::Verified { watermark } => Some(watermark),
+        ArchiveClaimState::Registered | ArchiveClaimState::Unregistered => None,
+    };
+    if archive_lag_alarms(&gap) {
+        tracing::warn!(
+            floor = %floor,
+            watermark = ?watermark.map(|w| w.to_string()),
+            segments_behind = gap.segments_behind,
+            bytes_behind = gap.bytes_behind,
+            reason = %crate::journal::ReleaseBlocked::ArchiveLag,
+            "the archive is not keeping up; the journal cannot reclaim and will fill              (docs/09-services-and-ops.md §10, \"archive unreachable\")"
+        );
+    } else {
+        tracing::trace!(
+            floor = %floor,
+            watermark = ?watermark.map(|w| w.to_string()),
+            segments_behind = gap.segments_behind,
+            bytes_behind = gap.bytes_behind,
+            reason = %crate::journal::ReleaseBlocked::ArchiveLag,
+            "journal release did nothing"
+        );
     }
 }
 
@@ -494,6 +579,51 @@ mod tests {
     use crate::{CellRuntime, JournalConfig, RuntimeConfig};
 
     use super::*;
+
+    /// The §15 alarm's escalation rule, asserted directly rather than through
+    /// a log level nothing can read back.
+    ///
+    /// Landing the tailer without this alarm is landing a silent countdown
+    /// (#808), so the boundary is pinned: a routine lag stays quiet, a gap of
+    /// [`ARCHIVE_LAG_ALARM_SEGMENTS`] alarms, and a claim that has verified
+    /// nothing at all alarms immediately.
+    ///
+    /// [`ARCHIVE_LAG_ALARM_SEGMENTS`]: crate::journal::ARCHIVE_LAG_ALARM_SEGMENTS
+    #[test]
+    fn the_archive_lag_alarm_fires_at_the_stated_gap_and_not_before() {
+        use crate::journal::{ArchiveClaimState, JournalArchiveGap, ARCHIVE_LAG_ALARM_SEGMENTS};
+
+        let gap = |claim, segments_behind| JournalArchiveGap {
+            proposed: Lsn::new(segments_behind, 0),
+            claim,
+            segments_behind,
+            bytes_behind: segments_behind * crate::journal::DEFAULT_SEGMENT_SIZE,
+        };
+        let verified = ArchiveClaimState::Verified {
+            watermark: Lsn::new(0, 0),
+        };
+
+        assert!(
+            !archive_lag_alarms(&gap(verified, 0)),
+            "a caught-up archive is not an alarm"
+        );
+        assert!(
+            !archive_lag_alarms(&gap(verified, ARCHIVE_LAG_ALARM_SEGMENTS - 1)),
+            "one round behind is routine and stays at trace"
+        );
+        assert!(
+            archive_lag_alarms(&gap(verified, ARCHIVE_LAG_ALARM_SEGMENTS)),
+            "at the stated gap the journal is holding half a gigabyte it cannot release"
+        );
+        assert!(
+            archive_lag_alarms(&gap(ArchiveClaimState::Registered, 0)),
+            "a claim that has verified nothing is the worst case, not a lesser one"
+        );
+        assert!(
+            !archive_lag_alarms(&gap(ArchiveClaimState::Unregistered, 99)),
+            "with no claim the archive is not what is holding the floor"
+        );
+    }
 
     fn test_runtime_config(dir: &std::path::Path) -> RuntimeConfig {
         RuntimeConfig {

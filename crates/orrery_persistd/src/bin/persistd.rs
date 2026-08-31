@@ -255,6 +255,31 @@ struct Cli {
     #[arg(long)]
     archive_retention: bool,
 
+    /// Run the journal-to-archive tailer, writing Parquet objects under this
+    /// directory (#808, docs/08-persistence.md §11.6).
+    ///
+    /// Implies `--archive-retention`: a tailer that runs while the journal is
+    /// free to release ahead of it would have its own input deleted underneath
+    /// it, which is the whole reason #806's clamp landed first.
+    ///
+    /// The backend is `FsArchiveStore` — a local directory. That is the
+    /// object-store seam's one implementation today; an S3 client is a
+    /// separate change against `ArchiveStore`, which is why this flag names a
+    /// path rather than a bucket URI.
+    ///
+    /// **Requires `--secret-key`.** The archive is keyed by this node's durable
+    /// `NodeId` in both places that matter — the object key and the
+    /// `jarchive/{node_id}` metadata range — so a node whose identity is minted
+    /// afresh each start would archive into a new namespace every run and
+    /// recover a watermark of zero from an empty range every time.
+    #[arg(long, value_name = "DIR")]
+    archive_dir: Option<std::path::PathBuf>,
+
+    /// Key prefix inside the archive store, so one store can hold several
+    /// clusters. Objects land at `{prefix}/jarchive/{node hex}/{seq}.parquet`.
+    #[arg(long, value_name = "PREFIX", default_value = "")]
+    archive_prefix: String,
+
     /// Checkpoint cadence in milliseconds, overriding D16's 20 s (jitter is
     /// held at a quarter of it, as the default pair is).
     ///
@@ -1046,7 +1071,12 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Arc::new(
         CellRuntime::open_with_lease_store(&config, &checkpoint_store, lease_store).await?,
     );
-    if cli.archive_retention {
+    if cli.archive_retention || cli.archive_dir.is_some() {
+        // Registered here, before anything can propose a floor, so the clamp
+        // is armed for the whole life of the process. `ArchiveTailer::open`
+        // registers too — the call is idempotent — but it runs after the
+        // gateway, and the window in between must not be a window in which
+        // release is unbounded.
         runtime.journal().register_archive();
     }
     tracing::info!(
@@ -1396,11 +1426,73 @@ async fn main() -> anyhow::Result<()> {
         let _ = handle.flush();
     }
 
+    // ── Archive tailer (#808) ───────────────────────────────────────────
+    //
+    // Started after the gateway because the gateway's `NodeId` *is* the
+    // node's durable identity, and both halves of the archive are keyed by it:
+    // the object key and the `jarchive/{node_id}` range the watermark is
+    // recovered from. `--secret-key` is what makes that identity survive a
+    // restart, which is why it is required rather than merely recommended.
+    let archive_tailer: Option<orrery_persistd::archive::ArchiveTailerHandle> =
+        match cli.archive_dir.clone() {
+            None => None,
+            Some(dir) => {
+                if cli.secret_key.is_none() {
+                    anyhow::bail!(
+                        "--archive-dir requires --secret-key: the archive is keyed by this node's \
+                     NodeId, and an ephemeral identity would archive into a fresh namespace on \
+                     every start"
+                    );
+                }
+                // The `jarchive/` rows belong in the same durable tier as the
+                // checkpoints that bound the other half of the release
+                // precondition. Without FDB there is nowhere durable to put them,
+                // and an in-memory index would make every restart re-archive from
+                // the floor — so this is refused rather than silently downgraded.
+                #[cfg(not(feature = "fdb"))]
+                {
+                    let _ = dir;
+                    anyhow::bail!(
+                    "--archive-dir requires the `fdb` feature: the jarchive/ metadata rows have \
+                     no durable home without it"
+                );
+                }
+                #[cfg(feature = "fdb")]
+                {
+                    let context = fdb_context.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                        "--archive-dir requires --fdb-cluster-file: the jarchive/ metadata rows \
+                         are the durable record a restart recovers its archive watermark from"
+                    )
+                    })?;
+                    let tailer = orrery_persistd::archive::ArchiveTailer::open(
+                        Arc::clone(runtime_for_shutdown.journal()),
+                        Arc::new(orrery_persistd::archive::FsArchiveStore::open(&dir)?),
+                        Arc::new(orrery_persistd::archive::FdbJarchiveIndex::new(
+                            context.database(),
+                        )),
+                        gateway.id(),
+                        cli.archive_prefix.clone(),
+                        orrery_persistd::archive::ArchiveTailerConfig::default(),
+                    )
+                    .await?;
+                    tracing::info!(
+                        dir = %dir.display(),
+                        prefix = %cli.archive_prefix,
+                        status = ?tailer.status(),
+                        "archive tailer started"
+                    );
+                    Some(orrery_persistd::archive::spawn_archive_tailer(tailer))
+                }
+            }
+        };
+
     tracing::info!(
         gateway = %gateway.id(),
         node_id = topology.node_id,
         shards = topology.shards.len(),
         role = topology.role.name(),
+        archive_tailer = archive_tailer.is_some(),
         startup_elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd cluster up"
     );
@@ -1449,6 +1541,12 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(reporter) = metrics_reporter {
         reporter.shutdown().await;
+    }
+
+    // Before the journal close below: the tailer holds an `Arc<Journal>`, and
+    // a pass mid-flight would be reading a journal being torn down.
+    if let Some(tailer) = archive_tailer {
+        tailer.shutdown().await;
     }
 
     // Close each runtime's journal explicitly.
@@ -1910,6 +2008,18 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
     if cli.secret_key.is_some() {
         anyhow::bail!(
             "--secret-key is not valid for a chain follower; --node-id is its stable chain identity"
+        );
+    }
+    if cli.archive_dir.is_some() {
+        // A follower originates nothing (D23): every record in its journal is
+        // mirrored, carries the *primary's* LSN space, and is archived by the
+        // primary under the primary's own `jarchive/{node_id}` range. A tailer
+        // here would have nothing to archive and no identity to archive it
+        // under — a follower has no `NodeId`, only `--node-id`. Refusing is
+        // the honest answer; see docs/08-persistence.md §11.6 item 7.
+        anyhow::bail!(
+            "--archive-dir is not valid for a chain follower; a follower originates no records \
+             and its mirror is bounded by the primary's own retention floor (D23)"
         );
     }
 
@@ -2914,6 +3024,8 @@ mod tests {
             authority_correction: AuthorityCorrectionEnforcement::Off,
             no_journal_retention: false,
             archive_retention: false,
+            archive_dir: None,
+            archive_prefix: String::new(),
             checkpoint_interval_ms: None,
             hot_ledger_sweep_interval_ms: 3_600_000,
             dev_seed: None,
