@@ -351,14 +351,30 @@ import sys
 REPO = os.environ["LANE_DIFF_AUDIT_REPO"]
 MAIN = sys.argv[1]
 
-# A mutation commit must say that it deliberately creates a broken/failing
-# state. This recognizes the repository's normal wording without treating an
-# ordinary bug fix that happens to mention "broken" as a mutation check.
+# A mutation commit must say that it is *breaking* something, not merely that
+# it exercises a mutation check. The load-bearing signal is a break verb aimed
+# at a build, test, or CI target ("break the compile", "break CI"), an explicit
+# "deliberately break", or a mutation/fault/failure check whose subject also
+# names the break ("for CI", "breaks the parser"). That is what separates
+# "test: break regolith compile for CI mutation check" (a deliberate break)
+# from "test: mutation-check every criterion" (a test that mutates fixtures)
+# and "fix: repair broken CI" (a fix). The word "broken" is deliberately not
+# a break verb, so an ordinary repair never trips this.
+#
+# The break verb must be the subject's *action*, i.e. the imperative that
+# conventional-commit subjects open with after the optional `type(scope):`
+# prefix. Matching "break" anywhere alongside a build word is too loose: it
+# flags "fix(lane-diff-audit): a break verb, not a bare mutation-check
+# mention", where "break" is a noun inside prose about the check itself.
+# That subject is this very commit, and an earlier draft of this pattern
+# refused it.
+SUBJECT_ACTION = r"^(?:[a-z]+(?:\([^)]*\))?!?:\s*)?(?:deliberately\s+|intentionally\s+|purposefully\s+)?"
 MUTATION_SUBJECT = re.compile(
     r"(?:"
-    r"\b(?:mutation|fault|failure)[ -]?(?:check|test|injection)\b"
+    + SUBJECT_ACTION + r"break(?:s|ing)?\b.*\b(?:compile|build|ci|check|test|guard)\b"
     r"|\b(?:deliberately|intentionally|purposefully)\s+\w*break\w*\b"
-    r"|\bbreak\w*\b.*\b(?:ci|check|test|guard)\b"
+    r"|\b(?:mutation|fault|failure)[ -]?(?:check|test|injection)\b.*"
+    r"(?:\bbreak(?:s|ing)?\b|\bfor\s+(?:the\s+)?ci\b)"
     r")",
     re.IGNORECASE,
 )
@@ -600,6 +616,30 @@ EOF
             echo "$NAME: self-test: refactor branch correctly passed" >&2
         else
             echo "$NAME: self-test: refactor branch was wrongly refused" >&2
+            exit 1
+        fi
+
+        # A non-breaking commit that mentions the practice must not trip the
+        # mutation check: "mutation-check every criterion" describes a test,
+        # not a deliberate compile break. An over-broad pattern flags it.
+        # Prose *about* breaking is not a break. "a break verb, not a bare
+        # mutation-check mention" uses "break" as a noun and names the check
+        # itself; an earlier pattern that looked for "break" anywhere beside a
+        # build word refused exactly this subject — the commit that introduced
+        # the check. The break verb must be the subject's action.
+        git commit -q --allow-empty -m "fix(audit): a break verb, not a bare mutation-check mention"
+        if audit_synthetic >/dev/null 2>&1; then
+            echo "$NAME: self-test: prose about breaking correctly passed" >&2
+        else
+            echo "$NAME: self-test: prose about breaking was wrongly refused" >&2
+            exit 1
+        fi
+
+        git commit -q --allow-empty -m "test: mutation-check the synthetic fixture"
+        if audit_synthetic >/dev/null 2>&1; then
+            echo "$NAME: self-test: mutation-check practice commit correctly passed" >&2
+        else
+            echo "$NAME: self-test: mutation-check practice commit was wrongly refused" >&2
             exit 1
         fi
     )
