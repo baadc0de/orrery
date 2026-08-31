@@ -1170,6 +1170,12 @@ impl Bot {
             .map(|(from, _)| RecordSource::InboundEvent { from })
             .collect();
         orders.reserve(4);
+        // Where this bot's own pilot orders begin. `orders` already holds this
+        // tick's *delivered* inbound orders (D46 clause (d) puts them first),
+        // so `orders.first_mut()` is only the pilot's Thrust when the inbox
+        // happened to be empty -- and the adaptation below must patch the
+        // pilot's order, never a neighbour's.
+        let authored_start = orders.len();
         orrery_games::regolith::pilot::honest_orders(
             self.entity,
             self.slot,
@@ -1212,6 +1218,15 @@ impl Bot {
         let turn_urad = self.turn_urad;
         let full_accel = self.accel_mmss;
         let speed_probe = self.tamper == Some(Tamper::SpeedMultiplier);
+        // This bot flies level. Pitch is zeroed on the pilot's own orders --
+        // never on a delivered neighbour order -- and separately from the
+        // accel/yaw adaptation below, whose `first_mut()` targeting is left
+        // exactly as it was rather than changed in the same breath.
+        for order in orders.iter_mut().skip(authored_start) {
+            if let Order::Thrust { pitch_urad, .. } = order {
+                *pitch_urad = 0;
+            }
+        }
         if let Some(Order::Thrust {
             accel_mmss,
             yaw_urad,
@@ -1220,11 +1235,8 @@ impl Bot {
         {
             // Input-source adaptation, parallel to the skin gating thrust and
             // choosing a yaw sign. The pilot still owns the Order vocabulary,
-            // scenario direction, held trigger, targets and elevation. Pitch
-            // is deliberately *not* rewritten here: since v19 it is a live
-            // axis, and overriding it would make the harness's honest bot
-            // disagree with `Game::honest_inputs` on a rule rather than on an
-            // input source.
+            // scenario direction, held trigger and targets.
+            //
             *accel_mmss = if speed_probe {
                 // A modified cruiser must ask beyond its honest acceleration
                 // ceiling or a raised ceiling is inert at the 32 m/s roam.
