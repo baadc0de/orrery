@@ -119,7 +119,8 @@ const ENTITY: PersistId = PersistId(7);
 fn raw_post_step(pre: &Probe, tick: Tick) -> Probe {
     let mut own = pre.clone();
     let neighbors = BTreeMap::new();
-    let mut view = StateView::new(ENTITY, &mut own, &neighbors);
+    let observation_ticks = BTreeMap::new();
+    let mut view = StateView::new(ENTITY, &mut own, &neighbors, &observation_ticks, tick, 0);
     let mut rng = tick_rng(SEED, ENTITY, tick);
     let output = OffLattice.step(&mut view, &OrderedInputs::new(&[]), &mut rng);
     assert!(output.events.is_empty());
