@@ -178,7 +178,7 @@ const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 const CAMPAIGN_ORBIT_RADIUS_M: f64 = 2_500.0;
 const CAMPAIGN_CROWD_ARC_RAD: f64 = 0.08;
-const CAMPAIGN_RADIAL_SPREAD: f64 = 0.10;
+const CAMPAIGN_RADIAL_SPREAD: f64 = 0.003;
 /// Rocks present at campaign start: one Large, two Medium and three Small.
 pub const CAMPAIGN_ROCK_COUNT: usize = 6;
 const CAMPAIGN_ROCK_RADII_MM: [i64; CAMPAIGN_ROCK_COUNT] = [
@@ -331,31 +331,24 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
-/// Regolith v20's rules identity: v19's rules under **snapshot isolation**
-/// (#758, ADR-0043 clause (b)).
+/// Regolith v21's rules identity: v20's rules with campaign participants kept
+/// in one replicating crowd (#788).
 ///
-/// Not one rule body changed. What changed is what a rule *sees*: until v19 a
-/// neighbour read at tick T returned whatever the neighbour's state was at the
-/// moment of the read, so an entity stepped later in a tick observed an
-/// earlier entity's post-step state. Since v20 every read is served from the
-/// state the world had when the tick began, and execution order is not
-/// observable to a rule.
+/// The canonical step is unchanged, but campaign initialization is not. At 32
+/// seats the former 10% radial spread quantized the bots' orbit inputs across
+/// 22 turn rates, shearing an initially compact crowd across kilometres during
+/// the campaign hour. The 0.3% spread keeps all seats on the same integer turn
+/// rate and their initial canonical states inside one overlapping AOI.
 ///
-/// **Bumped on principle, not on a moved golden.** Regolith's only neighbour
-/// read is `visibility::collision_candidate`, reached from `verify_claims`
-/// only for `ClaimCover` and `Collide` inputs, which the honest pilot never
-/// emits — so the committed corpus is blind to the difference and every
-/// pre-existing chain is byte-identical either side. The rules changed
-/// regardless: a craft-vs-rock collision where the craft's id exceeds the
-/// rock's, and a cover claim against a lower-id locker or rock, resolve
-/// differently. A v19 peer and a v20 peer would disagree on the first such
-/// tick, and two builds must not be treated as the same rules merely because
-/// the corpus cannot tell them apart. `ecs_differential.rs`'s
-/// `within-tick-neighbor-visibility` fixture is the case that can, and its
-/// chains moved.
+/// **Bumped on principle, not on a moved golden.** The committed corpus uses
+/// [`Game::spawn`]'s compact scenario ring, not [`campaign_spawn_pose`], so
+/// its chains remain byte-identical. Campaign peers still derive different
+/// tick-zero positions either side of this change. Calling both builds v20
+/// would let them enter one session and disagree before the first input; v21
+/// makes admission refuse that mixed campaign instead.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 20,
-    digest: [0x69; 32],
+    version: 21,
+    digest: [0x6A; 32],
 };
 
 /// Regolith's two statically linked rule domains.
@@ -499,9 +492,10 @@ pub struct CampaignRockSeed {
 /// the campaign crowd orbits at roughly 2.5 km, so that faithful bloom would
 /// still be content nobody sees. Six rocks make every published tier present
 /// without turning the crowd's orbit into a collision gauntlet: they sit in a
-/// radial pocket just inside and outside the outer crowd, 110--340 m from its
-/// player slot, but off every bot's initial flight line. A player can see,
-/// lock and deliberately fly into the pocket; orbiting bots do not begin in it.
+/// radial pocket just inside and outside the outer crowd, inside its 400 m
+/// engagement envelope but off every bot's initial flight line. A player can
+/// see, lock and deliberately fly into the pocket; orbiting bots do not begin
+/// in it.
 ///
 /// Identity, the small angular/radial variation, tier and owner are pure
 /// functions of `(universe seed, campaign-rock slot, host peer count)`. No

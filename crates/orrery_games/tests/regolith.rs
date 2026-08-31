@@ -69,9 +69,10 @@ fn campaign_seed_places_every_rock_tier_beside_but_not_on_the_crowd_orbit() {
 
     let (player, _) = campaign_spawn_pose(8, 9);
     for seeded in &rocks {
+        let distance = distance_mm(player, seeded.rock.pos);
         assert!(
-            distance_mm(player, seeded.rock.pos) <= 350_000,
-            "rock {} must start inside the player's stock encounter",
+            distance <= u128::try_from(MAX_ENGAGEMENT_RANGE_MM).unwrap(),
+            "rock {} at {distance} mm must start inside the player's engagement envelope",
             seeded.entity.0,
         );
         for slot in 0..8 {
@@ -471,8 +472,8 @@ fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
 }
 
 #[test]
-fn v20_snapshot_isolation_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 20);
+fn v21_campaign_crowd_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 21);
     assert_eq!(
         PITCH_LIMIT_URAD, 1_570_796,
         "a quarter turn either side of level, on the micro-radian lattice"

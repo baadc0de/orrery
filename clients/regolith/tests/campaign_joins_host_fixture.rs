@@ -25,7 +25,7 @@ use orrery_core::{CoreCodec as _, Executor};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState};
-use orrery_games::regolith::{campaign_rock_seeds, campaign_spawn_pose};
+use orrery_games::regolith::{campaign_rock_seeds, campaign_spawn_pose, in_firing_arc};
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::encode_replication;
 use orrery_protocol::{CellId, ChainHash, NodeId, PersistId, StateClaim, Tick, WitnessMsg};
@@ -809,13 +809,18 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
             },
             &mut sink,
         );
-        let ready = matches!(
+        let ready = match (
             runtime.executor().state(runtime.entity()),
-            Some(RegolithState::Craft(craft))
-                if craft.lock_target == Some(target)
+            runtime.executor().state(target),
+        ) {
+            (Some(RegolithState::Craft(craft)), Some(RegolithState::Craft(target_craft))) => {
+                craft.lock_target == Some(target)
                     && craft.lock_class.is_some()
                     && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
-        );
+                    && in_firing_arc(craft.archetype, craft.yaw_urad, craft.pos, target_craft.pos)
+            }
+            _ => false,
+        };
         if ready {
             break;
         }
@@ -823,13 +828,24 @@ fn a_human_campaign_lock_fire_round_trip_resolves_on_the_host() {
     }
     assert!(
         matches!(
-            runtime.executor().state(runtime.entity()),
-            Some(RegolithState::Craft(craft))
-                if craft.lock_target == Some(target)
-                    && craft.lock_class.is_some()
-                    && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+            (
+                runtime.executor().state(runtime.entity()),
+                runtime.executor().state(target),
+            ),
+            (
+                Some(RegolithState::Craft(craft)),
+                Some(RegolithState::Craft(target_craft)),
+            ) if craft.lock_target == Some(target)
+                && craft.lock_class.is_some()
+                && craft.lock_progress >= orrery_games::regolith::LOCK_ACQUISITION_TICKS
+                && in_firing_arc(
+                    craft.archetype,
+                    craft.yaw_urad,
+                    craft.pos,
+                    target_craft.pos,
+                )
         ),
-        "the host-authored LockConfirmed must mature the human's visible lock"
+        "the host-authored LockConfirmed must mature after the human aligns the firing arc"
     );
 
     let mut tracks = ProjectileTracks::default();
