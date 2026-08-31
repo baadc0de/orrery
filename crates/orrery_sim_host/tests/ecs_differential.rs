@@ -125,15 +125,21 @@ const WITHIN_TICK_VISIBILITY_SCENARIO: Scenario = Scenario {
 };
 
 /// D-1 baseline for [`WITHIN_TICK_VISIBILITY_SCENARIO`].
+///
+/// **Regenerated for #758.** The value pinned at `8305948` was this fixture
+/// under live within-tick visibility, which is the semantics the fixture
+/// exists to detect; adopting snapshot isolation moves it, and a chain that
+/// had *not* moved would mean the detector had stopped detecting.
 const WITHIN_TICK_VISIBILITY_CHAIN: [u8; 32] = [
-    49, 63, 129, 96, 10, 175, 54, 62, 186, 54, 208, 211, 237, 197, 226, 86, 171, 129, 219, 45, 219,
-    46, 110, 78, 12, 152, 128, 235, 239, 8, 181, 6,
+    236, 169, 106, 131, 119, 68, 147, 242, 220, 40, 178, 56, 148, 155, 157, 164, 199, 54, 93, 12,
+    240, 26, 244, 251, 205, 5, 168, 38, 195, 229, 84, 74,
 ];
 
-/// D-2 baseline for [`WITHIN_TICK_VISIBILITY_SCENARIO`].
+/// D-2 baseline for [`WITHIN_TICK_VISIBILITY_SCENARIO`]. Regenerated for #758,
+/// for the same reason as the chain above.
 const WITHIN_TICK_VISIBILITY_OUTCOME_CHAIN: [u8; 32] = [
-    92, 199, 5, 216, 30, 133, 141, 226, 80, 77, 37, 171, 16, 38, 97, 204, 200, 93, 62, 197, 157,
-    35, 197, 245, 18, 231, 194, 81, 216, 83, 155, 245,
+    251, 121, 222, 245, 199, 174, 227, 135, 168, 74, 19, 194, 45, 252, 17, 25, 19, 110, 161, 120,
+    252, 184, 174, 236, 170, 127, 198, 88, 254, 149, 76, 79,
 ];
 
 /// Regolith's production rules over the lower-rock/higher-craft fixture.
@@ -268,7 +274,7 @@ impl Game for WithinTickVisibility {
 
 fn within_tick_visibility_baseline() -> Baseline {
     Baseline {
-        commit: "8305948",
+        commit: "dc8d452",
         axes: regolith_axes(),
         chains: vec![(
             WITHIN_TICK_VISIBILITY_SCENARIO.name,

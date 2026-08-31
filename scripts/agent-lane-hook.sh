@@ -92,6 +92,34 @@ case $EVENT in
 
   session-end)
     "$LANE" release >/dev/null 2>&1 || true
+
+    # Post-merge reclaim (#781). A lane whose PR has landed no longer needs its
+    # target directory, and a worktree directory that has outlived its
+    # registration will never be built in again — 202 GiB across fifteen target
+    # trees, and two orphaned 100 GiB lanes in one day, because nothing ever
+    # asked. Session end is the moment a lane stops needing its outputs, so it
+    # is where the question gets asked.
+    #
+    # Not a systemd timer: a timer fires on wall-clock time, which is unrelated
+    # to whether anything landed, and it would live outside this repository as
+    # a user unit nobody clones. This hook already exists, already fires exactly
+    # when a lane finishes, and the reclaimer is idempotent and cheap — it does
+    # a fetch and a `du` and then, almost always, nothing.
+    #
+    # Two details that are load-bearing:
+    #   * the *primary* checkout's copy is invoked, not this worktree's. The
+    #     reclaimer never deletes the tree it is being read from, so a worktree
+    #     running its own copy could never reclaim itself — which is exactly the
+    #     tree that just finished.
+    #   * detached, from `/`, best-effort. This hook has a 10 s budget and must
+    #     never take a session down with it; a reclaim that has to fetch can
+    #     outlast that, and its own flock keeps two of them from racing.
+    common=$(git -C "$HERE" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+    primary=$(dirname "$common")
+    reclaimer="$primary/scripts/dev-cache.sh"
+    if [[ -x $reclaimer ]]; then
+      ( cd / && setsid nohup "$reclaimer" reclaim --apply >/dev/null 2>&1 </dev/null & ) || true
+    fi
     exit 0
     ;;
 
