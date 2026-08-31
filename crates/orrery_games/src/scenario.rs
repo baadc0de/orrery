@@ -57,8 +57,17 @@ pub const SAMPLE_PERIOD: u64 = 3;
 pub struct Scenario {
     /// Stable name. Appears in golden tables and in failure output.
     pub name: &'static str,
-    /// How many entities to spawn.
+    /// How many player entities to spawn, via [`Game::spawn`].
     pub entities: u64,
+    /// How many *world-owned* entities to seed, via [`Game::spawn_world`].
+    ///
+    /// Separate from [`Self::entities`] because it is a different question: a
+    /// player population is what an honest pilot drives, and a world
+    /// population is what the game's non-player domain owns — Regolith's
+    /// rocks, pickups and bloom director. Every scenario in [`SCENARIOS`]
+    /// declares zero, which is why they step no world entity at all; that is
+    /// a real gap in the corpus and is why [`WORLD_SCENARIO`] exists.
+    pub world_entities: u64,
     /// How many ticks to run. 180 is the 3 s adjudication window (D16).
     pub ticks: u64,
     /// The universe seed byte, expanded to the full 32-byte seed.
@@ -109,8 +118,10 @@ pub struct SealedScenario<G: Game> {
     pub seed: UniverseSeed,
     /// Exact tick range covered by [`Self::input_log`].
     pub tick_window: TickWindow,
-    /// Population installed before the first tick.
+    /// Player population installed before the first tick.
     pub initial_entities: u64,
+    /// World population installed before the first tick.
+    pub initial_world_entities: u64,
     /// Inputs sealed before each step, in tick and entity order.
     pub input_log: Vec<SealedTick<G::CoreInput>>,
 }
@@ -121,6 +132,7 @@ impl<G: Game> Clone for SealedScenario<G> {
             seed: self.seed,
             tick_window: self.tick_window,
             initial_entities: self.initial_entities,
+            initial_world_entities: self.initial_world_entities,
             input_log: self.input_log.clone(),
         }
     }
@@ -161,6 +173,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "solo",
         entities: 1,
+        world_entities: 0,
         ticks: 180,
         seed_byte: 0x11,
         sample_loss_pct: 0,
@@ -168,6 +181,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "duel",
         entities: 2,
+        world_entities: 0,
         ticks: 180,
         seed_byte: 0x22,
         sample_loss_pct: 0,
@@ -175,6 +189,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "island",
         entities: 8,
+        world_entities: 0,
         ticks: 600,
         seed_byte: 0x33,
         sample_loss_pct: 5,
@@ -182,11 +197,42 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "island-lossy",
         entities: 8,
+        world_entities: 0,
         ticks: 600,
         seed_byte: 0x44,
         sample_loss_pct: 40,
     },
 ];
+
+/// A scenario that actually steps a game's **world** domain.
+///
+/// Deliberately outside [`SCENARIOS`]. Every scenario in that table declares
+/// `world_entities: 0`, so across the whole battery corpus Regolith's
+/// `regolith.world` module — the `rock`, `pickup` and `bloom-director`
+/// sections #737 split out — is **stepped zero times**. That is measured, not
+/// assumed: `tests/world_scenario.rs` asserts it of `SCENARIOS` and asserts
+/// the opposite of this scenario, because a green suite over a module no
+/// scenario reaches is a suite that measured nothing about that module.
+///
+/// It is not added to [`SCENARIOS`] because that table is the battery's
+/// per-game corpus with committed F-1/F-2 goldens for every game in it, and
+/// this scenario asks for a world population that only Regolith has. Its own
+/// digests live in [`crate::golden::REGOLITH_WORLD`] and
+/// [`crate::golden::REGOLITH_WORLD_OUTCOMES`] instead; folding it into the
+/// battery's per-game tables is fixture work in a digest tree, not this
+/// change's.
+///
+/// 900 ticks so the seeded director's early bloom (`next_bloom_tick` well
+/// inside the window) seeds a batch, its rocks live and are shot, and the
+/// pickups they drop both get grabbed and time out.
+pub const WORLD_SCENARIO: Scenario = Scenario {
+    name: "world",
+    entities: 4,
+    world_entities: 8,
+    ticks: 900,
+    seed_byte: 0x55,
+    sample_loss_pct: 0,
+};
 
 /// A stage-1 check that failed, and where.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +302,26 @@ impl<G: Game> Play<G> {
     }
 }
 
+/// The world-owned entities a scenario seeds, in install order.
+///
+/// Their stable ids continue past the player block — player `slot` takes
+/// `PersistId(slot + 1)`, world `slot` takes `PersistId(players + slot + 1)`
+/// — so adding a world population cannot renumber a player, and a game with
+/// no world domain ([`Game::spawn_world`]'s default) seeds nothing however
+/// many the scenario asks for.
+pub(crate) fn world_population<G: Game>(
+    game: &G,
+    players: u64,
+    world_entities: u64,
+) -> Vec<(PersistId, G::CoreState)> {
+    (0..world_entities)
+        .filter_map(|slot| {
+            let entity = PersistId::new(players + slot + 1);
+            game.spawn_world(entity, slot).map(|state| (entity, state))
+        })
+        .collect()
+}
+
 /// Play `scenario` under `game`'s rules.
 ///
 /// The inputs come from [`Game::honest_inputs`] and never from game state, so
@@ -276,9 +342,13 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
         .enumerate()
         .map(|(slot, entity)| (*entity, game.spawn(*entity, slot as u64)))
         .collect();
+    let seeded_world = world_population(&game, scenario.entities, scenario.world_entities);
 
     let mut executor = Executor::new(game, seed);
     for (entity, state) in spawned {
+        executor.insert(entity, state);
+    }
+    for (entity, state) in seeded_world {
         executor.insert(entity, state);
     }
 
@@ -398,6 +468,7 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
                 end_exclusive: Tick::new(T0 + scenario.ticks),
             },
             initial_entities: scenario.entities,
+            initial_world_entities: scenario.world_entities,
             input_log,
         },
         log,
@@ -422,8 +493,16 @@ pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
         .enumerate()
         .map(|(slot, entity)| (*entity, game.spawn(*entity, slot as u64)))
         .collect();
+    let seeded_world = world_population(
+        &game,
+        sealed.initial_entities,
+        sealed.initial_world_entities,
+    );
     let mut executor = Executor::new(game, sealed.seed);
     for (entity, state) in spawned {
+        executor.insert(entity, state);
+    }
+    for (entity, state) in seeded_world {
         executor.insert(entity, state);
     }
 

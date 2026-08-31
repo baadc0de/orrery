@@ -211,3 +211,37 @@ pub const SKIRMISH_OUTCOMES: [(&str, [u8; 32]); 4] = [
         ],
     ),
 ];
+
+/// Regolith's `world` scenario ([`WORLD_SCENARIO`](crate::scenario::WORLD_SCENARIO)),
+/// the one scenario that steps the `regolith.world` module at all.
+///
+/// Held apart from [`REGOLITH`] and [`REGOLITH_OUTCOMES`] because the
+/// scenario is held apart from [`SCENARIOS`](crate::scenario::SCENARIOS): the
+/// battery's tables are its per-game corpus, and this scenario asks for a
+/// world population only Regolith has. These rows are *new* fixtures, not a
+/// regeneration of anything — no committed digest above moved, and nothing
+/// that produces one reaches a world population.
+///
+/// Their job is the same as every other row here: pin the chain so a later
+/// change to the `rock`, `pickup` or `bloom-director` sections has to move a
+/// committed number rather than pass unnoticed. Before this scenario existed
+/// those three sections were stepped zero times across the whole corpus, so
+/// no digest anywhere covered them.
+pub const REGOLITH_WORLD: [(&str, [u8; 32]); 1] = [(
+    "world",
+    [
+        0x0d, 0x86, 0x4c, 0x2c, 0xb7, 0xa6, 0x04, 0x85, 0xb9, 0x0d, 0xaf, 0xbd, 0xf4, 0xa0, 0xfa,
+        0xb6, 0x05, 0x75, 0x15, 0xfc, 0x57, 0x99, 0xea, 0xf0, 0x2f, 0xa9, 0x80, 0xf4, 0xe4, 0xd5,
+        0x9b, 0x6c,
+    ],
+)];
+
+/// The D-2 outcome chain for the same scenario. See [`REGOLITH_WORLD`].
+pub const REGOLITH_WORLD_OUTCOMES: [(&str, [u8; 32]); 1] = [(
+    "world",
+    [
+        0x85, 0x51, 0x08, 0x6f, 0x03, 0x32, 0x3d, 0x20, 0x4f, 0x54, 0xf5, 0x40, 0xbd, 0x65, 0xd1,
+        0x23, 0x5c, 0x11, 0x24, 0x0b, 0xeb, 0x68, 0xfc, 0xcf, 0xb3, 0x6a, 0xa5, 0xcd, 0x0a, 0xe1,
+        0xf3, 0x8a,
+    ],
+)];

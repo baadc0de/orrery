@@ -133,6 +133,23 @@ pub trait Game: Ruleset + Sized {
     /// game can vary loadouts across a population deterministically.
     fn spawn(&self, entity: PersistId, slot: u64) -> Self::CoreState;
 
+    /// One *world-owned* entity's starting state, or `None` if this game has
+    /// no non-player domain to seed.
+    ///
+    /// The default is `None`, which is the honest answer for a game whose
+    /// whole population is players: a scenario asking such a game for a world
+    /// population gets an empty one rather than a synthesized player. Regolith
+    /// overrides it to seed the `regolith.world` module — rocks and a bloom
+    /// director — because without a seed nothing in the scenario corpus ever
+    /// steps that module at all.
+    ///
+    /// Deterministic in `(entity, slot)` for the same reason
+    /// [`Game::spawn`] is: the population a differential replays from must be
+    /// reconstructible from the sealed inputs alone.
+    fn spawn_world(&self, _entity: PersistId, _slot: u64) -> Option<Self::CoreState> {
+        None
+    }
+
     /// What an honest player of this game asks for at `tick`.
     ///
     /// Appends to `out` rather than returning, so a harness can prepend the
