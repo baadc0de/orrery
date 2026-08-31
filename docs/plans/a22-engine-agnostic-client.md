@@ -153,6 +153,36 @@ Three questions, in order, each cheap and each able to invalidate the next:
 3. **What must the C ABI look like for prediction?** Feeds S5's signature
    directly, which is why this runs first.
 
+> **Answered and landed, 2026-08-31 (#725, #744).** All three: decode with no
+> Rust linked (`ldd` showed only libc and friends); the fixed-step accumulator
+> reproduces host arithmetic **field-exactly** across fast, jittered and a
+> forced 250 ms hitch (120 ticks, craft 7, `(76097, -22824, 5756)` mm); and the
+> C ABI landed as `crates/orrery_sim/include/orrery_sim.h` (#727), which S5
+> (#738) was designed against. **Section 4's recommendation is therefore
+> checkable rather than an opinion: let Unreal own the loop.** A bootstrap
+> owning `main()` buys lifecycle control, not deterministic arithmetic.
+>
+> Track D then took it further: **D.1** rendered the first frame, and **D.2**
+> rendered four craft decoded live from a running `gates/p1-swarm`, with a
+> receiver that refuses unanchored, superseded and malformed patches. Both are
+> wireframe under Mesa llvmpipe; **appearance and performance remain
+> unverified.**
+
+> **Correction to the wire cost, 2026-08-31 (D.2).** This plan and the spike
+> report both describe the State datagram as singly tagged. **The live
+> exterior wire is double-tagged**: `[TAG_STATE][TAG_STATE][TAG_REPLICATION*]`,
+> because the peer stack wraps the replication envelope's own tagged message in
+> an outer channel byte. `fixture_gen` calls `encode_replication` directly and
+> so emits the single-tagged form; the first live decode failed outright with
+> `packet 0: not replication traffic`.
+>
+> The lesson is larger than the byte. A C++ decoder built and tested against a
+> fixture was **wrong about the real wire, and nothing caught it** - which is
+> precisely the hazard the "wire is not self-describing" cost names. **A fixture
+> that does not travel the live encoding path is not a fixture for the live
+> path**, and that argues for the cross-language fixture test earlier than its
+> position in track D suggests.
+
 ## 7. Reserved to the owner
 
 1. **Whether to do this at all**, and in what order against A18's programme.
