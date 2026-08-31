@@ -1218,33 +1218,27 @@ impl Bot {
         let turn_urad = self.turn_urad;
         let full_accel = self.accel_mmss;
         let speed_probe = self.tamper == Some(Tamper::SpeedMultiplier);
-        // This bot flies level. Pitch is zeroed on the pilot's own orders --
-        // never on a delivered neighbour order -- and separately from the
-        // accel/yaw adaptation below, whose `first_mut()` targeting is left
-        // exactly as it was rather than changed in the same breath.
+        // Input-source adaptation applies to the pilot's own Thrust orders --
+        // never to delivered neighbour orders. The shared pilot currently
+        // emits exactly one Thrust, but walking the authored suffix keeps the
+        // boundary correct if it ever authors more than one.
         for order in orders.iter_mut().skip(authored_start) {
-            if let Order::Thrust { pitch_urad, .. } = order {
+            if let Order::Thrust {
+                accel_mmss,
+                yaw_urad,
+                pitch_urad,
+            } = order
+            {
                 *pitch_urad = 0;
+                *accel_mmss = if speed_probe {
+                    // A modified cruiser must ask beyond its honest acceleration
+                    // ceiling or a raised ceiling is inert at the 32 m/s roam.
+                    full_accel
+                } else {
+                    profile.accel_mmss(tick, speed, *accel_mmss, CRUISE_MPS)
+                };
+                *yaw_urad = yaw_urad.signum() * turn_urad.abs();
             }
-        }
-        if let Some(Order::Thrust {
-            accel_mmss,
-            yaw_urad,
-            ..
-        }) = orders.first_mut()
-        {
-            // Input-source adaptation, parallel to the skin gating thrust and
-            // choosing a yaw sign. The pilot still owns the Order vocabulary,
-            // scenario direction, held trigger and targets.
-            //
-            *accel_mmss = if speed_probe {
-                // A modified cruiser must ask beyond its honest acceleration
-                // ceiling or a raised ceiling is inert at the 32 m/s roam.
-                full_accel
-            } else {
-                profile.accel_mmss(tick, speed, *accel_mmss, CRUISE_MPS)
-            };
-            *yaw_urad = yaw_urad.signum() * turn_urad.abs();
         }
         // Log *before* executing, and log exactly what is about to be applied.
         // A log written from what happened rather than what was asked would
@@ -2628,6 +2622,70 @@ mod tests {
             cheat: None,
             enforcing: false,
         })
+    }
+
+    #[test]
+    fn input_adaptation_targets_authored_thrust_after_a_delivered_thrust() {
+        let spec = BotSpec {
+            index: 1,
+            count: 32,
+            seed: UniverseSeed([0xA1; 32]),
+            cell_edge_m: default_cell_edge_m(),
+            witnessing: true,
+            cheat: None,
+            enforcing: false,
+        };
+        let mut bot = Bot::new(spec);
+        assert_eq!(
+            bot.profile,
+            Profile::Idle,
+            "the fixture needs zero shaped thrust"
+        );
+        let turn_urad = bot.turn_urad.abs();
+        let delivered = Order::Thrust {
+            accel_mmss: 7_777,
+            yaw_urad: 8_888,
+            pitch_urad: 9_999,
+        };
+        bot.inject_delivered(PersistId::new(99), delivered.clone());
+
+        bot.step_core(0, spec.cell_edge_m);
+
+        let authored = bot
+            .chain
+            .as_mut()
+            .expect("witnessing installed the live producer")
+            .cut_frame(u64::from(FRAME_TICKS) - 1)
+            .expect("the frame interval closes");
+        let records = &authored.frame.entities[0].records;
+        assert!(matches!(
+            records[0].source,
+            RecordSource::InboundEvent { from } if from == PersistId::new(99)
+        ));
+        assert_eq!(
+            Order::decode(&records[0].payload).expect("delivered order decodes"),
+            delivered,
+            "input adaptation must not rewrite a preceding delivered Thrust"
+        );
+        assert!(matches!(records[1].source, RecordSource::OwnPlayer { .. }));
+        let Order::Thrust {
+            accel_mmss,
+            yaw_urad,
+            pitch_urad,
+        } = Order::decode(&records[1].payload).expect("authored order decodes")
+        else {
+            panic!("the pilot's first authored order must be Thrust");
+        };
+        assert_eq!(
+            accel_mmss, 0,
+            "the idle profile shapes authored acceleration"
+        );
+        assert_eq!(
+            yaw_urad.abs(),
+            turn_urad,
+            "the orbit rate shapes authored yaw"
+        );
+        assert_eq!(pitch_urad, 0, "the planar swarm shapes authored pitch");
     }
 
     /// A snapshot-built peer really starts with no replicas.
