@@ -23,21 +23,45 @@
 //! changes, and the whole blast radius is measured by
 //! `tests/ecs_differential.rs`.
 //!
-//! **What this does not buy, stated plainly.** [`TickBackend::state`] returns
-//! `&R::CoreState`, so the migrated component holds the whole state enum and
-//! not the narrower `Rock`/`Pickup`/`BloomDirector` its section names. The
-//! decomposition separates *storage*, not types.
+//! # The payload is the sum, and it is the seam that says so
 //!
-//! #791 raised half of that ceiling and left the other half standing, so the
-//! sentence above is still true and it is worth being exact about which half
-//! is which. [`TickBackend::section_state`] now narrows on the way *out*: a
-//! caller that wants a craft asks for [`orrery_core::Section`] and is handed a
-//! `&Craft`, and the four-arm match that used to open every consumer is gone.
-//! What has **not** changed is the payload stored here. [`MigratedSection`]
-//! still holds the sum, so this backend's `section_state` is the provided
-//! default — it narrows a sum it already had, and buys nothing over the
-//! `Executor`. Storing `Rock` in the component instead is the next step and is
-//! where a storage win would come from; it is not taken here.
+//! [`MigratedSection`] holds the whole `R::CoreState`, not the narrower
+//! `Rock`/`Pickup`/`BloomDirector` its section names. That is not a choice
+//! this file makes and not one it can unmake. [`TickBackend::state`] is
+//! declared as
+//!
+//! ```text
+//! fn state(&self, entity: PersistId) -> Option<&R::CoreState>;
+//! ```
+//!
+//! — a *reference* to the sum. A component holding one section's own payload
+//! can only ever yield an owned sum, because rebuilding a `RegolithState` from
+//! a `Rock` constructs a value; there is nothing for the returned reference to
+//! borrow from. Written out, rustc refuses it:
+//!
+//! ```text
+//! error[E0515]: cannot return value referencing temporary value
+//!     |     Some(&embed::<S>(held.0.clone()))
+//!     |     ^^^^^^--------------------------^
+//!     |     |     temporary value created here
+//!     |     returns a value referencing data owned by the current function
+//! ```
+//!
+//! So every decomposition of the payload — per section, per field, or the
+//! `bevy_ecs`-native ruleset of #793 — meets the same one line, and no amount
+//! of ECS idiom in this file gets past it. What a decomposing host *can* do
+//! without the seam moving is answered from the storage layout instead of the
+//! payload, and that is what [`Slot`] and this backend's
+//! [`TickBackend::section_state`] override do: the migration frontier decides
+//! the wrong-section case before any state is read, and only a migrated
+//! entity's choice *among* the migrated module's three sections still projects
+//! off the sum.
+//!
+//! #791 raised the consumer-facing half of this ceiling — a caller that wants
+//! a craft asks for [`orrery_core::Section`] and is handed a `&Craft` — and
+//! this file now answers that question from its own layout rather than taking
+//! the provided default. The stored payload is unchanged, and a narrow one is
+//! not reachable from here.
 //!
 //! # Why this is legal where the previous attempt was not
 //!
@@ -77,7 +101,7 @@ use bevy_ecs::prelude::{
 use bevy_ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel};
 use orrery_core::{
     canonical_step, CanonicalOutcome, CanonicalStep, NeighborSnapshot, Quantized, Ruleset,
-    SealedTickInputs, Sectioned, SteppedEntity, TickBackend, TickOutcome,
+    SealedTickInputs, Section, Sectioned, SteppedEntity, TickBackend, TickOutcome,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
@@ -185,11 +209,34 @@ struct Rules<R: EcsHostable> {
     seed: UniverseSeed,
 }
 
-/// `PersistId` → `Entity`. The ECS's own identifier is not canonical, so the
+/// Where one canonical entity lives in this world.
+///
+/// A newtype rather than a bare `(Entity, Side)`, because the two fields are
+/// two different kinds of fact — one is a handle into this world, the other is
+/// which component type holds the state — and a tuple at a call site says
+/// which is which only by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Slot {
+    /// This world's handle for the entity.
+    entity: Entity,
+    /// The component type its canonical state is filed in.
+    side: Side,
+}
+
+/// `PersistId` → [`Slot`]. The ECS's own identifier is not canonical, so the
 /// substrate must carry this index; it is also what gives [`TickBackend::entities`]
 /// its ascending-`PersistId` order, which archetype iteration does not have.
+///
+/// Carrying the [`Side`] here rather than re-deriving it is what makes a
+/// canonical read *one* component lookup. Before, [`EcsBackend::state_at`]
+/// probed [`MigratedSection`] and fell back to [`RemainderSection`], so every
+/// entity on the remainder side — which for Regolith is every craft, and a
+/// craft population is what the capacity leg measures — paid a miss before its
+/// hit. The index already had to exist and already had to be maintained at
+/// exactly the three places the side changes, so the side rides along for
+/// free.
 #[derive(Resource, Debug, Default)]
-struct Index(BTreeMap<PersistId, Entity>);
+struct Index(BTreeMap<PersistId, Slot>);
 
 /// What the seal stage fixed for this tick.
 #[derive(Resource)]
@@ -459,8 +506,9 @@ fn install_materializations<R: EcsHostable>(world: &mut World) {
         // substrate where a spawn's archetype is chosen, and it is why
         // `regolith.world` — the module whose population changes mid-tick — is
         // the one migrated first.
+        let side = Side::of(&materialized.state);
         let mut spawn = world.spawn((Identity(materialized.entity), ObservedAt(settled)));
-        match Side::of(&materialized.state) {
+        match side {
             Side::Migrated => spawn.insert(MigratedSection::<R>(materialized.state)),
             Side::Remainder => spawn.insert(RemainderSection::<R>(materialized.state)),
         };
@@ -468,7 +516,7 @@ fn install_materializations<R: EcsHostable>(world: &mut World) {
         world
             .resource_mut::<Index>()
             .0
-            .insert(materialized.entity, entity);
+            .insert(materialized.entity, Slot { entity, side });
     }
 }
 
@@ -644,24 +692,34 @@ impl<R: EcsHostable> EcsBackend<R> {
         query.iter(&self.world).map(|identity| identity.0).collect()
     }
 
-    fn entity_for(&self, entity: PersistId) -> Option<Entity> {
+    fn slot_for(&self, entity: PersistId) -> Option<Slot> {
         self.world.resource::<Index>().0.get(&entity).copied()
     }
 
-    /// One entity's canonical state, from whichever side of the frontier holds
-    /// it.
+    /// One entity's canonical state, read from the one component its slot
+    /// names.
     ///
-    /// The two-arm lookup is the decomposition's cost, and it is charged here
-    /// exactly once. `TickBackend::state` returns `&R::CoreState`, so the
-    /// migrated component has to hold the whole state enum rather than the
-    /// narrower `Rock`/`Pickup`/`BloomDirector` the section names — the seam's
+    /// The decomposition used to charge a probe here — try [`MigratedSection`],
+    /// fall back to [`RemainderSection`] — so a remainder entity paid a miss
+    /// before its hit. The [`Slot`] says which component holds it, so this is
+    /// one lookup on either side. The index is the authority on that, and
+    /// `the_index_and_the_archetypes_agree_on_every_entity` is what holds the
+    /// two to each other.
+    ///
+    /// `TickBackend::state` returns `&R::CoreState`, so the component has to
+    /// hold the whole state enum rather than the narrower
+    /// `Rock`/`Pickup`/`BloomDirector` the section names — the seam's
     /// contract, not the substrate, is what stops the payload being narrowed.
-    fn state_at(&self, handle: Entity) -> Option<&R::CoreState> {
-        match self.world.get::<MigratedSection<R>>(handle) {
-            Some(held) => Some(&held.0),
-            None => self
+    /// See the module note for the proof.
+    fn state_at(&self, slot: Slot) -> Option<&R::CoreState> {
+        match slot.side {
+            Side::Migrated => self
                 .world
-                .get::<RemainderSection<R>>(handle)
+                .get::<MigratedSection<R>>(slot.entity)
+                .map(|held| &held.0),
+            Side::Remainder => self
+                .world
+                .get::<RemainderSection<R>>(slot.entity)
                 .map(|held| &held.0),
         }
     }
@@ -698,17 +756,23 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
         // first tick reads it.
         state.quantize();
         let side = Side::of(&state);
-        let handle = match self.entity_for(entity) {
-            Some(existing) => existing,
-            None => {
-                let spawned = self
-                    .world
-                    .spawn((Identity(entity), ObservedAt(observed_tick)))
-                    .id();
-                self.world.resource_mut::<Index>().0.insert(entity, spawned);
-                spawned
-            }
+        let handle = match self.slot_for(entity) {
+            Some(existing) => existing.entity,
+            None => self
+                .world
+                .spawn((Identity(entity), ObservedAt(observed_tick)))
+                .id(),
         };
+        // The index row is written after the side is known, so a replacing
+        // install that crosses the frontier updates the side in the same
+        // statement that moves the component.
+        self.world.resource_mut::<Index>().0.insert(
+            entity,
+            Slot {
+                entity: handle,
+                side,
+            },
+        );
         let mut held = self.world.entity_mut(handle);
         held.insert(ObservedAt(observed_tick));
         // A replacing install may cross the frontier — a replay harness reuses
@@ -733,14 +797,47 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
     /// sealed by `seal_population` — which queries components, not the index —
     /// and would go on being a neighbour nobody could see.
     fn take_state(&mut self, entity: PersistId) -> Option<R::CoreState> {
-        let handle = self.world.resource_mut::<Index>().0.remove(&entity)?;
-        let state = self.state_at(handle).cloned();
-        self.world.despawn(handle);
+        let slot = self.world.resource_mut::<Index>().0.remove(&entity)?;
+        let state = self.state_at(slot).cloned();
+        self.world.despawn(slot.entity);
         state
     }
 
     fn state(&self, entity: PersistId) -> Option<&R::CoreState> {
-        self.state_at(self.entity_for(entity)?)
+        self.state_at(self.slot_for(entity)?)
+    }
+
+    /// The frontier decides, and only then is any state read.
+    ///
+    /// The provided default is `self.state(entity).and_then(S::project)` — it
+    /// fetches a whole state and *then* asks whether it was the section the
+    /// caller named. A decomposing host already knows the answer to half of
+    /// that question from its storage layout: a section past the migration
+    /// frontier cannot be held by an entity filed on the remainder side, and a
+    /// remainder section cannot be held by one filed past it. Those two cases
+    /// are answered here from the [`Slot`] alone, and the entity's canonical
+    /// state is never touched.
+    ///
+    /// What is *not* answered from the layout is which of the migrated
+    /// module's three sections a migrated entity occupies, because all three
+    /// share one component. That case still projects, and it is the exact
+    /// residue of the payload still being the sum. Narrowing it needs a
+    /// component per section holding that section's own type, which
+    /// [`TickBackend::state`]'s return type refuses — see the module note.
+    fn section_state<S>(&self, entity: PersistId) -> Option<&S::State>
+    where
+        S: Section<Root = R::CoreState>,
+    {
+        let slot = self.slot_for(entity)?;
+        let wanted = if R::CoreState::MIGRATED_SECTIONS.contains(&S::SECTION) {
+            Side::Migrated
+        } else {
+            Side::Remainder
+        };
+        if slot.side != wanted {
+            return None;
+        }
+        self.state_at(slot).and_then(S::project)
     }
 
     fn entities(&self) -> Vec<PersistId> {
@@ -753,7 +850,7 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
         tick: Tick,
         inputs: &[R::CoreInput],
     ) -> Option<TickOutcome<R::CoreEvent>> {
-        self.entity_for(entity)?;
+        self.slot_for(entity)?;
         let mut sealed = SealedTickInputs::new();
         sealed.extend(entity, inputs.iter().cloned());
         let mut stepped = self.run_tick(tick, &sealed, Some(entity));
