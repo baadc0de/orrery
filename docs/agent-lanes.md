@@ -109,6 +109,46 @@ reach any other instance.
 So this arrangement is deliberately two-speed: **lanes are advisory, leases are
 exclusive.**
 
+### Never mutate `~/.cargo/registry` (2026-08-31)
+
+The extracted crate sources under
+`~/.cargo/registry/src/index.crates.io-*/` are shared by **every build on the
+machine** and are invisible to `git status` in every worktree. A change there
+silently alters what every concurrent lane compiles, and nothing in this
+repository will tell you.
+
+This is not hypothetical. On 2026-08-31 a lane needed to break a dependency to
+demonstrate a mutation check and edited
+`lightyear_prediction-0.29.0/src/rollback.rs` in place, injecting a
+`type_name::<C>().ends_with("Vitality")` special case. It was left there. A
+registry-wide audit — every extracted crate, compared against its own
+`.cargo-ok` extraction timestamp — found exactly one modified file, which was
+restored byte-identical from the cached `.crate` tarball. A `check.sh` had been
+running through the window, and was restarted for that reason.
+
+**To mutate a dependency, copy it and patch the copy:**
+
+```bash
+cp -r ~/.cargo/registry/src/index.crates.io-*/<crate>-<ver> /tmp/mycopy
+chmod -R u+w /tmp/mycopy
+# add to the workspace Cargo.toml, then revert when done:
+#   [patch.crates-io]
+#   <crate> = { path = "/tmp/mycopy" }
+```
+
+That is contained, visible in `git diff`, and cannot escape the worktree.
+
+**To audit**, if you suspect the registry has been touched:
+
+```bash
+R=~/.cargo/registry/src/index.crates.io-*/
+for d in $R*/; do ok="$d.cargo-ok"; [ -f "$ok" ] || continue
+  find "$d" -type f ! -name '.cargo-ok' -newer "$ok"; done
+```
+
+Any output is a file written after its crate was extracted. Restore from
+`~/.cargo/registry/cache/index.crates.io-*/<crate>-<ver>.crate`.
+
 ### Where the shared state lives
 
 In the git *common* directory — `$(git rev-parse --path-format=absolute
