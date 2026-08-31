@@ -499,6 +499,16 @@ impl Journal {
     #[allow(clippy::unused_self)]
     pub fn note_chain_watermark(&self, _watermark: Lsn) {}
 
+    /// Register an archive claim (D20). A no-op: this backend releases
+    /// nothing, so nothing needs holding back.
+    #[allow(clippy::unused_self)]
+    pub fn register_archive(&self) {}
+
+    /// Record a verified archive watermark (D20). A no-op; see
+    /// [`Journal::register_archive`].
+    #[allow(clippy::unused_self)]
+    pub fn note_archive_watermark(&self, _watermark: Lsn) {}
+
     /// Record a mirrored chain's primary retention floor (D23). A no-op: this
     /// backend releases nothing, so nothing is bounded by it.
     #[cfg(feature = "chain-grpc")]

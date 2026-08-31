@@ -605,6 +605,78 @@ async fn a_chain_follower_bounds_the_release() {
     journal.close().await.expect("close");
 }
 
+/// A registered archive claim is a destructive-release guard (D20).
+///
+/// The checkpoint proposal can run ahead, but release must stop by name until
+/// the archive has verified the records it would destroy. Once verification
+/// advances, the archive watermark is the third term in the same minimum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lagging_archive_claim_blocks_release_and_preserves_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = Journal::open(&config(dir.path())).expect("open");
+    let lsns = fill(&journal, 100).await;
+
+    journal.register_archive();
+    journal.note_archive_watermark(Lsn::new(0, 0));
+    assert_eq!(
+        journal.retention_floor(Some(lsns[80])),
+        Some(Lsn::new(0, 0)),
+        "the lagging archive is the binding third term"
+    );
+
+    let blocked = journal.release_before(lsns[80]).expect("release answers");
+    assert_eq!(blocked.blocked, Some(ReleaseBlocked::ArchiveLag));
+    assert_eq!(blocked.records_dropped, 0);
+    assert_eq!(journal.released_floor(), Lsn::new(0, 0));
+    assert_eq!(
+        journal
+            .scan_from(lsns[0])
+            .collect::<Result<Vec<_>, _>>()
+            .expect("guarded records remain readable")
+            .len(),
+        100,
+        "the refused release preserves every record the archive still needs"
+    );
+
+    journal.note_archive_watermark(lsns[40]);
+    journal.note_archive_watermark(lsns[20]);
+    assert_eq!(
+        journal.retention_floor(Some(lsns[80])),
+        Some(lsns[40]),
+        "a stale archive report cannot move the watermark backward"
+    );
+    let release = journal.release_before(lsns[80]).expect("release answers");
+    assert_eq!(release.blocked, None);
+    assert!(release.records_dropped > 0);
+    assert_eq!(release.floor, lsns[40]);
+    assert_eq!(
+        journal.scan_from(lsns[40]).count(),
+        60,
+        "the record at the archive watermark is retained"
+    );
+    journal.close().await.expect("close");
+}
+
+/// The archive claim is opt-in. Without registration, its watermark abstains
+/// and the pre-#806 checkpoint-plus-chain floor and release stay unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_an_archive_claim_the_existing_floor_and_release_are_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = Journal::open(&config(dir.path())).expect("open");
+    let lsns = fill(&journal, 100).await;
+
+    // A watermark reported without registration cannot silently enable the
+    // claim. The existing locally-originated floor is still the checkpoint.
+    journal.note_archive_watermark(Lsn::new(0, 0));
+    assert_eq!(journal.retention_floor(Some(lsns[80])), Some(lsns[80]));
+
+    let release = journal.release_before(lsns[80]).expect("release answers");
+    assert_eq!(release.blocked, None);
+    assert!(release.records_dropped > 0);
+    assert_eq!(release.floor, lsns[80]);
+    journal.close().await.expect("close");
+}
+
 /// A promotion-adopted chain echoes the *source's* LSNs, so its watermark is
 /// not a position in this journal at all. Registering as non-bounding is what
 /// keeps that number from being mistaken for one.
