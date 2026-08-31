@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens;
@@ -34,13 +34,14 @@ pub struct DigestClosure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContributingCrate {
     name: String,
+    logical_path: String,
     manifest_path: PathBuf,
     sources: Vec<SourceUnit>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceUnit {
-    logical_path: PathBuf,
+    logical_path: String,
     disk_path: PathBuf,
 }
 
@@ -50,9 +51,16 @@ impl DigestClosure {
     pub fn from_manifest(manifest: &Path) -> Result<Self> {
         let manifest_path = manifest.canonicalize()?;
         let workspace_manifest = workspace_manifest_for(&manifest_path)?;
+        let workspace_root = workspace_manifest
+            .parent()
+            .ok_or("workspace manifest has no parent")?;
         let workspace_members = workspace_members(&workspace_manifest)?;
-        let packages =
-            contributing_crates(&manifest_path, &workspace_manifest, &workspace_members)?;
+        let packages = contributing_crates(
+            &manifest_path,
+            &workspace_manifest,
+            &workspace_members,
+            workspace_root,
+        )?;
         let mut rerun_inputs = BTreeSet::new();
         rerun_inputs.insert(workspace_manifest);
         for package in &packages {
@@ -96,12 +104,9 @@ impl DigestClosure {
         write_record(&mut hasher, b"domain", DOMAIN);
         for package in &self.packages {
             write_record(&mut hasher, b"crate", package.name.as_bytes());
+            write_record(&mut hasher, b"crate-path", package.logical_path.as_bytes());
             for source in &package.sources {
-                write_record(
-                    &mut hasher,
-                    b"path",
-                    source.logical_path.to_string_lossy().as_bytes(),
-                );
+                write_record(&mut hasher, b"path", source.logical_path.as_bytes());
                 let text = fs::read_to_string(&source.disk_path)?;
                 write_record(&mut hasher, b"tokens", canonical_tokens(&text)?.as_bytes());
             }
@@ -178,6 +183,7 @@ fn contributing_crates(
     manifest: &Path,
     workspace_manifest: &Path,
     workspace_members: &BTreeSet<PathBuf>,
+    workspace_root: &Path,
 ) -> Result<Vec<ContributingCrate>> {
     let mut pending = VecDeque::from([manifest.to_path_buf()]);
     let mut selected = BTreeSet::new();
@@ -197,9 +203,13 @@ fn contributing_crates(
 
     let mut closure = selected
         .iter()
-        .map(|manifest_path| package_inputs(manifest_path))
+        .map(|manifest_path| package_inputs(manifest_path, workspace_root))
         .collect::<Result<Vec<_>>>()?;
-    closure.sort_by(|left, right| left.name.cmp(&right.name));
+    closure.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.logical_path.cmp(&right.logical_path))
+    });
     Ok(closure)
 }
 
@@ -279,7 +289,7 @@ fn workspace_dependency_path(workspace_manifest: &Path, name: &str) -> Result<Op
         .map(|path| path.map(PathBuf::from))?)
 }
 
-fn package_inputs(manifest_path: &Path) -> Result<ContributingCrate> {
+fn package_inputs(manifest_path: &Path, workspace_root: &Path) -> Result<ContributingCrate> {
     let document = read_manifest(manifest_path)?;
     let name = document
         .get("package")
@@ -294,24 +304,52 @@ fn package_inputs(manifest_path: &Path) -> Result<ContributingCrate> {
         .join("src");
     let mut source_paths = Vec::new();
     collect_rust_sources(&source_root, &mut source_paths)?;
-    source_paths.sort();
-    let sources = source_paths
+    let mut sources = source_paths
         .into_iter()
         .map(|disk_path| {
-            let logical_path = disk_path
-                .strip_prefix(manifest_path.parent().expect("manifest parent checked"))?
-                .to_path_buf();
+            let logical_path = workspace_relative_path(&disk_path, workspace_root)?;
             Ok(SourceUnit {
                 logical_path,
                 disk_path,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    sources.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
     Ok(ContributingCrate {
         name,
+        logical_path: workspace_relative_path(manifest_path, workspace_root)?,
         manifest_path: manifest_path.to_path_buf(),
         sources,
     })
+}
+
+/// Return a platform-neutral, workspace-relative source identity.
+///
+/// `PathBuf` is intentionally confined to filesystem access. The encoded
+/// identity uses slash-separated UTF-8 components, so neither a checkout path
+/// nor Windows' native separator can enter the digest.
+fn workspace_relative_path(path: &Path, workspace_root: &Path) -> Result<String> {
+    let relative = path.strip_prefix(workspace_root)?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(component) => {
+                let component = component.to_str().ok_or("source path is not valid UTF-8")?;
+                if component.contains(['/', '\\']) {
+                    return Err("source path component contains a separator".into());
+                }
+                components.push(component);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err("source path is not a normal workspace-relative path".into());
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err("source path is the workspace root".into());
+    }
+    Ok(components.join("/"))
 }
 
 fn read_manifest(path: &Path) -> Result<Value> {
@@ -589,5 +627,39 @@ mod tests {
             "pub const RULE: u32 = 7;\n#[cfg(test)] mod only_tests { const TEST_ONLY: u32 = 99; }\n",
         );
         assert_eq!(digest(&directory), baseline);
+    }
+
+    #[test]
+    fn crlf_checkout_of_an_identical_source_tree_has_the_same_digest() {
+        let lf = fixture();
+        let crlf = fixture();
+        for source in ["games/src/lib.rs", "core/src/lib.rs"] {
+            let path = crlf.path().join(source);
+            let contents = fs::read_to_string(&path).expect("read LF fixture source");
+            assert!(!contents.contains("\r\n"), "fixture starts as LF");
+            fs::write(&path, contents.replace('\n', "\r\n")).expect("rewrite source as CRLF");
+        }
+
+        assert_eq!(
+            digest(&lf),
+            digest(&crlf),
+            "the source trees differ only in checkout line endings"
+        );
+    }
+
+    #[test]
+    fn encoded_source_paths_are_workspace_relative_and_slash_separated() {
+        let directory = fixture();
+        let closure = DigestClosure::from_manifest(&directory.path().join("games/Cargo.toml"))
+            .expect("derive manifest closure");
+        let paths = closure
+            .packages
+            .iter()
+            .flat_map(|package| package.sources.iter())
+            .map(|source| source.logical_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["core/src/lib.rs", "games/src/lib.rs"]);
+        assert!(paths.iter().all(|path| !path.contains('\\')));
     }
 }
