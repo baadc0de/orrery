@@ -161,11 +161,14 @@ unresolvable or unfetchable is reported and kept.
 - **Content on main.** Deliberately **not** `git merge-base --is-ancestor`. PRs
   here are squash-merged, so a lane's own commits are never ancestors of `main`
   and an ancestry test reports every landed lane as unmerged — a reclaimer that
-  reclaims nothing. Instead the files the branch changed are compared against a
-  freshly fetched `main` by content. The question is asked **from the primary
-  checkout**, never from inside the worktree: an orphaned worktree's own
-  `origin` can point at a local filesystem path, so its `origin/main` is stale
-  and `git log origin/main..HEAD` run there reports landed work as unlanded.
+  reclaims nothing. Instead the branch's own merge-base-to-tip patch must
+  reverse-apply cleanly to a temporary index of freshly fetched `main`. This
+  permits later, disjoint edits to a file the lane touched while remaining
+  fail-closed when Git cannot apply the exact patch. The question is asked
+  **from the primary checkout**, never from inside the worktree: an orphaned
+  worktree's own `origin` can point at a local filesystem path, so its
+  `origin/main` is stale and `git log origin/main..HEAD` run there reports
+  landed work as unlanded.
 
 What it then does depends on what the tree is:
 

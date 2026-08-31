@@ -186,33 +186,43 @@ tree_busy_reason() {
 # Deliberately **not** `git merge-base --is-ancestor`. PRs here are
 # squash-merged, so a lane's own commits are never ancestors of main and an
 # ancestry test would report every single landed lane as unmerged — a reclaimer
-# that never reclaims. Compare the files the lane actually changed instead: if
-# every one of them is byte-identical on main, the lane's work is on main
-# however it got there.
+# that never reclaims. Instead, ask whether the lane's own base..tip patch can
+# be reversed from main. That distinguishes its changes from later, disjoint
+# edits to a file the lane also touched.
 #
-# The asymmetry is deliberate. A file the lane touched that main has since
-# changed *again* reads as not-merged and the tree is kept. That is a false
-# negative, and false negatives cost disk.
+# The temporary index makes this a test against `main_ref`, rather than against
+# whichever branch happens to be checked out in the primary checkout. `git
+# apply --check` makes it read-only. It is deliberately strict: an unreadable
+# patch or one that cannot be reversed is not proof that the work landed, so
+# the tree is kept.
 content_is_on_main() {
-  local repo=$1 main_ref=$2 sha=$3 base names
-  local -a paths=()
+  local repo=$1 main_ref=$2 sha=$3 base status index
 
   git -C "$repo" cat-file -e "$sha^{commit}" 2>/dev/null || return 1
   base=$(git -C "$repo" merge-base "$main_ref" "$sha" 2>/dev/null) || return 1
 
-  names=$(git -C "$repo" diff --name-only "$base" "$sha" 2>/dev/null) || return 1
   # Nothing of its own to lose.
-  [[ -n $names ]] || return 0
-  # git quotes a path containing a newline or a control character, and a quoted
-  # string used as a pathspec matches nothing — which would make `git diff
-  # --quiet` succeed and report the branch merged. Refuse rather than guess.
-  if grep -q '^"' <<<"$names"; then
-    note 'a changed path needed quoting; refusing to judge this branch by pathspec'
+  if git -C "$repo" diff --quiet "$base" "$sha" 2>/dev/null; then
+    return 0
+  else
+    status=$?
+  fi
+  (( status == 1 )) || return 1
+
+  index=$(mktemp "${TMPDIR:-/tmp}/dev-cache-index.XXXXXX") || return 1
+  if ! GIT_INDEX_FILE="$index" git -C "$repo" read-tree "$main_ref" 2>/dev/null; then
+    rm -f -- "$index"
     return 1
   fi
-  mapfile -t paths <<<"$names"
 
-  git -C "$repo" diff --quiet "$main_ref" "$sha" -- "${paths[@]}" 2>/dev/null
+  if git -C "$repo" diff --binary --no-ext-diff "$base" "$sha" 2>/dev/null \
+    | GIT_INDEX_FILE="$index" git -C "$repo" apply --check --reverse --cached >/dev/null 2>&1; then
+    status=0
+  else
+    status=1
+  fi
+  rm -f -- "$index"
+  return "$status"
 }
 
 # The worktrees git still knows about.
@@ -446,12 +456,12 @@ self_test() {
   git -C "$repo" config user.email dev-cache@example.invalid
   git -C "$repo" config user.name 'dev-cache self-test'
   git -C "$repo" config commit.gpgsign false
-  printf 'one\n' > "$repo/a.txt"
+  printf 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n' > "$repo/a.txt"
   git -C "$repo" add -A
   git -C "$repo" commit -qm base
 
   git -C "$repo" checkout -q -b lane
-  printf 'two\n' > "$repo/a.txt"
+  sed -i 's/^one$/lane/' "$repo/a.txt"
   printf 'new\n' > "$repo/b.txt"
   git -C "$repo" add -A
   git -C "$repo" commit -qm 'lane: first'
@@ -464,18 +474,30 @@ self_test() {
   git -C "$repo" checkout -q main
   git -C "$repo" checkout -q lane -- .
   git -C "$repo" commit -qm 'lane (#1)'
+  # The lane's patch is now on main, then main changes a *different hunk* of
+  # the same file. The old file-identity test rejects this exact shape.
+  sed -i 's/^eight$/main later/' "$repo/a.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm 'main: a moved after lane'
 
   if git -C "$repo" merge-base --is-ancestor "$landed_tip" refs/heads/main 2>/dev/null; then
     die 'self-test: the fixture is not a squash merge; the whole clause is vacuous'
   fi
   st_ok 'the fixture is a real squash merge (the lane tip is not an ancestor of main)'
 
-  if ! content_is_on_main "$repo" refs/heads/main "$landed_tip"; then
-    die 'self-test: a squash-merged lane was not recognised as landed'
+  if git -C "$repo" diff --quiet refs/heads/main "$landed_tip" -- a.txt; then
+    die 'self-test: main did not move a file the landed lane changed; the regression fixture is vacuous'
   fi
-  st_ok 'content_is_on_main sees a squash-merged lane as landed'
+  st_ok 'the fixture makes the old file-identity check reject a landed lane after main moved that file'
 
+  # content_is_on_main must still inspect the named main ref when another
+  # branch is checked out: the reclaimer invokes it from the primary checkout.
   git -C "$repo" checkout -q lane
+  if ! content_is_on_main "$repo" refs/heads/main "$landed_tip"; then
+    die 'self-test: a squash-merged lane was not recognised as landed after main moved its file'
+  fi
+  st_ok 'content_is_on_main sees that landed patch on main after a later edit to the same file'
+
   printf 'unlanded\n' > "$repo/c.txt"
   git -C "$repo" add -A
   git -C "$repo" commit -qm 'lane: not landed'
@@ -484,9 +506,9 @@ self_test() {
   git -C "$repo" checkout -q main
 
   if content_is_on_main "$repo" refs/heads/main "$unlanded_tip"; then
-    die 'self-test: a lane carrying work that is not on main was called landed'
+    die 'self-test: a lane carrying unlanded work was called landed after main moved the same file'
   fi
-  st_ok 'content_is_on_main refuses a lane carrying work main does not have'
+  st_ok 'content_is_on_main refuses a lane carrying unlanded work even after main moved the same file'
 
   # ── Clause 2: liveness is cwd, not argv ───────────────────────────────────
   #
