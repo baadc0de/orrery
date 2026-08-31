@@ -46,6 +46,7 @@ cover (A10 §8.2). Repetition counts are fixed constants, not time budgets.
 | B-3 `b3.memory.*` | RSS high-water delta, 9 runs of the largest committed corpus case (Linux only) | bytes per entity |
 | B-4 `b4.snapshot.*` | `CoreCodec::to_canonical` over the battery's logged states | encode µs p50/p99, canonical bytes |
 | B-5 `b5.claim.*` | clone → quantize → canonical encode → blake3, the `StateClaim` path | µs per claim, p50/p99 |
+| B-5 `b5.capacity-mirror.*` | real `SimulationHost::step`, `collect_output_bytes`, full-population and 24-entity-AOI `state_bytes` reads at 10k, 20k, and 24k Regolith entities, executor-backed and ECS-backed | warm min/p50/p99/max µs, canonical bytes |
 
 Legs whose instrument does not exist are recorded **absent with a reason**
 in the baseline document, never silently skipped: `b1.swarm-large` (waits for
@@ -55,6 +56,28 @@ final states; the same canonical encode is measured over battery states
 instead), `b4.feed-uplink-diff`, `b6.startup` (Phase 2), and
 `b7.compile-and-binary-size` (needs an isolated cold target directory; this
 box shares one kache cache and one disk with live lanes).
+
+The capacity-mirror leg replaces A3 P4's synthetic `(PersistId, Pos)` row copy
+with the byte path which now exists. Ten thousand entities keeps the A3 and
+docs/14 comfortable-point reference; 20,000 is docs/14's 2 Hz service-knee
+conversion; 24,000 is the upper end of its 4,000-player entity implication.
+Every row is an all-Craft Regolith population with no inputs. Forty-eight
+untimed ticks fill the canonical trail, then three untimed output calls warm
+code, allocator, and caches before eleven timed repetitions. The output
+operation still allocates and returns a new owned buffer every time; no result
+buffer is retained. These are **warm** numbers. Host construction, population
+installation, first-use cost, OS-page-cache cold cost, AOI filtering,
+change-detection filtering, destination-world insertion, FFI copying, and
+network transport are not measured.
+
+The 24-entity lookup uses evenly spaced installed ids and measures only the
+public byte lookup after a consumer already knows its interest set. It does not
+measure spatial query or AOI-set maintenance.
+
+`RegolithState::Craft` does **not** carry a `Vec` trail in this tree. Its
+`Trail` is an inline `[TrailPoint; 4]`; cloning a state therefore performs no
+per-entity trail heap allocation. The canonical encoder does allocate its
+owned `Vec<u8>`, and both byte APIs include that real allocation.
 
 ## What it does not do
 

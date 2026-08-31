@@ -22,6 +22,7 @@
 #![warn(missing_docs)]
 
 mod baseline;
+mod capacity;
 mod environment;
 mod report;
 mod suite;
