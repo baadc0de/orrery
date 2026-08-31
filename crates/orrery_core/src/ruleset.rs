@@ -462,3 +462,51 @@ mod tests {
         );
     }
 }
+
+// ── module state sections (S7.4, #745) ──────────────────────────────────
+
+/// The stable name of one module-owned section of a game's `CoreState`.
+///
+/// The same string the composition manifest carries as
+/// `orrery_compose::StateSectionId`. It is newtyped here rather than shared
+/// because `orrery_compose` depends on this crate and not the other way round;
+/// the two are held together by a test in the game that declares both, which
+/// is the only place that knows they are the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StateSection(pub &'static str);
+
+/// A `CoreState` that says, per value, which declared module section it
+/// occupies — and which of those sections a decomposing host stores apart.
+///
+/// # Why the game declares this and not the host
+///
+/// A [`TickBackend`](crate::TickBackend) sees an opaque `R::CoreState`. It
+/// cannot look inside, so it cannot know that a Regolith entity is a craft
+/// rather than a rock, and a store that cannot know that has exactly one
+/// archetype: "entity". This trait is the smallest thing a game can say that
+/// lets a host keep one module's population in its own component instead.
+///
+/// # `MIGRATED_SECTIONS` is a migration frontier, not a property of the state
+///
+/// S7.4 migrates modules to the ECS **one at a time**, each landing only with
+/// the four-class differential green across it. The frontier therefore has to
+/// be nameable, and this is where it is named: the sections listed here are the
+/// ones a decomposing host stores in their own component, and every other
+/// section stays in the undivided remainder. Moving a module across the
+/// frontier is a one-line edit whose whole blast radius is measured by F-4.
+pub trait Sectioned {
+    /// The sections a decomposing host stores apart from the remainder.
+    ///
+    /// Must be a subset of the sections [`Self::section`] can return, and
+    /// should be exactly the state sections of the migrated module as the
+    /// composition manifest declares them.
+    const MIGRATED_SECTIONS: &'static [StateSection];
+
+    /// Which declared section this value occupies.
+    fn section(&self) -> StateSection;
+
+    /// Whether this value belongs to a section past the migration frontier.
+    fn is_migrated(&self) -> bool {
+        Self::MIGRATED_SECTIONS.contains(&self.section())
+    }
+}

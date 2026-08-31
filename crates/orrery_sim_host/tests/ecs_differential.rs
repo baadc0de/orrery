@@ -21,15 +21,20 @@
 //!
 //! # The unit of migration
 //!
-//! At the seam there is no such thing as "one module at a time". The host sees
-//! an opaque `R: Ruleset` and a `PersistId`-keyed store; #737's Regolith module
-//! split is a concept *inside* the gated crate and has no expression here. So
-//! the unit is the whole entity store, taken at once, and the safety that a
-//! module-at-a-time migration would have bought is bought instead by the two
-//! backends being simultaneously live and differentially compared on every run
-//! of this file. What the schedule's three named stages give is the *place*
-//! module structure would land if the `Ruleset` contract ever handed a backend
-//! a whole tick's population.
+//! One module's state sections, and #745's S7.4 asks for exactly that. The
+//! host still sees an opaque `R: Ruleset`, but since this lane it also sees
+//! `orrery_core::Sectioned` — the smallest thing a gated crate can say that
+//! lets a host know which entities belong to which of #737's modules. Regolith
+//! declares `regolith.world` as its migration frontier, so `rock`, `pickup`
+//! and `bloom-director` are stored in their own `bevy_ecs` component and
+//! `regolith.craft` is the remainder. See `tests/ecs_module_sections.rs` for
+//! the storage claims and `orrery_sim_host::ecs` for why the *payload* stays
+//! the whole state enum.
+//!
+//! The safety a module-at-a-time migration buys is still bought the same way:
+//! the two backends are simultaneously live and differentially compared on
+//! every run of this file, so moving the next module across the frontier is a
+//! one-line edit whose consequences this file measures.
 
 use std::collections::BTreeMap;
 

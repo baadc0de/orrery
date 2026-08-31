@@ -1803,8 +1803,12 @@ pub fn campaign_orbit_radius_m(slot: usize, count: usize) -> f64 {
 
 #[cfg(test)]
 mod composition_tests {
-    use super::REGOLITH_COMPOSITION;
-    use orrery_compose::registry::regolith::COMPONENT_TYPE_IDS;
+    use super::archetype::Archetype;
+    use super::state::{BloomDirector, Craft, Pickup, RegolithState, Rock, RockTier};
+    use super::weapon::WeaponKind;
+    use super::{REGOLITH_COMPOSITION, REGOLITH_MODULES};
+    use orrery_compose::{registry::regolith::COMPONENT_TYPE_IDS, ModuleId};
+    use orrery_core::{QPos, QVel, Sectioned};
 
     #[test]
     fn assembled_regolith_manifest_validates() {
@@ -1838,6 +1842,69 @@ mod composition_tests {
              reviewed (ComponentTypeId, SchemaVersion) rows in \
              orrery_compose::registry::regolith::COMPONENT_TYPE_IDS"
         );
+    }
+
+    /// S7.4: the ECS migration frontier is a *declared module*, not a hand-picked
+    /// set of variants.
+    ///
+    /// `RegolithState::MIGRATED_SECTIONS` is what a decomposing host stores
+    /// apart (`orrery_sim_host::ecs`). If it could name any subset of sections,
+    /// "one module at a time" would be a claim in a PR body rather than a fact
+    /// about the tree: a frontier cutting across two modules would still
+    /// compile, still pass the differential, and still be described as a module
+    /// migration. This pins it to the manifest's own `regolith.world` row, in
+    /// both directions.
+    #[test]
+    fn the_migration_frontier_is_a_declared_module() {
+        let world = REGOLITH_MODULES
+            .iter()
+            .find(|module| module.id == ModuleId("regolith.world"))
+            .expect("the manifest declares regolith.world");
+        let declared: Vec<&str> = world
+            .state_sections
+            .iter()
+            .map(|section| section.0)
+            .collect();
+        let frontier: Vec<&str> = RegolithState::MIGRATED_SECTIONS
+            .iter()
+            .map(|section| section.0)
+            .collect();
+        assert_eq!(
+            frontier, declared,
+            "the migrated section set must be exactly one manifest module's \
+             state sections"
+        );
+    }
+
+    /// Every section a value can report is one some module owns.
+    ///
+    /// The complement of the test above: the frontier being a module means
+    /// nothing if `section()` can return a name no module declares, because
+    /// then the un-migrated remainder is not "the other modules" but "whatever
+    /// is left over".
+    #[test]
+    fn every_reported_section_is_owned_by_a_module() {
+        let owned: Vec<&str> = REGOLITH_MODULES
+            .iter()
+            .flat_map(|module| module.state_sections.iter().map(|section| section.0))
+            .collect();
+        for state in [
+            RegolithState::Craft(Craft::spawned(Archetype::Interceptor, QPos::default(), 0)),
+            RegolithState::Rock(Rock::spawned(
+                RockTier::Large,
+                0,
+                QPos::default(),
+                QVel::default(),
+            )),
+            RegolithState::Pickup(Pickup::spawned(QPos::default(), WeaponKind::Stock, 0)),
+            RegolithState::BloomDirector(BloomDirector::spawned()),
+        ] {
+            assert!(
+                owned.contains(&state.section().0),
+                "section {:?} is reported by a state value but owned by no module",
+                state.section().0
+            );
+        }
     }
 }
 
