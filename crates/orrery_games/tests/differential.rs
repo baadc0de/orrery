@@ -30,7 +30,8 @@
 //! except where a test declares a bump, which is how a migration comparison
 //! is declared. Regolith is the subject because it is the game whose
 //! composition manifest carries the projection and schema axes; Skirmish has
-//! no manifest yet.
+//! no manifest yet (see `orrery_games::skirmish::components` for why it is
+//! left that way).
 
 use std::collections::BTreeMap;
 
@@ -47,17 +48,18 @@ use orrery_games::{game::Tamper, Game};
 use orrery_protocol::atrest::SchemaVersion;
 use orrery_protocol::{UniverseSeed, Verdict as AdjudicatedVerdict};
 
-/// Regolith's one reviewed component-type allocation, at the bootstrap schema
-/// version.
+/// Regolith's one persisted component, read from the manifest that declares
+/// it.
 ///
-/// `REGOLITH_COMPOSITION.component_schemas` is still empty — the manifest's
-/// schema table has not been populated from
-/// `orrery_compose::registry::regolith`, which is a gap in the manifest and
-/// not in this harness — so the axes below are handed the reviewed registry
-/// row directly. This is the real row S7.1 said these tests would switch to:
-/// `Regolith::classify_component` returns `CoreClass::Core` for it, so D-3
-/// frames a real slot per entity-tick and the class is not vacuous.
-const DECLARED_COMPONENT: ComponentTypeId = orrery_compose::registry::regolith::STATE;
+/// This used to reach past the manifest to `orrery_compose::registry::regolith`
+/// because `REGOLITH_COMPOSITION.component_schemas` was empty (#750). It is
+/// populated now, and the manifest is the harness's source for the schema
+/// axis, as A10 §4.3 says it should be — the registry remains the reviewed
+/// ledger the manifest is checked against, but the harness no longer needs to
+/// know that. `Regolith::classify_component` returns `CoreClass::Core` for
+/// this row, so D-3 frames a real slot per entity-tick and the class is not
+/// vacuous.
+const DECLARED_COMPONENT: ComponentTypeId = REGOLITH_COMPOSITION.component_schemas[0].id.component;
 
 /// A second declared component, classified `Cosmetic` by Regolith and so
 /// never persisted, held only so the schema-**membership** arm has a row it
@@ -73,7 +75,10 @@ fn regolith_axes() -> VersionAxes {
         .iter()
         .map(|schema| (schema.id.component, schema.id.version))
         .collect();
-    schema_versions.insert(DECLARED_COMPONENT, orrery_protocol::atrest::SCHEMA_V0);
+    assert!(
+        schema_versions.contains_key(&DECLARED_COMPONENT),
+        "the manifest must declare the persisted component these axes are framed on"
+    );
     schema_versions.insert(UNPERSISTED_COMPONENT, orrery_protocol::atrest::SCHEMA_V0);
     VersionAxes {
         ruleset_version: Regolith::META.ruleset.version,

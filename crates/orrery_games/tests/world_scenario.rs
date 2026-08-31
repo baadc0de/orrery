@@ -32,19 +32,24 @@ use orrery_protocol::PersistId;
 use orrery_protocol::MAX_ADJUDICATION_TICKS;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The same axes `tests/differential.rs` declares, for the same reasons: the
-/// manifest's schema table is still empty, so the reviewed registry row is
-/// handed over directly and D-3 frames a real slot per entity-tick.
-const DECLARED_COMPONENT: orrery_core::ComponentTypeId = orrery_compose::registry::regolith::STATE;
+/// The same axes `tests/differential.rs` declares, for the same reasons, and
+/// now from the same source: the manifest's schema table is populated (#750),
+/// so the persisted component is read from it rather than reached for in the
+/// registry, and D-3 frames a real slot per entity-tick.
+const DECLARED_COMPONENT: orrery_core::ComponentTypeId =
+    REGOLITH_COMPOSITION.component_schemas[0].id.component;
 
 fn regolith_axes() -> VersionAxes {
-    let mut schema_versions: BTreeMap<orrery_core::ComponentTypeId, SchemaVersion> =
+    let schema_versions: BTreeMap<orrery_core::ComponentTypeId, SchemaVersion> =
         REGOLITH_COMPOSITION
             .component_schemas
             .iter()
             .map(|schema| (schema.id.component, schema.id.version))
             .collect();
-    schema_versions.insert(DECLARED_COMPONENT, orrery_protocol::atrest::SCHEMA_V0);
+    assert!(
+        schema_versions.contains_key(&DECLARED_COMPONENT),
+        "the manifest must declare the persisted component these axes are framed on"
+    );
     VersionAxes {
         ruleset_version: Regolith::META.ruleset.version,
         projection_version: REGOLITH_COMPOSITION.projection_version.0,

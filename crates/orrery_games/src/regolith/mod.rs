@@ -17,9 +17,11 @@ use crate::game::{Game, GameMeta, Tamper};
 use archetype::Archetype;
 use order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult};
 use orrery_compose::{
-    AmbiguityDetection, CanonicalSchedule, CompatibilityManifest, ExecutorPolicy, GameId,
-    ManifestFormatVersion, ModuleId, ModuleManifest, ModuleVersion, ProfileId, ProjectionVersion,
-    StateSectionId,
+    AmbiguityDetection, CanonicalSchedule, CompatibilityManifest, ComponentCapabilities,
+    ComponentSchemaId, ComponentSchemaManifest, ExecutorPolicy, GameId, ManifestFormatVersion,
+    ModuleId, ModuleManifest, ModuleVersion, PersistenceCapability, ProfileId, ProjectionVersion,
+    ReplicationCapability, RollbackCapability, StateSectionId, WitnessCapability,
+    WriteAuthorityCapability,
 };
 use orrery_core::{
     ComponentTypeId, CoreClass, EntityMaterialization, Invariant, OrderedInputs, QPos, QVel,
@@ -305,6 +307,50 @@ pub const REGOLITH_MODULES: &[ModuleManifest] = &[
     },
 ];
 
+/// Regolith's component-schema table, stated from the reviewed ledger.
+///
+/// This is the derived half of the split #750 settled:
+/// `orrery_compose::registry::regolith` is canonical for D45 clause (a)'s
+/// schema id of record — the `(ComponentTypeId, SchemaVersion)` pair — and
+/// this table restates that pair with the two things a ledger does not carry,
+/// the owning module and D45's five capability dimensions. The agreement is
+/// asserted, not assumed: see
+/// [`composition_tests::the_manifest_schema_table_agrees_with_the_reviewed_registry`].
+///
+/// **The capabilities are ADR-0045 clause (d)'s `Core` profile, whose in-tree
+/// example is this exact component** — `P1` bulk persistence, `R1` rollback
+/// membership, `W2` replay-adjudicated, `N1` interest-replicated, `A1`
+/// lease-holder — and the row is legal under every clause (e) prohibition
+/// that could reach it: `W2` has its single fenced writer (IV-1) and its
+/// deterministic [`orrery_core::CoreCodec`] (IV-2); `P1` is not the `P2`
+/// IV-3 and IV-5 constrain; the component is not on an ephemeral identity
+/// (IV-4); and `N1` is not paired with `A0` (IV-6).
+///
+/// **On `owner`, honestly.** One allocation covers *both* modules' state
+/// sections — [`state::RegolithState`]'s variants are exactly
+/// `regolith.craft`'s `craft` plus `regolith.world`'s `rock`, `pickup` and
+/// `bloom-director` — because the id predates the module split, and the
+/// manifest names one owner per row. It names `regolith.craft`, the only
+/// module from which every section of the component is reachable in the
+/// declared dependency order (craft depends on world; world does not depend
+/// on craft). Splitting `STATE` into per-section components would be a new
+/// reviewed allocation and an at-rest change, so it is deliberately not done
+/// here.
+pub const REGOLITH_COMPONENT_SCHEMAS: &[ComponentSchemaManifest] = &[ComponentSchemaManifest {
+    owner: ModuleId("regolith.craft"),
+    id: ComponentSchemaId {
+        component: components::STATE,
+        version: orrery_protocol::atrest::SCHEMA_V0,
+    },
+    capabilities: ComponentCapabilities {
+        persistence: PersistenceCapability::Bulk,
+        rollback: RollbackCapability::Included,
+        witness: WitnessCapability::ReplayAdjudicated,
+        replication: ReplicationCapability::InterestReplicated,
+        write_authority: WriteAuthorityCapability::LeaseHolder,
+    },
+}];
+
 /// The assembled, validated-at-registration composition manifest for Regolith.
 pub const REGOLITH_COMPOSITION: CompatibilityManifest = CompatibilityManifest {
     game_id: GameId("regolith"),
@@ -313,7 +359,7 @@ pub const REGOLITH_COMPOSITION: CompatibilityManifest = CompatibilityManifest {
     toolchain_stamp: "rust-2024",
     ruleset: REGOLITH_RULESET,
     modules: REGOLITH_MODULES,
-    component_schemas: &[],
+    component_schemas: REGOLITH_COMPONENT_SCHEMAS,
     schedule: CanonicalSchedule {
         stages: &[],
         ordering_edges: &[],
@@ -2078,9 +2124,39 @@ pub fn campaign_orbit_radius_m(slot: usize, count: usize) -> f64 {
 #[cfg(test)]
 mod composition_tests {
     use super::REGOLITH_COMPOSITION;
+    use orrery_compose::registry::regolith::COMPONENT_TYPE_IDS;
 
     #[test]
     fn assembled_regolith_manifest_validates() {
         assert_eq!(orrery_compose::validate(&REGOLITH_COMPOSITION), Ok(()));
+    }
+
+    /// The guard on #750's split: the manifest's schema table is the
+    /// *derived* half, and this is what makes "derived" mean something.
+    ///
+    /// Without it, `REGOLITH_COMPOSITION.component_schemas` could name a
+    /// component the reviewed ledger never allocated, or a `SchemaVersion`
+    /// nobody reviewed, and every other test in the tree would stay green —
+    /// which is exactly the state #750 found the empty table in. Both halves
+    /// of D45 clause (a)'s pair are compared, in both directions, so neither
+    /// a row the ledger does not carry nor a ledger row the manifest forgot
+    /// can pass.
+    #[test]
+    fn the_manifest_schema_table_agrees_with_the_reviewed_registry() {
+        let manifest: Vec<_> = REGOLITH_COMPOSITION
+            .component_schemas
+            .iter()
+            .map(|schema| (schema.id.component, schema.id.version))
+            .collect();
+        let reviewed: Vec<_> = COMPONENT_TYPE_IDS
+            .iter()
+            .map(|entry| (entry.id, entry.schema_version))
+            .collect();
+        assert_eq!(
+            manifest, reviewed,
+            "REGOLITH_COMPOSITION.component_schemas must state exactly the \
+             reviewed (ComponentTypeId, SchemaVersion) rows in \
+             orrery_compose::registry::regolith::COMPONENT_TYPE_IDS"
+        );
     }
 }
