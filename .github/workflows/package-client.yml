@@ -7,6 +7,17 @@ on:
         description: "Tag to create or update with these client assets"
         required: true
         type: string
+      join_all_platforms:
+        description: >-
+          Join the deployed campaign: once per platform from that platform's
+          extracted archive, and once as the Linux three-client cohort. Leave
+          on for anything a volunteer will download. Turning it off skips
+          every campaign join for the case PLAYTEST.md warns about -- a tester
+          waiting while one platform is rebuilt -- and it costs exactly the
+          check that let a Windows join defect reach her (#769).
+        required: false
+        default: true
+        type: boolean
   push:
     tags:
       - "playtest-*"
@@ -50,6 +61,9 @@ jobs:
       # A fresh runner has no incremental artifacts to reuse, so they cost
       # build time and buy nothing.
       CARGO_INCREMENTAL: 0
+      # A tag push carries no inputs, and a release is exactly the run that
+      # must be join-tested everywhere, so an absent input means yes.
+      JOIN_ALL_PLATFORMS: ${{ github.event_name != 'workflow_dispatch' || inputs.join_all_platforms }}
     steps:
       - uses: actions/checkout@v7
 
@@ -88,42 +102,6 @@ jobs:
         # newer dependency while producing a client somebody will be asked to
         # reconcile against a campaign's pinned revision.
         run: cargo build --release --locked
-
-      # A rendered launch is necessary but cannot prove a volunteer can enter
-      # the deployed world. The Linux candidate therefore exercises its own
-      # baked origin and joinability predicate, seats three distinct identities,
-      # completes all three iroh handshakes, and exits only after each executor
-      # has received both other nickname-bound replicated crafts. The campaign's
-      # client_rev pin must already target this build; a mismatch fails here
-      # before any archive is offered to testers.
-      - name: Preflight three clients against the deployed campaign
-        if: runner.os == 'Linux'
-        run: >-
-          ../../scripts/client-campaign-preflight.sh
-          --binary ./target/release/${{ matrix.binary }}
-          --campaign shakedown
-
-      # This is a rendered launch proof, not the non-graphics `--smoke-test`.
-      # The client stays alive for twenty seconds, then exits successfully only
-      # after Bevy's primary-window screenshot callback proves the renderer
-      # completed a frame. That catches a compositor/backend failure that
-      # occurs after process creation, such as #550's delayed Wayland crash.
-      #
-      # Linux needs a virtual X server on a hosted runner. Explicitly removing
-      # WAYLAND_DISPLAY matters even under Xvfb: winit otherwise prefers a
-      # real Wayland session when one is present. Mesa's Vulkan software
-      # adapter supplies the renderer there; Windows and macOS use their
-      # runners' native display stacks and platform graphics backends.
-      - name: Render-smoke the built client
-        run: |
-          set -euo pipefail
-          binary="./target/release/${{ matrix.binary }}"
-          if [ "$RUNNER_OS" = Linux ]; then
-            xvfb-run -a env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
-              WGPU_BACKEND=vulkan "$binary" --render-smoke
-          else
-            "$binary" --render-smoke
-          fi
 
       - name: Stage, identify, and checksum the code-only client
         working-directory: .
@@ -192,7 +170,10 @@ jobs:
           archive="dist/orrery-regolith-${{ matrix.label }}.tar.gz"
           tar -C stage -czf "$archive" "$asset" "$asset.sha256" build-info.json README.md
           test -s "$archive"
-          test "$(tar -tzf "$archive" | sort)" = "$(printf '%s\n' "$asset" "$asset.sha256" build-info.json README.md | sort)"
+          # The manifest assertion that used to live here now runs against an
+          # *extraction* of this archive, on every platform, in the artifact
+          # smoke below. A listing and what lands on disk are two different
+          # claims, and only the second is what the volunteer gets. (#774)
 
       - name: Package Windows client
         if: runner.os == 'Windows'
@@ -214,14 +195,66 @@ jobs:
           )
           7z t "$archive"
           test -s "$archive"
-          # The tar leg asserts its exact contents and this one asserted only
-          # that the zip was valid and non-empty — so a zip of wrong names in a
-          # wrong directory passed, and shipped. Same manifest check, same
-          # four names, no prefix. (#768)
-          test "$(7z l -ba -slt "$archive" | sed -n 's/^Path = //p' | sort)" = "$(printf '%s\n' "$asset" "$asset.sha256" build-info.json README.md | sort)"
-          # And the README that actually shipped must name the binary that
-          # actually shipped.
-          7z x -so "$archive" README.md | grep -qF "$asset"
+          # #768's manifest assertion — the four names, flat, no `stage/`
+          # prefix — and the clause holding the shipped README to the shipped
+          # binary have both moved into the artifact smoke below, which asserts
+          # them from an extraction rather than from a listing, and does it on
+          # all three platforms instead of only where somebody remembered.
+          # (#774)
+
+      # The pipeline verified what it compiled and nothing verified what it
+      # shipped. Everything below operates on the archive that is about to be
+      # uploaded: it is extracted into a fresh directory, its contents are held
+      # to the names PLAYTEST.md puts in front of a volunteer, and the
+      # extracted binary is launched from that directory — once where it may
+      # write, and once from a copy this runner genuinely cannot write, which
+      # is the case that stopped the first Windows volunteer at the door
+      # (#766, #772). Nothing here looks at `target/`.
+      #
+      # This replaces the built-binary render smoke that used to run here: the
+      # read-only case below is a rendered launch, so #550's delayed
+      # compositor failure is still covered — by the copy that ships.
+      - name: Smoke the archive that will be published
+        working-directory: .
+        run: |
+          set -euo pipefail
+          archive="dist/orrery-regolith-${{ matrix.label }}."
+          if [ "$RUNNER_OS" = Windows ]; then archive="${archive}zip"; else archive="${archive}tar.gz"; fi
+          # Windows and macOS have never join-tested the artifact they publish,
+          # which is how #769 reached a volunteer. They do it here, with one
+          # client; Linux's three-client cohort scenario runs in the next step,
+          # against the same extraction.
+          join=()
+          if [ "$RUNNER_OS" != Linux ] && [ "$JOIN_ALL_PLATFORMS" = true ]; then
+            join=(--campaign shakedown --join-timeout-secs 900)
+          fi
+          scripts/package-artifact-smoke.sh \
+            --archive "$archive" \
+            --label ${{ matrix.label }} \
+            --keep-extraction "$RUNNER_TEMP/extracted" \
+            ${join[@]+"${join[@]}"}
+
+      # A rendered launch is necessary but cannot prove a volunteer can enter
+      # the deployed world. The Linux candidate therefore exercises its own
+      # baked origin and joinability predicate, seats three distinct identities,
+      # completes all three iroh handshakes, and exits only after each executor
+      # has received both other nickname-bound replicated crafts. The campaign's
+      # client_rev pin must already target this build; a mismatch fails here
+      # before any archive is offered to testers.
+      #
+      # The binary is the one the step above extracted from the archive, not
+      # `target/release`. The three-client cohort scenario stays on one platform
+      # on purpose: it asserts a property of the campaign — a frozen cohort, a
+      # released seat, mutual replication — and three matrix legs running it at
+      # once against one shakedown lobby would be three cohorts interleaved,
+      # which is a different scenario from the one it claims to run. What is
+      # platform-specific about joining is covered per platform above. (#774)
+      - name: Preflight three clients against the deployed campaign
+        if: runner.os == 'Linux' && env.JOIN_ALL_PLATFORMS == 'true'
+        run: >-
+          ../../scripts/client-campaign-preflight.sh
+          --binary "$RUNNER_TEMP/extracted/orrery-regolith-${{ matrix.label }}"
+          --campaign shakedown
 
       - name: Upload release assets for publication
         uses: actions/upload-artifact@v7
