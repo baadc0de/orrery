@@ -10,7 +10,7 @@
 //! §9.3, §11.1, and docs/adr/0011-persistence.md.
 
 use orrery_protocol::atrest::{SchemaVersion, SCHEMA_V0};
-use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, NodeId, PersistId};
+use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, Lsn, NodeId, PersistId};
 
 use crate::actor::Tombstone;
 use crate::checkpoint::CheckpointError;
@@ -1957,6 +1957,163 @@ pub fn ledger_receipt_range_end() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Journal archive metadata family: `jarchive/{node_id}/{segment_seq}`
+// ---------------------------------------------------------------------------
+//
+// Archive tailer metadata rows (docs/08-persistence.md §11). Each row records
+// one archived journal segment bundle: where the Parquet object lives, which
+// (grid, cell) ranges it contains, the LSN span it covers, and a checksum over
+// the object bytes. The family prefix is `z` and the sub-kind discriminator is
+// `a`, so the row key is `za ‖ node_id: 32 bytes ‖ segment_seq: u64 BE`.
+
+/// Family byte for the journal-archive metadata family.
+pub const JARCHIVE_PREFIX: u8 = b'z';
+/// Sub-kind discriminator for archive metadata rows inside the `z` family.
+pub const JARCHIVE_DISCRIMINATOR: u8 = b'a';
+
+/// One cell range included in an archive object.
+///
+/// `start` and `end` are Morton `CellId`s in `grid`'s coordinate space; the
+/// range is half-open `[start, end)` so contiguous ranges can be concatenated
+/// without overlap or gaps. The tailer keeps a object's `cell_ranges` sorted
+/// and non-overlapping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JarchiveCellRange {
+    /// Grid whose `CellId` space the bounds are expressed in.
+    pub grid: GridId,
+    /// First cell in the half-open range (inclusive).
+    pub start: CellId,
+    /// Cell after the last cell in the range (exclusive).
+    pub end: CellId,
+}
+
+/// The LSN span covered by one archive object.
+///
+/// Both bounds are inclusive: the object contains every journal record whose
+/// `lsn` satisfies `start <= lsn <= end`. This is the server-assigned,
+/// monotonic axis the archive selects and sorts on (docs/08-persistence.md §11,
+/// #813); `tick` is stored as displayed metadata and for the `(entity, tick)`
+/// idempotency key it already serves, but it is never the archive's time axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JarchiveLsnSpan {
+    /// First LSN included in the object (inclusive).
+    pub start: Lsn,
+    /// Last LSN included in the object (inclusive).
+    pub end: Lsn,
+}
+
+/// Metadata row stored under `jarchive/{node_id}/{segment_seq}`.
+///
+/// The value is postcard-encoded and carries enough information for a reader
+/// to decide whether an object is relevant to a `(cell range, lsn range)` query
+/// without downloading the object itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JarchiveMetadata {
+    /// Object-store key of the Parquet object (e.g. `s3://bucket/...`).
+    pub object_key: String,
+    /// Cell ranges included in the object. Kept sorted and non-overlapping by
+    /// the tailer on write.
+    pub cell_ranges: Vec<JarchiveCellRange>,
+    /// LSN span the object covers.
+    pub lsn_span: JarchiveLsnSpan,
+    /// BLAKE3 digest over the object bytes, used to verify the object before
+    /// the archive watermark advances (docs/08-persistence.md §11).
+    pub checksum: [u8; 32],
+}
+
+/// Key for a journal-archive metadata row:
+/// `za ‖ node_id: 32 bytes ‖ segment_seq: u64 BE`.
+///
+/// The discriminator bytes are written as literals so the source scanners in
+/// [`every_family_prefix_written_in_this_module_is_registered`] and
+/// [`every_discriminated_constructor_is_registered_with_its_pair`] can see the
+/// family and its `(z, a)` pair; the named constants [`JARCHIVE_PREFIX`] and
+/// [`JARCHIVE_DISCRIMINATOR`] are the source of truth for readers and tests.
+#[must_use]
+pub fn jarchive_key(node_id: &NodeId, segment_seq: u64) -> [u8; 42] {
+    let mut key = [0u8; 42];
+    key[0] = b'z';
+    key[1] = b'a';
+    key[2..34].copy_from_slice(node_id.as_bytes());
+    key[34..].copy_from_slice(&segment_seq.to_be_bytes());
+    key
+}
+
+/// Decode a `jarchive/{node_id}/{segment_seq}` key.
+///
+/// Returns `None` for any key that is not exactly 42 bytes beginning with the
+/// registered `za` pair, or when the 32 node bytes are not a valid ed25519
+/// public key — a `NodeId` is a curve point, so not every 32-byte string is
+/// one.
+#[must_use]
+pub fn decode_jarchive_key(key: &[u8]) -> Option<(NodeId, u64)> {
+    if key.len() != 42 || key[0] != JARCHIVE_PREFIX || key[1] != JARCHIVE_DISCRIMINATOR {
+        return None;
+    }
+    let node_id = NodeId::from_bytes(key[2..34].try_into().ok()?).ok()?;
+    let segment_seq = u64::from_be_bytes(key[34..42].try_into().ok()?);
+    Some((node_id, segment_seq))
+}
+
+/// Inclusive start of the whole `jarchive/` family span.
+#[must_use]
+pub fn jarchive_range_start() -> Vec<u8> {
+    vec![JARCHIVE_PREFIX, JARCHIVE_DISCRIMINATOR]
+}
+
+/// Exclusive end of the whole `jarchive/` family span.
+#[must_use]
+pub fn jarchive_range_end() -> Vec<u8> {
+    vec![JARCHIVE_PREFIX, JARCHIVE_DISCRIMINATOR.wrapping_add(1)]
+}
+
+/// Inclusive start of the `jarchive/{node_id}/…` span for one node.
+#[must_use]
+pub fn jarchive_node_range_start(node_id: &NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(34);
+    key.push(JARCHIVE_PREFIX);
+    key.push(JARCHIVE_DISCRIMINATOR);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+/// Exclusive end of the `jarchive/{node_id}/…` span for one node.
+#[must_use]
+pub fn jarchive_node_range_end(node_id: &NodeId) -> Vec<u8> {
+    let mut key = jarchive_node_range_start(node_id);
+    for byte in key.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            return key;
+        }
+    }
+    // Overflow of the entire 34-byte prefix: the next byte past `za‖node` is
+    // the single byte `zb`, which is also the family end bound.
+    vec![JARCHIVE_PREFIX, JARCHIVE_DISCRIMINATOR.wrapping_add(1)]
+}
+
+/// Encode a [`JarchiveMetadata`] value as postcard bytes.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] if postcard serialization fails.
+pub fn encode_jarchive_metadata(meta: &JarchiveMetadata) -> Result<Vec<u8>, CheckpointError> {
+    postcard::to_stdvec(meta)
+        .map_err(|e| CheckpointError::Store(format!("jarchive metadata encode: {e}")))
+}
+
+/// Decode a [`JarchiveMetadata`] value from postcard bytes.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] if postcard deserialization fails.
+pub fn decode_jarchive_metadata(bytes: &[u8]) -> Result<JarchiveMetadata, CheckpointError> {
+    postcard::from_bytes(bytes)
+        .map_err(|e| CheckpointError::Store(format!("jarchive metadata decode: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3627,6 +3784,17 @@ mod tests {
                     }],
                 },
             },
+            Family {
+                prefix: b'z',
+                name: "jarchive",
+                kinds: Kinds::SubKinds {
+                    table: vec![SubKind {
+                        discriminator: b'a',
+                        name: "jarchive/za metadata",
+                        sample: jarchive_key(&node(1), 0).to_vec(),
+                    }],
+                },
+            },
         ]
     }
 
@@ -3934,7 +4102,7 @@ mod tests {
         // Sanity: the scanner must find something, or the two-source property
         // is vacuous and every future family passes unnoticed.
         assert!(
-            written.len() >= 18,
+            written.len() >= 19,
             "the source scan found only {} family prefixes; \
              the recognized constructor forms have drifted from the code",
             written.len()
@@ -3976,9 +4144,9 @@ mod tests {
     ///
     /// **The floor is the anti-vacuity clause.** Set-equality between two
     /// empty sets passes, so the test asserts the scan found at least the
-    /// nine discriminated constructors known to exist today (`da db dh dw lb
-    /// le li lr ya`) — eight as #265 landed it, plus `dw`, which D36 (a)
-    /// adds and registers in the same change so neither side of this test can
+    /// ten discriminated constructors known to exist today (`da db dh dw lb
+    /// le li lr ya za`) — nine as the previous guard counted them, plus `za`,
+    /// which this change adds and registers so neither side of this test can
     /// pass without the other. If the recognized pairing idiom drifts from the
     /// code — a helper rename, a new construction form — the floor fires first
     /// and names the drift, rather than letting two empty sides pass as equal.
@@ -4003,9 +4171,9 @@ mod tests {
                 .join(" ")
         };
 
-        // Sanity, floored: nine discriminated constructors exist today.
+        // Sanity, floored: ten discriminated constructors exist today.
         assert!(
-            written.len() >= 9,
+            written.len() >= 10,
             "the source scan found only {} discriminated constructors \
              ({}); the recognized pairing idiom has drifted from the code",
             written.len(),
@@ -4187,6 +4355,133 @@ mod tests {
 
         assert_eq!(fence_range_start(), vec![b'a']);
         assert_eq!(fence_range_end(), vec![b'b']);
+    }
+
+    #[test]
+    fn jarchive_key_round_trips_metadata() {
+        let node = node(1);
+        let segment_seq = 42u64;
+        let key = jarchive_key(&node, segment_seq);
+
+        // The key layout is exactly `za ‖ node_id ‖ segment_seq`.
+        assert_eq!(key.len(), 42, "jarchive key is 42 bytes");
+        assert_eq!(key[0], b'z', "family byte is z");
+        assert_eq!(key[1], b'a', "discriminator byte is a");
+        assert_eq!(&key[2..34], node.as_bytes(), "node id occupies bytes 2..34");
+        assert_eq!(
+            u64::from_be_bytes(key[34..42].try_into().unwrap()),
+            segment_seq,
+            "segment_seq is big-endian at bytes 34..42"
+        );
+
+        let (decoded_node, decoded_seq) = decode_jarchive_key(&key)
+            .expect("decode_jarchive_key must accept a well-formed jarchive key");
+        assert_eq!(decoded_node, node, "round-tripped node id");
+        assert_eq!(decoded_seq, segment_seq, "round-tripped segment_seq");
+
+        let shard = CellId::from_bits(SHARD).unwrap();
+        let meta = JarchiveMetadata {
+            object_key: "s3://orrery-archive/jarchive/001/0000002a.parquet".to_owned(),
+            cell_ranges: vec![JarchiveCellRange {
+                grid: GRID,
+                start: shard,
+                end: CellId::from_bits(shard.to_bits().wrapping_add(1)).unwrap(),
+            }],
+            lsn_span: JarchiveLsnSpan {
+                start: Lsn::new(1, 0),
+                end: Lsn::new(3, 4096),
+            },
+            checksum: [0xAB; 32],
+        };
+        let encoded = encode_jarchive_metadata(&meta).expect("encode metadata");
+        let decoded = decode_jarchive_metadata(&encoded).expect("decode metadata");
+        assert_eq!(decoded, meta, "metadata round-trips byte-for-byte");
+    }
+
+    #[test]
+    fn jarchive_family_is_disjoint_from_neighbours() {
+        let node = node(1);
+        let jarchive = jarchive_key(&node, 0);
+
+        // The family sits after `y` (strike) and before the byte after `z`.
+        let strike = strike_key(AccountId::new(1));
+        assert!(
+            jarchive.as_slice() > strike.as_slice(),
+            "jarchive/ must sort after strike/"
+        );
+        assert!(
+            jarchive.as_slice() >= jarchive_range_start().as_slice(),
+            "jarchive key is inside its family start"
+        );
+        assert!(
+            jarchive.as_slice() < jarchive_range_end().as_slice(),
+            "jarchive key is inside its family end"
+        );
+        assert!(
+            jarchive_node_range_end(&node).as_slice() > jarchive_node_range_start(&node).as_slice(),
+            "per-node jarchive span is non-empty"
+        );
+        assert!(
+            jarchive.as_slice() < jarchive_node_range_end(&node).as_slice(),
+            "a concrete jarchive key sits inside its per-node span"
+        );
+    }
+
+    #[test]
+    fn jarchive_neighbouring_keys_do_not_parse_as_jarchive() {
+        let node = node(1);
+
+        // A strike key (`y…`) is the immediate predecessor; it must not decode.
+        let strike = strike_key(AccountId::new(1));
+        assert_eq!(strike.len(), 20);
+        assert!(
+            decode_jarchive_key(&strike).is_none(),
+            "strike/ key must not parse as jarchive/"
+        );
+
+        // A content/version key (`v`) is also a different family; it must not decode.
+        let content = content_version_key();
+        assert!(
+            decode_jarchive_key(&content).is_none(),
+            "content/version key must not parse as jarchive/"
+        );
+
+        // A truncated or over-long key must not decode.
+        assert!(decode_jarchive_key(&jarchive_key(&node, 0)[..41]).is_none());
+        let mut too_long = jarchive_key(&node, 0).to_vec();
+        too_long.push(0x00);
+        assert!(decode_jarchive_key(&too_long).is_none());
+    }
+
+    #[test]
+    fn jarchive_rejects_mutated_discriminator() {
+        let node = node(1);
+        let mut key = jarchive_key(&node, 7).to_vec();
+
+        // Mutate the discriminator byte after construction.
+        key[1] = b'x';
+        assert!(
+            decode_jarchive_key(&key).is_none(),
+            "decode_jarchive_key must reject a key whose discriminator byte is wrong"
+        );
+
+        // Mutate the family byte after construction.
+        key[0] = b'y';
+        key[1] = b'a';
+        assert!(
+            decode_jarchive_key(&key).is_none(),
+            "decode_jarchive_key must reject a key whose family byte is wrong"
+        );
+    }
+
+    #[test]
+    fn jarchive_family_prefix_and_discriminator_are_za() {
+        // This test is the guarded stage for the discriminator byte. A
+        // mutation of `JARCHIVE_PREFIX` or `JARCHIVE_DISCRIMINATOR` must fail
+        // here by name, not silently move the family in the keyspace.
+        let key = jarchive_key(&node(1), 0);
+        assert_eq!(key[0], b'z', "jarchive family prefix is z");
+        assert_eq!(key[1], b'a', "jarchive sub-kind discriminator is a");
     }
 
     /// The registry is written in prefix order, and that order is load-bearing
