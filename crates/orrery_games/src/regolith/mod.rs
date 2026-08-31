@@ -331,20 +331,31 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
-/// Regolith v19's rules identity: v18's execution with the elevation axis
-/// unlocked — `pitch_urad` may now be non-zero, bounded by
-/// [`PITCH_LIMIT_URAD`], and the honest pilot flies it.
+/// Regolith v20's rules identity: v19's rules under **snapshot isolation**
+/// (#758, ADR-0043 clause (b)).
 ///
-/// This is a canonical behaviour change, not a schema migration: the field was
-/// already declared, encoded and replicated, and the step already applied and
-/// clamped it. What v18 forbade was the *value*, in the value-range invariant.
-/// Lifting that admits vertical thrust, which moves velocity, position and
-/// therefore every state hash downstream of a thrusting craft. A v18 peer and
-/// a v19 peer would disagree on the first tick anyone pitches, so the mismatch
-/// must fail ruleset identity matching rather than try to interpolate.
+/// Not one rule body changed. What changed is what a rule *sees*: until v19 a
+/// neighbour read at tick T returned whatever the neighbour's state was at the
+/// moment of the read, so an entity stepped later in a tick observed an
+/// earlier entity's post-step state. Since v20 every read is served from the
+/// state the world had when the tick began, and execution order is not
+/// observable to a rule.
+///
+/// **Bumped on principle, not on a moved golden.** Regolith's only neighbour
+/// read is `visibility::collision_candidate`, reached from `verify_claims`
+/// only for `ClaimCover` and `Collide` inputs, which the honest pilot never
+/// emits — so the committed corpus is blind to the difference and every
+/// pre-existing chain is byte-identical either side. The rules changed
+/// regardless: a craft-vs-rock collision where the craft's id exceeds the
+/// rock's, and a cover claim against a lower-id locker or rock, resolve
+/// differently. A v19 peer and a v20 peer would disagree on the first such
+/// tick, and two builds must not be treated as the same rules merely because
+/// the corpus cannot tell them apart. `ecs_differential.rs`'s
+/// `within-tick-neighbor-visibility` fixture is the case that can, and its
+/// chains moved.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 19,
-    digest: [0x68; 32],
+    version: 20,
+    digest: [0x69; 32],
 };
 
 /// Regolith's two statically linked rule domains.

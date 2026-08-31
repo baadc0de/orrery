@@ -436,3 +436,22 @@ fn an_entity_may_not_relabel_its_own_archetype() {
         Some(InvariantKind::ValueRange)
     );
 }
+
+/// The premise of #758's decision not to bump `SKIRMISH_RULESET`.
+///
+/// Snapshot isolation changed what a neighbour read returns. Skirmish declares
+/// it makes none — `max_neighbor_reads()` is the trait default of zero, and
+/// the executor's budget is what a rule is held to — so no Skirmish tick can
+/// reach the changed path and no two builds either side of #758 can disagree.
+/// If this ever fails, Skirmish acquired neighbour reads and the version
+/// decision is due for review, not for inheritance.
+#[test]
+fn skirmish_declares_no_neighbour_reads() {
+    assert_eq!(
+        Skirmish::honest().max_neighbor_reads(),
+        0,
+        "Skirmish now reads neighbours, so #758's argument for leaving \
+         SKIRMISH_RULESET at v{} no longer holds",
+        SKIRMISH_RULESET.version
+    );
+}

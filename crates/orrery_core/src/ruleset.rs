@@ -94,8 +94,8 @@ pub struct ComponentTypeId(pub u32);
 
 /// The only state `step` may read or write.
 ///
-/// Own state is mutable; neighbours are read-only, snapshotted at tick start,
-/// and **every read is recorded**. Recording is what closes the input set: a
+/// Own state is mutable; neighbours are read-only, served from the tick-start
+/// snapshot (D43 (b)), and **every read is recorded**. Recording is what closes the input set: a
 /// replay never needs the neighbour's live state, and an authority that feeds
 /// itself fabricated neighbour state to justify an outcome produces checkable
 /// evidence against itself.
@@ -166,20 +166,33 @@ impl<'a, S> StateView<'a, S> {
     /// Takes `&mut self` precisely because reading has a side effect on the
     /// log. A view that let neighbours be read without recording would produce
     /// windows that cannot be replayed.
+    ///
+    /// The stepping entity's own identifier reads as `None`, whether or not
+    /// the neighbour map holds a row for it. Own state is reachable through
+    /// [`Self::own`] alone; a rule able to reach it both ways would hold two
+    /// aliases for one value under two different staleness rules, and only one
+    /// of them recorded. The read is still recorded, so the log says the rule
+    /// asked.
     pub fn neighbor(&mut self, id: PersistId) -> Option<&S> {
-        let fresh = self
-            .observation_ticks
-            .is_none_or(|(observed, tick, staleness_cap)| {
-                observed.get(&id).is_some_and(|observed_tick| {
-                    // An observation stamped at or after the reader's tick
-                    // is fresher than fresh, not stale: `step` sets each
-                    // entity's tick to T+1 as it finishes, so every neighbour
-                    // already stepped this tick reads as T+1 > T. Treating
-                    // that as unreadable hid same-tick neighbours entirely
-                    // and silently broke collision resolution.
-                    tick.0.saturating_sub(observed_tick.0) <= staleness_cap
-                })
-            });
+        let readable = id != self.entity;
+        let fresh = readable
+            && self
+                .observation_ticks
+                .is_none_or(|(observed, tick, staleness_cap)| {
+                    observed.get(&id).is_some_and(|observed_tick| {
+                        // Checked, not saturating. Since #758 neighbours are
+                        // served from the tick-start slot, so the stepping
+                        // path cannot stamp an observation ahead of its
+                        // reader; one that is ahead arrived by replication and
+                        // is state from the reader's future, which
+                        // `ReplayHarness` already refuses as a malformed
+                        // frame. Live execution refuses it too, or the two
+                        // would disagree about the same log.
+                        tick.0
+                            .checked_sub(observed_tick.0)
+                            .is_some_and(|age| age <= staleness_cap)
+                    })
+                });
         let found = fresh.then(|| self.neighbors.get(&id)).flatten();
         if !self.reads.contains(&id) {
             self.reads.push(id);
