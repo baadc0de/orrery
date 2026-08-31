@@ -144,9 +144,9 @@ $ ./scripts/dev-cache.sh reclaim              # report only
 $ ./scripts/dev-cache.sh reclaim --apply      # and delete
 ```
 
-It looks only at `.claude/worktrees/`, and every tree passes two independent
-gates before anything is deleted. Both fail closed: anything unreadable,
-unresolvable or unfetchable is reported and kept.
+It looks only at `.claude/worktrees/`, and every tree passes independent gates
+before anything is deleted. All fail closed: anything unreadable, unresolvable
+or unfetchable is *reported and skipped*, never deleted.
 
 - **Liveness.** No `cargo`/`rustc`/`kache`/linker process has its working
   directory inside the tree, and no process at all holds an open descriptor
@@ -169,13 +169,21 @@ unresolvable or unfetchable is reported and kept.
   worktree's own `origin` can point at a local filesystem path, so its
   `origin/main` is stale and `git log origin/main..HEAD` run there reports
   landed work as unlanded.
+- **Pushed.** A registered worktree whose content is not yet on `main` may still
+  have its `target/` dropped if its branch exists on `origin` at the same
+  commit as local HEAD. Source, `.git`, and the worktree registration are left
+  untouched; only the reproducible build output is removed. This is the shape
+  that caused the 2026-08-31 low-disk alarms: open PRs whose agents had
+  finished and whose `target/` directories were still being kept because the
+  content gate alone reported them as unlanded.
 
 What it then does depends on what the tree is:
 
-| tree | reclaimed |
-|---|---|
-| **orphan** — a directory under `.claude/worktrees/` that `git worktree list` does not know about | the whole directory. No lane can build there again, and `git worktree remove` refuses it, which is why both of #781's 100 GiB incidents survived. |
-| **registered** — a live worktree whose branch content has landed | its `target/` only. The checkout belongs to an agent and is not this script's to remove. |
+| tree | verdict | reclaimed |
+|---|---|---|
+| **orphan** — a directory under `.claude/worktrees/` that `git worktree list` does not know about | `DELETE` | the whole directory. No lane can build there again, and `git worktree remove` refuses it, which is why both of #781's 100 GiB incidents survived. |
+| **registered, landed** — a live worktree whose branch content has landed | `DELETE` | its `target/` only. The checkout belongs to an agent and is not this script's to remove. |
+| **registered, pushed** — a live worktree with an open PR whose branch is on `origin` at `HEAD` | `TRIM` | its `target/` only, exactly like a landed worktree. The checkout and `.git` stay. |
 
 A registered worktree with a warm heartbeat in the agent-lane ledger is also
 left alone — not a safety gate (liveness is), but deleting a live agent's
