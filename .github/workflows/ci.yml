@@ -1,8 +1,9 @@
 # Orrery's commit-time gates.
 #
 # The static rules in scripts/core-gates.sh — no Bevy in orrery_core's graph,
-# no std HashMap, no ambient inputs, no std transcendentals — are exactly the
-# kind that rot silently: nothing breaks the day someone writes
+# no std HashMap, no ambient inputs, no std transcendentals, and ADR-0043
+# clause (e)'s Tier-H battery over any crate hosting canonical state in a
+# `bevy_ecs::World` — are exactly the kind that rot silently: nothing breaks the day someone writes
 # `Instant::now()` in the core, it just quietly stops being replayable. They
 # are enforced here so drift is caught at commit time rather than in the strike
 # pipeline months later.
