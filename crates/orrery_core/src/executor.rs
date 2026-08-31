@@ -419,7 +419,30 @@ pub trait TickBackend<R: Ruleset> {
     fn ruleset(&self) -> &R;
 
     /// Install or replace an entity's state, quantizing it first (VC-7).
-    fn insert(&mut self, entity: PersistId, state: R::CoreState);
+    ///
+    /// The observation clock starts at zero, which is what a tick-zero spawn
+    /// wants; a replicated or replayed state that was observed later carries
+    /// its own tick through [`Self::insert_observed`].
+    fn insert(&mut self, entity: PersistId, state: R::CoreState) {
+        self.insert_observed(entity, state, Tick::new(0));
+    }
+
+    /// Install or replace state carrying the tick at which it was observed.
+    ///
+    /// Adjudication needs this, not just [`Self::insert`]: a bundle's
+    /// neighbour records name the tick each neighbour state was observed at,
+    /// and a replay that installed them at tick zero would fail the ruleset's
+    /// staleness bound instead of reproducing the read. Quantizes first,
+    /// exactly as `insert` does.
+    fn insert_observed(&mut self, entity: PersistId, state: R::CoreState, observed_tick: Tick);
+
+    /// Remove and return an entity's state.
+    ///
+    /// The adjudicator's window is closed: a neighbour installed for one
+    /// tick's read, and a child materialized inside a single-entity replay,
+    /// both have to leave again, or the next tick would find a population the
+    /// authority never had. See [`ReplayHarness::replay`](crate::ReplayHarness).
+    fn take_state(&mut self, entity: PersistId) -> Option<R::CoreState>;
 
     /// Read an entity's current canonical state.
     fn state(&self, entity: PersistId) -> Option<&R::CoreState>;
@@ -465,6 +488,14 @@ impl<R: Ruleset> TickBackend<R> for Executor<R> {
 
     fn insert(&mut self, entity: PersistId, state: R::CoreState) {
         Executor::insert(self, entity, state);
+    }
+
+    fn insert_observed(&mut self, entity: PersistId, state: R::CoreState, observed_tick: Tick) {
+        Executor::insert_observed(self, entity, state, observed_tick);
+    }
+
+    fn take_state(&mut self, entity: PersistId) -> Option<R::CoreState> {
+        Executor::take_state(self, entity)
     }
 
     fn state(&self, entity: PersistId) -> Option<&R::CoreState> {

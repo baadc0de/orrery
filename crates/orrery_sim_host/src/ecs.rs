@@ -493,16 +493,16 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
         &self.world.resource::<Rules<R>>().ruleset
     }
 
-    fn insert(&mut self, entity: PersistId, mut state: R::CoreState) {
-        // VC-7 on install, exactly as `Executor::insert` does it: a snapshot
-        // loaded from a bundle must sit on the lattice before the first tick
-        // reads it.
+    fn insert_observed(&mut self, entity: PersistId, mut state: R::CoreState, observed_tick: Tick) {
+        // VC-7 on install, exactly as `Executor::insert_observed` does it: a
+        // snapshot loaded from a bundle must sit on the lattice before the
+        // first tick reads it.
         state.quantize();
         match self.entity_for(entity) {
             Some(existing) => {
                 self.world
                     .entity_mut(existing)
-                    .insert((Canonical::<R>(state), ObservedAt(Tick::new(0))));
+                    .insert((Canonical::<R>(state), ObservedAt(observed_tick)));
             }
             None => {
                 let spawned = self
@@ -510,12 +510,26 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
                     .spawn((
                         Identity(entity),
                         Canonical::<R>(state),
-                        ObservedAt(Tick::new(0)),
+                        ObservedAt(observed_tick),
                     ))
                     .id();
                 self.world.resource_mut::<Index>().0.insert(entity, spawned);
             }
         }
+    }
+
+    /// Despawn the entity outright rather than only dropping its index row:
+    /// an entity left in the `World` without its index row would still be
+    /// sealed by `seal_population` — which queries components, not the index —
+    /// and would go on being a neighbour nobody could see.
+    fn take_state(&mut self, entity: PersistId) -> Option<R::CoreState> {
+        let handle = self.world.resource_mut::<Index>().0.remove(&entity)?;
+        let state = self
+            .world
+            .get::<Canonical<R>>(handle)
+            .map(|held| held.0.clone());
+        self.world.despawn(handle);
+        state
     }
 
     fn state(&self, entity: PersistId) -> Option<&R::CoreState> {

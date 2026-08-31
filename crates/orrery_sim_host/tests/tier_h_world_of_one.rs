@@ -23,21 +23,23 @@
 //! difference is invisible, which is precisely why this file also holds the
 //! populated case.
 //!
-//! # What this file does *not* claim, stated rather than hidden
+//! # What this file claims, and what its sibling does
 //!
-//! The shipped adjudicator still re-executes on the `Executor`:
-//! `orrery_core::verify_bundle` (replay.rs:331) builds its own harness around
-//! `Executor::new` (replay.rs:106), and `orrery_games::diff`'s
-//! `authored_bundles` (diff.rs:918) re-executes each side's signed log through
-//! an `Executor` regardless of which backend authored it. So on the ECS path
-//! the D-4 *frames* are executor-authored while the *claim values* are
-//! ECS-derived. Conviction power survives — a diverging ECS fails D-1/D-2/D-3
-//! and the claim values independently of the frames — but the world-of-one
-//! property is demonstrated *here*, by this harness, rather than embodied in
-//! the adjudicator's own substrate. Closing that means making `verify_bundle`
-//! and `authored_bundles` backend-parametric, which is a change to
-//! `orrery_core` and `orrery_games`; see the Tier-H clause (e)(5) note in
-//! `scripts/core-gates.sh`.
+//! This file demonstrates the property *here*, in a harness: given the run's
+//! recorded inputs, a world of one on the ECS reproduces every hash the full
+//! population claimed. Until #763 that was the whole of it — the shipped
+//! adjudicator still re-executed on the `Executor`, so on the ECS path the
+//! D-4 *frames* were executor-authored while the *claim values* were
+//! ECS-derived. Conviction power never depended on it (a diverging ECS fails
+//! D-1/D-2/D-3 and the claim values independently of the frames), but the
+//! adjudicator that would convict an ECS host was re-executing on a different
+//! substrate than the one under suspicion.
+//!
+//! #763 closed that: `orrery_core::verify_bundle_on` and `ReplayHarness::on`
+//! take the substrate, and `orrery_games::diff`'s `authored_bundles`,
+//! `collect_witness_on` and `cross_replay_on` carry it through. The property
+//! is now embodied in the adjudicator's own substrate, and
+//! `tier_h_adjudication_substrate.rs` is what holds it there.
 
 use std::collections::BTreeMap;
 

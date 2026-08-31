@@ -13,6 +13,7 @@
 //! anyone. Bogus-report pressure is meant to be absorbed by per-account rate
 //! limits, not by punishing honest reporters for gaps the cluster owns.
 
+use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
 use orrery_protocol::{
@@ -20,7 +21,7 @@ use orrery_protocol::{
     RecordSource, Tick, UnadjudicableReason, UniverseSeed, Verdict, MAX_ADJUDICATION_TICKS,
 };
 
-use crate::executor::Executor;
+use crate::executor::{Executor, TickBackend};
 use crate::log::{claim_hash, verify_claim, verify_frame, LogError};
 use crate::ruleset::{CoreCodec, Ruleset};
 
@@ -86,9 +87,18 @@ impl ReplayTrace {
     }
 }
 
-/// Re-executes a window from logged frames.
-pub struct ReplayHarness<R: Ruleset> {
-    executor: Executor<R>,
+/// Re-executes a window from logged frames, on whatever substrate it is given.
+///
+/// The backend parameter is D43 clause (e)(5)'s adjudication half. A verdict
+/// reached by replaying on the [`Executor`] is evidence about the `Executor`;
+/// when the claims under suspicion were authored on some other
+/// [`TickBackend`], the replay has to happen *there*, or "the schedule was
+/// deterministic" has quietly been substituted for per-entity replay. The
+/// default is `Executor` so that every existing caller keeps the substrate it
+/// already had — this relocates where a replay runs and changes no canonical
+/// byte.
+pub struct ReplayHarness<R: Ruleset, B: TickBackend<R> = Executor<R>> {
+    backend: B,
     entity: Option<PersistId>,
     /// The chain head the loaded claim commits to.
     ///
@@ -97,15 +107,28 @@ pub struct ReplayHarness<R: Ruleset> {
     /// and report a head mismatch on the first frame. This is what
     /// `StateClaim::input_head` is *for*.
     start_head: Option<ChainHash>,
+    ruleset: PhantomData<fn() -> R>,
 }
 
-impl<R: Ruleset> ReplayHarness<R> {
-    /// A harness over one ruleset build and universe seed.
+impl<R: Ruleset> ReplayHarness<R, Executor<R>> {
+    /// A harness over one ruleset build and universe seed, on the [`Executor`].
     pub fn new(ruleset: R, universe_seed: UniverseSeed) -> Self {
+        Self::on(Executor::new(ruleset, universe_seed))
+    }
+}
+
+impl<R: Ruleset, B: TickBackend<R>> ReplayHarness<R, B> {
+    /// A harness over a substrate that already carries its ruleset and seed.
+    ///
+    /// `backend` must be empty: `load_claimed_snapshot` installs the one state
+    /// the claim commits to, and a backend arriving with a population would
+    /// give the replay neighbours the authority's own window did not have.
+    pub fn on(backend: B) -> Self {
         Self {
-            executor: Executor::new(ruleset, universe_seed),
+            backend,
             entity: None,
             start_head: None,
+            ruleset: PhantomData,
         }
     }
 
@@ -129,7 +152,7 @@ impl<R: Ruleset> ReplayHarness<R> {
         }
         let state =
             R::CoreState::decode(snapshot_bytes).map_err(|_| ReplayError::SnapshotMalformed)?;
-        self.executor.insert(claim.entity, state);
+        self.backend.insert(claim.entity, state);
         self.entity = Some(claim.entity);
         self.start_head = Some(claim.input_head);
         Ok(())
@@ -144,7 +167,7 @@ impl<R: Ruleset> ReplayHarness<R> {
     #[must_use]
     pub fn canonical_state(&self) -> Option<Vec<u8>> {
         self.entity
-            .and_then(|entity| self.executor.state(entity))
+            .and_then(|entity| self.backend.state(entity))
             .map(CoreCodec::to_canonical)
     }
 
@@ -233,7 +256,7 @@ impl<R: Ruleset> ReplayHarness<R> {
                         let reader_tick = frame.first_tick.0 + u64::from(record.tick_off);
                         let age = reader_tick.checked_sub(observed_tick.0);
                         if age.is_none_or(|age| {
-                            age > self.executor.ruleset().max_neighbor_staleness_ticks()
+                            age > self.backend.ruleset().max_neighbor_staleness_ticks()
                         }) {
                             return Err(ReplayError::NeighborFramesMalformed);
                         }
@@ -249,7 +272,7 @@ impl<R: Ruleset> ReplayHarness<R> {
                             None
                         };
                         let frames = neighbors_per_tick.entry(reader_tick).or_default();
-                        if frames.len() >= self.executor.ruleset().max_neighbor_reads()
+                        if frames.len() >= self.backend.ruleset().max_neighbor_reads()
                             || frames.iter().any(|(found, _, _)| found == &neighbor)
                         {
                             return Err(ReplayError::NeighborFramesMalformed);
@@ -288,11 +311,11 @@ impl<R: Ruleset> ReplayHarness<R> {
                     continue;
                 }
                 if let Some(state) = state {
-                    self.executor
+                    self.backend
                         .insert_observed(*neighbor, state.clone(), *observed_tick);
                 }
             }
-            let Some(outcome) = self.executor.step_entity(entity, Tick::new(tick), &inputs) else {
+            let Some(outcome) = self.backend.step_entity(entity, Tick::new(tick), &inputs) else {
                 return Err(ReplayError::SnapshotMalformed);
             };
             let expected_reads: Vec<_> = neighbor_frames
@@ -304,7 +327,7 @@ impl<R: Ruleset> ReplayHarness<R> {
             }
             for (neighbor, _, state) in &neighbor_frames {
                 if state.is_some() {
-                    self.executor.take_state(*neighbor);
+                    self.backend.take_state(*neighbor);
                 }
             }
             // The adjudicator replays exactly one entity. Its emitted child
@@ -312,7 +335,7 @@ impl<R: Ruleset> ReplayHarness<R> {
             // those children here would make them neighbours on the next tick
             // and quietly turn a closed window into a growing world.
             for materialized in &outcome.materialized {
-                self.executor.take_state(*materialized);
+                self.backend.take_state(*materialized);
             }
             trace.hashes.push((Tick::new(tick), outcome.state_hash));
         }
@@ -334,7 +357,31 @@ pub fn verify_bundle<R: Ruleset>(
     authority: NodeId,
     bundle: &EvidenceBundle,
 ) -> Verdict {
-    if ruleset.id() != bundle.ruleset {
+    verify_bundle_on(Executor::new(ruleset, universe_seed), authority, bundle)
+}
+
+/// Adjudicate a bundle on a given substrate — D43 clause (e)(5)'s adjudication
+/// half.
+///
+/// [`verify_bundle`] is this function on the [`Executor`], and that is the
+/// right substrate exactly when the `Executor` is what authored the claims.
+/// When something else did — an ECS world behind the seam, per D42 (d) — the
+/// adjudicator that would convict it must re-execute *there*, because a
+/// verdict reached on a different substrate than the one under suspicion is
+/// evidence about the wrong substrate. Nothing about the rules moves with the
+/// backend: the RNG, the rule call, quantization, hashing and neighbour
+/// framing are all `canonical_step`, which every backend calls and none
+/// reimplements, so this relocates a replay and changes no canonical byte.
+///
+/// `backend` carries the ruleset build and universe seed, and must be empty:
+/// the bundle's own `t0_snapshot` is the only state a window may start from.
+#[must_use]
+pub fn verify_bundle_on<R: Ruleset, B: TickBackend<R>>(
+    backend: B,
+    authority: NodeId,
+    bundle: &EvidenceBundle,
+) -> Verdict {
+    if backend.ruleset().id() != bundle.ruleset {
         return Verdict::Unadjudicable(UnadjudicableReason::UnknownRuleset);
     }
     let span = bundle.window_end.0.saturating_sub(bundle.window_start.0);
@@ -359,7 +406,7 @@ pub fn verify_bundle<R: Ruleset>(
         }
     }
 
-    let mut harness = ReplayHarness::new(ruleset, universe_seed);
+    let mut harness = ReplayHarness::on(backend);
     if let Err(error) = harness.load_claimed_snapshot(&bundle.t0_claim, &bundle.t0_snapshot) {
         return match error {
             ReplayError::SnapshotHashMismatch => {

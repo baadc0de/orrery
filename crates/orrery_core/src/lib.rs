@@ -95,7 +95,7 @@ pub use author::{AuthoredFrame, InputLogProducer};
 pub use invariants::{evaluate, Invariant, InvariantKind, InvariantSample, InvariantViolation};
 pub use migration::ComponentMigrator;
 pub use quantize::{QPos, QVel, Quantized};
-pub use replay::{verify_bundle, ReplayError, ReplayHarness, ReplayTrace};
+pub use replay::{verify_bundle, verify_bundle_on, ReplayError, ReplayHarness, ReplayTrace};
 pub use rng::{tick_rng, tick_seed, TickRng};
 pub use ruleset::{
     state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, EntityMaterialization,
