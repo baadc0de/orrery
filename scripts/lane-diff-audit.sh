@@ -9,7 +9,7 @@
 # ancestor with origin/main, not to the tip, because the push is what would land
 # on main; the diff from the merge-base is what the merge commit will contain.
 #
-# The four checks are intentionally mechanical and overridable. A lane whose
+# The five checks are intentionally mechanical and overridable. A lane whose
 # real job is deleting a large file or reverting a recent commit can pass
 # --waive CHECK; the waiver is printed so it cannot be accidental.
 #
@@ -56,12 +56,20 @@ readonly REVERT_HUNK_MIN_LINES=3
 # which builds a synthetic repository where there is no origin/main yet.
 MAIN_REF="${LANE_DIFF_AUDIT_MAIN:-origin/main}"
 
+# The checkout containing the branch under audit. Capture it once instead of
+# letting individual git commands inherit whichever directory the script or a
+# helper happens to be in. The self-test overrides this by invoking a new copy
+# of the script from its synthetic repository.
+AUDIT_REPO="${LANE_DIFF_AUDIT_REPO:-$PWD}"
+readonly AUDIT_REPO
+
 # ── Override state ───────────────────────────────────────────────────────────
 
 WAIVE_FILE_TRUNC=0
 WAIVE_STALE_BASE=0
 WAIVE_REVERT=0
 WAIVE_DELETION_SURGE=0
+WAIVE_MUTATION_COMMIT=0
 
 # ── Usage ────────────────────────────────────────────────────────────────────
 
@@ -75,7 +83,8 @@ Options:
   --waive stale-base            do not fail on a merge-base far behind main
   --waive revert-hunk           do not fail on reverts of merged hunks
   --waive deletion-surge        do not fail on deletions exceeding additions
-  --waive-all                   waive all four checks
+  --waive mutation-commit       do not fail on an unreverted mutation commit
+  --waive-all                   waive all five checks
   -h, --help                    show this help and exit
 
 A waiver is printed to stderr exactly once per check that would have fired.
@@ -84,7 +93,7 @@ USAGE
 
 # ── Helper: run git in the repository under audit ────────────────────────────
 
-git_() { git "$@"; }
+git_() { git -C "$AUDIT_REPO" "$@"; }
 
 # ── Check 1: tracked file truncated to empty or nearly empty ─────────────────
 #
@@ -109,14 +118,14 @@ check_file_truncation() {
         esac
 
         # Skip binary files: line counts are meaningless.
-        if git diff --numstat "$left_ref" HEAD -- "$file" 2>/dev/null \
+        if git_ diff --numstat "$left_ref" HEAD -- "$file" 2>/dev/null \
             | awk -v f="$file" '$3 == f { exit ($1 == "-" || $2 == "-") ? 0 : 1 }'; then
             continue
         fi
 
         local main_lines head_lines
-        main_lines=$(git show "$left_ref:$file" 2>/dev/null | wc -l) || main_lines=0
-        head_lines=$(git show "HEAD:$file" 2>/dev/null | wc -l) || head_lines=0
+        main_lines=$(git_ show "$left_ref:$file" 2>/dev/null | wc -l) || main_lines=0
+        head_lines=$(git_ show "HEAD:$file" 2>/dev/null | wc -l) || head_lines=0
 
         if (( main_lines > 0 && head_lines == 0 )); then
             printf 'file-truncation\tempty\t%s\tmain=%s\n' "$file" "$main_lines"
@@ -131,7 +140,7 @@ check_file_truncation() {
                 fi
             fi
         fi
-    done < <(git diff --name-status --find-renames "$left_ref" HEAD)
+    done < <(git_ diff --name-status --find-renames "$left_ref" HEAD)
 }
 
 # ── Check 2: merge-base far behind main ──────────────────────────────────────
@@ -139,7 +148,7 @@ check_file_truncation() {
 check_stale_base() {
     local _base="$1"
     local distance
-    distance=$(git rev-list --count --first-parent "$_base..$MAIN_REF")
+    distance=$(git_ rev-list --count --first-parent "$_base..$MAIN_REF")
     if (( distance > BASE_DISTANCE_THRESHOLD )); then
         printf 'stale-base\tdistance=%s\n' "$distance"
     fi
@@ -159,7 +168,7 @@ check_deletion_surge() {
         [[ $added == '-' || $deleted == '-' ]] && continue
         total_ins=$((total_ins + added))
         total_del=$((total_del + deleted))
-    done < <(git diff --numstat --find-renames "$left_ref" HEAD)
+    done < <(git_ diff --numstat --find-renames "$left_ref" HEAD)
 
     if (( total_del > DELETION_SURGE_LINES )); then
         local ratio_label="inf"
@@ -185,16 +194,15 @@ check_deletion_surge() {
 check_revert_hunks() {
     local left_ref="$1"
     local _base="$2"
-    python3 - "$left_ref" "$_base" "$MAIN_REF" <<'PYEOF'
+    LANE_DIFF_AUDIT_REPO="$AUDIT_REPO" python3 - "$left_ref" "$_base" "$MAIN_REF" <<'PYEOF'
 import os
 import subprocess
 import sys
 
-REPO = os.getcwd()
+REPO = os.environ["LANE_DIFF_AUDIT_REPO"]
 LEFT = sys.argv[1]
 BASE = sys.argv[2]
 MAIN = sys.argv[3]
-REPO = os.getcwd()
 MIN_BLOCK = int(os.environ.get("REVERT_HUNK_MIN_LINES", "3"))
 
 
@@ -325,6 +333,69 @@ if __name__ == "__main__":
 PYEOF
 }
 
+# ── Check 5: deliberate compile-break commit has not been reverted ──────────
+#
+# Mutation checks deliberately commit a broken tree so CI can prove that a
+# guard bites. That is safe only when the branch also contains the genuine
+# `git revert` commit. Detect the intent from the commit subject (rather than a
+# single fixture string), then pair each candidate with Git's unambiguous
+# "This reverts commit <sha>." trailer in a later branch-only commit.
+
+check_mutation_commits() {
+    LANE_DIFF_AUDIT_REPO="$AUDIT_REPO" python3 - "$MAIN_REF" <<'PYEOF'
+import os
+import re
+import subprocess
+import sys
+
+REPO = os.environ["LANE_DIFF_AUDIT_REPO"]
+MAIN = sys.argv[1]
+
+# A mutation commit must say that it deliberately creates a broken/failing
+# state. This recognizes the repository's normal wording without treating an
+# ordinary bug fix that happens to mention "broken" as a mutation check.
+MUTATION_SUBJECT = re.compile(
+    r"(?:"
+    r"\b(?:mutation|fault|failure)[ -]?(?:check|test|injection)\b"
+    r"|\b(?:deliberately|intentionally|purposefully)\s+\w*break\w*\b"
+    r"|\bbreak\w*\b.*\b(?:ci|check|test|guard)\b"
+    r")",
+    re.IGNORECASE,
+)
+REVERT_TRAILER = re.compile(r"^This reverts commit ([0-9a-f]{40})\.$", re.MULTILINE)
+
+
+def run(args):
+    return subprocess.run(
+        ["git", "-C", REPO, *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def main():
+    records = run(["log", "--format=%H%x00%s%x00%B%x00", f"{MAIN}..HEAD"]).split("\x00")
+    candidates = {}
+    reverted = set()
+
+    for index in range(0, len(records) - 1, 3):
+        commit, subject, body = records[index : index + 3]
+        commit = commit.strip()
+        subject = subject.strip()
+        if not commit:
+            continue
+        reverted.update(REVERT_TRAILER.findall(body))
+        if not subject.lower().startswith("revert ") and MUTATION_SUBJECT.search(subject):
+            candidates[commit] = subject
+
+    for commit, subject in candidates.items():
+        if commit not in reverted:
+            print(f"mutation-commit\tcommit={commit}\tsubject={subject}")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+}
+
 # ── Collect and report violations ────────────────────────────────────────────
 
 collect_violations() {
@@ -334,6 +405,7 @@ collect_violations() {
     check_stale_base "$base_for_stale"
     check_deletion_surge "$left_ref"
     check_revert_hunks "$left_ref" "$base_for_stale"
+    check_mutation_commits
 }
 
 report_violation() {
@@ -368,6 +440,13 @@ report_violation() {
             fi
             note "FAIL revert-hunk: $detail"
             ;;
+        mutation-commit)
+            if (( WAIVE_MUTATION_COMMIT )); then
+                note "WAIVED mutation-commit: $detail"
+                return 0
+            fi
+            note "FAIL mutation-commit: $detail (unreverted deliberate compile-break commit)"
+            ;;
         *)
             note "FAIL unknown: $kind $detail"
             ;;
@@ -385,12 +464,35 @@ self_test() {
 
     note "self-test: building synthetic repository in $tmp"
     (
+        audit_synthetic() {
+            # Run from outside the synthetic repository. This pins the target
+            # selection independently of both the self-test's cwd and its
+            # caller's cwd; changing git_ back to ambient git makes this fail.
+            (
+                cd /
+                LANE_DIFF_AUDIT_REPO="$tmp" LANE_DIFF_AUDIT_MAIN=main \
+                    "$ROOT/scripts/lane-diff-audit.sh" "$@"
+            )
+        }
+
         cd "$tmp"
         git init -q
         git config user.email "lane-diff-audit@orrery.local"
         git config user.name "Lane Diff Audit"
 
+        cat > Cargo.toml <<'EOF'
+[package]
+name = "lane-diff-audit-synthetic"
+version = "0.1.0"
+edition = "2021"
+EOF
         mkdir -p src
+        cat > src/lib.rs <<'EOF'
+#[allow(dead_code)]
+pub struct MutationCheckRecord {
+    expected_field: (),
+}
+EOF
         cat > src/lib.txt <<'EOF'
 common line one
 common line two
@@ -398,6 +500,7 @@ common line three
 EOF
         git add .
         git commit -q -m "initial"
+        cargo check --quiet
 
         {
             echo "merged feature A"
@@ -427,8 +530,53 @@ EOF
         git add src/lib.txt src/other.txt
         git commit -q -m "stale revert of everything after base"
 
-        if LANE_DIFF_AUDIT_MAIN=main "$ROOT/scripts/lane-diff-audit.sh" >/dev/null 2>&1; then
+        if audit_synthetic >/dev/null 2>&1; then
             echo "$NAME: self-test: stale-revert branch was NOT refused" >&2
+            exit 1
+        fi
+
+        # #782's shape: the mutation commit leaves a real compile error, and
+        # its subject marks why. The audit must name that exact commit. A later
+        # genuine git-revert must then clear the finding and restore compilation.
+        git checkout -q main
+        git checkout -q -b unreverted-mutation
+        cat >> src/lib.rs <<'EOF'
+
+pub fn mutation_check_deliberate_compile_break() {
+    let _ = MutationCheckRecord {
+        mutation_check_missing_field: (),
+    };
+}
+EOF
+        git add src/lib.rs
+        git commit -q -m "test: break synthetic compile for CI mutation check"
+        local mutation_commit audit_output
+        mutation_commit=$(git rev-parse HEAD)
+        if cargo check --quiet >/dev/null 2>&1; then
+            echo "$NAME: self-test: mutation compile break unexpectedly compiled" >&2
+            exit 1
+        fi
+        if audit_output=$(audit_synthetic 2>&1); then
+            echo "$NAME: self-test: unreverted mutation branch was NOT refused" >&2
+            exit 1
+        elif [[ $audit_output != *"FAIL mutation-commit: commit=$mutation_commit"* ]]; then
+            echo "$NAME: self-test: mutation failure did not name $mutation_commit" >&2
+            exit 1
+        fi
+        echo "$NAME: self-test: unreverted mutation branch correctly refused ($mutation_commit)" >&2
+        if audit_synthetic --waive mutation-commit >/dev/null 2>&1; then
+            echo "$NAME: self-test: mutation-commit waiver correctly passed" >&2
+        else
+            echo "$NAME: self-test: mutation-commit waiver was wrongly refused" >&2
+            exit 1
+        fi
+
+        git revert --no-edit "$mutation_commit" >/dev/null
+        cargo check --quiet
+        if audit_synthetic >/dev/null 2>&1; then
+            echo "$NAME: self-test: reverted mutation branch correctly passed" >&2
+        else
+            echo "$NAME: self-test: reverted mutation branch was wrongly refused" >&2
             exit 1
         fi
         echo "$NAME: self-test: stale-revert branch correctly refused" >&2
@@ -448,7 +596,7 @@ EOF
         git add src/lib.txt
         git commit -q -a -m "refactor feature text"
 
-        if LANE_DIFF_AUDIT_MAIN=main "$ROOT/scripts/lane-diff-audit.sh" >/dev/null 2>&1; then
+        if audit_synthetic >/dev/null 2>&1; then
             echo "$NAME: self-test: refactor branch correctly passed" >&2
         else
             echo "$NAME: self-test: refactor branch was wrongly refused" >&2
@@ -472,7 +620,8 @@ while (($#)); do
                 stale-base) WAIVE_STALE_BASE=1 ;;
                 revert-hunk) WAIVE_REVERT=1 ;;
                 deletion-surge) WAIVE_DELETION_SURGE=1 ;;
-                *) die "unknown waiver '${2:-}'; expected file-truncation, stale-base, revert-hunk, or deletion-surge" ;;
+                mutation-commit) WAIVE_MUTATION_COMMIT=1 ;;
+                *) die "unknown waiver '${2:-}'; expected file-truncation, stale-base, revert-hunk, deletion-surge, or mutation-commit" ;;
             esac
             shift 2
             ;;
@@ -481,6 +630,7 @@ while (($#)); do
             WAIVE_STALE_BASE=1
             WAIVE_REVERT=1
             WAIVE_DELETION_SURGE=1
+            WAIVE_MUTATION_COMMIT=1
             shift
             ;;
         -h | --help)
@@ -496,11 +646,11 @@ done
 command -v git >/dev/null || die 'git is required'
 command -v python3 >/dev/null || die 'python3 is required'
 
-if ! git rev-parse --verify "$MAIN_REF" >/dev/null 2>&1; then
+if ! git_ rev-parse --verify "$MAIN_REF" >/dev/null 2>&1; then
     die "ref '$MAIN_REF' does not exist; this script audits against origin/main"
 fi
 
-merge_base=$(git merge-base HEAD "$MAIN_REF")
+merge_base=$(git_ merge-base HEAD "$MAIN_REF")
 readonly merge_base
 
 failures=0
@@ -516,5 +666,5 @@ if (( failures )); then
     exit 1
 fi
 
-note "audit passed: no revert, truncation, stale-base, or deletion-surge detected"
+note "audit passed: no revert, truncation, stale-base, deletion-surge, or unreverted mutation commit detected"
 exit 0
