@@ -33,14 +33,19 @@
 
 use std::collections::BTreeMap;
 
-use orrery_core::{ComponentTypeId, Executor, Ruleset, TickBackend};
+use orrery_core::{
+    ComponentTypeId, CoreClass, EntityMaterialization, Executor, Invariant, OrderedInputs, QPos,
+    QVel, Ruleset, StateView, StepOutput, TickBackend, TickRng,
+};
 use orrery_games::diff::{
     run_differential_on, Backends, Baseline, Class, Subject, Verdict, VersionAxes,
 };
 use orrery_games::golden;
-use orrery_games::regolith::{Regolith, REGOLITH_COMPOSITION};
-use orrery_games::scenario::{play_with, Scenario, SCENARIOS, WORLD_SCENARIO};
-use orrery_games::Game;
+use orrery_games::regolith::order::{Order, Outcome};
+use orrery_games::regolith::state::{Craft, RegolithState, Rock, RockTier};
+use orrery_games::regolith::{archetype::Archetype, Regolith, REGOLITH_COMPOSITION};
+use orrery_games::scenario::{play_with, Scenario, SCENARIOS, T0, WORLD_SCENARIO};
+use orrery_games::{Game, GameMeta, Tamper};
 use orrery_protocol::atrest::SchemaVersion;
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use orrery_sim_host::ecs::EcsBackend;
@@ -96,6 +101,191 @@ fn scenarios() -> Vec<Scenario> {
     scenarios
 }
 
+/// The one F-4 fixture whose result depends on within-tick neighbour visibility.
+///
+/// The ordinary corpus cannot express this population: every player is a craft
+/// and every world seed receives an id after the players. Here entity 1 is a
+/// moving rock and entity 2 is an approaching craft that submits entity 1 as a
+/// collision candidate. Entity 1 steps first, so the production neighbour read
+/// in `regolith::visibility` sees its post-step state under the shipped live
+/// semantics and its tick-start state under snapshot isolation.
+const WITHIN_TICK_VISIBILITY_SCENARIO: Scenario = Scenario {
+    name: "within-tick-neighbor-visibility",
+    entities: 2,
+    world_entities: 0,
+    // The read is the first tick after D-4's 180-tick cross-replay window.
+    // Live execution stamps the observed neighbour T+1, while today's replay
+    // rejects any observation newer than the reader tick. Keeping that
+    // independent contradiction outside the replay window lets this fixture
+    // measure F-4's backend parity without changing either policy (#758).
+    ticks: 181,
+    seed_byte: 0x66,
+    sample_loss_pct: 0,
+};
+
+/// D-1 baseline for [`WITHIN_TICK_VISIBILITY_SCENARIO`].
+const WITHIN_TICK_VISIBILITY_CHAIN: [u8; 32] = [
+    49, 63, 129, 96, 10, 175, 54, 62, 186, 54, 208, 211, 237, 197, 226, 86, 171, 129, 219, 45, 219,
+    46, 110, 78, 12, 152, 128, 235, 239, 8, 181, 6,
+];
+
+/// D-2 baseline for [`WITHIN_TICK_VISIBILITY_SCENARIO`].
+const WITHIN_TICK_VISIBILITY_OUTCOME_CHAIN: [u8; 32] = [
+    92, 199, 5, 216, 30, 133, 141, 226, 80, 77, 37, 171, 16, 38, 97, 204, 200, 93, 62, 197, 157,
+    35, 197, 245, 18, 231, 194, 81, 216, 83, 155, 245,
+];
+
+/// Regolith's production rules over the lower-rock/higher-craft fixture.
+///
+/// Only population and authored inputs differ from ordinary Regolith play; the
+/// rule call, including its single audited `StateView::neighbor` site, is the
+/// shipped implementation.
+#[derive(Debug, Clone, Copy)]
+struct WithinTickVisibility;
+
+impl Ruleset for WithinTickVisibility {
+    type CoreState = RegolithState;
+    type CoreInput = Order;
+    type CoreEvent = Outcome;
+
+    fn id(&self) -> orrery_protocol::RulesetId {
+        Regolith::honest().id()
+    }
+
+    fn max_neighbor_reads(&self) -> usize {
+        Regolith::honest().max_neighbor_reads()
+    }
+
+    fn max_neighbor_staleness_ticks(&self) -> u64 {
+        Regolith::honest().max_neighbor_staleness_ticks()
+    }
+
+    fn step(
+        &self,
+        view: &mut StateView<'_, Self::CoreState>,
+        inputs: &OrderedInputs<'_, Self::CoreInput>,
+        rng: &mut TickRng,
+    ) -> StepOutput<Self::CoreEvent> {
+        Regolith::honest().step(view, inputs, rng)
+    }
+
+    fn materialize(
+        &self,
+        event: &Self::CoreEvent,
+        out: &mut Vec<EntityMaterialization<Self::CoreState>>,
+    ) {
+        Regolith::honest().materialize(event, out);
+    }
+
+    fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
+        Regolith::honest().classify_component(component)
+    }
+
+    fn invariants(&self) -> &[Invariant<Self::CoreState>] {
+        orrery_games::regolith::invariants::INVARIANTS
+    }
+}
+
+impl Game for WithinTickVisibility {
+    const META: GameMeta = GameMeta {
+        name: "regolith-within-tick-visibility",
+        summary: "F-4 fixture for live within-tick neighbour visibility",
+        ruleset: Regolith::META.ruleset,
+    };
+
+    fn honest() -> Self {
+        Self
+    }
+
+    fn tampered(_tamper: Tamper) -> Option<Self> {
+        None
+    }
+
+    fn spawn(&self, _entity: PersistId, slot: u64) -> RegolithState {
+        match slot {
+            0 => RegolithState::Rock(Rock::spawned(
+                RockTier::Small,
+                0,
+                QPos {
+                    x: 5_000,
+                    y: 0,
+                    z: 0,
+                },
+                QVel::default(),
+            )),
+            1 => RegolithState::Craft(Craft::spawned(Archetype::Interceptor, QPos::default(), 0)),
+            _ => unreachable!("the fixture installs exactly two entities"),
+        }
+    }
+
+    fn honest_inputs(
+        &self,
+        entity: PersistId,
+        _slot: u64,
+        tick: Tick,
+        _peers: &[PersistId],
+        _rng: &mut TickRng,
+        out: &mut Vec<Order>,
+    ) {
+        if entity == PersistId::new(2) {
+            // Keep the witness frame chain continuous without moving the
+            // fixture through an unrelated authored acceleration.
+            out.push(Order::Thrust {
+                accel_mmss: 0,
+                yaw_urad: 0,
+                pitch_urad: 0,
+            });
+        }
+        if tick.0 == T0 + 180 {
+            match entity.0 {
+                1 => out.push(Order::CollisionResolved {
+                    from: PersistId::new(2),
+                    velocity: QVel {
+                        x: -6_000,
+                        y: 6_000,
+                        z: 0,
+                    },
+                }),
+                2 => out.push(Order::Collide {
+                    other: PersistId::new(1),
+                }),
+                _ => unreachable!("the fixture installs exactly two entities"),
+            }
+        }
+    }
+
+    fn deliver(&self, event: &Outcome) -> Option<(PersistId, Order)> {
+        Regolith::honest().deliver(event)
+    }
+
+    fn trajectory(state: &RegolithState) -> (QPos, QVel) {
+        Regolith::trajectory(state)
+    }
+}
+
+fn within_tick_visibility_baseline() -> Baseline {
+    Baseline {
+        commit: "8305948",
+        axes: regolith_axes(),
+        chains: vec![(
+            WITHIN_TICK_VISIBILITY_SCENARIO.name,
+            WITHIN_TICK_VISIBILITY_CHAIN,
+        )],
+        outcome_chains: vec![(
+            WITHIN_TICK_VISIBILITY_SCENARIO.name,
+            WITHIN_TICK_VISIBILITY_OUTCOME_CHAIN,
+        )],
+    }
+}
+
+fn within_tick_visibility_subject(label: &'static str) -> Subject<WithinTickVisibility> {
+    Subject {
+        label,
+        game: WithinTickVisibility,
+        axes: regolith_axes(),
+    }
+}
+
 fn subject(label: &'static str) -> Subject<Regolith> {
     Subject {
         label,
@@ -149,6 +339,29 @@ fn the_ecs_backend_reaches_four_class_parity_with_the_store() {
             scenario.name
         );
     }
+}
+
+/// F-4 must include the semantic axis that distinguishes live visibility from
+/// snapshot isolation, rather than reporting parity over a corpus with no
+/// neighbour reads.
+#[test]
+fn within_tick_neighbor_visibility_reaches_four_class_parity() {
+    let verdict = run_differential_on(
+        within_tick_visibility_subject("store-backed host"),
+        within_tick_visibility_subject("ecs-backed host"),
+        &WITHIN_TICK_VISIBILITY_SCENARIO,
+        Some(&within_tick_visibility_baseline()),
+        Backends {
+            legacy: Executor::new,
+            candidate: EcsBackend::new,
+        },
+    );
+    assert_eq!(
+        verdict,
+        four_class_parity(),
+        "regolith/{}: live within-tick neighbour visibility is absent from F-4 parity",
+        WITHIN_TICK_VISIBILITY_SCENARIO.name
+    );
 }
 
 /// The differential is not vacuous about the ECS: the candidate side really
