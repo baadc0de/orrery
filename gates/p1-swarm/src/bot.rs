@@ -2596,6 +2596,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn campaign_crowd_shares_one_turn_rate_inside_the_pairwise_aoi() {
+        const PEERS: usize = 32;
+        let turns: BTreeSet<i32> = (0..PEERS)
+            .map(|slot| {
+                ((CRUISE_MPS / orbit_radius_m(slot, PEERS)) / TICK_HZ as f64 * 1_000_000.0) as i32
+            })
+            .collect();
+        assert_eq!(
+            turns,
+            BTreeSet::from([213]),
+            "different integer turn rates shear neighboring campaign slots apart over the hour"
+        );
+
+        let poses: Vec<QPos> = (0..PEERS).map(|slot| spawn_pose(slot, PEERS).0).collect();
+        let diameter_mm = poses
+            .iter()
+            .enumerate()
+            .flat_map(|(slot, position)| {
+                poses
+                    .iter()
+                    .skip(slot + 1)
+                    .map(move |other| distance_mm(*position, *other))
+            })
+            .max()
+            .expect("the campaign crowd has more than one peer");
+        let pairwise_aoi_mm = (orrery_games::regolith::campaign_engagement_budget_m(
+            orrery_games::regolith::CAMPAIGN_CELL_EDGE_M,
+        ) * 1_000.0) as u128;
+        assert!(
+            diameter_mm <= pairwise_aoi_mm,
+            "campaign diameter {diameter_mm} mm exceeds pairwise AOI {pairwise_aoi_mm} mm"
+        );
+    }
+
+    #[test]
     fn boundary_return_window_measures_returns_in_a_sliding_second() {
         let mut window = BoundaryReturnWindow::default();
 
