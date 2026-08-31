@@ -158,17 +158,19 @@ note 'witnessed run: the same impaired hour, every peer re-executing its witness
 # allowance is the measured number exactly, and not a round one: it is a ratchet,
 # and a run that moves it has found something.
 #
-# It has moved twice. 206 → 230 when watches stopped dying on their first lost
-# frame, which is more repair traffic on the unsheddable control lane and so
-# more of the cheap lane shed to afford it (docs/11-roadmap.md §P4). 230 → 162
-# when the bots stopped playing `orrery_conformance`'s corpus kernel and started
-# playing `orrery_games`' Skirmish: those rules apply drag and a per-archetype
-# speed clamp, so every trajectory in the swarm moved and with it the crowd
-# density that decides how much any peer has to send. Re-measured rather than
-# adjusted — 162 at 3% loss, and *identical* at five simulated minutes and at
-# one hour, which is what still says transient rather than overrun. 172 at the
-# 5% end.
-"$BIN" --peers 32 --seconds 3600 --min-cells 1 --max-pops 0 --max-shed 162 \
+# It has moved three times. 206 → 230 when watches stopped dying on their first
+# lost frame, which is more repair traffic on the unsheddable control lane and
+# so more of the cheap lane shed to afford it (docs/11-roadmap.md §P4). 230 →
+# 162 when the bots stopped playing `orrery_conformance`'s corpus kernel and
+# started playing `orrery_games`' Skirmish: those rules apply drag and a
+# per-archetype speed clamp, so every trajectory in the swarm moved and with it
+# the crowd density that decides how much any peer has to send. #788 moved 162
+# → 278 by narrowing the campaign's radial spread: the initially compact crowd
+# stays on one integer turn rate instead of shearing apart, so more peers remain
+# in range and send replication. Re-measured rather than adjusted — 278 at 3%
+# loss, and *identical* at five simulated minutes and at one hour, which is what
+# still says transient rather than overrun. 94 at the 5% end.
+"$BIN" --peers 32 --seconds 3600 --min-cells 1 --max-pops 0 --max-shed 278 \
   --late-join-at 1800 --impaired --witness --stamp-wall-clock \
   --json "$OUT/witnessed.json" \
   || die 'the P4 witnessing clauses did not hold over the impaired hour'
