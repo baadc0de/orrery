@@ -18,11 +18,10 @@
 //! a given client can see.
 
 use bevy::prelude::*;
-use bevy_replicon::prelude::*;
-use bevy_replicon::server::visibility::client_visibility::ClientVisibility;
 use orrery_net::{IslandMembership, IslandSource};
 use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
 use orrery_protocol::{CellId, NodeId};
+use orrery_replicon::{ClientVisibility, Replicated, RepliconPlugins};
 use orrery_spatial::plugin::{AoiSubscription, Cell, LocalPlayer};
 use orrery_spatial::visibility::{AoiVisibilityBit, ClientAoi, ClientNode};
 use orrery_spatial::{AoiVisibilityPlugin, OrrerySpatialPlugin};

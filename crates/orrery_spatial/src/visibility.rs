@@ -28,11 +28,7 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_replicon::server::visibility::{
-    client_visibility::ClientVisibility, filters_mask::FilterBit, registry::FilterRegistry,
-};
-use bevy_replicon::shared::replication::registry::ReplicationRegistry;
-use bevy_replicon::shared::replication::visibility::ScopeLifetime;
+use orrery_replicon::{register_visibility_scope, ClientVisibility, FilterBit, ScopeLifetime};
 
 use orrery_net::IslandMembership;
 use orrery_protocol::{CellId, NodeId};
@@ -92,16 +88,10 @@ impl Plugin for AoiVisibilityPlugin {
 
 impl FromWorld for AoiVisibilityBit {
     fn from_world(world: &mut World) -> Self {
-        let bit = world.resource_scope(|world, mut filter_registry: Mut<FilterRegistry>| {
-            world.resource_scope(|world, mut registry: Mut<ReplicationRegistry>| {
-                filter_registry.register_scope::<Entity>(
-                    world,
-                    &mut registry,
-                    ScopeLifetime::WhileVisible,
-                )
-            })
-        });
-        Self(bit)
+        Self(register_visibility_scope::<Entity>(
+            world,
+            ScopeLifetime::WhileVisible,
+        ))
     }
 }
 

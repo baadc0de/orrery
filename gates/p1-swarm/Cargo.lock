@@ -3569,6 +3569,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_replicon"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_replicon",
+ "orrery_protocol",
+ "serde",
+ "variadics_please 2.0.0",
+]
+
+[[package]]
 name = "orrery_ruleset_digest"
 version = "0.1.0"
 dependencies = [
@@ -3587,12 +3599,12 @@ dependencies = [
  "bevy_ecs",
  "bevy_math",
  "bevy_reflect",
- "bevy_replicon",
  "bevy_time",
  "big_space",
  "glam",
  "orrery_net",
  "orrery_protocol",
+ "orrery_replicon",
  "tracing",
 ]
 

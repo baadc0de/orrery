@@ -24,6 +24,7 @@ disk-queue = ["dep:fjall"]
 orrery_protocol = { path = "../orrery_protocol" }
 orrery_authority = { path = "../orrery_authority" }
 orrery_net = { path = "../orrery_net" }
+orrery_replicon = { path = "../orrery_replicon", features = ["uplink"] }
 orrery_spatial = { path = "../orrery_spatial" }
 aeronet_io = { workspace = true }
 aeronet_iroh = { workspace = true }
@@ -32,9 +33,9 @@ bevy_ecs = { workspace = true }
 bevy_platform = { workspace = true }
 bevy_reflect = { workspace = true }
 bevy_time = { workspace = true }
-# The `uplink` feature surfaces replicon's change-detection stream as
-# `ComponentDiff` messages, which this crate turns into `DiffUplink`s (D11).
-bevy_replicon = { workspace = true, features = ["uplink"] }
+# The wrapper's `uplink` feature surfaces replicon's change-detection stream as
+# `ComponentDiff` messages, which this crate turns into `DiffUplink`s (D11),
+# without exposing replicon's unguarded registration API.
 bytes = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }

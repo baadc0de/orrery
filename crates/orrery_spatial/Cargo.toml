@@ -21,12 +21,12 @@ big_space = ["dep:big_space"]
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
 orrery_net = { path = "../orrery_net" }
+orrery_replicon = { path = "../orrery_replicon" }
 bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_math = { workspace = true }
 bevy_reflect = { workspace = true }
 bevy_time = { workspace = true }
-bevy_replicon = { workspace = true }
 glam = { workspace = true }
 big_space = { workspace = true, optional = true }
 tracing = { workspace = true }
