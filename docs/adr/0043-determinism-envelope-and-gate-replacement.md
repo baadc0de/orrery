@@ -371,6 +371,45 @@ crate hosting canonical state in a `bevy_ecs::World`:
 > an application world. **The gap is the unenforced battery, not a broken
 > gate.**
 
+> **Amended again 2026-08-31 (owner-authorised): the debt is paid and the
+> confinement lifts.** Every clause of this Tier H battery is now enforced and
+> demonstrated mutation-style, which is the condition the amendment above set:
+>
+> | Clause | Enforced by | Mutation |
+> |---|---|---|
+> | (e)(1) host allowlist | `core-gates.sh` §6, `DECLARED_HOST_CRATES`, checked both directions | a rogue crate hosting canonical state on an ECS fails by name |
+> | (e)(2) `bevy_ecs` only | `cargo tree -e normal` scan | a `bevy_app` runtime dependency fails by name |
+> | (e)(3) Tier V + async + RNG bans | over every host library source | four separate compiling mutations, each named |
+> | (e)(4) canary + projection differential | `tier_h_projection_differential.rs` | a permuted insertion order fails; **permutation 0 passes and permutation 1 does not**, which is the "agreement would be luck" property this clause names |
+> | (e)(5) world-of-one, host and adjudication | `tier_h_world_of_one.rs`, `tier_h_adjudication_substrate.rs` | adjudication forced back onto the `Executor` fails by name |
+>
+> Two things are worth recording about *how* (e)(5) was closed, because both
+> shaped the guard. First, `TickBackend` as landed was insufficient: a closed
+> adjudication window installs a neighbour at its recorded observation tick and
+> takes it back out, so the trait needed `insert_observed` and `take_state`.
+> Second — and this is the part a future reader should not have to rediscover —
+> **the two substrates are byte-indistinguishable to the adjudicator by
+> construction.** Every canonical byte comes from `orrery_core::canonical_step`,
+> which both backends call and neither copies, so *no comparison of outputs can
+> establish which substrate ran*. The guard is therefore **observational**: a
+> counting backend records the steps taken on it, a swapping backend proves those
+> steps are what the verdict rests on, and a width probe pins the replay to a
+> population of one. A counter alone would tick over for a backend nobody
+> consulted.
+>
+> **So the confinement recorded above is lifted.** The admitted host is no longer
+> barred from canonical bytes moving on it: goldens may be regenerated on the ECS
+> path under the ordinary rules, a second host may be admitted **through clause
+> (e)(1)'s allowlist and the whole battery**, and the Bevy-free scan over the
+> gated crates stays exactly as it is — that sentence was never part of the
+> confinement and does not move.
+>
+> What does **not** change: [D42] clause (a)'s boundary, that canonical truth
+> never lives in a Bevy *application* world; the hash call site staying in
+> `orrery_core`; and clause (e)(4)'s own words, that these checks are
+> *"preconditions of admitting the host, not follow-ups"* — which now describes
+> the tree rather than indicting it.
+
 **Honest accounting this record owes the reader (A4 §11.5, not dropped):**
 Tier H is *entirely conditional*. Until a trigger fires, Tier H is empty, the
 tree is exactly Tier V, and every Tier-H clause above is unused
