@@ -476,7 +476,7 @@ pub fn canonical_step<R: Ruleset>(
     } = neighbors;
 
     let staleness_cap = ruleset.max_neighbor_staleness_ticks();
-    let mut view = StateView::observed(entity, own, states, observed_ticks, tick, staleness_cap);
+    let mut view = StateView::new(entity, own, states, observed_ticks, tick, staleness_cap);
     let ordered = OrderedInputs::new(inputs);
     let mut rng = tick_rng(seed, entity, tick);
 

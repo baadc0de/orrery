@@ -426,7 +426,15 @@ mod tests {
     fn run() -> (Trace, StepOutput<Trace>) {
         let mut own = Trace::default();
         let neighbors = BTreeMap::new();
-        let mut view = StateView::new(PersistId::new(1), &mut own, &neighbors);
+        let observation_ticks = BTreeMap::new();
+        let mut view = StateView::new(
+            PersistId::new(1),
+            &mut own,
+            &neighbors,
+            &observation_ticks,
+            Tick::new(0),
+            0,
+        );
         let inputs: [Trace; 0] = [];
         let ordered = OrderedInputs::new(&inputs);
         let mut rng = crate::rng::tick_rng(UniverseSeed([7; 32]), PersistId::new(1), Tick::new(0));

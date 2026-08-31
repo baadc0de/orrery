@@ -103,25 +103,20 @@ pub struct StateView<'a, S> {
     entity: PersistId,
     own: &'a mut S,
     neighbors: &'a BTreeMap<PersistId, S>,
-    observation_ticks: Option<(&'a BTreeMap<PersistId, Tick>, Tick, u64)>,
+    observation_ticks: &'a BTreeMap<PersistId, Tick>,
+    tick: Tick,
+    staleness_cap: u64,
     reads: Vec<PersistId>,
 }
 
 impl<'a, S> StateView<'a, S> {
-    /// Build a view over one entity's own state and its neighbour snapshot.
-    pub fn new(entity: PersistId, own: &'a mut S, neighbors: &'a BTreeMap<PersistId, S>) -> Self {
-        Self {
-            entity,
-            own,
-            neighbors,
-            observation_ticks: None,
-            reads: Vec::new(),
-        }
-    }
-
-    /// Build a live view that hides observations older than the ruleset's
-    /// declared staleness cap.
-    pub(crate) fn observed(
+    /// Build a view that hides neighbour observations outside the declared
+    /// staleness cap.
+    ///
+    /// Freshness is mandatory at construction: every neighbour must carry its
+    /// observation tick, and observations from the future or older than
+    /// `staleness_cap` are refused by [`Self::neighbor`].
+    pub fn new(
         entity: PersistId,
         own: &'a mut S,
         neighbors: &'a BTreeMap<PersistId, S>,
@@ -133,7 +128,9 @@ impl<'a, S> StateView<'a, S> {
             entity,
             own,
             neighbors,
-            observation_ticks: Some((observation_ticks, tick, staleness_cap)),
+            observation_ticks,
+            tick,
+            staleness_cap,
             reads: Vec::new(),
         }
     }
@@ -178,20 +175,20 @@ impl<'a, S> StateView<'a, S> {
         let fresh = readable
             && self
                 .observation_ticks
-                .is_none_or(|(observed, tick, staleness_cap)| {
-                    observed.get(&id).is_some_and(|observed_tick| {
-                        // Checked, not saturating. Since #758 neighbours are
-                        // served from the tick-start slot, so the stepping
-                        // path cannot stamp an observation ahead of its
-                        // reader; one that is ahead arrived by replication and
-                        // is state from the reader's future, which
-                        // `ReplayHarness` already refuses as a malformed
-                        // frame. Live execution refuses it too, or the two
-                        // would disagree about the same log.
-                        tick.0
-                            .checked_sub(observed_tick.0)
-                            .is_some_and(|age| age <= staleness_cap)
-                    })
+                .get(&id)
+                .is_some_and(|observed_tick| {
+                    // Checked, not saturating. Since #758 neighbours are
+                    // served from the tick-start slot, so the stepping
+                    // path cannot stamp an observation ahead of its
+                    // reader; one that is ahead arrived by replication and
+                    // is state from the reader's future, which
+                    // `ReplayHarness` already refuses as a malformed
+                    // frame. Live execution refuses it too, or the two
+                    // would disagree about the same log.
+                    self.tick
+                        .0
+                        .checked_sub(observed_tick.0)
+                        .is_some_and(|age| age <= self.staleness_cap)
                 });
         let found = fresh.then(|| self.neighbors.get(&id)).flatten();
         if !self.reads.contains(&id) {
@@ -424,7 +421,18 @@ mod tests {
         let mut neighbors = BTreeMap::new();
         neighbors.insert(PersistId::new(5), Bag(2));
         neighbors.insert(PersistId::new(6), Bag(3));
-        let mut view = StateView::new(PersistId::new(1), &mut own, &neighbors);
+        let observation_ticks = BTreeMap::from([
+            (PersistId::new(5), Tick::new(10)),
+            (PersistId::new(6), Tick::new(10)),
+        ]);
+        let mut view = StateView::new(
+            PersistId::new(1),
+            &mut own,
+            &neighbors,
+            &observation_ticks,
+            Tick::new(10),
+            0,
+        );
 
         assert_eq!(view.neighbor(PersistId::new(5)), Some(&Bag(2)));
         assert_eq!(view.neighbor(PersistId::new(5)), Some(&Bag(2)));
@@ -443,7 +451,15 @@ mod tests {
         // neighbour frame the authority never actually consulted.
         let mut own = Bag(1);
         let neighbors = BTreeMap::new();
-        let mut view = StateView::new(PersistId::new(1), &mut own, &neighbors);
+        let observation_ticks = BTreeMap::new();
+        let mut view = StateView::new(
+            PersistId::new(1),
+            &mut own,
+            &neighbors,
+            &observation_ticks,
+            Tick::new(10),
+            0,
+        );
         assert!(view.neighbor(PersistId::new(9)).is_none());
         assert_eq!(view.recorded_reads(), &[PersistId::new(9)]);
     }
