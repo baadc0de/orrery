@@ -107,8 +107,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use orrery_core::store::AuthorityLog;
 use orrery_core::{
-    state_hash, verify_bundle, ComponentTypeId, CoreCodec, Executor, InputLogProducer, Quantized,
-    TickBackend,
+    state_hash, verify_bundle_on, ComponentTypeId, CoreCodec, Executor, InputLogProducer,
+    Quantized, TickBackend,
 };
 use orrery_protocol::atrest::SchemaVersion;
 use orrery_protocol::{
@@ -895,6 +895,25 @@ fn witness_authority() -> iroh_base::SecretKey {
 /// implementation.
 #[must_use]
 pub fn collect_witness<G: Game + Clone>(game: &G, played: &Play<G>) -> Option<WitnessArtifact> {
+    collect_witness_on(game, played, Executor::new)
+}
+
+/// [`collect_witness`], authoring the bundles on a given substrate.
+///
+/// The D-4 evidence a side offers must be authored by the substrate that side
+/// actually ran on, or its *frames* come from one engine while its *claim
+/// values* come from another — which is precisely the gap D43 clause (e)(5)
+/// names.
+#[must_use]
+pub fn collect_witness_on<G, B>(
+    game: &G,
+    played: &Play<G>,
+    backend: impl FnOnce(G, UniverseSeed) -> B,
+) -> Option<WitnessArtifact>
+where
+    G: Game + Clone,
+    B: TickBackend<G>,
+{
     let mut claims = BTreeMap::new();
     for record in &played.log {
         for entry in &record.entries {
@@ -907,7 +926,7 @@ pub fn collect_witness<G: Game + Clone>(game: &G, played: &Play<G>) -> Option<Wi
             );
         }
     }
-    let bundles = authored_bundles(game, &played.sealed)?;
+    let bundles = authored_bundles(game, &played.sealed, backend)?;
     Some(WitnessArtifact { claims, bundles })
 }
 
@@ -924,13 +943,18 @@ pub fn collect_witness<G: Game + Clone>(game: &G, played: &Play<G>) -> Option<Wi
 /// mid-window has no claim at the window's start, so no window can be opened
 /// on it, and inventing one would be assembling evidence no authority could
 /// have produced. *Initially installed* includes the scenario's world
-/// population as well as its players — both are in the executor before the
+/// population as well as its players — both are in the substrate before the
 /// first tick, and reconstructing only the player half would build a bundle
 /// set over a population the run never had.
-fn authored_bundles<G: Game + Clone>(
+fn authored_bundles<G, B>(
     game: &G,
     sealed: &SealedScenario<G>,
-) -> Option<BTreeMap<PersistId, EvidenceBundle>> {
+    backend: impl FnOnce(G, UniverseSeed) -> B,
+) -> Option<BTreeMap<PersistId, EvidenceBundle>>
+where
+    G: Game + Clone,
+    B: TickBackend<G>,
+{
     let first = sealed.tick_window.first.0;
     let span = sealed
         .tick_window
@@ -968,12 +992,12 @@ fn authored_bundles<G: Game + Clone>(
         .chain(seeded_world.iter().map(|(entity, _)| *entity))
         .collect();
     let ruleset = game.id();
-    let mut executor = Executor::new(game.clone(), sealed.seed);
+    let mut substrate = backend(game.clone(), sealed.seed);
     for (entity, state) in spawned {
-        executor.insert(entity, state);
+        substrate.insert(entity, state);
     }
     for (entity, state) in seeded_world {
-        executor.insert(entity, state);
+        substrate.insert(entity, state);
     }
 
     let key = witness_authority();
@@ -991,7 +1015,7 @@ fn authored_bundles<G: Game + Clone>(
         // The anchor commits to the state as installed — quantized by
         // `insert` (VC-7) — not to the raw spawn, because that is the state
         // the first tick actually reads.
-        let state = executor.state(*entity)?.clone();
+        let state = substrate.state(*entity)?.clone();
         let claim = producer.anchor(first, &state);
         log.record_claim(claim, state.to_canonical());
         producers.insert(*entity, producer);
@@ -1007,7 +1031,7 @@ fn authored_bundles<G: Game + Clone>(
                 // inputs about to be applied; then execute. That order is the
                 // producer's contract, and getting it wrong would put a claim
                 // on a chain head that never existed.
-                let state = executor.state(entry.entity)?.clone();
+                let state = substrate.state(entry.entity)?.clone();
                 let producer = producers
                     .get_mut(&entry.entity)
                     .expect("the producer was just found");
@@ -1016,7 +1040,7 @@ fn authored_bundles<G: Game + Clone>(
                 }
                 producer.log_inputs(record.tick.0, &entry.inputs);
             }
-            let outcome = executor.step_entity(entry.entity, record.tick, &entry.inputs)?;
+            let outcome = substrate.step_entity(entry.entity, record.tick, &entry.inputs)?;
             if let Some(producer) = producers.get_mut(&entry.entity) {
                 producer.log_neighbor_frames(record.tick.0, &outcome.neighbor_frames);
                 producer.log_tick_hash(outcome.state_hash);
@@ -1042,7 +1066,7 @@ fn authored_bundles<G: Game + Clone>(
     // closes the window is never executed inside it — so its pre-step claim
     // has to be cut here rather than in the loop above.
     for entity in &entities {
-        let state = executor.state(*entity)?.clone();
+        let state = substrate.state(*entity)?.clone();
         let producer = producers.get_mut(entity).expect("one producer per entity");
         if let Some(claim) = producer.cut_claim(window.1 .0, &state) {
             log.record_claim(claim, state.to_canonical());
@@ -1130,6 +1154,43 @@ pub fn cross_replay<G: Game + Clone>(
     candidate: &WitnessArtifact,
     seed: UniverseSeed,
 ) -> CrossReplay {
+    cross_replay_on(
+        legacy_game,
+        candidate_game,
+        legacy,
+        candidate,
+        seed,
+        &Backends {
+            legacy: Executor::new,
+            candidate: Executor::new,
+        },
+    )
+}
+
+/// [`cross_replay`], adjudicating each direction on the substrate that
+/// authored the log being re-executed.
+///
+/// The build whose log is re-executed already decided the adjudicating
+/// *ruleset*; D43 clause (e)(5) says the same must be true of the
+/// *substrate*. Otherwise, on the ECS path, a candidate's frames would be
+/// re-executed by an `Executor` while the claims it is being held to came off
+/// an ECS — a verdict about a substrate nobody was running.
+#[must_use]
+pub fn cross_replay_on<G, L, C, BL, BC>(
+    legacy_game: &G,
+    candidate_game: &G,
+    legacy: &WitnessArtifact,
+    candidate: &WitnessArtifact,
+    seed: UniverseSeed,
+    backends: &Backends<L, C>,
+) -> CrossReplay
+where
+    G: Game + Clone,
+    BL: TickBackend<G>,
+    BC: TickBackend<G>,
+    L: Fn(G, UniverseSeed) -> BL,
+    C: Fn(G, UniverseSeed) -> BC,
+{
     let authority: NodeId = witness_authority().public();
     let mut verdicts = Vec::new();
     for (entity, legacy_bundle) in &legacy.bundles {
@@ -1139,9 +1200,8 @@ pub fn cross_replay<G: Game + Clone>(
         verdicts.push((
             Crossing::LegacyClaimsCandidateLogs,
             *entity,
-            verify_bundle(
-                candidate_game.clone(),
-                seed,
+            verify_bundle_on(
+                (backends.candidate)(candidate_game.clone(), seed),
                 authority,
                 &crossed(legacy_bundle, candidate_bundle),
             ),
@@ -1154,9 +1214,8 @@ pub fn cross_replay<G: Game + Clone>(
         verdicts.push((
             Crossing::CandidateClaimsLegacyLogs,
             *entity,
-            verify_bundle(
-                legacy_game.clone(),
-                seed,
+            verify_bundle_on(
+                (backends.legacy)(legacy_game.clone(), seed),
                 authority,
                 &crossed(candidate_bundle, legacy_bundle),
             ),
@@ -1643,6 +1702,26 @@ pub fn collect_artifacts<G: Game + Clone>(
     side: Side,
     axes: VersionAxes,
 ) -> SideArtifacts {
+    collect_artifacts_on(game, played, side, axes, Executor::new)
+}
+
+/// [`collect_artifacts`], authoring the D-4 evidence on a given substrate.
+///
+/// Only D-4 takes the backend: D-1, D-2 and D-3 are read off the run the
+/// substrate already produced, and re-executing them would be measuring the
+/// harness rather than the side.
+#[must_use]
+pub fn collect_artifacts_on<G, B>(
+    game: &G,
+    played: &Play<G>,
+    side: Side,
+    axes: VersionAxes,
+    backend: impl FnOnce(G, UniverseSeed) -> B,
+) -> SideArtifacts
+where
+    G: Game + Clone,
+    B: TickBackend<G>,
+{
     let d2 = if played.outcome_entries.len() == played.log.len() {
         Some(outcome_chain_material(
             played.sealed.tick_window.first,
@@ -1652,7 +1731,7 @@ pub fn collect_artifacts<G: Game + Clone>(
         None
     };
     let d3 = collect_persistence::<G>(played, &axes.schema_versions);
-    let d4 = collect_witness(game, played);
+    let d4 = collect_witness_on(game, played, backend);
     SideArtifacts {
         side,
         axes,
@@ -1820,8 +1899,8 @@ where
     G: Game + Clone,
     BL: TickBackend<G>,
     BC: TickBackend<G>,
-    L: FnOnce(G, UniverseSeed) -> BL,
-    C: FnOnce(G, UniverseSeed) -> BC,
+    L: Fn(G, UniverseSeed) -> BL,
+    C: Fn(G, UniverseSeed) -> BC,
 {
     // A10 §4.4: no baseline, no run. A comparison against "whatever the
     // legacy side happens to be" is not a comparison.
@@ -1844,12 +1923,13 @@ where
     // build is kept, not consumed: D-3 asks it what is persisted and D-4's
     // cross-replay adjudicates under it.
     let legacy_game = legacy.game.clone();
-    let legacy_played = crate::scenario::play_with(legacy.game, scenario, backends.legacy);
-    let legacy_artifacts = collect_artifacts(
+    let legacy_played = crate::scenario::play_with(legacy.game, scenario, &backends.legacy);
+    let legacy_artifacts = collect_artifacts_on(
         &legacy_game,
         &legacy_played,
         Side::Legacy,
         legacy.axes.clone(),
+        &backends.legacy,
     );
 
     // Pin: the legacy side must reproduce its committed goldens, class by
@@ -1890,12 +1970,13 @@ where
     // claiming a differential comparison.
     let candidate_game = candidate.game.clone();
     let candidate_played =
-        crate::scenario::replay_with(candidate.game, &legacy_played.sealed, backends.candidate);
-    let candidate_artifacts = collect_artifacts(
+        crate::scenario::replay_with(candidate.game, &legacy_played.sealed, &backends.candidate);
+    let candidate_artifacts = collect_artifacts_on(
         &candidate_game,
         &candidate_played,
         Side::Candidate,
         candidate.axes,
+        &backends.candidate,
     );
 
     // D-4's second half: the existing adjudicator, run in both directions.
@@ -1905,12 +1986,13 @@ where
         legacy_artifacts.d4.as_ref(),
         candidate_artifacts.d4.as_ref(),
     ) {
-        (Some(legacy_witness), Some(candidate_witness)) => Some(cross_replay(
+        (Some(legacy_witness), Some(candidate_witness)) => Some(cross_replay_on(
             &legacy_game,
             &candidate_game,
             legacy_witness,
             candidate_witness,
             legacy_played.sealed.seed,
+            &backends,
         )),
         _ => None,
     };

@@ -426,6 +426,9 @@ DECLARED_HOST_HARNESSES=(
   'crates/orrery_sim_host/tests/tier_h_projection_differential.rs::the_canonical_schedule_composes_unambiguously_and_the_unordered_mutant_does_not'
   'crates/orrery_sim_host/tests/tier_h_projection_differential.rs::permuted_insertion_orders_agree_on_the_sorted_projection_and_the_executor_chain'
   'crates/orrery_sim_host/tests/tier_h_world_of_one.rs::the_verdict_holds_in_a_world_of_one'
+  'crates/orrery_sim_host/tests/tier_h_adjudication_substrate.rs::adjudication_re_executes_on_the_substrate_that_authored_the_claims'
+  'crates/orrery_sim_host/tests/tier_h_adjudication_substrate.rs::the_substrate_the_adjudicator_was_handed_is_what_the_verdict_rests_on'
+  'crates/orrery_sim_host/tests/tier_h_adjudication_substrate.rs::the_d4_evidence_is_authored_on_the_substrate_that_ran_the_scenario'
 )
 
 # The synthetic host fixtures at the end of this file are their own tiny
@@ -584,26 +587,33 @@ done
 note "Tier-H harnesses declared and present: ${#DECLARED_HOST_HARNESSES[@]}"
 fi
 
-# ── The clause (e)(5) boundary this battery does not cross ──────────────
+# ── Clause (e)(5)'s two halves, and where each one is held ──────────────
 # Recorded here rather than left to be rediscovered. The clause asks for
-# single-entity semantics exposed "to witnesses and adjudication". The host
-# half is enforced above and demonstrated by
+# single-entity semantics exposed "to witnesses and adjudication".
+#
+# The host half is enforced above and demonstrated by
 # `tier_h_world_of_one.rs::the_verdict_holds_in_a_world_of_one`, which builds
 # one `EcsBackend` per entity and reproduces every recorded hash from
 # per-entity replay on the ECS itself.
 #
-# The adjudicator half is not closed and is not claimed: `verify_bundle`
-# (orrery_core/src/replay.rs:331) builds its harness around `Executor::new`
-# (replay.rs:106) and `authored_bundles` (orrery_games/src/diff.rs:918)
-# re-executes each side's signed log through an `Executor` whatever authored
-# it. On the ECS path the D-4 frames are therefore executor-authored while the
-# claim values are ECS-derived. Conviction power survives — a diverging ECS
-# fails D-1/D-2/D-3 and the claim values independently of the frames — but
-# "the verdict must hold in a world of one" is demonstrated by a harness rather
-# than embodied in the adjudicator's substrate. Closing it means making
-# `verify_bundle` and `authored_bundles` backend-parametric, which is a change
-# to `orrery_core` and `orrery_games`; that is a separate lane and this file
-# does not pretend otherwise.
+# The adjudicator half was open until #763 and is now closed:
+# `orrery_core::verify_bundle_on` and `ReplayHarness::on` take the substrate,
+# `orrery_games::diff`'s `authored_bundles`/`collect_witness_on`/
+# `cross_replay_on` carry it through, and the ECS path therefore authors its
+# D-4 frames on the ECS *and* re-executes them there. The two declared
+# harnesses in `tier_h_adjudication_substrate.rs` are what hold it: one
+# observes that the adjudicator stepped the substrate it was handed, one proves
+# that substrate's answers are what the verdict rests on — a pair, because a
+# counter alone would tick over for a backend nobody consulted — and the third
+# holds the authoring half, that the D-4 frames come off the substrate the
+# scenario ran on.
+#
+# What this did *not* do, stated because it is the constraint the lane ran
+# under (#759): no canonical byte moved. Every byte is
+# `orrery_core::canonical_step`, which both backends call and neither copies,
+# so this relocated a replay and changed no golden, no chain and no ruleset
+# version. `tier_h_adjudication_substrate.rs::the_ecs_authors_byte_identical_evidence_to_the_store`
+# checks that at the evidence rather than inferring it from a green golden.
 
 echo "$NAME: verifiable-core static gates pass"
 

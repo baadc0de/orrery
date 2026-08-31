@@ -38,16 +38,17 @@ use orrery_core::{
     Ruleset, StateView, StepOutput, TickBackend, TickRng,
 };
 use orrery_games::diff::{
-    run_differential_on, Backends, Baseline, Class, Subject, Verdict, VersionAxes,
+    collect_artifacts_on, cross_replay_on, run_differential_on, Backends, Baseline, Class,
+    Crossing, Side, Subject, Verdict, VersionAxes,
 };
 use orrery_games::golden;
 use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState, Rock, RockTier};
 use orrery_games::regolith::{archetype::Archetype, Regolith, REGOLITH_COMPOSITION};
-use orrery_games::scenario::{play_with, Scenario, SCENARIOS, T0, WORLD_SCENARIO};
+use orrery_games::scenario::{play_with, replay_with, Scenario, SCENARIOS, T0, WORLD_SCENARIO};
 use orrery_games::{CompatibilityManifest, Game, GameMeta, Tamper};
 use orrery_protocol::atrest::SchemaVersion;
-use orrery_protocol::{PersistId, Tick, UniverseSeed};
+use orrery_protocol::{PersistId, Tick, UniverseSeed, Verdict as AdjudicatedVerdict};
 use orrery_sim_host::ecs::EcsBackend;
 use orrery_sim_host::{Delivery, RulesetAdapter, SimulationHost, SimulationHostConfig, TickCount};
 
@@ -528,4 +529,79 @@ fn the_two_hosts_agree_on_report_events_and_state_bytes() {
         ecs_host.collect_output_bytes(),
         "the two hosts disagree on the canonical state bytes"
     );
+}
+
+/// **Conviction survives the relocation.** With the candidate side both
+/// authoring *and* adjudicating on the ECS, a `DamageInflation` cheat is still
+/// convicted by the shipped adjudicator in both directions.
+///
+/// This is the load-bearing half of #763's constraint. Moving the replay onto
+/// the authoring substrate would be worthless — worse than worthless — if it
+/// cost the adjudicator its ability to say `Confirms`. `DamageInflation` is
+/// the tamper worth asking it with: nothing about an inflated roll is
+/// out-of-range or malformed, every field stays legal, and only a bit-exact
+/// re-execution catches it.
+#[test]
+fn the_adjudicator_still_convicts_a_damage_inflating_candidate_on_the_ecs() {
+    let scenario = SCENARIOS
+        .iter()
+        .find(|scenario| scenario.name == "duel")
+        .expect("the battery corpus declares a duel scenario");
+    let honest = Regolith::honest();
+    let tampered = Regolith::tampered(Tamper::DamageInflation).expect("regolith has this tamper");
+
+    // The legacy side plays and seals; the cheating candidate replays those
+    // sealed inputs on the ECS, so the only difference between the sides is
+    // the tamper.
+    let legacy_played = play_with(honest, scenario, Executor::new);
+    let candidate_played = replay_with(tampered, &legacy_played.sealed, EcsBackend::new);
+    let legacy = collect_artifacts_on(
+        &honest,
+        &legacy_played,
+        Side::Legacy,
+        regolith_axes(),
+        Executor::new,
+    );
+    let candidate = collect_artifacts_on(
+        &tampered,
+        &candidate_played,
+        Side::Candidate,
+        regolith_axes(),
+        EcsBackend::new,
+    );
+
+    let cross = cross_replay_on(
+        &honest,
+        &tampered,
+        legacy
+            .d4
+            .as_ref()
+            .expect("the honest side authored D-4 evidence"),
+        candidate
+            .d4
+            .as_ref()
+            .expect("the cheating side authored D-4 evidence"),
+        legacy_played.sealed.seed,
+        &Backends {
+            legacy: Executor::new,
+            candidate: EcsBackend::new,
+        },
+    );
+
+    let unclean = cross.unclean();
+    assert!(
+        !unclean.is_empty(),
+        "a damage-inflating candidate adjudicated on its own substrate was exonerated"
+    );
+    for crossing in [
+        Crossing::LegacyClaimsCandidateLogs,
+        Crossing::CandidateClaimsLegacyLogs,
+    ] {
+        assert!(
+            unclean.iter().any(|(found, _, verdict)| *found == crossing
+                && matches!(verdict, AdjudicatedVerdict::Confirms { .. })),
+            "{} did not confirm a deviation: {unclean:?}",
+            crossing.name()
+        );
+    }
 }
