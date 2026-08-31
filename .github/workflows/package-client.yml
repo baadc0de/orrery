@@ -131,7 +131,19 @@ jobs:
           set -euo pipefail
           mkdir -p stage dist
           artifact="orrery-regolith-${{ matrix.label }}"
-          cp "clients/regolith/target/release/${{ matrix.binary }}" "stage/$artifact"
+          binary="${{ matrix.binary }}"
+          # Windows refuses to execute an extensionless file — Explorer asks
+          # "how do you want to open this file?" and the player is stuck — so
+          # the shipped name must keep the extension the compiler gave the
+          # binary. Deriving it from `matrix.binary` rather than hardcoding
+          # `.exe` on the Windows leg keeps the two in step. (#768)
+          case "$binary" in
+            *.*) artifact="$artifact.${binary##*.}" ;;
+          esac
+          # Both packaging steps name the asset; this is the one place it is
+          # decided, so the archive can never disagree with the stage.
+          echo "CLIENT_ASSET=$artifact" >> "$GITHUB_ENV"
+          cp "clients/regolith/target/release/$binary" "stage/$artifact"
           "stage/$artifact" --build-info > stage/build-info.json
           node -e '
             const fs = require("fs");
@@ -163,13 +175,21 @@ jobs:
           test -s stage/build-info.json
           test -s stage/README.md
           test -s "stage/$artifact.sha256"
+          # The README tells the player which file to open. If it names a file
+          # the archive does not contain — as it did while the `.exe` was being
+          # renamed away — the player is left guessing. (#768)
+          grep -qF "$artifact" stage/README.md
+          # The checksum file is generated after the rename above, so its
+          # recorded name is the shipped name and `sha256sum -c` works as the
+          # README describes it.
+          grep -qF " $artifact" "stage/$artifact.sha256"
 
       - name: Package Unix client
         if: runner.os != 'Windows'
         working-directory: .
         run: |
-          asset="orrery-regolith-${{ matrix.label }}"
-          archive="dist/$asset.tar.gz"
+          asset="$CLIENT_ASSET"
+          archive="dist/orrery-regolith-${{ matrix.label }}.tar.gz"
           tar -C stage -czf "$archive" "$asset" "$asset.sha256" build-info.json README.md
           test -s "$archive"
           test "$(tar -tzf "$archive" | sort)" = "$(printf '%s\n' "$asset" "$asset.sha256" build-info.json README.md | sort)"
@@ -178,11 +198,30 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: .
         run: |
-          asset="orrery-regolith-${{ matrix.label }}"
-          archive="dist/$asset.zip"
-          7z a -tzip "$archive" "stage/$asset" "stage/$asset.sha256" stage/build-info.json stage/README.md
+          asset="$CLIENT_ASSET"
+          archive="dist/orrery-regolith-${{ matrix.label }}.zip"
+          # Stated literally, not derived: if the name derivation in the stage
+          # step ever loses the extension again, the assertions below would
+          # otherwise move along with it and stay green. (#768)
+          test "$asset" = "orrery-regolith-${{ matrix.label }}.exe"
+          # Zip from inside `stage` so the archive is flat. 7z stores whatever
+          # path it is handed, so naming `stage/...` here put an internal build
+          # directory in the player's extraction. The tar leg has always used
+          # `-C stage`; this is the same thing. (#768)
+          (
+            cd stage
+            7z a -tzip "../$archive" "$asset" "$asset.sha256" build-info.json README.md
+          )
           7z t "$archive"
           test -s "$archive"
+          # The tar leg asserts its exact contents and this one asserted only
+          # that the zip was valid and non-empty — so a zip of wrong names in a
+          # wrong directory passed, and shipped. Same manifest check, same
+          # four names, no prefix. (#768)
+          test "$(7z l -ba -slt "$archive" | sed -n 's/^Path = //p' | sort)" = "$(printf '%s\n' "$asset" "$asset.sha256" build-info.json README.md | sort)"
+          # And the README that actually shipped must name the binary that
+          # actually shipped.
+          7z x -so "$archive" README.md | grep -qF "$asset"
 
       - name: Upload release assets for publication
         uses: actions/upload-artifact@v7
