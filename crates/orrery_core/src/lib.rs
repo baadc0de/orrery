@@ -83,7 +83,10 @@ pub mod ruleset;
 pub mod store;
 pub mod tolerance;
 
-pub use executor::{Executor, NeighborFrame, TickOutcome, TICK_HZ, TICK_NANOS};
+pub use executor::{
+    canonical_step, CanonicalOutcome, CanonicalStep, Executor, NeighborFrame, NeighborSnapshot,
+    SealedTickInputs, SteppedEntity, TickBackend, TickOutcome, TICK_HZ, TICK_NANOS,
+};
 pub mod geometry;
 pub use author::{AuthoredFrame, InputLogProducer};
 pub use invariants::{evaluate, Invariant, InvariantKind, InvariantSample, InvariantViolation};

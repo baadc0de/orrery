@@ -108,7 +108,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use orrery_core::store::AuthorityLog;
 use orrery_core::{
     state_hash, verify_bundle, ComponentTypeId, CoreClass, CoreCodec, Executor, InputLogProducer,
-    Quantized,
+    Quantized, TickBackend,
 };
 use orrery_protocol::atrest::SchemaVersion;
 use orrery_protocol::{
@@ -1754,6 +1754,63 @@ pub fn run_differential<G: Game + Clone>(
     scenario: &Scenario,
     baseline: Option<&Baseline>,
 ) -> Verdict {
+    run_differential_on(
+        legacy,
+        candidate,
+        scenario,
+        baseline,
+        Backends {
+            legacy: Executor::new,
+            candidate: Executor::new,
+        },
+    )
+}
+
+/// The substrate each side of a differential runs on.
+///
+/// A named record rather than two positional closures: at the call site that
+/// finally makes S7.4's claim, which backend is the legacy one and which is
+/// the candidate is the whole meaning of the run, and a reader must not have
+/// to count arguments to find out.
+pub struct Backends<L, C> {
+    /// Builds the baseline-pinned side's substrate from its build and seed.
+    pub legacy: L,
+    /// Builds the side-under-comparison's substrate.
+    pub candidate: C,
+}
+
+/// Run the differential with each side on its own storage-and-scheduling
+/// substrate (S7.4, #745).
+///
+/// This is the generalisation [`run_differential`] is now a special case of:
+/// both sides on [`Executor`]. It is what lets the S7.4 claim be made at all,
+/// because the ECS backend lives at the seam (`orrery_sim_host`) and this
+/// crate is Bevy-free by `core-gates.sh` clause 1 — the harness therefore has
+/// to accept a backend it cannot name.
+///
+/// Everything the comparison rests on is unchanged and unchangeable by the
+/// backend: the legacy side still plays the scenario and seals the inputs, the
+/// candidate still replays from *those* sealed inputs and nothing else, the
+/// legacy side is still pinned to its committed baseline before anything is
+/// compared, and the sealed-input digests are still proved equal. A backend
+/// that wanted to pass by rewriting the pilot would be caught by the sealed
+/// digest; one that wanted to pass by rewriting the goldens would be caught by
+/// the pin.
+#[must_use]
+pub fn run_differential_on<G, L, C, BL, BC>(
+    legacy: Subject<G>,
+    candidate: Subject<G>,
+    scenario: &Scenario,
+    baseline: Option<&Baseline>,
+    backends: Backends<L, C>,
+) -> Verdict
+where
+    G: Game + Clone,
+    BL: TickBackend<G>,
+    BC: TickBackend<G>,
+    L: FnOnce(G, UniverseSeed) -> BL,
+    C: FnOnce(G, UniverseSeed) -> BC,
+{
     // A10 §4.4: no baseline, no run. A comparison against "whatever the
     // legacy side happens to be" is not a comparison.
     let Some(baseline) = baseline else {
@@ -1775,7 +1832,7 @@ pub fn run_differential<G: Game + Clone>(
     // build is kept, not consumed: D-3 asks it what is persisted and D-4's
     // cross-replay adjudicates under it.
     let legacy_game = legacy.game.clone();
-    let legacy_played = crate::scenario::play(legacy.game, scenario);
+    let legacy_played = crate::scenario::play_with(legacy.game, scenario, backends.legacy);
     let legacy_artifacts = collect_artifacts(
         &legacy_game,
         &legacy_played,
@@ -1820,7 +1877,8 @@ pub fn run_differential<G: Game + Clone>(
     // silently replace the baseline's pilot or delivery history while
     // claiming a differential comparison.
     let candidate_game = candidate.game.clone();
-    let candidate_played = crate::scenario::replay(candidate.game, &legacy_played.sealed);
+    let candidate_played =
+        crate::scenario::replay_with(candidate.game, &legacy_played.sealed, backends.candidate);
     let candidate_artifacts = collect_artifacts(
         &candidate_game,
         &candidate_played,
