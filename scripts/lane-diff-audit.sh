@@ -97,9 +97,10 @@ git_() { git -C "$AUDIT_REPO" "$@"; }
 
 # ── Check 1: tracked file truncated to empty or nearly empty ─────────────────
 #
-# Compares the branch tree directly against main. A file that is simply deleted
-# in the branch is reported by the deletion-surge check, not here; only files
-# that still exist in HEAD but have been gutted are flagged.
+# Compares the branch tree against the merge-base tree: what a squash merge
+# would land. A file that is simply deleted in the branch is reported by the
+# deletion-surge check, not here; only files that still exist in HEAD but have
+# been gutted are flagged.
 
 check_file_truncation() {
     local left_ref="$1"
@@ -123,20 +124,20 @@ check_file_truncation() {
             continue
         fi
 
-        local main_lines head_lines
-        main_lines=$(git_ show "$left_ref:$file" 2>/dev/null | wc -l) || main_lines=0
+        local base_lines head_lines
+        base_lines=$(git_ show "$left_ref:$file" 2>/dev/null | wc -l) || base_lines=0
         head_lines=$(git_ show "HEAD:$file" 2>/dev/null | wc -l) || head_lines=0
 
-        if (( main_lines > 0 && head_lines == 0 )); then
-            printf 'file-truncation\tempty\t%s\tmain=%s\n' "$file" "$main_lines"
-        elif (( main_lines > 0 )); then
-            local removed=$((main_lines - head_lines))
+        if (( base_lines > 0 && head_lines == 0 )); then
+            printf 'file-truncation\tempty\t%s\tbase=%s\n' "$file" "$base_lines"
+        elif (( base_lines > 0 )); then
+            local removed=$((base_lines - head_lines))
             if (( removed > 0 )); then
                 local frac
-                frac=$(awk "BEGIN { printf \"%.4f\", $removed / $main_lines }")
+                frac=$(awk "BEGIN { printf \"%.4f\", $removed / $base_lines }")
                 if awk "BEGIN { exit ($frac >= $FILE_TRUNCATION_FRACTION) ? 0 : 1 }"; then
                     printf 'file-truncation\tfrac=%s\t%s\tremoved=%s/%s\n' \
-                        "$frac" "$file" "$removed" "$main_lines"
+                        "$frac" "$file" "$removed" "$base_lines"
                 fi
             fi
         fi
@@ -189,7 +190,8 @@ check_deletion_surge() {
 #
 # Implemented in Python because parsing unified diff and running pickaxe searches
 # is exactly the kind of structured work bash is bad at. The helper is fed the
-# base and main refs on stdin and prints tab-separated violation records.
+# left, base, and main refs as arguments and prints tab-separated violation
+# records.
 
 check_revert_hunks() {
     local left_ref="$1"
@@ -227,7 +229,13 @@ def content_lines(ref, path):
 
 
 def deletion_blocks(diff_text):
-    """Yield (path, [deleted lines]) for contiguous deletion-only blocks."""
+    """Yield (path, [deleted lines]) for contiguous deletion-only blocks.
+
+    A deletion run that additions immediately follow inside the same hunk is a
+    replacement: the branch rewrote the content in place. That is the shape of
+    an ordinary refactor, which must pass. The #742 sweep deletes regions with
+    nothing written back over them, and that is the shape this yields.
+    """
     current_path = None
     in_hunk = False
     block = []
@@ -256,7 +264,7 @@ def deletion_blocks(diff_text):
             if raw.startswith("-") and not raw.startswith("---"):
                 block.append(raw[1:])
             elif raw.startswith("+") and not raw.startswith("+++"):
-                yield from flush()
+                block = []  # a replacement, not a revert: drop the deletion run
             else:
                 yield from flush()
         else:
@@ -279,17 +287,23 @@ def good_sample(lines):
 
 
 def merged_adding_commits(line, path):
-    """Commits in BASE..MAIN whose diff changed the count of this line in path.
+    """Commits at or below BASE whose diff changed the count of this line.
 
-    We deliberately do *not* pass --diff-filter=A: that filter restricts to
-    commits that created the file, not commits that added a line inside an
-    existing file. If the line is still present on main, the most recent commit
-    that changed its count is the one that (re-)introduced it.
+    The audited deletions come from the BASE..HEAD diff, so a deleted line was
+    present in BASE's tree: the commit that introduced it is reachable from
+    BASE, and searching BASE..MAIN can never attribute anything — a line added
+    after BASE is not in BASE's tree, so the branch cannot be deleting it.
+    Pairing a BASE..HEAD diff with a BASE..MAIN pickaxe made the check silently
+    stop firing (#801). We deliberately do *not* pass --diff-filter=A: that
+    filter restricts to commits that created the file, not commits that added a
+    line inside an existing file. If the line is still present on main, the
+    most recent commit at or below BASE that changed its count is the one that
+    (re-)introduced it.
     """
     out = run(
         [
             "git", "log", "-S", line,
-            "--format=%H", f"{BASE}..{MAIN}",
+            "--format=%H", BASE,
             "--", path,
         ],
         check=False,
@@ -530,24 +544,50 @@ EOF
         git add src/other.txt
         git commit -q -m "other file"
 
-        # Stale-revert shape: cut from the initial commit, bring in the current
-        # main tree, then commit a deletion of everything that was added after
-        # the base. This produces the #742 signature: a branch whose diff
-        # against origin/main reverts merged hunks.
-        local initial
+        # #742's shape: the branch's own commit deletes already-merged work.
+        # The branch is cut from a commit that contains the merged feature;
+        # its tree then goes stale (pre-feature content), and `git commit -a`
+        # sweeps the difference into the branch as its own deletions. They
+        # live in merge-base..HEAD — exactly what a squash merge would land —
+        # so the audit must refuse and name the reverted commit. (The branch
+        # is cut *at* the feature commit, not before it: a branch can only
+        # revert a line its own merge-base already contained.)
+        local initial feature_commit
         initial=$(git rev-list --max-parents=0 HEAD)
-        git checkout -q -b stale-revert "$initial"
-        git checkout -q main -- src/lib.txt src/other.txt
-        # Remove the merged feature additions and the later file, but add a
-        # small marker so the commit is not identical to the old base.
-        sed -i '/^merged feature/d' src/lib.txt
-        echo "stale marker" >> src/lib.txt
-        rm -f src/other.txt
-        git add src/lib.txt src/other.txt
-        git commit -q -m "stale revert of everything after base"
+        feature_commit=$(git rev-parse main~1)
+        git checkout -q -b stale-revert "$feature_commit"
+        git show "$initial:src/lib.txt" > src/lib.txt
+        git commit -q -a -m "stale checkout sweeps the difference as deletions"
 
-        if audit_synthetic >/dev/null 2>&1; then
+        local stale_output
+        if stale_output=$(audit_synthetic 2>&1); then
             echo "$NAME: self-test: stale-revert branch was NOT refused" >&2
+            exit 1
+        elif [[ $stale_output != *"FAIL revert-hunk: src/lib.txt"*"commits=$feature_commit"* ]]; then
+            echo "$NAME: self-test: stale-revert refusal did not name revert-hunk for $feature_commit" >&2
+            echo "$stale_output" >&2
+            exit 1
+        fi
+        echo "$NAME: self-test: stale-revert branch correctly refused (revert-hunk named $feature_commit)" >&2
+
+        # The merely-behind branch (#801): cut before the merged feature and
+        # authoring one change to a file main never touched. It deletes
+        # nothing; it simply lacks the feature lines, which main added after
+        # the branch point. Diffing against main made that absence look like
+        # a revert of the feature commit; the merge-base diff shows only the
+        # authored change and must pass without a waiver.
+        git checkout -q -b merely-behind "$initial"
+        echo "# an unrelated change" >> Cargo.toml
+        git add Cargo.toml
+        git commit -q -m "chore: unrelated change while main moved on"
+
+        local behind_output behind_distance
+        behind_distance=$(git rev-list --count HEAD..main)
+        if behind_output=$(audit_synthetic 2>&1); then
+            echo "$NAME: self-test: merely-behind branch ($behind_distance behind) correctly passed without waiver" >&2
+        else
+            echo "$NAME: self-test: merely-behind branch ($behind_distance behind) was wrongly refused" >&2
+            echo "$behind_output" >&2
             exit 1
         fi
 
@@ -595,7 +635,6 @@ EOF
             echo "$NAME: self-test: reverted mutation branch was wrongly refused" >&2
             exit 1
         fi
-        echo "$NAME: self-test: stale-revert branch correctly refused" >&2
 
         # Ordinary refactor from a recent base: replace the merged feature with
         # new text, keeping comparable additions and deletions.
@@ -693,13 +732,19 @@ fi
 merge_base=$(git_ merge-base HEAD "$MAIN_REF")
 readonly merge_base
 
+# The truncation, deletion-surge, and revert-hunk checks take the merge base as
+# the left ref: a squash merge lands merge-base..HEAD, so that is the diff this
+# script owns. Diffing against $MAIN_REF instead counted every commit that
+# landed after the branch point as a deletion authored by the branch, so a
+# branch that was merely behind looked like a revert (#801). check_stale_base
+# measures the base against main itself and is unaffected.
 failures=0
 while IFS=$'\t' read -r kind rest; do
     [[ -n $kind ]] || continue
     if ! report_violation "$kind" "$rest"; then
         failures=$((failures + 1))
     fi
-done < <(collect_violations "$MAIN_REF" "$merge_base")
+done < <(collect_violations "$merge_base" "$merge_base")
 
 if (( failures )); then
     note "$failures audit violation(s); push refused (waive with --waive CHECK or --waive-all)"
