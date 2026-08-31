@@ -342,6 +342,35 @@ crate hosting canonical state in a `bevy_ecs::World`:
    is never a substitute for per-entity replay. The rollback unit itself
    stays R6's (A7).
 
+> **Amended 2026-08-31 (owner-authorised), against [D42] clause (d)'s
+> admission record.** The accounting below is written against an antecedent
+> that no longer holds: no trigger fired, and yet **a host is admitted** —
+> `orrery_sim_host`'s `EcsBackend`, landed by #757 under a direct owner
+> sanction. So "Tier H is empty, the tree is exactly Tier V" is no longer a
+> description of the tree; Tier H is empty *and a host it was written to
+> govern now exists*.
+>
+> **This amendment does not waive a single Tier-H clause, and does not convert
+> any of them into a follow-up.** Clause (4) says its canary and projection
+> differential are wired in *"as preconditions of admitting the host, not
+> follow-ups"*, and that sentence stays exactly as written. What has happened
+> is that admission ran ahead of the preconditions — which is a debt, recorded
+> here as a debt, not retired by recording it.
+>
+> **The consequence, which is the operative part.** Until every clause of this
+> Tier H battery is enforced and demonstrated mutation-style, the admitted host
+> is confined to what it does today: it may run, be compared, and be proven at
+> parity, but **no canonical byte may move on it** — no golden regenerated on
+> the ECS path, no second host admitted, no gated crate taking a Bevy
+> dependency. [D42] clause (d)'s T3 keeps that force after its admission
+> function lapses.
+>
+> Nothing in this record's active enforcement is breached by the admission:
+> `orrery_core` remains Bevy-free, the gated-crate scan is unchanged, the hash
+> call site is still in core, and the admitted world is dedicated rather than
+> an application world. **The gap is the unenforced battery, not a broken
+> gate.**
+
 **Honest accounting this record owes the reader (A4 §11.5, not dropped):**
 Tier H is *entirely conditional*. Until a trigger fires, Tier H is empty, the
 tree is exactly Tier V, and every Tier-H clause above is unused
