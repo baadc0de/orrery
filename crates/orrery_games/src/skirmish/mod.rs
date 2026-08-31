@@ -103,6 +103,24 @@ pub const SKIRMISH_RULESET: RulesetId = RulesetId {
 };
 
 /// Component identifiers, for the §2 classification.
+///
+/// # Why these are not in `orrery_compose::registry` (#750)
+///
+/// #750 populated Regolith's manifest schema table from its reviewed registry
+/// ledger and asked that Skirmish get the same treatment or an explicit note.
+/// This is the note, and the reason is that there is nothing here to give the
+/// same treatment to: **Skirmish has no [`orrery_compose::CompatibilityManifest`]
+/// at all** — no module table, no canonical schedule, no `profile_id` — so it
+/// has no `component_schemas` field to populate, and no reviewed allocation
+/// table for one to agree with. The ids below are declared inline and consumed
+/// only by [`Skirmish::classify_component`].
+///
+/// Giving Skirmish a manifest is a composition-root change carrying the module
+/// split, the schedule topology and the determinism-profile claim with it. It
+/// is not a schema-table fix, so it is deliberately not smuggled into one; when
+/// Skirmish gets a manifest, these three ids become a reviewed registry table
+/// and the manifest states them with D45 capabilities, exactly as Regolith's
+/// does.
 pub mod components {
     use orrery_core::ComponentTypeId;
 
