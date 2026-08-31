@@ -33,6 +33,10 @@
 // undocumented public item a build failure rather than a warning nobody reads.
 #![warn(missing_docs)]
 
+mod ruleset_digest {
+    include!(concat!(env!("OUT_DIR"), "/ruleset_digest.rs"));
+}
+
 pub mod compare;
 pub mod corpus;
 pub mod ruleset;

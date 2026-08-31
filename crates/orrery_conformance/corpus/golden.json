@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "ruleset_version": 2,
-  "ruleset_digest": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+  "ruleset_digest": "71118bd5b4edda404e8fbfe049bad7fad2756faf027eec2cae9203775d6d6bd5",
   "target": "x86_64-linux-unix",
   "cases": [
     {

@@ -33,3 +33,9 @@ iroh-base = { workspace = true }
 bytes = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
+
+[build-dependencies]
+# D49's build identity is generated while this crate compiles. The encoder
+# derives the source closure from first-party path dependencies in the
+# manifests, rather than maintaining it beside this manifest.
+orrery_ruleset_digest = { path = "../orrery_ruleset_digest" }

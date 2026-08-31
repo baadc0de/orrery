@@ -348,7 +348,7 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
 /// makes admission refuse that mixed campaign instead.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
     version: 21,
-    digest: [0x6A; 32],
+    digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 
 /// Regolith's two statically linked rule domains.

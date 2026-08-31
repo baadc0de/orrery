@@ -7920,6 +7920,7 @@ dependencies = [
  "libm",
  "orrery_core",
  "orrery_protocol",
+ "orrery_ruleset_digest",
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
  "serde",
@@ -7978,6 +7979,7 @@ dependencies = [
  "orrery_compose",
  "orrery_core",
  "orrery_protocol",
+ "orrery_ruleset_digest",
  "postcard",
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -8124,6 +8126,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "orrery_ruleset_digest"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "tempfile",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
