@@ -127,13 +127,21 @@ jobs:
       # workspace: cargo discovers .cargo/config.toml while walking up from
       # each of their directories. Keep the cache local to this run; the
       # remote economics for the old gates/test lanes do not predict this
-      # compile-only shape.
+      # compile-only shape. kache-action intentionally leaves RUSTC_WRAPPER
+      # empty when no persistent backend is configured, so restore the local
+      # wrapper explicitly in the following step.
       - name: Install kache with no remote, for same-run deduplication
         uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
         with:
           version: 0.14.2
           github-cache: false
           pr-comment: false
+      - name: Enable kache's local same-run store
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v kache
+          echo 'RUSTC_WRAPPER=kache' >> "$GITHUB_ENV"
 
       # Some standalone tools compile the FDB feature and regolith compiles
       # Bevy's Linux backends. This is compilation support only: no test or
@@ -155,6 +163,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ "${RUSTC_WRAPPER:-}" == *kache* ]] || {
+            echo '::error::RUSTC_WRAPPER is not kache' >&2
+            exit 1
+          }
           mapfile -t workspaces < <(
             find . -name Cargo.toml -not -path './target/*' -print0 |
               while IFS= read -r -d '' manifest; do
