@@ -13,6 +13,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens;
@@ -43,6 +44,19 @@ struct ContributingCrate {
 struct SourceUnit {
     logical_path: String,
     disk_path: PathBuf,
+}
+
+/// One canonical source input and the hash of the token stream it contributes.
+///
+/// This is diagnostic data rather than another identity format: callers can
+/// compare a checkout with a fresh clone without exposing a checkout-local
+/// disk path to the digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestInput {
+    /// Stable, workspace-relative identity of the Rust source file.
+    pub logical_path: String,
+    /// BLAKE3 of the canonical token stream encoded for this source file.
+    pub canonical_tokens_hash: [u8; 32],
 }
 
 impl DigestClosure {
@@ -113,6 +127,23 @@ impl DigestClosure {
         }
         Ok(*hasher.finalize().as_bytes())
     }
+
+    /// Return the exact source identities and canonical token hashes used by
+    /// [`Self::digest`], in digest order.
+    pub fn diagnostic_inputs(&self) -> Result<Vec<DigestInput>> {
+        let mut inputs = Vec::new();
+        for package in &self.packages {
+            for source in &package.sources {
+                let text = fs::read_to_string(&source.disk_path)?;
+                inputs.push(DigestInput {
+                    logical_path: source.logical_path.clone(),
+                    canonical_tokens_hash: *blake3::hash(canonical_tokens(&text)?.as_bytes())
+                        .as_bytes(),
+                });
+            }
+        }
+        Ok(inputs)
+    }
 }
 
 /// Generate the Rust constant and Cargo rerun directives for the package
@@ -127,6 +158,16 @@ pub fn generate_build_output() -> Result<()> {
     closure.verify_manifest_closure()?;
     for input in closure.rerun_inputs() {
         println!("cargo:rerun-if-changed={}", input.display());
+    }
+    println!("cargo:rerun-if-env-changed=ORRERY_RULESET_DIGEST_DIAGNOSTICS");
+    if env::var_os("ORRERY_RULESET_DIGEST_DIAGNOSTICS").is_some() {
+        for input in closure.diagnostic_inputs()? {
+            println!(
+                "cargo:warning=orrery-ruleset-digest input {} {}",
+                input.logical_path,
+                lower_hex(&input.canonical_tokens_hash),
+            );
+        }
     }
 
     let digest = closure.digest()?;
@@ -302,8 +343,7 @@ fn package_inputs(manifest_path: &Path, workspace_root: &Path) -> Result<Contrib
         .parent()
         .ok_or("package manifest has no parent")?
         .join("src");
-    let mut source_paths = Vec::new();
-    collect_rust_sources(&source_root, &mut source_paths)?;
+    let source_paths = tracked_rust_sources(&source_root, workspace_root)?;
     let mut sources = source_paths
         .into_iter()
         .map(|disk_path| {
@@ -356,17 +396,59 @@ fn read_manifest(path: &Path) -> Result<Value> {
     Ok(toml::from_str(&fs::read_to_string(path)?)?)
 }
 
-fn collect_rust_sources(directory: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rust_sources(&path, output)?;
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            output.push(path);
+/// Enumerate only Rust sources recorded in the repository index.
+///
+/// Walking `src/` is deliberately not sufficient: an editor file or generated
+/// build artefact in a dirty worktree would then become a build identity input.
+/// The repository's tracked set is the declared source set D49 hashes.
+fn tracked_rust_sources(source_root: &Path, workspace_root: &Path) -> Result<Vec<PathBuf>> {
+    let repository_root = Command::new("git")
+        .args(["-C"])
+        .arg(workspace_root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !repository_root.status.success() {
+        return Err("could not resolve the repository root for ruleset sources".into());
+    }
+    let repository_root = PathBuf::from(String::from_utf8(repository_root.stdout)?.trim());
+    if repository_root.canonicalize()? != workspace_root.canonicalize()? {
+        return Err(
+            "the Cargo workspace root must be the repository root for ruleset sources".into(),
+        );
+    }
+
+    let source_root_identity = workspace_relative_path(source_root, workspace_root)?;
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(workspace_root)
+        .args(["ls-files", "-z", "--"])
+        .arg(&source_root_identity)
+        .output()?;
+    if !output.status.success() {
+        return Err("could not enumerate tracked ruleset sources".into());
+    }
+
+    let mut sources = Vec::new();
+    for identity in output.stdout.split(|byte| *byte == 0) {
+        if identity.is_empty() {
+            continue;
+        }
+        let identity = std::str::from_utf8(identity)?;
+        let path = workspace_root.join(identity);
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "tracked ruleset source {} is not a regular file",
+                    path.display()
+                )
+                .into());
+            }
+            sources.push(path);
         }
     }
-    Ok(())
+    sources.sort();
+    Ok(sources)
 }
 
 fn write_record(hasher: &mut blake3::Hasher, tag: &[u8], bytes: &[u8]) {
@@ -374,6 +456,15 @@ fn write_record(hasher: &mut blake3::Hasher, tag: &[u8], bytes: &[u8]) {
     hasher.update(tag);
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 fn canonical_tokens(source: &str) -> Result<String> {
@@ -461,6 +552,7 @@ fn is_doc_attribute(group: &Group) -> bool {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use tempfile::TempDir;
 
     use super::DigestClosure;
@@ -491,11 +583,29 @@ mod tests {
             directory.path().join("games/tests/rules.rs"),
             "#[test] fn integration() {}\n",
         );
+        git(directory.path(), &["init", "-q"]);
+        git(directory.path(), &["add", "--all"]);
+        git(
+            directory.path(),
+            &[
+                "-c",
+                "user.email=ruleset-digest@example.invalid",
+                "-c",
+                "user.name=Ruleset Digest Test",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
         directory
     }
 
     fn digest(directory: &TempDir) -> [u8; 32] {
-        let closure = DigestClosure::from_manifest(&directory.path().join("games/Cargo.toml"))
+        digest_at(directory.path())
+    }
+
+    fn digest_at(directory: &Path) -> [u8; 32] {
+        let closure = DigestClosure::from_manifest(&directory.join("games/Cargo.toml"))
             .expect("derive manifest closure");
         closure
             .verify_manifest_closure()
@@ -506,6 +616,15 @@ mod tests {
     fn write(path: PathBuf, contents: &str) {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
         fs::write(path, contents).expect("write fixture source");
+    }
+
+    fn git(directory: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(directory)
+            .args(arguments)
+            .status()
+            .expect("run git for fixture");
+        assert!(status.success(), "git {arguments:?} failed");
     }
 
     #[test]
@@ -616,6 +735,48 @@ mod tests {
             "#[test] fn integration() { assert!(true); }\n",
         );
         assert_eq!(digest(&directory), baseline);
+    }
+
+    #[test]
+    fn fresh_clone_and_dirty_worktree_have_the_same_digest() {
+        let dirty = fixture();
+        let clone_parent = tempfile::tempdir().expect("clone parent");
+        let clean = clone_parent.path().join("clean");
+        let source = dirty.path().to_str().expect("fixture path is UTF-8");
+        let destination = clean.to_str().expect("clone path is UTF-8");
+        git(clone_parent.path(), &["clone", "-q", source, destination]);
+        let fresh_clone_digest = digest_at(&clean);
+
+        let untracked_source = dirty.path().join("games/src/local_untracked.rs");
+        let build_artefact = dirty.path().join("games/src/.digest-build/generated.rs");
+        write(untracked_source, "pub const LOCAL_ONLY: u32 = 8;\n");
+        write(build_artefact, "pub const GENERATED: u32 = 9;\n");
+
+        let closure = DigestClosure::from_manifest(&dirty.path().join("games/Cargo.toml"))
+            .expect("derive dirty manifest closure");
+        let encoded_paths = closure
+            .diagnostic_inputs()
+            .expect("list dirty closure inputs")
+            .into_iter()
+            .map(|input| input.logical_path)
+            .collect::<Vec<_>>();
+        assert!(
+            !encoded_paths
+                .iter()
+                .any(|path| path.ends_with("local_untracked.rs")),
+            "the untracked source is under games/src and must not enter the closure"
+        );
+        assert!(
+            !encoded_paths
+                .iter()
+                .any(|path| path.ends_with(".digest-build/generated.rs")),
+            "the build artefact is under games/src and must not enter the closure"
+        );
+        assert_eq!(
+            digest(&dirty),
+            fresh_clone_digest,
+            "a fresh clone and a dirty worktree must encode the same tracked source closure"
+        );
     }
 
     #[test]
