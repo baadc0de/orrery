@@ -506,7 +506,16 @@ self_test() {
         }
 
         cd "$tmp"
-        git init -q
+        # `-b main` explicitly, because the fixture's assertions name `main~1`
+        # and `git init`'s default branch is *ambient*: it is whatever
+        # `init.defaultBranch` says, and unset means `master`. Every developer
+        # box here sets it, so this self-test passed locally for months and
+        # failed the first time it ran on a runner that does not
+        # (`static gates`, which is nightly-only since 2026-08-28 — so the gap
+        # this closes is exactly the environment-dependent class ci.yml warns
+        # that move trades away). The fixture must not read configuration it is
+        # not the subject of.
+        git init -q -b main
         git config user.email "lane-diff-audit@orrery.local"
         git config user.name "Lane Diff Audit"
 
