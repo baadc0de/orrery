@@ -547,7 +547,61 @@ makes it more than a preference:
    panic, which (f)(1) bars. A stray plain operation is still a bug (it
    bypasses the flag and, if saturating is chosen, the posture); the pin
    turns it from a divergence into an ordinary defect.
-3. **Occurrence reaches witnessed state, or the flag is theater.** This is
+
+> **Amended 2026-08-31 (owner-authorised), per [#628]: overflow-canonicity is
+> a required per-ruleset declaration, not a blanket requirement.**
+>
+> The owner chose **(B) scoping** over **(A) parity**. Skirmish does **not**
+> gain `arithmetic_overflowed`; instead, clause (f)(3) applies only to
+> rulesets that declare arithmetic overflow to be canonical state. The
+> declaration is a `Ruleset` trait obligation with **no default** — for
+> example, an associated constant `const OVERFLOW_IS_CANONICAL: bool;` or a
+> parameterless method without a default body — so a ruleset that does not
+> state `true` or `false` fails to compile. A game that does economically
+> meaningful arithmetic and declares nothing is therefore unrepresentable
+> rather than merely undocumented.
+>
+> **What survives.** The clause's reasoning is untouched where it applies:
+>
+> > if overflow set a bit that hashing never sees, two hosts could diverge —
+> > one flagged, one not — while `hash(e, t)` still matches, and the flag
+> > would prove nothing precisely when it matters.
+>
+> Regolith keeps its flag.
+> `crates/orrery_games/src/regolith/state.rs:268-269` (`Craft`) and
+> `:394-395` (`Rock`) carry `pub arithmetic_overflowed: bool`, encoded and
+> decoded in the `CoreCodec` implementations below, so the bit is inside
+> `bytes(e,t)` and therefore inside `hash(e,t)`.
+>
+> **The scoping rule.** A ruleset that declares overflow canonical must
+> carry the flag as a per-entity discrete field of canonical state, set
+> during S2 at the point of occurrence, and include it in `bytes(e,t)` so
+> that it is inside `hash(e,t)` — exactly as the original clause text below
+> requires. A ruleset that declares overflow not canonical must still
+> resolve overflow without panic under (f)(1) and without profile-dependence
+> under (f)(2), but it need not carry the flag; its contract is that
+> overflow is not part of its canonical state and therefore not part of its
+> adjudication surface.
+>
+> **Why scoping is defensible for Skirmish.** Skirmish is a test ruleset,
+> not shipped to players. It declares `max_neighbor_reads() == 0` and stayed
+> at v2 through #758 on structural grounds — there is no input under which a
+> pre- and post-#758 Skirmish build reach the changed code. Requiring it to
+> carry a witnessed overflow flag would add canonical state and a
+> `SchemaVersion` bump to a ruleset whose purpose is to be the simple one.
+> Skirmish's canonical arithmetic uses `saturating_*` and deliberate
+> `wrapping_add` for angular wraparound
+> (`crates/orrery_games/src/skirmish/mod.rs`, `pilot.rs`,
+> `invariants.rs`); no `arithmetic_overflowed` field exists under
+> `crates/orrery_games/src/skirmish/`.
+>
+> **Consequence for (f)(4).** Under (A) this lane additionally blocked on
+> D43 (f)(4) — *"no canonical arithmetic may be written that depends on
+> which one wins"* — because a `flagged_*` helper depends on it. Under (B)
+> that dependency does not arise; (f)(4) remains reserved to the owner and
+> is not amended here.
+
+ 3. **Occurrence reaches witnessed state, or the flag is theater.** This is
    the part that needs care. A flag is only evidence if it is part of the
    hashed projection: if overflow set a bit that hashing never sees, two
    hosts could diverge — one flagged, one not — while `hash(e, t)` still
@@ -724,6 +778,7 @@ than silently repeated.
 [D16]: 0016-parameter-reference.md
 [D38]: 0038-at-rest-schema-versioning.md
 [D42]: 0042-canonical-simulation-architecture.md
+[#628]: https://github.com/baadc0de/orrery/issues/628
 [#793]: https://github.com/baadc0de/orrery/issues/793
 [#796]: https://github.com/baadc0de/orrery/pull/796
 [#798]: https://github.com/baadc0de/orrery/pull/798
