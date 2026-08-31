@@ -257,6 +257,20 @@ here.
 > because admission has happened. It remains binding on *canonical bytes
 > moving*: no golden may be regenerated on the ECS path, and no second host may
 > be admitted, until [D43] clause (e)'s battery is enforced.
+>
+> > **Discharged 2026-08-31 (owner-authorised).** [D43] clause (e)'s battery is
+> > now enforced and demonstrated mutation-style in full — all five clauses, each
+> > with a named killing mutation — and that record's confinement is lifted
+> > accordingly. T3 is satisfied for this host. It stays binding on any *further*
+> > adoption: a second host still enters through clause (e)(1)'s review-required
+> > allowlist and inherits the whole battery, which is the mechanism rather than
+> > a formality.
+> >
+> > The package's other two open items are unchanged by this and are **not**
+> > discharged: A5's component-policy registry is nearer (the declaration data
+> > plane is now the single source, `classify_component` retired) but IV-7's
+> > engine-handle refusal and the persistd linkage remain open; the
+> > capacity-scale mirror-cost numbers remain unmet.
 
 A dedicated canonical `bevy_ecs::World` — same per-entity topology, different
 substrate behind the seam — is neither adopted nor foreclosed. It becomes a
