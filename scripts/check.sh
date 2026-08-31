@@ -527,6 +527,12 @@ lane_gates() {
     # remembered to. It is a few `find`s and a `grep`; it belongs in the gate.
     run scripts/check.sh --self-test
 
+    # #779's pre-push audit. It checks the current branch against origin/main for
+    # reverting merged hunks, whole-file truncation, a stale merge-base, and a
+    # deletion surge. The self-test rebuilds both failure directions in a
+    # throwaway repository so a check that refuses everything cannot pass.
+    run scripts/lane-diff-audit.sh --self-test
+
     # Each standalone tool declares its own `[workspace]`, so the `test` lane's
     # `cargo test --workspace` reaches none of them.
     local dir
