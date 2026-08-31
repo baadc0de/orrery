@@ -90,6 +90,9 @@ pub mod invariants;
 /// **SPIKE #793 — propose-only.** The `bevy_ecs`-native rewrite of the
 /// stage-1 checks, kept beside the shipped ones for the differential.
 pub mod native;
+/// **SPIKE #793 — propose-only.** Four ways to reach a neighbour under a
+/// native ECS, scored against D43 (e)(5)'s recorded-read discipline.
+pub mod neighbour_options;
 pub mod order;
 pub mod pilot;
 pub mod state;
