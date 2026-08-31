@@ -1,6 +1,6 @@
 //! Hashed, own-state traces for Regolith entities.
 
-use orrery_core::{CodecError, CoreCodec, QPos, QVel, Quantized};
+use orrery_core::{CodecError, CoreCodec, QPos, QVel, Quantized, Sectioned, StateSection};
 
 use super::{archetype::Archetype, weapon::WeaponKind};
 
@@ -451,6 +451,40 @@ pub enum RegolithState {
     Pickup(Pickup),
     /// One island's bloom scheduler and replicated site announcement.
     BloomDirector(BloomDirector),
+}
+
+/// The `regolith.craft` module's one state section.
+pub const SECTION_CRAFT: StateSection = StateSection("craft");
+/// The `regolith.world` module's rock section.
+pub const SECTION_ROCK: StateSection = StateSection("rock");
+/// The `regolith.world` module's pickup section.
+pub const SECTION_PICKUP: StateSection = StateSection("pickup");
+/// The `regolith.world` module's bloom-director section.
+pub const SECTION_BLOOM_DIRECTOR: StateSection = StateSection("bloom-director");
+
+/// Every state section the `regolith.world` module owns, in manifest order.
+///
+/// This is the S7.4 migration frontier: the sections a decomposing host stores
+/// in their own component. It is `regolith.world` and not `regolith.craft`
+/// because the world module is the one whose population *changes inside a
+/// tick* — rocks are materialized by splits and blooms, pickups by the
+/// contest — so migrating it is the only choice that exercises a host's spawn
+/// path at all. Held against the manifest by
+/// `regolith::composition_tests::the_migration_frontier_is_a_declared_module`.
+pub const REGOLITH_WORLD_SECTIONS: &[StateSection] =
+    &[SECTION_ROCK, SECTION_PICKUP, SECTION_BLOOM_DIRECTOR];
+
+impl Sectioned for RegolithState {
+    const MIGRATED_SECTIONS: &'static [StateSection] = REGOLITH_WORLD_SECTIONS;
+
+    fn section(&self) -> StateSection {
+        match self {
+            Self::Craft(_) => SECTION_CRAFT,
+            Self::Rock(_) => SECTION_ROCK,
+            Self::Pickup(_) => SECTION_PICKUP,
+            Self::BloomDirector(_) => SECTION_BLOOM_DIRECTOR,
+        }
+    }
 }
 
 const CRAFT_BASE_ENCODED_LEN: usize = 132;

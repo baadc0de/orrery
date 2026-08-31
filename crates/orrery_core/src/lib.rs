@@ -99,7 +99,7 @@ pub use replay::{verify_bundle, verify_bundle_on, ReplayError, ReplayHarness, Re
 pub use rng::{tick_rng, tick_seed, TickRng};
 pub use ruleset::{
     state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, EntityMaterialization,
-    OrderedInputs, Ruleset, StateView, StepOutput,
+    OrderedInputs, Ruleset, Sectioned, StateSection, StateView, StepOutput,
 };
 pub use sched::{
     run_schedule, run_system, run_system_as, Observation, Schedule, Scheduled, Stage, StageName,
