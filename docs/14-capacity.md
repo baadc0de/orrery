@@ -1512,3 +1512,61 @@ for run in 1 2 3 4 5; do
 done
 jq '.metrics.b5_capacity_mirror' /tmp/capacity-run-*.json
 ```
+
+### 12.7 Re-measured 2026-08-31 after #784, #789, #800 and #802 — the ECS is now the faster substrate
+
+§12.3's headline — *"the ECS backend was 14.0–14.5% slower per tick"*, and
+`91.6% / 104.8%` of a 60 Hz budget at 24k — was measured on a tree that predates
+four merges into `crates/orrery_sim_host/src/ecs.rs`: #784 (#758, neighbours
+read from the tick start, which took the second per-entity copy off the advance
+path), #789 (#745, the `regolith.world` module in its own components), #800
+(#787) and #802 (#791). **`gates/migration-bench/src/capacity.rs` has not been
+touched since #777**, so the harness, the workload, the warm-up and the
+repetition counts are identical and the two measurements are comparable.
+
+Same box, same `rustc 1.96.0`, same release profile, same all-`Craft`
+population. Method differs from §12.2 in two ways, stated so the numbers are
+not over-read: **three** process captures per arm rather than five, and **no
+`taskset` pinning**. Cells are the median of the three run medians, with the
+min–max of those medians.
+
+| entities | backend | `step(1)` ms | vs executor | % of 16.667 ms |
+|---:|---|---:|---:|---:|
+| 10,000 | executor | 6.399 (6.368–6.463) | — | 38.4% |
+| 10,000 | ECS | 5.764 (5.763–5.829) | **0.90×** | 34.6% |
+| 20,000 | executor | 12.755 (12.726–12.808) | — | 76.5% |
+| 20,000 | ECS | 11.522 (11.503–11.573) | **0.90×** | 69.1% |
+| **24,000** | **executor** | **15.465 (15.414–15.521)** | — | **92.8%** |
+| **24,000** | **ECS** | **14.238 (14.045–14.279)** | **0.92×** | **85.4%** |
+
+The executor rows are within 1.3% of §12.3's (15.266 → 15.465 ms at 24k), which
+is what makes the ECS rows readable as a change rather than as a different box:
+the ECS tick at 24k fell from 17.462 ms to 14.238 ms, **−18.5%**, while the
+control moved by noise. §12.3's sentence *"on this workload the admitted
+alternative is slower"* no longer holds, and **at 24k the ECS now fits inside a
+60 Hz budget where §12.3 recorded it at 104.8% and outside**. Anyone quoting
+`104.8%` or `~14% slower` should quote this row instead.
+
+The byte-read legs have **not** reversed. Full `state_bytes` sweep at 24k is
+3.058 ms on the ECS against 2.664 ms on the executor (1.15×), and full
+`collect_output_bytes` 3.218 ms against 2.644 ms (1.22×). Reading whole
+canonical states one id at a time is the ECS's weak leg, and it is the same
+`&R::CoreState` shape that stops the components holding a narrower payload —
+see `crates/orrery_sim_host/src/ecs.rs`'s module note.
+
+**A null result recorded as such.** This lane's own change — `Index` carrying
+the entity's side so a canonical read is one component lookup instead of a
+probe-and-fall-back — did not move any leg beyond run-to-run noise. The paired
+before/after medians differ by −8.7% to +6.8% across the twelve ECS cells, and
+the *executor* cells, which the change cannot touch, differ by up to +10.3% over
+the same runs. The executor spread bounds the noise, and the effect is inside
+it. The change stands on the storage layout answering a question it already
+knew the answer to, not on a measured speed-up.
+
+```bash
+cd gates/migration-bench && cargo build --release
+for run in 1 2 3; do
+  ./target/release/migration-bench capture --out "/tmp/capacity-run-${run}.json"
+done
+jq '.metrics.b5_capacity_mirror' /tmp/capacity-run-*.json
+```
