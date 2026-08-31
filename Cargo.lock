@@ -7907,6 +7907,7 @@ dependencies = [
 name = "orrery_compose"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "orrery_core",
  "orrery_protocol",
 ]

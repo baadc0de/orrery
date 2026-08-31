@@ -301,6 +301,63 @@ pub enum CompositionError {
     CanonicalScheduleAmbiguity(ScheduleAmbiguity),
 }
 
+/// Compute D43 clause (g)'s schedule digest.
+///
+/// blake3 over a canonical serialization of: the ordered stage list; each
+/// stage's ordered system names; every declared ordering edge, sorted
+/// lexicographically; the ambiguity-detection setting; and the executor
+/// policy. It exists to catch scheduler-topology drift that state goldens
+/// cannot see — goldens hash states, not graphs.
+///
+/// **Every field is length-prefixed** rather than separator-delimited. A
+/// separator makes `["a", "b"]` and `["a|b"]` hash alike, which would let a
+/// stage rename disguise a system reorder; a digest that can be spoofed by
+/// choosing a name is worse than no digest, because it is trusted.
+///
+/// Edges are sorted here rather than assumed sorted at the declaration site:
+/// the clause says the digest covers the *set* of edges, so two manifests
+/// declaring the same constraints in a different textual order must agree.
+#[must_use]
+pub fn schedule_digest(schedule: &CanonicalSchedule) -> [u8; 32] {
+    fn push_str(out: &mut Vec<u8>, value: &str) {
+        let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    fn push_len(out: &mut Vec<u8>, value: usize) {
+        out.extend_from_slice(&u32::try_from(value).unwrap_or(u32::MAX).to_le_bytes());
+    }
+
+    let mut bytes = Vec::new();
+    push_len(&mut bytes, schedule.stages.len());
+    for stage in schedule.stages {
+        push_str(&mut bytes, stage.id.0);
+        push_len(&mut bytes, stage.systems.len());
+        for system in stage.systems {
+            push_str(&mut bytes, system.0);
+        }
+    }
+    let mut edges = schedule
+        .ordering_edges
+        .iter()
+        .map(|edge| (edge.before.0, edge.after.0))
+        .collect::<Vec<_>>();
+    edges.sort_unstable();
+    push_len(&mut bytes, edges.len());
+    for (before, after) in edges {
+        push_str(&mut bytes, before);
+        push_str(&mut bytes, after);
+    }
+    bytes.push(match schedule.ambiguity_detection {
+        AmbiguityDetection::Error => 0,
+        AmbiguityDetection::Warning => 1,
+    });
+    bytes.push(match schedule.executor_policy {
+        ExecutorPolicy::SingleThreaded => 0,
+    });
+    *blake3::hash(&bytes).as_bytes()
+}
+
 /// Validate a link-time composition manifest before registration.
 ///
 /// Dependency cycles are detected over the complete transitive closure of the
@@ -578,6 +635,54 @@ mod tests {
             error,
             Err(CompositionError::DuplicateComponentTypeId(regolith::STATE))
         );
+    }
+
+    /// Length prefixes, not separators: two different topologies whose
+    /// concatenated names coincide must not hash alike.
+    ///
+    /// Without this the digest is spoofable by choosing a name, and a
+    /// spoofable digest is worse than none because it is trusted.
+    #[test]
+    fn the_digest_separates_topologies_whose_names_concatenate_alike() {
+        const SPLIT: &[ScheduleStageManifest] = &[ScheduleStageManifest {
+            id: ScheduleStageId("stage"),
+            systems: &[SystemId("ab"), SystemId("c")],
+        }];
+        const JOINED: &[ScheduleStageManifest] = &[ScheduleStageManifest {
+            id: ScheduleStageId("stage"),
+            systems: &[SystemId("a"), SystemId("bc")],
+        }];
+        let base = CanonicalSchedule {
+            stages: SPLIT,
+            ordering_edges: EMPTY_EDGES,
+            ambiguities: EMPTY_AMBIGUITIES,
+            ambiguity_detection: AmbiguityDetection::Error,
+            executor_policy: ExecutorPolicy::SingleThreaded,
+        };
+        let mut other = base;
+        other.stages = JOINED;
+        assert_ne!(schedule_digest(&base), schedule_digest(&other));
+    }
+
+    /// The empty schedule every game declared before it had systems hashes to
+    /// one value, so the digest asserted nothing about any of them.
+    #[test]
+    fn the_empty_schedule_digest_is_the_same_for_every_game() {
+        let empty = CanonicalSchedule {
+            stages: EMPTY_STAGES,
+            ordering_edges: EMPTY_EDGES,
+            ambiguities: EMPTY_AMBIGUITIES,
+            ambiguity_detection: AmbiguityDetection::Error,
+            executor_policy: ExecutorPolicy::SingleThreaded,
+        };
+        assert_eq!(schedule_digest(&empty), schedule_digest(&empty));
+        let mut populated = empty;
+        const ONE: &[ScheduleStageManifest] = &[ScheduleStageManifest {
+            id: ScheduleStageId("stage"),
+            systems: &[SystemId("only")],
+        }];
+        populated.stages = ONE;
+        assert_ne!(schedule_digest(&empty), schedule_digest(&populated));
     }
 
     #[test]

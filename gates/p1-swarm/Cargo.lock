@@ -3494,6 +3494,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "orrery_compose"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "orrery_core",
  "orrery_protocol",
 ]

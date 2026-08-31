@@ -6,5 +6,8 @@ license = "MIT OR Apache-2.0"
 description = "Link-time composition manifest for Orrery rulesets"
 
 [dependencies]
+# D43 clause (g): the schedule digest is blake3, like every other digest the
+# verifiable core commits to.
+blake3 = "1.8"
 orrery_core = { path = "../orrery_core" }
 orrery_protocol = { path = "../orrery_protocol" }
