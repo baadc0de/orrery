@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use orrery_core::{
-    evaluate, tick_rng, CoreCodec, Executor, InvariantKind, InvariantSample, QPos, QVel, TICK_HZ,
+    assert_section_is_exact, evaluate, tick_rng, CoreCodec, Executor, InvariantKind,
+    InvariantSample, QPos, QVel, TickBackend, TICK_HZ,
 };
 use orrery_games::game::Game;
 use orrery_games::regolith::{
@@ -15,8 +16,9 @@ use orrery_games::regolith::{
     pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
     projectile_flight_ticks,
     state::{
-        BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
-        PITCH_LIMIT_URAD, TRAIL_CAPACITY, TRAIL_MAX_ENCODED_BYTES, TRAIL_SAMPLE_TICKS,
+        BloomDirector, BloomDirectorSection, BloomMembership, Craft, CraftSection, LockClass,
+        Pickup, PickupSection, RegolithState, Rock, RockSection, RockTier, PITCH_LIMIT_URAD,
+        TRAIL_CAPACITY, TRAIL_MAX_ENCODED_BYTES, TRAIL_SAMPLE_TICKS,
     },
     weapon::{WeaponKind, MAX_WEAPON_REACH_MM},
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
@@ -3028,4 +3030,173 @@ fn pickup_state_and_grammar_are_canonical() {
         Outcome::decode(&bloom_outcome.to_canonical()).unwrap(),
         bloom_outcome
     );
+}
+
+// ── the sections as types (#791) ────────────────────────────────────────────
+//
+// `Sectioned` (#789) told a decomposing host which component to file a value
+// in. It could not change what any consumer was *handed*, because a
+// `StateSection` is a string and a string cannot appear in a signature — so
+// every consumer kept matching over all four sections, including the arms that
+// existed only to yield a value the caller discarded. `Section` is the same
+// four sections named as types, and these are the tests that hold it to the one
+// property the whole thing rests on: a section hands out its own state and
+// nothing else.
+
+/// One value of every section, so the exactness law is tested in both
+/// directions rather than only where it is convenient.
+fn one_of_every_section() -> [RegolithState; 4] {
+    [
+        RegolithState::Craft(craft_at(0)),
+        RegolithState::Rock(Rock::spawned(
+            RockTier::Small,
+            0,
+            QPos::default(),
+            QVel::default(),
+        )),
+        RegolithState::Pickup(Pickup::spawned(
+            QPos::default(),
+            WeaponKind::Stock,
+            PICKUP_TTL_TICKS,
+        )),
+        RegolithState::BloomDirector(BloomDirector::spawned()),
+    ]
+}
+
+#[test]
+fn section_projection_is_exact_for_every_section() {
+    // The `Some` half alone proves nothing: a projection that answered `Some`
+    // for every value would pass it and would silently widen every check
+    // written against it. `assert_section_is_exact` compares against
+    // `Sectioned::section`, and this runs all four markers over all four
+    // values, so the sixteen-cell cross product is covered rather than the
+    // four cells on the diagonal.
+    for state in &one_of_every_section() {
+        assert_section_is_exact::<CraftSection>(state);
+        assert_section_is_exact::<RockSection>(state);
+        assert_section_is_exact::<PickupSection>(state);
+        assert_section_is_exact::<BloomDirectorSection>(state);
+    }
+}
+
+#[test]
+fn the_section_accessor_hands_out_one_section_and_refuses_the_others() {
+    // `TickBackend::section_state` is the seam #791 widened. What makes it
+    // worth having is not that it can narrow, but that it *refuses*: an entity
+    // filed under one section must read as absent through every other, or a
+    // check written for crafts would start seeing rocks.
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x79; 32]));
+    let craft = PersistId::new(1);
+    let rock = PersistId::new(2);
+    let pickup = PersistId::new(3);
+    let director = PersistId::new(4);
+
+    executor.insert(craft, RegolithState::Craft(craft_at(0)));
+    executor.insert(
+        rock,
+        RegolithState::Rock(Rock::spawned(
+            RockTier::Small,
+            0,
+            QPos::default(),
+            QVel::default(),
+        )),
+    );
+    executor.insert(
+        pickup,
+        RegolithState::Pickup(Pickup::spawned(
+            QPos::default(),
+            WeaponKind::Stock,
+            PICKUP_TTL_TICKS,
+        )),
+    );
+    executor.insert(
+        director,
+        RegolithState::BloomDirector(BloomDirector::spawned()),
+    );
+
+    assert!(
+        TickBackend::<Regolith>::section_state::<CraftSection>(&executor, craft).is_some(),
+        "the craft reads through its own section",
+    );
+    assert!(
+        TickBackend::<Regolith>::section_state::<CraftSection>(&executor, rock).is_none(),
+        "a rock must not read as a craft",
+    );
+    assert!(
+        TickBackend::<Regolith>::section_state::<CraftSection>(&executor, pickup).is_none(),
+        "a pickup must not read as a craft",
+    );
+    assert!(
+        TickBackend::<Regolith>::section_state::<CraftSection>(&executor, director).is_none(),
+        "a bloom director must not read as a craft",
+    );
+    assert!(
+        TickBackend::<Regolith>::section_state::<RockSection>(&executor, rock).is_some(),
+        "the rock reads through its own section",
+    );
+    assert!(
+        TickBackend::<Regolith>::section_state::<RockSection>(&executor, craft).is_none(),
+        "a craft must not read as a rock",
+    );
+
+    // Absent is absent in every section, not just the one that would have held
+    // it. A section accessor that answered for an uninstalled entity would be
+    // inventing a population.
+    let never_installed = PersistId::new(99);
+    assert!(
+        TickBackend::<Regolith>::section_state::<CraftSection>(&executor, never_installed)
+            .is_none()
+    );
+    assert!(
+        TickBackend::<Regolith>::section_state::<RockSection>(&executor, never_installed).is_none()
+    );
+}
+
+#[test]
+fn a_section_lifted_check_runs_on_its_own_section_and_passes_every_other() {
+    // The behavioural half of the win. `regolith/speed-cap` is registered once
+    // per moving section, so it must still catch an impossible speed in both —
+    // and the sections that used to reach the two zero-yielding arms must now
+    // reach no check at all rather than a comparison against zero.
+    let mut fast_craft = craft_at(0);
+    fast_craft.vel = QVel {
+        x: 10_000_000,
+        y: 0,
+        z: 0,
+    };
+    let fast_craft = RegolithState::Craft(fast_craft);
+    assert_eq!(
+        evaluate(INVARIANTS, &sample(None, &fast_craft))
+            .expect_err("an impossible craft speed is still caught")
+            .kind,
+        InvariantKind::SpeedCap,
+    );
+
+    let fast_rock = RegolithState::Rock(Rock::spawned(
+        RockTier::Small,
+        0,
+        QPos::default(),
+        QVel {
+            x: 10_000_000,
+            y: 0,
+            z: 0,
+        },
+    ));
+    assert_eq!(
+        evaluate(INVARIANTS, &sample(None, &fast_rock))
+            .expect_err("an impossible rock speed is still caught")
+            .kind,
+        InvariantKind::SpeedCap,
+    );
+
+    // A pickup and a director are legal, and reach neither instantiation of
+    // the speed cap: there is no `SpeedLimited` impl for either, so there is
+    // nowhere left to write the zero the old comparison discarded.
+    for state in &one_of_every_section()[2..] {
+        assert_eq!(
+            evaluate(INVARIANTS, &sample(None, state)),
+            Ok(()),
+            "a motionless section passes every lifted check",
+        );
+    }
 }

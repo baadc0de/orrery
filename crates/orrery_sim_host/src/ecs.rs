@@ -26,9 +26,18 @@
 //! **What this does not buy, stated plainly.** [`TickBackend::state`] returns
 //! `&R::CoreState`, so the migrated component holds the whole state enum and
 //! not the narrower `Rock`/`Pickup`/`BloomDirector` its section names. The
-//! decomposition separates *storage*, not types. Narrowing the payload would
-//! need the seam's contract to change, and that is not a thing S7.4 is allowed
-//! to do.
+//! decomposition separates *storage*, not types.
+//!
+//! #791 raised half of that ceiling and left the other half standing, so the
+//! sentence above is still true and it is worth being exact about which half
+//! is which. [`TickBackend::section_state`] now narrows on the way *out*: a
+//! caller that wants a craft asks for [`orrery_core::Section`] and is handed a
+//! `&Craft`, and the four-arm match that used to open every consumer is gone.
+//! What has **not** changed is the payload stored here. [`MigratedSection`]
+//! still holds the sum, so this backend's `section_state` is the provided
+//! default — it narrows a sum it already had, and buys nothing over the
+//! `Executor`. Storing `Rock` in the component instead is the next step and is
+//! where a storage win would come from; it is not taken here.
 //!
 //! # Why this is legal where the previous attempt was not
 //!
@@ -130,8 +139,10 @@ struct Identity(PersistId);
 /// different `bevy_ecs` component, which is the whole of the decomposition:
 /// the migrated module's entities live in their own archetype, and a query for
 /// them visits no other entity's memory and needs no discriminant test. The
-/// *payload* is still the whole `R::CoreState` and cannot be narrowed here —
-/// see the module note on `TickBackend::state`.
+/// *payload* is still the whole `R::CoreState`. Since #791 a **caller** can
+/// narrow — [`TickBackend::section_state`] hands out one section's own type —
+/// but the stored bytes here are still the sum, and this backend therefore
+/// takes that method's provided default. See the module note.
 #[derive(Component, Debug, Clone)]
 struct MigratedSection<R: EcsHostable>(R::CoreState);
 

@@ -98,8 +98,9 @@ pub use quantize::{QPos, QVel, Quantized};
 pub use replay::{verify_bundle, verify_bundle_on, ReplayError, ReplayHarness, ReplayTrace};
 pub use rng::{tick_rng, tick_seed, TickRng};
 pub use ruleset::{
-    state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, EntityMaterialization,
-    OrderedInputs, Ruleset, Sectioned, StateSection, StateView, StepOutput,
+    assert_section_is_exact, state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec,
+    EntityMaterialization, OrderedInputs, Ruleset, Section, Sectioned, StateSection, StateView,
+    StepOutput,
 };
 pub use sched::{
     run_schedule, run_system, run_system_as, Observation, Schedule, Scheduled, Stage, StageName,

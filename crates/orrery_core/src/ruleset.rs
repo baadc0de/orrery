@@ -510,3 +510,80 @@ pub trait Sectioned {
         Self::MIGRATED_SECTIONS.contains(&self.section())
     }
 }
+
+/// One declared section of a `CoreState`, named as a **type** rather than as a
+/// value — and the narrowing that gets at the state it actually carries.
+///
+/// # Why this exists alongside [`Sectioned`]
+///
+/// [`Sectioned`] says, of a *value*, which section it occupies. That is what a
+/// decomposing host needs to pick a component to store it in, and #745's S7.4
+/// migration used it for exactly that. What it cannot do is change any
+/// consumer's *type*: a host that files a craft in the craft component still
+/// hands its caller the whole `CoreState` sum, because `StateSection` is a
+/// string and a string cannot appear in a signature.
+///
+/// So the decomposition separated storage and left types alone, and every
+/// consumer downstream still opens with a match over every section — including
+/// the arms that exist only to yield a value the caller discards. This trait is
+/// the missing half: it lifts a section from a value into the type system, so a
+/// consumer that only ever wanted craft can *say* craft and be handed
+/// [`Self::State`].
+///
+/// # The implementor is a marker, not the state
+///
+/// `Self` is a zero-sized marker (`CraftSection`), and [`Self::State`] is the
+/// payload (`Craft`). They are kept apart deliberately: several sections of one
+/// game can share a payload type, and a payload type has no business carrying
+/// the name of the section it happens to be filed under.
+///
+/// # The law
+///
+/// [`Self::project`] must return `Some` for exactly those values whose
+/// [`Sectioned::section`] is [`Self::SECTION`], and `None` for every other —
+/// no wider, no narrower. A projection that answered `Some` for a neighbouring
+/// section would silently widen every check written against it, which is the
+/// one failure this trait exists to make impossible. `assert_section_is_exact`
+/// holds an implementation to it against a value it is given.
+pub trait Section {
+    /// The whole-state sum this is one section of.
+    type Root;
+
+    /// What a value in this section actually carries.
+    type State;
+
+    /// The declared name of this section — the same constant [`Sectioned`]
+    /// returns for a value that occupies it.
+    const SECTION: StateSection;
+
+    /// Narrow a whole-state reference to this section, or `None` when the
+    /// value occupies a different one.
+    fn project(root: &Self::Root) -> Option<&Self::State>;
+}
+
+/// Hold one [`Section`] implementation to its law against one value.
+///
+/// Call it from a game's tests with at least one value of every section: the
+/// law is a per-value property, so a test that only ever passes crafts to
+/// `CraftSection` proves the `Some` half and nothing about the `None` half.
+///
+/// # Panics
+///
+/// When [`Section::project`] disagrees with [`Sectioned::section`] about
+/// whether `value` belongs to `S`.
+pub fn assert_section_is_exact<S>(value: &S::Root)
+where
+    S: Section,
+    S::Root: Sectioned,
+{
+    let declared = value.section() == S::SECTION;
+    let projected = S::project(value).is_some();
+    assert!(
+        declared == projected,
+        "{:?} declares section {:?} but {:?} projected {}",
+        core::any::type_name::<S::Root>(),
+        value.section(),
+        S::SECTION,
+        if projected { "Some" } else { "None" },
+    );
+}
