@@ -1,0 +1,18 @@
+[package]
+name = "orrery_ecs_facade"
+version = "0.1.0"
+edition = "2021"
+description = "Spike (#793): a curated re-export of bevy_ecs that game crates depend on under the name `bevy_ecs`, so that what a game can name is a written list rather than everything upstream happens to export"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+bevy_ecs = { workspace = true }
+orrery_protocol = { path = "../../crates/orrery_protocol" }
+
+# A dev-dependency cycle, which cargo permits: `facade_game` depends on this
+# crate, and this crate's tests depend on `facade_game`. That is deliberate.
+# The systems under test must be written in a crate that *cannot* name
+# `bevy_ecs`, and the world they run in must be built by a crate that can.
+[dev-dependencies]
+facade_game = { path = "../facade_game" }

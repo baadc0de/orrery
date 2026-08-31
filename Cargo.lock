@@ -3888,6 +3888,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "facade_game"
+version = "0.1.0"
+dependencies = [
+ "orrery_ecs_facade",
+ "orrery_protocol",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7965,6 +7973,15 @@ dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
  "serde",
+]
+
+[[package]]
+name = "orrery_ecs_facade"
+version = "0.1.0"
+dependencies = [
+ "bevy_ecs",
+ "facade_game",
+ "orrery_protocol",
 ]
 
 [[package]]

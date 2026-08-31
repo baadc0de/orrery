@@ -1,0 +1,25 @@
+[package]
+name = "facade_game"
+version = "0.1.0"
+edition = "2021"
+description = "Spike (#793): a stand-in game crate that depends on the facade and cannot name bevy_ecs, proving the extern-prelude boundary and that the derives still resolve"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The load-bearing line of the whole spike. `package` is the real crate; the
+# key is the name this crate sees in its extern prelude. Two things follow:
+#
+#   1. `bevy_ecs::…` in this crate resolves to the facade, not to upstream.
+#      Upstream is a transitive dependency, and Rust 2018+ does not put a
+#      transitive dependency in the extern prelude — so there is no path from
+#      here to anything the facade did not re-export. A visibility boundary,
+#      not a lint.
+#   2. `bevy_ecs_macros` resolves its emitted crate path by reading *this*
+#      manifest (`bevy_macro_utils::BevyManifest::maybe_get_path`, which keys
+#      on the dependency table's key and not on the package name), so it finds
+#      `bevy_ecs`, emits `bevy_ecs::component::Component`, and that resolves
+#      to the facade too. The derives follow the facade because the key says
+#      they must.
+[dependencies]
+bevy_ecs = { package = "orrery_ecs_facade", path = "../orrery_ecs_facade" }
+orrery_protocol = { path = "../../crates/orrery_protocol" }

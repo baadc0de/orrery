@@ -26,6 +26,14 @@ members = [
     "crates/orrery_sim_host",
     # The facade sits on top of the spine: it depends on every client plugin.
     "crates/orrery",
+    # Spike (#793), propose-only. Two throwaway crates whose only job is to be
+    # compiled: `orrery_ecs_facade` curates `bevy_ecs`, and `facade_game`
+    # declares it under the key `bevy_ecs` and so cannot name upstream at all.
+    # Members rather than a standalone workspace on purpose — a directory
+    # declaring its own `[workspace]` and absent from `check.sh`'s lane table
+    # fails `check.sh --self-test`, and a spike may not edit that table.
+    "spikes/orrery_ecs_facade",
+    "spikes/facade_game",
 ]
 
 # The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /
