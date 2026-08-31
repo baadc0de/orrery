@@ -103,6 +103,25 @@ const GOLDEN_ANGLE_URAD: i64 = 2_399_963;
 /// change** — the committed golden chains are only meaningful against fixed
 /// rules, and a silent rules change would present as a determinism failure
 /// rather than as what it is.
+///
+/// # Why #758's snapshot isolation did *not* bump this
+///
+/// Regolith went v19 → v20 when neighbour reads moved to the tick-start
+/// snapshot. Skirmish stayed at 2, and the reason is structural rather than
+/// evidential: `Skirmish` declares `Ruleset::max_neighbor_reads() == 0` — it
+/// does not override the default — and its `step` contains no
+/// `StateView::neighbor` call at any depth. There is no input under which a
+/// pre-#758 and a post-#758 Skirmish build reach the changed code, so no pair
+/// of peers either side of it can disagree about any tick.
+///
+/// That is a different claim from "no golden moved", which is all the corpus
+/// could have told us. A ruleset version is a claim about *these rules*, and
+/// bumping it for an engine change no rule can observe would make the version
+/// track the executor instead — after which every core refactor would owe a
+/// bump on every game, and a real mismatch would be one more number in a
+/// stream of them. `skirmish.rs`'s `skirmish_declares_no_neighbour_reads`
+/// holds the premise, so the day Skirmish grows a neighbour read the decision
+/// is revisited rather than inherited.
 pub const SKIRMISH_RULESET: RulesetId = RulesetId {
     version: 2,
     digest: [0x5C; 32],

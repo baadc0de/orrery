@@ -35,7 +35,7 @@
 //! being made, and it is a structural one: there is no expression in this file
 //! that can compute a hash.
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap};
 use std::marker::PhantomData;
 
 use bevy_ecs::prelude::{
@@ -141,13 +141,18 @@ struct StepSlot {
     entity: Entity,
 }
 
-/// The live neighbour view, maintained across the advance stage.
+/// The tick-start neighbour snapshot, filled by `seal` and read-only after it.
 ///
 /// This is the substrate's least comfortable object and the honest place to
 /// say why it exists: `StateView` — frozen, and rightly so — reads neighbours
 /// out of a `&BTreeMap<PersistId, S>`. An ECS that stores state in components
 /// therefore has to reconstitute the very map it replaced before it can call a
 /// rule. See the crate report for what that costs a rules author.
+///
+/// Since #758 the advance stage never writes to it. That is the whole of the
+/// backend's half of snapshot isolation, and it is also what took the *second*
+/// copy off this path: a stepped entity's new state is now written straight
+/// into its component and mirrored nowhere.
 #[derive(Resource)]
 struct Neighborhood<R: EcsHostable> {
     states: BTreeMap<PersistId, R::CoreState>,
@@ -171,43 +176,60 @@ struct Materialized<R: EcsHostable> {
 /// Stage 1 — `host.seal-population`.
 ///
 /// Fixes the population and snapshots every entity's canonical state and
-/// observation tick. Archetype iteration order is not `PersistId` order, so
-/// the population is sorted here: the order entities step in is canonical
-/// (a neighbour read at tick T sees whatever an earlier-stepped neighbour
-/// wrote at T), and leaving it to the archetype layout would be exactly the
-/// unordered-iteration hazard VC-4 exists for.
+/// observation tick — including the state of each entity that is about to
+/// step, because *other* entities must go on reading its tick-start value all
+/// tick. Archetype iteration order is not `PersistId` order, so the population
+/// is sorted here: the order entities step in is still canonical — it decides
+/// event collection, materialization first-writer-wins and the order results
+/// are reported in — and leaving it to the archetype layout would be exactly
+/// the unordered-iteration hazard VC-4 exists for.
 fn seal_population<R: EcsHostable>(
     population: Query<(Entity, &Identity, &Canonical<R>, &ObservedAt)>,
     mut plan: ResMut<TickPlan<R>>,
     mut neighborhood: ResMut<Neighborhood<R>>,
 ) {
     let mut order = Vec::new();
-    neighborhood.states.clear();
-    neighborhood.observed.clear();
+    let neighborhood = neighborhood.as_mut();
     for (entity, identity, canonical, observed) in &population {
         order.push(StepSlot {
             persist: identity.0,
             entity,
         });
-        neighborhood.states.insert(identity.0, canonical.0.clone());
+        // Overwritten in place, not cleared and rebuilt: the population is the
+        // same set on almost every tick, so the view keeps its nodes and each
+        // row keeps its own buffer. Entities that left are dropped below,
+        // against the order that was just sealed.
+        match neighborhood.states.entry(identity.0) {
+            btree_map::Entry::Occupied(mut held) => held.get_mut().clone_from(&canonical.0),
+            btree_map::Entry::Vacant(slot) => {
+                slot.insert(canonical.0.clone());
+            }
+        }
         neighborhood.observed.insert(identity.0, observed.0);
     }
     order.sort_by_key(|slot| slot.persist);
+    let held = |entity: &PersistId| {
+        order
+            .binary_search_by_key(entity, |slot| slot.persist)
+            .is_ok()
+    };
+    neighborhood.states.retain(|entity, _| held(entity));
+    neighborhood.observed.retain(|entity, _| held(entity));
     plan.order = order;
 }
 
 /// Stage 2 — `host.advance-population`.
 ///
-/// Runs the canonical stage for each sealed entity, in order, writing the
-/// result back into its components. The neighbour view is kept live as it
-/// goes, because an entity stepped later in a tick can observe an
-/// earlier-stepped neighbour's new state — that is the executor's behaviour
-/// and therefore the canonical one.
+/// Runs the canonical stage for each sealed entity, in order, mutating its
+/// canonical component in place. The sealed neighbour view is **not** touched:
+/// every entity in the tick reads the state the world had when the tick began
+/// (D43 (b), #758), so what a rule observes does not depend on where in the
+/// tick it ran.
 fn advance_population<R: EcsHostable>(
     rules: Res<Rules<R>>,
     plan: Res<TickPlan<R>>,
     index: Res<Index>,
-    mut neighborhood: ResMut<Neighborhood<R>>,
+    neighborhood: Res<Neighborhood<R>>,
     mut results: ResMut<TickResults<R>>,
     mut states: Query<(&mut Canonical<R>, &mut ObservedAt)>,
 ) {
@@ -220,9 +242,11 @@ fn advance_population<R: EcsHostable>(
         if plan.only.is_some_and(|only| only != slot.persist) {
             continue;
         }
-        // Own state leaves the neighbour view for the duration of its own
-        // step, exactly as it leaves the executor's map.
-        let Some(mut own) = neighborhood.states.remove(&slot.persist) else {
+        // Own state is mutated in place in its component, and stays in the
+        // sealed view for everyone else to read at its tick-start value. It is
+        // hidden from *this* step by identity, inside `StateView`, not by
+        // taking the row out of a map that other steps also read.
+        let Ok((mut canonical, mut observed)) = states.get_mut(slot.entity) else {
             continue;
         };
         let CanonicalOutcome {
@@ -236,45 +260,45 @@ fn advance_population<R: EcsHostable>(
                 tick,
                 inputs: plan.inputs.for_entity(slot.persist),
             },
-            &mut own,
+            &mut canonical.0,
             NeighborSnapshot {
                 states: &neighborhood.states,
                 observed_ticks: &neighborhood.observed,
             },
         );
+        // The write has already happened, in the component; the stamp goes
+        // beside it rather than at the end of the tick, so a T+1 stamp is
+        // never paired with a pre-step state.
+        observed.0 = settled;
 
         // First writer wins, against the population and against anything an
-        // earlier entity in this same tick already materialized.
+        // earlier entity in this same tick already materialized. The pending
+        // spawns are the second half of that test now that the neighbour view
+        // is read-only: `Index` covers everything alive at the tick boundary,
+        // `results.spawned` covers everything claimed since.
         let mut installed = Vec::with_capacity(materializations.len());
         for description in materializations {
             if index.0.contains_key(&description.entity)
-                || neighborhood.states.contains_key(&description.entity)
+                || results
+                    .spawned
+                    .iter()
+                    .any(|pending| pending.entity == description.entity)
             {
                 continue;
             }
             let mut state = description.state;
             state.quantize();
-            neighborhood
-                .states
-                .insert(description.entity, state.clone());
-            neighborhood.observed.insert(description.entity, settled);
             installed.push(description.entity);
+            // Deliberately not added to the sealed view: an entity born
+            // during tick T had no state at the start of T, so no
+            // later-stepping entity can have observed one. It becomes a
+            // neighbour on T+1, the tick it starts stepping on.
             results.spawned.push(Materialized {
                 entity: description.entity,
                 state,
             });
         }
         outcome.materialized = installed;
-
-        // The component is the store of record: write the stepped state back
-        // to it, and mirror it into the live neighbour view.
-        let (mut canonical, mut observed) = states
-            .get_mut(slot.entity)
-            .expect("a sealed entity still holds its canonical components");
-        canonical.0 = own.clone();
-        observed.0 = settled;
-        neighborhood.states.insert(slot.persist, own);
-        neighborhood.observed.insert(slot.persist, settled);
 
         results.stepped.push(SteppedEntity {
             entity: slot.persist,

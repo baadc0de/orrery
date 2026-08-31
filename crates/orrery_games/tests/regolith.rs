@@ -471,8 +471,8 @@ fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
 }
 
 #[test]
-fn v19_pitch_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 19);
+fn v20_snapshot_isolation_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 20);
     assert_eq!(
         PITCH_LIMIT_URAD, 1_570_796,
         "a quarter turn either side of level, on the micro-radian lattice"
