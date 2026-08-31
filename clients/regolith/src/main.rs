@@ -25,6 +25,9 @@ Volunteer options:
   --admission-url <url>           Override the baked campaign-service origin
   --join <path>                   Join from an operator-provided join file
   --campaign-consent              Acknowledge campaign recording
+  --telemetry-jsonl <path>        Session record and join file location
+                                  (default: the per-user application data
+                                  directory; ORRERY_TELEMETRY_JSONL also sets it)
 
 Preflight and diagnostics:
   --headless-join <campaign>      Select, admit, and join a campaign without input
@@ -159,9 +162,14 @@ fn main() {
             return;
         }
     };
-    let telemetry_path = flag_value(&args, "--telemetry-jsonl")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/regolith-client/session.jsonl"));
+    // Flag, then environment, then the platform's per-user data directory --
+    // never a path relative to wherever the volunteer launched the binary
+    // (#766). The join artifact and the upload-retry state are written beside
+    // whatever this resolves to.
+    let telemetry_path = orrery_regolith_client::paths::resolve_telemetry_path(
+        &args,
+        std::env::var_os("ORRERY_TELEMETRY_JSONL"),
+    );
     retry_pending_uploads(&telemetry_path);
     let admission_url = resolve_admission_url(&args, std::env::var("ORRERY_ADMISSION_URL").ok());
 
@@ -482,9 +490,9 @@ fn run_smoke_test() {
         // schedule.
         .add_plugins(bevy::state::app::StatesPlugin)
         .add_plugins(OrreryPredictPlugin::default())
-        .add_plugins(RegolithSkinPlugin::new(PathBuf::from(
-            "target/regolith-client/smoke.jsonl",
-        )));
+        .add_plugins(RegolithSkinPlugin::new(
+            orrery_regolith_client::paths::default_smoke_path(),
+        ));
     app.finish();
 
     // Keep this assertion beside the command's success message: it makes a

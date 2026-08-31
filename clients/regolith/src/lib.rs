@@ -19,6 +19,7 @@ pub mod join;
 pub mod legend;
 pub mod lobby;
 pub mod net;
+pub mod paths;
 pub mod roster;
 pub mod session;
 pub mod starfield;
@@ -445,6 +446,20 @@ impl ActiveSession {
             Self::Campaign(runtime) => Some(runtime.state()),
         }
     }
+
+    /// How this session names the campaign it is in, for the scope banner.
+    ///
+    /// `None` for a run that never had a campaign to name. A dial that is
+    /// still in flight, refused or dropped does have one, and the banner
+    /// still refuses to print it: what a player is told rests on
+    /// [`SessionPresentation::session_scope`], never on the presence of a
+    /// configuration.
+    fn campaign_identity(&self) -> Option<String> {
+        match self {
+            Self::Local(_) => None,
+            Self::Campaign(runtime) => Some(runtime.config().campaign_label()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,17 +493,111 @@ impl SessionPresentation {
         }
     }
 
-    const fn label(self) -> &'static str {
+    /// Why this local-scope run is local, when there is more to say than
+    /// "it never tried".
+    ///
+    /// `None` for [`Self::Live`] as well, which has no reason to give: the
+    /// banner reads the scope first and only then asks for this.
+    const fn local_reason(self) -> Option<&'static str> {
         match self {
-            Self::Local => "LOCAL SANDBOX - NOT CONNECTED TO CAMPAIGN",
-            Self::Dialing => "LOCAL SANDBOX - CONNECTING TO CAMPAIGN...",
-            Self::Live => "CAMPAIGN LIVE",
-            Self::Failed => "LOCAL SANDBOX - CAMPAIGN DIAL FAILED",
-            Self::Refused => "LOCAL SANDBOX - CAMPAIGN JOIN REFUSED",
-            Self::Disconnected => "LOCAL SANDBOX - CAMPAIGN DISCONNECTED",
+            Self::Local | Self::Live => None,
+            Self::Dialing => Some("connecting"),
+            Self::Failed => Some("dial failed"),
+            Self::Refused => Some("join refused"),
+            Self::Disconnected => Some("disconnected"),
         }
     }
 }
+
+/// What a player who is not in a campaign is told, for the whole session.
+///
+/// A volunteer flew this client for 2¼ minutes believing she was in the
+/// playtest (#769). Every one of her 255 overlay rows said `session_scope:
+/// "local"`, `island_id: null`, `banked_minutes: 0.0` — the client knew. So
+/// the banner says the two things she would have needed: that this is not a
+/// campaign, and that nothing is being banked, which is the consequence she
+/// actually cared about.
+const LOCAL_PRACTICE_BANNER: &str =
+    "LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN - NOTHING IS BEING BANKED";
+
+/// Conditions the player must be told about for the whole session.
+///
+/// Not a toast. A volunteer who missed a message during load has been told
+/// nothing (#769), and the two conditions this carries — no recording, so no
+/// banking — change whether flying the next twenty minutes is worth doing at
+/// all. They ride the scope banner, which is on screen from the first frame
+/// to the last.
+#[derive(Debug, Default, Resource)]
+pub struct SessionNotices {
+    lines: Vec<String>,
+}
+
+impl SessionNotices {
+    /// Add a condition, once.
+    pub fn push(&mut self, line: String) {
+        if !self.lines.contains(&line) {
+            self.lines.push(line);
+        }
+    }
+
+    /// What the player is being told, beyond the scope line.
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+}
+
+/// What a player is told when nothing this session does can be written down.
+///
+/// One sentence covering both consequences, because they arrive together: the
+/// telemetry stream, the campaign banking record and the upload state all live
+/// in one directory (`paths`), so a directory the client cannot write is a
+/// session that records nothing and banks nothing (#772, #773). Saying only
+/// "telemetry unavailable" would leave the volunteer with exactly the wrong
+/// impression #769 is about — that her time still counted.
+const RECORDING_UNAVAILABLE_NOTICE: &str =
+    "SESSION NOT BEING RECORDED - NOTHING YOU FLY NOW WILL BE SAVED OR BANKED";
+
+/// The banner line for a presentation, and the campaign it names when live.
+///
+/// Derived from [`SessionPresentation::session_scope`] — the same value every
+/// telemetry row carries — so the two cannot disagree about what this session
+/// is. Campaign scope *identifies* the campaign rather than merely omitting
+/// the warning: a volunteer must be able to tell the two states apart
+/// positively, not by the absence of a line she never saw.
+fn session_banner_text(
+    presentation: SessionPresentation,
+    campaign: Option<&str>,
+    notices: &[String],
+) -> String {
+    let scope = match presentation.session_scope() {
+        SessionScope::Campaign => match campaign {
+            Some(identity) => format!("CAMPAIGN LIVE - {identity}"),
+            // The runtime always has one; this is the honest reading if it
+            // ever does not, and it still never says "local".
+            None => "CAMPAIGN LIVE".to_owned(),
+        },
+        SessionScope::Local => match presentation.local_reason() {
+            Some(reason) => format!("{LOCAL_PRACTICE_BANNER} ({reason})"),
+            None => LOCAL_PRACTICE_BANNER.to_owned(),
+        },
+    };
+    std::iter::once(scope)
+        .chain(notices.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Where the scope banner is drawn.
+///
+/// Above [`admission::JOIN_GATE_Z`] deliberately. The join gate is a
+/// full-screen panel, so at the old depth the one line that says whether this
+/// is a campaign was hidden for exactly the stretch a volunteer is deciding
+/// whether she is in one — including while a failed join keeps her there.
+const SESSION_BANNER_Z: i32 = admission::JOIN_GATE_Z + 1;
+
+/// Where the waiting room is drawn: under the scope banner, over the world.
+const LOBBY_PANEL_Z: i32 = admission::JOIN_GATE_Z - 1;
 
 /// Installs the thin skin after Bevy's [`DefaultPlugins`].
 pub struct RegolithSkinPlugin {
@@ -517,12 +626,20 @@ impl RegolithSkinPlugin {
 
 impl Plugin for RegolithSkinPlugin {
     fn build(&self, app: &mut App) {
-        let sink = JsonlTelemetry::open(&self.telemetry_path).unwrap_or_else(|error| {
-            panic!(
-                "cannot open Regolith telemetry {}: {error}",
-                self.telemetry_path.display()
-            )
-        });
+        // An unwritable telemetry path is degradable, and this runs during
+        // plugin registration, before any UI exists: panicking here killed the
+        // process before its first frame and left a volunteer a stack trace in
+        // a console she may not have (#772). The session plays; it just keeps
+        // nothing, and the banner says so for its whole duration.
+        let (sink, unavailable) = JsonlTelemetry::open_or_unavailable(&self.telemetry_path);
+        let mut notices = SessionNotices::default();
+        if let Some(detail) = unavailable {
+            // Before Bevy's log plugin is necessarily installed, so not `error!`.
+            eprintln!(
+                "regolith: cannot open telemetry {detail}; this session will not be recorded or banked"
+            );
+            notices.push(RECORDING_UNAVAILABLE_NOTICE.to_owned());
+        }
         let mut ship_roster = roster::ShipRoster::default();
         if let Some(config) = &self.campaign {
             ship_roster.set_own(roster::OwnLabelGrant {
@@ -558,6 +675,7 @@ impl Plugin for RegolithSkinPlugin {
             ));
         }
         app.insert_resource(OverlayMetrics::new(self.telemetry_path.clone()))
+            .insert_resource(notices)
             .insert_resource(sink)
             // The harness and the design run 60 Hz; Bevy's FixedUpdate
             // default is 64. A campaign tick that drifts from TICK_HZ would
@@ -725,6 +843,7 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     paths: Res<VisualAssetPaths>,
     session: Res<ActiveSession>,
+    notices: Res<SessionNotices>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -772,9 +891,13 @@ fn setup_scene(
             justify_content: JustifyContent::Center,
             ..Default::default()
         },
-        GlobalZIndex(100),
+        GlobalZIndex(SESSION_BANNER_Z),
         children![(
-            Text::new(presentation.label()),
+            Text::new(session_banner_text(
+                presentation,
+                session.campaign_identity().as_deref(),
+                notices.lines()
+            )),
             TextFont::from_font_size(14.0),
             TextColor(Color::WHITE),
             Node {
@@ -820,7 +943,7 @@ fn setup_scene(
             justify_content: JustifyContent::Center,
             ..Default::default()
         },
-        GlobalZIndex(99),
+        GlobalZIndex(LOBBY_PANEL_Z),
         children![(
             Text::new(""),
             TextFont::from_font_size(LOBBY_ROW_FONT_PX),
@@ -2414,11 +2537,16 @@ fn session_banner_color(presentation: SessionPresentation) -> Color {
 
 fn refresh_session_banner(
     session: Res<ActiveSession>,
+    notices: Res<SessionNotices>,
     mut banner: Query<(&mut Text, &mut BackgroundColor), With<SessionBanner>>,
 ) {
     let presentation = SessionPresentation::from_join_state(session.join_state());
     if let Ok((mut text, mut background)) = banner.single_mut() {
-        **text = presentation.label().to_owned();
+        **text = session_banner_text(
+            presentation,
+            session.campaign_identity().as_deref(),
+            notices.lines(),
+        );
         background.0 = session_banner_color(presentation);
     }
 }
@@ -2537,6 +2665,22 @@ fn stream_metrics(
     }
 }
 
+/// Where a finished attempt's banking record is appended.
+///
+/// Beside the telemetry stream, which is the single resolved location for
+/// everything this client writes (`paths`). It therefore inherits #766's move
+/// to the per-user application-data directory, inherits `--telemetry-jsonl`,
+/// and shares one writability condition with the stream and the upload state
+/// — which is what lets the client warn about all three at startup instead of
+/// discovering the record failure at exit, with no UI left to say so (#773).
+#[must_use]
+fn campaign_record_path(session_record_path: &Path) -> PathBuf {
+    session_record_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("campaign-records.jsonl")
+}
+
 /// Writes the finished banking row once, on app exit.
 ///
 /// The row is produced by the joined-session accumulator only; an offline
@@ -2555,11 +2699,13 @@ fn write_campaign_record_on_exit(
         let Some(record) = runtime.shutdown() else {
             return;
         };
-        let path: &Path = metrics.session_record_path.as_path();
-        let record_path = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("campaign-records.jsonl");
+        // Beside the telemetry stream, which since #766 resolves to the
+        // per-user application-data directory rather than to `target/` under
+        // whatever the volunteer's working directory happened to be. One
+        // directory for the stream, the banking record and the upload state
+        // is what makes `--telemetry-jsonl` a complete override, and what
+        // makes the startup writability check below cover all three (#773).
+        let record_path = campaign_record_path(&metrics.session_record_path);
         let write = || -> std::io::Result<()> {
             if let Some(parent) = record_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -2594,10 +2740,34 @@ fn write_campaign_record_on_exit(
                     );
                 }
             }
-            Err(error) => error!(
-                "cannot write campaign record {}: {error}; upload not attempted so local evidence remains authoritative",
-                record_path.display()
-            ),
+            // The skip stands, and #773 asked for the reasoning rather than
+            // a change. Uploading a record the client could not persist would
+            // leave the service holding evidence its author cannot
+            // corroborate, which is the property #711 and #735 were careful
+            // about; a record that exists in one place only, and that place
+            // the server, is not the volunteer's evidence.
+            //
+            // What was wrong was never the skip but the silence: this fires at
+            // `AppExit`, when no UI is left to say anything, so an `error!`
+            // here is by construction a message the player cannot act on. The
+            // condition that produces it — a directory the client cannot write
+            // — is now detected at plugin build and carried on the scope
+            // banner for the whole session (`RECORDING_UNAVAILABLE_NOTICE`),
+            // so the volunteer is told before she flies rather than after she
+            // has quit. Only a failure that appears *between* those two
+            // moments, a disk filling mid-session, still reaches the player as
+            // stderr alone.
+            Err(error) => {
+                error!(
+                    "cannot write campaign record {}: {error}; upload not attempted so local evidence remains authoritative",
+                    record_path.display()
+                );
+                eprintln!(
+                    "regolith: your campaign record could not be saved to {}: {error}. \
+                     The banked minutes from this attempt were not recorded.",
+                    record_path.display()
+                );
+            }
         }
         let _ = exit;
     }
@@ -3632,17 +3802,160 @@ mod tests {
     #[test]
     fn local_fallbacks_cannot_present_or_serialize_as_live_campaigns() {
         let local = SessionPresentation::from_join_state(None);
-        assert_eq!(local.label(), "LOCAL SANDBOX - NOT CONNECTED TO CAMPAIGN");
+        assert_eq!(local.local_reason(), None);
         assert_eq!(local.session_scope(), SessionScope::Local);
 
         let failed = JoinState::Failed("fixture dial failure".to_owned());
         let failed = SessionPresentation::from_join_state(Some(&failed));
-        assert_eq!(failed.label(), "LOCAL SANDBOX - CAMPAIGN DIAL FAILED");
+        assert_eq!(failed.local_reason(), Some("dial failed"));
         assert_eq!(failed.session_scope(), SessionScope::Local);
 
         let joined = SessionPresentation::from_join_state(Some(&JoinState::Joined));
-        assert_eq!(joined.label(), "CAMPAIGN LIVE");
+        assert_eq!(joined.local_reason(), None);
         assert_eq!(joined.session_scope(), SessionScope::Campaign);
+    }
+
+    /// #769. The volunteer's own record said `session_scope: "local"` on all
+    /// 255 of its overlay rows while she believed she was in the playtest.
+    /// The banner is the same fact, in the one place she was looking, for
+    /// every state that is not a live join — including a dial that failed
+    /// after admission had already named a campaign, which is precisely the
+    /// state she was in.
+    #[test]
+    fn a_session_that_never_joined_cannot_show_a_campaign_banner() {
+        let refused = JoinState::Refused("island full".to_owned());
+        let failed = JoinState::Failed("fixture dial failure".to_owned());
+        let closed = JoinState::Closed {
+            host_said_goodbye: true,
+        };
+        let not_joined = [
+            None,
+            Some(&JoinState::Dialing),
+            Some(&failed),
+            Some(&refused),
+            Some(&closed),
+        ];
+        for state in not_joined {
+            let presentation = SessionPresentation::from_join_state(state);
+            // The identity is deliberately supplied: a campaign the client
+            // was told about but never entered must not be presented as one
+            // it is in.
+            let banner = session_banner_text(presentation, Some("orrery-live-3"), &[]);
+            assert_eq!(
+                presentation.session_scope(),
+                SessionScope::Local,
+                "{presentation:?} banks nothing and its rows say local"
+            );
+            assert!(
+                banner.starts_with("LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN"),
+                "{presentation:?} shows {banner:?}, which does not tell a player she is out"
+            );
+            assert!(
+                banner.contains("NOTHING IS BEING BANKED"),
+                "{presentation:?} shows {banner:?}, which hides the consequence she cares about"
+            );
+            assert!(
+                !banner.contains("CAMPAIGN LIVE"),
+                "{presentation:?} shows {banner:?}, which reads as a live campaign"
+            );
+            assert!(
+                !banner.contains("orrery-live-3"),
+                "{presentation:?} shows {banner:?}, naming a campaign it never joined"
+            );
+        }
+    }
+
+    /// The positive half: campaign scope identifies the campaign rather than
+    /// merely omitting the warning.
+    #[test]
+    fn a_live_campaign_banner_names_the_campaign_it_is_in() {
+        let joined = SessionPresentation::from_join_state(Some(&JoinState::Joined));
+        assert_eq!(joined.session_scope(), SessionScope::Campaign);
+        let banner = session_banner_text(joined, Some("orrery-live-3"), &[]);
+        assert_eq!(banner, "CAMPAIGN LIVE - orrery-live-3");
+
+        // Where the identity comes from: the roster URL this session actually
+        // joined through, and otherwise the session it was granted.
+        assert_eq!(
+            admission::campaign_id_of_roster_url(
+                "https://campaigns.distopik.com/v1/campaigns/orrery-live-3/roster"
+            )
+            .as_deref(),
+            Some("orrery-live-3")
+        );
+        assert_eq!(
+            admission::campaign_id_of_roster_url("https://example/v1/x"),
+            None
+        );
+    }
+
+    /// #772/#773's half of the banner: the conditions ride the same line the
+    /// scope does, so a player reading one reads the other.
+    #[test]
+    fn the_banner_carries_every_session_notice_beside_the_scope_line() {
+        let local = SessionPresentation::from_join_state(None);
+        let quiet = session_banner_text(local, None, &[]);
+        assert_eq!(quiet, LOCAL_PRACTICE_BANNER);
+
+        let warned = session_banner_text(local, None, &[RECORDING_UNAVAILABLE_NOTICE.to_owned()]);
+        assert!(
+            warned.starts_with(LOCAL_PRACTICE_BANNER),
+            "{warned:?} lost the scope line"
+        );
+        assert!(
+            warned.contains(RECORDING_UNAVAILABLE_NOTICE),
+            "{warned:?} dropped the notice the player must read"
+        );
+        assert!(
+            RECORDING_UNAVAILABLE_NOTICE.contains("BANKED"),
+            "the notice must name the consequence, not just the mechanism"
+        );
+
+        // A live campaign is warned too: recording is orthogonal to scope, and
+        // an unrecorded campaign attempt is exactly the loss #773 describes.
+        let joined = SessionPresentation::from_join_state(Some(&JoinState::Joined));
+        let live = session_banner_text(
+            joined,
+            Some("orrery-live-3"),
+            &[RECORDING_UNAVAILABLE_NOTICE.to_owned()],
+        );
+        assert!(live.starts_with("CAMPAIGN LIVE - orrery-live-3"));
+        assert!(live.contains(RECORDING_UNAVAILABLE_NOTICE));
+    }
+
+    /// One directory for the stream, the banking record and the upload state:
+    /// the property that makes `--telemetry-jsonl` a complete override, and
+    /// that lets one startup check speak for all three (#766, #773).
+    #[test]
+    fn the_campaign_record_lives_beside_the_telemetry_stream() {
+        let telemetry = Path::new("/home/vol/.local/share/orrery/regolith/session.jsonl");
+        assert_eq!(
+            campaign_record_path(telemetry),
+            Path::new("/home/vol/.local/share/orrery/regolith/campaign-records.jsonl")
+        );
+        assert!(campaign_record_path(telemetry).is_absolute());
+    }
+
+    /// The banner has to survive the join gate, which is a full-screen panel:
+    /// a scope line drawn under it is absent for exactly the stretch in which
+    /// a volunteer decides whether she is in a campaign.
+    #[test]
+    fn the_scope_banner_is_drawn_above_the_full_screen_join_gate() {
+        let depths = [
+            ("the join gate", admission::JOIN_GATE_Z),
+            ("the waiting room", LOBBY_PANEL_Z),
+            ("the scope banner", SESSION_BANNER_Z),
+        ];
+        let (topmost, depth) = depths
+            .into_iter()
+            .max_by_key(|(_, depth)| *depth)
+            .expect("three declared depths");
+        assert_eq!(
+            (topmost, depth),
+            ("the scope banner", SESSION_BANNER_Z),
+            "{topmost} is drawn over the scope banner, so the one line saying whether \
+             this is a campaign can be covered while a player decides that it is"
+        );
     }
 
     /// #377's fix, restated for the models that replaced its `Cone`.

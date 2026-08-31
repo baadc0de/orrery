@@ -4,8 +4,63 @@ The first rendered Orrery target: a Bevy 0.19 skin over the headless Regolith
 rules and executor.
 
 ```sh
-cargo run -- --telemetry-jsonl target/regolith-client/session.jsonl
+cargo run
 ```
+
+## Where the client writes
+
+Everything this client writes -- the session telemetry stream, the join file a
+campaign join produces, and the upload-retry state -- lives in one per-user
+application data directory:
+
+| Platform | Location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\Orrery\Regolith\` (`%APPDATA%` if unset) |
+| Linux | `$XDG_DATA_HOME/orrery/regolith/`, else `~/.local/share/orrery/regolith/` |
+| macOS | `~/Library/Application Support/Orrery/Regolith/` |
+
+Not `target/`: that is Cargo's build directory, which a downloaded client does
+not have, and resolving it against the working directory meant a volunteer who
+launched from a read-only folder could not save her join file and so could not
+join at all (#766). `--telemetry-jsonl <path>` (or `ORRERY_TELEMETRY_JSONL`)
+overrides the location; the join file and upload state follow it, because one
+directory for all three is what makes the override a complete workaround.
+
+```sh
+cargo run -- --telemetry-jsonl /tmp/regolith/session.jsonl
+```
+
+## Are you in a campaign?
+
+A banner across the top of the screen says so for the whole session, drawn
+above the join gate so it is never the thing that is covered:
+
+- `CAMPAIGN LIVE - <campaign>` -- joined, banking, and named, so campaign scope
+  is recognised positively rather than by the absence of a warning.
+- `LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN - NOTHING IS BEING BANKED` --
+  every other state, with the reason in parentheses when there is one
+  (`connecting`, `dial failed`, `join refused`, `disconnected`).
+
+It is the same fact as `session_scope` on every telemetry envelope, computed
+from the same value, so the screen and the record cannot disagree (#769).
+
+The banner also carries any condition that changes what the session is worth.
+The one that exists today:
+
+    SESSION NOT BEING RECORDED - NOTHING YOU FLY NOW WILL BE SAVED OR BANKED
+
+which appears when the telemetry stream cannot be opened. That is a degradable
+condition -- a game that cannot record can still be played, and the client no
+longer dies during plugin registration when it happens (#772) -- but it is not
+a silent one: the stream, the campaign banking record and the upload state
+share one directory, so a directory the client cannot write is a session that
+banks nothing, and the volunteer is told that before she flies rather than by
+an `error!` after she has quit (#773).
+
+When a banking record cannot be written at exit the upload is still not
+attempted, deliberately: the service would otherwise hold evidence its author
+cannot corroborate. What changed is that the condition which causes it is now
+visible for the whole session instead of only in the log.
 
 Campaign entry is explicit. `--campaign` prints the recording notice and exits
 without joining until `--campaign-consent` is supplied. Campaign coordinators
