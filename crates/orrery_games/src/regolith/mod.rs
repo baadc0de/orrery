@@ -105,9 +105,8 @@ use orrery_compose::{
     ScheduleStageManifest, StateSectionId, SystemId, WitnessCapability, WriteAuthorityCapability,
 };
 use orrery_core::{
-    ComponentTypeId, CoreClass, EntityMaterialization, Invariant, Observation, OrderedInputs, QPos,
-    QVel, Ruleset, Schedule, Scheduled, Stage, StageName, StateView, StepCtx, StepOutput, System,
-    TickRng, TICK_HZ,
+    EntityMaterialization, Invariant, Observation, OrderedInputs, QPos, QVel, Ruleset, Schedule,
+    Scheduled, Stage, StageName, StateView, StepCtx, StepOutput, System, TickRng, TICK_HZ,
 };
 use orrery_protocol::{PersistId, RulesetId, Tick};
 use rand_core::RngCore;
@@ -606,13 +605,6 @@ impl Ruleset for Regolith {
     }
     fn max_neighbor_staleness_ticks(&self) -> u64 {
         MAX_NEIGHBOR_STALENESS_TICKS
-    }
-    fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
-        if component == components::STATE {
-            CoreClass::Core
-        } else {
-            CoreClass::Cosmetic
-        }
     }
     fn invariants(&self) -> &[Invariant<RegolithState>] {
         invariants::INVARIANTS
@@ -1553,6 +1545,7 @@ impl Game for Regolith {
         summary: "planar combat, deterministic bloom density and logged scoring",
         ruleset: REGOLITH_RULESET,
     };
+    const COMPOSITION: CompatibilityManifest = REGOLITH_COMPOSITION;
     const GOLDEN_CHAINS: &'static [(&'static str, [u8; 32])] = &crate::golden::REGOLITH;
     fn honest() -> Self {
         Self::honest()

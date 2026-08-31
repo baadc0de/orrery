@@ -249,7 +249,7 @@ here.
 > | Item | State |
 > |---|---|
 > | the differential parity harness beyond goldens | **met** — all four A10 §4.1 classes, generalised across substrates |
-> | A5's component-policy registry | **partial** — declaration data plane live; IV-7's engine-handle refusal, the `classify_component` restatement and the persistd linkage remain open |
+> | A5's component-policy registry | **partial** — declaration data plane live and now the single source (`classify_component` retired, #761); IV-7's engine-handle refusal and the persistd linkage remain open |
 > | A4's Tier-H gate bundle (T3) | **not met** — see the open question below |
 > | capacity-scale mirror-cost numbers | **not met, and partly overtaken** — the admitted backend does not mirror into an application world, so A3's two-world-hop question is not the one now in front of us |
 >

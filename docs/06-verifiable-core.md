@@ -7,7 +7,7 @@ Normative source: [ADR-0009](adr/0009-verifiable-core.md) (context: [D10](adr/00
 > **Implementation status (2026-08-15).** `orrery_core` exists and is
 > Bevy-free, with wire types in `orrery_protocol::verifiable`. Landed: the
 > `Ruleset` contract (`CoreState`/`CoreInput`/`CoreEvent`, `step`,
-> `classify_component`, `invariants`), the fixed 60 Hz executor with its
+> `invariants`), the fixed 60 Hz executor with its
 > VC-1/VC-3/VC-7 guarantees, `StateView` neighbour-read recording, the
 > quantization lattice, the tolerance-band comparator, the hash-chained input
 > log with per-frame signatures and claim chaining, the stage-1 invariant
@@ -57,7 +57,15 @@ This inverts the lockstep failure economics: instead of bit-perfection being a l
 
 ## 2. What belongs in the core
 
-`Ruleset::classify_component` (§3) makes this machine-checked, not aspirational. The classification also drives persistence write classes (§D11) and witness attention (§D10).
+Each build's `orrery_compose::CompatibilityManifest::component_schemas` table makes this machine-checked, not aspirational: it declares, per `(ComponentTypeId, SchemaVersion)`, [D45](adr/0045-per-component-capability-policy.md)'s five independent capability dimensions — persistence, rollback membership, witnessing, replication, write authority — and the class names below are *derived* from those five (`orrery_compose::profile_of`). The declaration also drives persistence write classes (§D11) and witness attention (§D10).
+
+> **`classify_component` is retired (#761).** The trait method that used to
+> state this table was replaced, not merely unwired: one three-valued enum
+> cannot carry five independent dimensions, and a build that stated the class
+> in a method *and* in its manifest held two sources of one truth, kept in
+> step by review, in the place where a disagreement is a
+> persistence-classification error. The manifest is the single source; the
+> table below is vocabulary derived from it (D45 clause (g), A5 §6.2).
 
 | Class | Contents | Constraints | Examples |
 |---|---|---|---|
@@ -175,10 +183,6 @@ pub trait Ruleset: Send + Sync + 'static {
         rng: &mut RngFactory,
     ) -> CatchUpReport;
 
-    /// Core | Bulk | Cosmetic for every registered replicated component (§2).
-    /// Consulted by replication setup, the persistence uplink, and witnesses.
-    fn classify_component(&self, component: ComponentTypeId) -> CoreClass;
-
     /// The stateless invariant validators (§D10 stage 1): speed/acceleration
     /// caps, teleport detection, fire/action rate limits, value-range checks.
     /// Run by every interested peer on received authoritative state
@@ -188,7 +192,11 @@ pub trait Ruleset: Send + Sync + 'static {
     fn invariants(&self) -> &[InvariantValidator];
 }
 
-pub enum CoreClass { Core, Bulk, Cosmetic }
+// Classification is not on this trait. It is declared as data in the build's
+// composition manifest, one row per (ComponentTypeId, SchemaVersion), and read
+// by replication setup, the persistence uplink and witnesses without linking a
+// `Ruleset`. `CoreClass` survives only as the derived name of a profile.
+pub enum CoreClass { Core, Bulk, Cosmetic } // derived, never authored
 
 pub struct StepOutput<E> {
     /// Quantized field writes recorded by the view (the wire/journal delta).
@@ -207,7 +215,7 @@ Commentary on the load-bearing choices:
 - **`TickRng`** is a `rand_chacha::ChaCha8Rng` seeded per entity per tick (§4, rule VC-3). `step` cannot construct any other RNG.
 - **`validate_intent` is deliberately stateless and cheap** — it is the shared vocabulary between prediction, witnessing, and the gateway. The *authoritative* trade/loot mutation still only happens inside the cluster's FDB transaction; `validate_intent` is the precondition everyone can agree on.
 - **`park_tick`/`catch_up`** exist because §D7 parks orphaned entities cluster-side and §D15 assigns parked-cell catch-up to field hosts. They obey the same determinism rules (seeded RNG per tick), so offline progression is as auditable as live play.
-- **`classify_component`** is the single source of truth for §2's table; `orrery_persist_client` uses it to route bulk diffs vs. intents, `orrery_witness` uses it to decide what to watch.
+- **The manifest's `component_schemas` table** is the single source of truth for §2's table. It is *data at composition time* rather than a method, which is what lets the at-rest reader and the compatibility manifest read a component's policy without linking a `Ruleset` — and it is bound to a reviewed permanent ledger (`orrery_compose::registry`) by a two-direction named test per game, so a row cannot name an allocation nobody reviewed or drop one that was. Its one consumer in the tree today is the F-4 D-3 persistence collector (`orrery_games::diff`), which reads the `P` dimension to decide which components write an at-rest slot. `orrery_persist_client` (routing bulk diffs vs. intents on `P`) and `orrery_witness` (deciding what to watch on `W`) are the intended consumers and read neither today — the previous wording here said `classify_component` was used by both, which D45 disproved by census: the method had **zero** call sites when it was retired.
 - **`invariants()`** supplies the stage-1 witness checks. Every interested peer runs them on received state regardless of witness-set membership, and cell actors run them on inbound bulk diffs — mandatory in cells with fewer than N witness candidates, sampled elsewhere (§D11). They are the only validation most bulk-class state ever gets, which is why they live on the `Ruleset` rather than in `orrery_witness`.
 
 > **Implementation status of the neighbour-read path.** The closure landed for

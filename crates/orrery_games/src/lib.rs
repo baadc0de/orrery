@@ -71,7 +71,10 @@ pub mod regolith;
 pub mod scenario;
 pub mod skirmish;
 
+// Re-exported so anyone implementing [`Game`] can name the type its
+// `COMPOSITION` const takes without depending on `orrery_compose` directly.
 pub use game::{for_each_game, Game, GameMeta, GameVisitor, Tamper, CATALOGUE};
+pub use orrery_compose::CompatibilityManifest;
 pub use regolith::Regolith;
 pub use scenario::{
     adjudicate, adjudicate_isolated, play, Divergence, Flag, Play, Scenario, SCENARIOS,

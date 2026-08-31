@@ -21,10 +21,7 @@
 
 use orrery_core::quantize::{QPos, QVel, Quantized};
 use orrery_core::rng::TickRng;
-use orrery_core::ruleset::{
-    CodecError, ComponentTypeId, CoreClass, CoreCodec, OrderedInputs, Ruleset, StateView,
-    StepOutput,
-};
+use orrery_core::ruleset::{CodecError, CoreCodec, OrderedInputs, Ruleset, StateView, StepOutput};
 use orrery_protocol::{PersistId, RulesetId};
 use rand_core::RngCore;
 
@@ -237,10 +234,6 @@ impl Ruleset for Reference {
 
     fn id(&self) -> RulesetId {
         REFERENCE_RULESET
-    }
-
-    fn classify_component(&self, _component: ComponentTypeId) -> CoreClass {
-        CoreClass::Core
     }
 
     fn step(

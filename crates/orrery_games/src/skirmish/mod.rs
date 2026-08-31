@@ -49,9 +49,15 @@ pub mod order;
 pub mod pilot;
 pub mod state;
 
+use orrery_compose::{
+    AmbiguityDetection, CanonicalSchedule, CompatibilityManifest, ComponentCapabilities,
+    ComponentSchemaId, ComponentSchemaManifest, EventVocabularyId, ExecutorPolicy, GameId,
+    InputVocabularyId, ManifestFormatVersion, ModuleId, ModuleManifest, ModuleVersion,
+    PersistenceCapability, ProfileId, ProjectionVersion, ReplicationCapability, RollbackCapability,
+    StateSectionId, WitnessCapability, WriteAuthorityCapability,
+};
 use orrery_core::{
-    ComponentTypeId, CoreClass, Invariant, OrderedInputs, QPos, QVel, Ruleset, StateView,
-    StepOutput, TickRng, TICK_HZ,
+    Invariant, OrderedInputs, QPos, QVel, Ruleset, StateView, StepOutput, TickRng, TICK_HZ,
 };
 use orrery_protocol::{PersistId, RulesetId, Tick};
 use rand_core::RngCore;
@@ -102,36 +108,174 @@ pub const SKIRMISH_RULESET: RulesetId = RulesetId {
     digest: [0x5C; 32],
 };
 
-/// Component identifiers, for the §2 classification.
+/// Component identifiers, for the §2 classification, aliased from the
+/// reviewed ledger.
 ///
-/// # Why these are not in `orrery_compose::registry` (#750)
+/// # Why these moved into `orrery_compose::registry` (#761)
 ///
-/// #750 populated Regolith's manifest schema table from its reviewed registry
-/// ledger and asked that Skirmish get the same treatment or an explicit note.
-/// This is the note, and the reason is that there is nothing here to give the
-/// same treatment to: **Skirmish has no [`orrery_compose::CompatibilityManifest`]
-/// at all** — no module table, no canonical schedule, no `profile_id` — so it
-/// has no `component_schemas` field to populate, and no reviewed allocation
-/// table for one to agree with. The ids below are declared inline and consumed
-/// only by [`Skirmish::classify_component`].
+/// #750 left these declared inline with an explicit note: Skirmish had no
+/// [`orrery_compose::CompatibilityManifest`], so there was no
+/// `component_schemas` field to populate and no reviewed allocation table for
+/// one to agree with, and the ids were consumed only by
+/// `Skirmish::classify_component`.
 ///
-/// Giving Skirmish a manifest is a composition-root change carrying the module
-/// split, the schedule topology and the determinism-profile claim with it. It
-/// is not a schema-table fix, so it is deliberately not smuggled into one; when
-/// Skirmish gets a manifest, these three ids become a reviewed registry table
-/// and the manifest states them with D45 capabilities, exactly as Regolith's
-/// does.
+/// #761 retired that method. With it gone, Skirmish's three classification
+/// facts have to be **declarations** or they cease to exist, so the note's
+/// deferred work is now the work: the ids live in
+/// [`orrery_compose::registry::skirmish`], and [`SKIRMISH_COMPOSITION`] states
+/// them with their owning module and D45's five capability dimensions. The
+/// values are unchanged — this is a move of where a fact is stated, not of
+/// what it is.
 pub mod components {
     use orrery_core::ComponentTypeId;
 
     /// The craft's verifiable state: position, velocity, hull, shield, counters.
-    pub const CRAFT: ComponentTypeId = ComponentTypeId(1);
+    pub const CRAFT: ComponentTypeId = orrery_compose::registry::skirmish::CRAFT;
     /// Cumulative hull scarring — persisted so a ship looks fought-in across
     /// sessions, never adjudicated.
-    pub const HULL_WEAR: ComponentTypeId = ComponentTypeId(2);
+    pub const HULL_WEAR: ComponentTypeId = orrery_compose::registry::skirmish::HULL_WEAR;
     /// Engine trail. Never persisted, never verified.
-    pub const ENGINE_TRAIL: ComponentTypeId = ComponentTypeId(3);
+    pub const ENGINE_TRAIL: ComponentTypeId = orrery_compose::registry::skirmish::ENGINE_TRAIL;
 }
+
+/// Skirmish's one statically linked rule domain.
+///
+/// One module, and the honesty of that is the reason Skirmish could be given a
+/// manifest inside #761 rather than waiting for a composition-root lane: there
+/// is no module split to get wrong. [`Ruleset::CoreState`] is a single
+/// [`Craft`], every order and outcome in [`order`] concerns it, and
+/// [`Ruleset::step`] is the sole executor entry point here exactly as it is
+/// for Regolith.
+pub const SKIRMISH_MODULES: &[ModuleManifest] = &[ModuleManifest {
+    id: ModuleId("skirmish.craft"),
+    version: ModuleVersion(1),
+    dependencies: &[],
+    state_sections: &[StateSectionId("craft")],
+    inputs: &[InputVocabularyId("craft-control-and-damage")],
+    events: &[EventVocabularyId("craft-damage-and-destruction")],
+    schedule_stages: &[],
+}];
+
+/// Skirmish's component-schema table, stated from the reviewed ledger.
+///
+/// The derived half of the split #750 settled and #761 extended to this game:
+/// [`orrery_compose::registry::skirmish`] is canonical for D45 clause (a)'s
+/// `(ComponentTypeId, SchemaVersion)` pair, and this table restates that pair
+/// with the two things a ledger does not carry — the owning module and the
+/// five capability dimensions. The agreement is asserted, not assumed; see
+/// [`composition_tests::the_manifest_schema_table_agrees_with_the_reviewed_registry`].
+///
+/// **These three rows are exactly the three classification facts the retired
+/// `classify_component` stated**, restated as ADR-0045 clause (d) profiles:
+///
+/// - `CRAFT` is the `Core` profile — `P1` bulk persistence, `R1` rollback
+///   membership, `W2` replay-adjudicated, `N1` interest-replicated, `A1`
+///   lease-holder. Legal under every clause (e) prohibition that reaches it:
+///   `W2` has its single fenced writer (IV-1) and its deterministic
+///   [`orrery_core::CoreCodec`] (IV-2); `P1` is not the `P2` IV-3 and IV-5
+///   constrain; the craft is a durable [`orrery_protocol::PersistId`], not an
+///   ephemeral identity (IV-4); and `N1` is not paired with `A0` (IV-6).
+/// - `HULL_WEAR` is the `Bulk` profile — persisted so a ship looks fought-in
+///   across sessions, invariant-checked only, never replay-adjudicated.
+/// - `ENGINE_TRAIL` is the `Cosmetic-local` profile, all zeros: the row is
+///   inert-but-legal by clause (e)'s own note, and it is declared rather than
+///   omitted so the ledger records that the id is permanently spent.
+pub const SKIRMISH_COMPONENT_SCHEMAS: &[ComponentSchemaManifest] = &[
+    ComponentSchemaManifest {
+        owner: ModuleId("skirmish.craft"),
+        id: ComponentSchemaId {
+            component: components::CRAFT,
+            version: orrery_protocol::atrest::SCHEMA_V0,
+        },
+        capabilities: ComponentCapabilities {
+            persistence: PersistenceCapability::Bulk,
+            rollback: RollbackCapability::Included,
+            witness: WitnessCapability::ReplayAdjudicated,
+            replication: ReplicationCapability::InterestReplicated,
+            write_authority: WriteAuthorityCapability::LeaseHolder,
+        },
+    },
+    ComponentSchemaManifest {
+        owner: ModuleId("skirmish.craft"),
+        id: ComponentSchemaId {
+            component: components::HULL_WEAR,
+            version: orrery_protocol::atrest::SCHEMA_V0,
+        },
+        capabilities: ComponentCapabilities {
+            persistence: PersistenceCapability::Bulk,
+            rollback: RollbackCapability::Excluded,
+            witness: WitnessCapability::InvariantChecked,
+            replication: ReplicationCapability::InterestReplicated,
+            write_authority: WriteAuthorityCapability::LeaseHolder,
+        },
+    },
+    ComponentSchemaManifest {
+        owner: ModuleId("skirmish.craft"),
+        id: ComponentSchemaId {
+            component: components::ENGINE_TRAIL,
+            version: orrery_protocol::atrest::SCHEMA_V0,
+        },
+        capabilities: ComponentCapabilities {
+            persistence: PersistenceCapability::None,
+            rollback: RollbackCapability::Excluded,
+            witness: WitnessCapability::Unwatched,
+            replication: ReplicationCapability::None,
+            write_authority: WriteAuthorityCapability::Local,
+        },
+    },
+];
+
+/// The assembled, validated-at-registration composition manifest for Skirmish.
+///
+/// # Why this landed with #761 rather than in a lane of its own
+///
+/// #750's note deferred this because a manifest "carries the module split, the
+/// schedule topology and the determinism-profile claim with it". That is still
+/// true, and each of the three is answered here rather than waved past:
+///
+/// - **Module split** — [`SKIRMISH_MODULES`], one module. Skirmish is a single
+///   `Craft` state with one order and one outcome vocabulary; there is no
+///   split to get wrong.
+/// - **Schedule topology** — empty stages, and the one rider that is genuinely
+///   deferred rather than answered. Empty is not a placeholder: it is the
+///   accurate statement that this build declares no stage decomposition, which
+///   is true — [`Ruleset::step`] here is one undivided body, unlike Regolith's
+///   since #745/#764. [`orrery_compose::validate`] holds the table to
+///   [`AmbiguityDetection::Error`] and a single-threaded executor either way,
+///   so nothing is claimed that is not run. Decomposing Skirmish into declared
+///   systems with a pinned digest is D43 clause (g) work of the same shape
+///   #764 did for Regolith, and it is its own lane; it does not block, and is
+///   not blocked by, stating where this game's components are classified.
+/// - **Profile claim** — [`ProfileId`]`("d9")`, the same D9 verifiable-core
+///   envelope Skirmish has always run inside as a [`Ruleset`]: quantized
+///   state, a hand-written [`orrery_core::CoreCodec`], no ambient inputs, and
+///   `core-gates.sh` scanning this crate for exactly that.
+///
+/// What it buys is the reason it could not wait: with `classify_component`
+/// retired, a schema table with no manifest around it would be a declaration
+/// [`orrery_compose::validate`] never sees and no module table ever owns —
+/// weaker than the method it replaces. Nothing hashes or admits on a manifest
+/// today, so stating one moves no canonical byte.
+pub const SKIRMISH_COMPOSITION: CompatibilityManifest = CompatibilityManifest {
+    game_id: GameId("skirmish"),
+    manifest_format_version: ManifestFormatVersion(1),
+    protocol_version: 6,
+    toolchain_stamp: "rust-2024",
+    ruleset: SKIRMISH_RULESET,
+    modules: SKIRMISH_MODULES,
+    component_schemas: SKIRMISH_COMPONENT_SCHEMAS,
+    schedule: CanonicalSchedule {
+        stages: &[],
+        ordering_edges: &[],
+        ambiguities: &[],
+        ambiguity_detection: AmbiguityDetection::Error,
+        executor_policy: ExecutorPolicy::SingleThreaded,
+    },
+    canonical_constants: &[],
+    projection_version: ProjectionVersion(1),
+    profile_id: ProfileId("d9"),
+    removed_components: &[],
+};
 
 /// The Skirmish rules.
 ///
@@ -199,17 +343,6 @@ impl Ruleset for Skirmish {
 
     fn id(&self) -> RulesetId {
         SKIRMISH_RULESET
-    }
-
-    fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
-        match component {
-            components::CRAFT => CoreClass::Core,
-            components::HULL_WEAR => CoreClass::Bulk,
-            // Everything unnamed included: an unclassified component is
-            // cosmetic, so forgetting to classify costs persistence rather
-            // than silently admitting something to adjudication.
-            _ => CoreClass::Cosmetic,
-        }
     }
 
     fn invariants(&self) -> &[Invariant<Craft>] {
@@ -401,6 +534,8 @@ impl Game for Skirmish {
         ruleset: SKIRMISH_RULESET,
     };
 
+    const COMPOSITION: CompatibilityManifest = SKIRMISH_COMPOSITION;
+
     const GOLDEN_CHAINS: &'static [(&'static str, [u8; 32])] = &crate::golden::SKIRMISH;
 
     fn honest() -> Self {
@@ -465,5 +600,74 @@ impl Game for Skirmish {
 
     fn trajectory(state: &Craft) -> (QPos, QVel) {
         (state.pos, state.vel)
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::{SKIRMISH_COMPONENT_SCHEMAS, SKIRMISH_COMPOSITION};
+    use orrery_compose::registry::skirmish::COMPONENT_TYPE_IDS;
+    use orrery_compose::{profile_of, CapabilityProfile};
+    use orrery_core::CoreClass;
+
+    #[test]
+    fn the_composition_manifest_validates() {
+        assert_eq!(orrery_compose::validate(&SKIRMISH_COMPOSITION), Ok(()));
+    }
+
+    /// The two-direction guard #754 built for Regolith, for Skirmish.
+    ///
+    /// Without it, `SKIRMISH_COMPOSITION.component_schemas` could name a
+    /// component or a schema version the reviewed ledger never allocated, or
+    /// silently drop one it did — and since #761 that table is the only place
+    /// Skirmish states classification at all.
+    #[test]
+    fn the_manifest_schema_table_agrees_with_the_reviewed_registry() {
+        let reviewed: Vec<_> = COMPONENT_TYPE_IDS
+            .iter()
+            .map(|entry| (entry.id, entry.schema_version))
+            .collect();
+        let manifest: Vec<_> = SKIRMISH_COMPONENT_SCHEMAS
+            .iter()
+            .map(|schema| (schema.id.component, schema.id.version))
+            .collect();
+        assert_eq!(
+            manifest, reviewed,
+            "SKIRMISH_COMPOSITION.component_schemas must state exactly the \
+             reviewed (ComponentTypeId, SchemaVersion) rows in \
+             orrery_compose::registry::skirmish::COMPONENT_TYPE_IDS"
+        );
+    }
+
+    /// Every declared row names one of ADR-0045 clause (d)'s profiles, and the
+    /// three names are the three the retired `classify_component` returned.
+    ///
+    /// The tripwire A5 §6.2 asks for: a typo'd dimension lands on no profile
+    /// and fails here by name rather than quietly re-filing a component.
+    #[test]
+    fn every_declared_row_names_a_known_profile() {
+        let derived: Vec<Option<CoreClass>> = SKIRMISH_COMPONENT_SCHEMAS
+            .iter()
+            .map(|schema| {
+                profile_of(schema.capabilities).unwrap_or_else(|| {
+                    panic!(
+                        "component {:?} declares a capability combination \
+                             ADR-0045 clause (d) does not name",
+                        schema.id.component
+                    )
+                })
+            })
+            .map(CapabilityProfile::core_class)
+            .collect();
+        assert_eq!(
+            derived,
+            vec![
+                Some(CoreClass::Core),
+                Some(CoreClass::Bulk),
+                Some(CoreClass::Cosmetic),
+            ],
+            "CRAFT, HULL_WEAR and ENGINE_TRAIL must still derive the classes \
+             the retired classify_component stated for them"
+        );
     }
 }

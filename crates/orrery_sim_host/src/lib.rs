@@ -440,9 +440,7 @@ fn append_record(bytes: &mut Vec<u8>, entity: u64, payload: &[u8]) -> Result<(),
 mod tests {
     use bevy_app::{App, Update};
     use bevy_ecs::prelude::{ResMut, Resource};
-    use orrery_core::{
-        CodecError, CoreClass, OrderedInputs, Quantized, StateView, StepOutput, TickRng,
-    };
+    use orrery_core::{CodecError, OrderedInputs, Quantized, StateView, StepOutput, TickRng};
     use orrery_games::game::Game;
     use orrery_games::regolith::order::Order;
     use orrery_games::Regolith;
@@ -632,10 +630,6 @@ mod tests {
                 version: 1,
                 digest: [0xA5; 32],
             }
-        }
-
-        fn classify_component(&self, _component: orrery_core::ComponentTypeId) -> CoreClass {
-            CoreClass::Core
         }
 
         fn step(

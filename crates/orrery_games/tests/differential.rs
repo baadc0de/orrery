@@ -29,11 +29,11 @@
 //! [`REGOLITH_COMPOSITION`](orrery_games::regolith::REGOLITH_COMPOSITION) —
 //! except where a test declares a bump, which is how a migration comparison
 //! is declared. Regolith is the subject because it is the game whose
-//! composition manifest carries the projection and schema axes; Skirmish has
-//! no manifest yet (see `orrery_games::skirmish::components` for why it is
-//! left that way).
+//! composition manifest carries the corpus these comparators are framed on;
+//! Skirmish has a manifest too since #761, but no scenario corpus or golden
+//! chains for the differential to replay against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use orrery_core::{state_hash, CodecError, ComponentTypeId, CoreCodec, Quantized, Ruleset};
 use orrery_games::diff::{
@@ -56,18 +56,66 @@ use orrery_protocol::{UniverseSeed, Verdict as AdjudicatedVerdict};
 /// populated now, and the manifest is the harness's source for the schema
 /// axis, as A10 §4.3 says it should be — the registry remains the reviewed
 /// ledger the manifest is checked against, but the harness no longer needs to
-/// know that. `Regolith::classify_component` returns `CoreClass::Core` for
-/// this row, so D-3 frames a real slot per entity-tick and the class is not
-/// vacuous.
+/// know that. The row declares `P1` bulk persistence, so D-3 frames a real
+/// slot per entity-tick and the classification is not vacuous — and since
+/// #761 that declaration is the *only* statement of it, `classify_component`
+/// having been retired.
 const DECLARED_COMPONENT: ComponentTypeId = REGOLITH_COMPOSITION.component_schemas[0].id.component;
 
-/// A second declared component, classified `Cosmetic` by Regolith and so
-/// never persisted, held only so the schema-**membership** arm has a row it
+/// A second component named in the schema axis but **undeclared** by the
+/// manifest, and so never persisted (D45 clause (c): no declaration, no
+/// capability), held only so the schema-**membership** arm has a row it
 /// can remove without taking the game's whole at-rest artifact with it.
 /// Removing the persisted row instead would refuse on the missing D-3
 /// artifact before the axes were ever compared, which is a different
 /// refusal answering a different question.
 const UNPERSISTED_COMPONENT: ComponentTypeId = ComponentTypeId(0x5353_1001);
+
+/// D-3's at-rest slot set is exactly what the manifest declares persisted.
+///
+/// The named guard for #761's unified stage: **classification reaches D-3 from
+/// the declaration and from nowhere else.** Before #761 the collector asked
+/// `Regolith::classify_component`, and the manifest's capability table said
+/// the same thing a second time; the two were kept in step by review, in the
+/// one place a disagreement is a persistence-classification error that D-3
+/// cannot catch because D-3 is what consumes it.
+///
+/// There is now no second statement, so the two *cannot* be made to disagree.
+/// What is still expressible — and what this test kills — is the declaration
+/// itself being wrong: flip `REGOLITH_COMPONENT_SCHEMAS`'s one row to `P0`
+/// and the game persists nothing, which this test names rather than letting
+/// the harness read an absent D-3 artifact as a differently-shaped refusal.
+#[test]
+fn d3_persists_exactly_the_components_the_manifest_declares_persisted() {
+    let declared: BTreeSet<ComponentTypeId> = REGOLITH_COMPOSITION
+        .component_schemas
+        .iter()
+        .filter(|schema| schema.capabilities.is_persisted())
+        .map(|schema| schema.id.component)
+        .collect();
+    assert!(
+        !declared.is_empty(),
+        "REGOLITH_COMPOSITION must declare at least one persisted component: \
+         it is the single source D-3 reads, and a game declaring none produces \
+         no D-3 artifact at all"
+    );
+
+    let (legacy, _candidate) = honest_pair("solo");
+    let d3 = legacy
+        .d3
+        .expect("a manifest declaring a persisted component must produce a D-3 artifact");
+    let observed: BTreeSet<ComponentTypeId> = d3.slots.keys().map(|slot| slot.component).collect();
+    assert_eq!(
+        observed, declared,
+        "D-3 must write a slot for exactly the components \
+         REGOLITH_COMPOSITION.component_schemas declares persisted"
+    );
+    assert!(
+        !observed.contains(&UNPERSISTED_COMPONENT),
+        "a component the schema axis names but the manifest does not declare \
+         has no capabilities, so it must write no at-rest slot"
+    );
+}
 
 fn regolith_axes() -> VersionAxes {
     let mut schema_versions: BTreeMap<ComponentTypeId, SchemaVersion> = REGOLITH_COMPOSITION
