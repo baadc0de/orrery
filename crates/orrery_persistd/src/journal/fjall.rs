@@ -11,8 +11,9 @@
 //! payload crc (in [`JournalRecord::crc`]); replay re-verifies it.
 //!
 //! The "segment" is a logical unit inside the LSN (a segment seq advances when
-//! cumulative bytes cross [`JournalConfig::segment_size`]); it is **not** a raw
-//! 128 MiB file. D19 retains this implementation as an explicit fallback while
+//! cumulative bytes cross the journal's segment stride,
+//! [`DEFAULT_SEGMENT_SIZE`](crate::journal::DEFAULT_SEGMENT_SIZE)); it is
+//! **not** a raw 128 MiB file. D19 retains this implementation as an explicit fallback while
 //! selecting the indexed wal-db-backed `journal-raw` implementation by default.
 
 #[cfg(feature = "chain-grpc")]
@@ -219,6 +220,28 @@ impl Journal {
     /// Open (or reopen) a journal in `cfg.dir`, starting a group-commit
     /// committer task.
     pub fn open(config: &JournalConfig) -> Result<Self, JournalError> {
+        Self::open_with_segment_size(config, crate::journal::DEFAULT_SEGMENT_SIZE)
+    }
+
+    /// [`Journal::open`] with an explicit logical segment stride.
+    ///
+    /// Parity with the raw backend's constructor of the same name, so a caller
+    /// that needs a narrow segment — the archive tests, which would otherwise
+    /// have to write 128 MiB to seal one — compiles under either backend. `0`
+    /// is read as the default rather than as a segment that can hold nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Journal::open`].
+    pub fn open_with_segment_size(
+        config: &JournalConfig,
+        segment_size: u64,
+    ) -> Result<Self, JournalError> {
+        let segment_size = if segment_size == 0 {
+            crate::journal::DEFAULT_SEGMENT_SIZE
+        } else {
+            segment_size
+        };
         let opened_at = std::time::Instant::now();
         let db = Database::builder(&config.dir)
             .manual_journal_persist(true)
@@ -297,7 +320,7 @@ impl Journal {
             records: Deferred(Some(records)),
             originated_records: Deferred(Some(originated_records)),
             cursor: std::sync::Mutex::new(next_lsn),
-            segment_size: 128 * 1024 * 1024,
+            segment_size,
             committer,
             closed: std::sync::atomic::AtomicBool::new(false),
             metrics,
@@ -458,8 +481,11 @@ impl Journal {
     /// The byte span a segment covers before the cursor rolls to the next one.
     ///
     /// An [`Lsn`] is a `(segment, offset)` pair, so any byte distance that
-    /// crosses a segment boundary needs this stride to be expressible at all.
-    pub(crate) fn segment_size(&self) -> u64 {
+    /// crosses a segment boundary needs this stride to be expressible at all —
+    /// which is what [`Journal::archive_gap`] turns a segment count into bytes
+    /// with on the raw backend.
+    #[must_use]
+    pub fn segment_size(&self) -> u64 {
         self.segment_size
     }
 
@@ -508,6 +534,23 @@ impl Journal {
     /// [`Journal::register_archive`].
     #[allow(clippy::unused_self)]
     pub fn note_archive_watermark(&self, _watermark: Lsn) {}
+
+    /// The archive claim's state. Always
+    /// [`ArchiveClaimState::Unregistered`](crate::journal::ArchiveClaimState::Unregistered):
+    /// this backend releases nothing, so it is never bounded by an archive and
+    /// must never report a claim that would make the scheduler alarm about a
+    /// journal it was never going to shrink (D20 rule 9).
+    #[allow(clippy::unused_self)]
+    pub fn archive_claim(&self) -> crate::journal::ArchiveClaimState {
+        crate::journal::ArchiveClaimState::Unregistered
+    }
+
+    /// How far the archive is behind a proposed floor. Always `None`; see
+    /// [`Journal::archive_claim`].
+    #[allow(clippy::unused_self)]
+    pub fn archive_gap(&self, _proposed: Lsn) -> Option<crate::journal::JournalArchiveGap> {
+        None
+    }
 
     /// Record a mirrored chain's primary retention floor (D23). A no-op: this
     /// backend releases nothing, so nothing is bounded by it.
@@ -1251,13 +1294,18 @@ fn decode_pair(key: &[u8], value: &[u8]) -> Result<StoredRecord, JournalError> {
         msg: "unparseable key in scan".into(),
     })?;
     // Unversioned bytes bootstrap to encoding v0 rather than being refused
-    // (D38 (d)(1)); acting on the version is W2's, not this reader's.
-    let (record, _encoding) =
+    // (D38 (d)(1)); the version travels out on the `StoredRecord` so the
+    // archive's `encoding_version` column records what was on disk.
+    let (record, encoding) =
         JournalRecord::decode_frame(value).map_err(|e| JournalError::Corrupt {
             lsn,
             msg: format!("decode: {e}"),
         })?;
-    Ok(StoredRecord { lsn, record })
+    Ok(StoredRecord {
+        lsn,
+        record,
+        encoding,
+    })
 }
 
 #[cfg(test)]

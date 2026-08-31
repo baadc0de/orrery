@@ -26,6 +26,7 @@
 
 pub mod actor;
 pub mod adjudication;
+pub mod archive;
 pub mod audit;
 pub mod census;
 pub mod checkpoint;
