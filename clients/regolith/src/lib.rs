@@ -4307,6 +4307,7 @@ mod tests {
         }
         let play = Play {
             chain: [0; 32],
+            mutation_check_missing_field: (),
             // #630 added the outcome chain and the sealed inputs to `Play`.
             // This fixture exercises the adjudicator over a hand-built log, so
             // it asserts nothing about either: an empty seal and a zero chain
