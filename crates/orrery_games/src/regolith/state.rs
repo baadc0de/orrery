@@ -1,6 +1,6 @@
 //! Hashed, own-state traces for Regolith entities.
 
-use orrery_core::{CodecError, CoreCodec, QPos, QVel, Quantized, Sectioned, StateSection};
+use orrery_core::{CodecError, CoreCodec, QPos, QVel, Quantized, Section, Sectioned, StateSection};
 
 use super::{archetype::Archetype, weapon::WeaponKind};
 
@@ -483,6 +483,86 @@ impl Sectioned for RegolithState {
             Self::Rock(_) => SECTION_ROCK,
             Self::Pickup(_) => SECTION_PICKUP,
             Self::BloomDirector(_) => SECTION_BLOOM_DIRECTOR,
+        }
+    }
+}
+
+// ── the sections as types (#791) ────────────────────────────────────────
+//
+// `Sectioned` above says, of a value, which section it occupies; that is what
+// lets a decomposing host file it in its own component. It cannot appear in a
+// signature, so it changed nothing about what consumers are handed. These four
+// markers are the same four sections named as types, so a check that is about
+// crafts can say `Craft` and stop matching. See `orrery_core::Section`.
+//
+// Each is zero-sized and carries no state of its own. `assert_section_is_exact`
+// holds every one of them to the law against every section's values in
+// `section_projection_is_exact_for_every_section`.
+
+/// The `regolith.craft` module's section, as a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CraftSection;
+
+/// The `regolith.world` module's rock section, as a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RockSection;
+
+/// The `regolith.world` module's pickup section, as a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PickupSection;
+
+/// The `regolith.world` module's bloom-director section, as a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomDirectorSection;
+
+impl Section for CraftSection {
+    type Root = RegolithState;
+    type State = Craft;
+    const SECTION: StateSection = SECTION_CRAFT;
+
+    fn project(root: &Self::Root) -> Option<&Self::State> {
+        match root {
+            RegolithState::Craft(craft) => Some(craft),
+            _ => None,
+        }
+    }
+}
+
+impl Section for RockSection {
+    type Root = RegolithState;
+    type State = Rock;
+    const SECTION: StateSection = SECTION_ROCK;
+
+    fn project(root: &Self::Root) -> Option<&Self::State> {
+        match root {
+            RegolithState::Rock(rock) => Some(rock),
+            _ => None,
+        }
+    }
+}
+
+impl Section for PickupSection {
+    type Root = RegolithState;
+    type State = Pickup;
+    const SECTION: StateSection = SECTION_PICKUP;
+
+    fn project(root: &Self::Root) -> Option<&Self::State> {
+        match root {
+            RegolithState::Pickup(pickup) => Some(pickup),
+            _ => None,
+        }
+    }
+}
+
+impl Section for BloomDirectorSection {
+    type Root = RegolithState;
+    type State = BloomDirector;
+    const SECTION: StateSection = SECTION_BLOOM_DIRECTOR;
+
+    fn project(root: &Self::Root) -> Option<&Self::State> {
+        match root {
+            RegolithState::BloomDirector(director) => Some(director),
+            _ => None,
         }
     }
 }

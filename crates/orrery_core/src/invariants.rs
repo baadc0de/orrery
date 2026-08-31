@@ -16,6 +16,7 @@
 use orrery_protocol::{PersistId, Tick};
 
 use crate::quantize::{QPos, QVel};
+use crate::ruleset::Section;
 
 /// What a stage-1 check found.
 ///
@@ -79,6 +80,93 @@ pub struct InvariantSample<'a, S> {
     /// under loss the gap widens — so every rate-derived check must divide by
     /// this rather than assume adjacency.
     pub elapsed_ticks: u32,
+}
+
+impl<'a, S> InvariantSample<'a, S> {
+    /// Narrow this sample to one declared section, or `None` when the entity
+    /// does not occupy it.
+    ///
+    /// This is the whole mechanism behind [`section_invariant!`]: it turns a
+    /// check that would have opened with a match over every section into a
+    /// check whose *signature* names the one section it is about.
+    ///
+    /// # `previous` narrows independently, and that is deliberate
+    ///
+    /// `current` decides whether there is a sample at all — a value in another
+    /// section yields `None` and the check never runs. `previous` is narrowed
+    /// separately, so an entity whose *previous* sample was in a different
+    /// section arrives with `previous: None`.
+    ///
+    /// That is not a hole. It is what the whole-state form already did: a
+    /// pair-matching check like `acceleration_cap` opened with
+    /// `(Some(Craft(_)), Craft(_)) else { return Ok(()) }`, so a
+    /// rock-then-craft pair passed there too. What makes it safe in both forms
+    /// is that changing section between two samples is *itself* a violation,
+    /// caught by the discriminant arm of `regolith/value-range` — which stays
+    /// a whole-state check precisely because it is the one that asks about the
+    /// pair rather than about a section.
+    #[must_use]
+    pub fn project<Sec>(&self) -> Option<InvariantSample<'a, Sec::State>>
+    where
+        Sec: Section<Root = S>,
+    {
+        Some(InvariantSample {
+            entity: self.entity,
+            current: Sec::project(self.current)?,
+            tick: self.tick,
+            previous: self.previous.and_then(Sec::project),
+            elapsed_ticks: self.elapsed_ticks,
+        })
+    }
+}
+
+/// Register a per-section check as a whole-state [`Invariant`].
+///
+/// The check is written against [`Section::State`] — the payload of one
+/// section — and this lifts it to the `Invariant<CoreState>` that
+/// [`Ruleset::invariants`](crate::Ruleset::invariants) publishes. An entity in
+/// any other section passes without the check running, which is exactly what
+/// the discarding arms of a hand-written match did, written once here instead
+/// of once per check.
+///
+/// The lift is a plain `fn` item, so the result is still a function pointer and
+/// still const-constructible: an `INVARIANTS` slice keeps being a `const`.
+///
+/// ```ignore
+/// pub const INVARIANTS: &[Invariant<RegolithState>] = &[
+///     section_invariant!("regolith/speed-cap", CraftSection, speed_cap::<Craft>),
+///     section_invariant!("regolith/acceleration-cap", CraftSection, acceleration_cap),
+/// ];
+/// ```
+///
+/// Passing a check written for a *different* section is a type error at the
+/// macro's expansion site, not a test failure: the `check` local is annotated
+/// with the section's own `State`, so `CraftSection` will not accept a check
+/// over `Rock`.
+#[macro_export]
+macro_rules! section_invariant {
+    ($name:expr, $section:ty, $check:expr $(,)?) => {
+        $crate::Invariant {
+            name: $name,
+            check: {
+                fn lifted(
+                    sample: &$crate::InvariantSample<'_, <$section as $crate::Section>::Root>,
+                ) -> ::core::result::Result<(), $crate::InvariantViolation> {
+                    // Annotated rather than inferred: this is the line that
+                    // refuses a check written against another section.
+                    let check: fn(
+                        &$crate::InvariantSample<'_, <$section as $crate::Section>::State>,
+                    )
+                        -> ::core::result::Result<(), $crate::InvariantViolation> = $check;
+                    match sample.project::<$section>() {
+                        ::core::option::Option::Some(narrowed) => check(&narrowed),
+                        ::core::option::Option::None => ::core::result::Result::Ok(()),
+                    }
+                }
+                lifted
+            },
+        }
+    };
 }
 
 /// One registered stateless check.

@@ -1,56 +1,89 @@
 //! Integer stage-1 checks for Regolith's craft and rock tables.
 use super::{
-    state::{RegolithState, PITCH_LIMIT_URAD, TAU_URAD},
+    state::{Craft, CraftSection, RegolithState, Rock, RockSection, PITCH_LIMIT_URAD, TAU_URAD},
     weapon::WeaponKind,
     BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_MAX_LIVE_ROCKS, DRAG_PER_SEC_PER_MILLE,
     ISLAND_CRAFT_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, LOCK_ACQUISITION_TICKS,
     RESPAWN_TICKS,
 };
 use orrery_core::invariants::checks;
-use orrery_core::{Invariant, InvariantKind, InvariantSample, InvariantViolation, QVel, TICK_HZ};
+use orrery_core::{
+    section_invariant, Invariant, InvariantKind, InvariantSample, InvariantViolation, QVel, TICK_HZ,
+};
 
 const VEL_MARGIN_MMS: i64 = 100;
 const POS_MARGIN_MM: i64 = 100;
 const TICKS_PER_SEC: i64 = TICK_HZ as i64;
 /// Every published Regolith stage-1 validator.
 pub const INVARIANTS: &[Invariant<RegolithState>] = &[
-    Invariant {
-        name: "regolith/speed-cap",
-        check: speed_cap,
-    },
-    Invariant {
-        name: "regolith/acceleration-cap",
-        check: acceleration_cap,
-    },
+    // Four of the six checks name the section they are about in their own
+    // signature (#791). `section_invariant!` lifts each to the whole-state
+    // `Invariant` this slice publishes, and an entity in another section
+    // passes without the check running — which is what the discarding arms of
+    // the hand-written matches did, written once in `orrery_core` instead of
+    // once per check.
+    //
+    // The speed cap is registered twice because it is genuinely about two
+    // sections: crafts and rocks both move under a published ceiling. It is
+    // one body, generic over `SpeedLimited`, and neither instantiation can see
+    // a pickup or a director at all.
+    section_invariant!("regolith/speed-cap", CraftSection, speed_cap::<Craft>),
+    section_invariant!("regolith/speed-cap", RockSection, speed_cap::<Rock>),
+    section_invariant!("regolith/acceleration-cap", CraftSection, acceleration_cap),
+    // Teleport and value-range stay whole-state, and the reason is the same
+    // for both: they ask about a *pair* of samples spanning two sections. A
+    // craft that arrives where a rock was is the discriminant mismatch each of
+    // them reports, and no per-section signature can hold a question about the
+    // section changing. See `InvariantSample::project`.
     Invariant {
         name: "regolith/teleport",
         check: teleport,
     },
-    Invariant {
-        name: "regolith/fire-rate",
-        check: fire_rate,
-    },
-    Invariant {
-        name: "regolith/score-rate",
-        check: score_rate,
-    },
+    section_invariant!("regolith/fire-rate", CraftSection, fire_rate),
+    section_invariant!("regolith/score-rate", CraftSection, score_rate),
     Invariant {
         name: "regolith/value-range",
         check: value_range,
     },
 ];
-fn speed_cap(sample: &InvariantSample<'_, RegolithState>) -> Result<(), InvariantViolation> {
-    let limit = match sample.current {
-        RegolithState::Craft(craft) => craft.archetype.limits().max_speed_mms,
-        RegolithState::Rock(rock) => rock.tier.limits().max_speed_mms,
-        RegolithState::Pickup(_) | RegolithState::BloomDirector(_) => 0,
-    } + VEL_MARGIN_MMS;
-    let vel = match sample.current {
-        RegolithState::Craft(craft) => craft.vel,
-        RegolithState::Rock(rock) => rock.vel,
-        RegolithState::Pickup(_) | RegolithState::BloomDirector(_) => QVel::default(),
-    };
-    if vel.difference_squared(QVel::default()) > i128::from(limit) * i128::from(limit) {
+/// A section whose values move under a published velocity ceiling.
+///
+/// Implemented by craft and rock and by nothing else, which is the whole
+/// content of the two arms `speed_cap` used to carry only to yield a zero the
+/// comparison then discarded: pickups and bloom directors do not move, so they
+/// have no ceiling to name, and now there is nowhere to write one.
+trait SpeedLimited {
+    /// Lattice velocity.
+    fn vel(&self) -> QVel;
+    /// The resolver-owned velocity ceiling, in millimetres per second.
+    fn max_speed_mms(&self) -> i64;
+}
+
+impl SpeedLimited for Craft {
+    fn vel(&self) -> QVel {
+        self.vel
+    }
+
+    fn max_speed_mms(&self) -> i64 {
+        self.archetype.limits().max_speed_mms
+    }
+}
+
+impl SpeedLimited for Rock {
+    fn vel(&self) -> QVel {
+        self.vel
+    }
+
+    fn max_speed_mms(&self) -> i64 {
+        self.tier.limits().max_speed_mms
+    }
+}
+
+fn speed_cap<S: SpeedLimited>(sample: &InvariantSample<'_, S>) -> Result<(), InvariantViolation> {
+    let limit = sample.current.max_speed_mms() + VEL_MARGIN_MMS;
+    if sample.current.vel().difference_squared(QVel::default())
+        > i128::from(limit) * i128::from(limit)
+    {
         Err(InvariantViolation::new(
             InvariantKind::SpeedCap,
             "regolith/speed-cap",
@@ -59,12 +92,15 @@ fn speed_cap(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invarian
         Ok(())
     }
 }
-fn acceleration_cap(sample: &InvariantSample<'_, RegolithState>) -> Result<(), InvariantViolation> {
-    let (Some(RegolithState::Craft(previous)), RegolithState::Craft(current)) =
-        (sample.previous, sample.current)
-    else {
+fn acceleration_cap(sample: &InvariantSample<'_, Craft>) -> Result<(), InvariantViolation> {
+    // The one remaining `else` is the documented no-history case, not a
+    // section discard: `InvariantSample::previous` is `None` for the first
+    // sample of an entity this peer has just met, and a check that cannot
+    // decide without history must pass rather than accuse.
+    let Some(previous) = sample.previous else {
         return Ok(());
     };
+    let current = sample.current;
     if previous.hull == 0 && current.hull > 0 {
         return Ok(());
     }
@@ -128,12 +164,11 @@ fn teleport(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invariant
         Ok(())
     }
 }
-fn fire_rate(sample: &InvariantSample<'_, RegolithState>) -> Result<(), InvariantViolation> {
-    let (Some(RegolithState::Craft(previous)), RegolithState::Craft(current)) =
-        (sample.previous, sample.current)
-    else {
+fn fire_rate(sample: &InvariantSample<'_, Craft>) -> Result<(), InvariantViolation> {
+    let Some(previous) = sample.previous else {
         return Ok(());
     };
+    let current = sample.current;
     let fired = current.shots.saturating_sub(previous.shots);
     let cooldown = u32::from(current.weapon.weapon().cooldown_ticks).max(1);
     if fired > sample.elapsed_ticks / cooldown + 1 {
@@ -145,12 +180,11 @@ fn fire_rate(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invarian
         Ok(())
     }
 }
-fn score_rate(sample: &InvariantSample<'_, RegolithState>) -> Result<(), InvariantViolation> {
-    let (Some(RegolithState::Craft(previous)), RegolithState::Craft(current)) =
-        (sample.previous, sample.current)
-    else {
+fn score_rate(sample: &InvariantSample<'_, Craft>) -> Result<(), InvariantViolation> {
+    let Some(previous) = sample.previous else {
         return Ok(());
     };
+    let current = sample.current;
     let ticks = u64::from(sample.elapsed_ticks);
     let kills = u64::from(current.kills.saturating_sub(previous.kills));
     let pickups = u64::from(current.pickups_won.saturating_sub(previous.pickups_won));

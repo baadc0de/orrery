@@ -20,7 +20,7 @@ use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use crate::quantize::Quantized;
 use crate::rng::tick_rng;
 use crate::ruleset::{
-    state_hash, CoreCodec, EntityMaterialization, OrderedInputs, Ruleset, StateView,
+    state_hash, CoreCodec, EntityMaterialization, OrderedInputs, Ruleset, Section, StateView,
 };
 
 /// The fixed simulation rate (VC-1, D8).
@@ -571,6 +571,43 @@ pub trait TickBackend<R: Ruleset> {
 
     /// Read an entity's current canonical state.
     fn state(&self, entity: PersistId) -> Option<&R::CoreState>;
+
+    /// Read an entity's state **as one declared section**, or `None` when the
+    /// entity is absent or occupies a different section.
+    ///
+    /// This is the type half of the ECS decomposition (#791). [`Self::state`]
+    /// hands back the whole `CoreState` sum whatever the entity is, so a host
+    /// that files crafts in their own component still forces every caller to
+    /// match over every section — the decomposition separated storage and left
+    /// types alone. Naming the section in the *signature* is what removes the
+    /// match, and it is the caller who knows which section it wanted.
+    ///
+    /// # Why a provided method over `state`, and not a change to `state`
+    ///
+    /// `&R::CoreState` is not only the executor's shape. It is the witness's
+    /// sample map, the replay harness's decode target, and — through
+    /// `CoreCodec::to_canonical` — the bytes `orrery_protocol::authority` and
+    /// `orrery_persistd::adjudication` commit to. Replacing it would put the
+    /// adjudication path through a refactor to buy an ergonomic win that does
+    /// not need one: conviction is over canonical *bytes*, which are a property
+    /// of the whole state, while the win is over *reads*, which are per
+    /// section. So this widens the seam additively. Nothing above changes
+    /// shape, and D42 (b)(2)'s canonical encoding is untouched.
+    ///
+    /// # Backends may do better than this default
+    ///
+    /// The default narrows after the fact, which costs a match a decomposing
+    /// host already knows the answer to. A backend that stores a section in its
+    /// own component — [`EcsBackend`](../../orrery_sim_host/ecs/struct.EcsBackend.html)
+    /// does — can override this to read that component directly and skip the
+    /// sum entirely. The default is written so that not overriding it is
+    /// correct rather than merely permitted.
+    fn section_state<S>(&self, entity: PersistId) -> Option<&S::State>
+    where
+        S: Section<Root = R::CoreState>,
+    {
+        self.state(entity).and_then(S::project)
+    }
 
     /// Every installed entity, in ascending `PersistId` order.
     fn entities(&self) -> Vec<PersistId>;
