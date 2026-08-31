@@ -108,6 +108,82 @@ jobs:
       # own. scripts/check.sh holds the list.
       - run: scripts/check.sh fmt
 
+  standalone-workspaces:
+    name: standalone workspaces
+    # This is deliberately independent of `changes`. The filter is correct for
+    # the heavy lanes it guards, but this small compile-only tripwire is the
+    # protection against a green PR leaving a standalone workspace broken.
+    # In particular, it must run for every pull request, including a
+    # documentation-only one whose merge commit may expose another change.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The repository-level config makes kache available to every standalone
+      # workspace: cargo discovers .cargo/config.toml while walking up from
+      # each of their directories. Keep the cache local to this run; the
+      # remote economics for the old gates/test lanes do not predict this
+      # compile-only shape. kache-action intentionally leaves RUSTC_WRAPPER
+      # empty when no persistent backend is configured, so restore the local
+      # wrapper explicitly in the following step.
+      - name: Install kache with no remote, for same-run deduplication
+        uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
+        with:
+          version: 0.14.2
+          github-cache: false
+          pr-comment: false
+      - name: Enable kache's local same-run store
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v kache
+          echo 'RUSTC_WRAPPER=kache' >> "$GITHUB_ENV"
+
+      # Some standalone tools compile the FDB feature and regolith compiles
+      # Bevy's Linux backends. This is compilation support only: no test or
+      # harness is run in this PR lane.
+      - name: Install the FoundationDB client
+        uses: ./.github/actions/foundationdb
+      - name: Install Bevy's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+
+      # Derive the inventory from manifests, rather than duplicating a list
+      # that can go stale. The root workspace is already covered by the root
+      # lanes; every nested manifest declaring [workspace] is checked and
+      # formatted here.
+      - name: Compile and format every standalone workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RUSTC_WRAPPER:-}" == *kache* ]] || {
+            echo '::error::RUSTC_WRAPPER is not kache' >&2
+            exit 1
+          }
+          mapfile -t workspaces < <(
+            find . -name Cargo.toml -not -path './target/*' -print0 |
+              while IFS= read -r -d '' manifest; do
+                if [[ $manifest != ./Cargo.toml ]] && grep -qx '\[workspace\]' "$manifest"; then
+                  dirname "$manifest"
+                fi
+              done | sort
+          )
+          ((${#workspaces[@]})) || { echo 'no standalone workspaces found' >&2; exit 1; }
+          printf 'Standalone workspaces:\n%s\n' "${workspaces[*]}"
+          for workspace in "${workspaces[@]}"; do
+            echo "[$workspace] cargo check --all-targets"
+            (cd "$workspace" && cargo check --all-targets)
+            echo "[$workspace] cargo fmt --all --check"
+            (cd "$workspace" && cargo fmt --all --check)
+          done
+
   # ── is there anything for the heavy lanes to check? ────────────────────────
   #
   # A documentation-only change cannot break clippy, the static gates or the
