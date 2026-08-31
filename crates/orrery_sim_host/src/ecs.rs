@@ -41,7 +41,7 @@ use std::marker::PhantomData;
 use bevy_ecs::prelude::{
     Component, Entity, IntoScheduleConfigs, Query, Res, ResMut, Resource, Schedule, World,
 };
-use bevy_ecs::schedule::ScheduleLabel;
+use bevy_ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel};
 use orrery_core::{
     canonical_step, CanonicalOutcome, CanonicalStep, NeighborSnapshot, Quantized, Ruleset,
     SealedTickInputs, SteppedEntity, TickBackend, TickOutcome,
@@ -311,6 +311,84 @@ fn install_materializations<R: EcsHostable>(world: &mut World) {
     }
 }
 
+/// Whether [`canonical_schedule`] chains its stages or leaves them unordered.
+///
+/// The unordered arm exists only for D43 (c)(1)'s canary mutant and is never
+/// reachable from [`EcsBackend::new`]; a backend is always built `Chained`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ordering {
+    Chained,
+    Unordered,
+}
+
+/// The dedicated world every `EcsBackend` runs on, with its resources installed.
+///
+/// Factored out of `EcsBackend::new` so the ambiguity canary composes the
+/// schedule against *this* world rather than an approximation of it: a canary
+/// that initializes against a different resource set is not a canary for the
+/// schedule that ships.
+fn canonical_world<R: EcsHostable>(ruleset: R, seed: UniverseSeed) -> World {
+    let mut world = World::new();
+    world.insert_resource(Rules { ruleset, seed });
+    world.insert_resource(Index::default());
+    world.insert_resource(TickPlan::<R> {
+        tick: Tick::new(0),
+        order: Vec::new(),
+        only: None,
+        inputs: SealedTickInputs::new(),
+    });
+    world.insert_resource(Neighborhood::<R> {
+        states: BTreeMap::new(),
+        observed: BTreeMap::new(),
+    });
+    world.insert_resource(TickResults::<R> {
+        stepped: Vec::new(),
+        spawned: Vec::new(),
+    });
+    world
+}
+
+/// The canonical tick schedule.
+///
+/// `Ordering::Chained` is the shipped one: explicitly chained, because the
+/// canonical schedule declares no ambiguity, so neither may this one.
+/// `bevy_ecs` is built here without `multi_threaded`, so single-threaded
+/// execution is a property of the build and not a request this schedule makes.
+fn canonical_schedule<R: EcsHostable>(ordering: Ordering) -> Schedule {
+    let mut schedule = Schedule::new(CanonicalTick);
+    let stages = (
+        seal_population::<R>,
+        advance_population::<R>,
+        install_materializations::<R>,
+    );
+    match ordering {
+        Ordering::Chained => schedule.add_systems(stages.chain()),
+        Ordering::Unordered => schedule.add_systems(stages),
+    };
+    // The declared stage list is not decoration: a fourth system added to the
+    // chain without a row in `CANONICAL_TICK_STAGES` is a stage the published
+    // order does not mention, and that is how a schedule starts running
+    // something nobody reviewed.
+    assert_eq!(
+        schedule.systems_len(),
+        CANONICAL_TICK_STAGES.len(),
+        "the canonical tick schedule runs a different number of stages than it declares"
+    );
+    schedule
+}
+
+/// Initialize `schedule` against `world` with ambiguity promoted to an error.
+fn audit_ambiguity(mut schedule: Schedule, mut world: World) -> Result<(), String> {
+    schedule.set_build_settings(ScheduleBuildSettings {
+        ambiguity_detection: LogLevel::Error,
+        ..ScheduleBuildSettings::default()
+    });
+    schedule
+        .initialize(&mut world)
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+}
+
 /// Canonical state in a dedicated `bevy_ecs::World`, stepped by a `Schedule`.
 ///
 /// See the module documentation for what this does and does not own. It is
@@ -327,51 +405,82 @@ impl<R: EcsHostable> EcsBackend<R> {
     /// Build a dedicated world for `ruleset` under `seed`.
     #[must_use]
     pub fn new(ruleset: R, seed: UniverseSeed) -> Self {
-        let mut world = World::new();
-        world.insert_resource(Rules { ruleset, seed });
-        world.insert_resource(Index::default());
-        world.insert_resource(TickPlan::<R> {
-            tick: Tick::new(0),
-            order: Vec::new(),
-            only: None,
-            inputs: SealedTickInputs::new(),
-        });
-        world.insert_resource(Neighborhood::<R> {
-            states: BTreeMap::new(),
-            observed: BTreeMap::new(),
-        });
-        world.insert_resource(TickResults::<R> {
-            stepped: Vec::new(),
-            spawned: Vec::new(),
-        });
-
-        let mut schedule = Schedule::new(CanonicalTick);
-        // Explicitly chained: the canonical schedule declares no ambiguity, so
-        // neither may this one. `bevy_ecs` is built here without
-        // `multi_threaded`, so single-threaded execution is a property of the
-        // build and not a request this schedule makes.
-        schedule.add_systems(
-            (
-                seal_population::<R>,
-                advance_population::<R>,
-                install_materializations::<R>,
-            )
-                .chain(),
-        );
-        // The declared stage list is not decoration: a fourth system added to
-        // the chain without a row in `CANONICAL_TICK_STAGES` is a stage the
-        // published order does not mention, and that is how a schedule starts
-        // running something nobody reviewed.
-        assert_eq!(
-            schedule.systems_len(),
-            CANONICAL_TICK_STAGES.len(),
-            "the canonical tick schedule runs a different number of stages than it declares"
-        );
         Self {
-            world,
-            schedule,
+            world: canonical_world(ruleset, seed),
+            schedule: canonical_schedule::<R>(Ordering::Chained),
             ruleset: PhantomData,
         }
+    }
+
+    /// D43 (c)(1)'s ambiguity canary, arming direction.
+    ///
+    /// Builds the *real* canonical schedule against a real canonical world,
+    /// turns `bevy_ecs`'s ambiguity detection up from its default `Ignore` to
+    /// `Error`, and initializes. `Ok(())` means the shipped schedule carries an
+    /// explicit ordering edge between every pair of systems with conflicting
+    /// data access; an `Err` means the schedule this backend actually runs has
+    /// an ambiguity in it — which the record refuses at composition rather than
+    /// logs.
+    ///
+    /// Neither direction is evidence on its own: a rejector that rejects
+    /// nothing returns `Ok` here too. The other direction is
+    /// [`EcsBackend::ambiguity_audit_of_the_unordered_mutant`], and the record
+    /// requires both in CI.
+    ///
+    /// # Errors
+    ///
+    /// The `bevy_ecs` schedule build error, rendered, when the canonical
+    /// schedule does not compose unambiguously.
+    pub fn ambiguity_audit(ruleset: R, seed: UniverseSeed) -> Result<(), String> {
+        audit_ambiguity(
+            canonical_schedule::<R>(Ordering::Chained),
+            canonical_world(ruleset, seed),
+        )
+    }
+
+    /// D43 (c)(1)'s ambiguity canary, refuting direction.
+    ///
+    /// The same three systems over the same world with the `.chain()` taken
+    /// off, and nothing else changed. `seal_population` and
+    /// `advance_population` both take `ResMut<Neighborhood<R>>`, and
+    /// `install_materializations` is exclusive, so with no ordering edges this
+    /// schedule is ambiguous by construction. If it initializes `Ok`, the
+    /// rejector is asleep and every `Ok` from [`EcsBackend::ambiguity_audit`]
+    /// is worth nothing.
+    ///
+    /// A3's probe ran an ambiguous schedule 200/200 identical, which is why
+    /// this is a composition-time check and not a repetition count.
+    ///
+    /// # Errors
+    ///
+    /// The `bevy_ecs` schedule build error, rendered — which is the outcome
+    /// this function exists to obtain.
+    pub fn ambiguity_audit_of_the_unordered_mutant(
+        ruleset: R,
+        seed: UniverseSeed,
+    ) -> Result<(), String> {
+        audit_ambiguity(
+            canonical_schedule::<R>(Ordering::Unordered),
+            canonical_world(ruleset, seed),
+        )
+    }
+
+    /// The population in **archetype iteration order** — the order `bevy_ecs`
+    /// happens to hold it in, which follows spawn history.
+    ///
+    /// Nothing canonical may be derived from this, and nothing is: no caller
+    /// inside this crate reads it, and [`TickBackend::entities`] remains the
+    /// `PersistId`-ordered index. It exists for D43 (e)(4)'s projection
+    /// differential, which has to *prove* that permuting insertion order
+    /// really moved the substrate's storage order — a differential over
+    /// permutations that never permuted anything passes for the wrong reason,
+    /// and "agreement would be luck, not a property" is the failure the record
+    /// names. See `tests/tier_h_projection_differential.rs`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn storage_order_probe(&mut self) -> Vec<PersistId> {
+        let mut query = self.world.query::<&Identity>();
+        query.iter(&self.world).map(|identity| identity.0).collect()
     }
 
     fn entity_for(&self, entity: PersistId) -> Option<Entity> {

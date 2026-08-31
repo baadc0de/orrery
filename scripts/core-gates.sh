@@ -13,6 +13,13 @@
 #   3. No ambient inputs (VC-8) or std float transcendentals (VC-6).
 #   4. No live neighbour reads inside a `Ruleset` (docs/06 §3 implementation
 #      status) — cross-entity effects travel as events.
+#   5. ADR-0043 clause (e)'s Tier-H host battery, over any crate hosting
+#      canonical state in a `bevy_ecs::World`: a review-required allowlist, a
+#      `bevy_ecs`-only dependency rule, the whole Tier V source battery plus an
+#      async ban and an RNG-construction ban over the host's canonical modules,
+#      and the declared existence of the ambiguity canary, the projection
+#      differential and the world-of-one harness — which clause (e)(4) makes
+#      "preconditions of admitting the host, not follow-ups".
 #
 # The scans cover `orrery_core`, **the game core crates**, and the conformance
 # corpus's reference ruleset, which is what docs/06 §4 asks for: the rules are
@@ -379,6 +386,225 @@ fi
 
 note "recorded neighbour reads confined to ${#AUDITED_NEIGHBOR_PREDICATES[@]} declared audited predicate(s)"
 
+# ── 6. Tier H — the conditional host battery (D43 (e)) ──────────────────
+# Armed by a crate hosting canonical state in a `bevy_ecs::World`. D42 (d)
+# admitted exactly one such host (#757, `orrery_sim_host`'s `EcsBackend`) under
+# a direct owner sanction, ahead of this battery; D43 (e)'s amendment records
+# that as a debt and confines the host until the battery is enforced and
+# demonstrated mutation-style. This section is that battery.
+#
+# What "hosting canonical state" is, mechanically. A crate is a Tier-H host
+# when it (i) implements `orrery_core::TickBackend` — the trait through which
+# canonical state is stored and stepped — and (ii) has `bevy_ecs` in its
+# runtime graph. Both halves matter: `Executor` implements the trait without an
+# ECS, and `orrery_net`, `orrery_spatial`, `orrery_authority`, `orrery_predict`,
+# `orrery_witness`, `orrery_persist_client` and `orrery` all use `bevy_ecs`
+# without ever holding canonical state. Neither is a host; the conjunction is.
+#
+# Clause (e)(1) says "no discovery here, because hosting ECS is always a
+# decision, never an accident". So the *membership* mechanism is the declared
+# allowlist below — a one-line diff a reviewer cannot miss. The conjunction
+# above is not a second membership mechanism; it is the escape check that makes
+# a new host fail by name instead of arriving silently, in the same two-source
+# idiom Tier V's role discovery uses against DECLARED_GATED_CRATES.
+
+# The allowlist. Adding a row here is a review decision that this crate takes
+# the whole battery below.
+DECLARED_HOST_CRATES=(orrery_sim_host)
+
+# Clause (e)(2): the only Bevy crate a host may depend on is `bevy_ecs`. These
+# are the spellings the record names as hard failures — app coupling, the
+# umbrella, and the ambient clock. `bevy_ecs`'s own transitive crates
+# (`bevy_platform`, `bevy_ptr`, `bevy_tasks`, `bevy_reflect`, the macro crates)
+# are not app coupling and are not listed.
+readonly FORBIDDEN_HOST_BEVY_CRATES=(bevy_app bevy_internal bevy_time)
+
+# Clause (e)(4) and (e)(5): the harnesses that are preconditions of admitting a
+# host, declared by name so removing or renaming one fails here rather than
+# reducing the suite by one silent test. `cargo test --workspace` runs them.
+DECLARED_HOST_HARNESSES=(
+  'crates/orrery_sim_host/tests/tier_h_projection_differential.rs::the_canonical_schedule_composes_unambiguously_and_the_unordered_mutant_does_not'
+  'crates/orrery_sim_host/tests/tier_h_projection_differential.rs::permuted_insertion_orders_agree_on_the_sorted_projection_and_the_executor_chain'
+  'crates/orrery_sim_host/tests/tier_h_world_of_one.rs::the_verdict_holds_in_a_world_of_one'
+)
+
+# The synthetic host fixtures at the end of this file are their own tiny
+# workspaces with no `orrery_sim_host` in them, so the declarations above are
+# the repository's and cannot be theirs. The override is empty by default,
+# which is what makes a fixture's rogue host fail the (e)(1) escape check
+# rather than the staleness check.
+if [[ ${_CORE_GATES_INTERNAL_SELF_TEST:-0} == 1 ]]; then
+  DECLARED_HOST_CRATES=()
+  DECLARED_HOST_HARNESSES=()
+  if [[ -n ${_CORE_GATES_TEST_HOSTS:-} ]]; then
+    read -r -a DECLARED_HOST_CRATES <<<"$_CORE_GATES_TEST_HOSTS"
+  fi
+fi
+readonly -a DECLARED_HOST_CRATES
+readonly -a DECLARED_HOST_HARNESSES
+
+# A crate's runtime dependency graph, dev-dependencies excluded. `-e normal` is
+# load-bearing for clause (e)(2): `orrery_sim_host` legitimately carries
+# `bevy_app` as a dev-dependency for a test that builds an `App` it never gives
+# canonical state to, and a check that could not tell the two apart would have
+# to be either vacuous or wrong.
+runtime_tree() {
+  (cd "$ROOT" && cargo tree -p "$1" -e normal 2>/dev/null)
+}
+
+# Crates that host canonical state on an ECS, by the conjunction above.
+ecs_host_crates() {
+  local crate sources=()
+  for crate in "${!CRATE_DIRS[@]}"; do
+    sources=()
+    while IFS= read -r file; do sources+=("$file"); done < <(lib_sources "$crate")
+    (( ${#sources[@]} > 0 )) || continue
+    # Do not use grep -q under pipefail: an early match can SIGPIPE awk and
+    # turn a successful discovery into a silent miss.
+    strip_cfg_test_items "${sources[@]}" \
+      | grep -E '(^|[[:space:]])impl[^;{}]*([[:alnum:]_]+::)*TickBackend[[:space:]<][^;{}]*[[:space:]]for([[:space:]<{]|$)' \
+        >/dev/null || continue
+    runtime_tree "$crate" | grep -Eq '(^|[^[:alnum:]_])bevy_ecs v' || continue
+    echo "$crate"
+  done | sort -u
+}
+
+HOST_CRATES=()
+while IFS= read -r crate; do
+  [[ -n $crate ]] && HOST_CRATES+=("$crate")
+done < <(ecs_host_crates)
+
+# (e)(1), both directions. An undeclared host is an accident; a declared crate
+# that is no longer a host is a stale allowlist, and the two must not report as
+# each other.
+for crate in "${DECLARED_HOST_CRATES[@]}"; do
+  if ! printf '%s\n' "${HOST_CRATES[@]}" | grep -Fxq "$crate"; then
+    die "declared Tier-H host '$crate' no longer hosts canonical state in a bevy_ecs::World — remove it from DECLARED_HOST_CRATES in this file (D43 (e)(1))"
+  fi
+done
+for crate in "${HOST_CRATES[@]}"; do
+  if ! printf '%s\n' "${DECLARED_HOST_CRATES[@]}" | grep -Fxq "$crate"; then
+    die "undeclared ECS host crate '$crate' — hosting canonical state in a bevy_ecs::World is always a decision, never an accident: add it to DECLARED_HOST_CRATES in this file and take the whole Tier-H battery (D43 (e)(1))"
+  fi
+done
+note "Tier-H host allowlist: ${DECLARED_HOST_CRATES[*]}"
+
+# Everything below governs a *declared* host. With none declared — the state
+# D43 (e) was written for, and the state every synthetic fixture in this file
+# is in — Tier H is unarmed and only the escape check above runs.
+if (( ${#DECLARED_HOST_CRATES[@]} == 0 )); then
+  note "Tier H: no declared ECS host, battery unarmed"
+else
+
+# (e)(2): bevy_ecs only.
+for crate in "${DECLARED_HOST_CRATES[@]}"; do
+  host_tree="$(runtime_tree "$crate")"
+  [[ -n $host_tree ]] || die "could not read $crate's runtime dependency graph"
+  for forbidden in "${FORBIDDEN_HOST_BEVY_CRATES[@]}"; do
+    if grep -Eq "(^|[^[:alnum:]_])${forbidden} v" <<<"$host_tree"; then
+      die "Tier-H host '$crate' has a runtime dependency on $forbidden — a host may depend on bevy_ecs only, which is what keeps SubApp-style app coupling out (D43 (e)(2))"
+    fi
+  done
+  if grep -Eq '(^|[^[:alnum:]_])bevy v' <<<"$host_tree"; then
+    die "Tier-H host '$crate' has a runtime dependency on the full bevy crate — a host may depend on bevy_ecs only (D43 (e)(2))"
+  fi
+  if grep -Eq '(^|[[:space:]│├└─])(tokio|async-std) v' <<<"$host_tree"; then
+    die "Tier-H host '$crate' has an async runtime in its dependency graph — canonical execution is synchronous end-to-end within a tick (D43 (e)(3), (c)(7))"
+  fi
+done
+note "Tier-H hosts depend on bevy_ecs only: ${DECLARED_HOST_CRATES[*]}"
+
+# (e)(3): the full Tier V source battery over the host's canonical modules,
+# plus the async ban and the RNG-construction ban.
+#
+# "Canonical modules" is taken here as every library source of the host crate.
+# A declared subset would be a second allowlist governing which files are
+# allowed to hold canonical state, and a host that moved a `HashMap` into an
+# undeclared module would pass — so the whole `src/` tree carries the battery,
+# and a host crate that wants a HashMap for something non-canonical must put it
+# in a crate that is not a host.
+HOST_SOURCES=()
+while IFS= read -r file; do HOST_SOURCES+=("$file"); done < <(lib_sources "${DECLARED_HOST_CRATES[@]}")
+[[ ${#HOST_SOURCES[@]} -gt 0 ]] || die "no Tier-H host sources found"
+
+scan '\b(HashMap|HashSet)\b' \
+  'VC-4 (Tier H): std HashMap/HashSet in a host canonical module — use BTreeMap/BTreeSet or a sorted Vec (D43 (e)(3))' \
+  "${HOST_SOURCES[@]}"
+scan '\b(Instant::now|SystemTime::now|thread_rng|from_entropy|rand::random|OsRng|from_os_rng|std::env::var)\b|\.elapsed\(\)' \
+  'VC-8 (Tier H): ambient input in a host canonical module — time is Tick, randomness is seeded (D43 (e)(3))' \
+  "${HOST_SOURCES[@]}"
+scan "\\bf(32|64)::($TRANSCENDENTALS)\\b" \
+  'VC-6 (Tier H): std float transcendental (path form) in a host canonical module — route through libm (D43 (e)(3))' \
+  "${HOST_SOURCES[@]}"
+scan "\\.($TRANSCENDENTALS)\\(" \
+  'VC-6 (Tier H): std float transcendental (method form) in a host canonical module — route through libm (D43 (e)(3))' \
+  "${HOST_SOURCES[@]}"
+scan '(^|[^[:alnum:]_])async[[:space:]]+(fn|move|\{)|\.await([^[:alnum:]_]|$)|#\[(tokio|async_std)::' \
+  'D43 (e)(3): async in a host canonical module — canonical execution is synchronous end-to-end within a tick, and nothing spawned during it may outlive the schedule run (D43 (c)(7))' \
+  "${HOST_SOURCES[@]}"
+# The RNG ban is construction, not use: a host receives `&mut TickRng` and
+# passes it along. `orrery_core::tick_rng` is the only canonical constructor and
+# it does not live in a host crate, so any construction site here is one too
+# many.
+scan '\b(StdRng|SmallRng|ChaCha8Rng|ChaCha12Rng|ChaCha20Rng|ChaChaRng|Pcg[[:alnum:]]*|Xoshiro[[:alnum:]]*)\b|\b(from_entropy|from_seed|seed_from_u64|from_rng|thread_rng|rng\(\))[[:space:]]*\(|\bSeedableRng\b' \
+  'D43 (e)(3): RNG construction in a host canonical module — the per-entity, per-tick stream is orrery_core::tick_rng and a host never builds one (D43 (c)(5))' \
+  "${HOST_SOURCES[@]}"
+note "Tier-H source battery (VC-4/VC-6/VC-8 + async + RNG construction) over ${#HOST_SOURCES[@]} host source(s)"
+
+# (e)(5): the host must implement single-entity stepping itself.
+#
+# `TickBackend::step_entity` has no default, so a host cannot inherit one — but
+# it can implement it by delegating to a whole-population step, which is the
+# expensive lie the clause is about ("the schedule was deterministic" is never
+# a substitute for per-entity replay). The gate can only see that the site
+# exists and is named; that the site is *honest* is what the declared
+# world-of-one harness below proves, in a populated world where the difference
+# is visible.
+for crate in "${DECLARED_HOST_CRATES[@]}"; do
+  host_sources=()
+  while IFS= read -r file; do host_sources+=("$file"); done < <(lib_sources "$crate")
+  strip_cfg_test_items "${host_sources[@]}" \
+    | grep -E '(^|[[:space:]])fn[[:space:]]+step_entity([[:space:]<(]|$)' >/dev/null \
+    || die "Tier-H host '$crate' does not implement TickBackend::step_entity — the verdict must hold in a world of one, and a host that cannot step one entity cannot be adjudicated per-entity (D43 (e)(5))"
+done
+
+# (e)(4) and (e)(5): the declared harnesses exist, by name.
+#
+# Staleness first, in the AUDITED_NEIGHBOR_PREDICATES idiom: a renamed test
+# must report as a stale declaration pointing at the name that moved, not as
+# something else.
+for harness in "${DECLARED_HOST_HARNESSES[@]}"; do
+  harness_file=${harness%%::*}
+  harness_fn=${harness##*::}
+  [[ -f $ROOT/$harness_file ]] \
+    || die "declared Tier-H harness file '$harness_file' does not exist — clause (e)(4)'s canary and projection differential are preconditions of admitting a host, not follow-ups (D43 (e)(4))"
+  grep -qE "fn ${harness_fn}\b" "$ROOT/$harness_file" 2>/dev/null \
+    || die "declared Tier-H harness '$harness' does not exist — fix the name or restore the test; clause (e)(4)'s checks are preconditions of admitting a host, not follow-ups (D43 (e)(4), (e)(5))"
+done
+note "Tier-H harnesses declared and present: ${#DECLARED_HOST_HARNESSES[@]}"
+fi
+
+# ── The clause (e)(5) boundary this battery does not cross ──────────────
+# Recorded here rather than left to be rediscovered. The clause asks for
+# single-entity semantics exposed "to witnesses and adjudication". The host
+# half is enforced above and demonstrated by
+# `tier_h_world_of_one.rs::the_verdict_holds_in_a_world_of_one`, which builds
+# one `EcsBackend` per entity and reproduces every recorded hash from
+# per-entity replay on the ECS itself.
+#
+# The adjudicator half is not closed and is not claimed: `verify_bundle`
+# (orrery_core/src/replay.rs:331) builds its harness around `Executor::new`
+# (replay.rs:106) and `authored_bundles` (orrery_games/src/diff.rs:918)
+# re-executes each side's signed log through an `Executor` whatever authored
+# it. On the ECS path the D-4 frames are therefore executor-authored while the
+# claim values are ECS-derived. Conviction power survives — a diverging ECS
+# fails D-1/D-2/D-3 and the claim values independently of the frames — but
+# "the verdict must hold in a world of one" is demonstrated by a harness rather
+# than embodied in the adjudicator's substrate. Closing it means making
+# `verify_bundle` and `authored_bundles` backend-parametric, which is a change
+# to `orrery_core` and `orrery_games`; that is a separate lane and this file
+# does not pretend otherwise.
+
 echo "$NAME: verifiable-core static gates pass"
 
 # ── Role-discovery self-tests ───────────────────────────────────────────
@@ -386,7 +612,7 @@ echo "$NAME: verifiable-core static gates pass"
 # a scripts/check.sh registration owned by another lane; keeping the fixtures
 # here makes them impossible to add without also running them per commit.
 make_discovery_fixture() {
-  local fixture=$1 host_mode=$2 conformance_violation=$3
+  local fixture=$1 host_mode=$2 conformance_violation=$3 tier_h_app_dep=${4:-no}
   mkdir -p \
     "$fixture/crates/orrery_core/src" \
     "$fixture/crates/orrery_games/src/regolith" \
@@ -406,6 +632,7 @@ edition = "2024"
 EOF
   cat >"$fixture/crates/orrery_core/src/lib.rs" <<'EOF'
 pub trait Ruleset {}
+pub trait TickBackend<R> {}
 EOF
   cat >"$fixture/crates/orrery_games/Cargo.toml" <<'EOF'
 [package]
@@ -460,6 +687,63 @@ mod tests {
     impl orrery_core::Ruleset for TestOnly {}
 }
 EOF
+
+  if [[ $host_mode == tier_h ]]; then
+    # A Tier-H shaped crate: canonical state on an ECS (`impl TickBackend` plus
+    # `bevy_ecs` in the runtime graph) and no `impl Ruleset` at all, so Tier V's
+    # role discovery does not see it and only the host allowlist can.
+    mkdir -p "$fixture/crates/orrery_rogue_host/src" "$fixture/crates/bevy_ecs/src"
+    cat >"$fixture/crates/bevy_ecs/Cargo.toml" <<'EOF'
+[package]
+name = "bevy_ecs"
+version = "0.0.0"
+edition = "2024"
+EOF
+    cat >"$fixture/crates/bevy_ecs/src/lib.rs" <<'EOF'
+pub struct World;
+EOF
+    if [[ $tier_h_app_dep == yes ]]; then
+      mkdir -p "$fixture/crates/bevy_app/src"
+      cat >"$fixture/crates/bevy_app/Cargo.toml" <<'EOF'
+[package]
+name = "bevy_app"
+version = "0.0.0"
+edition = "2024"
+EOF
+      cat >"$fixture/crates/bevy_app/src/lib.rs" <<'EOF'
+pub struct App;
+EOF
+      cat >"$fixture/crates/orrery_rogue_host/Cargo.toml" <<'EOF'
+[package]
+name = "orrery_rogue_host"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+bevy_app = { path = "../bevy_app" }
+bevy_ecs = { path = "../bevy_ecs" }
+orrery_core = { path = "../orrery_core" }
+EOF
+    else
+      cat >"$fixture/crates/orrery_rogue_host/Cargo.toml" <<'EOF'
+[package]
+name = "orrery_rogue_host"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs = { path = "../bevy_ecs" }
+orrery_core = { path = "../orrery_core" }
+EOF
+    fi
+    cat >"$fixture/crates/orrery_rogue_host/src/lib.rs" <<'EOF'
+pub struct RogueHost {
+    world: bevy_ecs::World,
+}
+impl orrery_core::TickBackend<()> for RogueHost {}
+fn step_entity() {}
+EOF
+  fi
 
   if [[ $host_mode == bevy ]]; then
     mkdir -p "$fixture/crates/orrery_host/src" "$fixture/crates/bevy_ecs/src"
@@ -535,6 +819,49 @@ run_discovery_self_tests() {
   grep -Fq "core-gates: VC-4: std HashMap/HashSet in a gated crate" <<<"$output" \
     || die "discovery self-test: removed-floor mutant did not fail VC-4"
   note "discovery self-test: removing a floor entry cannot remove a discovered crate from VC-4"
+
+  # ── Tier H (D43 (e)) ──────────────────────────────────────────────────
+  # (e)(1): a crate that hosts canonical state on an ECS and is not on the
+  # allowlist must fail by name. The fixture's host carries no `impl Ruleset`,
+  # so Tier V's role discovery cannot see it — if the allowlist check were
+  # removed, this crate would sail through every other clause in this file.
+  fixture="$scratch/tier-h-rogue-host"
+  make_discovery_fixture "$fixture" tier_h no
+  status=0
+  output="$(_CORE_GATES_INTERNAL_SELF_TEST=1 \
+    _CORE_GATES_TEST_ROOT="$fixture" \
+    _CORE_GATES_SKIP_SELF_TESTS=1 \
+    "$SCRIPT_PATH" 2>&1)" || status=$?
+  if [[ ${CORE_GATES_SHOW_SELF_TEST_OUTPUT:-0} == 1 ]]; then
+    printf '%s\n' '--- synthetic ECS host with no allowlist entry ---' "$output" >&2
+  fi
+  (( status == 1 )) \
+    || die "Tier-H self-test: synthetic ECS host returned $status, expected 1"
+  grep -Fq "core-gates: undeclared ECS host crate 'orrery_rogue_host'" <<<"$output" \
+    || die "Tier-H self-test: an undeclared ECS host did not fail the allowlist check by name"
+  note "Tier-H self-test: an unallowlisted crate hosting canonical state on an ECS fails clause (e)(1) by name"
+
+  # (e)(2): the same host, allowlisted, with a `bevy_app` runtime dependency.
+  # Declared this time, so the escape check above is satisfied and the
+  # dependency gate is the only thing that can fail.
+  fixture="$scratch/tier-h-app-coupled-host"
+  make_discovery_fixture "$fixture" tier_h no yes
+  status=0
+  output="$(_CORE_GATES_INTERNAL_SELF_TEST=1 \
+    _CORE_GATES_TEST_ROOT="$fixture" \
+    _CORE_GATES_TEST_HOSTS=orrery_rogue_host \
+    _CORE_GATES_SKIP_SELF_TESTS=1 \
+    "$SCRIPT_PATH" 2>&1)" || status=$?
+  if [[ ${CORE_GATES_SHOW_SELF_TEST_OUTPUT:-0} == 1 ]]; then
+    printf '%s\n' '--- allowlisted ECS host with a bevy_app runtime dependency ---' "$output" >&2
+  fi
+  (( status == 1 )) \
+    || die "Tier-H self-test: app-coupled ECS host returned $status, expected 1"
+  grep -Fq "core-gates: Tier-H host allowlist: orrery_rogue_host" <<<"$output" \
+    || die "Tier-H self-test: the declared fixture host was not allowlisted, so the failure below is the wrong one"
+  grep -Fq "core-gates: Tier-H host 'orrery_rogue_host' has a runtime dependency on bevy_app" <<<"$output" \
+    || die "Tier-H self-test: a bevy_app runtime dependency did not fail the dependency gate by name"
+  note "Tier-H self-test: an allowlisted host taking bevy_app fails clause (e)(2) by name"
 }
 
 if [[ ${_CORE_GATES_SKIP_SELF_TESTS:-0} != 1 ]]; then
