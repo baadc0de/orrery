@@ -492,9 +492,10 @@ pub struct CampaignRockSeed {
 /// the campaign crowd orbits at roughly 2.5 km, so that faithful bloom would
 /// still be content nobody sees. Six rocks make every published tier present
 /// without turning the crowd's orbit into a collision gauntlet: they sit in a
-/// radial pocket just inside and outside the outer crowd, 110--340 m from its
-/// player slot, but off every bot's initial flight line. A player can see,
-/// lock and deliberately fly into the pocket; orbiting bots do not begin in it.
+/// radial pocket just inside and outside the outer crowd, inside its 400 m
+/// engagement envelope but off every bot's initial flight line. A player can
+/// see, lock and deliberately fly into the pocket; orbiting bots do not begin
+/// in it.
 ///
 /// Identity, the small angular/radial variation, tier and owner are pure
 /// functions of `(universe seed, campaign-rock slot, host peer count)`. No

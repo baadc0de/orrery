@@ -69,9 +69,10 @@ fn campaign_seed_places_every_rock_tier_beside_but_not_on_the_crowd_orbit() {
 
     let (player, _) = campaign_spawn_pose(8, 9);
     for seeded in &rocks {
+        let distance = distance_mm(player, seeded.rock.pos);
         assert!(
-            distance_mm(player, seeded.rock.pos) <= 350_000,
-            "rock {} must start inside the player's stock encounter",
+            distance <= u128::try_from(MAX_ENGAGEMENT_RANGE_MM).unwrap(),
+            "rock {} at {distance} mm must start inside the player's engagement envelope",
             seeded.entity.0,
         );
         for slot in 0..8 {
