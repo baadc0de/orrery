@@ -16,6 +16,8 @@
 //!
 //! - [`ruleset`] — the [`Ruleset`](ruleset::Ruleset) contract a game implements
 //!   once and links identically into peers, field hosts and `persistd`.
+//! - [`sched`] — the optional declared per-entity system schedule a ruleset may
+//!   write its tick as, instead of one long `step` body (D43 clause (b)/(g)).
 //! - [`executor`] — the fixed 60 Hz tick (VC-1), which owns the guarantees a
 //!   ruleset must not have to remember: seeded RNG, post-step quantization,
 //!   neighbour-read recording.
@@ -80,6 +82,7 @@ pub mod quantize;
 pub mod replay;
 pub mod rng;
 pub mod ruleset;
+pub mod sched;
 pub mod store;
 pub mod tolerance;
 
@@ -97,6 +100,10 @@ pub use rng::{tick_rng, tick_seed, TickRng};
 pub use ruleset::{
     state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, EntityMaterialization,
     OrderedInputs, Ruleset, StateView, StepOutput,
+};
+pub use sched::{
+    run_schedule, run_system, run_system_as, Observation, Schedule, Scheduled, Stage, StageName,
+    StepCtx, System, SystemName,
 };
 pub use store::{AuthorityLog, BundleError, ClaimRecord, Retention};
 pub use tolerance::{Tolerance, ToleranceOutcome, TrajectorySample};

@@ -3,6 +3,87 @@
 //! A split is described entirely by an ordered event. Its parent records the
 //! monotone split counter in its own state, so materialization is adjudicable.
 
+/// Declare a canonical system that runs only on entities carrying `$variant`.
+///
+/// This is the projection half of an ECS query, and deliberately only that
+/// half. The runner never scans a population — it hands each system the one
+/// entity being stepped — so a rule cannot reach a neighbour it did not
+/// record, and the `match own { .. }` four-way dispatch that used to open
+/// `Ruleset::step` disappears into the table instead of being rewritten in
+/// every rule body.
+macro_rules! projected_system {
+    ($name:literal, $variant:ident, $body:path) => {
+        ::orrery_core::System {
+            name: ::orrery_core::SystemName($name),
+            run: {
+                fn run(
+                    state: &mut $crate::regolith::state::RegolithState,
+                    cx: &mut $crate::regolith::Cx<'_>,
+                ) {
+                    if let $crate::regolith::state::RegolithState::$variant(component) = state {
+                        $body(component, cx);
+                    }
+                }
+                run
+            },
+        }
+    };
+}
+
+/// A system over `&mut Craft`.
+macro_rules! craft_system {
+    ($name:literal, $body:path) => {
+        projected_system!($name, Craft, $body)
+    };
+}
+
+/// A system over `&mut Rock`.
+macro_rules! rock_system {
+    ($name:literal, $body:path) => {
+        projected_system!($name, Rock, $body)
+    };
+}
+
+/// A system over `&mut Pickup`.
+macro_rules! pickup_system {
+    ($name:literal, $body:path) => {
+        projected_system!($name, Pickup, $body)
+    };
+}
+
+/// A system over `&mut BloomDirector`.
+macro_rules! director_system {
+    ($name:literal, $body:path) => {
+        projected_system!($name, BloomDirector, $body)
+    };
+}
+
+/// A system over the whole state enum, for rules that span components.
+macro_rules! state_system {
+    ($name:literal, $body:path) => {
+        ::orrery_core::System {
+            name: ::orrery_core::SystemName($name),
+            run: $body,
+        }
+    };
+}
+
+/// Declare the one kind of system that may read a recorded neighbour.
+///
+/// An [`::orrery_core::Observation`] is the only system shape handed a
+/// `StateView`. Every other system receives `&mut RegolithState` and has
+/// nothing to read a neighbour *from* — the audited-predicate rule that
+/// `scripts/core-gates.sh` clause 5 enforces textually is enforced here by the
+/// signature as well.
+macro_rules! observation {
+    ($name:literal, $body:path) => {
+        ::orrery_core::Observation {
+            name: ::orrery_core::SystemName($name),
+            run: $body,
+        }
+    };
+}
+
 pub mod archetype;
 mod craft;
 pub mod invariants;
@@ -20,18 +101,19 @@ use orrery_compose::{
     AmbiguityDetection, CanonicalSchedule, CompatibilityManifest, ComponentCapabilities,
     ComponentSchemaId, ComponentSchemaManifest, ExecutorPolicy, GameId, ManifestFormatVersion,
     ModuleId, ModuleManifest, ModuleVersion, PersistenceCapability, ProfileId, ProjectionVersion,
-    ReplicationCapability, RollbackCapability, StateSectionId, WitnessCapability,
-    WriteAuthorityCapability,
+    ReplicationCapability, RollbackCapability, ScheduleOrderingEdge, ScheduleStageId,
+    ScheduleStageManifest, StateSectionId, SystemId, WitnessCapability, WriteAuthorityCapability,
 };
 use orrery_core::{
-    ComponentTypeId, CoreClass, EntityMaterialization, Invariant, OrderedInputs, QPos, QVel,
-    Ruleset, StateView, StepOutput, TickRng, TICK_HZ,
+    ComponentTypeId, CoreClass, EntityMaterialization, Invariant, Observation, OrderedInputs, QPos,
+    QVel, Ruleset, Schedule, Scheduled, Stage, StageName, StateView, StepCtx, StepOutput, System,
+    TickRng, TICK_HZ,
 };
 use orrery_protocol::{PersistId, RulesetId, Tick};
 use rand_core::RngCore;
 use state::{
     BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
-    PITCH_LIMIT_URAD, TAU_URAD,
+    TAU_URAD,
 };
 
 const DT: f64 = 1.0 / TICK_HZ as f64;
@@ -268,12 +350,15 @@ pub const REGOLITH_RULESET: RulesetId = RulesetId {
 
 /// Regolith's two statically linked rule domains.
 ///
-/// The table is deliberately an assembled description rather than a second
-/// dispatcher: [`Ruleset::step`] remains the sole executor entry point. The
-/// craft module owns `Craft` state and player/combat orders; the world module
-/// owns rocks, pickups, and the bloom director. Their only coupling is the
-/// existing ordered `Outcome` -> next-tick `Order` delivery channel owned by
-/// [`Game::deliver`].
+/// [`Ruleset::step`] remains the sole executor entry point; what changed is
+/// that `schedule_stages` is no longer `&[]`. Each module now names the stages
+/// whose systems it owns, and those stages hold the actual `const` tables the
+/// tick runs ([`craft::CONTROL`], [`world::RESOLUTION`], and so on) — so a
+/// module is a place rules live rather than a description of where they would
+/// live if there were anywhere to put them. The craft module owns `Craft`
+/// state and player/combat orders; the world module owns rocks, pickups, and
+/// the bloom director. Their only coupling is the existing ordered `Outcome`
+/// -> next-tick `Order` delivery channel owned by [`Game::deliver`].
 pub const REGOLITH_MODULES: &[ModuleManifest] = &[
     ModuleManifest {
         id: ModuleId("regolith.craft"),
@@ -286,7 +371,18 @@ pub const REGOLITH_MODULES: &[ModuleManifest] = &[
         events: &[orrery_compose::EventVocabularyId(
             "craft-requests-and-credit",
         )],
-        schedule_stages: &[],
+        // The audited observation stage and the claim-application stage are
+        // declared here rather than on `regolith.world` because the claims
+        // themselves are craft-originated — a cover claim names a locker, a
+        // collision claim names a craft's counterparty. `claims-apply` writes
+        // one world-owned field (a rock's overflow flag), which is why the
+        // world module declares it too.
+        schedule_stages: &[
+            STAGE_OBSERVE,
+            STAGE_CRAFT_CONTROL,
+            STAGE_CRAFT_MOTION,
+            STAGE_CLAIMS_APPLY,
+        ],
     },
     ModuleManifest {
         id: ModuleId("regolith.world"),
@@ -303,7 +399,11 @@ pub const REGOLITH_MODULES: &[ModuleManifest] = &[
         events: &[orrery_compose::EventVocabularyId(
             "world-responses-and-materialization",
         )],
-        schedule_stages: &[],
+        schedule_stages: &[
+            STAGE_WORLD_RESOLUTION,
+            STAGE_WORLD_LIFECYCLE,
+            STAGE_CLAIMS_APPLY,
+        ],
     },
 ];
 
@@ -360,13 +460,7 @@ pub const REGOLITH_COMPOSITION: CompatibilityManifest = CompatibilityManifest {
     ruleset: REGOLITH_RULESET,
     modules: REGOLITH_MODULES,
     component_schemas: REGOLITH_COMPONENT_SCHEMAS,
-    schedule: CanonicalSchedule {
-        stages: &[],
-        ordering_edges: &[],
-        ambiguities: &[],
-        ambiguity_detection: AmbiguityDetection::Error,
-        executor_policy: ExecutorPolicy::SingleThreaded,
-    },
+    schedule: REGOLITH_CANONICAL_SCHEDULE,
     canonical_constants: &[],
     projection_version: ProjectionVersion(1),
     profile_id: ProfileId("d9"),
@@ -523,47 +617,20 @@ impl Ruleset for Regolith {
     fn invariants(&self) -> &[Invariant<RegolithState>] {
         invariants::INVARIANTS
     }
+    /// Run the declared schedule.
+    ///
+    /// The tick's shape is [`REGOLITH_SCHEDULE`], not this function. What used
+    /// to live here — a four-way `match` on the state enum, a per-kind
+    /// delegation, and three tacked-on claim fix-ups — is now a `const` table
+    /// of named systems that the composition manifest declares and the
+    /// schedule digest covers (D43 clause (g)).
     fn step(
         &self,
         view: &mut StateView<'_, RegolithState>,
         inputs: &OrderedInputs<'_, Order>,
         rng: &mut TickRng,
     ) -> StepOutput<Outcome> {
-        let me = view.entity();
-        let claims = visibility::verify_claims(view, inputs);
-        let (mut state, mut events) = match view.own().clone() {
-            RegolithState::Craft(craft) => {
-                let (craft, events) = craft::step(self, me, craft, inputs, claims.collision, rng);
-                (RegolithState::Craft(craft), events)
-            }
-            RegolithState::Rock(rock) => {
-                let (rock, events) = world::step_rock(self, me, rock, inputs, rng);
-                (RegolithState::Rock(rock), events)
-            }
-            RegolithState::Pickup(pickup) => {
-                let (pickup, events) = world::step_pickup(me, pickup, inputs);
-                (RegolithState::Pickup(pickup), events)
-            }
-            RegolithState::BloomDirector(director) => {
-                let (director, events) = world::step_director(me, director, inputs, rng);
-                (RegolithState::BloomDirector(director), events)
-            }
-        };
-        if let (Some(Outcome::LockVisibility { occluded, .. }), RegolithState::Craft(craft)) =
-            (&claims.visibility, &mut state)
-        {
-            craft.last_cover_occluded = *occluded;
-        }
-        if claims.arithmetic_overflowed {
-            match &mut state {
-                RegolithState::Craft(craft) => craft.arithmetic_overflowed = true,
-                RegolithState::Rock(rock) => rock.arithmetic_overflowed = true,
-                RegolithState::Pickup(_) | RegolithState::BloomDirector(_) => {}
-            }
-        }
-        *view.own_mut() = state;
-        events.extend(claims.visibility);
-        StepOutput { events }
+        orrery_core::run_schedule(self, view, inputs, rng)
     }
     fn materialize(&self, event: &Outcome, out: &mut Vec<EntityMaterialization<RegolithState>>) {
         match event {
@@ -620,750 +687,359 @@ impl Ruleset for Regolith {
     }
 }
 
-impl Regolith {
-    pub(crate) fn step_craft(
-        &self,
-        me: PersistId,
-        own: Craft,
-        inputs: &OrderedInputs<'_, Order>,
-        collision: Option<visibility::CollisionResolution>,
-        rng: &mut TickRng,
-    ) -> (Craft, Vec<Outcome>) {
-        let mut events = Vec::new();
-        let limits = own.archetype.limits();
-        let mut equipped = own.weapon;
-        let origin = own.pos;
-        let firing_vel = own.vel;
-        let (mut px, mut py, mut pz) = own.pos.to_metres();
-        let (mut vx, mut vy, mut vz) = own.vel.to_metres_per_sec();
-        let (mut yaw, mut pitch, mut hull, mut shield) =
-            (own.yaw_urad, own.pitch_urad, own.hull, own.shield);
-        let (mut shots, mut damage_dealt, mut cooldown) =
-            (own.shots, own.damage_dealt, own.cooldown.saturating_sub(1));
-        let (mut grabs_attempted, mut pickups_won, mut grabs_lost) =
-            (own.grabs_attempted, own.pickups_won, own.grabs_lost);
-        let (mut respawn_in, mut score_rock_points, mut kills) =
-            (own.respawn_in, own.score_rock_points, own.kills);
-        let (mut lock_target, mut lock_class, mut lock_progress, mut locks_acquired) = (
-            own.lock_target,
-            own.lock_class,
-            own.lock_progress,
-            own.locks_acquired,
-        );
-        let mut collisions = own.collisions;
-        let mut trail = own.trail.clone();
-        let mut arithmetic_overflowed = own.arithmetic_overflowed;
-        let mut lock_reply = None;
-        let mut lock_decay_progress = own.lock_decay_progress;
-        let mut cover_claim_cooldown = own.cover_claim_cooldown.saturating_sub(1);
-        if lock_decay_progress > 0 {
-            lock_decay_progress = lock_decay_progress.saturating_add(LOCK_DECAY_PER_TICK);
-            if lock_decay_progress >= LOCK_ACQUISITION_TICKS {
-                lock_target = None;
-                lock_class = None;
-                lock_progress = 0;
-                lock_decay_progress = 0;
-            }
-        }
-        let was_alive = own.alive();
-        let mut disabled = !was_alive;
-        for order in inputs.iter() {
-            match order {
-                Order::Thrust { .. } | Order::Lock { .. } | Order::Fire | Order::Grab { .. }
-                    if disabled => {}
-                Order::Thrust {
-                    accel_mmss,
-                    yaw_urad,
-                    pitch_urad,
-                } => {
-                    let accel = i64::from(*accel_mmss)
-                        .clamp(0, self.movement_cap(limits.max_accel_mmss))
-                        as f64
-                        / 1_000.0;
-                    let theta = f64::from(yaw) / 1_000_000.0;
-                    let phi = f64::from(pitch) / 1_000_000.0;
-                    let horizontal = libm::cos(phi);
-                    // Thrust contributes Δv for this tick. It does not replace
-                    // velocity: repeated thrust therefore builds speed over
-                    // time until drag and the chassis ceiling balance it.
-                    let delta_vx = accel * horizontal * libm::cos(theta) * DT;
-                    let delta_vy = accel * libm::sin(phi) * DT;
-                    let delta_vz = accel * horizontal * libm::sin(theta) * DT;
-                    vx += delta_vx;
-                    vy += delta_vy;
-                    vz += delta_vz;
-                    yaw = yaw.wrapping_add(*yaw_urad).rem_euclid(TAU_URAD);
-                    pitch = pitch
-                        .saturating_add(*pitch_urad)
-                        .clamp(-PITCH_LIMIT_URAD, PITCH_LIMIT_URAD);
-                }
-                Order::Lock { target } => {
-                    match lock_target {
-                        None => {
-                            lock_target = Some(*target);
-                            lock_class = None;
-                            lock_progress = 1;
-                            lock_decay_progress = 0;
-                            events.push(Outcome::LockRequested {
-                                locker: me,
-                                target: *target,
-                            });
-                        }
-                        Some(current) if current == *target => {
-                            if lock_progress < LOCK_ACQUISITION_TICKS {
-                                lock_progress = lock_progress.saturating_add(1);
-                                if lock_progress == LOCK_ACQUISITION_TICKS && lock_class.is_some() {
-                                    locks_acquired = locks_acquired.saturating_add(1);
-                                }
-                            }
-                        }
-                        // A Lock naming a different target switches the lock,
-                        // paying acquisition again from scratch: the switch is
-                        // free to make but never cheaper than a fresh lock.
-                        Some(_) => {
-                            lock_target = Some(*target);
-                            lock_class = None;
-                            lock_progress = 1;
-                            lock_decay_progress = 0;
-                            events.push(Outcome::LockRequested {
-                                locker: me,
-                                target: *target,
-                            });
-                        }
-                    }
-                }
-                Order::LockConfirmed { target, class } => {
-                    lock_reply = Some((*target, Some(*class)));
-                }
-                Order::LockRefused { target } => {
-                    lock_reply = Some((*target, None));
-                }
-                Order::Fire => {
-                    // Orders are applied in their sealed order. A preceding Lock
-                    // therefore switches first, while a preceding Fire consumes
-                    // the lock that existed before a later switch.
-                    let Some(target) = lock_target.filter(|_| {
-                        lock_progress >= LOCK_ACQUISITION_TICKS && lock_class.is_some()
-                    }) else {
-                        events.push(Outcome::ShotRefused {
-                            attacker: me,
-                            result: ShotResult::NoLock,
-                        });
-                        continue;
-                    };
-                    let weapon = equipped.weapon();
-                    if cooldown > 0 && self.honours_cooldown() {
-                        continue;
-                    }
-                    for _ in 0..weapon.rolls {
-                        let roll = rng.next_u32() % weapon.damage_spread.max(1);
-                        let amount = self.damage(
-                            i32::try_from(weapon.damage_base.saturating_add(roll))
-                                .unwrap_or(i32::MAX),
-                        );
-                        damage_dealt =
-                            damage_dealt.saturating_add(u64::from(amount.unsigned_abs()));
-                        events.push(Outcome::DamageDealt {
-                            attacker: me,
-                            target,
-                            amount,
-                            attacker_pos: origin,
-                            attacker_vel: firing_vel,
-                            attacker_yaw_urad: yaw,
-                            attacker_archetype: own.archetype,
-                            attacker_weapon: equipped,
-                            flight_ticks: None,
-                        });
-                    }
-                    shots = shots.saturating_add(1);
-                    cooldown = weapon.cooldown_ticks;
-                }
-                Order::LockRequested { locker } => {
-                    if hull > 0 {
-                        events.push(Outcome::LockConfirmed {
-                            locker: *locker,
-                            target: me,
-                            class: LockClass::Ship,
-                        });
-                    } else {
-                        events.push(Outcome::LockRefused {
-                            locker: *locker,
-                            target: me,
-                        });
-                    }
-                }
-                Order::Damage {
-                    amount,
-                    from,
-                    from_pos,
-                    from_vel,
-                    from_yaw_urad,
-                    from_archetype,
-                    from_weapon,
-                    flight_ticks,
-                } => {
-                    match projectile_resolution(
-                        origin,
-                        own.vel,
-                        limits.radius_mm,
-                        was_alive && !disabled,
-                        *from_pos,
-                        *from_vel,
-                        *from_yaw_urad,
-                        *from_archetype,
-                        *from_weapon,
-                        *flight_ticks,
-                        rng,
-                    ) {
-                        ProjectileResolution::InFlight(ticks) => {
-                            events.push(Outcome::DamageDealt {
-                                attacker: *from,
-                                target: me,
-                                amount: *amount,
-                                attacker_pos: *from_pos,
-                                attacker_vel: *from_vel,
-                                attacker_yaw_urad: *from_yaw_urad,
-                                attacker_archetype: *from_archetype,
-                                attacker_weapon: *from_weapon,
-                                flight_ticks: Some(ticks),
-                            });
-                            continue;
-                        }
-                        ProjectileResolution::Miss => {
-                            events.push(Outcome::ShotResolved {
-                                attacker: *from,
-                                target: me,
-                                result: ShotResult::Miss,
-                            });
-                            continue;
-                        }
-                        ProjectileResolution::OutOfArc => {
-                            events.push(Outcome::ShotResolved {
-                                attacker: *from,
-                                target: me,
-                                result: ShotResult::OutOfArc,
-                            });
-                            continue;
-                        }
-                        ProjectileResolution::Break(reason) => {
-                            events.push(Outcome::LockBroken {
-                                locker: *from,
-                                target: me,
-                                reason,
-                            });
-                            continue;
-                        }
-                        ProjectileResolution::Hit => {
-                            events.push(Outcome::ShotResolved {
-                                attacker: *from,
-                                target: me,
-                                result: ShotResult::Hit,
-                            });
-                        }
-                    }
-                    let incoming = (*amount).max(0);
-                    let absorbed = incoming.min(shield.max(0));
-                    shield -= absorbed;
-                    let through = incoming - absorbed;
-                    if through > 0 && hull > 0 {
-                        hull = (hull - through).max(0);
-                        if hull == 0 {
-                            disabled = true;
-                            respawn_in = RESPAWN_TICKS;
-                            events.push(Outcome::Destroyed { by: *from });
-                            events.push(Outcome::LockBroken {
-                                locker: *from,
-                                target: me,
-                                reason: LockBreakReason::TargetDestroyed,
-                            });
-                        }
-                    }
-                }
-                Order::Grab { pickup } => {
-                    grabs_attempted = grabs_attempted.saturating_add(1);
-                    events.push(Outcome::GrabAttempted {
-                        pickup: *pickup,
-                        ship: me,
-                        ship_pos: origin,
-                    });
-                }
-                Order::PickupGranted { kind } => {
-                    // This write is the durable inventory trace: the pickup
-                    // decided the outcome, then delivery brought it home.
-                    equipped = *kind;
-                    pickups_won = pickups_won.saturating_add(1);
-                }
-                Order::PickupDenied => {
-                    grabs_lost = grabs_lost.saturating_add(1);
-                }
-                Order::KillCredit => kills = kills.saturating_add(1),
-                Order::RockCredit { points } => {
-                    score_rock_points = score_rock_points.saturating_add(u64::from(*points));
-                }
-                Order::LockBroken { target, reason: _ } => {
-                    if lock_target == Some(*target) {
-                        lock_target = None;
-                        lock_class = None;
-                        lock_progress = 0;
-                        lock_decay_progress = 0;
-                    }
-                }
-                Order::LockVisibility { target, occluded } => {
-                    if lock_target == Some(*target) && lock_progress == LOCK_ACQUISITION_TICKS {
-                        if *occluded {
-                            if lock_decay_progress == 0 {
-                                lock_decay_progress = LOCK_DECAY_PER_TICK;
-                            }
-                        } else {
-                            lock_decay_progress = 0;
-                            lock_progress = LOCK_ACQUISITION_TICKS;
-                        }
-                    }
-                }
-                Order::CollisionResolved { from: _, velocity } => {
-                    if velocity_within_limit(*velocity, limits.max_speed_mms) {
-                        vx = velocity.x as f64 / 1_000.0;
-                        vy = velocity.y as f64 / 1_000.0;
-                        vz = velocity.z as f64 / 1_000.0;
-                        collisions = collisions.saturating_add(1);
-                    }
-                }
-                Order::Collide { other }
-                    if collision.is_some_and(|resolution| resolution.other == *other) =>
-                {
-                    let resolution = collision.expect("guarded by the matching resolution");
-                    // One exchange is adjudicated twice, but its force is computed
-                    // once: this step applies the resolver's own velocity and the
-                    // event carries its counterparty's. Keeping this arm in the
-                    // sealed-order loop is the physical meaning of D46(d). A
-                    // prior-tick CollisionResolved is delivered first and applies
-                    // before this authored contact; reversing host composition
-                    // reverses which mutually applied force is observed last.
-                    vx = resolution.own_velocity.x as f64 / 1_000.0;
-                    vy = resolution.own_velocity.y as f64 / 1_000.0;
-                    vz = resolution.own_velocity.z as f64 / 1_000.0;
-                    collisions = collisions.saturating_add(1);
-                    events.push(Outcome::Collision {
-                        collider: me,
-                        target: resolution.other,
-                        target_velocity: resolution.target_velocity,
-                    });
-                }
-                Order::ClaimCover { .. } => {
-                    if cover_claim_cooldown == 0 {
-                        cover_claim_cooldown = COVER_CLAIM_INTERVAL_TICKS;
-                    }
-                }
-                Order::GrabAttempt { .. }
-                | Order::BloomPopulationChanged { .. }
-                | Order::ShotResolved { .. }
-                | Order::Collide { .. } => {}
-            }
-        }
-        if let Some((target, class)) = lock_reply {
-            if lock_target == Some(target) {
-                match class {
-                    Some(class) if lock_class.is_none() => {
-                        lock_class = Some(class);
-                        if lock_progress == LOCK_ACQUISITION_TICKS {
-                            locks_acquired = locks_acquired.saturating_add(1);
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        lock_target = None;
-                        lock_class = None;
-                        lock_progress = 0;
-                        lock_decay_progress = 0;
-                    }
-                }
-            }
-        }
-        let speed = libm::sqrt(vx * vx + vy * vy + vz * vz);
-        let ceiling = self.movement_cap(limits.max_speed_mms) as f64 / 1_000.0;
-        if speed > ceiling && speed > 0.0 {
-            let scale = ceiling / speed;
-            vx *= scale;
-            vy *= scale;
-            vz *= scale;
-        }
-        let retained = 1.0 - DRAG_PER_SEC * DT;
-        vx *= retained;
-        vy *= retained;
-        vz *= retained;
-        px += vx * DT;
-        py += vy * DT;
-        pz += vz * DT;
-        let mut respawned = false;
-        if !was_alive && hull == 0 && respawn_in > 0 {
-            respawn_in -= 1;
-            if respawn_in == 0 {
-                let (spawn_pos, spawn_yaw) = spawn_pose(me.0.saturating_sub(1));
-                px = spawn_pos.x as f64 / 1_000.0;
-                py = spawn_pos.y as f64 / 1_000.0;
-                pz = spawn_pos.z as f64 / 1_000.0;
-                vx = 0.0;
-                vy = 0.0;
-                vz = 0.0;
-                yaw = spawn_yaw;
-                pitch = 0;
-                hull = limits.max_hull;
-                shield = limits.max_shield;
-                cooldown = 0;
-                equipped = weapon::WeaponKind::Stock;
-                lock_target = None;
-                lock_class = None;
-                lock_progress = 0;
-                lock_decay_progress = 0;
-                cover_claim_cooldown = 0;
-                respawned = true;
-            }
-        }
-        let next_pos = QPos::from_metres(px, py, pz);
-        let next_vel = QVel::from_metres_per_sec(vx, vy, vz);
-        if hull == 0 || respawned {
-            // A wreck has no engine trail, and a respawn must not draw one
-            // enormous segment from the wreck to the new spawn position.
-            trail.clear();
-        } else {
-            trail.advance(next_pos, &mut arithmetic_overflowed);
-        }
-        let next = Craft {
-            weapon: equipped,
-            pos: next_pos,
-            vel: next_vel,
-            trail,
-            yaw_urad: yaw,
-            pitch_urad: pitch,
-            hull,
-            shield,
-            cooldown,
-            shots,
-            damage_dealt,
-            grabs_attempted,
-            pickups_won,
-            grabs_lost,
-            respawn_in,
-            score_rock_points,
-            kills,
-            lock_target,
-            lock_class,
-            lock_progress,
-            locks_acquired,
-            lock_decay_progress,
-            cover_claim_cooldown,
-            collisions,
-            arithmetic_overflowed,
-            ..own
-        };
-        (next, events)
-    }
-    pub(crate) fn step_rock(
-        &self,
-        me: PersistId,
-        mut rock: Rock,
-        inputs: &OrderedInputs<'_, Order>,
-        rng: &mut TickRng,
-    ) -> (Rock, Vec<Outcome>) {
-        let mut events = Vec::new();
-        let origin = rock.pos;
-        let mut killer = None;
-        if rock.hull > 0 {
-            for order in inputs.iter() {
-                match order {
-                    Order::LockRequested { locker } => {
-                        events.push(Outcome::LockConfirmed {
-                            locker: *locker,
-                            target: me,
-                            class: LockClass::Rock,
-                        });
-                    }
-                    Order::Damage {
-                        amount,
-                        from,
-                        from_pos,
-                        from_vel,
-                        from_yaw_urad,
-                        from_archetype,
-                        from_weapon,
-                        flight_ticks,
-                    } => match projectile_resolution(
-                        origin,
-                        rock.vel,
-                        rock.tier.limits().radius_mm,
-                        rock.hull > 0,
-                        *from_pos,
-                        *from_vel,
-                        *from_yaw_urad,
-                        *from_archetype,
-                        *from_weapon,
-                        *flight_ticks,
-                        rng,
-                    ) {
-                        ProjectileResolution::InFlight(ticks) => {
-                            events.push(Outcome::DamageDealt {
-                                attacker: *from,
-                                target: me,
-                                amount: *amount,
-                                attacker_pos: *from_pos,
-                                attacker_vel: *from_vel,
-                                attacker_yaw_urad: *from_yaw_urad,
-                                attacker_archetype: *from_archetype,
-                                attacker_weapon: *from_weapon,
-                                flight_ticks: Some(ticks),
-                            });
-                        }
-                        ProjectileResolution::Hit => {
-                            events.push(Outcome::ShotResolved {
-                                attacker: *from,
-                                target: me,
-                                result: ShotResult::Hit,
-                            });
-                            rock.hull = (rock.hull - (*amount).max(0)).max(0);
-                            if rock.hull == 0 {
-                                killer = Some(*from);
-                            }
-                        }
-                        ProjectileResolution::OutOfArc => {
-                            events.push(Outcome::ShotResolved {
-                                attacker: *from,
-                                target: me,
-                                result: ShotResult::OutOfArc,
-                            });
-                        }
-                        ProjectileResolution::Break(reason) => {
-                            events.push(Outcome::LockBroken {
-                                locker: *from,
-                                target: me,
-                                reason,
-                            });
-                        }
-                        ProjectileResolution::Miss => {
-                            events.push(Outcome::ShotResolved {
-                                attacker: *from,
-                                target: me,
-                                result: ShotResult::Miss,
-                            });
-                        }
-                    },
-                    Order::CollisionResolved { from: _, velocity }
-                        if velocity_within_limit(*velocity, rock.tier.limits().max_speed_mms) =>
-                    {
-                        rock.vel = *velocity;
-                        rock.collisions = rock.collisions.saturating_add(1);
-                    }
-                    _ => {}
-                }
-            }
-            if rock.hull == 0 {
-                if let Some(child_tier) = rock.tier.child() {
-                    let children = split_children(me, &rock, child_tier, rng);
-                    events.push(Outcome::Split {
-                        parent: me,
-                        generation: rock.generation,
-                        children,
-                    });
-                    rock.splits_done = rock.splits_done.saturating_add(1);
-                    if let Some(bloom) = rock.bloom {
-                        events.push(Outcome::BloomPopulationChanged {
-                            director: bloom.director,
-                            bloom_index: bloom.bloom_index,
-                            delta: 1,
-                        });
-                    }
-                } else {
-                    let threshold = if rock.born_in_bloom { 50 } else { 25 };
-                    if uniform_percent(rng) < threshold {
-                        let kind = if rng.next_u32() & 1 == 0 {
-                            weapon::WeaponKind::Volley
-                        } else {
-                            weapon::WeaponKind::Heavy
-                        };
-                        events.push(Outcome::SpawnPickup {
-                            id: pickup_id(me),
-                            pos: rock.pos,
-                            kind,
-                            expires_at: PICKUP_TTL_TICKS,
-                        });
-                        rock.pickups_dropped = rock.pickups_dropped.saturating_add(1);
-                    }
-                    if let Some(bloom) = rock.bloom {
-                        events.push(Outcome::BloomPopulationChanged {
-                            director: bloom.director,
-                            bloom_index: bloom.bloom_index,
-                            delta: -1,
-                        });
-                    }
-                }
-                if let Some(by) = killer {
-                    events.push(Outcome::RockDestroyed {
-                        by,
-                        points: rock.tier.limits().points,
-                    });
-                    events.push(Outcome::LockBroken {
-                        locker: by,
-                        target: me,
-                        reason: LockBreakReason::TargetDestroyed,
-                    });
-                }
-            }
-        } else {
-            for order in inputs.iter() {
-                match order {
-                    Order::Damage { from, .. } => events.push(Outcome::LockBroken {
-                        locker: *from,
-                        target: me,
-                        reason: LockBreakReason::TargetDestroyed,
-                    }),
-                    Order::LockRequested { locker } => events.push(Outcome::LockRefused {
-                        locker: *locker,
-                        target: me,
-                    }),
-                    _ => {}
-                }
-            }
-        }
-        if rock.hull > 0 {
-            rock.pos.x = flagged_add(
-                rock.pos.x,
-                rock.vel.x / i64::from(TICK_HZ),
-                &mut rock.arithmetic_overflowed,
-            );
-            rock.pos.y = flagged_add(
-                rock.pos.y,
-                rock.vel.y / i64::from(TICK_HZ),
-                &mut rock.arithmetic_overflowed,
-            );
-            rock.pos.z = flagged_add(
-                rock.pos.z,
-                rock.vel.z / i64::from(TICK_HZ),
-                &mut rock.arithmetic_overflowed,
-            );
-            if rock.pos.x.unsigned_abs() > ISLAND_BOUNDARY_MM as u64 {
-                rock.vel.x = flagged_neg(rock.vel.x, &mut rock.arithmetic_overflowed);
-            }
-            if rock.pos.y.unsigned_abs() > ISLAND_BOUNDARY_MM as u64 {
-                rock.vel.y = flagged_neg(rock.vel.y, &mut rock.arithmetic_overflowed);
-            }
-            if rock.pos.z.unsigned_abs() > ISLAND_BOUNDARY_MM as u64 {
-                rock.vel.z = flagged_neg(rock.vel.z, &mut rock.arithmetic_overflowed);
-            }
-        }
-        (rock, events)
-    }
+// ── the canonical schedule ──────────────────────────────────────────────
 
-    pub(crate) fn step_pickup(
-        me: PersistId,
-        mut pickup: Pickup,
-        inputs: &OrderedInputs<'_, Order>,
-    ) -> (Pickup, Vec<Outcome>) {
-        let mut events = Vec::new();
-        if pickup.claimed_by.is_none() && !pickup.expired {
-            pickup.ttl_remaining = pickup.ttl_remaining.saturating_sub(1);
-            if pickup.ttl_remaining == 0 {
-                pickup.expired = true;
-                events.push(Outcome::Expired { id: me });
-            }
-        }
-        for order in inputs.iter() {
-            match order {
-                Order::GrabAttempt { ship, ship_pos } => {
-                    let eligible = pickup.claimed_by.is_none()
-                        && !pickup.expired
-                        && within_grab_reach(pickup.pos, *ship_pos);
-                    if eligible {
-                        pickup.claimed_by = Some(*ship);
-                        pickup.claimed_at =
-                            Some(pickup.expires_at.saturating_sub(pickup.ttl_remaining));
-                        events.push(Outcome::Granted {
-                            ship: *ship,
-                            kind: pickup.kind,
-                        });
-                    } else {
-                        events.push(Outcome::Denied { ship: *ship });
-                    }
-                }
-                Order::LockRequested { locker } => events.push(Outcome::LockRefused {
-                    locker: *locker,
-                    target: me,
-                }),
-                _ => {}
-            }
-        }
-        (pickup, events)
-    }
+/// Everything one entity's systems share for the length of one tick.
+///
+/// This is the whole of what a Regolith rule may carry between systems, and
+/// it is deliberately small. The 440-line `step_craft` it replaces opened by
+/// destructuring **twenty-eight** fields of `Craft` into `let mut` locals and
+/// closed by naming twenty-five of them again in a struct literal with a
+/// `..own` fallthrough — a shape in which forgetting a field silently retains
+/// last tick's value and nothing complains. Systems mutate `&mut Craft` in
+/// place, so all twenty-eight are gone; what is left here is exactly the state
+/// that genuinely cannot live in the component:
+///
+/// * the **unquantized kinematic window** (VC-7), because position and
+///   velocity must survive four systems in metres before they rejoin the
+///   lattice, and
+/// * three **tick-start premises** — was this craft alive, did it respawn,
+///   what did a lock target answer — that later systems must read as of the
+///   start of the tick rather than as of now.
+///
+/// It is reset to [`Default`] at the top of every entity's tick, never carried
+/// between entities or between ticks. Carrying it would be state outside the
+/// closed input set.
+#[derive(Debug, Default)]
+pub struct RegolithLocals {
+    claims: visibility::VerifiedClaims,
+    craft: CraftScratch,
+    rock: RockScratch,
+}
 
-    pub(crate) fn step_director(
-        me: PersistId,
-        mut director: BloomDirector,
-        inputs: &OrderedInputs<'_, Order>,
-        rng: &mut TickRng,
-    ) -> (BloomDirector, Vec<Outcome>) {
-        let mut events = Vec::new();
-        for input in inputs {
-            if let Order::LockRequested { locker } = input {
-                events.push(Outcome::LockRefused {
-                    locker: *locker,
-                    target: me,
-                });
-                continue;
-            }
-            let Order::BloomPopulationChanged { bloom_index, delta } = input else {
-                continue;
-            };
-            let current_index = director.blooms_seeded.checked_sub(1);
-            if current_index != Some(*bloom_index) || director.site_pos.is_none() {
-                continue;
-            }
-            director.site_rocks_alive = if *delta < 0 {
-                director
-                    .site_rocks_alive
-                    .saturating_sub(delta.unsigned_abs().into())
-            } else {
-                director
-                    .site_rocks_alive
-                    .saturating_add(u16::try_from(*delta).unwrap_or(0))
-                    .min(BLOOM_MAX_LIVE_ROCKS)
-            };
-            if director.site_rocks_alive == 0 {
-                director.site_pos = None;
-                director.site_active_until = None;
-            }
-        }
+/// A craft's tick-scoped scratch. See [`RegolithLocals`].
+#[derive(Debug, Default)]
+pub(crate) struct CraftScratch {
+    /// Position in metres, unquantized, between load and store.
+    pub(crate) pos_m: [f64; 3],
+    /// Velocity in metres per second, unquantized, between load and store.
+    pub(crate) vel_mps: [f64; 3],
+    /// Hull was positive when the tick began.
+    pub(crate) was_alive: bool,
+    /// The wreck countdown completed this tick.
+    pub(crate) respawned: bool,
+    /// A target's answer to a lock request, settled after the sealed inputs.
+    pub(crate) lock_reply: Option<(PersistId, Option<LockClass>)>,
+}
 
-        director.clock_tick = director.clock_tick.saturating_add(1);
-        if director
-            .site_active_until
-            .is_some_and(|until| director.clock_tick >= until)
-        {
-            director.site_pos = None;
-            director.site_active_until = None;
-            director.site_rocks_alive = 0;
-        }
+/// A rock's tick-scoped scratch. See [`RegolithLocals`].
+#[derive(Debug, Default)]
+pub(crate) struct RockScratch {
+    /// Hull was positive when the tick began.
+    pub(crate) was_alive: bool,
+    /// Who landed the shot that took the hull to zero this tick.
+    pub(crate) killer: Option<PersistId>,
+}
 
-        if director.clock_tick >= director.next_bloom_tick {
-            let bloom_index = director.blooms_seeded;
-            let site_pos = draw_bloom_site(rng);
-            let active_until = director.clock_tick.saturating_add(BLOOM_LIFETIME_TICKS);
-            let rocks = Box::new(core::array::from_fn(|slot| {
-                bloom_spec(me, bloom_index, slot, site_pos, rng)
-            }));
-            events.push(Outcome::BloomSeeded {
-                director: me,
-                bloom_index,
-                site_pos,
-                active_until,
-                rocks,
-            });
-            director.blooms_seeded = director.blooms_seeded.saturating_add(1);
-            director.next_bloom_tick = director.next_bloom_tick.saturating_add(BLOOM_CADENCE_TICKS);
-            director.site_pos = Some(site_pos);
-            director.site_active_until = Some(active_until);
-            director.site_rocks_alive = BLOOM_ROCK_COUNT;
-        }
-        (director, events)
+/// The context every Regolith system receives beside its own component.
+pub(crate) type Cx<'a> = StepCtx<'a, Regolith, RegolithLocals>;
+
+/// Read the recorded neighbour frames this tick's claims need.
+///
+/// The single audited read site, unchanged from what
+/// `scripts/core-gates.sh` clause 5 already names. It is an
+/// [`orrery_core::Observation`] rather than a [`orrery_core::System`] because
+/// observations are the only system shape that receives a [`StateView`] —
+/// which is what makes "a rule cannot read a neighbour" a fact about the
+/// signature rather than a fact about a text scan.
+fn observe_claims(
+    view: &mut StateView<'_, RegolithState>,
+    inputs: &OrderedInputs<'_, Order>,
+    locals: &mut RegolithLocals,
+) {
+    locals.claims = visibility::verify_claims(view, inputs);
+}
+
+/// Record the cover claim's verdict in the locking craft's own state.
+fn apply_cover_claim(craft: &mut state::Craft, cx: &mut Cx<'_>) {
+    if let Some(Outcome::LockVisibility { occluded, .. }) = &cx.locals.claims.visibility {
+        craft.last_cover_occluded = *occluded;
     }
 }
+
+/// Carry an overflow seen inside the audited predicate into own state.
+fn propagate_claim_overflow(state: &mut RegolithState, cx: &mut Cx<'_>) {
+    if !cx.locals.claims.arithmetic_overflowed {
+        return;
+    }
+    match state {
+        RegolithState::Craft(craft) => craft.arithmetic_overflowed = true,
+        RegolithState::Rock(rock) => rock.arithmetic_overflowed = true,
+        RegolithState::Pickup(_) | RegolithState::BloomDirector(_) => {}
+    }
+}
+
+/// Emit the visibility outcome last, after every module event.
+fn emit_visibility_outcome(_state: &mut RegolithState, cx: &mut Cx<'_>) {
+    if let Some(outcome) = cx.locals.claims.visibility.take() {
+        cx.emit(outcome);
+    }
+}
+
+/// The audited observation stage.
+const OBSERVE: &[Observation<Regolith, RegolithLocals>] =
+    &[observation!("verify-claims", observe_claims)];
+
+/// The stage that folds verified claims back into own state.
+const CLAIMS_APPLY: &[System<Regolith, RegolithLocals>] = &[
+    craft_system!("craft-apply-cover-claim", apply_cover_claim),
+    state_system!("propagate-claim-overflow", propagate_claim_overflow),
+    state_system!("emit-visibility-outcome", emit_visibility_outcome),
+];
+
+/// Regolith's canonical tick, as data.
+///
+/// This table **is** the tick. Reading it top to bottom is the whole answer to
+/// "what happens in a Regolith tick, and in what order" — a question that
+/// previously required reading 440 lines of `step_craft` and inferring the
+/// order from statement sequence. Reordering two entries here is a canonical
+/// change, and unlike a statement swap inside one function it moves the
+/// schedule digest, which is exactly what D43 clause (g) asks a digest to
+/// catch: topology drift that state goldens cannot see.
+pub static REGOLITH_SCHEDULE: Schedule<Regolith, RegolithLocals> = Schedule {
+    observe_stage: StageName(STAGE_OBSERVE.0),
+    observe: OBSERVE,
+    stages: &[
+        Stage {
+            name: StageName(STAGE_CRAFT_CONTROL.0),
+            systems: craft::CONTROL,
+        },
+        Stage {
+            name: StageName(STAGE_CRAFT_MOTION.0),
+            systems: craft::MOTION,
+        },
+        Stage {
+            name: StageName(STAGE_WORLD_RESOLUTION.0),
+            systems: world::RESOLUTION,
+        },
+        Stage {
+            name: StageName(STAGE_WORLD_LIFECYCLE.0),
+            systems: world::LIFECYCLE,
+        },
+        Stage {
+            name: StageName(STAGE_CLAIMS_APPLY.0),
+            systems: CLAIMS_APPLY,
+        },
+    ],
+};
+
+impl Scheduled for Regolith {
+    type Locals = RegolithLocals;
+    fn schedule(&self) -> &'static Schedule<Self, RegolithLocals> {
+        &REGOLITH_SCHEDULE
+    }
+}
+
+/// The audited neighbour-reading stage.
+pub const STAGE_OBSERVE: ScheduleStageId = ScheduleStageId("observe");
+/// Craft cooldowns, locks and the sealed-input loop.
+pub const STAGE_CRAFT_CONTROL: ScheduleStageId = ScheduleStageId("craft-control");
+/// The craft's unquantized kinematic window and its close.
+pub const STAGE_CRAFT_MOTION: ScheduleStageId = ScheduleStageId("craft-motion");
+/// Rock, pickup and director rules driven by sealed inputs.
+pub const STAGE_WORLD_RESOLUTION: ScheduleStageId = ScheduleStageId("world-resolution");
+/// Rock drift and the bloom cadence.
+pub const STAGE_WORLD_LIFECYCLE: ScheduleStageId = ScheduleStageId("world-lifecycle");
+/// Folding verified claims back into own state.
+pub const STAGE_CLAIMS_APPLY: ScheduleStageId = ScheduleStageId("claims-apply");
+
+/// D43 clause (g)'s pinned schedule digest.
+///
+/// Recomputed by `schedule_tests::the_schedule_digest_is_pinned`. Moving a
+/// system, renaming one, or changing an ordering edge moves this value, and
+/// that is the point: state goldens hash states, not graphs, so a reorder that
+/// happens not to change any pinned chain is otherwise invisible.
+pub const REGOLITH_SCHEDULE_DIGEST: [u8; 32] = [
+    0x2c, 0xdb, 0x2f, 0x33, 0xce, 0xc3, 0x0e, 0xd5, 0x06, 0xc1, 0xda, 0xfe, 0xee, 0xe3, 0xf1, 0x57,
+    0x4b, 0x2e, 0x8d, 0x37, 0x32, 0x61, 0xeb, 0x3d, 0x0b, 0xef, 0xda, 0xe9, 0x94, 0x84, 0xb3, 0x64,
+];
+
+/// The declared schedule topology D43 clause (g) digests.
+///
+/// This is the manifest's statement of what
+/// [`REGOLITH_SCHEDULE`] runs. It is written out rather than derived because
+/// `CanonicalSchedule` is a `const` of `&'static` slices and the runnable
+/// table holds function pointers; deriving one from the other in a `const`
+/// context is not expressible today. The two are held together by
+/// [`schedule_tests::the_declared_schedule_matches_the_table_that_runs`],
+/// which fails on any drift in either direction — the same
+/// declared-plus-asserted shape `REGOLITH_COMPONENT_SCHEMAS` already uses
+/// against the reviewed registry.
+///
+/// **On `ambiguities: &[]`.** D43 clause (c)(1) requires composition to reject
+/// an ambiguous schedule. Regolith declares none because it can have none:
+/// [`REGOLITH_SCHEDULE`] is a list, so every pair of systems is already totally
+/// ordered, and [`ExecutorPolicy::SingleThreaded`] runs them in exactly that
+/// order. Ambiguity is a property of a schedule expressed as constraints to be
+/// solved; this one is expressed as the solution. The rejector itself is
+/// proven awake in both directions by `orrery_compose`'s own tests, which
+/// initialize the real manifest `Ok` and an `ambiguities`-bearing fixture
+/// `Err`.
+///
+/// **On `ordering_edges`, honestly.** These are the load-bearing edges: the
+/// ones where swapping two systems changes canonical output. D43 clause (c)(1)
+/// asks for an explicit edge on *every* pair with conflicting data access,
+/// derived mechanically; that derivation needs per-system data-access
+/// declarations, which this design does not yet carry. What is here is a
+/// hand-written subset, checked against the runnable order rather than
+/// asserted.
+pub const REGOLITH_CANONICAL_SCHEDULE: CanonicalSchedule = CanonicalSchedule {
+    stages: REGOLITH_SCHEDULE_STAGES,
+    ordering_edges: REGOLITH_SCHEDULE_EDGES,
+    ambiguities: &[],
+    ambiguity_detection: AmbiguityDetection::Error,
+    executor_policy: ExecutorPolicy::SingleThreaded,
+};
+
+/// The declared stage table. See [`REGOLITH_CANONICAL_SCHEDULE`].
+pub const REGOLITH_SCHEDULE_STAGES: &[ScheduleStageManifest] = &[
+    ScheduleStageManifest {
+        id: STAGE_OBSERVE,
+        systems: &[SystemId("verify-claims")],
+    },
+    ScheduleStageManifest {
+        id: STAGE_CRAFT_CONTROL,
+        systems: &[
+            SystemId("craft-tick-cooldowns"),
+            SystemId("craft-decay-lock"),
+            SystemId("craft-load-kinematics"),
+            SystemId("craft-apply-orders"),
+            SystemId("craft-resolve-lock-reply"),
+        ],
+    },
+    ScheduleStageManifest {
+        id: STAGE_CRAFT_MOTION,
+        systems: &[
+            SystemId("craft-clamp-speed"),
+            SystemId("craft-apply-drag"),
+            SystemId("craft-integrate"),
+            SystemId("craft-respawn"),
+            SystemId("craft-store-kinematics"),
+            SystemId("craft-advance-trail"),
+        ],
+    },
+    ScheduleStageManifest {
+        id: STAGE_WORLD_RESOLUTION,
+        systems: &[
+            SystemId("rock-load"),
+            SystemId("rock-resolve-orders"),
+            SystemId("rock-resolve-destruction"),
+            SystemId("rock-refuse-when-dead"),
+            SystemId("pickup-expire"),
+            SystemId("pickup-contest"),
+            SystemId("bloom-apply-population"),
+        ],
+    },
+    ScheduleStageManifest {
+        id: STAGE_WORLD_LIFECYCLE,
+        systems: &[
+            SystemId("rock-drift"),
+            SystemId("bloom-advance-clock"),
+            SystemId("bloom-expire-site"),
+            SystemId("bloom-seed"),
+        ],
+    },
+    ScheduleStageManifest {
+        id: STAGE_CLAIMS_APPLY,
+        systems: &[
+            SystemId("craft-apply-cover-claim"),
+            SystemId("propagate-claim-overflow"),
+            SystemId("emit-visibility-outcome"),
+        ],
+    },
+];
+
+/// The declared ordering edges. See [`REGOLITH_CANONICAL_SCHEDULE`].
+pub const REGOLITH_SCHEDULE_EDGES: &[ScheduleOrderingEdge] = &[
+    // A collision claim must be verified against a recorded frame before the
+    // sealed-input loop is allowed to apply either body's force.
+    ScheduleOrderingEdge {
+        before: SystemId("verify-claims"),
+        after: SystemId("craft-apply-orders"),
+    },
+    // The unquantized window opens before anything writes into it and closes
+    // after the last writer. This pair is VC-7's tick boundary, stated.
+    ScheduleOrderingEdge {
+        before: SystemId("craft-load-kinematics"),
+        after: SystemId("craft-apply-orders"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("craft-apply-orders"),
+        after: SystemId("craft-resolve-lock-reply"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("craft-clamp-speed"),
+        after: SystemId("craft-apply-drag"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("craft-apply-drag"),
+        after: SystemId("craft-integrate"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("craft-integrate"),
+        after: SystemId("craft-store-kinematics"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("craft-respawn"),
+        after: SystemId("craft-store-kinematics"),
+    },
+    // The trail samples the *stored* position, so a respawn cannot draw one
+    // enormous segment from the wreck to the new spawn point.
+    ScheduleOrderingEdge {
+        before: SystemId("craft-store-kinematics"),
+        after: SystemId("craft-advance-trail"),
+    },
+    // A rock's tick-start hull is the premise of both branches below it.
+    ScheduleOrderingEdge {
+        before: SystemId("rock-load"),
+        after: SystemId("rock-resolve-orders"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("rock-load"),
+        after: SystemId("rock-refuse-when-dead"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("rock-resolve-orders"),
+        after: SystemId("rock-resolve-destruction"),
+    },
+    // A rock destroyed this tick does not drift.
+    ScheduleOrderingEdge {
+        before: SystemId("rock-resolve-destruction"),
+        after: SystemId("rock-drift"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("pickup-expire"),
+        after: SystemId("pickup-contest"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("bloom-apply-population"),
+        after: SystemId("bloom-advance-clock"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("bloom-advance-clock"),
+        after: SystemId("bloom-expire-site"),
+    },
+    ScheduleOrderingEdge {
+        before: SystemId("bloom-expire-site"),
+        after: SystemId("bloom-seed"),
+    },
+    // The cover verdict is read into own state before it is consumed as an
+    // emitted outcome.
+    ScheduleOrderingEdge {
+        before: SystemId("craft-apply-cover-claim"),
+        after: SystemId("emit-visibility-outcome"),
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectileResolution {
@@ -2157,6 +1833,329 @@ mod composition_tests {
             "REGOLITH_COMPOSITION.component_schemas must state exactly the \
              reviewed (ComponentTypeId, SchemaVersion) rows in \
              orrery_compose::registry::regolith::COMPONENT_TYPE_IDS"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::{
+        REGOLITH_CANONICAL_SCHEDULE, REGOLITH_COMPOSITION, REGOLITH_MODULES, REGOLITH_SCHEDULE,
+        REGOLITH_SCHEDULE_DIGEST,
+    };
+    use orrery_compose::{schedule_digest, ScheduleStageId, SystemId};
+
+    /// The manifest is a *declaration*; this is what makes it mean something.
+    ///
+    /// `CanonicalSchedule` is what ships to a peer and what the digest covers,
+    /// but the thing that actually runs is `REGOLITH_SCHEDULE`'s table of
+    /// function pointers. Nothing in the language holds them together, so a
+    /// system inserted in the runnable table and forgotten in the manifest
+    /// would leave every other test green while the digest asserted a topology
+    /// that had not existed since the edit. Both directions are compared,
+    /// stage by stage and system by system, in order.
+    #[test]
+    fn the_declared_schedule_matches_the_table_that_runs() {
+        let running: Vec<(String, Vec<String>)> = REGOLITH_SCHEDULE
+            .stages_with_systems()
+            .into_iter()
+            .map(|(stage, systems)| {
+                (
+                    stage.0.to_owned(),
+                    systems.into_iter().map(|s| s.0.to_owned()).collect(),
+                )
+            })
+            .collect();
+        let declared: Vec<(String, Vec<String>)> = REGOLITH_CANONICAL_SCHEDULE
+            .stages
+            .iter()
+            .map(|stage| {
+                (
+                    stage.id.0.to_owned(),
+                    stage.systems.iter().map(|s| s.0.to_owned()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            running, declared,
+            "REGOLITH_CANONICAL_SCHEDULE must state exactly the stages and \
+             systems REGOLITH_SCHEDULE runs, in order"
+        );
+    }
+
+    /// A name that appears twice makes an ordering edge ambiguous and the
+    /// digest a statement about something that does not exist.
+    #[test]
+    fn every_system_name_is_unique() {
+        assert_eq!(REGOLITH_SCHEDULE.duplicate_system_name(), None);
+    }
+
+    /// Every declared ordering edge is satisfied by the order that runs.
+    ///
+    /// D43 clause (c)(1) asks that conflicting systems carry explicit edges.
+    /// The declared set is a hand-written subset — see
+    /// `REGOLITH_CANONICAL_SCHEDULE` — but a declared edge that the runnable
+    /// table violates is a manifest telling a peer something false, so each
+    /// one is checked rather than trusted.
+    #[test]
+    fn every_declared_ordering_edge_holds_in_the_running_order() {
+        for edge in REGOLITH_CANONICAL_SCHEDULE.ordering_edges {
+            let before = REGOLITH_SCHEDULE
+                .position_of(orrery_core::SystemName(edge.before.0))
+                .unwrap_or_else(|| panic!("edge names unknown system {}", edge.before.0));
+            let after = REGOLITH_SCHEDULE
+                .position_of(orrery_core::SystemName(edge.after.0))
+                .unwrap_or_else(|| panic!("edge names unknown system {}", edge.after.0));
+            assert!(
+                before < after,
+                "declared edge {} -> {} is violated by the running order \
+                 (positions {before} and {after})",
+                edge.before.0,
+                edge.after.0
+            );
+        }
+    }
+
+    /// Every stage a module declares exists, and every stage exists because
+    /// some module declared it.
+    ///
+    /// `orrery_compose::validate` only checks the first direction. A stage in
+    /// the schedule that no module owns is a rule with no home — which is the
+    /// state both Regolith modules were in while `schedule_stages` was `&[]`.
+    #[test]
+    fn every_stage_is_owned_by_at_least_one_module() {
+        let declared: Vec<ScheduleStageId> = REGOLITH_CANONICAL_SCHEDULE
+            .stages
+            .iter()
+            .map(|stage| stage.id)
+            .collect();
+        for stage in &declared {
+            assert!(
+                REGOLITH_MODULES
+                    .iter()
+                    .any(|module| module.schedule_stages.contains(stage)),
+                "stage {} is declared by no module",
+                stage.0
+            );
+        }
+        for module in REGOLITH_MODULES {
+            for stage in module.schedule_stages {
+                assert!(
+                    declared.contains(stage),
+                    "module {} names undeclared stage {}",
+                    module.id.0,
+                    stage.0
+                );
+            }
+        }
+    }
+
+    /// D43 clause (g): the digest is pinned so an accidental system reorder
+    /// fails CI the way a golden does.
+    ///
+    /// This is the assertion the clause asks for and could not previously
+    /// have: with `stages: &[]` and `ordering_edges: &[]` the digest was a
+    /// constant of the empty schedule, identical for every game and moved by
+    /// nothing. It now moves if a system is added, removed, renamed,
+    /// reordered, moved between stages, or if an ordering edge changes.
+    #[test]
+    fn the_schedule_digest_is_pinned() {
+        assert_eq!(
+            schedule_digest(&REGOLITH_COMPOSITION.schedule),
+            REGOLITH_SCHEDULE_DIGEST,
+            "the canonical schedule moved; if the change is intended, update \
+             REGOLITH_SCHEDULE_DIGEST in the same commit and say why"
+        );
+    }
+
+    /// A reorder, a rename and a dropped edge each move the digest.
+    ///
+    /// Without this the pin above is untestable in the direction that
+    /// matters: a digest that never moves passes forever.
+    #[test]
+    fn the_digest_moves_when_the_topology_does() {
+        let base = schedule_digest(&REGOLITH_COMPOSITION.schedule);
+
+        let mut swapped = REGOLITH_COMPOSITION.schedule;
+        const SWAPPED_STAGES: &[orrery_compose::ScheduleStageManifest] =
+            &[orrery_compose::ScheduleStageManifest {
+                id: ScheduleStageId("craft-motion"),
+                systems: &[SystemId("craft-apply-drag"), SystemId("craft-clamp-speed")],
+            }];
+        swapped.stages = SWAPPED_STAGES;
+        assert_ne!(schedule_digest(&swapped), base);
+
+        let mut fewer_edges = REGOLITH_COMPOSITION.schedule;
+        fewer_edges.ordering_edges = &[];
+        assert_ne!(schedule_digest(&fewer_edges), base);
+
+        let mut relaxed = REGOLITH_COMPOSITION.schedule;
+        relaxed.ambiguity_detection = orrery_compose::AmbiguityDetection::Warning;
+        assert_ne!(schedule_digest(&relaxed), base);
+    }
+
+    /// Edge order at the declaration site is not part of the topology.
+    #[test]
+    fn the_digest_ignores_the_textual_order_of_edges() {
+        let mut reversed = REGOLITH_COMPOSITION.schedule;
+        let flipped: Vec<orrery_compose::ScheduleOrderingEdge> = REGOLITH_CANONICAL_SCHEDULE
+            .ordering_edges
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        let leaked: &'static [orrery_compose::ScheduleOrderingEdge] = Box::leak(flipped.into());
+        reversed.ordering_edges = leaked;
+        assert_eq!(
+            schedule_digest(&reversed),
+            schedule_digest(&REGOLITH_COMPOSITION.schedule)
+        );
+    }
+}
+
+#[cfg(test)]
+mod system_tests {
+    //! What a declared schedule buys a rules author, demonstrated rather than
+    //! asserted: a rule is now a thing you can *hold*.
+    //!
+    //! Every test here drives **one named system** on **one constructed
+    //! state**. None of them builds an `Executor`, seals an input log, plays a
+    //! scenario, or steps a tick. Before the schedule none of that was
+    //! optional: the smallest unit `Ruleset::step` exposed was a whole
+    //! entity-tick, so a four-line rule about a wreck's countdown could only be
+    //! reached by flying a craft into enough damage to produce one — which is
+    //! why the existing acceptance tests in `tests/regolith.rs` are written as
+    //! scenarios even where the thing under test is arithmetic.
+
+    use super::state::{Craft, Pickup};
+    use super::{
+        archetype::Archetype, order::Order, order::Outcome, weapon::WeaponKind, Regolith,
+        RegolithLocals, RegolithState, PICKUP_TTL_TICKS, REGOLITH_SCHEDULE, RESPAWN_TICKS,
+    };
+    use orrery_core::{run_system_as, OrderedInputs, QPos, SystemName};
+    use orrery_protocol::{PersistId, Tick, UniverseSeed};
+
+    fn rng() -> orrery_core::TickRng {
+        orrery_core::tick_rng(UniverseSeed([3; 32]), PersistId::new(1), Tick::new(0))
+    }
+
+    /// The wreck countdown, tested as four lines of arithmetic.
+    #[test]
+    fn the_respawn_rule_can_be_driven_on_its_own() {
+        let system = REGOLITH_SCHEDULE
+            .system(SystemName("craft-respawn"))
+            .expect("craft-respawn is in the schedule");
+        let mut craft = Craft::spawned(Archetype::Interceptor, QPos::default(), 0);
+        craft.hull = 0;
+        craft.respawn_in = 1;
+        craft.weapon = WeaponKind::Heavy;
+        let mut state = RegolithState::Craft(craft);
+        let mut locals = RegolithLocals::default();
+        // The premise this rule reads: the craft entered the tick already dead.
+        locals.craft.was_alive = false;
+
+        let inputs: [Order; 0] = [];
+        let events = run_system_as(
+            PersistId::new(1),
+            &Regolith::honest(),
+            &mut state,
+            &OrderedInputs::new(&inputs),
+            &mut rng(),
+            &mut locals,
+            system,
+        );
+
+        assert!(events.is_empty(), "respawning emits nothing");
+        assert!(locals.craft.respawned, "the countdown completed");
+        let RegolithState::Craft(craft) = state else {
+            unreachable!("the state is a craft")
+        };
+        assert_eq!(craft.hull, Archetype::Interceptor.limits().max_hull);
+        assert_eq!(craft.weapon, WeaponKind::Stock, "a respawn re-equips stock");
+        assert_eq!(craft.respawn_in, 0);
+    }
+
+    /// A live craft is not touched by the respawn rule at all.
+    #[test]
+    fn the_respawn_rule_declines_a_craft_that_entered_the_tick_alive() {
+        let system = REGOLITH_SCHEDULE
+            .system(SystemName("craft-respawn"))
+            .expect("craft-respawn is in the schedule");
+        let mut craft = Craft::spawned(Archetype::Interceptor, QPos::default(), 0);
+        craft.respawn_in = RESPAWN_TICKS;
+        let before = craft.clone();
+        let mut state = RegolithState::Craft(craft);
+        let mut locals = RegolithLocals::default();
+        locals.craft.was_alive = true;
+
+        let inputs: [Order; 0] = [];
+        run_system_as(
+            PersistId::new(1),
+            &Regolith::honest(),
+            &mut state,
+            &OrderedInputs::new(&inputs),
+            &mut rng(),
+            &mut locals,
+            system,
+        );
+        assert_eq!(state, RegolithState::Craft(before));
+        assert!(!locals.craft.respawned);
+    }
+
+    /// A rock is not a craft, so the craft systems do not run on it.
+    ///
+    /// The projection is the selection an ECS query would perform, done per
+    /// entity. It replaces the four-way `match` that used to open
+    /// `Ruleset::step`, and it is what lets a rule be written against
+    /// `&mut Craft` instead of against the whole state enum.
+    #[test]
+    fn a_craft_system_declines_a_state_that_is_not_a_craft() {
+        let system = REGOLITH_SCHEDULE
+            .system(SystemName("craft-tick-cooldowns"))
+            .expect("craft-tick-cooldowns is in the schedule");
+        let mut state = RegolithState::Pickup(Pickup::spawned(
+            QPos::default(),
+            WeaponKind::Volley,
+            PICKUP_TTL_TICKS,
+        ));
+        let before = state.clone();
+        let inputs: [Order; 0] = [];
+        let events = run_system_as(
+            PersistId::new(9),
+            &Regolith::honest(),
+            &mut state,
+            &OrderedInputs::new(&inputs),
+            &mut rng(),
+            &mut RegolithLocals::default(),
+            system,
+        );
+        assert_eq!(state, before);
+        assert!(events.is_empty());
+    }
+
+    /// The pickup TTL rule, one system, one assertion.
+    #[test]
+    fn the_pickup_expiry_rule_can_be_driven_on_its_own() {
+        let system = REGOLITH_SCHEDULE
+            .system(SystemName("pickup-expire"))
+            .expect("pickup-expire is in the schedule");
+        let mut state =
+            RegolithState::Pickup(Pickup::spawned(QPos::default(), WeaponKind::Volley, 1));
+        let inputs: [Order; 0] = [];
+        let events = run_system_as(
+            PersistId::new(4),
+            &Regolith::honest(),
+            &mut state,
+            &OrderedInputs::new(&inputs),
+            &mut rng(),
+            &mut RegolithLocals::default(),
+            system,
+        );
+        assert_eq!(
+            events,
+            vec![Outcome::Expired {
+                id: PersistId::new(4)
+            }]
         );
     }
 }
