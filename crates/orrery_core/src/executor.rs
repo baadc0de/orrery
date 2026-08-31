@@ -142,6 +142,15 @@ impl<R: Ruleset> Executor<R> {
     /// travel as events consumed on the *next* tick, which is what keeps each
     /// entity's replay self-contained.
     ///
+    /// The canonical arithmetic — RNG derivation, the rule call, neighbour
+    /// framing, VC-7 quantization and the state hash — is [`canonical_step`],
+    /// which this method owns no copy of. Everything left here is *storage*:
+    /// taking own state out of the map, putting it back, stamping the
+    /// observation tick, installing materializations. That split is what lets
+    /// an alternative backend (S7.4, #745) replace the storage without being
+    /// able to produce different canonical bytes: there is one implementation
+    /// of the canonical stage in the workspace and both backends call it.
+    ///
     /// Returns `None` for an entity this executor does not hold.
     pub fn step_entity(
         &mut self,
@@ -149,68 +158,35 @@ impl<R: Ruleset> Executor<R> {
         tick: Tick,
         inputs: &[R::CoreInput],
     ) -> Option<TickOutcome<R::CoreEvent>> {
+        // Own state leaves the map for the duration of the step: a rule reads
+        // its own state through `StateView::own`, never as its own neighbour.
         let mut own = self.states.remove(&entity)?;
-        let neighbors = &self.states;
-        let staleness_cap = self.ruleset.max_neighbor_staleness_ticks();
-        let mut view = StateView::observed(
-            entity,
+        let produced = canonical_step(
+            CanonicalStep {
+                ruleset: &self.ruleset,
+                seed: self.seed,
+                entity,
+                tick,
+                inputs,
+            },
             &mut own,
-            neighbors,
-            &self.state_ticks,
-            tick,
-            staleness_cap,
+            NeighborSnapshot {
+                states: &self.states,
+                observed_ticks: &self.state_ticks,
+            },
         );
-        let ordered = OrderedInputs::new(inputs);
-        let mut rng = tick_rng(self.seed, entity, tick);
-
-        let output = self.ruleset.step(&mut view, &ordered, &mut rng);
-        let neighbor_reads = view.recorded_reads().to_vec();
-        let neighbor_frames = neighbor_reads
-            .iter()
-            .map(|neighbor| {
-                let observed_tick = self.state_ticks.get(neighbor).copied();
-                let fresh = observed_tick.is_some_and(|observed_tick| {
-                    // Saturating, not checked: an observation stamped at
-                    // or after `tick` is the freshest there is. `step` stamps
-                    // T+1 on each entity as it finishes, so a neighbour
-                    // already stepped this tick would otherwise vanish.
-                    tick.0.saturating_sub(observed_tick.0) <= staleness_cap
-                });
-                let state = fresh.then(|| neighbors.get(neighbor)).flatten();
-                NeighborFrame {
-                    neighbor: *neighbor,
-                    observed_tick: if fresh {
-                        observed_tick.unwrap_or(tick)
-                    } else {
-                        tick
-                    },
-                    state: state.map(CoreCodec::to_canonical),
-                }
-            })
-            .collect();
-
-        // VC-7: snap before anything hashes or replicates it.
-        own.quantize();
-        let hash = state_hash(&own);
         self.states.insert(entity, own);
         // A claim at T commits to the state before T executes. The state just
         // produced by tick T is therefore the state whose claim tick is T+1.
         self.state_ticks
             .insert(entity, Tick::new(tick.0.saturating_add(1)));
 
-        let mut descriptions = Vec::new();
-        for event in &output.events {
-            self.ruleset.materialize(event, &mut descriptions);
-        }
-        let materialized = self.install_materializations(descriptions, tick);
-
-        Some(TickOutcome {
-            events: output.events,
-            materialized,
-            neighbor_reads,
-            neighbor_frames,
-            state_hash: hash,
-        })
+        let CanonicalOutcome {
+            mut outcome,
+            materializations,
+        } = produced;
+        outcome.materialized = self.install_materializations(materializations, tick);
+        Some(outcome)
     }
 
     fn install_materializations(
@@ -229,6 +205,283 @@ impl<R: Ruleset> Executor<R> {
             }
         }
         materialized
+    }
+}
+
+/// Everything one canonical per-entity step needs that is not storage.
+///
+/// A named record rather than five positional parameters: the call site is the
+/// boundary between "where state lives" and "what the rules compute", and a
+/// reader of a backend should be able to see at a glance that it supplies the
+/// ruleset, the universe seed, the identity, the absolute tick and the sealed
+/// inputs — and nothing else.
+pub struct CanonicalStep<'a, R: Ruleset> {
+    /// The rules to run.
+    pub ruleset: &'a R,
+    /// The universe seed VC-3 derives the tick RNG from.
+    pub seed: UniverseSeed,
+    /// The entity being advanced.
+    pub entity: PersistId,
+    /// The absolute tick being executed.
+    pub tick: Tick,
+    /// This entity's sealed inputs, in applied order (VC-2).
+    pub inputs: &'a [R::CoreInput],
+}
+
+/// The neighbour states a canonical step may observe, and when each was
+/// observed.
+///
+/// The stepping entity's own state is deliberately **not** in `states`: a rule
+/// reads its own state through [`StateView::own`], and a backend that left it
+/// in the neighbour map would let a rule read itself twice under two different
+/// staleness rules.
+pub struct NeighborSnapshot<'a, S> {
+    /// Every other entity's current canonical state, in `PersistId` order.
+    pub states: &'a BTreeMap<PersistId, S>,
+    /// The tick each of those states was observed at.
+    pub observed_ticks: &'a BTreeMap<PersistId, Tick>,
+}
+
+/// What the canonical stage produced, before any of it is stored.
+///
+/// [`TickOutcome::materialized`] is empty here and filled in by whichever
+/// backend installs the descriptions: which identifiers actually materialize
+/// is a first-writer-wins property of the *store*, not of the rules.
+pub struct CanonicalOutcome<R: Ruleset> {
+    /// The tick outcome, with `materialized` not yet resolved.
+    pub outcome: TickOutcome<R::CoreEvent>,
+    /// Entities the emitted events asked to materialize, in emission order.
+    pub materializations: Vec<EntityMaterialization<R::CoreState>>,
+}
+
+/// Run the canonical stage of one entity-tick: derive the RNG (VC-3), call the
+/// rule, frame the neighbour reads, quantize (VC-7) and hash.
+///
+/// This is the whole of what D43 calls canonical about a tick, and the only
+/// implementation of it in the workspace. It touches no store: `own` is a
+/// borrow the caller owns, neighbours are read-only, and materializations are
+/// handed back undecided. That is what makes an alternative storage backend a
+/// storage change and nothing more — it cannot reach the bytes.
+pub fn canonical_step<R: Ruleset>(
+    step: CanonicalStep<'_, R>,
+    own: &mut R::CoreState,
+    neighbors: NeighborSnapshot<'_, R::CoreState>,
+) -> CanonicalOutcome<R> {
+    let CanonicalStep {
+        ruleset,
+        seed,
+        entity,
+        tick,
+        inputs,
+    } = step;
+    let NeighborSnapshot {
+        states,
+        observed_ticks,
+    } = neighbors;
+
+    let staleness_cap = ruleset.max_neighbor_staleness_ticks();
+    let mut view = StateView::observed(entity, own, states, observed_ticks, tick, staleness_cap);
+    let ordered = OrderedInputs::new(inputs);
+    let mut rng = tick_rng(seed, entity, tick);
+
+    let output = ruleset.step(&mut view, &ordered, &mut rng);
+    let neighbor_reads = view.recorded_reads().to_vec();
+    let neighbor_frames = neighbor_reads
+        .iter()
+        .map(|neighbor| {
+            let observed_tick = observed_ticks.get(neighbor).copied();
+            let fresh = observed_tick.is_some_and(|observed_tick| {
+                // Saturating, not checked: an observation stamped at
+                // or after `tick` is the freshest there is. `step` stamps
+                // T+1 on each entity as it finishes, so a neighbour
+                // already stepped this tick would otherwise vanish.
+                tick.0.saturating_sub(observed_tick.0) <= staleness_cap
+            });
+            let state = fresh.then(|| states.get(neighbor)).flatten();
+            NeighborFrame {
+                neighbor: *neighbor,
+                observed_tick: if fresh {
+                    observed_tick.unwrap_or(tick)
+                } else {
+                    tick
+                },
+                state: state.map(CoreCodec::to_canonical),
+            }
+        })
+        .collect();
+
+    // VC-7: snap before anything hashes or replicates it.
+    own.quantize();
+    let hash = state_hash(own);
+
+    let mut materializations = Vec::new();
+    for event in &output.events {
+        ruleset.materialize(event, &mut materializations);
+    }
+
+    CanonicalOutcome {
+        outcome: TickOutcome {
+            events: output.events,
+            materialized: Vec::new(),
+            neighbor_reads,
+            neighbor_frames,
+            state_hash: hash,
+        },
+        materializations,
+    }
+}
+
+/// One tick's sealed inputs, by recipient.
+///
+/// A newtype rather than a bare map so a backend cannot be handed "some
+/// map of inputs" whose keying is ambiguous: the key is always the *recipient*
+/// `PersistId`, and an entity absent from it steps with no inputs.
+#[derive(Debug, Clone)]
+pub struct SealedTickInputs<I> {
+    by_recipient: BTreeMap<PersistId, Vec<I>>,
+}
+
+impl<I> Default for SealedTickInputs<I> {
+    fn default() -> Self {
+        Self {
+            by_recipient: BTreeMap::new(),
+        }
+    }
+}
+
+impl<I> SealedTickInputs<I> {
+    /// An empty sealed set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seal one more input for `recipient`, after everything already sealed
+    /// for it.
+    pub fn push(&mut self, recipient: PersistId, input: I) {
+        self.by_recipient.entry(recipient).or_default().push(input);
+    }
+
+    /// Seal a whole ordered run of inputs for `recipient`.
+    pub fn extend(&mut self, recipient: PersistId, inputs: impl IntoIterator<Item = I>) {
+        self.by_recipient
+            .entry(recipient)
+            .or_default()
+            .extend(inputs);
+    }
+
+    /// What `recipient` steps with this tick, in applied order.
+    #[must_use]
+    pub fn for_entity(&self, recipient: PersistId) -> &[I] {
+        self.by_recipient
+            .get(&recipient)
+            .map_or(&[][..], Vec::as_slice)
+    }
+}
+
+/// One entity's completed tick, as a backend reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteppedEntity<E> {
+    /// Whose tick.
+    pub entity: PersistId,
+    /// What it produced.
+    pub outcome: TickOutcome<E>,
+}
+
+/// The storage and scheduling substrate a fixed-step driver advances.
+///
+/// [`Executor`] is the reference implementation and the canonical store. The
+/// trait exists so the seam (`orrery_sim_host`) can be handed a different
+/// *substrate* — an ECS world, per D42 (d) — while the canonical stage stays
+/// [`canonical_step`] and the canonical bytes stay identical by construction
+/// rather than by comparison.
+///
+/// # What an implementor owns, and what it must not touch
+///
+/// It owns: where states live, the iteration order of [`Self::entities`], and
+/// what schedules [`Self::step_tick`]. It must not own: the RNG, the rule
+/// call, quantization, hashing, or neighbour framing — all of those are
+/// `canonical_step`, and an implementor that reimplements any of them has left
+/// the seam and is a second ruleset engine.
+///
+/// # Why within-tick order is part of the contract
+///
+/// A neighbour read at tick T sees whatever the neighbour's state is *at the
+/// moment of the read*, and the executor stamps each entity's observation tick
+/// as T+1 as it finishes. So an entity stepped later in a tick can observe an
+/// earlier entity's post-step state, and the ascending-`PersistId` order is
+/// therefore canonical, not incidental. A backend that stepped entities
+/// concurrently or in a different order would be a different simulation, which
+/// is exactly what [`Self::step_tick`]'s default implementation refuses to
+/// leave to chance.
+pub trait TickBackend<R: Ruleset> {
+    /// The rules this backend drives.
+    fn ruleset(&self) -> &R;
+
+    /// Install or replace an entity's state, quantizing it first (VC-7).
+    fn insert(&mut self, entity: PersistId, state: R::CoreState);
+
+    /// Read an entity's current canonical state.
+    fn state(&self, entity: PersistId) -> Option<&R::CoreState>;
+
+    /// Every installed entity, in ascending `PersistId` order.
+    fn entities(&self) -> Vec<PersistId>;
+
+    /// Advance one entity by one tick, or `None` if it is not installed.
+    fn step_entity(
+        &mut self,
+        entity: PersistId,
+        tick: Tick,
+        inputs: &[R::CoreInput],
+    ) -> Option<TickOutcome<R::CoreEvent>>;
+
+    /// Advance every entity installed at the tick boundary, in canonical
+    /// order, and report each one's outcome.
+    ///
+    /// Entities materialized while the tick runs begin stepping on the *next*
+    /// tick, never halfway through their birth tick, so the population is
+    /// snapshotted before the first entity steps.
+    fn step_tick(
+        &mut self,
+        tick: Tick,
+        inputs: &SealedTickInputs<R::CoreInput>,
+    ) -> Vec<SteppedEntity<R::CoreEvent>> {
+        let population = self.entities();
+        let mut stepped = Vec::with_capacity(population.len());
+        for entity in population {
+            let Some(outcome) = self.step_entity(entity, tick, inputs.for_entity(entity)) else {
+                continue;
+            };
+            stepped.push(SteppedEntity { entity, outcome });
+        }
+        stepped
+    }
+}
+
+impl<R: Ruleset> TickBackend<R> for Executor<R> {
+    fn ruleset(&self) -> &R {
+        Executor::ruleset(self)
+    }
+
+    fn insert(&mut self, entity: PersistId, state: R::CoreState) {
+        Executor::insert(self, entity, state);
+    }
+
+    fn state(&self, entity: PersistId) -> Option<&R::CoreState> {
+        Executor::state(self, entity)
+    }
+
+    fn entities(&self) -> Vec<PersistId> {
+        Executor::entities(self).copied().collect()
+    }
+
+    fn step_entity(
+        &mut self,
+        entity: PersistId,
+        tick: Tick,
+        inputs: &[R::CoreInput],
+    ) -> Option<TickOutcome<R::CoreEvent>> {
+        Executor::step_entity(self, entity, tick, inputs)
     }
 }
 

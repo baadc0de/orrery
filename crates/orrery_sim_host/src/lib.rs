@@ -17,9 +17,11 @@
 
 #![warn(missing_docs)]
 
+pub mod ecs;
+
 use std::collections::BTreeMap;
 
-use orrery_core::{CoreCodec, Executor, Ruleset};
+use orrery_core::{CoreCodec, Executor, Ruleset, SealedTickInputs, SteppedEntity, TickBackend};
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
 const PERSIST_ID_BYTES: usize = size_of::<u64>();
@@ -243,20 +245,42 @@ struct EmittedEvent {
 /// The host owns one lifetime of the existing executor.  It owns no wall-clock
 /// accumulator and no presentation state: callers explicitly submit flat
 /// commands, call [`Self::step`], then collect flat canonical outputs.
-pub struct SimulationHost<R: Ruleset, A: RulesetAdapter<R>> {
-    executor: Executor<R>,
+pub struct SimulationHost<R: Ruleset, A: RulesetAdapter<R>, B = Executor<R>> {
+    backend: B,
     adapter: A,
     next_tick: Tick,
     pending_inputs: BTreeMap<PersistId, PendingInputs<R::CoreInput>>,
     emitted_events: Vec<EmittedEvent>,
 }
 
-impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A> {
-    /// Create a host and start its explicit lifetime at `config.first_tick`.
+impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A, Executor<R>> {
+    /// Create a host on the canonical [`Executor`] store and start its
+    /// explicit lifetime at `config.first_tick`.
     #[must_use]
     pub fn new(config: SimulationHostConfig, ruleset: R, adapter: A) -> Self {
+        Self::on_backend(config, Executor::new(ruleset, config.seed), adapter)
+    }
+
+    /// Consume the host and return its executor at the end of this host
+    /// lifetime.  This is the only API that transfers its canonical storage.
+    #[must_use]
+    pub fn into_executor(self) -> Executor<R> {
+        self.backend
+    }
+}
+
+impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B> {
+    /// Create a host over an explicit storage-and-scheduling substrate.
+    ///
+    /// The substrate is a [`TickBackend`]: it owns where canonical state
+    /// lives, the entity iteration order, and what schedules a tick. It does
+    /// not own — and structurally cannot own — the canonical arithmetic, which
+    /// is `orrery_core::canonical_step` in both backends. That is the whole of
+    /// D42 (d)'s "behind the seam": swapping this changes storage, never bytes.
+    #[must_use]
+    pub fn on_backend(config: SimulationHostConfig, backend: B, adapter: A) -> Self {
         Self {
-            executor: Executor::new(ruleset, config.seed),
+            backend,
             adapter,
             next_tick: config.first_tick,
             pending_inputs: BTreeMap::new(),
@@ -264,11 +288,10 @@ impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A> {
         }
     }
 
-    /// Consume the host and return its executor at the end of this host
-    /// lifetime.  This is the only API that transfers its canonical storage.
+    /// Consume the host and return its substrate.
     #[must_use]
-    pub fn into_executor(self) -> Executor<R> {
-        self.executor
+    pub fn into_backend(self) -> B {
+        self.backend
     }
 
     /// The absolute tick that the next [`Self::step`] call will execute.
@@ -283,7 +306,7 @@ impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A> {
     /// Hosts use this for deterministic setup or decoded replication; it does
     /// not put canonical state in an engine application world.
     pub fn install_state(&mut self, entity: PersistId, state: R::CoreState) {
-        self.executor.insert(entity, state);
+        self.backend.insert(entity, state);
     }
 
     /// Look up the current canonical bytes for one stable id.
@@ -292,7 +315,7 @@ impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A> {
     /// canonical bytes, never a Rust reference into the host.
     #[must_use]
     pub fn state_bytes(&self, entity: PersistId) -> Option<Vec<u8>> {
-        self.executor.state(entity).map(CoreCodec::to_canonical)
+        self.backend.state(entity).map(CoreCodec::to_canonical)
     }
 
     /// Queue one flat command for the next fixed tick.
@@ -328,17 +351,16 @@ impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A> {
         for _ in 0..ticks.get() {
             let tick = self.next_tick;
             // S0: all externally queued input becomes immutable for this tick.
-            let mut sealed_inputs = std::mem::take(&mut self.pending_inputs);
-            // The executor's BTreeMap is the D44 stable-id index and yields
-            // canonical PersistId order.  Materializations happen inside each
-            // step but are not in this snapshot, so cannot step this tick.
-            let entities: Vec<PersistId> = self.executor.entities().copied().collect();
-            for entity in entities {
-                let inputs = sealed_inputs.remove(&entity).unwrap_or_default();
-                let Some(outcome) = self.executor.step_entity(entity, tick, &inputs.inputs) else {
-                    continue;
-                };
-
+            let queued = std::mem::take(&mut self.pending_inputs);
+            let mut sealed = SealedTickInputs::new();
+            for (target, pending) in queued {
+                sealed.extend(target, pending.inputs);
+            }
+            // The backend snapshots its population at the tick boundary and
+            // steps it in canonical PersistId order.  Materializations happen
+            // inside a step but are not in that snapshot, so cannot step this
+            // tick.
+            for SteppedEntity { entity, outcome } in self.backend.step_tick(tick, &sealed) {
                 state_hashes.push(StateHash {
                     entity,
                     tick,
@@ -380,11 +402,11 @@ impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A> {
     /// every frame while canonical state remains solely inside the executor.
     pub fn collect_output_bytes(&self) -> Result<OutputBuffer, HostError> {
         let mut bytes = Vec::new();
-        for entity in self.executor.entities() {
+        for entity in self.backend.entities() {
             let state = self
-                .executor
-                .state(*entity)
-                .expect("executor entity index and state store agree");
+                .backend
+                .state(entity)
+                .expect("backend entity index and state store agree");
             append_record(&mut bytes, entity.0, &state.to_canonical())?;
         }
         Ok(OutputBuffer { bytes })

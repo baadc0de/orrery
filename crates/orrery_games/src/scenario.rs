@@ -33,7 +33,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use orrery_core::{
-    evaluate, state_hash, CoreCodec, Executor, InvariantSample, InvariantViolation, Tolerance,
+    evaluate, state_hash, CoreCodec, Executor, InvariantSample, InvariantViolation,
+    SealedTickInputs, SteppedEntity, TickBackend, Tolerance,
 };
 use orrery_protocol::{DeviationKind, PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -328,6 +329,23 @@ pub(crate) fn world_population<G: Game>(
 /// an honest build and a tampered one receive identical input streams and
 /// every difference between their logs is the rules' doing.
 pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
+    play_with(game, scenario, Executor::new)
+}
+
+/// Play `scenario` under `game`'s rules on a caller-supplied backend.
+///
+/// `backend` is handed the game and the scenario's seed and returns the
+/// substrate the run executes on. This is the seam the S7.4 differential needs
+/// (#745): the legacy side runs on [`Executor`], the candidate on an
+/// ECS-backed [`TickBackend`], and *everything else about the run* — the
+/// population, the pilot, the sealing, the folds, the sampling — is this one
+/// function, so a difference between the two sides can only have come from the
+/// backend.
+pub fn play_with<G: Game, B: TickBackend<G>>(
+    game: G,
+    scenario: &Scenario,
+    backend: impl FnOnce(G, UniverseSeed) -> B,
+) -> Play<G> {
     let seed = UniverseSeed([scenario.seed_byte; 32]);
     let entities: Vec<PersistId> = (1..=scenario.entities).map(PersistId::new).collect();
     let player_slots: BTreeMap<PersistId, u64> = entities
@@ -336,20 +354,22 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
         .map(|(slot, entity)| (*entity, slot as u64))
         .collect();
 
-    // Spawn before the ruleset moves into the executor.
+    let mut backend = backend(game, seed);
     let spawned: Vec<(PersistId, G::CoreState)> = entities
         .iter()
         .enumerate()
-        .map(|(slot, entity)| (*entity, game.spawn(*entity, slot as u64)))
+        .map(|(slot, entity)| (*entity, backend.ruleset().spawn(*entity, slot as u64)))
         .collect();
-    let seeded_world = world_population(&game, scenario.entities, scenario.world_entities);
-
-    let mut executor = Executor::new(game, seed);
+    let seeded_world = world_population(
+        backend.ruleset(),
+        scenario.entities,
+        scenario.world_entities,
+    );
     for (entity, state) in spawned {
-        executor.insert(entity, state);
+        backend.insert(entity, state);
     }
     for (entity, state) in seeded_world {
-        executor.insert(entity, state);
+        backend.insert(entity, state);
     }
 
     let mut chain = [0u8; 32];
@@ -368,12 +388,17 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
         // Snapshot the population at the tick boundary. Entities materialized
         // while this tick runs begin stepping on the next tick, never halfway
         // through their birth tick.
-        let tick_entities: Vec<PersistId> = executor.entities().copied().collect();
-        let mut delivered: BTreeMap<PersistId, Vec<G::CoreInput>> = BTreeMap::new();
-        let mut entries = Vec::with_capacity(tick_entities.len());
-        let mut sealed_entries = Vec::with_capacity(tick_entities.len());
-        let mut outcome_entries = Vec::with_capacity(tick_entities.len());
+        let tick_entities: Vec<PersistId> = backend.entities();
 
+        // S0: seal every entity's inputs for the tick before any of them
+        // steps. This used to be interleaved with stepping; hoisting it is
+        // what lets a backend own the whole tick's scheduling. It changes
+        // nothing observable, because `honest_inputs` is deliberately not a
+        // function of game state (see `Game`'s contract) — the same peer list
+        // and the same pilot RNG produce the same bytes either way, which the
+        // committed golden chains hold this refactor to.
+        let mut sealed_inputs: SealedTickInputs<G::CoreInput> = SealedTickInputs::new();
+        let mut sealed_entries = Vec::with_capacity(tick_entities.len());
         for entity in &tick_entities {
             // Events delivered from the previous tick come first, then what
             // an initial scenario player asked for. Materialized entities are
@@ -387,7 +412,7 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
                     .filter(|peer| peer != entity)
                     .collect();
                 let mut rng = pilot_rng(seed, *entity, tick);
-                executor.ruleset().honest_inputs(
+                backend.ruleset().honest_inputs(
                     *entity,
                     *slot,
                     tick,
@@ -396,37 +421,52 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
                     &mut inputs,
                 );
             }
+            sealed_entries.push(SealedEntry {
+                entity: *entity,
+                inputs: inputs.clone(),
+            });
+            sealed_inputs.extend(*entity, inputs);
+        }
 
-            let outcome = executor
-                .step_entity(*entity, tick, &inputs)
-                .expect("every scenario entity is installed in the executor");
+        let stepped = backend.step_tick(tick, &sealed_inputs);
+        assert_eq!(
+            stepped.len(),
+            tick_entities.len(),
+            "the backend did not step every entity installed at the tick boundary"
+        );
+
+        let mut delivered: BTreeMap<PersistId, Vec<G::CoreInput>> = BTreeMap::new();
+        let mut entries = Vec::with_capacity(stepped.len());
+        let mut outcome_entries = Vec::with_capacity(stepped.len());
+        for (SteppedEntity { entity, outcome }, sealed) in stepped.into_iter().zip(&sealed_entries)
+        {
+            assert_eq!(
+                entity, sealed.entity,
+                "the backend stepped entities out of canonical order"
+            );
             chain = fold(chain, &outcome.state_hash);
             events += outcome.events.len() as u64;
             let mut outcome_events = Vec::with_capacity(outcome.events.len());
             let mut delivery_pairs = Vec::new();
             for event in &outcome.events {
                 outcome_events.push(event.to_canonical());
-                if let Some((target, input)) = executor.ruleset().deliver(event) {
+                if let Some((target, input)) = backend.ruleset().deliver(event) {
                     delivered.entry(target).or_default().push(input.clone());
                     delivery_pairs.push(DeliveryPair { target, input });
                 }
             }
             outcome_entries.push(OutcomeEntry {
-                entity: *entity,
+                entity,
                 events: outcome_events,
                 materialized: outcome.materialized,
                 delivered: delivery_pairs,
             });
-            sealed_entries.push(SealedEntry {
-                entity: *entity,
-                inputs: inputs.clone(),
-            });
             entries.push(Entry::<G> {
-                entity: *entity,
-                inputs,
+                entity,
+                inputs: sealed.inputs.clone(),
                 hash: outcome.state_hash,
-                state: executor
-                    .state(*entity)
+                state: backend
+                    .state(entity)
                     .expect("the entity was just stepped")
                     .clone(),
             });
@@ -448,7 +488,7 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
 
         if offset.is_multiple_of(SAMPLE_PERIOD) {
             sample_stage_one(
-                &executor,
+                &backend,
                 &tick_entities,
                 tick,
                 scenario,
@@ -487,23 +527,36 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
 /// observer concern, not one of the sealed simulation inputs.
 #[must_use]
 pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
+    replay_with(game, sealed, Executor::new)
+}
+
+/// Replay a sealed run under `game` on a caller-supplied backend.
+///
+/// The candidate half of the S7.4 differential (#745): identical sealed
+/// inputs, identical population, identical tick window, different substrate.
+#[must_use]
+pub fn replay_with<G: Game, B: TickBackend<G>>(
+    game: G,
+    sealed: &SealedScenario<G>,
+    backend: impl FnOnce(G, UniverseSeed) -> B,
+) -> Play<G> {
     let entities: Vec<PersistId> = (1..=sealed.initial_entities).map(PersistId::new).collect();
+    let mut backend = backend(game, sealed.seed);
     let spawned: Vec<(PersistId, G::CoreState)> = entities
         .iter()
         .enumerate()
-        .map(|(slot, entity)| (*entity, game.spawn(*entity, slot as u64)))
+        .map(|(slot, entity)| (*entity, backend.ruleset().spawn(*entity, slot as u64)))
         .collect();
     let seeded_world = world_population(
-        &game,
+        backend.ruleset(),
         sealed.initial_entities,
         sealed.initial_world_entities,
     );
-    let mut executor = Executor::new(game, sealed.seed);
     for (entity, state) in spawned {
-        executor.insert(entity, state);
+        backend.insert(entity, state);
     }
     for (entity, state) in seeded_world {
-        executor.insert(entity, state);
+        backend.insert(entity, state);
     }
 
     let expected_ticks = sealed.tick_window.end_exclusive.0 - sealed.tick_window.first.0;
@@ -527,7 +580,7 @@ pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
             record.tick, expected_tick,
             "sealed input log has a tick gap"
         );
-        let installed: Vec<PersistId> = executor.entities().copied().collect();
+        let installed: Vec<PersistId> = backend.entities();
         let sealed_entities: Vec<PersistId> =
             record.entries.iter().map(|entry| entry.entity).collect();
         assert_eq!(
@@ -535,34 +588,48 @@ pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
             "sealed input log does not match the replay population at {expected_tick:?}"
         );
 
+        let mut tick_inputs: SealedTickInputs<G::CoreInput> = SealedTickInputs::new();
+        for sealed_entry in &record.entries {
+            tick_inputs.extend(sealed_entry.entity, sealed_entry.inputs.iter().cloned());
+        }
+        let stepped = backend.step_tick(record.tick, &tick_inputs);
+        assert_eq!(
+            stepped.len(),
+            record.entries.len(),
+            "the backend did not step every sealed entity"
+        );
+
         let mut entries = Vec::with_capacity(record.entries.len());
         let mut outcome_entries = Vec::with_capacity(record.entries.len());
-        for sealed_entry in &record.entries {
-            let outcome = executor
-                .step_entity(sealed_entry.entity, record.tick, &sealed_entry.inputs)
-                .expect("sealed input names an installed entity");
+        for (SteppedEntity { entity, outcome }, sealed_entry) in
+            stepped.into_iter().zip(&record.entries)
+        {
+            assert_eq!(
+                entity, sealed_entry.entity,
+                "the backend stepped entities out of canonical order"
+            );
             chain = fold(chain, &outcome.state_hash);
             events += outcome.events.len() as u64;
             let mut outcome_events = Vec::with_capacity(outcome.events.len());
             let mut delivered = Vec::new();
             for event in &outcome.events {
                 outcome_events.push(event.to_canonical());
-                if let Some((target, input)) = executor.ruleset().deliver(event) {
+                if let Some((target, input)) = backend.ruleset().deliver(event) {
                     delivered.push(DeliveryPair { target, input });
                 }
             }
             outcome_entries.push(OutcomeEntry {
-                entity: sealed_entry.entity,
+                entity,
                 events: outcome_events,
                 materialized: outcome.materialized,
                 delivered,
             });
             entries.push(Entry {
-                entity: sealed_entry.entity,
+                entity,
                 inputs: sealed_entry.inputs.clone(),
                 hash: outcome.state_hash,
-                state: executor
-                    .state(sealed_entry.entity)
+                state: backend
+                    .state(entity)
                     .expect("the entity was just stepped")
                     .clone(),
             });
@@ -587,8 +654,8 @@ pub fn replay<G: Game>(game: G, sealed: &SealedScenario<G>) -> Play<G> {
 }
 
 /// Run the game's stage-1 invariants over this tick's samples, dropping some.
-fn sample_stage_one<G: Game>(
-    executor: &Executor<G>,
+fn sample_stage_one<G: Game, B: TickBackend<G>>(
+    backend: &B,
     entities: &[PersistId],
     tick: Tick,
     scenario: &Scenario,
@@ -599,7 +666,7 @@ fn sample_stage_one<G: Game>(
         if dropped(scenario, *entity, tick) {
             continue;
         }
-        let current = executor
+        let current = backend
             .state(*entity)
             .expect("the entity is installed")
             .clone();
@@ -613,7 +680,7 @@ fn sample_stage_one<G: Game>(
                 .map(|(_, at)| u32::try_from(tick.0.saturating_sub(at.0)).unwrap_or(u32::MAX))
                 .unwrap_or(0),
         };
-        if let Err(violation) = evaluate(executor.ruleset().invariants(), &sample) {
+        if let Err(violation) = evaluate(backend.ruleset().invariants(), &sample) {
             flags.push(Flag {
                 tick,
                 entity: *entity,
