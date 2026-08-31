@@ -165,6 +165,63 @@ simulation. This ratifies the shipped topology; it changes no code.
 > unbreached: the admitted world is dedicated, reachable only through the
 > backend, with no `bevy_app` and no `&World` accessor.
 
+> **Amended again 2026-08-31 (owner-authorised), on the acceptance recorded in
+> [#793] ("OWNER ACCEPTANCE, 2026-08-31").** The owner accepted `bevy_ecs` as a
+> first-class, non-dev dependency of `orrery_games`, in their words:
+>
+> > I accept the amendments. Bevy ECS in `orrery_games` as first class
+> > dependency. ECS as idiomatic storage for entities and ruleset logic.
+> > Systems registration and tick driving works over `World`.
+>
+> **What this changes is reach, not location.** The amendment above already
+> admitted a dedicated `bevy_ecs::World` as a store of record during a tick.
+> What it left implicit is that the world was reachable only *through the
+> backend* — the rules themselves were Bevy-free code the host called. That
+> implication is withdrawn. A ruleset may own components, register systems, and
+> be driven over a `World`, so the admitted world is now reachable **from the
+> rules**. The store of record is still per-entity, still dedicated, and still
+> outside any application world.
+>
+> **The clause's load-bearing sentence below is unchanged and unbreached:
+> canonical truth never lives in a Bevy *application* world.** That distinction
+> is the entire reason this clause can be amended without reopening
+> clause (c). Clause (c) rejects *sharing* canonical state with presentation
+> and replication state in one app world; a dedicated rules world shares
+> nothing, holds no presentation component, takes no `bevy_app` and hands out
+> no `&World` accessor. **Clause (c) is not amended and this acceptance does
+> not reopen it.** [#796] §4 is the evidence that the two are genuinely
+> separable: the one place a native ruleset would have paid for itself on the
+> client is exactly the shared world (c) forbids, and that gain is forfeited
+> here rather than argued for.
+>
+> **The cost, stated rather than hidden.** The amendment above rests on *"every
+> committed byte is produced by `orrery_core::canonical_step`, which both
+> backends call"* (`crates/orrery_core/src/executor.rs:364`). A system written
+> over a `World` inside `orrery_games` is not obliged by any *type* to route
+> through that function; the executor and `EcsBackend` were. So that sentence
+> changes status from structural fact to an obligation the ruleset author
+> carries, and its enforcement moves to [D43] clause (e) and to
+> `scripts/core-gates.sh` — see the 2026-08-31 note on (e)(5) there. Recording
+> this is not a waiver: `canonical_step` and the hash call site stay in
+> `orrery_core`, and nothing here licenses a second producer of canonical
+> bytes.
+>
+> **`orrery_core` stays Bevy-free, and its ban is untouched.** It is a
+> different rule with a live justification: `orrery_core` is a non-dev
+> dependency of **eleven** crates — `clients/regolith`, `orrery`,
+> `orrery_compose`, `orrery_conformance`, `orrery_games`, `orrery_persistd`,
+> `orrery_sim`, `orrery_sim_host`, `orrery_witness`, `gates/migration-bench`,
+> `gates/p1-swarm` — so one build of it links into the client that
+> re-executes, the host that steps, and the adjudicator that convicts, and
+> `crates/orrery_core/Cargo.toml:8-12` states that reason correctly for that
+> crate. `orrery_games` was never in that position: it has exactly **four**
+> non-dev consumers (`clients/regolith`, `crates/orrery_sim`,
+> `gates/p1-swarm`, `gates/migration-bench`) and neither `orrery_persistd` nor
+> `orrery_witness` links it at all, not even as a dev-dependency. The
+> adjudication path never linked the crate the ban was protecting. See
+> `scripts/core-gates.sh` clause 1 for the corrected reasoning in the gate
+> itself.
+
 The boundary form is A9's B-1, absorbed here verbatim in substance:
 **canonical truth never lives in a Bevy application world.** Application
 worlds hold only *mirrors* — presentation and replication components keyed by
@@ -200,6 +257,55 @@ programme contemplates, including "never migrate".
    host API. **The host's storage is an implementation detail behind the
    seam**, and today that storage is clause (a)'s executor: the seam moves
    no state.
+
+> **Amended 2026-08-31 (owner-authorised) — the seam's read surface.** Drafted
+> in [#802] and accepted verbatim in [#793] ("OWNER ACCEPTANCE, 2026-08-31"),
+> which names it first among the amendments the owner accepted. The sentence
+> above — the host's storage is an implementation detail behind the seam, and
+> the seam moves no state — is unchanged and remains true.
+>
+> What is added is that **the seam's read surface is no longer uniformly the
+> whole `CoreState` sum.** A host may be asked for an entity's state *as one
+> declared module section* (`orrery_core::Section`), and answers with that
+> section's own type or with `None`. The following are normative:
+>
+> 1. **Additive only.** `TickBackend::state` keeps returning
+>    `Option<&R::CoreState>`, and `section_state` has a correct default written
+>    in terms of it. A backend that ignores sections entirely is conformant.
+> 2. **The canonical encoding is unchanged.** Sections are a *read* projection.
+>    Every byte committed to by `orrery_protocol::authority`,
+>    `orrery_persistd::adjudication` and `state_hash` is still the canonical
+>    encoding of the whole `CoreState`, and no section may be encoded, hashed,
+>    replicated or adjudicated on its own. Clause (a) is untouched.
+> 3. **Exactness is the game's obligation.** `Section::project` answers `Some`
+>    for exactly the values whose `Sectioned::section` is `Section::SECTION`. A
+>    projection that answered wider would silently widen every check written
+>    against it; a game declaring sections holds itself to this with
+>    `orrery_core::assert_section_is_exact` over a value of every section.
+> 4. **Sections are about own state.** Nothing here touches neighbour access.
+>    `StateView::neighbor` keeps its `&mut self` recording discipline, and no
+>    section accessor may be reached from inside a step to read another entity
+>    ([D43] (e)(5), and [#798]'s verdict on why).
+>
+> Rationale: clause (b)(1) already commits to modules that "each own a section
+> of `CoreState`". Until now a section was a name a host could file by and
+> nothing a consumer could say. This makes the same section sayable in a
+> signature, which is what clause (b)(1)'s modularity motivation asked for and
+> did not get.
+>
+> Evidence, from the lane that built it ([#802], merged): **four of Regolith's
+> six published invariants lost their section match** — `speed_cap`, which
+> opened with the same four-arm `match` twice, and `acceleration_cap`,
+> `fire_rate` and `score_rate`, each of which opened by discarding every
+> non-craft pair with a `let-else`. All four are now registered per section
+> (`crates/orrery_games/src/regolith/invariants.rs:30-43`). The two that kept
+> the match, `teleport` and `value_range`, did so for a reason that is a
+> property of the question they ask rather than of the seam: they compare a
+> *pair* of samples that may span two sections, and `value_range`'s last arm is
+> literally `discriminant(previous) != discriminant(current)` (`:328`). No
+> per-section signature can hold a question about the section changing. [#796]
+> reached the same finding about `teleport` independently, which is
+> corroboration rather than coincidence.
 
 Layering: the host seam extends [D15]'s spine as a layer between
 `orrery_core` and the hosts that drive it. It adds a crate and an adapter; it
@@ -303,6 +409,21 @@ nothing weakens it. (R2's Tier V discovery clause *strengthens* membership
 detection and is compatible with this sentence; the conditional Tier H
 battery arms only with a trigger here.)
 
+> **Amended 2026-08-31 (owner-authorised): the paragraph above no longer names
+> the tree.** The owner's acceptance in [#793] removes `orrery_games` from the
+> Bevy-free scan — see the second 2026-08-31 amendment to clause (a) for the
+> decision and the manifest evidence, and `scripts/core-gates.sh` clause 1 for
+> the corrected reasoning. **The set the sentence protects is now
+> `orrery_core` and `orrery_conformance`, and for those two it stands
+> unweakened.** No trigger fired; this is the same owner power clause (d)
+> already reserved and already exercised once for #757, recorded against the
+> clause rather than edited in silently.
+>
+> Everything else in the paragraph holds: the declared floor
+> (`DECLARED_GATED_CRATES`) still carries `orrery_games`, so role discovery,
+> VC-4, VC-6, VC-8, the async-runtime ban and the neighbour-read scan all
+> still bind it. The only clause that stops binding it is the Bevy one.
+
 ### (e) The pre-registered reversal condition
 
 If an A10 E-1-class experiment — a second-game-scale module set built
@@ -336,6 +457,9 @@ clause (d) stay binding on the hybrid's ECS-hosted tier regardless.
   are refused by this record, not argued case-by-case; and the trigger list
   means such a proposal now has a legitimate path — produce the T1/T2
   measurement and the T3 gate bundle — instead of a standing argument.
+  (2026-08-31: `orrery_games` has left that set by the clause (a) and
+  clause (d) amendments above. `orrery_core` and `orrery_conformance` have
+  not, and the sentence is about them.)
 - The rejection in clause (c) forfeits, permanently, the shared world's real
   conveniences: zero mirror hop and idiomatic Bevy module shape (modularity
   and copy cost are the only axes where either matrix scored it well). This record
@@ -382,5 +506,10 @@ clause (d) stay binding on the hybrid's ECS-hosted tier regardless.
 [a3-simulation-host-second-opinion.md]: ../plans/a3-simulation-host-second-opinion.md
 [D15]: 0015-crate-set.md
 [D21]: 0021-ruleset-distribution.md
+[D43]: 0043-determinism-envelope-and-gate-replacement.md
 [docs/10 §2]: ../10-crates.md
 [#407]: https://github.com/baadc0de/orrery/issues/407
+[#793]: https://github.com/baadc0de/orrery/issues/793
+[#796]: https://github.com/baadc0de/orrery/pull/796
+[#798]: https://github.com/baadc0de/orrery/pull/798
+[#802]: https://github.com/baadc0de/orrery/pull/802

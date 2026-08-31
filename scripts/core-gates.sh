@@ -6,7 +6,10 @@
 # pipeline months later:
 #
 #   1. Every crate that defines or implements canonical rules builds with no
-#      Bevy anywhere in its graph.
+#      Bevy anywhere in its graph — except `orrery_games`, exempted by the
+#      owner on 2026-08-31 (#793, amending D42 (a) and D43 (e)(1)). Clause 1
+#      itself carries the reasoning: why the rule still binds `orrery_core`,
+#      and why it never correctly bound `orrery_games`.
 #   2. No std `HashMap`/`HashSet` in core sources (VC-4) — their iteration order
 #      is randomized per process, so any behaviour depending on it differs
 #      between two runs of the same binary.
@@ -217,15 +220,63 @@ while IFS= read -r file; do RULES_SOURCES+=("$file"); done < <(lib_sources "${RU
 [[ ${#RULES_SOURCES[@]} -gt 0 ]] || die "no ruleset sources found"
 
 # ── 1. Bevy-free ────────────────────────────────────────────────────────
-# The same build links into game clients, field hosts and persistd. A Bevy
-# dependency would not just be weight — it would make those three disagree,
-# which is the exact failure the crate exists to detect.
+# Why this still binds `orrery_core`. It is a non-dev dependency of eleven
+# crates — `clients/regolith`, `orrery`, `orrery_compose`, `orrery_conformance`,
+# `orrery_games`, `orrery_persistd`, `orrery_sim`, `orrery_sim_host`,
+# `orrery_witness`, `gates/migration-bench`, `gates/p1-swarm` — so one build of
+# it links into the client that re-executes, the host that steps and the
+# adjudicator that convicts. A Bevy dependency there would not just be weight;
+# it would make those three disagree, which is the exact failure the crate
+# exists to detect. `crates/orrery_core/Cargo.toml:8-12` says the same thing in
+# the manifest it is about, and that is where the sentence originated.
+#
+# Why it never correctly bound `orrery_games`. Until 2026-08-31 the paragraph
+# above stood here as the justification for the whole gated set, copied from
+# that manifest. For `orrery_games` it was false in the checkable part: parsing
+# every manifest in the tree, `orrery_games` has exactly four non-dev
+# consumers — `clients/regolith` (already a Bevy app), `crates/orrery_sim`,
+# `gates/p1-swarm` and `gates/migration-bench` — and `orrery_persistd` and
+# `orrery_witness` do not link it at all, not even as dev-dependencies. The
+# adjudication path never linked the crate this clause was protecting. The rule
+# was inherited from a manifest where it earns its keep.
+#
+# So on 2026-08-31 the owner accepted `bevy_ecs` as a first-class, non-dev
+# dependency of `orrery_games` (#793, amending D42 (a) and D43 (e)(1)) and this
+# clause stops binding it. Nothing else about it relaxes: it stays in
+# DECLARED_GATED_CRATES and in DECLARED_RULES_CRATES, so VC-4, VC-6, VC-8, the
+# async-runtime ban, role discovery and — load-bearing now that a query could
+# reach another entity's state without any type objecting — clause 5's
+# neighbour-read scan all still apply. If it goes on to host canonical state in
+# a `bevy_ecs::World`, section 6's escape check makes it fail by name until it
+# is declared in DECLARED_HOST_CRATES and takes the whole Tier-H battery.
+#
+# The consumer this costs is `crates/orrery_sim`: `crate-type = ["rlib",
+# "cdylib"]` behind a `#[repr(C)]` C ABI, which the Unreal seam (#744) consumes.
+# It has to keep building.
+#
+# Adding a row below is an amendment to D42 (a) / D43 (e)(1), not a
+# configuration change. Removing one is likewise.
+readonly BEVY_PERMITTED_CRATES=(orrery_games)
+
+bevy_scanned=()
 for crate in "${GATED_CRATES[@]}"; do
+  if printf '%s\n' "${BEVY_PERMITTED_CRATES[@]}" | grep -Fxq "$crate"; then
+    continue
+  fi
+  bevy_scanned+=("$crate")
   if (cd "$ROOT" && cargo tree -p "$crate" 2>/dev/null | grep -qi bevy); then
     die "$crate has Bevy in its dependency graph"
   fi
 done
-note "Bevy-free: ${GATED_CRATES[*]}"
+# A permitted crate that is no longer gated at all would silently shrink this
+# clause to nothing, so refuse a stale exemption the way the allowlists here do.
+for crate in "${BEVY_PERMITTED_CRATES[@]}"; do
+  if ! printf '%s\n' "${GATED_CRATES[@]}" | grep -Fxq "$crate"; then
+    die "stale Bevy exemption '$crate' — it is not a gated crate; remove it from BEVY_PERMITTED_CRATES in this file"
+  fi
+done
+(( ${#bevy_scanned[@]} > 0 )) || die "Bevy-free clause scanned no crates"
+note "Bevy-free: ${bevy_scanned[*]} (permitted: ${BEVY_PERMITTED_CRATES[*]})"
 
 # D43(d)(4): canonical execution stays synchronous. This is structural on the
 # current tree, but making it a dependency check prevents a future role crate

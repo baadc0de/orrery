@@ -269,6 +269,16 @@ neighbour ban — is kept **unchanged**. What changes is who it applies to:
 > predicate to the list remains an ordinary reviewed change; removing the
 > declaration requirement would be a further amendment.*
 
+> *Amended by the owner on 2026-08-31 ([#793]): the sentence above is no longer
+> true of one clause for one crate. **`orrery_games` leaves the Bevy-free graph
+> scan** and keeps every other clause in the battery — VC-4, VC-6, VC-8, the
+> async-runtime ban, role discovery and the neighbour scan all still bind it,
+> and it stays in `DECLARED_GATED_CRATES`. `orrery_core` and
+> `orrery_conformance` are unchanged in every clause. The reasoning, and why
+> the gate's stated justification was never true of `orrery_games`, is in
+> clause (e)'s third 2026-08-31 amendment and in `scripts/core-gates.sh`
+> clause 1.*
+
 1. **Discovery scan.** Walk workspace crates; strip `#[cfg(test)]` modules;
    flag any crate whose library sources define `trait Ruleset` or contain an
    `impl … Ruleset for` site, qualified paths included. Crates so flagged are
@@ -409,6 +419,102 @@ crate hosting canonical state in a `bevy_ecs::World`:
 > `orrery_core`; and clause (e)(4)'s own words, that these checks are
 > *"preconditions of admitting the host, not follow-ups"* — which now describes
 > the tree rather than indicting it.
+
+> **Amended a third time 2026-08-31 (owner-authorised): `orrery_games` may host
+> a `bevy_ecs::World`, and (e)(5) changes character.** On the acceptance
+> recorded in [#793] ("OWNER ACCEPTANCE, 2026-08-31"), in the owner's words:
+>
+> > I accept the amendments. Bevy ECS in `orrery_games` as first class
+> > dependency. ECS as idiomatic storage for entities and ruleset logic.
+> > Systems registration and tick driving works over `World`.
+>
+> **Clause (e)(1) is amended.** Its allowlist was written on the assumption
+> that a host is *machinery around* a ruleset, never a ruleset crate. That
+> assumption is withdrawn: **`orrery_games` is eligible for
+> `DECLARED_HOST_CRATES`**, and `scripts/core-gates.sh` clause 1 no longer
+> refuses it a Bevy dependency. Everything else in (e)(1) is unchanged and
+> binds it in full — membership stays an explicit, review-required allowlist
+> row with no discovery, the escape check still runs in both directions
+> (`scripts/core-gates.sh:534-543`), and a crate joining it **takes the whole
+> battery**, including (e)(2)'s `bevy_ecs`-only rule and (e)(3)'s Tier V +
+> async + RNG bans over its host sources. Nothing here admits a host; it makes
+> one admissible. A ruleset crate on the allowlist inherits the Tier V source
+> battery twice over — once as a gated crate, once as a host — and that is
+> intended rather than redundant.
+>
+> `orrery_core` is **not** amended and stays Bevy-free. Its ban is a different
+> rule with a live justification, set out in [D42] clause (a)'s second
+> 2026-08-31 amendment and stated correctly for that crate in
+> `crates/orrery_core/Cargo.toml:8-12`. [D42] clause (c) is not amended either:
+> the world admitted here is dedicated, not the shared application world.
+>
+> **Clause (e)(5) is *not* amended — its wording survives contact and is left
+> exactly as written — but what enforces it changes, and that is the operative
+> part of this amendment.** Today `Ruleset::step` takes one entity's own state
+> plus a *recorded* neighbour view, and `StateView::neighbor`
+> (`crates/orrery_core/src/ruleset.rs:176`) takes `&mut self` precisely so that
+> reading has a side effect on the log: it pushes the read **before** it knows
+> whether it found anything, and `crates/orrery_core/src/replay.rs:325` checks
+> the sequence exactly. That signature is what makes the world-of-one verdict
+> possible — a **type**, not a convention. `Query<&mut Rock>` deletes it, and
+> deleting it is a query's entire purpose. [#796]'s own sentence is the honest
+> statement of what is lost:
+>
+> > My systems preserve it only because I wrote them to.
+>
+> So under queries the discipline stops being enforced by a type and becomes a
+> convention. Three consequences, normative:
+>
+> 1. **Rules reach neighbours through `StateView::neighbor` and nowhere else.**
+>    A component query must not become a path to another entity's state. This
+>    is a standing constraint on all work under this acceptance, not advice.
+> 2. **`scripts/core-gates.sh`'s neighbour-read scan (clause 5, `:357-438`) is
+>    load-bearing again**, rather than the belt-and-braces it has been. Its own
+>    comment calls it a tripwire — *"no code starts reading neighbours without
+>    a human seeing it"* (`:372`) — and that is now the enforcement rather than
+>    a second line behind one. It runs over `RULES_CRATES`, which carries
+>    `orrery_games` by declaration (`scripts/core-gates.sh:59`), and it is now
+>    the mechanism standing where the type system used to.
+> 3. **`tier_h_world_of_one.rs` and `tier_h_adjudication_substrate.rs` are the
+>    guards** and must stay green. How they are built matters here: the two
+>    substrates are byte-indistinguishable to the adjudicator, so those guards
+>    are *observational* rather than comparative — see the amendment above.
+>
+> [#798] is why (e)(5)'s text needs no change. Of four ways to preserve the
+> discipline under a native ruleset it found **A** — leave `neighbor(id)`
+> exactly as it is and go native only for own-state systems — the winner, and
+> not on cost: a recorded read is a **lookup, not a dereference**, and every
+> query-shaped alternative splits finding from reading, so `query.get(e)`'s
+> `Result` discriminant is an existence bit obtained with the log untouched.
+> Absence is precisely the read dishonesty wants — *"I never saw the
+> occluder"* is the cover claim that pays. The collision is also smaller than
+> it looks: `InvariantSample` (`crates/orrery_core/src/invariants.rs:67-79`)
+> carries own state and own history and **no neighbours**, so [#796]'s entire
+> ergonomic win involves zero neighbour reads, and the workspace has exactly
+> one production `StateView::neighbor` call site
+> (`crates/orrery_games/src/regolith/visibility.rs:171`).
+>
+> **Clause (e)(4) is not amended, and matters more under this decision rather
+> than less.** The ambiguity canary and the permuted-insertion-order projection
+> differential were written when the *host* iterated on the rules' behalf. Once
+> game code iterates directly, query iteration order becomes the rules author's
+> problem: [#796] measured that query iteration is **not** stable across
+> permuted insertion, and canonicalizing it is work no type does for you.
+> [#800] already paid part of that debt — `TickBackend::step_tick`'s result
+> vector is sorted by `PersistId` by enforcement rather than by execution
+> accident, on both the `Executor` (the trait default) and
+> `EcsBackend::run_tick`, and event collection rides the same vector, so
+> committed event order became canonical with it. What remains unpaid stays
+> named there: materialization first-writer-wins is still an execution-order
+> effect.
+>
+> **Also unaffected**, recorded so the scope is not read wider than it is: F-4
+> remains the instrument that distinguishes "behaves identically" from "our
+> fixtures cannot tell", and all four classes stay green across every step;
+> and `orrery_sim`'s cdylib C ABI (`crates/orrery_sim/Cargo.toml:9`,
+> `crate-type = ["rlib", "cdylib"]`) — the sharpest of `orrery_games`' four
+> non-dev consumers, and what the Unreal seam (#744) consumes — must keep
+> building.
 
 **Honest accounting this record owes the reader (A4 §11.5, not dropped):**
 Tier H is *entirely conditional*. Until a trigger fires, Tier H is empty, the
@@ -618,3 +724,7 @@ than silently repeated.
 [D16]: 0016-parameter-reference.md
 [D38]: 0038-at-rest-schema-versioning.md
 [D42]: 0042-canonical-simulation-architecture.md
+[#793]: https://github.com/baadc0de/orrery/issues/793
+[#796]: https://github.com/baadc0de/orrery/pull/796
+[#798]: https://github.com/baadc0de/orrery/pull/798
+[#800]: https://github.com/baadc0de/orrery/pull/800
