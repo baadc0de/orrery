@@ -19,6 +19,7 @@ members = [
     "crates/orrery_identity",
     "crates/orrery_seed",
     "crates/orrery_games",
+    "crates/orrery_ruleset_digest",
     "crates/orrery_compose",
     "crates/orrery_conformance",
     # Pre-S5 C ABI spike: proves the engine-neutral simulation boundary.

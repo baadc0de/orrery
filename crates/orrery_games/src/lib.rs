@@ -64,6 +64,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod ruleset_digest {
+    include!(concat!(env!("OUT_DIR"), "/ruleset_digest.rs"));
+}
+
 pub mod diff;
 pub mod game;
 pub mod golden;
