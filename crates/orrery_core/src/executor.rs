@@ -35,7 +35,8 @@ pub struct TickOutcome<E> {
     /// Events emitted, in emission order.
     pub events: Vec<E>,
     /// Entity identifiers installed from those events, in materialization
-    /// order. Colliding later descriptions are absent: first writer wins.
+    /// order. Colliding later descriptions are absent: the lowest emitter,
+    /// then its earliest emission, wins.
     pub materialized: Vec<PersistId>,
     /// Neighbours the step actually read, in first-read order. These become
     /// `NeighborFrame` records.
@@ -190,6 +191,25 @@ impl<R: Ruleset> Executor<R> {
         tick: Tick,
         inputs: &[R::CoreInput],
     ) -> Option<TickOutcome<R::CoreEvent>> {
+        let CanonicalOutcome {
+            mut outcome,
+            materializations,
+        } = self.step_entity_canonical(entity, tick, inputs)?;
+        outcome.materialized = self.install_materializations(materializations, tick);
+        Some(outcome)
+    }
+
+    /// Run one entity's canonical stage without resolving its materializations.
+    ///
+    /// A whole tick keeps those candidates until every tick-boundary entity has
+    /// stepped, then sorts them by their explicit winner key. A single-entity
+    /// replay resolves the one emitter immediately in [`Self::step_entity`].
+    fn step_entity_canonical(
+        &mut self,
+        entity: PersistId,
+        tick: Tick,
+        inputs: &[R::CoreInput],
+    ) -> Option<CanonicalOutcome<R>> {
         if !self.states.contains_key(&entity) {
             return None;
         }
@@ -227,12 +247,52 @@ impl<R: Ruleset> Executor<R> {
         // produced by tick T is therefore the state whose claim tick is T+1.
         state_ticks.insert(entity, Tick::new(tick.0.saturating_add(1)));
 
-        let CanonicalOutcome {
-            mut outcome,
-            materializations,
-        } = produced;
-        outcome.materialized = self.install_materializations(materializations, tick);
-        Some(outcome)
+        Some(produced)
+    }
+
+    /// Advance a tick-boundary population and resolve materialization winners.
+    ///
+    /// Candidate order is established after stepping, so changing the loop's
+    /// execution order cannot change which description wins a collision. This
+    /// remains deliberately single-threaded; storage aliasing is a separate
+    /// concern and this method does not attempt it.
+    fn step_tick(
+        &mut self,
+        tick: Tick,
+        inputs: &SealedTickInputs<R::CoreInput>,
+    ) -> Vec<SteppedEntity<R::CoreEvent>> {
+        let population: Vec<PersistId> = self.entities().copied().collect();
+        let mut stepped = Vec::with_capacity(population.len());
+        let mut candidates = Vec::new();
+
+        for entity in population {
+            let Some(CanonicalOutcome {
+                outcome,
+                materializations,
+            }) = self.step_entity_canonical(entity, tick, inputs.for_entity(entity))
+            else {
+                continue;
+            };
+            candidates.extend(materializations);
+            stepped.push(SteppedEntity { entity, outcome });
+        }
+
+        // #800 establishes result order here rather than inheriting it from
+        // the loop above. Materialization now does the analogous thing: its
+        // winner order is established on the candidates below.
+        stepped.sort_by_key(|entry| entry.entity);
+        sort_materialization_candidates(&mut candidates);
+        for candidate in candidates {
+            let emitter = candidate.emitter;
+            let Some(installed) = self.install_materialization(candidate.description, tick) else {
+                continue;
+            };
+            let outcome = stepped
+                .binary_search_by_key(&emitter, |entry| entry.entity)
+                .expect("a materialization candidate came from a stepped entity");
+            stepped[outcome].outcome.materialized.push(installed);
+        }
+        stepped
     }
 
     /// Fill the tick-start slot for `tick`, unless it already holds it.
@@ -277,25 +337,35 @@ impl<R: Ruleset> Executor<R> {
 
     fn install_materializations(
         &mut self,
-        descriptions: Vec<EntityMaterialization<R::CoreState>>,
+        candidates: Vec<MaterializationCandidate<R::CoreState>>,
         tick: Tick,
     ) -> Vec<PersistId> {
-        let mut materialized = Vec::with_capacity(descriptions.len());
-        for EntityMaterialization { entity, mut state } in descriptions {
-            if let Entry::Vacant(slot) = self.states.entry(entity) {
-                state.quantize();
-                slot.insert(state);
-                // Deliberately not added to the tick-start slot: an entity
-                // born during tick T had no state at the start of T, so there
-                // is nothing for a later-stepping entity to have observed. It
-                // becomes a neighbour on T+1, the same tick it starts
-                // stepping on.
-                self.state_ticks
-                    .insert(entity, Tick::new(tick.0.saturating_add(1)));
+        let mut materialized = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if let Some(entity) = self.install_materialization(candidate.description, tick) {
                 materialized.push(entity);
             }
         }
         materialized
+    }
+
+    fn install_materialization(
+        &mut self,
+        EntityMaterialization { entity, mut state }: EntityMaterialization<R::CoreState>,
+        tick: Tick,
+    ) -> Option<PersistId> {
+        let Entry::Vacant(slot) = self.states.entry(entity) else {
+            return None;
+        };
+        state.quantize();
+        slot.insert(state);
+        // Deliberately not added to the tick-start slot: an entity born during
+        // tick T had no state at the start of T, so there is nothing for any
+        // entity in T to have observed. It becomes a neighbour on T+1, the
+        // same tick it starts stepping on.
+        self.state_ticks
+            .insert(entity, Tick::new(tick.0.saturating_add(1)));
+        Some(entity)
     }
 }
 
@@ -344,13 +414,40 @@ pub struct NeighborSnapshot<'a, S> {
 /// What the canonical stage produced, before any of it is stored.
 ///
 /// [`TickOutcome::materialized`] is empty here and filled in by whichever
-/// backend installs the descriptions: which identifiers actually materialize
-/// is a first-writer-wins property of the *store*, not of the rules.
+/// backend installs the descriptions. The candidates carry the canonical
+/// winner key, so which colliding description materializes is established
+/// before either store installs it.
 pub struct CanonicalOutcome<R: Ruleset> {
     /// The tick outcome, with `materialized` not yet resolved.
     pub outcome: TickOutcome<R::CoreEvent>,
-    /// Entities the emitted events asked to materialize, in emission order.
-    pub materializations: Vec<EntityMaterialization<R::CoreState>>,
+    /// Entities the emitted events asked to materialize, with their winner key.
+    pub materializations: Vec<MaterializationCandidate<R::CoreState>>,
+}
+
+/// One materialization description attributed to the step that emitted it.
+///
+/// `emission_index` is the description's zero-based position after walking the
+/// emitter's events in emission order and each event's appended descriptions
+/// in description order. That flattened index preserves the old within-emitter
+/// behaviour while making the cross-emitter winner key explicit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationCandidate<S> {
+    /// Entity whose step emitted the description.
+    pub emitter: PersistId,
+    /// Position within that emitter's materialization output.
+    pub emission_index: usize,
+    /// Fully described entity to install if this candidate wins.
+    pub description: EntityMaterialization<S>,
+}
+
+/// Establish the deterministic materialization winner order.
+///
+/// Backends consume candidates from this order and retain the first candidate
+/// for each unoccupied identifier: lowest emitting [`PersistId`], then lowest
+/// emission index. Sorting here, after the canonical steps, makes the winner
+/// independent of the order those steps executed in.
+pub fn sort_materialization_candidates<S>(candidates: &mut [MaterializationCandidate<S>]) {
+    candidates.sort_unstable_by_key(|candidate| (candidate.emitter, candidate.emission_index));
 }
 
 /// Run the canonical stage of one entity-tick: derive the RNG (VC-3), call the
@@ -423,10 +520,19 @@ pub fn canonical_step<R: Ruleset>(
     own.quantize();
     let hash = state_hash(own);
 
-    let mut materializations = Vec::new();
+    let mut descriptions = Vec::new();
     for event in &output.events {
-        ruleset.materialize(event, &mut materializations);
+        ruleset.materialize(event, &mut descriptions);
     }
+    let materializations = descriptions
+        .into_iter()
+        .enumerate()
+        .map(|(emission_index, description)| MaterializationCandidate {
+            emitter: entity,
+            emission_index,
+            description,
+        })
+        .collect();
 
     CanonicalOutcome {
         outcome: TickOutcome {
@@ -520,25 +626,20 @@ pub struct SteppedEntity<E> {
 /// tick it ran, and D43 (b)'s S2 row ("steps are independent — snapshot
 /// isolation") describes this code.
 ///
-/// Ascending `PersistId` remains canonical because two output properties are
-/// now *established* on the vector [`Self::step_tick`] returns, rather than
-/// inherited from the order entities happened to step in:
+/// Ascending `PersistId` remains canonical because three output properties are
+/// now *established* after stepping rather than inherited from the order
+/// entities happened to step in:
 ///
 /// - **Result reporting order.** [`Self::step_tick`] returns one entry per
 ///   entity, sorted by ascending `PersistId`.
 /// - **Event collection order.** [`TickOutcome::events`] are folded in the
 ///   order those sorted entries are consumed, so the committed event order is
 ///   the sorted order, not the execution order.
+/// - **Materialization winner.** Candidates are sorted by lowest emitting
+///   `PersistId`, then emission index, before either backend installs them.
 ///
-/// Materialization first-writer-wins is the remaining ordering obligation:
-/// two entities describing the same identifier in one tick are still resolved
-/// by which one ran first, so the winner is still a fact about execution
-/// order. A backend that stepped entities in a different order would still be
-/// a different simulation until that is also given a deterministic rule.
-///
-/// What *has* changed is the reason: the order no longer reaches inside a
-/// step, only around it — and for result reporting and event collection it
-/// is now established explicitly on output.
+/// None of this parallelizes storage access. It removes execution order from
+/// the three cheap merge obligations while leaving storage aliasing separate.
 pub trait TickBackend<R: Ruleset> {
     /// The rules this backend drives.
     fn ruleset(&self) -> &R;
@@ -631,18 +732,7 @@ pub trait TickBackend<R: Ruleset> {
         &mut self,
         tick: Tick,
         inputs: &SealedTickInputs<R::CoreInput>,
-    ) -> Vec<SteppedEntity<R::CoreEvent>> {
-        let population = self.entities();
-        let mut stepped = Vec::with_capacity(population.len());
-        for entity in population {
-            let Some(outcome) = self.step_entity(entity, tick, inputs.for_entity(entity)) else {
-                continue;
-            };
-            stepped.push(SteppedEntity { entity, outcome });
-        }
-        stepped.sort_by_key(|entry| entry.entity);
-        stepped
-    }
+    ) -> Vec<SteppedEntity<R::CoreEvent>>;
 }
 
 impl<R: Ruleset> TickBackend<R> for Executor<R> {
@@ -677,6 +767,14 @@ impl<R: Ruleset> TickBackend<R> for Executor<R> {
         inputs: &[R::CoreInput],
     ) -> Option<TickOutcome<R::CoreEvent>> {
         Executor::step_entity(self, entity, tick, inputs)
+    }
+
+    fn step_tick(
+        &mut self,
+        tick: Tick,
+        inputs: &SealedTickInputs<R::CoreInput>,
+    ) -> Vec<SteppedEntity<R::CoreEvent>> {
+        Executor::step_tick(self, tick, inputs)
     }
 }
 
@@ -999,9 +1097,21 @@ mod tests {
         );
         let accepted = executor.install_materializations(
             vec![
-                EntityMaterialization::new(occupied, Body { rolls: 1, ..body() }),
-                EntityMaterialization::new(new, Body { rolls: 2, ..body() }),
-                EntityMaterialization::new(new, Body { rolls: 3, ..body() }),
+                MaterializationCandidate {
+                    emitter: PersistId::new(1),
+                    emission_index: 0,
+                    description: EntityMaterialization::new(occupied, Body { rolls: 1, ..body() }),
+                },
+                MaterializationCandidate {
+                    emitter: PersistId::new(1),
+                    emission_index: 1,
+                    description: EntityMaterialization::new(new, Body { rolls: 2, ..body() }),
+                },
+                MaterializationCandidate {
+                    emitter: PersistId::new(1),
+                    emission_index: 2,
+                    description: EntityMaterialization::new(new, Body { rolls: 3, ..body() }),
+                },
             ],
             Tick::new(0),
         );

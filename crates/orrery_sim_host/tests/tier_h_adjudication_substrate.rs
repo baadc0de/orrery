@@ -37,7 +37,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use orrery_core::{Ruleset, TickBackend, TickOutcome};
+use orrery_core::{Ruleset, SealedTickInputs, SteppedEntity, TickBackend, TickOutcome};
 use orrery_games::diff::{collect_witness_on, cross_replay_on, Backends, WitnessArtifact};
 use orrery_games::regolith::Regolith;
 use orrery_games::scenario::{play_with, Play, Scenario, SCENARIOS};
@@ -86,6 +86,16 @@ impl<R: Ruleset, B: TickBackend<R>> TickBackend<R> for Counting<B> {
         self.steps.fetch_add(1, Ordering::Relaxed);
         self.inner.step_entity(entity, tick, inputs)
     }
+
+    fn step_tick(
+        &mut self,
+        tick: Tick,
+        inputs: &SealedTickInputs<R::CoreInput>,
+    ) -> Vec<SteppedEntity<R::CoreEvent>> {
+        let stepped = self.inner.step_tick(tick, inputs);
+        self.steps.fetch_add(stepped.len(), Ordering::Relaxed);
+        stepped
+    }
 }
 
 /// A substrate that installs a *different* state than the one it was handed.
@@ -133,6 +143,14 @@ impl<R: Game, B: TickBackend<R>> TickBackend<R> for Swapped<B> {
         inputs: &[R::CoreInput],
     ) -> Option<TickOutcome<R::CoreEvent>> {
         self.inner.step_entity(entity, tick, inputs)
+    }
+
+    fn step_tick(
+        &mut self,
+        tick: Tick,
+        inputs: &SealedTickInputs<R::CoreInput>,
+    ) -> Vec<SteppedEntity<R::CoreEvent>> {
+        self.inner.step_tick(tick, inputs)
     }
 }
 
@@ -388,5 +406,15 @@ impl<R: Ruleset, B: TickBackend<R>> TickBackend<R> for Widest<B> {
         let held = self.inner.entities().len();
         self.widest.fetch_max(held, Ordering::Relaxed);
         self.inner.step_entity(entity, tick, inputs)
+    }
+
+    fn step_tick(
+        &mut self,
+        tick: Tick,
+        inputs: &SealedTickInputs<R::CoreInput>,
+    ) -> Vec<SteppedEntity<R::CoreEvent>> {
+        let held = self.inner.entities().len();
+        self.widest.fetch_max(held, Ordering::Relaxed);
+        self.inner.step_tick(tick, inputs)
     }
 }
