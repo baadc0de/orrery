@@ -7,7 +7,7 @@
 #   ./scripts/dev-cache.sh prune    delete every target/ (safe: sources are in git)
 #   ./scripts/dev-cache.sh reclaim  report what is reclaimable in the worktrees
 #   ./scripts/dev-cache.sh reclaim --apply   and delete it
-#   ./scripts/dev-cache.sh --self-test       the reclaimer's two gates hold
+#   ./scripts/dev-cache.sh --self-test       the reclaimer's three gates hold
 #
 # Why this exists: each agent worktree keeps its own `target/`, because cargo
 # takes an exclusive lock on a target directory and sharing one would serialize
@@ -72,17 +72,20 @@ cache_ops() {
 # them. Two orphaned 100 GiB-class worktrees appeared in a single day.
 #
 # `reclaim` widens the scope `prune` is only accidentally safe within, so it
-# cannot inherit that accident. Every tree it touches passes two independent
-# gates, and each gate is conservative in the same direction — anything
-# unreadable, unresolvable or unfetchable is *reported and skipped*, never
-# deleted:
+# cannot inherit that accident. Every tree it touches passes independent gates,
+# and each gate is conservative in the same direction — anything unreadable,
+# unresolvable or unfetchable is *reported and skipped*, never deleted:
 #
 #   liveness  no build process is rooted in the tree. Resolved through
 #             /proc/<pid>/cwd, never guessed from a command line.
 #   content   the branch's changes are already on a freshly fetched main,
 #             compared by content rather than by ancestry.
+#   pushed    for a registered worktree whose content is not yet on main, the
+#             branch exists on origin at the same commit as local HEAD, so
+#             dropping its `target/` cannot lose unpushed work.
 #
-# What it does with a tree that passes both depends on what the tree is:
+# What it does with a tree that passes the applicable gates depends on what the
+# tree is:
 #
 #   orphan     a directory under .claude/worktrees/ that `git worktree list`
 #              does not know about. Dead by definition — no lane can ever build
@@ -90,6 +93,8 @@ cache_ops() {
 #              both of #781's incidents survived. The whole directory goes.
 #   registered a live worktree whose PR has landed. Only its `target/` goes;
 #              the checkout is the agent's and is not this script's to remove.
+#   registered a live worktree whose PR is open and whose branch is pushed.
+#              Its `target/` is trimmed; the checkout and `.git` stay.
 
 readonly RECLAIM_REF=refs/dev-cache/main
 # Matches scripts/agent-lane.sh's own staleness window, and reads the same
@@ -185,7 +190,7 @@ tree_busy_reason() {
 #
 # Deliberately **not** `git merge-base --is-ancestor`. PRs here are
 # squash-merged, so a lane's own commits are never ancestors of main and an
-# ancestry test would report every single landed lane as unmerged — a reclaimer
+# ancestry test would report every landed lane as unmerged — a reclaimer
 # that never reclaims. Instead, ask whether the lane's own base..tip patch can
 # be reversed from main. That distinguishes its changes from later, disjoint
 # edits to a file the lane also touched.
@@ -223,6 +228,28 @@ content_is_on_main() {
   fi
   rm -f -- "$index"
   return "$status"
+}
+
+# Is the worktree's current branch on origin at the same commit as local HEAD?
+#
+# This is intentionally stricter than "the branch has an upstream": it requires
+# the remote ref to exist and to point at the exact commit checked out here, so
+# nothing unpushed is at risk. A branch that is clean but not pushed is kept:
+# the source commits survive in the shared .git, but the rule here is the one
+# that prevented the 2026-08-31 alarms — a branch visible on origin — and that
+# is the condition we state to users.
+branch_is_pushed_at_head() {
+  local repo=$1 branch head remote_sha
+
+  branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+  # Detached HEAD has no branch name to look up on origin.
+  [[ $branch != HEAD ]] || return 1
+
+  head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || return 1
+  remote_sha=$(git -C "$repo" ls-remote origin "refs/heads/$branch" 2>/dev/null \
+    | awk '{print $1; exit}') || return 1
+
+  [[ -n $remote_sha && $remote_sha == "$head" ]]
 }
 
 # The worktrees git still knows about.
@@ -285,6 +312,7 @@ cmd_reclaim() {
   local lock="$common/.dev-cache-reclaim.lock"
   exec 9>"$lock"
   if ! flock -n 9; then
+    exec 9>&-
     note 'reclaim: another reclaim holds the lock; nothing to do'
     return 0
   fi
@@ -357,12 +385,13 @@ cmd_reclaim() {
       continue
     fi
 
-    if ! content_is_on_main "$primary" "$main_ref" "$head"; then
-      printf '  keep     %-16s its content is not on %s\n' "$name" "${main_ref##*/}"
-      continue
-    fi
-
     if [[ $kind == orphan ]]; then
+      # An orphan only leaves in one piece. Its source and target are one
+      # directory, and git no longer tracks the worktree at all.
+      if ! content_is_on_main "$primary" "$main_ref" "$head"; then
+        printf '  keep     %-16s its content is not on %s\n' "$name" "${main_ref##*/}"
+        continue
+      fi
       size=$(du -sk "$dir" 2>/dev/null | cut -f1) || size=0
       reclaimed_kb=$((reclaimed_kb + ${size:-0}))
       printf '  %-8s %-16s orphaned (not in `git worktree list`), content on %s, idle — %s\n' \
@@ -382,11 +411,26 @@ cmd_reclaim() {
           >> "$common/dev-cache-reclaim.log"
       fi
     else
+      # Registered worktrees: source is an agent's checkout and is preserved.
+      # Reclaim either the whole target/ when the branch has landed, or trim
+      # only the target/ when the branch is pushed but still open.
+      local verdict reason
+      if content_is_on_main "$primary" "$main_ref" "$head"; then
+        verdict=DELETE
+        reason="landed on ${main_ref##*/} and idle"
+      elif branch_is_pushed_at_head "$dir"; then
+        verdict=TRIM
+        reason="branch pushed, idle"
+      else
+        printf '  keep     %-16s its content is not on %s and branch is not pushed\n' \
+          "$name" "${main_ref##*/}"
+        continue
+      fi
       [[ -d "$dir/target" ]] || continue
       size=$(du -sk "$dir/target" 2>/dev/null | cut -f1) || size=0
       reclaimed_kb=$((reclaimed_kb + ${size:-0}))
-      printf '  %-8s %-16s landed on %s and idle — target/ only, %s\n' \
-        "$( (( apply )) && echo DELETE || echo would )" "$name" "${main_ref##*/}" \
+      printf '  %-8s %-16s %s — target/ only, %s\n' \
+        "$( (( apply )) && echo "$verdict" || echo would )" "$name" "$reason" \
         "$(numfmt --to=iec $(( ${size:-0} * 1024 )))"
       if (( apply )); then
         # See above: the liveness gate is only worth what it is worth at the
@@ -397,7 +441,7 @@ cmd_reclaim() {
           continue
         fi
         rm -rf -- "$dir/target"
-        printf '%s reclaim target %s %sK\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dir/target" "${size:-0}" \
+        printf '%s reclaim %s target %s %sK\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$verdict" "$dir/target" "${size:-0}" \
           >> "$common/dev-cache-reclaim.log"
       fi
     fi
@@ -406,13 +450,14 @@ cmd_reclaim() {
   printf '%s: %s %s\n' "$NAME" \
     "$( (( apply )) && echo reclaimed || echo reclaimable )" \
     "$(numfmt --to=iec $((reclaimed_kb * 1024)))"
+  exec 9>&-
 }
 
 # ── --self-test ─────────────────────────────────────────────────────────────
 #
 # This script's `reclaim` runs `rm -rf` over 100 GiB-class directories without a
-# human in the loop, so the two gates that stop it are the things worth pinning.
-# Both clauses are functional rather than structural: they build the situation
+# human in the loop, so the gates that stop it are the things worth pinning.
+# The clauses are functional rather than structural: they build the situation
 # and run the real function over it. A `grep` for the word `cwd` would pass on a
 # reclaimer that had stopped checking anything.
 
@@ -457,6 +502,7 @@ self_test() {
   git -C "$repo" config user.name 'dev-cache self-test'
   git -C "$repo" config commit.gpgsign false
   printf 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n' > "$repo/a.txt"
+  printf 'target/\n.claude/worktrees/\n' > "$repo/.gitignore"
   git -C "$repo" add -A
   git -C "$repo" commit -qm base
 
@@ -593,6 +639,122 @@ self_test() {
     die 'self-test: a directory git does not know about was listed as registered'
   fi
   st_ok 'registered_worktrees distinguishes a live worktree from a bare directory'
+
+  # ── Clause 4: a pushed but unmerged registered worktree is trimmed ─────────
+  #
+  # This is the shape that caused the 2026-08-31 alarms: a branch with an open
+  # PR, its commit on origin, its agent gone. The source must survive; only the
+  # reproducible target/ may go.
+  local remote="$ST_TMP/remote.git"
+  git init -q --bare "$remote"
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -q origin main
+
+  git -C "$repo" checkout -q -b feat/trim
+  printf 'trim-source\n' > "$repo/trim.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm 'pushed but unmerged'
+  git -C "$repo" push -q origin feat/trim
+  local trim_tip
+  trim_tip=$(git -C "$repo" rev-parse HEAD)
+  git -C "$repo" checkout -q main
+
+  if content_is_on_main "$repo" refs/heads/main "$trim_tip"; then
+    die 'self-test: the trim fixture branch appears landed; the clause is vacuous'
+  fi
+  st_ok 'the trim fixture branch is pushed but not considered landed'
+
+  mkdir -p "$repo/.claude/worktrees"
+  local trim_wt="$repo/.claude/worktrees/trim"
+  git -C "$repo" worktree add -q "$trim_wt" feat/trim
+  mkdir -p "$trim_wt/target/debug"
+  dd if=/dev/zero of="$trim_wt/target/debug/big.o" bs=1024 count=100 2>/dev/null
+  local wt_size
+  wt_size=$(du -sk "$trim_wt/target" 2>/dev/null | cut -f1) || wt_size=0
+  (( wt_size > 0 )) || die 'self-test: the trim fixture target/ is empty; the size check is vacuous'
+
+  # Run reclaim from the primary checkout so it sees the worktree the same way
+  # the real SessionEnd hook does.
+  local saved_root=$ROOT
+  ROOT="$repo"
+  local out
+  out=$(cmd_reclaim trim)
+  if [[ $out != *trim*branch*pushed* ]]; then
+    die "self-test: a pushed idle worktree was not reported as trimmable: $out"
+  fi
+  st_ok 'reclaim reports a pushed, idle, unmerged registered worktree as trimmable'
+
+  cmd_reclaim --apply trim
+  if [[ -d "$trim_wt/target" ]]; then
+    die 'self-test: target/ was not trimmed'
+  fi
+  if [[ ! -f "$trim_wt/trim.txt" ]]; then
+    die 'self-test: source file was removed along with target/'
+  fi
+  st_ok 'TRIM removed target/ and left source intact'
+
+  # ── Clause 5: an unpushed worktree is not trimmed ───────────────────────────
+  git -C "$repo" checkout -q -b feat/unpushed
+  printf 'unpushed-source\n' > "$repo/unpushed.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm 'unpushed commit'
+  git -C "$repo" checkout -q main
+  local unpushed_wt="$repo/.claude/worktrees/unpushed"
+  git -C "$repo" worktree add -q "$unpushed_wt" feat/unpushed
+  mkdir -p "$unpushed_wt/target"
+
+  out=$(cmd_reclaim unpushed)
+  if [[ $out == *TRIM*unpushed* || $out == *DELETE*unpushed* ]]; then
+    die "self-test: an unpushed worktree was scheduled for deletion/trim: $out"
+  fi
+  st_ok 'reclaim keeps an unpushed idle worktree'
+
+  # ── Clause 6: a dirty worktree is not trimmed ───────────────────────────────
+  git -C "$repo" checkout -q -b feat/dirty
+  printf 'dirty-source\n' > "$repo/dirty.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm 'dirty base'
+  git -C "$repo" push -q origin feat/dirty
+  git -C "$repo" checkout -q main
+  local dirty_wt="$repo/.claude/worktrees/dirty"
+  git -C "$repo" worktree add -q "$dirty_wt" feat/dirty
+  printf 'dirty-local-change\n' > "$dirty_wt/dirty-local.txt"
+  mkdir -p "$dirty_wt/target"
+
+  out=$(cmd_reclaim dirty)
+  if [[ $out == *TRIM*dirty* || $out == *DELETE*dirty* ]]; then
+    die "self-test: a dirty worktree was scheduled for deletion/trim: $out"
+  fi
+  st_ok 'reclaim keeps a dirty worktree'
+
+  # ── Clause 7: a pushed worktree with a live build is BUSY ───────────────────
+  git -C "$repo" checkout -q -b feat/busy
+  printf 'busy-source\n' > "$repo/busy.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm 'busy branch'
+  git -C "$repo" push -q origin feat/busy
+  git -C "$repo" checkout -q main
+  local busy_wt="$repo/.claude/worktrees/busy"
+  git -C "$repo" worktree add -q "$busy_wt" feat/busy
+  mkdir -p "$busy_wt/target"
+
+  ( cd "$busy_wt" && exec "$fake" -c 'sleep 30; :' ) &
+  local busy_pid=$!
+  ST_PIDS="$ST_PIDS $busy_pid"
+  st_await_comm "$busy_pid" cargo || die 'self-test: the busy decoy never appeared as cargo'
+
+  out=$(cmd_reclaim busy)
+  if [[ $out != *BUSY*busy* ]]; then
+    die "self-test: a live build in a pushed worktree was not reported BUSY: $out"
+  fi
+  if [[ ! -d "$busy_wt/target" ]]; then
+    die 'self-test: target/ of a BUSY pushed worktree was removed'
+  fi
+  kill "$busy_pid" 2>/dev/null || true
+  wait "$busy_pid" 2>/dev/null || true
+  st_ok 'reclaim reports BUSY for a pushed worktree with a live build and leaves it untouched'
+
+  ROOT="$saved_root"
 
   echo "$NAME: self-test passed"
 }
