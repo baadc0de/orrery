@@ -100,8 +100,9 @@ use bevy_ecs::prelude::{
 };
 use bevy_ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel};
 use orrery_core::{
-    canonical_step, CanonicalOutcome, CanonicalStep, NeighborSnapshot, Quantized, Ruleset,
-    SealedTickInputs, Section, Sectioned, SteppedEntity, TickBackend, TickOutcome,
+    canonical_step, sort_materialization_candidates, CanonicalOutcome, CanonicalStep,
+    NeighborSnapshot, Quantized, Ruleset, SealedTickInputs, Section, Sectioned, SteppedEntity,
+    TickBackend, TickOutcome,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
@@ -302,8 +303,8 @@ struct Materialized<R: EcsHostable> {
 /// is sorted here. The returned [`TickResults::stepped`] vector is sorted
 /// again before it leaves the backend, so result reporting and event
 /// collection order are established properties of the output rather than
-/// inherited from the iteration order. Materialization first-writer-wins
-/// remains the one ordering effect still decided by execution order.
+/// inherited from the iteration order. Materialization candidates are likewise
+/// sorted by their explicit winner key after every step completes.
 fn seal_population<R: EcsHostable>(
     migrated: Query<(Entity, &Identity, &MigratedSection<R>, &ObservedAt)>,
     remainder: Query<(Entity, &Identity, &RemainderSection<R>, &ObservedAt)>,
@@ -410,6 +411,7 @@ fn advance_population<R: EcsHostable>(
     let settled = Tick::new(tick.0.saturating_add(1));
     results.stepped.clear();
     results.spawned.clear();
+    let mut candidates = Vec::new();
 
     for slot in &plan.order {
         if plan.only.is_some_and(|only| only != slot.persist) {
@@ -427,7 +429,7 @@ fn advance_population<R: EcsHostable>(
             continue;
         };
         let CanonicalOutcome {
-            mut outcome,
+            outcome,
             materializations,
         } = canonical_step(
             CanonicalStep {
@@ -450,38 +452,44 @@ fn advance_population<R: EcsHostable>(
             observed.0 = settled;
         }
 
-        // First writer wins, against the population and against anything an
-        // earlier entity in this same tick already materialized. The pending
-        // spawns are the second half of that test now that the neighbour view
-        // is read-only: `Index` covers everything alive at the tick boundary,
-        // `results.spawned` covers everything claimed since.
-        let mut installed = Vec::with_capacity(materializations.len());
-        for description in materializations {
-            if index.0.contains_key(&description.entity)
-                || results
-                    .spawned
-                    .iter()
-                    .any(|pending| pending.entity == description.entity)
-            {
-                continue;
-            }
-            let mut state = description.state;
-            state.quantize();
-            installed.push(description.entity);
-            // Deliberately not added to the sealed view: an entity born
-            // during tick T had no state at the start of T, so no
-            // later-stepping entity can have observed one. It becomes a
-            // neighbour on T+1, the tick it starts stepping on.
-            results.spawned.push(Materialized {
-                entity: description.entity,
-                state,
-            });
-        }
-        outcome.materialized = installed;
-
+        candidates.extend(materializations);
         results.stepped.push(SteppedEntity {
             entity: slot.persist,
             outcome,
+        });
+    }
+
+    // Establish lowest-emitter, then emission-index order after every
+    // canonical step. `Index` refuses identifiers occupied at the tick
+    // boundary; `results.spawned` retains the first candidate for each new
+    // identifier. Neither half depends on the loop order above.
+    sort_materialization_candidates(&mut candidates);
+    for candidate in candidates {
+        let emitter = candidate.emitter;
+        let description = candidate.description;
+        if index.0.contains_key(&description.entity)
+            || results
+                .spawned
+                .iter()
+                .any(|pending| pending.entity == description.entity)
+        {
+            continue;
+        }
+        let mut state = description.state;
+        state.quantize();
+        let outcome = results
+            .stepped
+            .iter_mut()
+            .find(|stepped| stepped.entity == emitter)
+            .expect("a materialization candidate came from a stepped entity");
+        outcome.outcome.materialized.push(description.entity);
+        // Deliberately not added to the sealed view: an entity born during
+        // tick T had no state at the start of T, so no entity in T can have
+        // observed one. It becomes a neighbour on T+1, the tick it starts
+        // stepping on.
+        results.spawned.push(Materialized {
+            entity: description.entity,
+            state,
         });
     }
 }

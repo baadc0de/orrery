@@ -345,8 +345,10 @@ pub trait Ruleset: Send + Sync + 'static {
     /// Project one emitted event into fully described entities to install.
     ///
     /// The executor calls this immediately after [`Ruleset::step`], once per
-    /// event in emission order, and installs appended entities in append
-    /// order. The first description of an identifier wins; later descriptions
+    /// event in emission order. The executor attributes every appended
+    /// description to the emitter and its flattened emission index. Across a
+    /// tick, the lowest emitting `PersistId` wins an identifier collision;
+    /// within that emitter, the earliest description wins. Later descriptions
     /// are dropped. Existing rulesets need no materialization channel and use
     /// the empty default.
     ///
@@ -356,7 +358,8 @@ pub trait Ruleset: Send + Sync + 'static {
     /// from executor population or creation order. An isolated replay of the
     /// emitter therefore reproduces the same descriptions even though it does
     /// not hold the rest of the world. Whether a colliding description wins is
-    /// an executor concern and does not feed back into the emitter's step.
+    /// a backend concern resolved from the attributed candidates after all
+    /// tick-boundary entities step; it does not feed back into either step.
     ///
     /// Materialization descriptions are not part of [`state_hash`]. A game
     /// whose materialization matters to adjudication must also record an

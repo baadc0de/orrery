@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 
 use orrery_core::{
     ComponentTypeId, EntityMaterialization, Executor, Invariant, OrderedInputs, QPos, QVel,
-    Ruleset, StateView, StepOutput, TickBackend, TickRng,
+    Ruleset, SealedTickInputs, StateView, StepOutput, TickBackend, TickRng,
 };
 use orrery_games::diff::{
     collect_artifacts_on, cross_replay_on, run_differential_on, Backends, Baseline, Class,
@@ -49,6 +49,7 @@ use orrery_games::diff::{
 use orrery_games::golden;
 use orrery_games::regolith::order::{Order, Outcome};
 use orrery_games::regolith::state::{Craft, RegolithState, Rock, RockTier};
+use orrery_games::regolith::weapon::WeaponKind;
 use orrery_games::regolith::{archetype::Archetype, Regolith, REGOLITH_COMPOSITION};
 use orrery_games::scenario::{play_with, replay_with, Scenario, SCENARIOS, T0, WORLD_SCENARIO};
 use orrery_games::{CompatibilityManifest, Game, GameMeta, Tamper};
@@ -192,6 +193,95 @@ impl Ruleset for WithinTickVisibility {
     fn invariants(&self) -> &[Invariant<Self::CoreState>] {
         orrery_games::regolith::invariants::INVARIANTS
     }
+}
+
+/// A two-emitter collision whose winning state identifies both tie-breaks.
+///
+/// Each emitter describes the same pickup twice. Its x coordinate identifies
+/// the emitter and y identifies the flattened materialization emission index.
+/// The canonical winner is therefore `(x=1, y=0)` regardless of which emitter
+/// executes first.
+#[derive(Debug, Clone, Copy)]
+struct CollidingMaterializations;
+
+const COLLISION_TARGET: PersistId = PersistId::new(9_001);
+const LOW_EMITTER: PersistId = PersistId::new(1);
+const HIGH_EMITTER: PersistId = PersistId::new(2);
+
+impl Ruleset for CollidingMaterializations {
+    type CoreState = RegolithState;
+    type CoreInput = Order;
+    type CoreEvent = Outcome;
+
+    fn id(&self) -> orrery_protocol::RulesetId {
+        Regolith::honest().id()
+    }
+
+    fn step(
+        &self,
+        view: &mut StateView<'_, Self::CoreState>,
+        _inputs: &OrderedInputs<'_, Self::CoreInput>,
+        _rng: &mut TickRng,
+    ) -> StepOutput<Self::CoreEvent> {
+        let emitter = i64::try_from(view.entity().0).expect("the fixture emitter fits i64");
+        StepOutput {
+            events: vec![
+                Outcome::SpawnPickup {
+                    id: COLLISION_TARGET,
+                    pos: QPos {
+                        x: emitter,
+                        y: 0,
+                        z: 0,
+                    },
+                    kind: WeaponKind::Stock,
+                    expires_at: 60,
+                },
+                Outcome::SpawnPickup {
+                    id: COLLISION_TARGET,
+                    pos: QPos {
+                        x: emitter,
+                        y: 1,
+                        z: 0,
+                    },
+                    kind: WeaponKind::Heavy,
+                    expires_at: 60,
+                },
+            ],
+        }
+    }
+
+    fn materialize(
+        &self,
+        event: &Self::CoreEvent,
+        out: &mut Vec<EntityMaterialization<Self::CoreState>>,
+    ) {
+        Regolith::honest().materialize(event, out);
+    }
+}
+
+fn materialization_winner_on<B>(mut backend: B) -> (Vec<(PersistId, Vec<PersistId>)>, RegolithState)
+where
+    B: TickBackend<CollidingMaterializations>,
+{
+    // Reverse insertion is deliberate but is not the execution permutation
+    // proof: that direction temporarily reverses both stepping loops while
+    // this same named test stays green.
+    for emitter in [HIGH_EMITTER, LOW_EMITTER] {
+        TickBackend::insert(
+            &mut backend,
+            emitter,
+            RegolithState::Craft(Craft::spawned(Archetype::Interceptor, QPos::default(), 0)),
+        );
+    }
+    let stepped = TickBackend::step_tick(&mut backend, Tick::new(700), &SealedTickInputs::new());
+    let outcomes = stepped
+        .into_iter()
+        .map(|stepped| (stepped.entity, stepped.outcome.materialized))
+        .collect();
+    let winner = TickBackend::state(&backend, COLLISION_TARGET)
+        .expect("one colliding description won")
+        .clone();
+    (outcomes, winner)
 }
 
 impl Game for WithinTickVisibility {
@@ -375,6 +465,40 @@ fn within_tick_neighbor_visibility_reaches_four_class_parity() {
         four_class_parity(),
         "regolith/{}: live within-tick neighbour visibility is absent from F-4 parity",
         WITHIN_TICK_VISIBILITY_SCENARIO.name
+    );
+}
+
+/// Blocker 1 from #787: both stores establish the materialization winner from
+/// `(emitter, emission_index)`, rather than inheriting it from step order.
+///
+/// The mutation check reverses the shared candidate ordering and this test
+/// fails by name. Its other direction reverses both backends' stepping loops
+/// with candidate ordering intact and this same test remains green.
+#[test]
+fn lowest_emitter_then_emission_index_wins_on_both_backends() {
+    let seed = UniverseSeed([0x87; 32]);
+    let store = materialization_winner_on(Executor::new(CollidingMaterializations, seed));
+    let ecs = materialization_winner_on(EcsBackend::new(CollidingMaterializations, seed));
+
+    assert_eq!(
+        store, ecs,
+        "the store and ECS disagree on the colliding materialization winner"
+    );
+    assert_eq!(
+        store.0,
+        vec![
+            (LOW_EMITTER, vec![COLLISION_TARGET]),
+            (HIGH_EMITTER, vec![]),
+        ],
+        "the materialized identifier was attributed to the wrong emitter"
+    );
+    let RegolithState::Pickup(winner) = store.1 else {
+        panic!("the winning description did not materialize a pickup");
+    };
+    assert_eq!(
+        (winner.pos.x, winner.pos.y),
+        (1, 0),
+        "the winner was not the lowest emitter's earliest emission"
     );
 }
 
