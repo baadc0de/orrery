@@ -445,15 +445,14 @@ where the answer can only propose.
 
 Stated plainly, because this is the same gap #798 declared:
 
-* **Nothing is wired through `Ruleset::step`, `Executor`, `EcsBackend` or
+* ~~**Nothing is wired through `Ruleset::step`, `Executor`, `EcsBackend` or
   `ReplayHarness`.** The `get` compatibility is a demonstrated *shape* match
-  against quoted code, not a replay that ran. `tier_h_world_of_one.rs` and
-  `tier_h_adjudication_substrate.rs` are unchanged and untouched by this
-  branch, so their staying green proves nothing about this design.
-* **`OrderedQuery` does not implement staleness or #758's future-stamp
-  refusal.** `StateView::neighbor` does (`ruleset.rs:180-195`); a production
-  `OrderedQuery` would have to, and the `observed_ticks` it needs are not
-  modelled here.
+  against quoted code, not a replay that ran.~~ **Closed by §9.** A real
+  `Ruleset` now runs on `Executor` and is adjudicated by `ReplayHarness`. The
+  `get` result held; two other things did not.
+* ~~**`OrderedQuery` does not implement staleness or #758's future-stamp
+  refusal.**~~ **Closed by §9.3**, and it was not merely missing — §9.2 shows
+  it convicting an honest authority. `ReadWindow` now carries it.
 * **No `Ruleset` is written against it**, so nothing measures the ergonomics
   the arc is for. #796's before/after is the evidence for that and it is
   unaffected either way.
@@ -662,3 +661,239 @@ not edit that table.
 Not done, deliberately: no crate is migrated onto the facade, `orrery_games` is
 untouched, `scripts/core-gates.sh` is untouched, no ADR is amended, and
 `bevy_ecs` is neither forked nor vendored.
+
+---
+
+## 9. The replay that ran (#815's stated gap, closed)
+
+§4.1's first bullet said the `get` compatibility was *"a demonstrated shape
+match against quoted code, not a replay that ran"*. This section is the replay
+that ran. Everything below is from
+`spikes/orrery_ecs_facade/tests/replay_through_ordered_query.rs`, eight tests,
+all green, against unmodified `orrery_core`.
+
+### 9.0 The wiring, and the one thing it could not do
+
+`Ruleset::step` (`crates/orrery_core/src/ruleset.rs:338`) is handed a
+`&mut StateView<'_, CoreState>` and nothing else. `StateView`'s neighbour
+snapshot is a private `&BTreeMap` (`ruleset.rs:105`) reachable only through
+`StateView::neighbor` (`ruleset.rs:176`) — which is itself the recording call.
+**A query therefore cannot be sourced from a `StateView`.** That is a hard
+finding about the current signature and it shapes everything else here.
+
+What can be done without amending `orrery_core` is the inverse:
+
+1. the rules object owns the `World` (behind a `Mutex`, because `step` takes
+   `&self`);
+2. a `MirrorBackend: TickBackend` keeps that `World` equal to `Executor`'s
+   store, mirroring every `insert_observed`, `take_state` and post-step
+   write-back;
+3. `step` runs the game's rule through `OrderedQuery` against the `World`;
+4. `step` then **drains** `AccessLog::neighbor_reads()` into
+   `StateView::neighbor`, one call per id, in order.
+
+`StateView` stays the ledger; `OrderedQuery` becomes the read path. This is the
+*most favourable* arrangement available to the design — the two stores are
+equal by construction, and the recorded sequence is produced by the query
+itself. Every divergence below survives it.
+
+The drain is load-bearing and measured as such: deleting the
+`view.neighbor(key)` loop fails seven of the eight tests.
+
+### 9.1 The result: `get` produces the sequence `replay.rs:325` accepts
+
+The rule consults `[78, 999, 78]` each tick — a hit, an id installed nowhere,
+and the hit again. Over a three-tick signed window with one `LogFrame`,
+chain-folded and signed, replayed on a fresh `MirrorBackend` through
+`ReplayHarness::on`:
+
+| | tick T₀ | T₀+1 | T₀+2 |
+|---|---|---|---|
+| rule consulted | 78, 999, 78 | 78, 999, 78 | 78, 999, 78 |
+| `AccessLog::neighbor_reads()` | `[78, 999]` | `[78, 999]` | `[78, 999]` |
+| `outcome.neighbor_reads` | `[78, 999]` | `[78, 999]` | `[78, 999]` |
+| `NeighborFrame` ids logged (`expected_reads`) | `[78, 999]` | `[78, 999]` | `[78, 999]` |
+| frame `present` bits | `[true, false]` | `[true, false]` | `[true, false]` |
+
+`outcome.neighbor_reads == expected_reads` at `replay.rs:325` on every tick,
+and **every tick reproduces the state hash the authority claimed**. Dedup,
+first-mention order and the absent case all round-trip. #815's claim about
+`get` is confirmed by execution, not by shape.
+
+The check is not vacuous. `a_permuted_frame_order_is_refused` swaps the two
+neighbour records' contents within one tick, re-signs the frame, and gets
+`Err(NeighborFramesMalformed)` — so the green result above is about ordering.
+(Swapping whole records instead trips the earlier `seq` legality check and
+returns `InputOrderIllegal`, which is a different fact; the test avoids it
+deliberately.)
+
+### 9.2 Two refutations, and the second is the serious one
+
+**(a) The query answers for the reader's own id.** `StateView::neighbor` refuses
+it by identity (`ruleset.rs:176`, `id != self.entity`) while still recording the
+ask. `OrderedQuery` — as #815 left it — has no idea who is reading, so it
+returns the row.
+
+The read is recorded either way, so `replay.rs:325` is satisfied and **the
+window adjudicates clean**. What the log then says is false: `canonical_step`
+writes the own-id frame `present: false` with an empty payload
+(`executor.rs:394`, `(*neighbor != entity).then(..)`), while the rule consumed
+the entity's own state through a path the evidence does not describe. Measured:
+own `hp` 100, neighbour `hp` 7; a genuine miss then a hit gives 106, and the
+run gives **207**.
+
+**(b) A stale read convicts an honest authority.** This is the one that
+matters. `StateView::neighbor` hides an observation older than
+`max_neighbor_staleness_ticks` (`ruleset.rs:192`, `checked_sub`); `canonical_step`
+then logs the frame as `present: false` stamped at the *reader's* tick
+(`executor.rs:394-415`). `OrderedQuery` performs no such check — the row is in
+the `World`, so it is returned.
+
+So the authority computes with state its own log says was never delivered, and
+the adjudicator, which installs only `present` frames, computes without it:
+
+| | authority | adjudicator |
+|---|---|---|
+| neighbour observed at | T−10, cap 5 | frame says `present: false` |
+| query returned | `Some(hp = 7)` | `None` |
+| logged sequence | `[78, 999]` | `[78, 999]` — **matches** |
+| state hash | *h* | *h′ ≠ h* |
+
+The window is *well-formed*. The sequence check passes. The hashes diverge, and
+in `verify_bundle` terms that is a `Confirms` against an authority that did
+nothing wrong. A refusal would have been safe; this is not.
+
+### 9.3 The gap, closed: `ReadWindow`
+
+Both refutations are the same missing fact — the query does not know **who** is
+reading or **when**. Neither is derivable inside a rule: `Ruleset::step` is
+handed no tick at all, and the reader's identity reaches a rule only through
+`StateView::entity`. So it is a *host* obligation, and the facade now models it:
+
+```rust
+#[derive(Component)] pub struct ObservedAt(pub Tick);
+
+#[derive(Resource)] pub struct ReadWindow { /* reader, tick, max_staleness_ticks */ }
+impl ReadWindow {
+    pub const fn observed(reader: PersistId, tick: Tick, max_staleness_ticks: u64) -> Self;
+    pub const fn open() -> Self; // #815's behaviour, kept runnable for the refutations
+}
+```
+
+`ReadWindow::observed`'s three arguments are exactly `StateView::observed`'s
+`entity`, `tick` and `staleness_cap` (`ruleset.rs:124`), and `admits` is the
+same `checked_sub` for the same #758 reason: a stamp *ahead* of the reader is
+state from the reader's future, which `ReplayHarness` already refuses
+(`replay.rs:259`). `OrderedQuery::get` now records `Searched`, then refuses on
+identity, then refuses on staleness — so a hidden row and an absent row are
+still indistinguishable in the log.
+
+With the host stamping it (`MirrorBackend::step_entity` does, before calling
+`Executor::step_entity`, because the tick is not in the rule's signature):
+
+* the stale window of §9.2(b) replays to **the same hashes**;
+* the own id is refused, recorded, and priced as a miss (100 → 106);
+* an observation *inside* the cap is still delivered (four ticks back against a
+  cap of five → 107), so the bound is a bound and not a switch.
+
+`ReadWindow::open()` is retained only so the two refutations stay runnable
+measurements rather than recollections. **No host may ship it.**
+
+### 9.4 Can a game crate be written with no `World` in reach?
+
+**Yes — for the rule. No — for the system.** The whole rule is
+`facade_game::erode`:
+
+```rust
+pub fn erode(own: &mut Rock, rocks: &mut bevy_ecs::OrderedQuery<&'static Rock>, targets: &[PersistId])
+```
+
+No `World`, no `Commands`, no `Res`, no `SystemParam` derive, in a crate where
+`bevy_ecs` *is* the facade and upstream is not in the extern prelude at all.
+§2.2's resolution holds.
+
+But the line falls in a specific place, and it is not where "game crates never
+derive `SystemParam`" suggests. The **system** — the thing with `Res<Targets>`
+and `ResMut<Own>` in its signature, the thing bevy actually runs — is written on
+the *host* side, because `Res` and `ResMut` are not on the curated surface.
+The game contributes a plain function that the host's system calls. So:
+
+* a game crate **cannot declare a resource**, cannot schedule, cannot express
+  ordering between its own systems, and cannot add a new access shape;
+* every one of those is a host edit, reviewed as a facade change. That is the
+  tax §7(6) named, now priced concretely: it is not "add a param to the
+  facade", it is "the host owns every system signature a game will ever need".
+
+For the rule itself, what the facade must provide is short:
+
+| Item | Why |
+|---|---|
+| `Component`, `Resource`, `Entity` and their derive support | already §2.4's allowlist |
+| `OrderedQuery<D>` with `get` | the only neighbour read path |
+| own state as `&mut C` — the *same* component type the query yields | so a rule never learns own state is stored differently |
+| `PersistKey`, `KeyIndex`, `ObservedAt`, `ReadWindow`, `AccessLog` | host-side plumbing the game may name but cannot usefully act on |
+
+Audited against §2.3's closure rule — *closed under the types reachable through
+the signatures of listed items* — the items added by this lane pass:
+`KeyIndex::entity` returns `Entity`, which was already exported and is inert
+without something to look it up in; `ObservedAt` and `ReadWindow` are built from
+`Tick`, `PersistId` and `u64`; `OrderedQuery`'s public methods return
+`D::Item`, `Vec<PersistId>` and `&AccessLog`. No `World`, `DeferredWorld`,
+`EntityRef` or `UnsafeWorldCell` is reachable through any of them, and
+`facade_game`'s existing `compile_fail` doctests still refuse all four.
+
+One caveat, recorded rather than resolved: `SystemParam` remains re-exported
+(§2.2 explains why), so its trait methods are nameable in a game crate. They are
+not *callable* — `init_state` needs a `&mut World` value, which a game crate
+cannot construct or obtain — but this is an argument, not a `compile_fail`, and
+it is the kind of argument §2.3 exists to distrust.
+
+### 9.5 What is still unproven
+
+Same standard as §4.1, and the list is not short.
+
+* **The `World`-in-a-`Mutex` is a spike's answer to a signature problem, not a
+  design.** `Ruleset::step` is pure by contract (VC-8); this implementation
+  reads state that did not arrive through `view`. It produces the right bytes
+  here because `MirrorBackend` keeps the two stores equal, and that equality is
+  an invariant of ~40 lines of test code, not of anything shipped. **A real
+  bevy-native path must change `Ruleset::step`'s signature**, and this lane did
+  not design that change.
+* **The drain is not the design either.** In the real thing, `OrderedQuery`'s
+  log *is* the neighbour record; here it is copied into `StateView`, which
+  means `StateView::neighbor`'s freshness filter runs a second time over ids
+  the query already decided about. Two implementations of one rule agreed in
+  every case tested; nothing proves they must.
+* **One entity, one neighbour, one component type, three ticks, no events, no
+  materialization, no RNG draw.** The window is the smallest one that can carry
+  a `NeighborFrame`. Nothing here exercises `step_tick`, multi-entity ordering,
+  `EcsBackend`, or `orrery_sim_host` at all.
+* **`enumerate` is untouched by this lane** and still carries §4's bill. It now
+  also filters on `ReadWindow`, which is untested against replay.
+* **The cap interaction is unexercised.** `max_neighbor_reads` is 4 against 2
+  distinct reads; `replay.rs:275-278`'s cap rejection never fires in these
+  tests.
+* **`ReadWindow` is stamped by one host, in one place.** Nothing enforces that a
+  host stamps it, and `ReadWindow::open()` — which must never ship — is a public
+  constructor. A production facade would make the window a construction
+  parameter rather than a resource anyone may overwrite; that is a design this
+  lane names and does not build.
+* **No ADR is amended and none is proposed.** What is owed, if this path is
+  taken: D43 (e)(5) currently reads as though `StateView` is the only recorded
+  read path, and §9.3 makes `ReadWindow` a second place the staleness bound is
+  implemented. Two implementations of one normative rule is exactly the shape
+  ADR-0043 clause (b) exists to prevent.
+
+### 9.6 What was built (this lane)
+
+| Path | What it is |
+|---|---|
+| `spikes/orrery_ecs_facade/tests/replay_through_ordered_query.rs` | the `Ruleset`, the `MirrorBackend`, the signed window, and eight tests |
+| `spikes/orrery_ecs_facade/src/lib.rs` | `ObservedAt`, `ReadWindow`, `KeyIndex::entity`, and the two refusals inside `get` |
+| `spikes/facade_game/src/lib.rs` | `erode` — the whole rule, with no `World` in its signature — and `Rock`'s `CoreCodec`/`Quantized` |
+
+Not done, deliberately: Regolith is not migrated, `orrery_core` is not amended,
+`scripts/core-gates.sh` is untouched, no ADR is amended, and `bevy_ecs` is
+neither forked nor vendored. `Ruleset` is implemented in `tests/`, not `src/`,
+so `core-gates.sh`'s role discovery — which reads library sources only
+(`scripts/core-gates.sh:94-102`) — does not gate this crate.

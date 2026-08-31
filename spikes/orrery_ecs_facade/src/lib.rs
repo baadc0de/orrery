@@ -42,7 +42,7 @@ use alloc::collections::BTreeMap;
 
 extern crate alloc;
 
-use orrery_protocol::PersistId;
+use orrery_protocol::{PersistId, Tick};
 
 // ── The curated surface ─────────────────────────────────────────────────────
 //
@@ -191,7 +191,7 @@ impl AccessLog {
 
     /// Drop everything. The host calls this at the start of each entity-tick,
     /// the way `StateView` is constructed fresh per entity-tick in
-    /// `canonical_step` (`crates/orrery_core/src/executor.rs:384`).
+    /// `canonical_step` (`crates/orrery_core/src/executor.rs:382`).
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -235,6 +235,90 @@ impl AccessLog {
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PersistKey(pub PersistId);
 
+/// The tick the row's state was observed at.
+///
+/// The ECS-side counterpart of `Executor::state_ticks`
+/// (`crates/orrery_core/src/executor.rs:70`). Without it a query cannot answer
+/// the #758 question at all — "is this state from my past, and how far past?"
+/// — because a `World` row carries no provenance of its own.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedAt(pub Tick);
+
+/// What the reader is allowed to see this entity-tick.
+///
+/// This is the resource that puts `StateView::neighbor`'s two refusals
+/// (`crates/orrery_core/src/ruleset.rs:176`) inside the query: the
+/// own-identity refusal (`id != self.entity`) and the `checked_sub` staleness
+/// bound (`ruleset.rs:192`).
+///
+/// It is a *host* resource, and it has to be, because neither half is
+/// derivable inside a rule: `Ruleset::step` is handed no tick
+/// (`ruleset.rs:338`), and the stepping entity's identity reaches a rule only
+/// through `StateView::entity`. Whoever drives the tick stamps this before the
+/// step, exactly as `canonical_step` stamps `StateView::observed`
+/// (`executor.rs:382`).
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct ReadWindow {
+    reader: Option<PersistId>,
+    tick: Tick,
+    max_staleness_ticks: Option<u64>,
+}
+
+impl ReadWindow {
+    /// The window a host stamps: this reader, this tick, this ruleset's cap.
+    ///
+    /// The three arguments are exactly `StateView::observed`'s
+    /// `entity`, `tick` and `staleness_cap`.
+    #[must_use]
+    pub const fn observed(reader: PersistId, tick: Tick, max_staleness_ticks: u64) -> Self {
+        Self {
+            reader: Some(reader),
+            tick,
+            max_staleness_ticks: Some(max_staleness_ticks),
+        }
+    }
+
+    /// No identity refusal and no staleness bound — #815's `OrderedQuery`,
+    /// reproduced.
+    ///
+    /// This exists so the refutations in
+    /// `tests/replay_through_ordered_query.rs` stay *runnable* rather than
+    /// becoming prose about a version of the type that no longer exists. It is
+    /// not a mode any host may ship: a window stamped this way reads its own
+    /// state as a neighbour and reads observations from any tick, and both
+    /// diverge from `StateView` in ways that test file measures.
+    #[must_use]
+    pub const fn open() -> Self {
+        Self {
+            reader: None,
+            tick: Tick::new(0),
+            max_staleness_ticks: None,
+        }
+    }
+
+    /// Whether a row observed at `observed` may be read this tick.
+    ///
+    /// `checked_sub`, not saturating, and for #758's reason: an observation
+    /// stamped *ahead* of the reader is state from the reader's future,
+    /// arrived by replication, which `ReplayHarness` refuses as a malformed
+    /// frame (`crates/orrery_core/src/replay.rs:258`). A live read that
+    /// accepted it would disagree with adjudication about the same log.
+    fn admits(&self, observed: Tick) -> bool {
+        let Some(cap) = self.max_staleness_ticks else {
+            return true;
+        };
+        self.tick
+            .0
+            .checked_sub(observed.0)
+            .is_some_and(|age| age <= cap)
+    }
+
+    /// Whether `key` is the stepping entity itself.
+    fn is_reader(&self, key: PersistId) -> bool {
+        self.reader == Some(key)
+    }
+}
+
 /// `PersistId` → `Entity`, maintained by whoever spawns.
 ///
 /// A search by name needs this; without it `get` would have to scan, and a
@@ -253,6 +337,21 @@ impl KeyIndex {
     /// Forget a row's identity.
     pub fn remove(&mut self, key: PersistId) {
         self.by_key.remove(&key);
+    }
+
+    /// The `Entity` a `PersistId` names, if the index holds one.
+    ///
+    /// Added by #815's follow-up lane, and the reason is worth recording: a
+    /// host that mirrors an authoritative store into this `World` — which is
+    /// what `tests/replay_through_ordered_query.rs` does — has to *update*
+    /// a row it already spawned, and could not, because the map was
+    /// write-only. Reading it is a host capability, not a game one:
+    /// `Entity` is exported, but nothing a game crate can name turns one
+    /// into a component, so this widens the host's surface and not the
+    /// game's.
+    #[must_use]
+    pub fn entity(&self, key: PersistId) -> Option<Entity> {
+        self.by_key.get(&key).copied()
     }
 }
 
@@ -281,8 +380,9 @@ pub struct OrderedQuery<'w, 's, D>
 where
     D: bevy_ecs::query::QueryData + 'static,
 {
-    rows: bevy_ecs::system::Query<'w, 's, (&'static PersistKey, D)>,
+    rows: bevy_ecs::system::Query<'w, 's, (&'static PersistKey, &'static ObservedAt, D)>,
     index: bevy_ecs::system::Res<'w, KeyIndex>,
+    window: bevy_ecs::system::Res<'w, ReadWindow>,
     log: bevy_ecs::system::ResMut<'w, AccessLog>,
 }
 
@@ -293,18 +393,39 @@ where
     /// Look one row up by name, recording the lookup before its outcome is
     /// known.
     ///
-    /// The `Searched` entry is pushed on the first line, so the three ways
-    /// this can return `None` — no such id, the id has no matching row, the
-    /// row does not satisfy `D` — are indistinguishable in the log from each
-    /// other and from a hit. That is the property `query.get(e)` cannot have:
-    /// its `Result` tells the caller which case it was, for free.
+    /// The `Searched` entry is pushed on the first line, so the five ways this
+    /// can return `None` — no such id, the id has no matching row, the row
+    /// does not satisfy `D`, the id is the reader itself, the row's
+    /// observation is staler than the window admits — are indistinguishable in
+    /// the log from each other and from a hit. That is the property
+    /// `query.get(e)` cannot have: its `Result` tells the caller which case it
+    /// was, for free.
+    ///
+    /// The last two refusals arrived with [`ReadWindow`], and they are not
+    /// optional decoration: a query without them reads its own state as a
+    /// neighbour and consumes observations the log records as never delivered.
+    /// Both are measured in `tests/replay_through_ordered_query.rs`, against a
+    /// real `ReplayHarness`.
     pub fn get<'a>(
         &'a mut self,
         key: PersistId,
     ) -> Option<<D as bevy_ecs::query::QueryData>::Item<'a, 's>> {
         self.log.push(key, AccessKind::Searched);
-        let entity = *self.index.by_key.get(&key)?;
-        let (_, item) = self.rows.get_mut(entity).ok()?;
+        // The reader's own state is not a neighbour observation. `StateView`
+        // refuses it by identity and records the ask anyway
+        // (`ruleset.rs:176`); so does this, and in the same order.
+        if self.window.is_reader(key) {
+            return None;
+        }
+        let entity = self.index.entity(key)?;
+        let window = *self.window;
+        let (_, observed, item) = self.rows.get_mut(entity).ok()?;
+        // Read the stamp out before anything else borrows: #758's bound is a
+        // property of the row, and a row that fails it is *hidden*, not
+        // absent — the search above is already recorded either way.
+        if !window.admits(observed.0) {
+            return None;
+        }
         self.log.push(key, AccessKind::Tapped);
         Some(item)
     }
@@ -320,7 +441,13 @@ where
     /// consulted. That is honest and it is expensive; §4 of the spike document
     /// costs it against `Ruleset::max_neighbor_reads`.
     pub fn enumerate(&mut self) -> alloc::vec::Vec<PersistId> {
-        let mut keys: alloc::vec::Vec<PersistId> = self.rows.iter().map(|(key, _)| key.0).collect();
+        let window = *self.window;
+        let mut keys: alloc::vec::Vec<PersistId> = self
+            .rows
+            .iter()
+            .filter(|(key, observed, _)| !window.is_reader(key.0) && window.admits(observed.0))
+            .map(|(key, _, _)| key.0)
+            .collect();
         keys.sort_unstable();
         for key in &keys {
             self.log.push(*key, AccessKind::Enumerated);

@@ -8,8 +8,10 @@
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
 use facade_game::{Occluder, Rock};
-use orrery_ecs_facade::{Access, AccessKind, AccessLog, KeyIndex, OrderedQuery, PersistKey};
-use orrery_protocol::PersistId;
+use orrery_ecs_facade::{
+    Access, AccessKind, AccessLog, KeyIndex, ObservedAt, OrderedQuery, PersistKey, ReadWindow,
+};
+use orrery_protocol::{PersistId, Tick};
 
 /// Regolith's cap today (`crates/orrery_games/src/regolith/mod.rs:608` →
 /// `visibility.rs:47`, one slot each for locker, rock and collision).
@@ -26,9 +28,15 @@ fn id(n: u64) -> PersistId {
 fn world_with(order: &[u64], hp: u32) -> World {
     let mut world = World::new();
     world.insert_resource(AccessLog::default());
+    // `ReadWindow::open()` — these tests are about what the log records, and
+    // the identity and staleness refusals are measured against a real replay
+    // in `replay_through_ordered_query.rs` instead.
+    world.insert_resource(ReadWindow::open());
     let mut index = KeyIndex::default();
     for n in order {
-        let entity = world.spawn((PersistKey(id(*n)), Rock { hp })).id();
+        let entity = world
+            .spawn((PersistKey(id(*n)), ObservedAt(Tick::new(0)), Rock { hp }))
+            .id();
         index.insert(id(*n), entity);
     }
     world.insert_resource(index);
@@ -128,9 +136,12 @@ fn enumerate_occluders(mut occluders: OrderedQuery<&'static Occluder>) {
 fn occluder_world(order: &[u64]) -> World {
     let mut world = World::new();
     world.insert_resource(AccessLog::default());
+    world.insert_resource(ReadWindow::open());
     let mut index = KeyIndex::default();
     for n in order {
-        let entity = world.spawn((PersistKey(id(*n)), Occluder)).id();
+        let entity = world
+            .spawn((PersistKey(id(*n)), ObservedAt(Tick::new(0)), Occluder))
+            .id();
         index.insert(id(*n), entity);
     }
     world.insert_resource(index);

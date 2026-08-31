@@ -16,3 +16,11 @@ orrery_protocol = { path = "../../crates/orrery_protocol" }
 # `bevy_ecs`, and the world they run in must be built by a crate that can.
 [dev-dependencies]
 facade_game = { path = "../facade_game" }
+# `tests/replay_through_ordered_query.rs` plays the *host*: it drives a real
+# `Ruleset` through `Executor` and adjudicates it with `ReplayHarness`, which
+# is the only way to answer whether the sequence `OrderedQuery` produces is the
+# one `crates/orrery_core/src/replay.rs:325` accepts.
+orrery_core = { path = "../../crates/orrery_core" }
+iroh-base = { workspace = true }
+bytes = { workspace = true }
+blake3 = "1.8"

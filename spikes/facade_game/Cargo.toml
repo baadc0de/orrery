@@ -23,3 +23,9 @@ publish = false
 [dependencies]
 bevy_ecs = { package = "orrery_ecs_facade", path = "../orrery_ecs_facade" }
 orrery_protocol = { path = "../../crates/orrery_protocol" }
+# The verifiable core, so this crate can implement the codec and quantization
+# its own canonical state owes (`CoreCodec`, `Quantized`) — the orphan rule
+# puts those impls here or nowhere. `orrery_core` is Bevy-free by gate
+# (`scripts/core-gates.sh` clause 1), so depending on it widens nothing: the
+# only `bevy_ecs` in this crate's extern prelude is still the facade.
+orrery_core = { path = "../../crates/orrery_core" }

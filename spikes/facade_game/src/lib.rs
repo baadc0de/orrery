@@ -146,3 +146,57 @@ pub mod system_param_is_refused {}
 /// under the types reachable through the signatures of the items on it, not
 /// merely over the names it writes down.
 pub mod the_alias_door {}
+
+// ── Canonical state, written in a crate that cannot name `World` ────────────
+
+impl orrery_core::CoreCodec for Rock {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.hp.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, orrery_core::CodecError> {
+        let raw: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| orrery_core::CodecError("a rock is four bytes"))?;
+        Ok(Self {
+            hp: u32::from_le_bytes(raw),
+        })
+    }
+}
+
+impl orrery_core::Quantized for Rock {
+    fn quantize(&mut self) {
+        // Integral already; VC-7 has nothing to snap.
+    }
+}
+
+/// The whole rule, and the shape the lane is testing.
+///
+/// Note what is in the signature and what is not. Own state arrives as
+/// `&mut Rock` — the same component type the query yields, so the game never
+/// learns that "own state" and "a neighbour's state" are stored differently.
+/// Neighbours arrive as an [`bevy_ecs::OrderedQuery`]. There is no `World`,
+/// no `Commands`, no `Res`, no `SystemParam` derive and no `#[system]`
+/// anything: this is a plain function, and the host is what turns it into a
+/// system.
+///
+/// It is deliberately *sensitive to absence*: a hit adds the neighbour's `hp`,
+/// a miss subtracts one. So a run in which the query answers differently from
+/// `StateView::neighbor` produces a different state hash, and the difference
+/// is visible to replay rather than merely notional.
+///
+/// The `targets` list comes from this tick's logged inputs, so the rule still
+/// *names* what it consults. Repeats and absent names are both permitted, and
+/// both are exercised.
+pub fn erode(
+    own: &mut Rock,
+    rocks: &mut bevy_ecs::OrderedQuery<&'static Rock>,
+    targets: &[PersistId],
+) {
+    for target in targets {
+        match rocks.get(*target) {
+            Some(rock) => own.hp = own.hp.saturating_add(rock.hp),
+            None => own.hp = own.hp.saturating_sub(1),
+        }
+    }
+}
