@@ -3653,20 +3653,19 @@ analysis.
 
 ### 11.5 What each consumer gets
 
-- **Griefing rollback (#809).** Administrative inverse-op replay — select
-  archive records by `(cell range, author/account, time range)`, generate
-  inverse operations, and apply them as administrative intents through the
-  critical path (audited, attributable). The schema supports the `(cell range,
-  lsn range)` half of the selector directly: prune objects by `cell_ranges` and
-  `lsn_span`, then filter rows inside. It does **not** answer
-  `author/account` from the archive alone: `JournalRecord::author` is a
-  `NodeId` (transport identity), while `AccountId` (economic identity) is bound
-  to it only in the `id/` family, which is P5's `orrery_identity` (#106). A
-  rollback harness must join archive rows against `id/db` bindings to resolve
-  account, or restrict itself to node-level attribution. The "preceding
-  checkpoint" the rollback spec mentions does not exist as a generational
-  snapshot; the target state must be computed from the archive and the current
-  (overwritten) checkpoint.
+- **Griefing rollback (#809).** Forward correction, never rewind: the pre-grief
+  image is computed from the archive on the server-assigned LSN axis and applied
+  forward as attributed `RecordKind::Restore` records appended at the current
+  journal position, writing no ledger family (contract: §11.1). The schema
+  supports the `(cell range, lsn range)` selector directly: prune objects by
+  `cell_ranges` and `lsn_span`, then filter rows inside. It does **not** answer
+  `author/account` from the archive alone: `JournalRecord::author` is a `NodeId`
+  (transport identity), while `AccountId` (economic identity) is bound to it only
+  in the `id/` family, which is P5's `orrery_identity` (#106). A restore plan
+  must join archive rows against `id/db` bindings to resolve account, or restrict
+  itself to node-level attribution. There is no generational snapshot to restore
+  *from*: the target image must be computed from the archive together with the
+  current (overwritten) checkpoint.
 
 - **Daily conservation sweep (#615).** Needs per-asset global conservation and
   per-item ownership continuity across history. **The archive cannot serve this
@@ -3699,6 +3698,163 @@ analysis.
 
 - **Desync forensics and adjudication context** (07-witnessing.md), and
   analytics export (Parquet is directly queryable by the telemetry stack, D12).
+
+### 11.1 The operator-rollback contract — forward correction, never rewind
+
+**This contract settles what the rollback bullet above means, and it settles
+one reading only.** The phrase the replaced sentence used — *"administrative
+intents"* — named no type, op id, or path anywhere in the tree; it is retired
+by this section rather than defined. What it pointed at is specified below,
+and it is a journal *record*, not an intent: the intent envelope is the P2
+critical tier's (§2.2), and this path is bulk-tier by construction. The
+settlement follows the D47 spike's verdict (docs/spikes/d47-durable-rewind-fallout.md,
+#812), which the owner accepted: reversing D47 clause (a)(2) is not required
+for operator rollback and would buy the feature nothing.
+
+**What "restore a cell to a timestamp" means.** It means: compute the target
+image out of the archive, and apply it forward. A restore reads the selected
+records from the read-only archive, assembles each affected entity's pre-grief
+image, and applies that image as ordinary appended records at the *current*
+journal position. The durable tier's *position* never moves backwards — the
+LSN it lands at is above every prior LSN, the `ckpt/` watermark only advances
+through the ordinary checkpoint, the epoch fence is untouched, and what a live
+client is served afterwards *is* the latest state, which now carries the
+restored value. D47 (a)(2) constrains where the durable tier may point, never
+what value the latest state may hold; clause (a)(1) already blesses this exact
+shape — corrections *"applied forward as authoritative overwrites at the
+current tick"* — and D47 scores it as *"**Nothing** rewinds"*.
+
+**There is nothing to rewind anyway.** One checkpoint per shard, overwritten
+(`checkpoint/mod.rs:113` — *"overwriting any prior one"*), so there is no
+preceding checkpoint for an image to come from; retention has already released
+every record below the minimum checkpoint watermark (`journal/raw.rs:465-470`),
+and a scan below the floor is a hard `JournalError::Released`, never a short
+answer (`journal/mod.rs:339-346`). The deepest rewind the in-tree journal
+could ever support is one checkpoint interval — 20 s (§8) — and a griefing
+incident is minutes to hours. The archive is therefore the source under every
+reading, and an archive is a read-only object store: it cannot be "restored
+into" position, only *applied* — forward.
+
+**The selection, and its axis.** A restore selects `(cell range, lsn range
+[L0, L1])`, optionally narrowed by `author: NodeId`. Every axis is
+server-assigned: `lsn` and `author` are in the gateway's own filled-in list —
+*"the gateway fills in the server-assigned `epoch`/`lsn`/`author`/`crc`"*
+(`crates/orrery_protocol/src/gateway.rs:366`) — and `tick` is precisely what
+is absent from that list. `tick` is client-supplied and never validated, so a
+griefer stamps the very coordinate a time-based selection would read (#813);
+it remains data and the `(entity, tick)` idempotency key, and is never a
+selection axis. The operator's "timestamp" is mapped to an LSN by server-side
+metadata — segment seal times and the `lsn span` already recorded at
+`jarchive/{node_id}/{segment_seq}` (§6) — never by a client field. The
+`author` axis is a `NodeId` because that is what `JournalRecord.author` is
+(`crates/orrery_protocol/src/persist.rs:221-222`); `AccountId` is a distinct
+identity whose binding lives in `id/{account_id}` (§6; #106), so selecting by
+account is refused until that binding exists, not approximated. The author
+narrowing names whose writes define the grief: the restore candidates are the
+entities the named authors touched inside `[L0, L1]`.
+
+**The target image is computed, and it fails closed.** For each candidate
+entity, the image is its last archived write per component strictly before
+`L0` — per component because the journal is a partial diff log with
+last-writer-wins per component (`persist.rs:204-206`) — or *absence* if the
+entity did not yet exist, which the restore applies as a despawn. An entity
+whose pre-image the archive cannot supply — a diff log cannot answer "state at
+T" without full-state archive records or archived checkpoint generations,
+which the schema child (#807) owes — is **refused by name in the plan, not
+guessed at**: a rollback that silently invents a pre-state is worse than one
+that reports a hole. Computing the plan touches nothing.
+
+**What is written — the type the old sentence meant.** One
+`RecordKind::Restore` record per planned entity: a new variant of
+`crates/orrery_protocol/src/persist.rs`'s `RecordKind`, carrying the entity's
+**full target image** (or absence), because the fold is a whole-entity
+overwrite and not a diff. It is journaled at the current tick and the current
+LSN, stamped with the owning cell actor's epoch, with `author` = the applying
+node's `NodeId`; the payload carries the plan's id and the operator identity
+the request named, so attribution travels with the record rather than beside
+it. It enters at the owning cell actor, node-local: there is **no client wire
+frame for it and no client can propose one** — the only producer is a node
+holding a valid operator request (the operator surface below). It takes the same
+per-entity single-writer serialization every bulk write passes through — the
+entity gate and the actor mailbox — and the epoch fence; it does not present a
+client lease to compare, because none authorizes it — its authorization is the
+request itself. This is the one refinement of the spike's "routed through
+`apply_fenced` like every other write" (#812 §3): same serialization, request
+validation in place of the lease comparison. The next scheduled checkpoint
+folds the image into `world/` with a watermark strictly above the previous
+one. The record lands in the journal and therefore in the very archive the
+plan was computed from — audited and attributable by mechanism, not by a
+bolted-on log. `tick` on the record is the current tick; it orders nothing
+the selection will ever read.
+
+**What is never written — the ledger is out of scope explicitly, not
+incidentally.** A restore may write the bulk families the owning cell actor
+already checkpoints — `world/` and `grid/`, and `chunk/` once the terrain
+substrate exists (§8) — and nothing else: it introduces no new writer into the
+keyspace, so its tier boundary is the checkpoint writer's boundary. It may not
+write `ledger/bal`, `ledger/item`, `ledger/receipt`, `intent/`, `player/`,
+`strike/`, `epoch/`, `id/`, `actor/`, `lease/`, `section_pin/`, `ckpt/`
+(watermarks advance only through ordinary checkpoints), or `pid/next`. This is
+D47 (a)(3) applied to this path: critical state is compensation-only. The
+spike priced the alternative (#812 §5): a rewind writing absolute ledger
+values would silently drop every concurrent committed intent, and the
+`intent/` idempotency rows that would catch the drop are swept at 1 h (§6), so
+a client retry of a dropped intent **double-applies**; and `ledger/item`'s
+single-ownership row *is* the anti-dupe invariant (§6). Economic damage is
+the business of D29's annulment — built, tested, and the (a)(3)-compliant answer
+(D29 clause 8; `intent/fdb.rs`'s `annul`, which negates each recorded write
+with a forward `MutationType::Add` and appends a compensating receipt). For
+#615's conservation sweep the consequence is the good one: a legitimate
+restore is a labelled bulk-tier record with no ledger delta — clean, not
+flagged, because it moves no value.
+
+**Adjudicated outcomes inside the restored range are held, not restored.**
+Adjudication's products are durable and authoritative over this path:
+`strike/{account_id}/{versionstamp}` rows (§6), `IntentFinality::Annulled`
+(`keyspace.rs:696-700`), and the compensating inverse-op entries stage 5b
+appends to the event journal (docs/07:74). An entity whose history since `L0`
+contains an adjudication product touching it is **held at its current value
+and named in the plan with the product that holds it** — the restore neither
+reinstates what adjudication annulled nor re-annuls what it confirmed. This is
+the forward design's answer to the rewind's worst property (#812 §4 row 5): a
+durable rewind past a compensating entry reinstates the cheat the cluster
+already reversed and leaves no record that it did, while a forward restore
+cannot — held entities are named, the annulment entry survives in the journal,
+and the restore's own record lands *after* it, so an auditor sees the verdict
+and the restore in order. Reversing an adjudicated outcome is not rollback and
+is not this path. Likewise a restore is an administrative overwrite of the
+same journaled class as stage 5b's own entries — appended, attributed,
+forward; it neither produces nor consumes witness claims.
+
+**What the operator sees.** `persistd` has no scrape endpoint and no admin
+wire surface (`gateway.rs:3082`), and the one precedent is followed rather
+than invented past: `--handover-request` (`bin/persistd.rs:219-236`) is a JSON
+file the node watches, chosen precisely to command a running gateway with no
+admin surface of its own — request in, file renamed aside, outcome written to
+`<path>.result`. A restore request is the same shape: the request names the
+selection and the operator; the outcome file records the plan entity by
+entity — restored, refused with the reason (archive cannot supply), or held
+with the adjudication product. This is the first operator surface that writes
+player-visible state, which makes who may drop the file a security decision
+rather than an ergonomic one; the contract requires only that every restore
+record names the request that produced it, and leaves the authorization policy
+to the owner.
+
+**What this amends: nothing.** D47 stands as written — clause (a)(2) is
+satisfied by position, not value, and clause (a)(3) is restated above, not
+relaxed. No ADR is amended or owed by this contract. What it does owe, to the
+issues that build on it: #807's archive schema must make `lsn` a first-class
+selection predicate (this contract selects on nothing else); #808's restore
+path owns the `RecordKind::Restore` fold, the request/outcome surface, and the
+hold detection; #106's account binding is what an account-named selection
+waits on. And one prerequisite this contract surfaces but does not fix: **the
+terrain substrate does not exist** — `RecordKind::TerrainDelta` folds to the
+empty arm at all three fold sites (`actor.rs:1409`, `:1426`;
+`runtime.rs:2135`), `chunk_key` has no caller outside `keyspace.rs`'s own
+tests, and the seeder says so (*"v1 has no `chunk/` rows"*,
+`orrery_seed/src/plan.rs:98`). Until it lands, a restore covers `world/`
+entities only, which is a prerequisite of the demo criterion rather than of
+this contract.
 
 ### 11.6 The tailer
 
