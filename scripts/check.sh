@@ -330,6 +330,17 @@ lane_gates() {
     # requires both directed third-seat checks to fail by name.
     run scripts/client-campaign-preflight.sh --self-test
 
+    # #774's packaging smoke, which exercises the archive rather than the
+    # build. Its live runs belong to package-client's three matrix legs; these
+    # fixtures build real archives around a stand-in client and prove that
+    # #768's two shapes (an internal `stage/` prefix, a Windows binary without
+    # its `.exe`), a README naming a file the archive lacks, a digest that does
+    # not check, and #766's CWD-relative artifact path each fail by name — the
+    # last of them while the client still exits 0, which is why an exit-status
+    # check would not have caught it. Needs tar, a zip tool and python3; a few
+    # seconds.
+    run scripts/package-artifact-smoke.sh --self-test
+
     # #478's admission service. Its suite was never run here at all, so the
     # thirteen tests #478 landed had never executed in CI — and when the
     # identity binaries are absent the suite skips every one of them and still

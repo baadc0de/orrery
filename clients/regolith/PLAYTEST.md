@@ -48,7 +48,10 @@ The three-platform packaging workflow takes roughly fifteen minutes and only
 publishes the GitHub release after its slowest platform finishes. Do not spend
 a waiting tester session on a rebuild. When one platform is urgently needed,
 its `regolith-<platform>` workflow artifact is downloadable as soon as that
-matrix leg finishes, before the final release-publishing job runs. The Linux
-leg also has to complete the three-client deployed-campaign preflight before its
-archive is staged, so update the campaign's revision pin to the candidate
-commit before starting the release workflow.
+matrix leg finishes, before the final release-publishing job runs. Every leg
+extracts its own archive and joins the deployed campaign with the extracted
+binary before the artifact is uploaded, and the Linux leg additionally runs the
+three-client cohort preflight, so update the campaign's revision pin to the
+candidate commit before starting the release workflow. The workflow-dispatch
+input `join_all_platforms` turns those joins off when a waiting tester makes
+their wall-clock cost worse than the coverage they buy.
