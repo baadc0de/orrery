@@ -8127,6 +8127,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_rules_dsl"
+version = "0.1.0"
+dependencies = [
+ "iroh-base",
+ "orrery_compose",
+ "orrery_core",
+ "orrery_games",
+ "orrery_protocol",
+]
+
+[[package]]
 name = "orrery_seed"
 version = "0.1.0"
 dependencies = [

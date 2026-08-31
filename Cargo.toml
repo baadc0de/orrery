@@ -26,6 +26,14 @@ members = [
     "crates/orrery_sim_host",
     # The facade sits on top of the spine: it depends on every client plugin.
     "crates/orrery",
+    # Spike (#793), propose-only. One throwaway crate whose only job is to be
+    # compiled and driven: a macro-defined form for gameplay rules, measured
+    # against the real Regolith code it would replace. Nothing depends on it.
+    # A member rather than a standalone workspace for the reason #820 gave: a
+    # directory declaring its own `[workspace]` and absent from `check.sh`'s
+    # lane table fails `check.sh --self-test`, and a spike may not edit that
+    # table.
+    "spikes/orrery_rules_dsl",
 ]
 
 # The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /

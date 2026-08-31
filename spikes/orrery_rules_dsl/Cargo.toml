@@ -1,0 +1,25 @@
+[package]
+name = "orrery_rules_dsl"
+version = "0.1.0"
+edition = "2021"
+description = "Spike (#793), propose-only: a macro-defined form for gameplay rules whose adjudication guarantees are structural rather than retrofitted"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Bevy-free and headless for the same reason `orrery_games` is: a rules form
+# that could not be linked into the adjudicator would be answering a different
+# question. Nothing here is a dependency of anything shipped.
+[dependencies]
+orrery_core = { path = "../../crates/orrery_core" }
+orrery_protocol = { path = "../../crates/orrery_protocol" }
+orrery_compose = { path = "../../crates/orrery_compose" }
+
+[dev-dependencies]
+# The replay leg signs a real window with a real transport identity (D3), the
+# same way `orrery_games`' evidence tests do. The key is a fixed constant.
+iroh-base = { workspace = true }
+# The before/after is measured against real Regolith code, so the "after" is
+# compiled against the real types rather than quoted. Nothing is migrated:
+# `orrery_games` does not depend on this crate, only the reverse, and only for
+# tests.
+orrery_games = { path = "../../crates/orrery_games" }
