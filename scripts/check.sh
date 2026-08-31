@@ -521,6 +521,17 @@ lane_gates() {
     # it would read as a control ready to promote.
     run scripts/ramp-report.py --self-test
 
+    # The reclaimer (#781) runs `rm -rf` over 100 GiB-class worktree
+    # directories with no human in the loop, on the SessionEnd hook. Its
+    # self-test is functional in both directions and pins the two gates that
+    # make that defensible: that a squash-merged lane is recognised as landed
+    # (an ancestry test would report every landed lane as unmerged, and reclaim
+    # nothing), and that liveness is read from /proc/<pid>/cwd rather than
+    # grepped out of a command line — the negative case is a live `cargo` whose
+    # argv names the tree and whose working directory is elsewhere, which
+    # `pgrep -f` finds and the reclaimer must not.
+    run scripts/dev-cache.sh --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human

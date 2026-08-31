@@ -146,6 +146,15 @@ and cargo treats a missing wrapper as a hard error rather than a fallback. The
 script never exports `CARGO_TARGET_DIR`; an already-set value always wins, and
 per-lane isolation is opt-in via `--isolate`.
 
+`target/` directories are the disk problem on this box, not the cache: 202 GiB
+across fifteen of them, and nothing ever reclaimed one until #781.
+`scripts/dev-cache.sh prune` is the deliberate manual lever; `reclaim` is the
+automatic one, and it runs on session end. It deletes an agent worktree that
+`git worktree list` no longer knows about, and the `target/` of one whose branch
+has landed — but only when no build process is rooted in the tree, resolved
+through `/proc/<pid>/cwd`. Run `./scripts/dev-cache.sh reclaim` to see what it
+would take without taking it.
+
 Details, including what exists on the developer box and in CI, are in
 [docs/build-cache.md](docs/build-cache.md).
 
