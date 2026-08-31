@@ -90,6 +90,13 @@ struct ChainClaim {
     watermark: Option<Lsn>,
 }
 
+/// The archive tailer's claim on the records this journal may release (D20).
+#[derive(Clone, Copy, Debug)]
+struct ArchiveClaim {
+    /// The highest watermark whose archive object has been verified.
+    watermark: Option<Lsn>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RecordLocation {
     physical: wal_db::Lsn,
@@ -156,6 +163,10 @@ pub struct Journal {
     /// has registered, in which case retention answers to the checkpoint floor
     /// alone.
     chain_floor: std::sync::Mutex<Option<ChainClaim>>,
+    /// The archive tailer's claim on this journal (D20). `None` until an
+    /// operator opts in, so nodes without a running tailer retain the exact
+    /// checkpoint-plus-chain behaviour they had before the claim existed.
+    archive_floor: std::sync::Mutex<Option<ArchiveClaim>>,
     /// Per mirrored chain, the retention floor its **primary** has itself
     /// reached, in that primary's LSN space (D23). A mirror is bounded by this
     /// and not by local checkpoints: no local actor folds a mirrored record,
@@ -319,6 +330,7 @@ impl Journal {
             published,
             release: std::sync::Mutex::new(()),
             chain_floor: std::sync::Mutex::new(None),
+            archive_floor: std::sync::Mutex::new(None),
             #[cfg(feature = "chain-grpc")]
             mirror_floors: std::sync::Mutex::new(BTreeMap::new()),
             retention: std::sync::Mutex::new(crate::journal::JournalRetention {
@@ -490,12 +502,13 @@ impl Journal {
     /// So the durable marker always precedes the deletion it describes, and
     /// the window in between costs a retry rather than a record.
     ///
-    /// Two clamps are the journal's own rather than the caller's, because both
-    /// are facts only it holds: a registered outbound chain's follower
-    /// watermark (D20), and — for each chain this journal *mirrors* — the
-    /// floor that chain's primary has itself reached (D23). Asking to release
-    /// past either is answered with a bounded release or a named block, never
-    /// with the records.
+    /// Three clamps are the journal's own rather than the caller's, because
+    /// they are facts only it holds: a registered outbound chain's follower
+    /// watermark (D20), the archive tailer's verified watermark (D20), and —
+    /// for each chain this journal *mirrors* — the floor that chain's primary
+    /// has itself reached (D23). Asking to release past any of them is
+    /// answered with a bounded release or a named block, never with the
+    /// records.
     pub fn release_before(&self, before: Lsn) -> Result<JournalRelease, JournalError> {
         let outcome = self.release_locked(before);
         // The operator-facing tally, updated on every answered call: a blocked
@@ -545,6 +558,32 @@ impl Journal {
         let (floor_now, cut, metadata) = {
             let index = read_index(&self.index)?;
             let floor_now = index.released_below.unwrap_or(Lsn::new(0, 0));
+
+            // A verified archive object is the second precondition for
+            // deleting local segments (docs/08 §11). Clamp before choosing
+            // the physical cut below: computing the cut from the checkpoint
+            // proposal and only then lowering the logical floor could reclaim
+            // a segment that still contains unarchived records.
+            //
+            // With no registration this term abstains, preserving the
+            // pre-archive release path exactly.
+            if let Some(claim) = *self.archive_floor.lock().expect("archive floor lock") {
+                let Some(watermark) = claim.watermark else {
+                    return Ok(JournalRelease::blocked(
+                        before,
+                        floor_now,
+                        ReleaseBlocked::ArchiveLag,
+                    ));
+                };
+                before = before.min(watermark);
+                if before <= floor_now {
+                    return Ok(JournalRelease::blocked(
+                        before,
+                        floor_now,
+                        ReleaseBlocked::ArchiveLag,
+                    ));
+                }
+            }
             if before <= floor_now {
                 return Ok(JournalRelease::blocked(
                     before,
@@ -752,6 +791,29 @@ impl Journal {
         }
     }
 
+    /// Register the archive tailer's claim on this journal (D20).
+    ///
+    /// Nothing is released until a verified archive watermark is known.
+    /// Registration lasts for the life of the journal: an unreachable or
+    /// stopped tailer keeps its claim because releasing then would destroy the
+    /// unread input it needs to recover.
+    pub fn register_archive(&self) {
+        *self.archive_floor.lock().expect("archive floor lock") =
+            Some(ArchiveClaim { watermark: None });
+    }
+
+    /// Record the highest journal position whose archive object is verified.
+    ///
+    /// The watermark is monotone and ignored until the archive claim is
+    /// registered, matching [`Journal::note_chain_watermark`]'s abstention
+    /// rule.
+    pub fn note_archive_watermark(&self, watermark: Lsn) {
+        let mut floor = self.archive_floor.lock().expect("archive floor lock");
+        if let Some(claim) = floor.as_mut() {
+            claim.watermark = Some(claim.watermark.map_or(watermark, |c| c.max(watermark)));
+        }
+    }
+
     /// Record the retention floor a mirrored chain's **primary** has reached,
     /// in that primary's LSN space (D23).
     ///
@@ -822,8 +884,9 @@ impl Journal {
     /// checkpoints cover — `None` while a hosted shard has yet to report one,
     /// and `None` again when there is nothing to bound.
     ///
-    /// The two halves answer to different authorities and a journal can hold
-    /// both kinds of record, so the floor is the lower of them (D23):
+    /// The journal's record sources and archive answer to different
+    /// authorities, so the floor is the lower of all participating terms
+    /// (D20, D23):
     ///
     /// - **Locally originated records** are bounded by the checkpoint floor,
     ///   which is what the node's own actors have folded into the durable
@@ -831,6 +894,8 @@ impl Journal {
     ///   a passive follower's actors fold nothing, and reading their empty
     ///   watermark as a floor of `0:0` is what kept every mirror unbounded.
     /// - **Mirrored records** are bounded by [`Journal::mirror_cuts`].
+    /// - **Archived records** are bounded by the verified archive watermark
+    ///   after an archive claim registers. With no claim, this term abstains.
     pub fn retention_floor(&self, checkpoint_floor: Option<Lsn>) -> Option<Lsn> {
         let tail = *self.cursor.lock().expect("journal cursor lock");
         let index = read_index(&self.index).ok()?;
@@ -847,6 +912,15 @@ impl Journal {
         }
         #[cfg(not(feature = "chain-grpc"))]
         let _ = tail;
+        match *self.archive_floor.lock().expect("archive floor lock") {
+            None => {}
+            Some(ArchiveClaim {
+                watermark: Some(watermark),
+            }) => floor = Some(floor.map_or(watermark, |floor| floor.min(watermark))),
+            Some(ArchiveClaim { watermark: None }) => {
+                floor = Some(index.released_below.unwrap_or(Lsn::new(0, 0)));
+            }
+        }
         floor
     }
 

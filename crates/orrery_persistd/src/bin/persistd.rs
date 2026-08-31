@@ -247,6 +247,14 @@ struct Cli {
     #[arg(long)]
     no_journal_retention: bool,
 
+    /// Hold journal release behind the verified archive watermark (D20).
+    ///
+    /// Default off: there is no archive tailer yet, so enabling this claim on
+    /// every node would pin every journal. An operator opts in only where a
+    /// tailer is running. Flipping the default is owner-reserved.
+    #[arg(long)]
+    archive_retention: bool,
+
     /// Checkpoint cadence in milliseconds, overriding D16's 20 s (jitter is
     /// held at a quarter of it, as the default pair is).
     ///
@@ -1038,6 +1046,9 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Arc::new(
         CellRuntime::open_with_lease_store(&config, &checkpoint_store, lease_store).await?,
     );
+    if cli.archive_retention {
+        runtime.journal().register_archive();
+    }
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: runtime recovered"
@@ -1915,6 +1926,9 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
             ..GroupCommitConfig::default()
         },
     })?);
+    if cli.archive_retention {
+        journal.register_archive();
+    }
     let server = spawn_chain_grpc(
         listen,
         Arc::clone(&journal),
@@ -2899,6 +2913,7 @@ mod tests {
             attestation_enforcement: AttestationEnforcement::Off,
             authority_correction: AuthorityCorrectionEnforcement::Off,
             no_journal_retention: false,
+            archive_retention: false,
             checkpoint_interval_ms: None,
             hot_ledger_sweep_interval_ms: 3_600_000,
             dev_seed: None,
@@ -3221,6 +3236,20 @@ mod tests {
             ),
             orrery_persistd::intent::IntentVerdict::Admit(_)
         ));
+    }
+
+    /// The archive claim must remain absent until an operator opts in. The
+    /// eventual default flip belongs to the owner once a tailer is deployed.
+    #[test]
+    fn archive_retention_defaults_off_and_requires_an_explicit_flag() {
+        use clap::Parser;
+
+        let defaulted = Cli::try_parse_from(["persistd"]).expect("bare invocation parses");
+        assert!(!defaulted.archive_retention);
+
+        let enabled = Cli::try_parse_from(["persistd", "--archive-retention"])
+            .expect("archive-retention flag parses");
+        assert!(enabled.archive_retention);
     }
 
     #[test]

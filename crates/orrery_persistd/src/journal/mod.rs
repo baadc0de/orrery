@@ -99,6 +99,12 @@ pub enum ReleaseBlocked {
     /// adopted chain, whose watermark is in the source's LSN space rather
     /// than this journal's.
     ChainLag,
+    /// The archive has not verified records through the proposed floor.
+    ///
+    /// An archive claim is opt-in until the tailer exists. Once registered,
+    /// it remains for the life of the journal: a missing or lagging tailer is
+    /// exactly when releasing its unread input would destroy history (D20).
+    ArchiveLag,
     /// This backend does not implement retention. The Fjall fallback (D19) is
     /// a rollback path, not the shipping default, and does not reclaim.
     Unsupported,
@@ -116,6 +122,7 @@ impl core::fmt::Display for ReleaseBlocked {
             }
             Self::MirrorLag => write!(f, "a mirrored chain's primary has not released this far"),
             Self::ChainLag => write!(f, "a chain follower has not mirrored past the floor"),
+            Self::ArchiveLag => write!(f, "the archive has not verified through the floor"),
             Self::Unsupported => write!(f, "backend does not implement retention"),
         }
     }
