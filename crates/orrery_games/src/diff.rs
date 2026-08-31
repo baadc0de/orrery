@@ -908,10 +908,13 @@ pub fn collect_witness<G: Game + Clone>(game: &G, played: &Play<G>) -> Option<Wi
 /// will accept, so a longer scenario is adjudicated over the same window a
 /// real dispute would open.
 ///
-/// Only the initially spawned entities get bundles: an entity materialized
+/// Only the initially installed entities get bundles: an entity materialized
 /// mid-window has no claim at the window's start, so no window can be opened
 /// on it, and inventing one would be assembling evidence no authority could
-/// have produced.
+/// have produced. *Initially installed* includes the scenario's world
+/// population as well as its players — both are in the executor before the
+/// first tick, and reconstructing only the player half would build a bundle
+/// set over a population the run never had.
 fn authored_bundles<G: Game + Clone>(
     game: &G,
     sealed: &SealedScenario<G>,
@@ -928,8 +931,8 @@ fn authored_bundles<G: Game + Clone>(
     }
     let window = (Tick::new(first), Tick::new(first + span));
 
-    let entities: Vec<PersistId> = (1..=sealed.initial_entities).map(PersistId::new).collect();
-    let spawned: Vec<(PersistId, G::CoreState)> = entities
+    let players: Vec<PersistId> = (1..=sealed.initial_entities).map(PersistId::new).collect();
+    let spawned: Vec<(PersistId, G::CoreState)> = players
         .iter()
         .enumerate()
         .map(|(slot, entity)| {
@@ -939,9 +942,25 @@ fn authored_bundles<G: Game + Clone>(
             )
         })
         .collect();
+    // The same population `scenario::replay` installs, reconstructed the same
+    // way: a bundle set built over a different population would be evidence
+    // about a run that never happened.
+    let seeded_world = crate::scenario::world_population(
+        game,
+        sealed.initial_entities,
+        sealed.initial_world_entities,
+    );
+    let entities: Vec<PersistId> = players
+        .iter()
+        .copied()
+        .chain(seeded_world.iter().map(|(entity, _)| *entity))
+        .collect();
     let ruleset = game.id();
     let mut executor = Executor::new(game.clone(), sealed.seed);
     for (entity, state) in spawned {
+        executor.insert(entity, state);
+    }
+    for (entity, state) in seeded_world {
         executor.insert(entity, state);
     }
 
@@ -1020,8 +1039,35 @@ fn authored_bundles<G: Game + Clone>(
 
     let mut bundles = BTreeMap::new();
     for entity in &entities {
-        let claimed = log.claimed_hashes(*entity, window)?;
+        // An entity whose window is not covered claim-to-claim authored no
+        // evidence at all, and there is nothing to open a window on. That is
+        // not hypothetical: `InputLogProducer::cut_frame` refuses to cut a
+        // frame with no pending records, so an entity that received **no
+        // inputs across the whole window** — which is every seeded
+        // `regolith.world` entity under the shipped honest pilot, measured by
+        // `tests/world_scenario.rs` — produces no frames and no tick hashes.
+        // Skipping it is the honest answer; fabricating a bundle would be
+        // assembling evidence no authority could have produced. Both sides
+        // skip the same entities, because both ran the same sealed inputs,
+        // and `cross_replay` already crosses only the entities present on
+        // both sides.
+        //
+        // **What that costs, stated rather than buried:** D-4's cross-replay
+        // half reaches only the entities that author frames. Its claim-value
+        // half reaches every entity-tick in the run. `tests/world_scenario.rs`
+        // pins both the reach and the reason, so an entity that *should* have
+        // authored evidence and silently stopped fails a named test rather
+        // than quietly leaving the class.
+        let Some(claimed) = log.claimed_hashes(*entity, window) else {
+            continue;
+        };
         bundles.insert(*entity, log.assemble_bundle(*entity, window, claimed).ok()?);
+    }
+    // No bundle at all is not "nothing to compare and therefore equal": it is
+    // a side that produced no D-4 evidence, and the harness owes a refusal
+    // rather than a class it silently did not check.
+    if bundles.is_empty() {
+        return None;
     }
     Some(bundles)
 }
@@ -1528,6 +1574,11 @@ pub fn sealed_digest<G: Game>(sealed: &SealedScenario<G>) -> [u8; 32] {
     hasher.update(&sealed.tick_window.first.0.to_le_bytes());
     hasher.update(&sealed.tick_window.end_exclusive.0.to_le_bytes());
     hasher.update(&sealed.initial_entities.to_le_bytes());
+    // Both halves of the population, because "initial population" above is a
+    // claim about the whole of it: two sides seeded with different world
+    // populations must not be able to present equal sealed digests and be
+    // compared as if they had run the same scenario.
+    hasher.update(&sealed.initial_world_entities.to_le_bytes());
     hasher.update(
         &u64::try_from(sealed.input_log.len())
             .expect("input log length fits u64")

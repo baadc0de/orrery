@@ -1843,6 +1843,9 @@ impl Game for Regolith {
         let (pos, yaw) = spawn_pose(slot);
         RegolithState::Craft(Craft::spawned(archetype, pos, yaw))
     }
+    fn spawn_world(&self, _entity: PersistId, slot: u64) -> Option<RegolithState> {
+        Some(world_seed(slot))
+    }
     fn honest_inputs(
         &self,
         entity: PersistId,
@@ -1983,6 +1986,58 @@ impl Game for Regolith {
             RegolithState::BloomDirector(_) => (QPos::default(), QVel::default()),
         }
     }
+}
+
+/// One world-owned seed for a scenario slot: the island's bloom director at
+/// slot 0, a pickup at slot 1, then rocks around the player spawn ring.
+///
+/// The director's `next_bloom_tick` is deliberately far below
+/// [`BLOOM_CADENCE_TICKS`]: the stock director waits sixty seconds, which is
+/// longer than any scenario in the corpus runs, so a stock seed would leave
+/// the bloom, split, materialization and pickup paths unstepped and the
+/// scenario would only look like it covered the module. Everything else is
+/// stock, and every value is a pure function of `slot`.
+fn world_seed(slot: u64) -> RegolithState {
+    if slot == 0 {
+        return RegolithState::BloomDirector(BloomDirector {
+            clock_tick: 0,
+            next_bloom_tick: 60,
+            ..BloomDirector::spawned()
+        });
+    }
+    if slot == 1 {
+        // A pickup whose TTL runs out well inside the window, so the expiry
+        // branch — and the `Expired` outcome it emits — is stepped rather
+        // than merely reachable. The stock 30-second TTL outlives every
+        // scenario in the corpus.
+        return RegolithState::Pickup(Pickup {
+            ttl_remaining: 300,
+            ..Pickup::spawned(
+                QPos::from_metres(SPAWN_RADIUS_MM / 1_000.0, 0.0, 0.0),
+                weapon::WeaponKind::Volley,
+                PICKUP_TTL_TICKS,
+            )
+        });
+    }
+    let rock_slot = slot - 2;
+    let tier = match rock_slot % 3 {
+        0 => RockTier::Large,
+        1 => RockTier::Medium,
+        _ => RockTier::Small,
+    };
+    // On the player spawn ring, angularly offset from every player pose, so
+    // the rocks are inside weapon and collision range of an orbiting craft
+    // without being spawned on top of one.
+    let angle_urad =
+        (rock_slot as i64).saturating_mul(GOLDEN_ANGLE_URAD) % i64::from(TAU_URAD) + 300_000;
+    let angle = angle_urad as f64 / 1_000_000.0;
+    let pos = QPos::from_metres(
+        SPAWN_RADIUS_MM * libm::cos(angle) / 1_000.0,
+        0.0,
+        SPAWN_RADIUS_MM * libm::sin(angle) / 1_000.0,
+    );
+    let vel = QVel::from_metres_per_sec(libm::sin(angle) * 4.0, 0.0, -libm::cos(angle) * 4.0);
+    RegolithState::Rock(Rock::spawned(tier, 0, pos, vel))
 }
 
 fn spawn_pose(slot: u64) -> (QPos, i32) {

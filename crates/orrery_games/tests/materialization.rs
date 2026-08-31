@@ -181,6 +181,7 @@ fn scenario_steps_materialized_entities_on_next_tick_and_replays_them_in_isolati
     let scenario = Scenario {
         name: "materialization",
         entities: 1,
+        world_entities: 0,
         ticks: 3,
         seed_byte: 0xA4,
         sample_loss_pct: 0,

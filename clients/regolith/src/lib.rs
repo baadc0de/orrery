@@ -3955,6 +3955,7 @@ mod tests {
         let scenario = Scenario {
             name: "human-recording",
             entities: 1,
+            world_entities: 0,
             ticks: 30,
             seed_byte: 0x61,
             sample_loss_pct: 0,
@@ -4009,6 +4010,7 @@ mod tests {
                     end_exclusive: Tick::new(log.len() as u64),
                 },
                 initial_entities: 1,
+                initial_world_entities: 0,
                 input_log: Vec::new(),
             },
             log,
