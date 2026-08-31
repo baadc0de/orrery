@@ -241,10 +241,11 @@ struct Materialized<R: EcsHostable> {
 /// observation tick — including the state of each entity that is about to
 /// step, because *other* entities must go on reading its tick-start value all
 /// tick. Archetype iteration order is not `PersistId` order, so the population
-/// is sorted here: the order entities step in is still canonical — it decides
-/// event collection, materialization first-writer-wins and the order results
-/// are reported in — and leaving it to the archetype layout would be exactly
-/// the unordered-iteration hazard VC-4 exists for.
+/// is sorted here. The returned [`TickResults::stepped`] vector is sorted
+/// again before it leaves the backend, so result reporting and event
+/// collection order are established properties of the output rather than
+/// inherited from the iteration order. Materialization first-writer-wins
+/// remains the one ordering effect still decided by execution order.
 fn seal_population<R: EcsHostable>(
     migrated: Query<(Entity, &Identity, &MigratedSection<R>, &ObservedAt)>,
     remainder: Query<(Entity, &Identity, &RemainderSection<R>, &ObservedAt)>,
@@ -336,7 +337,9 @@ impl<R: EcsHostable> SectionStore<'_, '_, R> {
 /// canonical component in place. The sealed neighbour view is **not** touched:
 /// every entity in the tick reads the state the world had when the tick began
 /// (D43 (b), #758), so what a rule observes does not depend on where in the
-/// tick it ran.
+/// tick it ran. The vector written to [`TickResults::stepped`] is sorted by
+/// ascending `PersistId` before it is returned, establishing the output order
+/// regardless of the iteration order used here.
 fn advance_population<R: EcsHostable>(
     rules: Res<Rules<R>>,
     plan: Res<TickPlan<R>>,
@@ -775,6 +778,8 @@ impl<R: EcsHostable> EcsBackend<R> {
         // advances only the one entity.
         self.schedule.run(&mut self.world);
         let mut results = self.world.resource_mut::<TickResults<R>>();
-        std::mem::take(&mut results.stepped)
+        let mut stepped = std::mem::take(&mut results.stepped);
+        stepped.sort_by_key(|entry| entry.entity);
+        stepped
     }
 }

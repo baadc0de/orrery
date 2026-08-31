@@ -520,24 +520,25 @@ pub struct SteppedEntity<E> {
 /// tick it ran, and D43 (b)'s S2 row ("steps are independent — snapshot
 /// isolation") describes this code.
 ///
-/// Ascending `PersistId` remains canonical all the same, because three other
-/// things are still decided by it:
+/// Ascending `PersistId` remains canonical because two output properties are
+/// now *established* on the vector [`Self::step_tick`] returns, rather than
+/// inherited from the order entities happened to step in:
 ///
+/// - **Result reporting order.** [`Self::step_tick`] returns one entry per
+///   entity, sorted by ascending `PersistId`.
 /// - **Event collection order.** [`TickOutcome::events`] are folded in the
-///   order entities are stepped, and the log commits to that order.
-/// - **Materialization first-writer-wins.** Two entities describing the same
-///   identifier in one tick are resolved by which one ran first, so the winner
-///   is a fact about execution order.
-/// - **Result reporting.** [`Self::step_tick`] returns one entry per entity in
-///   the order it stepped them, and every consumer folds that vector in the
-///   order it arrives.
+///   order those sorted entries are consumed, so the committed event order is
+///   the sorted order, not the execution order.
 ///
-/// So a backend that stepped entities in a different order would still be a
-/// different simulation, which is what [`Self::step_tick`]'s default
-/// implementation refuses to leave to chance. What *has* changed is the reason:
-/// the order no longer reaches inside a step, only around it — which is why
-/// parallelising S2 is now a question about merging those three, not about
-/// the rules seeing different state.
+/// Materialization first-writer-wins is the remaining ordering obligation:
+/// two entities describing the same identifier in one tick are still resolved
+/// by which one ran first, so the winner is still a fact about execution
+/// order. A backend that stepped entities in a different order would still be
+/// a different simulation until that is also given a deterministic rule.
+///
+/// What *has* changed is the reason: the order no longer reaches inside a
+/// step, only around it — and for result reporting and event collection it
+/// is now established explicitly on output.
 pub trait TickBackend<R: Ruleset> {
     /// The rules this backend drives.
     fn ruleset(&self) -> &R;
@@ -582,8 +583,9 @@ pub trait TickBackend<R: Ruleset> {
         inputs: &[R::CoreInput],
     ) -> Option<TickOutcome<R::CoreEvent>>;
 
-    /// Advance every entity installed at the tick boundary, in canonical
-    /// order, and report each one's outcome.
+    /// Advance every entity installed at the tick boundary and report each
+    /// one's outcome, with the returned vector sorted by ascending
+    /// [`PersistId`].
     ///
     /// Entities materialized while the tick runs begin stepping on the *next*
     /// tick, never halfway through their birth tick, so the population is
@@ -601,6 +603,7 @@ pub trait TickBackend<R: Ruleset> {
             };
             stepped.push(SteppedEntity { entity, outcome });
         }
+        stepped.sort_by_key(|entry| entry.entity);
         stepped
     }
 }
