@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# Refuse a lane push whose diff reverts merged work, truncates a file, or is cut
+# from a stale checkout (#779).
+#
+#   ./scripts/lane-diff-audit.sh              audit HEAD against origin/main
+#   ./scripts/lane-diff-audit.sh --self-test  prove the checks still bite both ways
+#
+# A lane runs this before pushing. It compares the current branch to the common
+# ancestor with origin/main, not to the tip, because the push is what would land
+# on main; the diff from the merge-base is what the merge commit will contain.
+#
+# The four checks are intentionally mechanical and overridable. A lane whose
+# real job is deleting a large file or reverting a recent commit can pass
+# --waive CHECK; the waiver is printed so it cannot be accidental.
+#
+# Thresholds were measured on this repository's history, not guessed. The
+# measurements are recorded in the PR that introduced this script (#779).
+set -euo pipefail
+
+readonly NAME=lane-diff-audit
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly ROOT
+
+die() { echo "$NAME: $*" >&2; exit 2; }
+note() { echo "$NAME: $*" >&2; }
+
+# ── Thresholds ──────────────────────────────────────────────────────────────
+#
+# Each number is chosen to separate the six known incidents from ordinary work
+# on origin/main. The distributions live in #779's description; the short form
+# is that no ordinary first-parent commit on main has ever reached these values.
+
+# Merge-base distance: how many first-parent commits on origin/main are not in
+# the branch's base. Every merged PR in this repository so far had a base within
+# 8 commits of main tip (p100 = 8); a stale checkout is tens or hundreds behind.
+readonly BASE_DISTANCE_THRESHOLD=20
+
+# Total deletions that exceed additions by enough to look like a bulk revert.
+# The largest ordinary commit on main deleted 864 lines (p100); the six known
+# incidents start at ~2,100. The ratio threshold is also extreme: among commits
+# with both additions and deletions on main, only one in 625 had d/a > 5.
+readonly DELETION_SURGE_LINES=1000
+readonly DELETION_SURGE_RATIO=5
+
+# A tracked file that keeps existing but loses this fraction of its lines.
+# Across all file changes on main, 0.42% reached 0.90; the two truncation
+# incidents were 1.00. Whole-file emptying is checked separately and always.
+readonly FILE_TRUNCATION_FRACTION=0.90
+
+# A deletion-only block this long is worth checking for a merged-source revert.
+# Smaller hunks are too noisy to attribute confidently.
+readonly REVERT_HUNK_MIN_LINES=3
+
+# The branch the audit treats as "main". Overridden only by the self-test,
+# which builds a synthetic repository where there is no origin/main yet.
+MAIN_REF="${LANE_DIFF_AUDIT_MAIN:-origin/main}"
+
+# ── Override state ───────────────────────────────────────────────────────────
+
+WAIVE_FILE_TRUNC=0
+WAIVE_STALE_BASE=0
+WAIVE_REVERT=0
+WAIVE_DELETION_SURGE=0
+
+# ── Usage ────────────────────────────────────────────────────────────────────
+
+usage() {
+    sed -n '2,/^set -euo/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -euo/d' >&2
+    cat >&2 <<'USAGE'
+
+Options:
+  --self-test                   run the synthetic mutation checks and exit
+  --waive file-truncation       do not fail on file truncation / emptying
+  --waive stale-base            do not fail on a merge-base far behind main
+  --waive revert-hunk           do not fail on reverts of merged hunks
+  --waive deletion-surge        do not fail on deletions exceeding additions
+  --waive-all                   waive all four checks
+  -h, --help                    show this help and exit
+
+A waiver is printed to stderr exactly once per check that would have fired.
+USAGE
+}
+
+# ── Helper: run git in the repository under audit ────────────────────────────
+
+git_() { git "$@"; }
+
+# ── Check 1: tracked file truncated to empty or nearly empty ─────────────────
+#
+# Compares the branch tree directly against main. A file that is simply deleted
+# in the branch is reported by the deletion-surge check, not here; only files
+# that still exist in HEAD but have been gutted are flagged.
+
+check_file_truncation() {
+    local left_ref="$1"
+    local file_status file
+
+    while IFS=$'\t' read -r status file new_path; do
+        [[ -n $status ]] || continue
+        # Renames are listed as "R100\told\tnew"; take the new path.
+        if [[ $status == R* ]]; then
+            file="$new_path"
+        fi
+
+        # We only care about files that still exist in HEAD.
+        case "$status" in
+            A|D|T) continue ;;
+        esac
+
+        # Skip binary files: line counts are meaningless.
+        if git diff --numstat "$left_ref" HEAD -- "$file" 2>/dev/null \
+            | awk -v f="$file" '$3 == f { exit ($1 == "-" || $2 == "-") ? 0 : 1 }'; then
+            continue
+        fi
+
+        local main_lines head_lines
+        main_lines=$(git show "$left_ref:$file" 2>/dev/null | wc -l) || main_lines=0
+        head_lines=$(git show "HEAD:$file" 2>/dev/null | wc -l) || head_lines=0
+
+        if (( main_lines > 0 && head_lines == 0 )); then
+            printf 'file-truncation\tempty\t%s\tmain=%s\n' "$file" "$main_lines"
+        elif (( main_lines > 0 )); then
+            local removed=$((main_lines - head_lines))
+            if (( removed > 0 )); then
+                local frac
+                frac=$(awk "BEGIN { printf \"%.4f\", $removed / $main_lines }")
+                if awk "BEGIN { exit ($frac >= $FILE_TRUNCATION_FRACTION) ? 0 : 1 }"; then
+                    printf 'file-truncation\tfrac=%s\t%s\tremoved=%s/%s\n' \
+                        "$frac" "$file" "$removed" "$main_lines"
+                fi
+            fi
+        fi
+    done < <(git diff --name-status --find-renames "$left_ref" HEAD)
+}
+
+# ── Check 2: merge-base far behind main ──────────────────────────────────────
+
+check_stale_base() {
+    local _base="$1"
+    local distance
+    distance=$(git rev-list --count --first-parent "$_base..$MAIN_REF")
+    if (( distance > BASE_DISTANCE_THRESHOLD )); then
+        printf 'stale-base\tdistance=%s\n' "$distance"
+    fi
+}
+
+# ── Check 4: deletions far exceed additions ──────────────────────────────────
+#
+# Numbered four because check three is the revert-hunk detector in the Python
+# helper below. The order here follows the order they are reported.
+
+check_deletion_surge() {
+    local left_ref="$1"
+    local total_del=0 total_ins=0
+
+    while IFS=$'\t' read -r added deleted _file; do
+        [[ -n $added ]] || continue
+        [[ $added == '-' || $deleted == '-' ]] && continue
+        total_ins=$((total_ins + added))
+        total_del=$((total_del + deleted))
+    done < <(git diff --numstat --find-renames "$left_ref" HEAD)
+
+    if (( total_del > DELETION_SURGE_LINES )); then
+        local ratio_label="inf"
+        if (( total_ins > 0 )); then
+            ratio_label=$(awk "BEGIN { printf \"%.2f\", $total_del / $total_ins }")
+            if awk "BEGIN { exit ($total_del > $DELETION_SURGE_RATIO * $total_ins) ? 0 : 1 }"; then
+                printf 'deletion-surge\tdel=%s\tins=%s\tratio=%s\n' \
+                    "$total_del" "$total_ins" "$ratio_label"
+            fi
+        else
+            printf 'deletion-surge\tdel=%s\tins=%s\tratio=%s\n' \
+                "$total_del" "$total_ins" "$ratio_label"
+        fi
+    fi
+}
+
+# ── Check 3: deletion-only hunks that revert merged additions ────────────────
+#
+# Implemented in Python because parsing unified diff and running pickaxe searches
+# is exactly the kind of structured work bash is bad at. The helper is fed the
+# base and main refs on stdin and prints tab-separated violation records.
+
+check_revert_hunks() {
+    local left_ref="$1"
+    local _base="$2"
+    python3 - "$left_ref" "$_base" "$MAIN_REF" <<'PYEOF'
+import os
+import subprocess
+import sys
+
+REPO = os.getcwd()
+LEFT = sys.argv[1]
+BASE = sys.argv[2]
+MAIN = sys.argv[3]
+REPO = os.getcwd()
+MIN_BLOCK = int(os.environ.get("REVERT_HUNK_MIN_LINES", "3"))
+
+
+def run(args, check=True):
+    r = subprocess.run(args, cwd=REPO, capture_output=True, text=True)
+    if check and r.returncode not in (0, 1):
+        sys.stderr.write(f"git failed: {' '.join(args)}\n{r.stderr}\n")
+        sys.exit(2)
+    return r.stdout
+
+
+def file_exists_in(ref, path):
+    r = subprocess.run(
+        ["git", "cat-file", "-e", f"{ref}:{path}"],
+        cwd=REPO, capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def content_lines(ref, path):
+    return run(["git", "show", f"{ref}:{path}"]).splitlines()
+
+
+def deletion_blocks(diff_text):
+    """Yield (path, [deleted lines]) for contiguous deletion-only blocks."""
+    current_path = None
+    in_hunk = False
+    block = []
+
+    def flush():
+        nonlocal block
+        if block and len(block) >= MIN_BLOCK and current_path is not None:
+            yield (current_path, block)
+        block = []
+
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git "):
+            yield from flush()
+            current_path = None
+            in_hunk = False
+        elif raw.startswith("deleted file mode"):
+            current_path = None  # whole-file deletions are handled elsewhere
+        elif raw.startswith("+++ b/"):
+            current_path = raw[6:]
+            yield from flush()
+            in_hunk = False
+        elif raw.startswith("@@"):
+            yield from flush()
+            in_hunk = True
+        elif in_hunk:
+            if raw.startswith("-") and not raw.startswith("---"):
+                block.append(raw[1:])
+            elif raw.startswith("+") and not raw.startswith("+++"):
+                yield from flush()
+            else:
+                yield from flush()
+        else:
+            pass
+    yield from flush()
+
+
+def good_sample(lines):
+    """Prefer non-trivial lines so pickaxe does not match generic noise."""
+    candidates = [ln for ln in lines if len(ln.strip()) >= 4]
+    if not candidates:
+        candidates = [ln for ln in lines if ln.strip()]
+    if not candidates:
+        return None
+    # first, middle, last
+    for idx in (0, len(candidates) // 2, -1):
+        if 0 <= idx < len(candidates):
+            return candidates[idx]
+    return candidates[0]
+
+
+def merged_adding_commits(line, path):
+    """Commits in BASE..MAIN whose diff changed the count of this line in path.
+
+    We deliberately do *not* pass --diff-filter=A: that filter restricts to
+    commits that created the file, not commits that added a line inside an
+    existing file. If the line is still present on main, the most recent commit
+    that changed its count is the one that (re-)introduced it.
+    """
+    out = run(
+        [
+            "git", "log", "-S", line,
+            "--format=%H", f"{BASE}..{MAIN}",
+            "--", path,
+        ],
+        check=False,
+    )
+    return [c for c in out.splitlines() if c]
+
+
+def line_present_on_main(line, path):
+    if not file_exists_in(MAIN, path):
+        return False
+    # git show is cheaper than repeated pickaxe for the present check.
+    return line in content_lines(MAIN, path)
+
+
+def main():
+    diff_text = run(["git", "diff", "-p", "--find-renames", LEFT, "HEAD"])
+    seen = set()
+    for path, block in deletion_blocks(diff_text):
+        if not file_exists_in(MAIN, path):
+            continue
+        sample = good_sample(block)
+        if sample is None:
+            continue
+        commits = merged_adding_commits(sample, path)
+        if not commits:
+            continue
+        if not line_present_on_main(sample, path):
+            continue
+        key = (path, commits[0])
+        if key in seen:
+            continue
+        seen.add(key)
+        subject = run(
+            ["git", "log", "-1", "--format=%s", commits[0]], check=False
+        ).strip()
+        print(f"revert-hunk\t{path}\tcommits={commits[0]}\t{subject}")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+}
+
+# ── Collect and report violations ────────────────────────────────────────────
+
+collect_violations() {
+    local left_ref="$1"
+    local base_for_stale="$2"
+    check_file_truncation "$left_ref"
+    check_stale_base "$base_for_stale"
+    check_deletion_surge "$left_ref"
+    check_revert_hunks "$left_ref" "$base_for_stale"
+}
+
+report_violation() {
+    local kind="$1"
+    local detail="$2"
+    case "$kind" in
+        file-truncation)
+            if (( WAIVE_FILE_TRUNC )); then
+                note "WAIVED file-truncation: $detail"
+                return 0
+            fi
+            note "FAIL file-truncation: $detail (threshold empty or >= ${FILE_TRUNCATION_FRACTION})"
+            ;;
+        stale-base)
+            if (( WAIVE_STALE_BASE )); then
+                note "WAIVED stale-base: $detail"
+                return 0
+            fi
+            note "FAIL stale-base: $detail (threshold ${BASE_DISTANCE_THRESHOLD})"
+            ;;
+        deletion-surge)
+            if (( WAIVE_DELETION_SURGE )); then
+                note "WAIVED deletion-surge: $detail"
+                return 0
+            fi
+            note "FAIL deletion-surge: $detail (threshold del>${DELETION_SURGE_LINES} and ratio>${DELETION_SURGE_RATIO}:1)"
+            ;;
+        revert-hunk)
+            if (( WAIVE_REVERT )); then
+                note "WAIVED revert-hunk: $detail"
+                return 0
+            fi
+            note "FAIL revert-hunk: $detail"
+            ;;
+        *)
+            note "FAIL unknown: $kind $detail"
+            ;;
+    esac
+    return 1
+}
+
+# ── Self-test: synthetic repository, both directions ─────────────────────────
+
+self_test() {
+    local tmp
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" EXIT
+
+    note "self-test: building synthetic repository in $tmp"
+    (
+        cd "$tmp"
+        git init -q
+        git config user.email "lane-diff-audit@orrery.local"
+        git config user.name "Lane Diff Audit"
+
+        mkdir -p src
+        cat > src/lib.txt <<'EOF'
+common line one
+common line two
+common line three
+EOF
+        git add .
+        git commit -q -m "initial"
+
+        {
+            echo "merged feature A"
+            echo "merged feature B"
+            echo "merged feature C"
+        } >> src/lib.txt
+        git add src/lib.txt
+        git commit -q -m "merged feature"
+
+        echo "later addition" > src/other.txt
+        git add src/other.txt
+        git commit -q -m "other file"
+
+        # Stale-revert shape: cut from the initial commit, bring in the current
+        # main tree, then commit a deletion of everything that was added after
+        # the base. This produces the #742 signature: a branch whose diff
+        # against origin/main reverts merged hunks.
+        local initial
+        initial=$(git rev-list --max-parents=0 HEAD)
+        git checkout -q -b stale-revert "$initial"
+        git checkout -q main -- src/lib.txt src/other.txt
+        # Remove the merged feature additions and the later file, but add a
+        # small marker so the commit is not identical to the old base.
+        sed -i '/^merged feature/d' src/lib.txt
+        echo "stale marker" >> src/lib.txt
+        rm -f src/other.txt
+        git add src/lib.txt src/other.txt
+        git commit -q -m "stale revert of everything after base"
+
+        if LANE_DIFF_AUDIT_MAIN=main "$ROOT/scripts/lane-diff-audit.sh" >/dev/null 2>&1; then
+            echo "$NAME: self-test: stale-revert branch was NOT refused" >&2
+            exit 1
+        fi
+        echo "$NAME: self-test: stale-revert branch correctly refused" >&2
+
+        # Ordinary refactor from a recent base: replace the merged feature with
+        # new text, keeping comparable additions and deletions.
+        git checkout -q main
+        git checkout -q -b refactor main~1
+        cat > src/lib.txt <<'EOF'
+common line one
+common line two
+common line three
+refactored feature X
+refactored feature Y
+refactored feature Z
+EOF
+        git add src/lib.txt
+        git commit -q -a -m "refactor feature text"
+
+        if LANE_DIFF_AUDIT_MAIN=main "$ROOT/scripts/lane-diff-audit.sh" >/dev/null 2>&1; then
+            echo "$NAME: self-test: refactor branch correctly passed" >&2
+        else
+            echo "$NAME: self-test: refactor branch was wrongly refused" >&2
+            exit 1
+        fi
+    )
+}
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+while (($#)); do
+    case "$1" in
+        --self-test)
+            self_test
+            note "self-test passed"
+            exit 0
+            ;;
+        --waive)
+            case "${2:-}" in
+                file-truncation) WAIVE_FILE_TRUNC=1 ;;
+                stale-base) WAIVE_STALE_BASE=1 ;;
+                revert-hunk) WAIVE_REVERT=1 ;;
+                deletion-surge) WAIVE_DELETION_SURGE=1 ;;
+                *) die "unknown waiver '${2:-}'; expected file-truncation, stale-base, revert-hunk, or deletion-surge" ;;
+            esac
+            shift 2
+            ;;
+        --waive-all)
+            WAIVE_FILE_TRUNC=1
+            WAIVE_STALE_BASE=1
+            WAIVE_REVERT=1
+            WAIVE_DELETION_SURGE=1
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument '$1'; expected --self-test, --waive CHECK, --waive-all, -h, --help"
+            ;;
+    esac
+done
+
+command -v git >/dev/null || die 'git is required'
+command -v python3 >/dev/null || die 'python3 is required'
+
+if ! git rev-parse --verify "$MAIN_REF" >/dev/null 2>&1; then
+    die "ref '$MAIN_REF' does not exist; this script audits against origin/main"
+fi
+
+merge_base=$(git merge-base HEAD "$MAIN_REF")
+readonly merge_base
+
+failures=0
+while IFS=$'\t' read -r kind rest; do
+    [[ -n $kind ]] || continue
+    if ! report_violation "$kind" "$rest"; then
+        failures=$((failures + 1))
+    fi
+done < <(collect_violations "$MAIN_REF" "$merge_base")
+
+if (( failures )); then
+    note "$failures audit violation(s); push refused (waive with --waive CHECK or --waive-all)"
+    exit 1
+fi
+
+note "audit passed: no revert, truncation, stale-base, or deletion-surge detected"
+exit 0
