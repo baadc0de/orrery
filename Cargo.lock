@@ -7971,6 +7971,7 @@ dependencies = [
 name = "orrery_games"
 version = "0.1.0"
 dependencies = [
+ "bevy_ecs",
  "blake3",
  "bytes",
  "iroh-base",

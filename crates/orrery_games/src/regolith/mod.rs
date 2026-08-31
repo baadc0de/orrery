@@ -87,6 +87,9 @@ macro_rules! observation {
 pub mod archetype;
 mod craft;
 pub mod invariants;
+/// **SPIKE #793 — propose-only.** The `bevy_ecs`-native rewrite of the
+/// stage-1 checks, kept beside the shipped ones for the differential.
+pub mod native;
 pub mod order;
 pub mod pilot;
 pub mod state;

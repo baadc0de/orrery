@@ -10,6 +10,17 @@ license = "MIT OR Apache-2.0"
 # matrix, so it takes no dependency that could differ between them: no tokio,
 # no OS services, no clock.
 [dependencies]
+# ── SPIKE #793, propose-only ────────────────────────────────────────────────
+# This dependency deliberately violates `scripts/core-gates.sh` clause 1
+# ("Bevy-free") and D42 (a) / D43 (e)(1). It is here because #793's owner
+# sanction asks for the ban to be *measured* rather than assumed, and the
+# measurement is not possible without `bevy_ecs` actually inside the rules
+# crate. It is a plain, non-optional dependency on purpose: putting it behind
+# a non-default feature would make `cargo tree -p orrery_games` — which is
+# exactly what the gate greps — keep reporting green while Bevy was in the
+# crate, and a spike that hides its own violation has measured nothing.
+# Removing this line and `src/regolith/native.rs` reverts the whole violation.
+bevy_ecs = { workspace = true }
 orrery_core = { path = "../orrery_core" }
 orrery_protocol = { path = "../orrery_protocol" }
 orrery_compose = { path = "../orrery_compose" }
