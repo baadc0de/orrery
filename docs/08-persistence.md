@@ -3247,8 +3247,11 @@ Hot-key conflict retries are application responsibility under optimistic concurr
 reader, the intent path and the offline seeder alike, so a key convention
 cannot drift between its writers. Each family carries a one-byte discriminator
 in place of the logical string prefix (`w` world, `c` ckpt, `k` chunk, `a`
-actor, `i` intent, `s` seedmap, `p` seedprog, `v` content/version); the
-families are provably range-disjoint and a test asserts it pairwise.
+actor, `i` intent, `s` seedmap, `p` seedprog, `v` content/version, `z`
+jarchive); the families are provably range-disjoint and a test asserts it
+pairwise. `jarchive/` wears the `z` byte with an ASCII sub-discriminator `a`
+(`za`) to match the discriminated-family pattern already used by `strike/`
+(`ya`) and `id/` (`da`, `db`, `dh`, `dw`).
 
 **No split rows (P2 decision, 2026-08-13).** An earlier revision of this table
 specified that a `world/` value above FDB's 100 KB limit splits into
@@ -3531,7 +3534,83 @@ Costs, against the D16 parameter table (transition parameters are design default
 
 ## 11. Event history and the archive
 
-The journal **is** the event source (R7). The archive tailer consumes sealed segments, re-sorts records into `(cell_id, tick)` order, and writes Parquet objects to object storage, recording each under `jarchive/{node_id}/{segment_seq}`. Local segments are deleted only after (a) the checkpoint watermark has passed them and (b) the archive object is verified — the journal disk holds minutes-to-hours, the archive holds the configured retention (default: 30 days full-fidelity, aggregated statistics thereafter). Consumers:
+The journal **is** the event source (R7). The archive tailer consumes sealed
+segments and writes Parquet objects to object storage, one object per
+`(node_id, segment_seq)` batch. The tailer records each object under
+`jarchive/{node_id}/{segment_seq}` with a metadata row carrying
+`(object key, cell ranges, lsn span, checksum)`. Local segments are deleted only
+after (a) the checkpoint watermark has passed them and (b) the archive object is
+verified — the journal disk holds minutes-to-hours, the archive holds the
+configured retention (default: 30 days full-fidelity, aggregated statistics
+thereafter). Consumers:
+
+### 11.1 Archive record schema
+
+One row per `JournalRecord`. Columns:
+
+| Column | Type | Source |
+|---|---|---|
+| `lsn_segment` | `u64` | `JournalRecord::lsn.segment` |
+| `lsn_offset` | `u64` | `JournalRecord::lsn.offset` |
+| `grid` | `u32` | `JournalRecord::grid` |
+| `cell` | `u64` (Morton bits) | `JournalRecord::cell` |
+| `entity` | `u64` | `JournalRecord::entity` |
+| `tick` | `u64` | `JournalRecord::tick` |
+| `epoch` | `u64` | `JournalRecord::epoch` |
+| `author` | `binary(32)` | `JournalRecord::author` (`NodeId`) |
+| `kind` | `u8` | `JournalRecord::kind` discriminant |
+| `payload` | `binary` | `JournalRecord::payload` |
+| `crc` | `u32` | `JournalRecord::crc` |
+| `encoding_version` | `u8` | trailing version byte from `JournalRecord::encode_frame` |
+
+Sort order within an object: `(grid, cell, lsn)`. Object granularity: one object
+per `(node_id, segment_seq)` batch. A reader locates records for a
+`(cell range, lsn range)` query by first scanning the `jarchive/` metadata rows
+to find objects whose `cell_ranges` and `lsn_span` overlap the query, then
+applying the cell/LSN filters inside the Parquet row groups.
+
+**Why `lsn`, not `tick`.** The server fills in `epoch`, `lsn`, `author`, and
+`crc` when it journals a `DiffUplink` (`gateway.rs:363-366`); `tick` is not
+among them. `tick` is therefore client-supplied and unvalidated. If the archive
+selected or sorted on `tick`, a griefer could stamp ticks to control which
+records fall inside a restore window, how last-writer-wins resolves, and how
+their own actions appear ordered against honest ones. `lsn` is server-assigned,
+monotone per journal, and already the axis retention and replication reason
+about (`released_floor`, mirror cuts, `ckpt_watermark`). `tick` stays available
+as displayed metadata and for the `(entity, tick)` idempotency key it already
+serves. This is #813.
+
+**Point-in-time reconstruction.** A per-component LWW diff log cannot answer
+"state at T" by itself (D47 spike, #812), and there is no checkpoint generation
+to fall back on — one checkpoint per shard, overwritten. The archive therefore
+stores full journal records, not just diffs, so a reader can reconstruct state
+at any LSN by replaying from the preceding checkpoint up to that LSN. The
+schema is the durable record of *inputs*, not a snapshot series; snapshots are
+derived on read.
+
+### 11.2 Metadata row
+
+The `jarchive/{node_id}/{segment_seq}` row is keyed under the `z` family with
+sub-discriminator `a` (`za ‖ node_id: 32 bytes ‖ segment_seq: u64 BE`),
+implemented in `orrery_persistd::keyspace::jarchive_key`. Its value is
+postcard-encoded and carries:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `object_key` | `String` | object-store URI of the Parquet object |
+| `cell_ranges` | `Vec<(grid, start_cell, end_cell)>` | half-open cell ranges the object contains |
+| `lsn_span` | `(start_lsn, end_lsn)` | inclusive LSN bounds the object covers |
+| `checksum` | `[u8; 32]` | BLAKE3 digest over the object bytes |
+
+### 11.3 Checksum and verification
+
+The `checksum` is a BLAKE3 hash over the bytes of the Parquet object as
+written. Verification means: after the object is written, read it back and
+recompute the hash; only when the recomputed hash matches the stored hash may
+the archive watermark advance past the object's `lsn_span.end` (#806). A
+checksum nobody re-reads is not a verification.
+
+### 11.4 Retention
 
 **Retention is now built, and the archive half of that rule is not
 ([D20](adr/0020-journal-retention.md)).** Until D20 nothing ever deleted a
@@ -3565,9 +3644,46 @@ promoted node's `Journal::open` took **2 905 ms** after a thirty-second load,
 against 764 ms and 300 ms in the arms that released
 (docs/data/p2-follower-retention-2026-08-20.json).
 
-- **Griefing rollback:** administrative inverse-op replay — select archive records by `(cell range, author/account, time range)`, generate inverse operations (terrain delta inverses, entity state restores from the preceding checkpoint), and apply them as administrative intents through the critical path (audited, attributable).
-- **Offline progress / parked-cell catch-up:** on reload of a parked cell, the field host runs `Ruleset` catch-up (D7); the archive supplies the input history where catch-up depends on past events.
-- **Desync forensics and adjudication context** (07-witnessing.md), and analytics export (Parquet is directly queryable by the telemetry stack, D12).
+What happens after the default 30 days of full fidelity is an owner-reserved
+decision for the tailer (#808). The schema does not define an aggregation
+format, and a record that has aged out of full fidelity is not guaranteed to be
+sufficient for #615's conservation sums or per-record ownership-continuity
+analysis.
+
+### 11.5 What each consumer gets
+
+- **Griefing rollback (#809).** Administrative inverse-op replay — select
+  archive records by `(cell range, author/account, time range)`, generate
+  inverse operations, and apply them as administrative intents through the
+  critical path (audited, attributable). The schema supports the `(cell range,
+  lsn range)` half of the selector directly: prune objects by `cell_ranges` and
+  `lsn_span`, then filter rows inside. It does **not** answer
+  `author/account` from the archive alone: `JournalRecord::author` is a
+  `NodeId` (transport identity), while `AccountId` (economic identity) is bound
+  to it only in the `id/` family, which is P5's `orrery_identity` (#106). A
+  rollback harness must join archive rows against `id/db` bindings to resolve
+  account, or restrict itself to node-level attribution. The "preceding
+  checkpoint" the rollback spec mentions does not exist as a generational
+  snapshot; the target state must be computed from the archive and the current
+  (overwritten) checkpoint.
+
+- **Daily conservation sweep (#615).** Needs per-asset global conservation and
+  per-item ownership continuity across history. The schema stores every record
+  with its `entity`, `kind`, and opaque payload, so the sweep can see every
+  balance delta and ownership change. However, the primary clustering is
+  `(grid, cell, lsn)`, while per-item ownership continuity is a
+  per-`PersistId` history; an item that moves between cells has its history
+  scattered across every cell's objects. Serving #615 efficiently from this
+  layout requires a full scan of the relevant time window plus an in-memory
+  re-sort by `PersistId`. Whether that cost is acceptable is part of #615's
+  measurement charter; this schema intentionally does not add a secondary
+  clustering by `PersistId` today.
+
+- **Offline progress / parked-cell catch-up.** Needs the input history for a
+  cell. The `(grid, cell, lsn)` clustering serves this directly.
+
+- **Desync forensics and adjudication context** (07-witnessing.md), and
+  analytics export (Parquet is directly queryable by the telemetry stack, D12).
 
 ## 12. Hotspot management
 
