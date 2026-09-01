@@ -24,7 +24,8 @@ numbered document; where a document conflicts with one, the ADR wins.
 
 Design is accepted and still moving; implementation runs across P0–P6, and the
 phases are not a queue — P2 started during P1, and P6's archive work landed
-before P5's criterion was met, because the P5 enforcement ramp needs it.
+before P5's criterion was met, because the enforcement ramp's last control was
+moved *into* P6 by that dependency rather than waiting behind P5.
 
 | Phase | Subject | Where it stands |
 |---|---|---|
