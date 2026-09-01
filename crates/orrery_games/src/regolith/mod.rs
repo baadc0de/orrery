@@ -86,7 +86,11 @@ macro_rules! observation {
 
 pub mod archetype;
 mod craft;
+#[doc(hidden)]
+pub mod craft_ecs;
 pub mod invariants;
+#[doc(hidden)]
+pub mod native_ecs;
 pub mod order;
 pub mod pilot;
 pub mod state;
@@ -333,13 +337,16 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
-/// Regolith v23's rules identity: v22's canonical behaviour under protocol v7,
-/// with `regolith.world` executed as native ECS components and systems.
+/// Regolith v24's rules identity: v23's canonical behaviour under protocol v7,
+/// with the remaining `regolith.craft` module executed as native ECS
+/// components and systems alongside `regolith.world`.
 ///
 /// The F-4 differential compares the legacy and native paths over D-1 through
 /// D-4 and requires byte parity. The version still advances because D49's
 /// source identity moved; the unchanged component schema and projection axes
 /// remain independently equal.
+///
+/// Regolith v23 moved `regolith.world` to native ECS execution.
 ///
 /// Regolith v22's rules identity was v21's gameplay rules under protocol v7.
 /// Adding the server-owned restore record moved the pinned first-party source
@@ -361,7 +368,7 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
 /// would let them enter one session and disagree before the first input; v21
 /// makes admission refuse that mixed campaign instead.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 23,
+    version: 24,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 
@@ -1815,7 +1822,7 @@ mod composition_tests {
     use super::state::{BloomDirector, Craft, Pickup, RegolithState, Rock, RockTier};
     use super::weapon::WeaponKind;
     use super::{REGOLITH_COMPOSITION, REGOLITH_MODULES};
-    use orrery_compose::{registry::regolith::COMPONENT_TYPE_IDS, ModuleId};
+    use orrery_compose::registry::regolith::COMPONENT_TYPE_IDS;
     use orrery_core::{QPos, QVel, Sectioned};
 
     #[test]
@@ -1852,26 +1859,22 @@ mod composition_tests {
         );
     }
 
-    /// S7.4: the ECS migration frontier is a *declared module*, not a hand-picked
-    /// set of variants.
+    /// S7.4: the ECS migration frontier is the union of complete declared
+    /// modules, not a hand-picked set of variants.
     ///
     /// `RegolithState::MIGRATED_SECTIONS` is what a decomposing host stores
     /// apart (`orrery_sim_host::ecs`). If it could name any subset of sections,
     /// "one module at a time" would be a claim in a PR body rather than a fact
     /// about the tree: a frontier cutting across two modules would still
-    /// compile, still pass the differential, and still be described as a module
-    /// migration. This pins it to the manifest's own `regolith.world` row, in
-    /// both directions.
+    /// compile, still pass the differential, and still be described as module
+    /// migration. Lane two has moved the second and final module, so this pins
+    /// the frontier to the manifest's complete section set in both directions.
     #[test]
-    fn the_migration_frontier_is_a_declared_module() {
-        let world = REGOLITH_MODULES
+    fn the_migration_frontier_is_the_union_of_declared_modules() {
+        let declared: Vec<&str> = REGOLITH_MODULES
             .iter()
-            .find(|module| module.id == ModuleId("regolith.world"))
-            .expect("the manifest declares regolith.world");
-        let declared: Vec<&str> = world
-            .state_sections
-            .iter()
-            .map(|section| section.0)
+            .rev()
+            .flat_map(|module| module.state_sections.iter().map(|section| section.0))
             .collect();
         let frontier: Vec<&str> = RegolithState::MIGRATED_SECTIONS
             .iter()
@@ -1879,8 +1882,8 @@ mod composition_tests {
             .collect();
         assert_eq!(
             frontier, declared,
-            "the migrated section set must be exactly one manifest module's \
-             state sections"
+            "the migrated section set must be exactly the complete declared \
+             module section set, in migration order"
         );
     }
 

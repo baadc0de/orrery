@@ -10,31 +10,24 @@
 //!
 //! # Why the test lives here and not in `orrery_games`
 //!
-//! `orrery_games` is on `core-gates.sh` clause 1's Bevy-free list and ADR-0042
-//! clause (d) refuses proposals to change that. The seam is not on it, and
-//! `bevy_ecs` is a first-class dependency of this crate — verified: with it
-//! declared under `[dependencies]` here, `./scripts/core-gates.sh` exits 0 and
-//! role discovery still reports exactly `orrery_conformance orrery_core
-//! orrery_games`. So the harness had to learn to accept a backend it cannot
-//! name (`orrery_games::diff::run_differential_on`), and the call site that
-//! names both backends is this file.
+//! The host and the game now share the dedicated rules world admitted by D42,
+//! but only this file names both backend implementations. The reusable harness
+//! remains game-owned and backend-generic through
+//! `orrery_games::diff::run_differential_on`.
 //!
 //! # The unit of migration
 //!
-//! One module's state sections, and #745's S7.4 asks for exactly that. The
-//! host still sees an opaque `R: Ruleset`, but since this lane it also sees
-//! `orrery_core::Sectioned` — the smallest thing a gated crate can say that
-//! lets a host know which entities belong to which of #737's modules. Regolith
-//! declares `regolith.world` as its migration frontier, so `rock`, `pickup`
-//! and `bloom-director` are stored in their own `bevy_ecs` component and
-//! `regolith.craft` is the remainder. See `tests/ecs_module_sections.rs` for
-//! the storage claims and `orrery_sim_host::ecs` for why the *payload* stays
-//! the whole state enum.
+//! One declared module at a time. Lane one moved `regolith.world`; lane two
+//! advances the frontier by the remaining `regolith.craft` module. All four
+//! Regolith state sections now have concrete game-owned components, while the
+//! generic host retains its migrated/remainder storage split. See
+//! `tests/ecs_module_sections.rs` for the storage claims and
+//! `orrery_sim_host::ecs` for why the seam cache stays the whole state enum.
 //!
 //! The safety a module-at-a-time migration buys is still bought the same way:
 //! the two backends are simultaneously live and differentially compared on
-//! every run of this file, so moving the next module across the frontier is a
-//! one-line edit whose consequences this file measures.
+//! every run of this file, so advancing the frontier by a complete declared
+//! module has consequences this file measures.
 
 use std::collections::BTreeMap;
 
@@ -400,8 +393,8 @@ fn subject(label: &'static str) -> Subject<Regolith> {
 
 fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
     EcsBackend::new(game, seed).with_migrated_module(
-        orrery_games::regolith::world_ecs::sync_migrated,
-        orrery_games::regolith::world_ecs::step_migrated,
+        orrery_games::regolith::native_ecs::sync_migrated,
+        orrery_games::regolith::native_ecs::step_migrated,
     )
 }
 

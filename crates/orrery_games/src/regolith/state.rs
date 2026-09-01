@@ -210,7 +210,7 @@ fn quantize_trail_axis(mm: i64, overflowed: &mut bool) -> Option<i16> {
 }
 
 /// A craft's verifiable state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct Craft {
     /// Immutable chassis.
     pub archetype: Archetype,
@@ -465,6 +465,9 @@ pub const SECTION_BLOOM_DIRECTOR: StateSection = StateSection("bloom-director");
 
 /// Every state section the `regolith.world` module owns, in manifest order.
 ///
+/// Historical lane-one rationale (the paragraph below describes the v23
+/// frontier and names the test as it existed in that lane):
+///
 /// This is the S7.4 migration frontier: the sections a decomposing host stores
 /// in their own component. It is `regolith.world` and not `regolith.craft`
 /// because the world module is the one whose population *changes inside a
@@ -475,8 +478,20 @@ pub const SECTION_BLOOM_DIRECTOR: StateSection = StateSection("bloom-director");
 pub const REGOLITH_WORLD_SECTIONS: &[StateSection] =
     &[SECTION_ROCK, SECTION_PICKUP, SECTION_BLOOM_DIRECTOR];
 
+/// Every Regolith section now implemented as native ECS components and systems.
+///
+/// S7.4 lane one moved `regolith.world`; lane two advances the frontier by the
+/// remaining declared module, `regolith.craft`. The order is module migration
+/// order and each module's own manifest order: world first, then craft.
+pub const REGOLITH_ECS_SECTIONS: &[StateSection] = &[
+    SECTION_ROCK,
+    SECTION_PICKUP,
+    SECTION_BLOOM_DIRECTOR,
+    SECTION_CRAFT,
+];
+
 impl Sectioned for RegolithState {
-    const MIGRATED_SECTIONS: &'static [StateSection] = REGOLITH_WORLD_SECTIONS;
+    const MIGRATED_SECTIONS: &'static [StateSection] = REGOLITH_ECS_SECTIONS;
 
     fn section(&self) -> StateSection {
         match self {
