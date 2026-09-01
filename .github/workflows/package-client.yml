@@ -107,6 +107,11 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
+          # Every command in this step is silent on success, and `test` and
+          # `grep -q` are silent on failure too — so a failure here used to
+          # produce a step with no output at all, which cost two blind
+          # diagnosis rounds. `must` gives every assertion a voice.
+          must() { local why=$1; shift; "$@" || { echo "package: $why" >&2; exit 1; }; }
           mkdir -p stage dist
           artifact="orrery-regolith-${{ matrix.label }}"
           binary="${{ matrix.binary }}"
@@ -140,7 +145,7 @@ jobs:
           # There are deliberately no private or loose visual assets in this
           # release. If that changes, #347 requires an encrypted/proprietary
           # bundle before the archive can ship.
-          test ! -e stage/assets
+          must "loose assets in stage/ — #347 requires an encrypted bundle first" test ! -e stage/assets
           (
             cd stage
             if command -v sha256sum >/dev/null; then
@@ -149,14 +154,15 @@ jobs:
               shasum -a 256 "$artifact" > "$artifact.sha256"
             fi
           )
-          test -s "stage/$artifact"
-          test -s stage/build-info.json
-          test -s stage/README.md
-          test -s "stage/$artifact.sha256"
+          must "staged binary is missing or empty" test -s "stage/$artifact"
+          must "build-info.json is missing or empty" test -s stage/build-info.json
+          must "README.md is missing or empty" test -s stage/README.md
+          must "checksum file is missing or empty" test -s "stage/$artifact.sha256"
           # The README tells the player which file to open. If it names a file
           # the archive does not contain — as it did while the `.exe` was being
           # renamed away — the player is left guessing. (#768)
-          grep -qF "$artifact" stage/README.md
+          must "README.md does not name $artifact, so the player is left guessing" \
+            grep -qF "$artifact" stage/README.md
           # The checksum file is generated after the rename above, so its
           # recorded name is the shipped name and `sha256sum -c` works as the
           # README describes it.
@@ -169,8 +175,15 @@ jobs:
           # leading space alone therefore could never pass on Windows — and it
           # never has: this assertion arrived in #776, after the last Windows
           # package succeeded, so its first real run was its first failure.
-          grep -qE "( |\\*)$(printf '%s' "$artifact" | sed 's/[.[\\*^$/]/\\\\&/g')\$" \
-            "stage/$artifact.sha256"
+          # An exact comparison on the recorded filename, not a pattern: the
+          # name contains a `.` on Windows and regex-escaping it inside a YAML
+          # `run:` block is how this assertion was got wrong twice.
+          must "the checksum file does not record the shipped name $artifact" \
+            awk -v want="$artifact" '{
+            name = $NF
+            sub(/^\*/, "", name)
+            if (name == want) { found = 1 }
+          } END { exit found ? 0 : 1 }' "stage/$artifact.sha256"
 
       - name: Package Unix client
         if: runner.os != 'Windows'
