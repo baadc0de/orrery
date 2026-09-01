@@ -7905,11 +7905,14 @@ dependencies = [
 name = "orrery"
 version = "0.1.0"
 dependencies = [
+ "aeronet_io",
+ "aeronet_iroh",
  "bevy",
  "bevy_app",
  "bevy_ecs",
  "bevy_state",
  "iroh",
+ "lightyear",
  "orrery_authority",
  "orrery_core",
  "orrery_games",
@@ -7917,6 +7920,7 @@ dependencies = [
  "orrery_persist_client",
  "orrery_predict",
  "orrery_protocol",
+ "orrery_replicon",
  "orrery_spatial",
  "orrery_witness",
 ]

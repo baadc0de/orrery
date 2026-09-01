@@ -55,7 +55,9 @@ use orrery_net::{
 use orrery_persist_client::{
     AuthorityCorrectionQueue, OrreryPersistClientPlugin, PersistClientConfig, ReportQueue,
 };
-use orrery_predict::{AuthorityCorrectionInbox, ConfigDefect, OrreryPredictPlugin, PredictConfig};
+use orrery_predict::{
+    AuthorityCorrectionInbox, ConfigDefect, OrreryPredictPlugin, PredictConfig, HIGH_RATE_SET,
+};
 use orrery_protocol::SeqPair;
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
 use orrery_witness::{ReportFiled, WitnessPlugin};
@@ -499,6 +501,16 @@ where
 {
     fn build(self) -> PluginGroupBuilder {
         let config = self.config;
+        assert_eq!(
+            config.spatial.high_rate_cap,
+            usize::from(HIGH_RATE_SET),
+            "SpatialConfig.high_rate_cap must equal orrery_predict::HIGH_RATE_SET; the rollback budget halves HIGH_RATE_SET under load"
+        );
+        assert_eq!(
+            config.predict.tick_hz,
+            orrery_core::TICK_HZ,
+            "PredictConfig.tick_hz must equal orrery_core::TICK_HZ; prediction and canonical simulation cannot run on different tick bases"
+        );
         PluginGroupBuilder::start::<Self>()
             .add(OrreryNetPlugin {
                 config: config.net,
@@ -551,6 +563,33 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "SpatialConfig.high_rate_cap must equal")]
+    fn group_refuses_a_high_rate_double_edit() {
+        let config = OrreryConfig::default().with_spatial(SpatialConfig {
+            high_rate_cap: usize::from(HIGH_RATE_SET) - 1,
+            ..SpatialConfig::default()
+        });
+        let _ = OrreryClientPlugins::<FacadeRules>::new(config).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "PredictConfig.tick_hz must equal")]
+    fn group_refuses_a_split_tick_basis() {
+        let predict = PredictConfig {
+            tick_hz: 30,
+            send_hz: 10,
+            rollback_ticks: 5,
+            interp_buffer: core::time::Duration::from_millis(200),
+            redundant_input_ticks: 6,
+            ..PredictConfig::default()
+        };
+        let config = OrreryConfig::default()
+            .with_predict(predict)
+            .expect("the coupled 30 Hz prediction retune is internally valid");
+        let _ = OrreryClientPlugins::<FacadeRules>::new(config).build();
+    }
+
+    #[test]
     fn binding_mirrors_membership() {
         let mut world = World::new();
         world.insert_resource(IslandMembership {
@@ -566,5 +605,63 @@ mod tests {
         let binding = world.resource::<IslandBinding>();
         assert_eq!(binding.island, Some(IslandId::new(9)));
         assert_eq!(binding.epoch, 4);
+    }
+
+    /// A private zero-behaviour ruleset for tests that exercise group build
+    /// validation without depending on a game crate.
+    struct FacadeRules;
+
+    impl Ruleset for FacadeRules {
+        type CoreState = FacadeState;
+        type CoreInput = FacadeNever;
+        type CoreEvent = FacadeNever;
+
+        fn id(&self) -> orrery_protocol::RulesetId {
+            orrery_protocol::RulesetId {
+                version: 1,
+                digest: [0x87; 32],
+            }
+        }
+
+        fn step(
+            &self,
+            _view: &mut orrery_core::StateView<'_, Self::CoreState>,
+            _inputs: &orrery_core::OrderedInputs<'_, Self::CoreInput>,
+            _rng: &mut orrery_core::TickRng,
+        ) -> orrery_core::StepOutput<Self::CoreEvent> {
+            orrery_core::StepOutput::default()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FacadeState;
+
+    impl orrery_core::Quantized for FacadeState {
+        fn quantize(&mut self) {}
+    }
+
+    impl orrery_core::CoreCodec for FacadeState {
+        fn encode(&self, _out: &mut Vec<u8>) {}
+
+        fn decode(bytes: &[u8]) -> Result<Self, orrery_core::CodecError> {
+            if bytes.is_empty() {
+                Ok(Self)
+            } else {
+                Err(orrery_core::CodecError("facade state is empty"))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    enum FacadeNever {}
+
+    impl orrery_core::CoreCodec for FacadeNever {
+        fn encode(&self, _out: &mut Vec<u8>) {
+            match *self {}
+        }
+
+        fn decode(_bytes: &[u8]) -> Result<Self, orrery_core::CodecError> {
+            Err(orrery_core::CodecError("facade input/event is uninhabited"))
+        }
     }
 }
