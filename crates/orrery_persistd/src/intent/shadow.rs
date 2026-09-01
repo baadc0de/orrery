@@ -249,6 +249,10 @@ pub struct QuarantineValidationObservation {
 ///
 /// Implementations must not block: it is called on the admission path.
 pub trait QuarantineValidationObserver: Send + Sync {
+    /// Count one quarantined-session intent entering C2, whatever posture or
+    /// later correctness check handles it. This is clause (e)'s denominator.
+    fn record_qualifying(&self, _subject: Option<AccountId>) {}
+
     /// Record one quarantined session that live mode would force through full
     /// validation.
     fn record(&self, observation: QuarantineValidationObservation);

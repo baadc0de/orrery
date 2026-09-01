@@ -70,7 +70,7 @@ use crate::adjudication::{AdjudicationExecutor, AdjudicationOutcome};
 use crate::cluster::{LeaseRenewal, Router};
 use crate::intent::stages::{self, intent_stage_metrics, IntentStageSnapshot, IntentTrace};
 use crate::intent::{
-    error_outcome, IntentContext, IntentVerdict, PermissiveValidator, SharedExecutor,
+    error_outcome, IntentContext, IntentVerdict, PermissiveValidator, RampMeter, SharedExecutor,
     SharedValidator,
 };
 use crate::lease::registrar_now_ms;
@@ -2908,9 +2908,19 @@ pub struct AuthorityCorrectionMetrics {
     broadcasts: AtomicU64,
     recipients: AtomicU64,
     dropped: AtomicU64,
+    ramp_meter: Option<Arc<RampMeter>>,
 }
 
 impl AuthorityCorrectionMetrics {
+    /// Attach D32 clause (e)'s cohort-aware C4 meter.
+    #[must_use]
+    pub fn with_ramp_meter(meter: Arc<RampMeter>) -> Self {
+        Self {
+            ramp_meter: Some(meter),
+            ..Self::default()
+        }
+    }
+
     /// Read every C4 counter.
     #[must_use]
     pub fn snapshot(&self) -> AuthorityCorrectionSnapshot {
@@ -8364,15 +8374,51 @@ async fn apply_authority_correction(
     router: &Arc<dyn Router>,
     redistributor: &Redistributor,
 ) {
+    // The report names a NodeId, while D32's honest cohort is account-scoped.
+    // Resolve through the authenticated live session before any posture return;
+    // otherwise Off would disappear from coverage's denominator and a meter
+    // built from the C4 aggregate counters could never answer clause (e).
+    let subject_account = if metrics.ramp_meter.is_some() {
+        redistributor
+            .peers
+            .current_session(report.subject)
+            .await
+            .map(|session| session.account)
+    } else {
+        None
+    };
+    if let Some(meter) = metrics.ramp_meter.as_deref() {
+        meter.qualify(subject_account);
+    }
+
     let mode = posture.get();
     if !mode.evaluates() {
         return;
     }
     let Verdict::Confirms { at, .. } = outcome.verdict else {
+        if mode == AuthorityCorrectionEnforcement::Shadow {
+            if let Some(meter) = metrics.ramp_meter.as_deref() {
+                meter.observe(
+                    subject_account,
+                    authority_correction_verdict_label(outcome.verdict),
+                    None,
+                    registrar_now_ms(),
+                );
+            }
+        }
         return;
     };
     let Some(corrected) = outcome.corrected.as_ref() else {
         metrics.unevaluated.fetch_add(1, Ordering::Relaxed);
+        if mode == AuthorityCorrectionEnforcement::Shadow {
+            if let Some(meter) = metrics.ramp_meter.as_deref() {
+                meter.observe_unevaluated(
+                    subject_account,
+                    "replayed_state_unavailable",
+                    registrar_now_ms(),
+                );
+            }
+        }
         tracing::warn!(
             target: AUTHORITY_CORRECTION_SHADOW_TARGET,
             control = AUTHORITY_CORRECTION_CONTROL,
@@ -8394,6 +8440,15 @@ async fn apply_authority_correction(
         .copied()
     else {
         metrics.unevaluated.fetch_add(1, Ordering::Relaxed);
+        if mode == AuthorityCorrectionEnforcement::Shadow {
+            if let Some(meter) = metrics.ramp_meter.as_deref() {
+                meter.observe_unevaluated(
+                    subject_account,
+                    "no_active_registrar_lease",
+                    registrar_now_ms(),
+                );
+            }
+        }
         tracing::warn!(
             target: AUTHORITY_CORRECTION_SHADOW_TARGET,
             control = AUTHORITY_CORRECTION_CONTROL,
@@ -8431,8 +8486,19 @@ async fn apply_authority_correction(
 
     // Re-read after every await and after the full computation. An operator
     // demoting live to shadow during evaluation must suppress both actions.
-    if !posture.get().acts() {
+    let final_mode = posture.get();
+    if !final_mode.acts() {
         metrics.shadow_suppressed.fetch_add(1, Ordering::Relaxed);
+        if final_mode == AuthorityCorrectionEnforcement::Shadow {
+            if let Some(meter) = metrics.ramp_meter.as_deref() {
+                meter.observe(
+                    subject_account,
+                    "would_revoke_and_broadcast",
+                    Some("revoke_and_broadcast"),
+                    registrar_now_ms(),
+                );
+            }
+        }
         tracing::info!(
             target: AUTHORITY_CORRECTION_SHADOW_TARGET,
             control = AUTHORITY_CORRECTION_CONTROL,
@@ -8457,6 +8523,15 @@ async fn apply_authority_correction(
     redistributor
         .fan_out_correction(audience, &correction, metrics)
         .await;
+}
+
+const fn authority_correction_verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Confirms { .. } => "confirms",
+        Verdict::Exonerates => "exonerates",
+        Verdict::EvidenceForged(_) => "evidence_forged",
+        Verdict::Unadjudicable(_) => "unadjudicable",
+    }
 }
 
 /// Refuse a report with a stable code and no verdict.
@@ -13784,7 +13859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guilty_shadow_computes_but_revokes_and_broadcasts_nothing() {
+    async fn c4_meter_counts_guilty_shadow_but_actions_stay_suppressed() {
         let (registry, subject_session, router, redistributor, posture, replies) =
             correction_fixture(AuthorityCorrectionEnforcement::Shadow).await;
         let entity = PersistId::new(701);
@@ -13800,7 +13875,8 @@ mod tests {
         );
         let report = correction_report(subject_session.node, entity);
         let signer = iroh::SecretKey::from_bytes(&[74; 32]);
-        let metrics = AuthorityCorrectionMetrics::default();
+        let meter = Arc::new(RampMeter::new(AUTHORITY_CORRECTION_CONTROL));
+        let metrics = AuthorityCorrectionMetrics::with_ramp_meter(Arc::clone(&meter));
         let routed: Arc<dyn Router> = router.clone();
 
         apply_authority_correction(
@@ -13823,17 +13899,27 @@ mod tests {
         assert_eq!(snapshot.leases_revoked, 0);
         assert_eq!(snapshot.broadcasts, 0);
         assert_eq!(snapshot.recipients, 0);
+        let mut cohort = crate::intent::HonestCohort::new();
+        cohort.arm(subject_session.account);
+        let ramp = meter.snapshot(&cohort);
+        assert_eq!(ramp.qualifying, 1);
+        assert_eq!(ramp.observed, 1);
+        assert_eq!(ramp.would_act, 1);
+        assert_eq!(ramp.by_cause.get("revoke_and_broadcast"), Some(&1));
+        assert_eq!(ramp.cohort.fp_count, 1);
+        assert_eq!(ramp.cohort.coverage, Some(1.0));
     }
 
     #[tokio::test]
-    async fn only_a_confirmed_verdict_can_trigger_authority_correction() {
+    async fn c4_meter_counts_non_confirming_verdicts_but_no_would_be_action() {
+        let meter = Arc::new(RampMeter::new(AUTHORITY_CORRECTION_CONTROL));
         for verdict in [
             Verdict::Exonerates,
             Verdict::EvidenceForged(orrery_protocol::ForgeryProof::ClaimSignatureInvalid),
             Verdict::Unadjudicable(orrery_protocol::UnadjudicableReason::IncompleteChain),
         ] {
             let (_registry, subject_session, router, redistributor, posture, replies) =
-                correction_fixture(AuthorityCorrectionEnforcement::Live).await;
+                correction_fixture(AuthorityCorrectionEnforcement::Shadow).await;
             let entity = PersistId::new(702);
             subject_session.state.lock().await.leases.insert(
                 entity,
@@ -13846,7 +13932,7 @@ mod tests {
                 },
             );
             let report = correction_report(subject_session.node, entity);
-            let metrics = AuthorityCorrectionMetrics::default();
+            let metrics = AuthorityCorrectionMetrics::with_ramp_meter(Arc::clone(&meter));
             let routed: Arc<dyn Router> = router.clone();
             apply_authority_correction(
                 &report,
@@ -13866,6 +13952,14 @@ mod tests {
             assert!(replies.lock().expect("reply capture").is_empty());
             assert_eq!(metrics.snapshot(), AuthorityCorrectionSnapshot::default());
         }
+        let mut cohort = crate::intent::HonestCohort::new();
+        cohort.arm(AccountId::new(70));
+        let ramp = meter.snapshot(&cohort);
+        assert_eq!(ramp.qualifying, 3);
+        assert_eq!(ramp.observed, 3);
+        assert_eq!(ramp.would_act, 0);
+        assert_eq!(ramp.cohort.fp_count, 0);
+        assert_eq!(ramp.cohort.coverage, Some(1.0));
     }
 
     #[tokio::test]

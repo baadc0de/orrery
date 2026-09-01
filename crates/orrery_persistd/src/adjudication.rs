@@ -29,6 +29,8 @@ use orrery_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::intent::RampMeter;
+
 /// How many rules builds the cluster keeps adjudicable at once (D16).
 pub const RETAINED_BUILDS: usize = 3;
 
@@ -74,6 +76,19 @@ pub enum StrikeKind {
     TimingPattern,
     /// A compensating fact authorized by an upheld appeal.
     Appeal,
+}
+
+impl StrikeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deviation => "deviation",
+            Self::EvidenceForged => "evidence_forged",
+            Self::FalseAttestation => "false_attestation",
+            Self::NonCooperation => "non_cooperation",
+            Self::TimingPattern => "timing_pattern",
+            Self::Appeal => "appeal",
+        }
+    }
 }
 
 /// Stable coordinates plus a digest for the evidence behind one strike.
@@ -311,6 +326,7 @@ pub struct AdjudicationExecutor {
     builds: VecDeque<Registered>,
     strike_filer: Option<StrikeFiler>,
     strike_metrics: StrikeMetrics,
+    strike_ramp_meter: Option<Arc<RampMeter>>,
 }
 
 impl AdjudicationExecutor {
@@ -322,6 +338,7 @@ impl AdjudicationExecutor {
             builds: VecDeque::new(),
             strike_filer: None,
             strike_metrics: StrikeMetrics::default(),
+            strike_ramp_meter: None,
         }
     }
 
@@ -333,6 +350,17 @@ impl AdjudicationExecutor {
             mode,
             clock: Arc::new(system_time_ms),
         });
+        self
+    }
+
+    /// Attach D32 clause (e)'s C5 meter.
+    ///
+    /// The cohort is deliberately not stored here: as with C1, membership is
+    /// handed to [`RampMeter::snapshot`] by the artifact producer. This seam
+    /// records only shadow-stamped filing attempts, never live actions.
+    #[must_use]
+    pub fn with_strike_ramp_meter(mut self, meter: Arc<RampMeter>) -> Self {
+        self.strike_ramp_meter = Some(meter);
         self
     }
 
@@ -442,26 +470,74 @@ impl AdjudicationExecutor {
             expires_at_ms: issued_at_ms.saturating_add(STRIKE_RETENTION_MS),
         };
         match filer.ledger.file(target, &row) {
-            Ok(StrikeFileOutcome::Filed { .. }) => {
+            Ok(StrikeFileOutcome::Filed { account }) => {
                 filed_counter.fetch_add(1, Ordering::Relaxed);
+                self.record_strike_ramp(
+                    filer.mode,
+                    Some(account),
+                    "strike_filed",
+                    Some(kind.as_str()),
+                    issued_at_ms,
+                );
             }
-            Ok(StrikeFileOutcome::Duplicate { .. }) => {
+            Ok(StrikeFileOutcome::Duplicate { account }) => {
                 self.strike_metrics
                     .duplicate
                     .fetch_add(1, Ordering::Relaxed);
+                self.record_strike_ramp(filer.mode, Some(account), "duplicate", None, issued_at_ms);
             }
             Ok(StrikeFileOutcome::UnresolvedBinding) => {
                 self.strike_metrics
                     .suppressed_unresolved
                     .fetch_add(1, Ordering::Relaxed);
+                self.record_strike_ramp_unevaluated(filer.mode, "unresolved_binding", issued_at_ms);
             }
             Err(error) => {
                 self.strike_metrics
                     .suppressed_error
                     .fetch_add(1, Ordering::Relaxed);
+                self.record_strike_ramp_unevaluated(
+                    filer.mode,
+                    "strike_filing_error",
+                    issued_at_ms,
+                );
                 tracing::warn!(%error, ?kind, "strike filing failed; verdict remains deliverable");
             }
         }
+    }
+
+    fn record_strike_ramp(
+        &self,
+        mode: StrikeMode,
+        account: Option<AccountId>,
+        verdict: &'static str,
+        action: Option<&'static str>,
+        observed_at_ms: u64,
+    ) {
+        if mode != StrikeMode::Shadow {
+            return;
+        }
+        let Some(meter) = self.strike_ramp_meter.as_deref() else {
+            return;
+        };
+        meter.qualify(account);
+        meter.observe(account, verdict, action, observed_at_ms);
+    }
+
+    fn record_strike_ramp_unevaluated(
+        &self,
+        mode: StrikeMode,
+        reason: &'static str,
+        observed_at_ms: u64,
+    ) {
+        if mode != StrikeMode::Shadow {
+            return;
+        }
+        let Some(meter) = self.strike_ramp_meter.as_deref() else {
+            return;
+        };
+        meter.qualify(None);
+        meter.observe_unevaluated(None, reason, observed_at_ms);
     }
 
     #[cfg(test)]
@@ -975,14 +1051,16 @@ mod tests {
     }
 
     #[test]
-    fn forged_evidence_files_against_reporter_and_never_subject() {
+    fn c5_meter_attributes_shadow_filing_to_reporter_and_never_subject() {
         let report = report();
         let subject_account = AccountId(51);
         let reporter_account = AccountId(52);
         let ledger = Arc::new(MemStrikeLedger::new());
         ledger.bind(report.subject, subject_account);
         ledger.bind(report.reporter, reporter_account);
-        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Shadow);
+        let meter = Arc::new(RampMeter::new("strikes"));
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Shadow)
+            .with_strike_ramp_meter(Arc::clone(&meter));
 
         executor.file_report_verdict(
             &report,
@@ -999,17 +1077,28 @@ mod tests {
         assert_eq!(rows[0].mode, StrikeMode::Shadow);
         assert_eq!(executor.strike_metrics().filed_reporter, 1);
         assert_eq!(executor.strike_metrics().filed_subject, 0);
+        let mut cohort = crate::intent::HonestCohort::new();
+        cohort.arm(reporter_account);
+        let ramp = meter.snapshot(&cohort);
+        assert_eq!(ramp.qualifying, 1);
+        assert_eq!(ramp.observed, 1);
+        assert_eq!(ramp.would_act, 1);
+        assert_eq!(ramp.by_cause.get("evidence_forged"), Some(&1));
+        assert_eq!(ramp.cohort.fp_count, 1);
+        assert_eq!(ramp.cohort.coverage, Some(1.0));
     }
 
     #[test]
-    fn non_striking_verdicts_file_nothing_for_either_party() {
+    fn c5_meter_counts_zero_for_non_striking_verdicts() {
         let report = report();
         let subject_account = AccountId(61);
         let reporter_account = AccountId(62);
         let ledger = Arc::new(MemStrikeLedger::new());
         ledger.bind(report.subject, subject_account);
         ledger.bind(report.reporter, reporter_account);
-        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+        let meter = Arc::new(RampMeter::new("strikes"));
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Shadow)
+            .with_strike_ramp_meter(Arc::clone(&meter));
 
         for verdict in [
             Verdict::Exonerates,
@@ -1022,6 +1111,15 @@ mod tests {
         assert!(ledger.rows(subject_account).is_empty());
         assert!(ledger.rows(reporter_account).is_empty());
         assert_eq!(executor.strike_metrics().suppressed_non_striking, 3);
+        let mut cohort = crate::intent::HonestCohort::new();
+        cohort.arm(subject_account);
+        cohort.arm(reporter_account);
+        let ramp = meter.snapshot(&cohort);
+        assert_eq!(ramp.qualifying, 0);
+        assert_eq!(ramp.observed, 0);
+        assert_eq!(ramp.would_act, 0);
+        assert_eq!(ramp.cohort.fp_count, 0);
+        assert_eq!(ramp.cohort.coverage, None);
     }
 
     #[test]

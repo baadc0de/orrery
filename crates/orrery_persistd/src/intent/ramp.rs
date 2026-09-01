@@ -51,12 +51,12 @@
 //!
 //! # What this measures and what it cannot
 //!
-//! This artifact measures only **C1**, the attestation quorum. C2 has no
-//! observation surface here, while the landed C3/C4/C5 measurements live at
-//! their annulment, gateway and strike-ledger seams rather than in the intent
-//! observer this artifact reads. [`RampArtifact::absent`] records those four by
-//! name with the reason, so a reader cannot mistake an uncollected control for
-//! a clean one.
+//! The same meter now consumes **C1** attestation observations, **C2**
+//! quarantined-intent incidence, **C4** correction evaluations and **C5**
+//! strike-ledger filing results. Each mechanism supplies the account before a
+//! snapshot joins it to [`HonestCohort`]. **C3** remains absent: there is no
+//! write-refusal or compensating-write observation seam to meter, and a raw
+//! annulment-shaped count would not be clause (e) evidence.
 //!
 //! Two dimensions D32 and [#221] ask for are **not** here, and are named rather
 //! than approximated:
@@ -95,7 +95,10 @@ use std::sync::Mutex;
 use orrery_protocol::AccountId;
 use serde::{Deserialize, Serialize};
 
-use super::shadow::{ShadowObservation, ShadowObserver, ShadowVerdict, ATTESTATION_QUORUM_CONTROL};
+use super::shadow::{
+    QuarantineValidationObservation, QuarantineValidationObserver, ShadowObservation,
+    ShadowObserver, ShadowVerdict, ATTESTATION_QUORUM_CONTROL,
+};
 
 /// The schema string every artifact this module writes carries.
 ///
@@ -377,6 +380,73 @@ impl RampMeter {
         Self::entry(&mut tallies, self.capacity, subject).qualifying += 1;
     }
 
+    /// Count C1 qualifying activity through the established observer spelling.
+    ///
+    /// This inherent method keeps direct callers unambiguous now that the same
+    /// meter also implements C2's observer trait.
+    pub fn record_qualifying(&self, subject: Option<AccountId>) {
+        self.qualify(subject);
+    }
+
+    /// Record one C1 observation through the established observer spelling.
+    pub fn record(&self, observation: ShadowObservation) {
+        <Self as ShadowObserver>::record(self, observation);
+    }
+
+    /// Record one completed control evaluation.
+    ///
+    /// `verdict` is the exhaustive outcome label. `action` is `Some` only
+    /// when live mode would act; for C1 it is the stable rejection-cause label,
+    /// while controls without a [`super::RejectionCause`] use the stable action
+    /// name D32 clause (d) assigns them.
+    pub fn observe(
+        &self,
+        subject: Option<AccountId>,
+        verdict: &'static str,
+        action: Option<&'static str>,
+        observed_at_ms: u64,
+    ) {
+        let capacity = self.capacity;
+        let mut tallies = self.lock();
+        Self::record_time_and_verdict(&mut tallies, verdict, observed_at_ms);
+        let tally = Self::entry(&mut tallies, capacity, subject);
+        tally.observed += 1;
+        if let Some(action) = action {
+            tally.would_act += 1;
+            *tally.causes.entry(action).or_default() += 1;
+        }
+    }
+
+    /// Record an evaluation which could not produce a verdict.
+    ///
+    /// It is present in the artifact but absent from coverage's numerator,
+    /// matching D32 clause (b)'s fail-open shadow rule.
+    pub fn observe_unevaluated(
+        &self,
+        subject: Option<AccountId>,
+        reason: &'static str,
+        observed_at_ms: u64,
+    ) {
+        let capacity = self.capacity;
+        let mut tallies = self.lock();
+        Self::record_time_and_verdict(&mut tallies, reason, observed_at_ms);
+        Self::entry(&mut tallies, capacity, subject).unevaluated += 1;
+    }
+
+    fn record_time_and_verdict(tallies: &mut Tallies, verdict: &'static str, observed_at_ms: u64) {
+        tallies.first_ms = Some(
+            tallies
+                .first_ms
+                .map_or(observed_at_ms, |first| first.min(observed_at_ms)),
+        );
+        tallies.last_ms = Some(
+            tallies
+                .last_ms
+                .map_or(observed_at_ms, |last| last.max(observed_at_ms)),
+        );
+        *tallies.by_verdict.entry(verdict).or_default() += 1;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Tallies> {
         self.tallies.lock().expect("ramp meter poisoned")
     }
@@ -512,39 +582,40 @@ fn string_keys(counts: &BTreeMap<&'static str, u64>) -> BTreeMap<String, u64> {
 
 impl ShadowObserver for RampMeter {
     fn record(&self, observation: ShadowObservation) {
-        let capacity = self.capacity;
-        let mut tallies = self.lock();
-
-        tallies.first_ms = Some(
-            tallies
-                .first_ms
-                .map_or(observation.observed_at_ms, |first| {
-                    first.min(observation.observed_at_ms)
-                }),
-        );
-        tallies.last_ms = Some(tallies.last_ms.map_or(observation.observed_at_ms, |last| {
-            last.max(observation.observed_at_ms)
-        }));
-        *tallies
-            .by_verdict
-            .entry(observation.verdict.as_str())
-            .or_default() += 1;
-
-        let tally = Self::entry(&mut tallies, capacity, observation.subject);
         // A degraded evaluation is *recorded* and is not *observed*, and the
         // split is the one D32 clause (b) draws when it refuses to let a
         // misconfiguration become a would-be refusal. Folding it into
         // `observed` would let a gateway with no epoch authority report full
         // coverage of a predicate it never ran.
         if matches!(observation.verdict, ShadowVerdict::Unevaluated(_)) {
-            tally.unevaluated += 1;
+            self.observe_unevaluated(
+                observation.subject,
+                observation.verdict.as_str(),
+                observation.observed_at_ms,
+            );
             return;
         }
-        tally.observed += 1;
-        if let Some(cause) = observation.verdict.cause() {
-            tally.would_act += 1;
-            *tally.causes.entry(cause.as_str()).or_default() += 1;
-        }
+        self.observe(
+            observation.subject,
+            observation.verdict.as_str(),
+            observation.verdict.cause().map(|cause| cause.as_str()),
+            observation.observed_at_ms,
+        );
+    }
+
+    fn record_qualifying(&self, subject: Option<AccountId>) {
+        self.qualify(subject);
+    }
+}
+
+impl QuarantineValidationObserver for RampMeter {
+    fn record(&self, observation: QuarantineValidationObservation) {
+        self.observe(
+            observation.subject,
+            "would_force_full_validation",
+            Some("force_full_validation"),
+            observation.observed_at_ms,
+        );
     }
 
     fn record_qualifying(&self, subject: Option<AccountId>) {
@@ -639,7 +710,8 @@ pub struct RampSnapshot {
     /// Every recorded verdict by its label, admitting ones included: the
     /// outcome split, exhaustive.
     pub by_verdict: BTreeMap<String, u64>,
-    /// Would-be actions by [`super::RejectionCause::as_str`], fleet-wide.
+    /// Would-be actions by stable action label, fleet-wide. C1 uses
+    /// [`super::RejectionCause::as_str`] verbatim.
     pub by_cause: BTreeMap<String, u64>,
     /// The same, restricted to `H`.
     pub cohort: CohortEvidence,
@@ -677,15 +749,15 @@ pub struct RampArtifact {
     pub schema: String,
     /// Where the numbers came from.
     pub provenance: Provenance,
-    /// One entry per measurable control. Today that is C1 alone.
+    /// One entry per measurable control.
     pub controls: Vec<RampSnapshot>,
-    /// The four D32 names and this tree cannot measure.
+    /// The D32 controls this tree cannot measure.
     pub absent: Vec<AbsentControl>,
 }
 
 impl RampArtifact {
-    /// An artifact carrying `controls`, with the four absent ones filled in
-    /// from D32 clause (c) and (d).
+    /// An artifact carrying `controls`, with absent controls filled in from
+    /// D32 clause (c) and (d).
     #[must_use]
     pub fn new(provenance: Provenance, controls: Vec<RampSnapshot>) -> Self {
         Self {
@@ -708,32 +780,15 @@ impl RampArtifact {
     }
 }
 
-/// The controls D32 clause (c) that this C1-specific artifact cannot measure,
-/// with the record's own reason.
+/// The controls D32 clause (c) that this tree still cannot measure, with the
+/// reason the missing mechanism prevents a cohort-restricted snapshot.
 #[must_use]
 pub fn absent_controls() -> Vec<AbsentControl> {
-    [
-        (
-            "quarantine_validation",
-            "D32 clause (d): with C1 off no intent commits on an attestation shortcut, so \
-             \"denied the shortcut\" is vacuous and C2-shadow degrades to counting \
-             quarantined-session intents — a count this tree does not emit on any target.",
-        ),
-        (
-            "write_annulment",
-            "D32 clause (e): C3's refusal and compensating-write measurements live at the \
-             durable intent/annulment seam, outside this C1-specific intent artifact.",
-        ),
-        (
-            "authority_correction",
-            "D32 clause (e): C4 emits process-local gateway metrics, while this C1-specific \
-             intent artifact has no gateway-metrics collector.",
-        ),
-        (
-            "strikes",
-            "D32 clause (e): C5's strike ledger is measured outside this C1-specific intent artifact.",
-        ),
-    ]
+    [(
+        "write_annulment",
+        "D32 clause (d): C3 has no write-refusal or compensating-write observation seam, \
+             so neither qualifying honest activity nor would-be annulments can be measured.",
+    )]
     .into_iter()
     .map(|(control, reason)| AbsentControl {
         control: control.to_owned(),
@@ -976,13 +1031,19 @@ mod tests {
         let meter = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
         meter.record_qualifying(Some(AccountId::new(1)));
         meter.record(obs(Some(1), ShadowVerdict::WouldAdmit, 1_000));
+        let cohort = cohort_of([1]);
         let artifact = RampArtifact::new(
             Provenance {
                 traffic: "harness".to_owned(),
                 source: "unit test".to_owned(),
                 note: String::new(),
             },
-            vec![meter.snapshot(&cohort_of([1]))],
+            vec![
+                meter.snapshot(&cohort),
+                RampMeter::new("quarantine_validation").snapshot(&cohort),
+                RampMeter::new("authority_correction").snapshot(&cohort),
+                RampMeter::new("strikes").snapshot(&cohort),
+            ],
         );
 
         let json = artifact.to_json().expect("serializable");
@@ -990,6 +1051,18 @@ mod tests {
         assert_eq!(parsed, artifact);
         assert_eq!(parsed.schema, RAMP_ARTIFACT_SCHEMA);
         assert_eq!(parsed.controls.len() + parsed.absent.len(), 5);
+        assert_eq!(parsed.absent, absent_controls());
         assert!(json.contains("\"coverage\": 1.0"));
+    }
+
+    #[test]
+    fn absent_controls_names_only_c3_and_why_it_cannot_be_measured() {
+        let absent = absent_controls();
+        assert_eq!(absent.len(), 1);
+        assert_eq!(absent[0].control, "write_annulment");
+        assert!(absent[0].reason.contains("no write-refusal"));
+        assert!(absent[0].reason.contains("compensating-write"));
+        assert!(absent[0].reason.contains("qualifying honest activity"));
+        assert!(absent[0].reason.contains("would-be annulments"));
     }
 }
