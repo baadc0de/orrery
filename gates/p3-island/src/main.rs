@@ -302,7 +302,7 @@ struct Cli {
 
     /// How long peers keep simulating. Must outlast the settle window with
     /// margin, so survivors are still logging while the proof is collected.
-    #[arg(long, default_value_t = 30, env = "ORRERY_DURATION_SECS")]
+    #[arg(long, default_value_t = 30, env = "ORRERY_P3_ISLAND_DURATION_SECS")]
     duration_secs: u64,
 
     /// Where to put peer logs and the report.
@@ -310,7 +310,7 @@ struct Cli {
         long,
         value_name = "DIR",
         default_value = "p3-island-out",
-        env = "ORRERY_OUT"
+        env = "ORRERY_P3_ISLAND_OUT"
     )]
     out: PathBuf,
 

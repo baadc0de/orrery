@@ -97,7 +97,7 @@ pub struct Cli {
     pub sessions: u32,
 
     /// Run duration, seconds.
-    #[arg(long, default_value_t = 30, env = "ORRERY_DURATION_SECS")]
+    #[arg(long, default_value_t = 30, env = "ORRERY_P2_LOAD_DURATION_SECS")]
     pub duration_secs: u64,
 
     /// A seeder manifest (JSONL, docs/12-world-seeding.md §9.3: one entry per

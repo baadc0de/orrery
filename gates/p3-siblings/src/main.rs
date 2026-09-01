@@ -249,7 +249,7 @@ struct Cli {
     victim_claim_kind: ClaimTier,
 
     /// How long peers keep simulating. Must outlast both settle windows.
-    #[arg(long, default_value_t = 75, env = "ORRERY_DURATION_SECS")]
+    #[arg(long, default_value_t = 75, env = "ORRERY_P3_SIBLINGS_DURATION_SECS")]
     duration_secs: u64,
 
     /// Where to put peer logs and the report.
@@ -257,7 +257,7 @@ struct Cli {
         long,
         value_name = "DIR",
         default_value = "p3-sibling-out",
-        env = "ORRERY_OUT"
+        env = "ORRERY_P3_SIBLINGS_OUT"
     )]
     out: PathBuf,
 

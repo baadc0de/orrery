@@ -83,7 +83,7 @@ type SharedExecutor = Arc<dyn IntentExecutor>;
 struct Cli {
     /// Stable process/node identity. Accepted in single-node mode so a process
     /// can keep the same runtime identity across restarts.
-    #[arg(long, env = "ORRERY_NODE_ID")]
+    #[arg(long)]
     node_id: Option<u64>,
 
     /// Base directory for node journals. Node `i` uses `{dir}/node-{i}`.
@@ -91,18 +91,18 @@ struct Cli {
     dir: PathBuf,
 
     /// Local chain listen address for clustered topology.
-    #[arg(long, env = "ORRERY_CHAIN_LISTEN")]
+    #[arg(long)]
     chain_listen: Option<SocketAddr>,
 
     /// Stable primary process identity for a follower. Used with
     /// `--chain-listen`; the follower never accepts gateway writes.
-    #[arg(long, env = "ORRERY_CHAIN_PRIMARY")]
+    #[arg(long)]
     chain_primary: Option<u64>,
 
     /// Fencing epoch for this static chain assignment. Required in clustered
     /// mode so a chain never silently resumes under a different ownership
     /// epoch.
-    #[arg(long, env = "ORRERY_CHAIN_EPOCH")]
+    #[arg(long)]
     chain_epoch: Option<u64>,
 
     /// Promote this passive follower after the named primary has failed.  The
@@ -113,11 +113,11 @@ struct Cli {
 
     /// A follower node and its listen address in `<node-id>@<addr>` form.
     /// Repeated to describe the follower chain order.
-    #[arg(long, value_name = "NODE_ID@ADDR", env = "ORRERY_CHAIN_FOLLOWER")]
+    #[arg(long, value_name = "NODE_ID@ADDR")]
     chain_follower: Vec<ChainFollower>,
 
     /// The gateway bind address.
-    #[arg(long, default_value = "127.0.0.1:0", env = "ORRERY_PERSISTD_BIND")]
+    #[arg(long, default_value = "127.0.0.1:0")]
     bind: String,
 
     /// FoundationDB cluster file path. When set, the binary connects to FDB for
@@ -132,7 +132,7 @@ struct Cli {
     allow_volatile_leases: bool,
 
     /// Trusted identity issuer key in `<key-id>@<public-key>` form.
-    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY", env = "ORRERY_ISSUER_KEY")]
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
     issuer_key: Vec<IssuerKeySpec>,
 
     /// Development affordance: spawn `<count>@<cell>` placeholder entities at
@@ -152,7 +152,7 @@ struct Cli {
     /// Repeatable, so a key rotation can be deployed with an overlap. Without
     /// at least one, no peer has coordinator-confirmed interest: weak claims
     /// are refused and a lost lease parks instead of moving to a successor.
-    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY", env = "ORRERY_COORDINATOR_KEY")]
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
     coordinator_key: Vec<IssuerKeySpec>,
 
     /// D27's K-of-N attestation quorum: `off`, `shadow` or `required`.
@@ -175,12 +175,7 @@ struct Cli {
     /// intent against a coordinator-signed announcement, and a gateway that
     /// trusts no coordinator key caches none. Startup refuses the combination
     /// rather than running a mode that can never evaluate anything.
-    #[arg(
-        long,
-        value_name = "off|shadow|required",
-        default_value = "off",
-        env = "ORRERY_ATTESTATION_ENFORCEMENT"
-    )]
+    #[arg(long, value_name = "off|shadow|required", default_value = "off")]
     attestation_enforcement: AttestationEnforcement,
 
     /// D32 control C4: guilty-verdict authority correction posture.
@@ -189,12 +184,7 @@ struct Cli {
     /// live mode would emit, while suppressing both registrar revocation and
     /// broadcast. A durable `ramp/authority_correction` row overrides this
     /// startup default within the one-second poll interval.
-    #[arg(
-        long,
-        value_name = "off|shadow|live",
-        default_value = "off",
-        env = "ORRERY_AUTHORITY_CORRECTION"
-    )]
+    #[arg(long, value_name = "off|shadow|live", default_value = "off")]
     authority_correction: AuthorityCorrectionEnforcement,
 
     /// Hex-encoded iroh secret key, pinning the gateway's NodeId across runs.
@@ -204,7 +194,7 @@ struct Cli {
 
     /// Local shard specification. Accepts raw `CellId` bits (`0x...` or
     /// decimal) or coordinate form `x,y,z@level`.
-    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL", env = "ORRERY_SHARD")]
+    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
     shard: Vec<ShardSpec>,
 
     /// A shard this node may **adopt** from a live sibling, but does not
@@ -223,7 +213,7 @@ struct Cli {
     /// `--shard` for overlap exactly as `--shard` values are against each
     /// other, because "`--shard` sets across siblings must not overlap" (D26)
     /// is worth catching within one process too.
-    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL", env = "ORRERY_STANDBY_SHARD")]
+    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
     standby_shard: Vec<ShardSpec>,
 
     /// Path to a JSON file this node watches for a shard-handover request.
@@ -242,7 +232,7 @@ struct Cli {
     ///
     /// `successor_gateway` is optional and is what lets the refusals this node
     /// then issues be *redirects* — see `DenyReason::WrongOwner`.
-    #[arg(long, value_name = "PATH", env = "ORRERY_HANDOVER_REQUEST")]
+    #[arg(long, value_name = "PATH")]
     handover_request: Option<PathBuf>,
 
     /// Retain every journal segment: never release the ones the checkpoints
@@ -254,7 +244,7 @@ struct Cli {
     /// operator wants when a journal has to be preserved for forensics. It is
     /// not a tuning knob: with retention off, journal disk and the index
     /// rebuilt from it at every open grow with the node's uptime.
-    #[arg(long, env = "ORRERY_NO_JOURNAL_RETENTION")]
+    #[arg(long)]
     no_journal_retention: bool,
 
     /// Hold journal release behind the verified archive watermark (D20).
@@ -302,7 +292,7 @@ struct Cli {
     /// persistd process. The implementation has one sequential range scanner;
     /// parallel scanners are deliberately not a tuning knob after #837
     /// measured avoidable intent-path interference at four.
-    #[arg(long, env = "ORRERY_RECEIPT_ARCHIVE")]
+    #[arg(long)]
     receipt_archive: bool,
 
     /// Rows per short read-only receipt archive transaction.
@@ -3180,6 +3170,79 @@ fn parse_shard_coords(s: &str) -> Result<CellId, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flags that must **never** read the environment, and why.
+    ///
+    /// #865 gave these fallbacks; an audit found each one wrong in a different
+    /// way, and the ways matter more than the list:
+    ///
+    /// - `--receipt-archive` is a deployment role whose own doc says "enable it
+    ///   on exactly one persistd process". An exported variable is inherited by
+    ///   every process a supervisor spawns — precisely the parallel-scanner
+    ///   deployment #837 measured and the flag forbids.
+    /// - `--attestation-enforcement` and `--authority-correction` are mode
+    ///   selectors that arm refusal and revocation. D32 makes promotion an
+    ///   operator decision; an inherited variable is not one.
+    /// - `--node-id`, `--bind` and `--chain-listen` are per-process identity.
+    ///   One value in a host's environment guarantees a collision the moment a
+    ///   second persistd starts.
+    /// - `--chain-primary` and `--chain-epoch` select a role and an ownership
+    ///   epoch; the epoch flag exists so a chain "never silently resumes under a
+    ///   different ownership epoch", which a stale exported value would cause.
+    /// - `--no-journal-retention` is a forensics switch, not a knob.
+    /// - `--handover-request` drives a single-writer transition.
+    #[test]
+    fn identity_role_and_mode_flags_do_not_read_the_environment() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV_LOCK.lock().expect("environment lock");
+
+        for (name, value) in [
+            ("ORRERY_RECEIPT_ARCHIVE", "true"),
+            ("ORRERY_ATTESTATION_ENFORCEMENT", "required"),
+            ("ORRERY_AUTHORITY_CORRECTION", "live"),
+            ("ORRERY_NODE_ID", "9"),
+            ("ORRERY_PERSISTD_BIND", "127.0.0.1:1"),
+            ("ORRERY_CHAIN_LISTEN", "127.0.0.1:2"),
+            ("ORRERY_CHAIN_PRIMARY", "127.0.0.1:3"),
+            ("ORRERY_CHAIN_EPOCH", "7"),
+            ("ORRERY_NO_JOURNAL_RETENTION", "true"),
+            ("ORRERY_HANDOVER_REQUEST", "/tmp/handover"),
+        ] {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            let parsed = Cli::try_parse_from(["persistd"]).expect("bare invocation parses");
+            match previous {
+                Some(old) => std::env::set_var(name, old),
+                None => std::env::remove_var(name),
+            }
+
+            assert!(
+                !parsed.receipt_archive,
+                "{name} reached --receipt-archive; a deployment role must not be inherited"
+            );
+            assert!(
+                parsed.node_id.is_none(),
+                "{name} reached --node-id; per-process identity must not be inherited"
+            );
+            assert!(
+                parsed.chain_primary.is_none() && parsed.chain_epoch.is_none(),
+                "{name} reached a chain role or epoch; a silent resume is what the flag prevents"
+            );
+            assert!(
+                !parsed.no_journal_retention,
+                "{name} reached --no-journal-retention; a forensics switch is not a knob"
+            );
+            assert!(
+                parsed.handover_request.is_none(),
+                "{name} reached --handover-request; the transition has one writer"
+            );
+            assert_eq!(
+                parsed.attestation_enforcement,
+                AttestationEnforcement::Off,
+                "{name} moved C1 off its D32 default; promotion is an operator decision"
+            );
+        }
+    }
 
     #[test]
     fn cli_env_fallback_and_flag_precedence() {
