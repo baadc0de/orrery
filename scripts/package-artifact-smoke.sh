@@ -186,19 +186,26 @@ make_read_only() { # directory
         elif ! command -v cygpath >/dev/null 2>&1; then
             read_only_why='cygpath is not on PATH, so the Windows path is unknown'
         else
-            local win_path account
+            local win_path account deny_err
             win_path="$(cygpath -w "$1")"
-            account="$(whoami 2>/dev/null)"
+            # Windows tools emit CRLF, and command substitution strips the
+            # newline but not the carriage return — which would make the
+            # account argument malformed and the deny fail for a reason no
+            # message would explain.
+            account="$(whoami 2>/dev/null | tr -d '\r\n')"
             if [[ -z $account ]]; then
                 read_only_why='whoami named no account to deny'
             else
+                # The deny goes on FIRST, while the directory still carries
+                # the inherited ACEs that let this process edit the DACL.
+                # Resetting inheritance first strips those, and the deny that
+                # followed reported "could not deny writes" — which is what
+                # the runner said after the previous attempt.
+                deny_err="$(icacls "$win_path" /deny "$account:(OI)(CI)(WD,AD)" 2>&1)" \
+                    && read_only_method="icacls deny for $account" \
+                    || read_only_why="icacls could not deny writes to $account: ${deny_err//$'\n'/ }"
                 icacls "$win_path" /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1 \
-                    || read_only_why='icacls could not reset inheritance'
-                if icacls "$win_path" /deny "$account:(OI)(CI)(WD,AD)" >/dev/null 2>&1; then
-                    read_only_method="icacls deny for $account"
-                else
-                    read_only_why="icacls could not deny writes to $account"
-                fi
+                    || read_only_why="${read_only_why:-icacls could not reset inheritance}"
             fi
         fi
     else
