@@ -20,11 +20,11 @@ use orrery_seed::wipe::{self, WipeOptions};
 struct PlanArgs {
     #[arg(value_name = "SCENARIO")]
     scenario: PathBuf,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_PROFILE")]
     profile: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_JSON")]
     json: bool,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_SINGLE_GRID")]
     single_grid: bool,
 }
 
@@ -32,11 +32,11 @@ struct PlanArgs {
 struct ApplyArgs {
     #[arg(value_name = "SCENARIO")]
     scenario: PathBuf,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_PROFILE")]
     profile: Option<String>,
     #[arg(long)]
     allow_opaque: bool,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_SINGLE_GRID")]
     single_grid: bool,
 }
 
@@ -44,16 +44,16 @@ struct ApplyArgs {
 struct VerifyArgs {
     #[arg(value_name = "SCENARIO")]
     scenario: PathBuf,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_PROFILE")]
     profile: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_FULL")]
     full: bool,
     /// Write the §9.3 manifest here: JSONL, one entry per line in
     /// `(grid, cell, ContentKey)` order, with the `content/version` record as
     /// the last line. Streamed, so the file's size is not bounded by memory.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_EMIT_MANIFEST")]
     emit_manifest: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_SINGLE_GRID")]
     single_grid: bool,
 }
 
@@ -69,11 +69,11 @@ struct ShardsArgs {
     #[arg(value_name = "MANIFEST")]
     manifest: PathBuf,
     /// The grid whose shards to report. persistd owns one grid per process.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, env = "ORRERY_GRID")]
     grid: u32,
     /// Emit a JSON object (`grid`, `shard_level`, `entries`, `shards`) instead
     /// of one `--shard` operand per line.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_JSON")]
     json: bool,
 }
 

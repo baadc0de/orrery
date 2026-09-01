@@ -100,16 +100,16 @@ struct Cli {
 enum Command {
     /// Run the persistence gateway until interrupted.
     Gateway {
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
         cluster_file: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_DATA_DIR")]
         data_dir: PathBuf,
         /// D32 clause (c)'s startup default for control C1, which seeds the
         /// posture cell and pins this process's identity.
         ///
         /// `required` is the default so every existing caller — the dupe
         /// gauntlet's gate among them — keeps the process it already launches.
-        #[arg(long, default_value = "required")]
+        #[arg(long, default_value = "required", env = "ORRERY_ENFORCEMENT")]
         enforcement: String,
         /// D32 clause (c)'s runtime lever, stood in for by a file.
         ///
@@ -120,20 +120,20 @@ enum Command {
         /// acting, within clause (c)'s bound — so the transport is a file this
         /// process polls on the same schedule. Every byte downstream of
         /// [`AttestationPosture::set`] is the production path.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_POSTURE_FILE")]
         posture_file: Option<PathBuf>,
     },
     /// Exercise all requested arms and write their durable evidence.
     Run {
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_GATEWAY_ADDR")]
         gateway_addr: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_GATEWAY_NODE")]
         gateway_node: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
         cluster_file: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_AUDIT_LOG")]
         audit_log: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_REPORT")]
         report: PathBuf,
         #[arg(long)]
         replay: bool,
@@ -145,57 +145,57 @@ enum Command {
     /// D32's enforcement ramp, against one shadow and one enforcing gateway
     /// (issue #222).
     Ramp {
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ENFORCING_ADDR")]
         enforcing_addr: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ENFORCING_NODE")]
         enforcing_node: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_SHADOW_ADDR")]
         shadow_addr: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_SHADOW_NODE")]
         shadow_node: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
         cluster_file: PathBuf,
         /// The enforcing gateway's own process log: refusal causes, and the
         /// shadow observations it starts emitting once it is demoted.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ENFORCING_LOG")]
         enforcing_log: PathBuf,
         /// The shadow gateway's process log, which is where the observation
         /// half of this gate is read from.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_SHADOW_LOG")]
         shadow_log: PathBuf,
         /// The file the enforcing gateway polls for its posture.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_POSTURE_FILE")]
         posture_file: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_REPORT")]
         report: PathBuf,
     },
     /// Measure paired honest trade commits with and without gateway-side
     /// attestation verification (issue #153). This is not a gauntlet arm and
     /// does not change the nightly gate's assertions or report.
     Measure {
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_CONTROL_ADDR")]
         control_addr: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_CONTROL_NODE")]
         control_node: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ATTESTED_ADDR")]
         attested_addr: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ATTESTED_NODE")]
         attested_node: String,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
         cluster_file: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_CONTROL_STAGES")]
         control_stages: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ATTESTED_STAGES")]
         attested_stages: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_REPORT")]
         report: PathBuf,
         /// Samples in each population. Ten thousand leaves 100 observations
         /// in the upper one percent instead of presenting a tiny tail as p99.
-        #[arg(long, default_value_t = 10_000)]
+        #[arg(long, default_value_t = 10_000, env = "ORRERY_SAMPLES")]
         samples: usize,
         /// Simultaneous submissions per population. Each worker owns one
         /// session to each gateway and submits its pair concurrently.
-        #[arg(long, default_value_t = 16)]
+        #[arg(long, default_value_t = 16, env = "ORRERY_CONCURRENCY")]
         concurrency: usize,
     },
 }

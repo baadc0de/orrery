@@ -25,7 +25,7 @@ use orrery_protocol::{GridId, IssuerKey, IssuerKeyId, NodeId};
 )]
 struct Cli {
     /// Local address to bind. Port `0` asks the OS for an ephemeral port.
-    #[arg(long, default_value = "127.0.0.1:0")]
+    #[arg(long, default_value = "127.0.0.1:0", env = "ORRERY_COORDINATOR_BIND")]
     bind: String,
 
     /// Trusted identity issuer key in `<key-id>@<public-key>` form.
@@ -33,7 +33,7 @@ struct Cli {
     /// Presence decides island membership *and* what a peer may claim, so an
     /// unauthenticated peer reporting presence would be granting itself
     /// authority by another route. At least one key is required.
-    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY", env = "ORRERY_ISSUER_KEY")]
     issuer_key: Vec<IssuerKeySpec>,
 
     /// Hex-encoded ed25519 secret used to sign interest grants.
@@ -45,7 +45,7 @@ struct Cli {
     interest_secret: String,
 
     /// Key id stamped into issued grants, for rotation.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, env = "ORRERY_INTEREST_KEY_ID")]
     interest_key_id: u32,
 
     /// Hex-encoded iroh secret key, pinning the coordinator's NodeId across
@@ -55,7 +55,7 @@ struct Cli {
 
     /// The grid whose cell space this coordinator serves (P-7: cell ids are
     /// grid-relative).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, env = "ORRERY_GRID")]
     grid: u32,
 
     /// Hex-encoded 32-byte master secret for witness-epoch seed keys (D28).
@@ -80,7 +80,7 @@ struct Cli {
     /// It must increase across failovers: two coordinators sharing an
     /// incarnation can mint colliding handles, and a handle is what an intent
     /// names when it says which witness set it was collected under.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, env = "ORRERY_WITNESS_INCARNATION")]
     witness_incarnation: u64,
 }
 

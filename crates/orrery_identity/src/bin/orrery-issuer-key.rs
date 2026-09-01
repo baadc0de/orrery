@@ -25,19 +25,19 @@ enum Operation {
     /// Generate a fresh key and a restrictive plain staging credential.
     Generate {
         /// Rotation identifier stamped into tokens signed by this key.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_KEY_ID")]
         key_id: u32,
         /// New staging credential; must be outside every repository.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ISSUER_KEY_GENERATE_OUTPUT")]
         output: PathBuf,
     },
     /// Encrypt a staging credential into a portable age escrow.
     Escrow {
         /// Restrictive plain credential produced by `generate` or `load`.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_CREDENTIAL")]
         credential: PathBuf,
         /// New encrypted age file; must be outside every repository.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ISSUER_KEY_ESCROW_OUTPUT")]
         output: PathBuf,
         /// Read one newline-terminated passphrase from a protected stdin fd;
         /// never put a literal passphrase in the shell command.
@@ -47,10 +47,10 @@ enum Operation {
     /// Rehearse recovery and compare against the generation public key.
     Restore {
         /// Encrypted age escrow to recover.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ESCROW")]
         escrow: PathBuf,
         /// Public key printed by `generate`; mismatch fails closed.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_EXPECT_PUBLIC_KEY")]
         expect_public_key: NodeId,
         /// Read one newline-terminated passphrase from a protected stdin fd;
         /// never put a literal passphrase in the shell command.
@@ -60,13 +60,13 @@ enum Operation {
     /// Decrypt a boot-time runtime credential for the identity service.
     Load {
         /// Encrypted age escrow to load.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ESCROW")]
         escrow: PathBuf,
         /// New service-private runtime credential, normally on volatile storage.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ISSUER_KEY_LOAD_OUTPUT")]
         output: PathBuf,
         /// Public key printed by `generate`; mismatch fails closed.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_EXPECT_PUBLIC_KEY")]
         expect_public_key: NodeId,
         /// Read one newline-terminated passphrase from a protected stdin fd;
         /// never put a literal passphrase in the shell command.

@@ -38,42 +38,42 @@ enum Operation {
     /// Mint one invite code into a local hash-only ledger.
     Mint {
         /// Local tab-separated invite ledger; created if it does not exist.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_LEDGER")]
         ledger: PathBuf,
         /// Operator's volunteer label, stored alongside the allocated account id.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_LABEL")]
         label: String,
     },
     /// Sign one session token, offline, against the issuer credential.
     SessionToken {
         /// Plain runtime credential from `orrery-issuer-key generate`/`load`;
         /// must be owner-readable only and outside every repository.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ISSUER_CREDENTIAL")]
         issuer_credential: PathBuf,
         /// The account the invite allocated (`mint` printed it).
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_ACCOUNT")]
         account: u64,
         /// The transport identity the token authorizes — for a campaign
         /// external slot, the persistent key the client prints
         /// (`orrery-regolith --print-slot-key <n>`).
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_NODE")]
         node: String,
         /// Requested lifetime; the protocol caps it at one hour.
-        #[arg(long, default_value_t = MAX_SESSION_TOKEN_TTL_MS)]
+        #[arg(long, default_value_t = MAX_SESSION_TOKEN_TTL_MS, env = "ORRERY_TTL_MS")]
         ttl_ms: u64,
         /// Write a complete, named-field join file instead of requiring the
         /// volunteer to transcribe its launch material.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_JOIN_FILE")]
         join_file: Option<PathBuf>,
         /// Hosting process NodeId included in `--join-file`.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_HOST_NODE")]
         host_node: Option<String>,
         /// Client slot included in `--join-file`; the token is independently
         /// bound to the persistent transport identity supplied by `--node`.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_SLOT")]
         slot: Option<usize>,
         /// Pre-minted session ID included in `--join-file`.
-        #[arg(long)]
+        #[arg(long, env = "ORRERY_SESSION_ID")]
         session_id: Option<String>,
     },
 }

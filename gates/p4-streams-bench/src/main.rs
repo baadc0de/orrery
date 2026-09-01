@@ -52,27 +52,27 @@ const STEP: Duration = Duration::from_millis(2);
 #[command(about = "Measure what each control-lane transport costs under loss")]
 struct Args {
     /// Which transports to run. Repeat, or omit for all four.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "ORRERY_TRANSPORT")]
     transport: Vec<Transport>,
     /// Seconds of traffic per transport.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, env = "ORRERY_SECONDS")]
     seconds: u64,
     /// Packet loss, 0.0–1.0. P4's criterion is 3%.
-    #[arg(long, default_value_t = 0.03)]
+    #[arg(long, default_value_t = 0.03, env = "ORRERY_LOSS")]
     loss: f64,
     /// One-way delay in milliseconds. The round trip is twice this.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, env = "ORRERY_DELAY_MS")]
     delay_ms: u64,
     /// Repairs per second. The default very nearly fills the link at 3% loss,
     /// which is a real operating point and a bad one for isolating head-of-line
     /// blocking — at saturation every transport is queueing. Sweep it.
-    #[arg(long, default_value_t = workload::REPAIR_HZ)]
+    #[arg(long, default_value_t = workload::REPAIR_HZ, env = "ORRERY_REPAIR_HZ")]
     repair_hz: u32,
     /// Seed for the link's loss and jitter, so a run can be repeated.
-    #[arg(long, default_value_t = 0xB1A5)]
+    #[arg(long, default_value_t = 0xB1A5, env = "ORRERY_SEED")]
     seed: u64,
     /// Emit the results as JSON rather than a table.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_JSON")]
     json: bool,
     /// Connect, exchange a little traffic, and report what the link did to it
     /// — without running the measurement.

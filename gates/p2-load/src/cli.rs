@@ -57,18 +57,18 @@ pub struct Cli {
     /// The gateway's NodeId (transport identity, D3). This is the node the rig
     /// dials; the rig refuses to run against a gateway whose `HelloAck` names
     /// a different id.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_GATEWAY")]
     pub gateway: orrery_protocol::NodeId,
 
     /// The gateway's socket address to dial (`ip:port`). The persistd binary
     /// prints its full `EndpointAddr` as one JSON line on startup; the direct
     /// socket address from it goes here.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_ADDR")]
     pub addr: std::net::SocketAddr,
 
     /// Number of synthetic entities to register in the uplink scheduler.
     /// Overridden by the manifest's inventory when `--manifest` is given.
-    #[arg(long, default_value_t = DEFAULT_ENTITIES)]
+    #[arg(long, default_value_t = DEFAULT_ENTITIES, env = "ORRERY_ENTITIES")]
     pub entities: u64,
 
     /// Minimum number of distinct interest cells the entity inventory must
@@ -76,28 +76,28 @@ pub struct Cli {
     /// every pre-existing load path in the repo hardcodes `CellId::ROOT`
     /// (benches/journal_latency.rs, tests/cluster.rs, bin/persistd.rs), which
     /// cannot measure cross-cell handoff or the 27-cell area load.
-    #[arg(long, default_value_t = DEFAULT_CELLS)]
+    #[arg(long, default_value_t = DEFAULT_CELLS, env = "ORRERY_CELLS")]
     pub cells: u32,
 
     /// Per-entity diff rate, Hz, within the D16 1–4 Hz uplink range.
-    #[arg(long, default_value_t = DEFAULT_DIFF_HZ)]
+    #[arg(long, default_value_t = DEFAULT_DIFF_HZ, env = "ORRERY_DIFF_HZ")]
     pub diff_hz: f64,
 
     /// Intent mix as `kind=fraction` pairs relative to the diff rate, e.g.
     /// `trade=0.02,craft=0.01` means 2% of diff sends are replaced by a
     /// `trade` intent and 1% by a `craft` intent.
-    #[arg(long, default_value = DEFAULT_INTENT_MIX)]
+    #[arg(long, default_value = DEFAULT_INTENT_MIX, env = "ORRERY_INTENT_MIX")]
     pub intent_mix: String,
 
     /// Number of concurrent client sessions (iroh connections) to fan the
     /// load out over. Must satisfy the startup fan-out assert: sessions ×
     /// per-session flush capacity ≥ entities × diff_hz, or the rig would
     /// silently report queueing delay as commit latency.
-    #[arg(long, default_value_t = DEFAULT_SESSIONS)]
+    #[arg(long, default_value_t = DEFAULT_SESSIONS, env = "ORRERY_SESSIONS")]
     pub sessions: u32,
 
     /// Run duration, seconds.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, env = "ORRERY_DURATION_SECS")]
     pub duration_secs: u64,
 
     /// A seeder manifest (JSONL, docs/12-world-seeding.md §9.3: one entry per
@@ -106,26 +106,26 @@ pub struct Cli {
     /// entity/cell inventory from. Without it the rig synthesizes a
     /// deterministic placement of `--entities` PersistIds over ≥ `--cells`
     /// cells at the interest level.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_MANIFEST")]
     pub manifest: Option<PathBuf>,
 
     /// Optional scenario file (TOML, docs/12-world-seeding.md §12.3) whose
     /// `[[workload]]` block supplies `diff_hz`/`intent_mix`/`duration` and the
     /// trajectory program (`motion`). Only meaningful with `--manifest`.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_SCENARIO")]
     pub scenario: Option<PathBuf>,
 
     /// Emit telemetry as one JSON object per line on stdout (the
     /// machine-parseable contract `gates/p2-dashboard` consumes). Tracing logs go to
     /// stderr.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_JSON")]
     pub json: bool,
 
     /// Append-only ack log: one JSON line per ack received (`diff` with
     /// `(entity, tick, lsn)`, `intent` with `(intent_id, tick)`), so a
     /// kill-9 harness can enumerate the pre-kill acked set and diff it
     /// against the post-restart manifest (docs/12-world-seeding.md §12.3).
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_ACK_LOG")]
     pub ack_log: Option<PathBuf>,
 
     /// Verify an ack log against the promoted gateway and durable intent rows.
@@ -133,20 +133,20 @@ pub struct Cli {
     pub verify_recovery: bool,
 
     /// FoundationDB cluster file for `--verify-recovery`.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
     pub fdb_cluster_file: Option<PathBuf>,
 
     /// Adopted journal watermark reported by the promoted follower.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_RECOVERY_CUTOFF")]
     pub recovery_cutoff: Option<String>,
 
     /// Machine-readable report path for `--verify-recovery`.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_P2_LOAD_OUTPUT")]
     pub output: Option<PathBuf>,
 
     /// Diff payload size in bytes. 64 matches the D16 flush-budget math in
     /// `UplinkScheduler::flush` (`size = payload + 64`).
-    #[arg(long, default_value_t = DEFAULT_DIFF_PAYLOAD_BYTES)]
+    #[arg(long, default_value_t = DEFAULT_DIFF_PAYLOAD_BYTES, env = "ORRERY_DIFF_PAYLOAD_BYTES")]
     pub diff_payload_bytes: usize,
 
     /// Rig-local iroh secret key (hex), pinning the rig's NodeId across runs.
@@ -167,11 +167,11 @@ pub struct Cli {
 
     /// The issuer key id carried in the rig's session token. Must match the
     /// id half of the gateway's `--issuer-key <id>@<key>`.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, env = "ORRERY_ISSUER_KEY_ID")]
     pub issuer_key_id: u32,
 
     /// The account id the rig's session token claims.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, env = "ORRERY_ACCOUNT_ID")]
     pub account_id: u64,
 }
 
