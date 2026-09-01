@@ -207,8 +207,15 @@ These are the accepted design targets. They describe what the architecture is
 
 **Client stack.** The `orrery` facade composes `OrreryClientPlugins<R: Ruleset>`
 — a Bevy `PluginGroup` adding net → spatial → authority → island binding →
-predict → witness → persist_client → escalation in dependency order, with `OrreryConfig`
-aggregating the per-plugin configs.
+predict → witness → persist_client → escalation in dependency order, with
+`OrreryConfig` aggregating the per-plugin configs.
+
+The reference client does **not** compose that facade yet. `clients/regolith`
+depends on `orrery_core`, `orrery_games`, `orrery_predict` and
+`orrery_protocol`, and speaks iroh directly through its own `net` module with
+transport pins mirroring `gates/p1-swarm` exactly — it is the second process on
+that harness's exterior wire. The facade is the intended composition; the
+skin has not been moved onto it.
 
 **Persistence (P2).** Single-writer cell actors, an indexed wal-db segmented
 journal with adaptive group commit on a dedicated OS thread, fencing and
@@ -312,12 +319,13 @@ rather than reporting green.
 ```mermaid
 graph LR
     subgraph client["Game client · Bevy 0.19"]
-        game["Game code + Ruleset"]
-        skin["clients/regolith<br/>reference rendered client"]
+        game["Game code + Ruleset<br/>(orrery_core · orrery_games)"]
         plugins["OrreryClientPlugins<br/>net · spatial · authority · island binding · predict · witness · persist_client · escalation"]
         stack["lightyear 0.29 → orrery_replicon → bevy_replicon 0.42 → aeronet 0.21"]
         io["aeronet_iroh (vendored)<br/>iroh 1.0 QUIC"]
-        skin --> game --> plugins --> stack --> io
+        skin["clients/regolith<br/>reference skin — own iroh wire,<br/>not yet on the facade"]
+        game --> plugins --> stack --> io
+        skin --> game
     end
 
     subgraph island["Island · one replication session"]
@@ -348,6 +356,7 @@ graph LR
     end
 
     io <-->|"state datagrams · control streams"| peers
+    skin -.->|"direct iroh wire (today)"| peers
     io -.-|"punch / relay fallback"| relays
     plugins -->|"presence"| coord
     plugins -->|"diff uplink · intents · leases"| gateway
