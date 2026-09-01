@@ -363,8 +363,8 @@ graph LR
     skin -.->|"direct iroh wire (today)"| peers
     io -.-|"punch / relay fallback"| relays
     plugins -->|"presence"| coord
-    plugins -->|"diff uplink · intents · leases"| gateway
-    plugins -->|"session tokens"| identity
+    plugins -->|"diff uplink · intents · leases · session token"| gateway
+    identity -.->|"issues session tokens<br/>(clients carry invite material today)"| plugins
     coord -->|"spawns"| fieldhost
     classDef planned stroke-dasharray: 5 5;
     class fieldhost planned;
