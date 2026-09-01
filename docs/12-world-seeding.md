@@ -602,7 +602,7 @@ On a later deploy, the seeder generates the new manifest, loads the recorded one
 
 ### 9.5 Wipe and re-seed
 
-`wipe` clears the scenario's `world/` and `seedmap/` ranges by real subtree spans (blocked on **P-3**), then clears `content/version`. It no longer clears `chunk/` because `chunk/` is not a v1 durable family ([D51](adr/0051-v1-terrain-is-not-durable-state.md)). It requires `--yes` plus the `content_build` string typed back, refuses outright when any `actor/{shard}` fence row in range is live, and refuses when `[limits] protect = true` — the production-wipe guard.
+`wipe` clears the scenario's `world/` and `seedmap/` ranges by real subtree spans (blocked on **P-3**), then clears `content/version`. It no longer clears `chunk/` because `chunk/` is not a v1 durable family ([D51](adr/0051-v1-terrain-is-not-durable-state.md)). It requires `--yes` plus the `content_build` string typed back, refuses outright when any `actor/{shard}` fence row in range is live, refuses when `[limits] protect = true` — the production-wipe guard — and refuses while `ORRERY_PROFILE` or `ORRERY_SINGLE_GRID` is set, because the other verbs read those from the environment and `wipe` does not, so a wipe here would resolve a different scenario than the plan it followed ([09 §12.4](09-services-and-ops.md)).
 
 ---
 
