@@ -87,9 +87,10 @@ pub mod store;
 pub mod tolerance;
 
 pub use executor::{
-    canonical_step, sort_materialization_candidates, sort_stepped_entities, CanonicalOutcome,
-    CanonicalStep, Executor, MaterializationCandidate, NeighborFrame, NeighborSnapshot,
-    SealedTickInputs, SteppedEntity, TickBackend, TickOutcome, TICK_HZ, TICK_NANOS,
+    canonical_step, canonical_step_with, sort_materialization_candidates, sort_stepped_entities,
+    CanonicalOutcome, CanonicalStep, Executor, MaterializationCandidate, NeighborFrame,
+    NeighborSnapshot, SealedTickInputs, SteppedEntity, TickBackend, TickOutcome, TICK_HZ,
+    TICK_NANOS,
 };
 pub mod geometry;
 pub use author::{AuthoredFrame, InputLogProducer};

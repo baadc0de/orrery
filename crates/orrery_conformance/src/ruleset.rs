@@ -38,7 +38,11 @@ const DRAG_PER_SEC: f64 = 0.15;
 /// only meaningful against a fixed ruleset, and a silent rule change would
 /// present as a determinism failure rather than as what it is.
 pub const REFERENCE_RULESET: RulesetId = RulesetId {
-    version: 3,
+    // `canonical_step_with` adds a rules-body delegation seam to the core
+    // source closure without moving this corpus's canonical chains. D49 still
+    // makes that source identity a new build, so the version advances with the
+    // separately regenerated identity-only golden.
+    version: 4,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 

@@ -50,6 +50,13 @@ use orrery_games::Game;
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use orrery_sim_host::ecs::EcsBackend;
 
+fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
+    EcsBackend::new(game, seed).with_migrated_module(
+        orrery_games::regolith::world_ecs::sync_migrated,
+        orrery_games::regolith::world_ecs::step_migrated,
+    )
+}
+
 /// Every scenario whose population is more than one entity — the ones where
 /// "a world of one" is a *reduction* rather than a restatement of the run.
 fn populated_scenarios() -> Vec<Scenario> {
@@ -73,7 +80,7 @@ fn the_verdict_holds_in_a_world_of_one() {
     for scenario in &scenarios {
         let seed = UniverseSeed([scenario.seed_byte; 32]);
         // The log under adjudication is authored on the ECS, not on the store.
-        let played = play_with(Regolith::honest(), scenario, EcsBackend::new);
+        let played = play_with(Regolith::honest(), scenario, regolith_ecs);
         assert!(
             !played.log.is_empty(),
             "regolith/{}: the ECS authored an empty log",
@@ -84,7 +91,7 @@ fn the_verdict_holds_in_a_world_of_one() {
         let mut worlds: BTreeMap<PersistId, EcsBackend<Regolith>> = BTreeMap::new();
         for slot in 0..scenario.entities {
             let entity = PersistId::new(slot + 1);
-            let mut world = EcsBackend::new(Regolith::honest(), seed);
+            let mut world = regolith_ecs(Regolith::honest(), seed);
             world.insert(entity, Regolith::honest().spawn(entity, slot));
             assert_eq!(
                 TickBackend::entities(&world),
@@ -141,7 +148,7 @@ fn the_verdict_holds_in_a_world_of_one() {
     // per-entity replay is only a substitute for the schedule if `step_entity`
     // really means one entity.
     let seed = UniverseSeed([0x5e; 32]);
-    let mut ecs = EcsBackend::new(Regolith::honest(), seed);
+    let mut ecs = regolith_ecs(Regolith::honest(), seed);
     let mut store = Executor::new(Regolith::honest(), seed);
     for slot in 0..6u64 {
         let entity = PersistId::new(slot + 1);

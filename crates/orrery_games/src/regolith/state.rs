@@ -1,5 +1,6 @@
 //! Hashed, own-state traces for Regolith entities.
 
+use bevy_ecs::prelude::Component;
 use orrery_core::{CodecError, CoreCodec, QPos, QVel, Quantized, Section, Sectioned, StateSection};
 
 use super::{archetype::Archetype, weapon::WeaponKind};
@@ -368,7 +369,7 @@ impl RockTier {
 /// A drifting rock. `splits_done` is the monotone, own-state record of a
 /// materialized split: it is knowable from this rock's damage input and RNG
 /// alone, without observing either child or any other entity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct Rock {
     /// The resolver-owned limits source.
     pub tier: RockTier,
@@ -405,7 +406,7 @@ pub struct BloomMembership {
 }
 
 /// A materialized weapon pickup with its own adjudicable window.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct Pickup {
     /// Lattice position used to resolve grabs.
     pub pos: QPos,
@@ -424,7 +425,7 @@ pub struct Pickup {
 }
 
 /// One island's deterministic bloom schedule and in-band site announcement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct BloomDirector {
     /// Island-local core tick advanced by this entity's own step.
     pub clock_tick: u64,

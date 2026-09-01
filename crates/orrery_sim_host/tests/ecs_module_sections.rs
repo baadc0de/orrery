@@ -25,10 +25,17 @@ fn seed() -> UniverseSeed {
     UniverseSeed([WORLD_SCENARIO.seed_byte; 32])
 }
 
+fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
+    EcsBackend::new(game, seed).with_migrated_module(
+        orrery_games::regolith::world_ecs::sync_migrated,
+        orrery_games::regolith::world_ecs::step_migrated,
+    )
+}
+
 /// The `world` scenario's population: four crafts, then eight world seeds.
 fn seeded_world() -> EcsBackend<Regolith> {
     let game = Regolith::honest();
-    let mut backend = EcsBackend::new(game, seed());
+    let mut backend = regolith_ecs(game, seed());
     for slot in 0..WORLD_SCENARIO.entities {
         let entity = PersistId::new(slot + 1);
         TickBackend::insert(&mut backend, entity, game.spawn(entity, slot));
@@ -160,7 +167,7 @@ fn a_materialized_entity_is_born_into_the_migrated_archetype() {
 #[test]
 fn an_install_across_the_frontier_moves_the_entity_rather_than_duplicating_it() {
     let game = Regolith::honest();
-    let mut backend = EcsBackend::new(game, seed());
+    let mut backend = regolith_ecs(game, seed());
     let entity = PersistId::new(1);
 
     TickBackend::insert(&mut backend, entity, game.spawn(entity, 0));
