@@ -659,7 +659,7 @@ mod tests {
     fn lease_bearing_nack_revokes_stale_writer_and_allows_reclaim() {
         // Given: this client has a fenced local grant and one queued write.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(17);
         let local_entity = app
             .world_mut()
@@ -804,7 +804,7 @@ mod tests {
     fn lease_less_nack_keeps_local_authority() {
         // Given: a granted local writer with a queued diff.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(18);
         let local_entity = app
             .world_mut()
@@ -970,7 +970,7 @@ mod tests {
     #[test]
     fn a_wrong_owner_nack_drops_the_diff_without_revoking_the_lease() {
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(22);
         let local = granted_entity(&mut app, persisted, LeaseId(9), node(1));
         app.world_mut()
@@ -1044,7 +1044,7 @@ mod tests {
         // granted this peer a newer fence. Acting on it revokes a live grant
         // and hands the entity to a holder the registrar has moved past.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(21);
         let local = granted_entity(&mut app, persisted, LeaseId(9), node(1));
 
@@ -1113,7 +1113,7 @@ mod tests {
         // no longer supersedes anything, so it must not report a second loss
         // or overwrite the row the first one installed.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(22);
         let local = granted_entity(&mut app, persisted, LeaseId(4), node(1));
         let row = lease_row(
@@ -1163,7 +1163,7 @@ mod tests {
         // revocation would have the client hand authority to itself and drop
         // to `Remote`, which no registrar ever asked for.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(23);
         let local = granted_entity(&mut app, persisted, LeaseId(4), node(1));
 
@@ -1202,7 +1202,7 @@ mod tests {
         // fence the newer one just installed, not against the stale `Authority`
         // the query still sees.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(24);
         let local = granted_entity(&mut app, persisted, LeaseId(4), node(1));
 
@@ -1258,7 +1258,7 @@ mod tests {
         // repointed at a peer that no longer holds it. `revoke_local_lease`
         // returns `None` on that path, so no `Lost` event reports it either.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(25);
         let local_entity = app
             .world_mut()
@@ -1371,7 +1371,7 @@ mod tests {
         // the same hole on every entity a peer watches — including entities no
         // registrar message ever addressed to it before D25.
         let (mut app, session_entity) = reply_app();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(26);
         let pair = SeqPair {
             own_seq: 0,

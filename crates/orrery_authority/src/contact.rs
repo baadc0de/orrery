@@ -884,7 +884,7 @@ mod tests {
     /// bodies present as entities so their claims reach the outbox.
     fn driven_app(n: u64) -> App {
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         for id in 1..=n {
             app.world_mut()
                 .spawn((PersistIdentity(PersistId::new(id)), AuthorityPhase::Remote));

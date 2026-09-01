@@ -7934,7 +7934,9 @@ dependencies = [
  "bevy_platform",
  "blake3",
  "iroh-base",
+ "orrery_core",
  "orrery_protocol",
+ "orrery_sim_host",
  "serde",
 ]
 

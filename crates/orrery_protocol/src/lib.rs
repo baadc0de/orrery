@@ -20,6 +20,7 @@ pub mod channels;
 pub mod coord;
 mod gateway;
 mod grid;
+pub mod hit;
 mod identity;
 pub mod join;
 pub mod metrics;
@@ -66,6 +67,10 @@ pub use gateway::{
     WITNESS_EPOCH_ACK_SUPERSEDED, WITNESS_EPOCH_ACK_UNSUPPORTED, WITNESS_EPOCH_ACK_UNTRUSTED,
 };
 pub use grid::GridId;
+pub use hit::{
+    HitClaim, HitClaimKey, HitMsg, HitOutcome, HitRefusal, HitSurface, HitVerdict, HitWindow,
+    InterpBasis, LatticePoint, QuantizedDir, QuantizedRay, UNorm16, WeaponRef,
+};
 pub use identity::{
     AccountInvalidation, FixedTokenClock, IssuerKey, IssuerKeyId, NodeId, SessionStanding,
     SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, SessionTokenVerificationError,

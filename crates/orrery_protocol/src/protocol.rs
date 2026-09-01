@@ -71,4 +71,13 @@
 /// variant of the `RecordKind` carried by `DiffUplink`; exact-version
 /// admission therefore keeps old peers from sharing a positional enum with a
 /// build whose type has grown.
-pub const PROTOCOL_VERSION: u16 = 7;
+///
+/// Version 8 adds the hit-registration datagram family
+/// ([`HitMsg`](crate::HitMsg) under [`TAG_HIT`](crate::channels::TAG_HIT),
+/// docs/05 §7). No existing byte moves — the family is a new sub-tag — but a
+/// version-7 peer *silently drops* it: `decode_hit` returns `None` for a tag
+/// it does not know, the shooter's claim is never answered, and it is resent
+/// until the shooter gives up, with no refusal anywhere. Exact-version
+/// admission turns that into one handshake refusal with a version in it,
+/// which is the same reason every bump above was taken.
+pub const PROTOCOL_VERSION: u16 = 8;

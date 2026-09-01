@@ -10,6 +10,7 @@
 
 pub mod contact;
 pub mod ephemeral;
+pub mod hit;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -19,8 +20,8 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_platform::time::Instant;
 use orrery_protocol::{
-    ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, GridId, IslandId, LeaseId,
-    LeaseMsg, NodeId, PersistId, SeqPair, Tick,
+    ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, GridId, HitWindow, IslandId,
+    LeaseId, LeaseMsg, NodeId, PersistId, SeqPair, Tick,
 };
 
 pub use contact::{
@@ -33,6 +34,7 @@ pub use ephemeral::{
     IslandAuthoritative, IslandAuthorityEvent, IslandClaim, IslandClient, IslandInbox,
     IslandOutbox,
 };
+pub use hit::{HitRules, PoseHistory, PoseRing, PoseSample};
 
 /// Registrar TTL from D7/D16, in milliseconds.
 pub const LEASE_TTL_MS: u64 = 10_000;
@@ -912,12 +914,38 @@ pub fn track_island_binding(
 pub struct PersistIdentity(pub PersistId);
 
 /// Bevy plugin providing client authority state and lease maintenance.
-#[derive(Default)]
-pub struct OrreryAuthorityPlugin;
+///
+/// Also owns [`PoseHistory`], the pose ring hit claims are validated against
+/// (docs/05 §7).
+/// Its window comes from `orrery_predict`'s numbers by way of the facade —
+/// [`with_hit_window`](Self::with_hit_window) — and defaults to
+/// [`HitWindow::CLOSED`], which refuses every claim, so a plugin composed
+/// without the facade fails closed rather than with a copied figure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OrreryAuthorityPlugin {
+    hit_window: HitWindow,
+}
+
+impl OrreryAuthorityPlugin {
+    /// Validate hit claims within `window` (the rewind cap and the pose ring
+    /// depth, from `PredictConfig::hit_window()`).
+    #[must_use]
+    pub fn with_hit_window(mut self, window: HitWindow) -> Self {
+        self.hit_window = window;
+        self
+    }
+
+    /// The window this plugin will size [`PoseHistory`] with.
+    #[must_use]
+    pub fn hit_window(&self) -> HitWindow {
+        self.hit_window
+    }
+}
 
 impl Plugin for OrreryAuthorityPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<AuthorityState>()
+        app.insert_resource(PoseHistory::new(self.hit_window))
+            .init_resource::<AuthorityState>()
             .init_resource::<InterestGrant>()
             .init_resource::<IslandBinding>()
             .init_resource::<LeaseInbox>()
@@ -983,7 +1011,7 @@ mod tests {
     fn a_registrar_initiated_grant_installs_authority_without_a_pending_claim() {
         // Given: an entity this peer replicates but never claimed.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let inherited = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(60)), AuthorityPhase::Remote))
@@ -1040,7 +1068,7 @@ mod tests {
         // Given: a peer already holding a newer fence than a delayed grant
         // names — a duplicate push, or one reordered behind a later transfer.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let held = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(61)), AuthorityPhase::Remote))
@@ -1093,7 +1121,7 @@ mod tests {
     fn divesting_stops_local_writes_before_the_message_leaves() {
         // Given: a granted lease this peer is writing under.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let held = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(62)), AuthorityPhase::Remote))
@@ -1155,7 +1183,7 @@ mod tests {
     fn a_reassigning_expiry_points_the_loser_at_the_new_holder() {
         // Given: a peer holding a lease the registrar is about to move.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let lost = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(63)), AuthorityPhase::Remote))
@@ -1218,7 +1246,7 @@ mod tests {
     fn current_grant_deny_and_expire_replies_apply_the_documented_transitions() {
         // Given: two optimistic claims awaiting their registrar replies.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let denied = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(40)), AuthorityPhase::Remote))
@@ -1294,7 +1322,7 @@ mod tests {
     fn delayed_control_replies_do_not_replace_or_revoke_a_newer_grant() {
         // Given: the Bevy scheduler installed a second grant after an earlier grant.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(42);
         let entity = app
             .world_mut()
@@ -1456,7 +1484,7 @@ mod tests {
         for order in permutations {
             // Given: claim two owns the current fence.
             let mut app = App::new();
-            app.add_plugins(OrreryAuthorityPlugin);
+            app.add_plugins(OrreryAuthorityPlugin::default());
             let persisted = PersistId::new(43);
             let entity = app
                 .world_mut()
@@ -1541,7 +1569,7 @@ mod tests {
     #[test]
     fn a_grant_installs_the_only_uplink_marker_and_a_denied_claim_never_does() {
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let e = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(4)), AuthorityPhase::Remote))
@@ -1591,7 +1619,7 @@ mod tests {
         // the 10 s TTL ran out — while `LeaseClient::claim` never checked for a
         // held lease before sending the upgrade in the first place.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let held = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(6)), AuthorityPhase::Remote))
@@ -1660,7 +1688,7 @@ mod tests {
     #[test]
     fn claim_queues_the_complete_request_and_marks_the_entity_pending() {
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let entity = app.world_mut().spawn_empty().id();
         let persist = PersistId::new(7);
         let grid = GridId::new(8);
@@ -1709,7 +1737,7 @@ mod tests {
     #[test]
     fn client_revoke_returns_the_granted_fencing_token() {
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persist = PersistId::new(8);
         let entity = app
             .world_mut()
@@ -1741,7 +1769,7 @@ mod tests {
     #[test]
     fn invalid_heartbeat_ack_immediately_removes_the_local_fence() {
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let e = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(5)), AuthorityPhase::Remote))
@@ -1785,7 +1813,7 @@ mod tests {
     #[test]
     fn an_invalid_ack_does_not_drop_a_sibling_at_the_same_token() {
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let refused = PersistId::new(1);
         let kept = PersistId::new(2);
         let mut spawn = |persisted: PersistId| {
@@ -1945,7 +1973,7 @@ mod tests {
     fn an_observed_reassignment_repoints_the_holder_and_touches_nothing_else() {
         // Given: a body this peer replicates from node 1 and never claimed.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(70);
         let pair = SeqPair {
             own_seq: 3,
@@ -2014,7 +2042,7 @@ mod tests {
     fn an_observed_park_clears_the_holder_once_however_many_copies_arrive() {
         // Given: a body this peer renders, written by node 1.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(71);
         let pair = SeqPair {
             own_seq: 1,
@@ -2070,7 +2098,7 @@ mod tests {
         // granted it. The registrar's per-row token advanced, as it does on
         // every acquire.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(72);
         let watched = observed_entity(
             &mut app,
@@ -2150,7 +2178,7 @@ mod tests {
         // Given: this peer has already applied the advisory that parked the
         // entity at token 9.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let persisted = PersistId::new(73);
         let pair = SeqPair {
             own_seq: 2,
@@ -2213,7 +2241,7 @@ mod tests {
         // peer's replicated set are ordinary traffic rather than an anomaly:
         // neither spawned nor logged at `warn`.
         let mut app = App::new();
-        app.add_plugins(OrreryAuthorityPlugin);
+        app.add_plugins(OrreryAuthorityPlugin::default());
         let known = PersistId::new(74);
         let unknown = PersistId::new(75);
         observed_entity(
