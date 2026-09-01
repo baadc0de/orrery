@@ -37,7 +37,10 @@ What is missing is not a decision but a **seam**: D42 clause (b)(2)'s
 `SimulationHost`, *"one kernel-owned driver owning tick advance, stable-id
 lookup, command-in/event-out, and output collection - the loop all three of
 today's hosts hand-roll"*. That is stage **S5** of A18's programme, whose
-serial spine is four deep: **S1.a -> S4.1 -> S4.2 -> S5**.
+serial spine is four deep: **S1.a -> S4.1 -> S4.2 -> S5**. (As written when
+this document was drafted; S5 landed 2026-08-30 as `crates/orrery_sim_host`
+(#738) — the existing `Ruleset` hosted through an adapter — so the missing
+artifact is no longer the seam but its consumer, track D's work.)
 
 ## 2. The two goals are independent, and the stated order inverts them
 
@@ -124,7 +127,11 @@ an accumulator already provides.
 
 ## 5. The load-bearing consequence, and it is timing-sensitive
 
-**This constrains S5's API shape, and S5 has not been built.**
+**This constrains S5's API shape, and S5 has not been built** (as written —
+S5 landed 2026-08-30, #738, as `crates/orrery_sim_host`. The "not been
+built" half is history; the constraint itself is untouched: it binds any
+future C++ crossing of the now-existing seam, whose C ABI already exists —
+§6's landed note records it).
 
 If the seam is ever crossed from C++, `SimulationHost` must be expressible as
 a **C ABI**: an opaque handle, an explicit `step(ticks)`, command-in and

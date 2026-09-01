@@ -503,7 +503,14 @@ blockquote records. Where S7 stands now: the seam substrate is in; the
 first-class, ECS as idiomatic storage, systems and tick driving over
 `World`) is recorded but the dependency is not yet taken - the manifest
 declares no Bevy and `BEVY_PERMITTED_CRATES` carries the crate
-(`scripts/core-gates.sh:259`).
+(`scripts/core-gates.sh:259`). That standing note was true at its writing
+and is history now: #855 (2026-09-01) took the dependency and migrated
+`regolith.world` — rock, pickup and bloom-director state as ruleset-owned
+components, the module's rules as chained systems — at four-class F-4
+parity (`crates/orrery_games/src/regolith/world_ecs.rs`), with every
+byte-producing stage still in `orrery_core` (`canonical_step_with`,
+`crates/orrery_core/src/executor.rs:480`). `BEVY_PERMITTED_CRATES` still
+carries the crate; `DECLARED_HOST_CRATES` still names only `orrery_sim_host`.
 
 - **Entry:** the owner's sanction (#745, 2026-08-30), not a fired trigger.
   Of the precondition package: Tier H demonstrated (#771); the four-class
