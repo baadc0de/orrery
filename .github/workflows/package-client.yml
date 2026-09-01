@@ -160,7 +160,17 @@ jobs:
           # The checksum file is generated after the rename above, so its
           # recorded name is the shipped name and `sha256sum -c` works as the
           # README describes it.
-          grep -qF " $artifact" "stage/$artifact.sha256"
+          #
+          # Two separators, because the tools disagree and both are correct.
+          # GNU `sha256sum` writes `HASH  NAME` in text mode, which is the
+          # default on Linux, and `HASH *NAME` in binary mode, which is the
+          # default for the `sha256sum` that ships with Git for Windows. macOS
+          # uses `shasum -a 256`, which writes two spaces. Asserting on a
+          # leading space alone therefore could never pass on Windows — and it
+          # never has: this assertion arrived in #776, after the last Windows
+          # package succeeded, so its first real run was its first failure.
+          grep -qE "( |\\*)$(printf '%s' "$artifact" | sed 's/[.[\\*^$/]/\\\\&/g')\$" \
+            "stage/$artifact.sha256"
 
       - name: Package Unix client
         if: runner.os != 'Windows'
