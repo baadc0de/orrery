@@ -11,13 +11,26 @@
 set -euo pipefail
 
 readonly NAME=terrain-substrate-gate
+die() { echo "$NAME: $*" >&2; exit 1; }
+
+# The scan below deliberately turns an empty result into a passing result, so
+# every external command that produces that result must be present before we
+# inspect the tree.  Otherwise a missing command can masquerade as a source
+# finding (or, worse, an empty scan).
+require_tool() {
+    command -v "$1" >/dev/null 2>&1 || die "required tool is not on PATH: $1"
+}
+
+for tool in basename dirname find grep mkdir mktemp rm sed sort; do
+    require_tool "$tool"
+done
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 if [[ ${_TERRAIN_SUBSTRATE_INTERNAL_SELF_TEST:-0} == 1 ]]; then
     ROOT=${_TERRAIN_SUBSTRATE_TEST_ROOT:?internal self-test requires a fixture root}
 fi
 
-die() { echo "$NAME: $*" >&2; exit 1; }
 note() { echo "$NAME: $*" >&2; }
 
 usage() {
