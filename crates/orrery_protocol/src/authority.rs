@@ -481,7 +481,7 @@ mod tests {
     fn the_wrong_owner_refusal_decodes_without_moving_the_variants_before_it() {
         assert_eq!(
             crate::PROTOCOL_VERSION,
-            6,
+            7,
             "this test pins the wire under a specific version; re-check it when the version moves"
         );
 

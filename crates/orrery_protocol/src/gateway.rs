@@ -377,7 +377,8 @@ pub struct DiffUplink {
     pub entity: PersistId,
     /// The universe tick at append (D8).
     pub tick: Tick,
-    /// The kind of record (spawn / component diff / despawn / terrain).
+    /// The client-proposable kind (spawn / component diff / despawn).
+    /// Server-owned rekey and restore kinds are refused at gateway ingress.
     pub kind: crate::RecordKind,
     /// The postcard-encoded component payload.
     pub payload: bytes::Bytes,
@@ -1054,7 +1055,7 @@ mod tests {
         // positional layout, and D33's probation field changes
         // `SessionTokenClaimsV1`'s, so pin the externally visible version as a
         // literal.
-        assert_eq!(crate::PROTOCOL_VERSION, 6);
+        assert_eq!(crate::PROTOCOL_VERSION, 7);
     }
 
     #[test]

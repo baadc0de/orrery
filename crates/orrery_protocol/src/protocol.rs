@@ -65,4 +65,10 @@
 /// window is for a fleet mid-rollout, where identity and the gateways are
 /// separate services with no handshake between them. It is not a second
 /// client-facing window: this one is exact equality and D29 clause 5 closed it.
-pub const PROTOCOL_VERSION: u16 = 6;
+///
+/// Version 7 appends [`RecordKind::Restore`](crate::RecordKind::Restore).
+/// Although that kind is server-owned and refused on client ingress, it is a
+/// variant of the `RecordKind` carried by `DiffUplink`; exact-version
+/// admission therefore keeps old peers from sharing a positional enum with a
+/// build whose type has grown.
+pub const PROTOCOL_VERSION: u16 = 7;

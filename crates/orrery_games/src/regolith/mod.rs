@@ -331,8 +331,12 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
-/// Regolith v21's rules identity: v20's rules with campaign participants kept
-/// in one replicating crowd (#788).
+/// Regolith v22's rules identity: v21's gameplay rules under protocol v7.
+/// Adding the server-owned restore record moved the pinned first-party source
+/// closure, so the identity advances even though the canonical step does not.
+///
+/// Regolith v21 changed v20 by keeping campaign participants in one
+/// replicating crowd (#788).
 ///
 /// The canonical step is unchanged, but campaign initialization is not. At 32
 /// seats the former 10% radial spread quantized the bots' orbit inputs across
@@ -347,7 +351,7 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
 /// would let them enter one session and disagree before the first input; v21
 /// makes admission refuse that mixed campaign instead.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 21,
+    version: 22,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 
@@ -458,7 +462,7 @@ pub const REGOLITH_COMPONENT_SCHEMAS: &[ComponentSchemaManifest] = &[ComponentSc
 pub const REGOLITH_COMPOSITION: CompatibilityManifest = CompatibilityManifest {
     game_id: GameId("regolith"),
     manifest_format_version: ManifestFormatVersion(1),
-    protocol_version: 6,
+    protocol_version: 7,
     toolchain_stamp: "rust-2024",
     ruleset: REGOLITH_RULESET,
     modules: REGOLITH_MODULES,

@@ -148,6 +148,10 @@ pub enum RecordKind {
     Rekey,
     /// A checkpoint watermark marker.
     CheckpointMark,
+    /// An operator-authorized, forward-applied full entity image (§11.1).
+    ///
+    /// Server-owned: clients cannot propose this kind through [`crate::DiffUplink`].
+    Restore,
 }
 
 /// An account identity on the ledger/player rows (D11 §6).
@@ -274,8 +278,47 @@ impl JournalRecord {
 /// self-describing. Everything written before it decodes as
 /// [`ENCODING_V0`](crate::atrest::ENCODING_V0) under the bootstrap rule
 /// ([`crate::atrest`]), which is what lets an existing journal be replayed
-/// rather than refused.
-pub const JOURNAL_RECORD_ENCODING: crate::atrest::EncodingVersion = 1;
+/// rather than refused. Version 2 adds the server-owned
+/// [`RecordKind::Restore`] payload.
+pub const JOURNAL_RECORD_ENCODING: crate::atrest::EncodingVersion = 2;
+
+/// Current serialization version for [`RestoreRecord`].
+pub const RESTORE_RECORD_VERSION: u8 = 1;
+
+/// The complete target state carried by one forward restoration record.
+///
+/// A restore is deliberately a whole-entity overwrite rather than a partial
+/// diff. `Absent` is the pre-image of an entity that did not yet exist and is
+/// folded as a despawn at the record's current journal position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreTarget {
+    /// The entity existed at the selected pre-grief cut.
+    Present {
+        /// Complete, ruleset-opaque component bag at that cut.
+        components: bytes::Bytes,
+        /// Persistd-visible component-schema floor carried with the bag.
+        schema_floor: crate::atrest::SchemaVersion,
+    },
+    /// The entity did not exist at the selected pre-grief cut.
+    Absent,
+}
+
+/// Server-owned payload of [`RecordKind::Restore`].
+///
+/// `plan_id` is the idempotency and audit key. `operator` is the identity from
+/// the validated operator request; the enclosing [`JournalRecord::author`]
+/// remains the applying node's transport identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRecord {
+    /// Payload schema version.
+    pub version: u8,
+    /// Stable operator-supplied plan/request identifier.
+    pub plan_id: String,
+    /// Human- or system-readable identity authorized to request the restore.
+    pub operator: String,
+    /// Full target image (or absence) computed by the archive planner.
+    pub target: RestoreTarget,
+}
 
 /// Current serialization version for [`EntityRekey`].
 ///
