@@ -393,3 +393,123 @@ measure before dispatch.
 - `docs/adr/0020-journal-retention.md` — D20 journal bounds and clamp
 - Measured data cited from `docs/data/p2-barrier-shape-2026-08-19.jsonl` and
   `docs/data/p2-intent-fence-2026-08-19.jsonl`.
+
+## 2026-09-01: live FDB measurement debts paid
+
+This section closes the first two entries under **Open measurement debts**
+above, after the owner selected Shape C in #832. It is measurement only: no
+intent transaction, `RecordKind`, or stored schema changed. A throwaway harness
+was added for the runs and removed before this report was written.
+
+### Cluster and method
+
+The old cluster files named above were still unreachable and no `fdbserver`
+process was running. The measurement instead used `scripts/fdb-dev.sh` to start
+a private FoundationDB 7.3.77 single-process, single-replica memory database on
+`127.0.0.1:45832`, under `/tmp/orrery-fdb-shapec.m5eMWJ`. This is a development
+measurement, not a claim about a production multi-process cluster.
+
+The mutation shape came directly from the current code:
+
+- `intent/fdb.rs:1374-1405` applies 18-byte balance keys with 16-byte `Add`
+  parameters, a 10-byte item key with its 17-byte encoded row, and the receipt
+  with `SetVersionstampedKey`.
+- `keyspace.rs:1714-1757` makes that receipt mutation's key parameter 16 bytes
+  (12-byte stored key plus the four-byte versionstamp offset).
+- `intent/mod.rs:2202-2210` confirms that a pure credit writes no receipt today.
+
+Each sample staged those same mutations, then timed only
+`Transaction::commit()`, matching the production `commit_us` boundary described
+at `intent/fdb.rs:1128-1136`. The trade comparison changed only the receipt
+value from the measured current 39 bytes to the proposed enriched 110 bytes. The
+credit comparison changed only the addition of a 52-byte enriched receipt. Two
+identical current-shape controls surrounded and rotated order with the enriched
+arm; each control had 12,000 samples, and each enriched arm had 12,000, after
+400 warm-up triplets.
+
+"Write set" below means client mutation key/parameter bytes plus value/parameter
+bytes for the affected ledger writes. It excludes FDB wire overhead and the
+intent, attestation, and player rows that are identical between arms.
+
+| intent shape | receipt value | affected write set | samples | commit p50 | commit p99 |
+|---|---:|---:|---:|---:|---:|
+| trade, current (two pooled controls) | 39 B | 150 B | 24,000 | 1,001 us | 1,146 us |
+| trade, enriched | 110 B | 221 B | 12,000 | 998 us | 1,133 us |
+| pure credit, current (two pooled controls) | none | 34 B | 24,000 | 1,001 us | 1,134 us |
+| pure credit, enriched | 52 B | 102 B | 12,000 | 1,005 us | 1,138 us |
+
+For the trade, the two identical current controls were 1,002/1,151 us and
+1,000/1,142 us at p50/p99. For the credit they were 1,001/1,132 us and
+1,000/1,136 us. The enriched observations move in opposite directions: trade
+is -3/-13 us and credit is +4/+4 us against the pooled current controls.
+**The Shape C latency delta is inside this harness's noise.** In particular,
+the negative trade delta is not a speed-up claim; neither arm resolves a
+marginal byte cost with defensible precision.
+
+The +52 B figure for a pure credit is the new receipt *value*. Its affected
+client write set grows by 68 B because `SetVersionstampedKey` also carries the
+16-byte key parameter. The trade replaces an existing value under the same key
+parameter, so both its value and write-set deltas are +71 B.
+
+### Receipt-range scan contention
+
+The harness put 286,953 rows in one bounded `ledger/receipt/` scan window, each
+with a 12-byte stored key and 110-byte value. Every scan fixed its upper key
+before concurrent writers began, as an archival pass with a captured watermark
+must, and walked the range in short snapshot-read transactions. Four writer
+tasks appended enriched receipts at an aggregate 530 intents/s for 10 seconds:
+5,300 commit samples per arm, matching the P2 intent rate used by the original
+spike.
+
+Three scan settings priced the available knob. Throughput is derived from the
+median complete-pass duration over the fixed 286,953-row window; the pass count
+is the sample size. For the four-scanner arm, throughput is aggregate across the
+four concurrent scans.
+
+| scan setting | scan-only passes, p50/p99 | with writes passes, p50/p99 | median throughput, scan only -> writes | change |
+|---|---:|---:|---:|---:|
+| 1 scanner, 256 rows/page, 2 ms pause/page | 3, 3,874/4,095 ms | 3, 3,904/3,909 ms | 74.1k -> 73.5k rows/s | -0.8% |
+| 1 scanner, 4,096 rows/page, no pause | 117, 85/102 ms | 114, 88/97 ms | 3.38M -> 3.26M rows/s | -3.4% |
+| 4 scanners, 4,096 rows/page, no pause | 384, 104/128 ms | 368, 109/118 ms | 11.04M -> 10.53M rows/s | -4.6% |
+
+The reverse interference — scan load on intent commits — was:
+
+| concurrent scan load | commit samples | commit p50 | commit p99 |
+|---|---:|---:|---:|
+| none, before scan arms | 5,300 | 788 us | 1,170 us |
+| 1 scanner, 256 rows/page, 2 ms pause/page | 5,300 | 736 us | 1,060 us |
+| 1 scanner, 4,096 rows/page, no pause | 5,300 | 767 us | 1,004 us |
+| 4 scanners, 4,096 rows/page, no pause | 5,300 | 936 us | 1,279 us |
+| none, after scan arms | 5,300 | 784 us | 1,100 us |
+
+One scanner, paced or continuous, did not increase either percentile beyond
+the before/after baseline variation. Four continuous scanners did: p50 rose
+148-152 us (about 19%) and p99 rose 109-179 us (9-16%) over the two baselines.
+That is real avoidable interference, but the absolute 1.279 ms p99 remains far
+inside D11's 10 ms critical-intent target. The write load reduced scan
+throughput by at most 4.6% and increased median full-pass duration by at most
+5 ms (4.8%). No transaction failed.
+
+### Finding and handoff
+
+**The contention result does not reopen the Shape C recommendation.** On this
+cluster a safe knob exists: keep the receipt tailer to one range scanner. A
+single continuous 4,096-row scanner was both much faster than the deliberately
+paced arm and indistinguishable from no scan on intent commit latency. Parallel
+unpaced scans buy aggregate throughput at a measurable cost to the hot path and
+should not be the implementation default.
+
+The implementation lane should:
+
+- capture a fixed upper versionstamp per pass and use bounded continuation
+  pages in short read-only transactions;
+- start with one scanner and make scan concurrency and page size observable;
+- watch intent commit p50/p99 together with receipt rows/s and full-pass
+  duration, including cold-cache and growing-range runs; and
+- repeat the contention arm on the deployment-shaped FDB cluster. If one
+  scanner cannot keep up, or intent p99 approaches D11's 10 ms target, that is
+  the trigger to reopen Shape B rather than quietly adding parallel scanners.
+
+The private cluster was started for both successful runs with
+`scripts/fdb-dev.sh` and stopped with the same script after each. A final process
+and port check found no running `fdbserver` and nothing listening on port 45832.
