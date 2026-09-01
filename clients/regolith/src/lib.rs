@@ -112,6 +112,17 @@ struct SelectedLock {
     target: Option<PersistId>,
 }
 
+/// This frame's lockable bodies that are actually on screen, ascending.
+///
+/// Presentation only. Membership is the same predicate the click path uses —
+/// the ruleset's own hull state — and the order is `PersistId` ascending so
+/// `Tab` walks the same ring every time rather than one that depends on
+/// spawn order or which way the camera happens to be pointing.
+#[derive(Debug, Default, Resource)]
+struct LockCandidates {
+    visible: Vec<PersistId>,
+}
+
 #[derive(Component)]
 struct AlwaysOnStrip;
 #[derive(Component)]
@@ -696,6 +707,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<roster::RosterTask>()
             .init_resource::<lobby::LobbyView>()
             .init_resource::<SelectedLock>()
+            .init_resource::<LockCandidates>()
             .init_resource::<CombatView>()
             .init_resource::<grab::ReachView>()
             .init_resource::<grab::GrabLatch>()
@@ -717,7 +729,15 @@ impl Plugin for RegolithSkinPlugin {
                         .after(legend::note_used_inputs)
                         .after(legend::toggle_legend),
                     sync_rendered_state,
-                    select_clicked_body.before(sync_rendered_state),
+                    // One tuple: the three ways a lock is chosen. Nested
+                    // because `add_systems` takes a bounded tuple and this
+                    // schedule is already at its width.
+                    (
+                        select_clicked_body,
+                        collect_lock_candidates,
+                        cycle_lock_target.after(collect_lock_candidates),
+                    )
+                        .before(sync_rendered_state),
                     recompose_craft_bodies.after(sync_rendered_state),
                     ensure_local_body.after(sync_rendered_state),
                     ensure_focus_body.after(recompose_craft_bodies),
@@ -1643,6 +1663,77 @@ fn select_clicked_body(
             .map(|screen| (entity.0, screen))
     });
     selected.target = nearest_clicked(cursor, candidates);
+}
+
+/// Gathers the lockable bodies the camera can currently see, ascending.
+///
+/// The membership predicate is deliberately the *same* one
+/// [`select_clicked_body`] uses — a body with hull left that is not the local
+/// craft — so `Tab` and a click can never disagree about what is lockable.
+/// "Visible" here means the camera can project it, which is the cheapest
+/// honest reading of on-screen and is all a naive cycle needs.
+fn collect_lock_candidates(
+    camera: Query<(&Camera, &GlobalTransform), With<ChaseCamera>>,
+    bodies: Query<(&CoreEntity, &GlobalTransform)>,
+    session: Res<ActiveSession>,
+    mut candidates: ResMut<LockCandidates>,
+) {
+    candidates.visible.clear();
+    let Ok((camera, camera_transform)) = camera.single() else {
+        return;
+    };
+    for (entity, transform) in &bodies {
+        let Some(state) = session.executor().state(entity.0) else {
+            continue;
+        };
+        let lockable = match state {
+            RegolithState::Craft(craft) => craft.hull > 0,
+            RegolithState::Rock(rock) => rock.hull > 0,
+            RegolithState::Pickup(_) | RegolithState::BloomDirector(_) => false,
+        };
+        if !lockable || entity.0 == session.local_entity() {
+            continue;
+        }
+        if camera
+            .world_to_viewport(camera_transform, transform.translation())
+            .is_ok()
+        {
+            candidates.visible.push(entity.0);
+        }
+    }
+    candidates.visible.sort_unstable();
+}
+
+/// `Tab` moves the lock to the next visible target.
+///
+/// Emits no order and decides nothing: it moves the same `lock_target` field a
+/// click moves, which the ruleset is free to refuse exactly as before.
+fn cycle_lock_target(
+    keys: Res<ButtonInput<KeyCode>>,
+    candidates: Res<LockCandidates>,
+    mut selected: ResMut<SelectedLock>,
+) {
+    if !keys.just_pressed(KeyCode::Tab) {
+        return;
+    }
+    selected.target = next_target(selected.target, &candidates.visible);
+}
+
+/// The next entry after `current` in an ascending ring, wrapping at the end.
+///
+/// A `current` that is not in the list — it died, or drifted out of view —
+/// starts the ring from the front rather than ending the cycle, so `Tab` is
+/// never a key that does nothing while a target is on screen.
+fn next_target(current: Option<PersistId>, visible: &[PersistId]) -> Option<PersistId> {
+    let first = visible.first().copied();
+    let Some(current) = current else {
+        return first;
+    };
+    visible
+        .iter()
+        .copied()
+        .find(|entity| *entity > current)
+        .or(first)
 }
 
 fn nearest_clicked(
@@ -2784,6 +2875,37 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
     use std::time::Duration;
+
+    /// `Tab` walks the ring and wraps, rather than stopping at the end.
+    #[test]
+    fn tab_cycles_through_visible_targets_and_wraps() {
+        let visible = [PersistId::new(2), PersistId::new(5), PersistId::new(9)];
+        assert_eq!(next_target(None, &visible), Some(PersistId::new(2)));
+        assert_eq!(
+            next_target(Some(PersistId::new(2)), &visible),
+            Some(PersistId::new(5))
+        );
+        assert_eq!(
+            next_target(Some(PersistId::new(9)), &visible),
+            Some(PersistId::new(2)),
+            "the last target wraps to the first"
+        );
+    }
+
+    /// A lock on something no longer on screen restarts the ring.
+    ///
+    /// The alternative — returning `None` — would make `Tab` do nothing
+    /// exactly when the player has lost their target and most wants it.
+    #[test]
+    fn a_target_that_left_the_screen_restarts_the_ring() {
+        let visible = [PersistId::new(4), PersistId::new(6)];
+        assert_eq!(
+            next_target(Some(PersistId::new(99)), &visible),
+            Some(PersistId::new(4))
+        );
+        assert_eq!(next_target(Some(PersistId::new(4)), &[]), None);
+        assert_eq!(next_target(None, &[]), None);
+    }
 
     struct UploadEndpoint {
         origin: String,
