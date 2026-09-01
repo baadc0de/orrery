@@ -229,6 +229,41 @@ async fn read_content_version(db: &Database) -> Result<orrery_seed::apply::Conte
 
 #[cfg(feature = "fdb")]
 #[tokio::test]
+async fn wipe_clears_seeded_v1_world_rows_after_terrain_removal() {
+    let Some(cluster) = skip_if_no_fdb() else {
+        return;
+    };
+    let grid = GridId::new(9421);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scenarios")
+        .join("smoke.toml");
+    let source = std::fs::read_to_string(&root).expect("read scenario");
+    let temp = write_temp_scenario("terrainless wipe", &with_grid(&source, grid, true));
+    wipe_scenario(temp.path(), "smoke-2026-08-13").await;
+
+    let applied = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
+    maybe_assert_success(&applied, "apply before terrainless wipe");
+    let db = open_db(&cluster);
+    assert!(
+        !scan_world_rows(&db, grid)
+            .await
+            .expect("scan world before terrainless wipe")
+            .is_empty(),
+        "the scenario seeded world rows for the wipe to clear"
+    );
+
+    wipe_scenario(temp.path(), "smoke-2026-08-13").await;
+    assert!(
+        scan_world_rows(&db, grid)
+            .await
+            .expect("scan world after terrainless wipe")
+            .is_empty(),
+        "terrainless v1 wipe clears every seeded world row"
+    );
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
 async fn fdb_reseed_preserves_persist_ids() {
     let Some(cluster) = skip_if_no_fdb() else {
         return;

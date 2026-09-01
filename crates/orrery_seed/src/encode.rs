@@ -49,20 +49,6 @@ pub struct EncodeCtx<'a> {
     pub rng: &'a mut ChaCha8Rng,
 }
 
-/// Context for a terrain chunk section encode (docs/12 §4.1). v1 has no
-/// terrain emit; the type exists so the trait's surface matches the spec and
-/// a later terrain task extends it rather than breaking it.
-pub struct SectionCtx<'a> {
-    /// The cell the section belongs to.
-    pub cell: CellId,
-    /// Its grid.
-    pub grid: GridId,
-    /// The section index within the cell (`chunk/{grid}/{cell}/{n}`).
-    pub section: u16,
-    /// The slot RNG for this section (§8).
-    pub rng: &'a mut ChaCha8Rng,
-}
-
 /// An encoder failure. Carries the archetype name when the failure is
 /// archetype-specific so the plan can name the offending table.
 #[derive(Debug)]
@@ -79,6 +65,7 @@ impl core::error::Error for EncodeError {}
 /// A game's bridge from scenario archetypes to component bags (docs/12
 /// §4.1). Implemented in the game's crate; linked into the game's seeder
 /// binary.
+/// D51 intentionally keeps this trait limited to entity component bags.
 pub trait SeedEncoder: Send + Sync {
     /// Encode one entity's component bag from its archetype and derived
     /// context. Returns the **bag only** — the writer prepends the storage
@@ -90,13 +77,7 @@ pub trait SeedEncoder: Send + Sync {
     /// measured vs declared. `None` when the encoder cannot say.
     fn declared_size(&self, archetype: &str) -> Option<usize>;
 
-    /// Encode one terrain chunk section. `None` if the game has no terrain
-    /// (docs/12 §4.1). v1 never calls this; the default keeps implementors
-    /// terrain-free by default.
-    fn encode_section(&self, ctx: &SectionCtx<'_>) -> Result<Option<Bytes>, EncodeError> {
-        let _ = ctx;
-        Ok(None)
-    }
+    // D51 keeps the extension point entity-only until a future owner decision.
 }
 
 /// The built-in encoder for `[payload] class = "opaque"` (docs/12 §4.1):

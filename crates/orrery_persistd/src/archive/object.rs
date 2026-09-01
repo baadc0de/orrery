@@ -83,12 +83,13 @@ pub const ARCHIVE_COLUMNS: [&str; 12] = [
 /// Pinned here rather than taken from `#[derive]` ordering: the column is a
 /// durable at-rest value, and a `RecordKind` variant inserted in the middle
 /// would silently re-number every object ever written if the discriminant were
-/// derived. Adding a kind means adding an arm here with a *new* number.
+/// derived. Adding a kind means adding an arm here with a *new* number. Kind
+/// 1 is retired with v1 terrain and remains intentionally unassigned, so an
+/// archive written before that decision is refused rather than reinterpreted.
 #[must_use]
 pub const fn kind_discriminant(kind: RecordKind) -> u8 {
     match kind {
         RecordKind::ComponentDiff => 0,
-        RecordKind::TerrainDelta => 1,
         RecordKind::Spawn => 2,
         RecordKind::Despawn => 3,
         RecordKind::Rekey => 4,
@@ -101,7 +102,6 @@ pub const fn kind_discriminant(kind: RecordKind) -> u8 {
 pub const fn kind_from_discriminant(value: u8) -> Option<RecordKind> {
     match value {
         0 => Some(RecordKind::ComponentDiff),
-        1 => Some(RecordKind::TerrainDelta),
         2 => Some(RecordKind::Spawn),
         3 => Some(RecordKind::Despawn),
         4 => Some(RecordKind::Rekey),
@@ -490,7 +490,6 @@ mod tests {
     fn every_record_kind_has_a_pinned_discriminant_that_round_trips() {
         for kind in [
             RecordKind::ComponentDiff,
-            RecordKind::TerrainDelta,
             RecordKind::Spawn,
             RecordKind::Despawn,
             RecordKind::Rekey,
@@ -499,5 +498,14 @@ mod tests {
             assert_eq!(kind_from_discriminant(kind_discriminant(kind)), Some(kind));
         }
         assert_eq!(kind_from_discriminant(6), None);
+    }
+
+    #[test]
+    fn retired_terrain_discriminant_is_refused_not_reused() {
+        assert_eq!(
+            kind_from_discriminant(1),
+            None,
+            "archive kind 1 was TerrainDelta and is permanently retired"
+        );
     }
 }

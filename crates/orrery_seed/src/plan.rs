@@ -95,7 +95,7 @@ pub struct EmitPlan {
     pub shard_distribution: BTreeMap<u64, u64>,
     /// Logical byte estimate: Σ over rows of ([`WORLD_ROW_OVERHEAD`] + bag).
     pub logical_bytes: u64,
-    /// `world/` rows written (entity rows; v1 has no `chunk/` rows).
+    /// `world/` rows written (entity rows; terrain is not durable state in v1).
     pub world_rows: u64,
 }
 

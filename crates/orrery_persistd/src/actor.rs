@@ -1406,7 +1406,7 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
                 }
             }
         }
-        RecordKind::TerrainDelta | RecordKind::CheckpointMark => {}
+        RecordKind::CheckpointMark => {}
     }
     match record.kind {
         RecordKind::Spawn | RecordKind::ComponentDiff | RecordKind::Despawn => {
@@ -1423,7 +1423,7 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
         RecordKind::Rekey => {
             env.state.entity_lsn.remove(&record.entity);
         }
-        RecordKind::TerrainDelta | RecordKind::CheckpointMark => {}
+        RecordKind::CheckpointMark => {}
     }
     env.state.ckpt_watermark = env.state.ckpt_watermark.max(record.lsn);
 }

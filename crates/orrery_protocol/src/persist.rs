@@ -140,8 +140,6 @@ impl core::fmt::Display for Lsn {
 pub enum RecordKind {
     /// A component diff for an existing entity (bulk path, §2.1).
     ComponentDiff,
-    /// A terrain delta for a chunk section (bulk path, §8).
-    TerrainDelta,
     /// A new entity, carrying its freshly minted `PersistId`.
     Spawn,
     /// An entity despawn (tombstone).
