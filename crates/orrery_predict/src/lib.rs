@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bridge;
 pub mod budget;
 pub mod config;
 pub mod correction;
@@ -39,6 +40,7 @@ pub mod plugin;
 pub mod tick;
 pub mod wiring;
 
+pub use bridge::{OrreryReplicationBridgePlugin, ReplicationPeerLink};
 pub use budget::{PredictPriority, ResimPlan, RollbackBudget};
 pub use config::{ConfigDefect, PredictConfig, HIGH_RATE_SET};
 pub use correction::{

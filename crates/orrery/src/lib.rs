@@ -56,7 +56,8 @@ use orrery_persist_client::{
     AuthorityCorrectionQueue, OrreryPersistClientPlugin, PersistClientConfig, ReportQueue,
 };
 use orrery_predict::{
-    AuthorityCorrectionInbox, ConfigDefect, OrreryPredictPlugin, PredictConfig, HIGH_RATE_SET,
+    AuthorityCorrectionInbox, ConfigDefect, OrreryPredictPlugin, OrreryReplicationBridgePlugin,
+    PredictConfig, HIGH_RATE_SET,
 };
 use orrery_protocol::SeqPair;
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
@@ -421,9 +422,11 @@ impl Plugin for OrreryIslandBindingPlugin {
 /// 4. [`OrreryIslandBindingPlugin`] — this crate's own wires, between the two
 ///    above: the membership binding, and the drain divestiture.
 /// 5. [`OrreryPredictPlugin`] — lightyear's client stack, per D8/D16.
-/// 6. [`WitnessPlugin<R>`] — the log stream and the discrepancy path.
-/// 7. [`OrreryPersistClientPlugin`] — the gateway session, uplink, area loader.
-/// 8. [`OrreryEscalationPlugin`] — this crate's other wire, from the witness's
+/// 6. [`OrreryReplicationBridgePlugin`] — established Orrery sessions become
+///    P2P replication links with a Replicon-backed sender and receiver.
+/// 7. [`WitnessPlugin<R>`] — the log stream and the discrepancy path.
+/// 8. [`OrreryPersistClientPlugin`] — the gateway session, uplink, area loader.
+/// 9. [`OrreryEscalationPlugin`] — this crate's other wire, from the witness's
 ///    filed reports to the gateway's report queue.
 ///
 /// # What the host must drive
@@ -449,6 +452,12 @@ impl Plugin for OrreryIslandBindingPlugin {
 /// ([`WitnessConfig::shadow_mode`](orrery_witness::WitnessConfig::shadow_mode))
 /// is on by default besides. No plugin here can invent it: `NetConfig`'s
 /// secret key is consumed into the iroh endpoint and never handed back.
+///
+/// The game also registers its replicated component schemas and their
+/// interpolation/correction policy, then attaches replication and prediction
+/// targets to its entities. Those are type- and gameplay-specific declarations
+/// that the generic facade cannot infer; the facade supplies their transport
+/// and sender once declared.
 ///
 /// `ContactTick::now_ms` is **not** on that list, and neither is
 /// [`TickBridge`](orrery_predict::TickBridge): those are clocks rather than
@@ -503,6 +512,9 @@ where
 {
     fn build(self) -> PluginGroupBuilder {
         let config = self.config;
+        let replication_bridge = OrreryReplicationBridgePlugin {
+            tick_duration: config.predict.tick_duration(),
+        };
         assert_eq!(
             config.spatial.high_rate_cap,
             usize::from(HIGH_RATE_SET),
@@ -530,6 +542,7 @@ where
             .add(OrreryPredictPlugin {
                 config: config.predict,
             })
+            .add(replication_bridge)
             .add(WitnessPlugin::<R>::new())
             .add(OrreryPersistClientPlugin {
                 config: config.persist,

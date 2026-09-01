@@ -30,6 +30,7 @@ use orrery_net::{CoordinatorConfig, IslandSource};
 use orrery_persist_client::plugin::OrreryPersistClientPlugin;
 use orrery_persist_client::{AreaLoader, GatewaySession, IntentQueue, UplinkScheduler};
 use orrery_predict::plugin::OrreryPredictPlugin;
+use orrery_predict::OrreryReplicationBridgePlugin;
 use orrery_predict::{PredictConfig, ReconciliationMonitor, RollbackBudget, TickBridge};
 use orrery_protocol::coord::{IslandManifest, PeerEntry, TopologyRegime};
 use orrery_protocol::{CellId, IslandId, NodeId, Tick};
@@ -63,6 +64,7 @@ probe!(BeforeSpatial, "spatial");
 probe!(BeforeAuthority, "authority");
 probe!(BeforeBinding, "binding");
 probe!(BeforePredict, "predict");
+probe!(BeforeReplicationBridge, "replication_bridge");
 probe!(BeforeWitness, "witness");
 probe!(BeforePersist, "persist");
 
@@ -100,6 +102,7 @@ fn group_builds_every_member_in_dependency_order() {
             .add_before::<OrreryAuthorityPlugin>(BeforeAuthority)
             .add_before::<OrreryIslandBindingPlugin>(BeforeBinding)
             .add_before::<OrreryPredictPlugin>(BeforePredict)
+            .add_before::<OrreryReplicationBridgePlugin>(BeforeReplicationBridge)
             .add_before::<WitnessPlugin<Skirmish>>(BeforeWitness)
             .add_before::<OrreryPersistClientPlugin>(BeforePersist),
     );
@@ -114,6 +117,7 @@ fn group_builds_every_member_in_dependency_order() {
             "authority",
             "binding",
             "predict",
+            "replication_bridge",
             "witness",
             "persist",
         ],

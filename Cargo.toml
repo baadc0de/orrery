@@ -107,6 +107,7 @@ lightyear = { version = "0.29", default-features = false, features = [
     "interpolation",
     "input_native",
 ] }
+lightyear_replication = "0.29"
 
 # big_space 0.13 (Bevy 0.19) is not yet on crates.io; the WIP `bevy-0.19`
 # branch is the tracked P1 risk (docs/11-roadmap.md §P1). Pinned to the branch

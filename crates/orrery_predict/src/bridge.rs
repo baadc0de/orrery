@@ -1,0 +1,180 @@
+//! Orrery peer sessions bridged into Lightyear's P2P replication stack.
+//!
+//! `orrery_net` deliberately owns the concrete Aeronet session queues, the
+//! Orrery channel tag, and upload-budget enforcement. Attaching upstream's
+//! generic `lightyear_aeronet` adapter directly would give two systems the
+//! same receive queue and would let Lightyear packets bypass that policy.
+//! This bridge therefore meets the transport at `PeerPacket`/`SendPacket`:
+//! Aeronet types stay in `orrery_net`, and every Lightyear type stays here.
+
+use std::time::Duration;
+
+use bevy_app::{App, Plugin, PostUpdate, PreUpdate, Startup, Update};
+use bevy_ecs::prelude::*;
+use bytes::BytesMut;
+use lightyear::prelude::server::{ClientOf, ServerPlugins, Started};
+use lightyear::prelude::{
+    Connected, Link, LinkMtu, LinkSystems, Linked, PeerId, PeerMetadata, RemoteId,
+    ReplicationReceiver, ReplicationSender, P2P,
+};
+use lightyear_replication::channels::RepliconChannelMap;
+use orrery_net::channels::Channel;
+use orrery_net::peer_link::{payload_budget, PeerPacket, SendPacket};
+use orrery_net::plugin::{PeerMtu, PeerRegistry};
+use orrery_protocol::NodeId;
+
+/// A Lightyear link created from one established Orrery peer session.
+#[derive(Debug, Clone, Copy, Component)]
+pub struct ReplicationPeerLink {
+    /// Aeronet session entity tracked by `orrery_net`.
+    pub session: Entity,
+    /// Authenticated iroh identity at the other end of the session.
+    pub peer: NodeId,
+}
+
+/// Installs the P2P sender half and bridges Orrery peer packets to Lightyear.
+///
+/// [`ClientPlugins`] is already installed by `OrreryPredictPlugin`; the
+/// server group contributes Replicon's sender backend. No conventional
+/// Lightyear server entity is spawned: each established session is one direct
+/// [`P2P`] link that is both a replication receiver and sender.
+#[derive(Debug, Clone, Copy)]
+pub struct OrreryReplicationBridgePlugin {
+    /// The same fixed tick duration used by `OrreryPredictPlugin`.
+    pub tick_duration: Duration,
+}
+
+impl Plugin for OrreryReplicationBridgePlugin {
+    fn build(&self, app: &mut App) {
+        app.add_plugins(ServerPlugins {
+            tick_duration: self.tick_duration,
+        });
+        // Orrery supplies an already-authenticated connection instead of one
+        // of Lightyear's connection plugins, so it must seed the metadata
+        // resource their lifecycle hooks normally install.
+        app.init_resource::<PeerMetadata>();
+        app.add_systems(Startup, align_p2p_replicon_channels);
+        app.add_systems(Update, synchronize_peer_links);
+        app.add_systems(
+            PreUpdate,
+            receive_replication_packets.before(LinkSystems::Receive),
+        );
+        app.add_systems(
+            PostUpdate,
+            send_replication_packets.in_set(LinkSystems::Send),
+        );
+    }
+}
+
+/// Match Lightyear's map to Replicon's actual directional channel counts.
+///
+/// Lightyear 0.29 builds a three-entry map for both namespaces, anticipating
+/// fully bidirectional Replicon replication. The pinned Replicon backend has
+/// two server channels (updates, mutations) and one client channel (mutation
+/// acknowledgements). A combined P2P role runs both packet bridges, so leaving
+/// the speculative entries present makes the server bridge index receive
+/// channels that do not exist.
+fn align_p2p_replicon_channels(mut channels: ResMut<RepliconChannelMap>) {
+    channels.server_channels.truncate(2);
+    channels.client_channels.truncate(1);
+}
+
+/// Owns the `Started` lifecycle marker that enables Replicon's sender schedule
+/// without declaring a conventional Lightyear `Server` topology.
+#[derive(Component)]
+struct P2PSenderSchedule;
+
+fn peer_id(node: NodeId) -> PeerId {
+    let bytes = node.as_bytes();
+    let mut folded = [0_u8; 8];
+    for (index, byte) in bytes.iter().enumerate() {
+        folded[index % folded.len()] ^= byte;
+    }
+    PeerId::Entity(u64::from_le_bytes(folded))
+}
+
+fn synchronize_peer_links(
+    mut commands: Commands,
+    peers: Res<PeerRegistry>,
+    session_mtus: Query<&PeerMtu>,
+    links: Query<(Entity, &ReplicationPeerLink)>,
+    sender_schedule: Query<Entity, With<P2PSenderSchedule>>,
+) {
+    for (session, peer) in &peers.peers {
+        if links.iter().any(|(_, link)| link.session == *session) {
+            continue;
+        }
+
+        let Ok(session_mtu) = session_mtus.get(*session) else {
+            // `PeerRegistry` is updated in the same deferred batch that adds
+            // `PeerMtu`; the component is visible on the next update.
+            continue;
+        };
+        let mtu = payload_budget(session_mtu.0);
+        let link = commands
+            .spawn((
+                Link::default().with_mtu(LinkMtu::new(mtu)),
+                RemoteId(peer_id(peer.id)),
+                P2P,
+                ClientOf,
+                ReplicationSender,
+                ReplicationReceiver,
+                ReplicationPeerLink {
+                    session: *session,
+                    peer: peer.id,
+                },
+            ))
+            .id();
+        // Lifecycle hooks require RemoteId and the role markers to exist first.
+        commands.entity(link).insert((Linked, Connected));
+    }
+
+    for (entity, link) in &links {
+        if !peers
+            .peers
+            .iter()
+            .any(|(session, _)| *session == link.session)
+        {
+            commands.entity(entity).try_despawn();
+        }
+    }
+
+    if peers.is_empty() {
+        for entity in &sender_schedule {
+            commands.entity(entity).try_despawn();
+        }
+    } else if sender_schedule.is_empty() {
+        // Replicon still names its sender schedule "server" even for direct
+        // P2P senders. `Started` drives that schedule, while the absence of a
+        // `Server` component keeps Lightyear's topology correctly classified
+        // as P2P so prediction remains enabled.
+        commands.spawn((P2PSenderSchedule, Started));
+    }
+}
+
+fn receive_replication_packets(
+    mut packets: MessageReader<PeerPacket>,
+    mut links: Query<(&ReplicationPeerLink, &mut Link)>,
+) {
+    for packet in packets.read() {
+        if packet.channel != Channel::State {
+            continue;
+        }
+        let Some((_, mut link)) = links.iter_mut().find(|(link, _)| link.peer == packet.from)
+        else {
+            continue;
+        };
+        link.recv.push_raw(BytesMut::from(packet.payload.as_ref()));
+    }
+}
+
+fn send_replication_packets(
+    mut links: Query<(&ReplicationPeerLink, &mut Link), With<Linked>>,
+    mut packets: MessageWriter<SendPacket>,
+) {
+    for (peer, mut link) in &mut links {
+        for payload in link.send.drain() {
+            packets.write(SendPacket::state(peer.peer, payload));
+        }
+    }
+}
