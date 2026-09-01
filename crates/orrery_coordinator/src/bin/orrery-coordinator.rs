@@ -89,12 +89,10 @@ struct Cli {
     ///
     /// The default is `off`, preserving the absence of strike actions until
     /// an operator deliberately selects shadow or live.
-    #[arg(
-        long,
-        value_name = "off|shadow|live",
-        default_value = "off",
-        env = "ORRERY_STRIKES"
-    )]
+    // C5 is a posture mode selector, so it takes no environment fallback —
+    // the rule #869 applied to C1 and C4 and #868 to persistd's own C5. An
+    // inherited variable would arm every coordinator a supervisor spawns.
+    #[arg(long, value_name = "off|shadow|live", default_value = "off")]
     strikes: StrikesMode,
 }
 
@@ -284,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn strikes_environment_fallback_yields_to_an_explicit_flag() {
+    fn strikes_mode_does_not_read_the_environment() {
         const NAME: &str = "ORRERY_STRIKES";
         let _lock = RAMP_ENV_LOCK.lock().expect("ramp environment lock");
         let previous = std::env::var_os(NAME);
@@ -304,8 +302,9 @@ mod tests {
         }
 
         assert_eq!(
-            from_env.expect("environment fallback parses").strikes,
-            StrikesMode::Shadow
+            from_env.expect("bare invocation parses").strikes,
+            StrikesMode::Off,
+            "ORRERY_STRIKES must not move C5 off its D32 default"
         );
         assert_eq!(
             from_flag.expect("explicit flag parses").strikes,
