@@ -42,7 +42,12 @@ pub const REFERENCE_RULESET: RulesetId = RulesetId {
     // source closure without moving this corpus's canonical chains. D49 still
     // makes that source identity a new build, so the version advances with the
     // separately regenerated identity-only golden.
-    version: 4,
+    //
+    // Version 5: the hit-registration wire types (#871) landed in
+    // `orrery_protocol`, which is in this crate's source closure. The rules
+    // and every canonical chain are untouched; only the build identity moved,
+    // and the golden was regenerated identity-only.
+    version: 5,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 
