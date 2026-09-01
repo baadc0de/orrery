@@ -1666,6 +1666,11 @@ impl BaselineIntentValidator {
         quarantine_observer: Option<&dyn QuarantineValidationObserver>,
         now_ms: u64,
     ) -> Result<IntentPrecheck, RejectionCause> {
+        if cx.standing == SessionStanding::Quarantined {
+            if let Some(observer) = quarantine_observer {
+                observer.record_qualifying(cx.account);
+            }
+        }
         let force_full_validation = cx.standing == SessionStanding::Quarantined
             && quarantine_validation == QuarantineValidation::Live;
         if cx.standing == SessionStanding::Quarantined
@@ -4260,7 +4265,13 @@ mod tests {
                        the same shadow arm a deployment would run."
                     .to_owned(),
             },
-            vec![meter.snapshot(&cohort)],
+            vec![
+                meter.snapshot(&cohort),
+                ramp::RampMeter::new(QUARANTINE_VALIDATION_CONTROL).snapshot(&cohort),
+                ramp::RampMeter::new(crate::gateway::AUTHORITY_CORRECTION_CONTROL)
+                    .snapshot(&cohort),
+                ramp::RampMeter::new(crate::gateway::STRIKES_CONTROL).snapshot(&cohort),
+            ],
         );
 
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5670,6 +5681,58 @@ mod tests {
             Err(RejectionCause::BadAttestation),
             "C2 live forces full validation before the cheap shape rejection"
         );
+    }
+
+    #[test]
+    fn c2_meter_counts_only_quarantined_shadow_incidence_and_keeps_the_denominator() {
+        let intent = intent_with(vec![IntentOp {
+            op: OPAQUE_OP_BASE,
+            args: bytes::Bytes::new(),
+        }]);
+        let account = AccountId::new(7);
+        let quarantined = cx_with_standing(Some(account.0), SessionStanding::Quarantined);
+        let mut cohort = ramp::HonestCohort::new();
+        cohort.arm(account);
+
+        let shadow_meter = Arc::new(ramp::RampMeter::new(QUARANTINE_VALIDATION_CONTROL));
+        let shadow = BaselineIntentValidator::permissive().with_quarantine_validation_observing(
+            QuarantineValidation::Shadow,
+            Arc::clone(&shadow_meter) as SharedQuarantineValidationObserver,
+        );
+        assert!(shadow.check_at(&intent, &quarantined, 100).is_ok());
+        let snapshot = shadow_meter.snapshot(&cohort);
+        assert_eq!(snapshot.qualifying, 1);
+        assert_eq!(snapshot.observed, 1);
+        assert_eq!(snapshot.would_act, 1);
+        assert_eq!(snapshot.by_cause.get("force_full_validation"), Some(&1));
+        assert_eq!(snapshot.cohort.fp_count, 1);
+        assert_eq!(snapshot.cohort.coverage, Some(1.0));
+
+        let ordinary_meter = Arc::new(ramp::RampMeter::new(QUARANTINE_VALIDATION_CONTROL));
+        let ordinary = BaselineIntentValidator::permissive().with_quarantine_validation_observing(
+            QuarantineValidation::Shadow,
+            Arc::clone(&ordinary_meter) as SharedQuarantineValidationObserver,
+        );
+        assert!(ordinary
+            .check_at(&intent, &cx(Some(account.0)), 101)
+            .is_ok());
+        let ordinary = ordinary_meter.snapshot(&cohort);
+        assert_eq!(ordinary.qualifying, 0);
+        assert_eq!(ordinary.observed, 0);
+        assert_eq!(ordinary.would_act, 0);
+        assert_eq!(ordinary.cohort.coverage, None);
+
+        let off_meter = Arc::new(ramp::RampMeter::new(QUARANTINE_VALIDATION_CONTROL));
+        let off = BaselineIntentValidator::permissive().with_quarantine_validation_observing(
+            QuarantineValidation::Off,
+            Arc::clone(&off_meter) as SharedQuarantineValidationObserver,
+        );
+        assert!(off.check_at(&intent, &quarantined, 102).is_ok());
+        let off = off_meter.snapshot(&cohort);
+        assert_eq!(off.qualifying, 1);
+        assert_eq!(off.observed, 0);
+        assert_eq!(off.would_act, 0);
+        assert_eq!(off.cohort.coverage, Some(0.0));
     }
 
     // ── The item ownership transfer: admission ──────────────────────────

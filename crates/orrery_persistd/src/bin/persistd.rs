@@ -3203,9 +3203,10 @@ mod tests {
     ///   on exactly one persistd process". An exported variable is inherited by
     ///   every process a supervisor spawns — precisely the parallel-scanner
     ///   deployment #837 measured and the flag forbids.
-    /// - `--attestation-enforcement` and `--authority-correction` are mode
-    ///   selectors that arm refusal and revocation. D32 makes promotion an
-    ///   operator decision; an inherited variable is not one.
+    /// - `--attestation-enforcement`, `--quarantine-validation`,
+    ///   `--authority-correction` and `--strikes` are mode selectors that arm
+    ///   refusal, validation, correction or standing changes. D32 makes
+    ///   promotion an operator decision; an inherited variable is not one.
     /// - `--node-id`, `--bind` and `--chain-listen` are per-process identity.
     ///   One value in a host's environment guarantees a collision the moment a
     ///   second persistd starts.
@@ -3222,7 +3223,9 @@ mod tests {
         for (name, value) in [
             ("ORRERY_RECEIPT_ARCHIVE", "true"),
             ("ORRERY_ATTESTATION_ENFORCEMENT", "required"),
+            ("ORRERY_QUARANTINE_VALIDATION", "shadow"),
             ("ORRERY_AUTHORITY_CORRECTION", "live"),
+            ("ORRERY_STRIKES", "live"),
             ("ORRERY_NODE_ID", "9"),
             ("ORRERY_PERSISTD_BIND", "127.0.0.1:1"),
             ("ORRERY_CHAIN_LISTEN", "127.0.0.1:2"),
@@ -3263,6 +3266,21 @@ mod tests {
                 parsed.attestation_enforcement,
                 AttestationEnforcement::Off,
                 "{name} moved C1 off its D32 default; promotion is an operator decision"
+            );
+            assert_eq!(
+                parsed.quarantine_validation,
+                QuarantineValidation::Live,
+                "{name} moved C2 off its D32 startup default; promotion is an operator decision"
+            );
+            assert_eq!(
+                parsed.authority_correction,
+                AuthorityCorrectionEnforcement::Off,
+                "{name} moved C4 off its D32 default; promotion is an operator decision"
+            );
+            assert_eq!(
+                parsed.strikes,
+                StrikesEnforcement::Off,
+                "{name} moved C5 off its D32 default; promotion is an operator decision"
             );
         }
     }
