@@ -113,6 +113,36 @@ fn main() -> ExitCode {
     }
 }
 
+/// Refuse a wipe while an environment variable the other verbs honour is set.
+///
+/// `plan`, `apply` and `verify` read `--profile` and `--single-grid` from
+/// `ORRERY_PROFILE` and `ORRERY_SINGLE_GRID` (#865). `wipe` deliberately does
+/// not: it is destructive, and an exported variable that silently selects what
+/// gets destroyed is armed for every process that inherits it.
+///
+/// That asymmetry is correct and it is also a trap. An operator who exported
+/// `ORRERY_PROFILE` for a plan and then runs `wipe` gets the *default* profile
+/// — so the wipe resolves a different scenario than the plan it was meant to
+/// undo, silently. Refusing is the only reading that cannot destroy the wrong
+/// thing: the operator passes the flag explicitly or unsets the variable.
+fn refuse_env_that_wipe_ignores() -> Result<(), String> {
+    const IGNORED: [&str; 2] = ["ORRERY_PROFILE", "ORRERY_SINGLE_GRID"];
+    let set: Vec<&str> = IGNORED
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "wipe ignores {} — the other verbs read {} from the environment and wipe does not, so a \
+         wipe here would resolve a different scenario than the plan it follows. Pass the flag \
+         explicitly, or unset the variable.",
+        set.join(" and "),
+        if set.len() == 1 { "it" } else { "them" },
+    ))
+}
+
 async fn dispatch(args: Vec<std::ffi::OsString>) -> Result<ExitCode, String> {
     if args.len() <= 1 {
         return Err("expected a scenario path".to_string());
@@ -147,6 +177,7 @@ async fn dispatch(args: Vec<std::ffi::OsString>) -> Result<ExitCode, String> {
             run_shards(&parsed)
         }
         Some("wipe") => {
+            refuse_env_that_wipe_ignores()?;
             let parsed = WipeArgs::try_parse_from(argv).map_err(|e| e.to_string())?;
             run_wipe(parsed).await
         }

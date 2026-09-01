@@ -70,7 +70,7 @@ pub struct Cli {
     pub ping_hz: u32,
 
     /// Total test window, in seconds.
-    #[arg(long, global = true, default_value_t = DEFAULT_DURATION_SECS, env = "ORRERY_DURATION_SECS")]
+    #[arg(long, global = true, default_value_t = DEFAULT_DURATION_SECS, env = "ORRERY_P0_NAT_DURATION_SECS")]
     pub duration_secs: u64,
 
     /// Print the NodeId and exit without dialing or sending (host helper).
