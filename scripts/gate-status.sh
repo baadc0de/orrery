@@ -616,6 +616,7 @@ gate_p2_kill9_evidence() {
     pass)        status=PASSED ;;
     unqualified) status=UNQUALIFIED ;;
     interrupted) status=INTERRUPTED ;;
+    provisioning_failed) status=FAILED ;;
     *)           status=FAILED ;;
   esac
   numbers=$(jq -c '{
@@ -965,10 +966,11 @@ evaluate() { # id kind fn_prefix source arg
     if [[ -z $status ]]; then
       status=$evidence_status
       if [[ $status == 'NOT RUN' ]]; then reason="mode '$MODE' does not run this gate and no evidence is on disk"; fi
-    elif [[ $status == PASSED && $evidence_status =~ ^(UNQUALIFIED|INTERRUPTED)$ ]]; then
-      # The harness completed successfully so that its correctness evidence
-      # could be retained, but the evidence is authoritative about whether the
-      # whole criterion was qualified to pass.
+    elif [[ $status == PASSED && $evidence_status =~ ^(FAILED|UNQUALIFIED|INTERRUPTED)$ ]]; then
+      # The harness may exit successfully to retain an artifact, but evidence
+      # is authoritative about whether the whole criterion passed. In
+      # particular, a controller that selected no device has not run fio and
+      # must not be promoted to PASSED merely because it wrote its non-verdict.
       status=$evidence_status
     fi
   else
@@ -1651,6 +1653,33 @@ EOF
     || die 'self-test: the P2 row did not read the low-water disk figure from the artifact'
   grep -q 'disk_samples=42' <<<"$p2_projection" \
     || die 'self-test: the P2 row lost the disk sample count'
+
+  # A controller that cannot launch any candidate did not run fio, so it must
+  # not inherit the unqualified-device verdict. It is still a loud red gate,
+  # rather than a pass or a vacuous device qualification.
+  mkdir -p "$dir/out/p2-kill9-vv-provisioning"
+  jq '.result = "provisioning_failed"
+      | .reason = "device provisioning failed: zero of 47 candidates launched"
+      | .proofs.device_qualification = {
+          qualified: null, candidate_count: 47, qualified_count: 0,
+          launch_failed_count: 47, selected: null
+        }
+      | .proofs.latency = {
+          gate: "not_evaluated",
+          reason: "no candidate instance launched to run fio job A"
+        }' \
+    "$dir/out/p2-kill9-unqualified/artifact.json" \
+    >"$dir/out/p2-kill9-vv-provisioning/artifact.json"
+  ROWS=()
+  evaluate 'nightly:p2-kill9' nightly gate_p2_kill9 \
+    'nightly.yml:p2-kill9@hosted (p2-kill9-gate.sh)'
+  p2_projection=$(render)
+  grep -qE '^  FAILED +nightly:p2-kill9' <<<"$p2_projection" \
+    || die 'self-test: a no-device-selected P2 run was not failed loudly'
+  grep -qE '^  (PASSED|UNQUALIFIED) +nightly:p2-kill9' <<<"$p2_projection" \
+    && die 'self-test: a provisioning failure was collapsed into pass or fio qualification failure'
+  grep -q 'result=provisioning_failed' <<<"$p2_projection" \
+    || die 'self-test: the P2 report hid the named provisioning failure result'
 
   # Spot loss is environmental, not a retryable test failure and not a gate
   # pass. The controller exits cleanly after bounded retries so it can retain
