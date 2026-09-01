@@ -38,12 +38,12 @@
 //!
 //! # What is deliberately not here
 //!
-//! **Standing is read, never written here.** D33 (proposed) puts the `ya`
-//! strike ledger behind a separate writer (the adjudication executor).
-//! [`standing`] supplies its read-time scorer and configurable boundaries;
-//! this crate still takes the result through [`StandingSource`] and stamps it
-//! into claims. The default source, [`UnavailableStanding`], **refuses**,
-//! which is D33 clause (f)'s posture: "a missing or unreadable ledger is never
+//! **The strike ledger is read, never written here.** D33 assigns `ya` to the
+//! adjudication executor. [`standing`] supplies its read-time scorer, while
+//! [`CooldownStanding`] records identity-owned derived `dc` entry state and
+//! applies the configured dwell floor before this crate stamps a result into a
+//! claim. The default source, [`UnavailableStanding`], **refuses**, which is
+//! D33 clause (f)'s posture: "a missing or unreadable ledger is never
 //! interpreted as `Good`".
 //!
 //! **Credentials, payment and account creation UX.** D10 item 5 says an account
@@ -70,6 +70,7 @@
 
 #![warn(missing_docs)]
 
+pub mod cooldown;
 pub mod invite;
 pub mod issuer;
 pub mod issuer_key_lifecycle;
@@ -82,6 +83,7 @@ pub mod window;
 #[cfg(feature = "fdb")]
 pub mod fdb;
 
+pub use cooldown::CooldownStanding;
 pub use invite::{
     is_uuid_v7, mint_invite, redeem_invite, uuid_v7, InviteCodeGenerator, InviteError,
     InviteLedger, InviteRedemptionError, MintedInvite, OsInviteCodeGenerator,
@@ -97,10 +99,10 @@ pub use service::{
     UnavailableStanding, DEFAULT_SESSION_TOKEN_TTL_MS,
 };
 pub use standing::{
-    score_rows, ComputedStanding, StandingLevel, StandingScores, StandingThresholdError,
-    StandingThresholds, StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
+    score_rows, ComputedStanding, StandingLevel, StandingObservation, StandingScores,
+    StandingThresholdError, StandingThresholds, StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
 };
-pub use store::{AccountStore, BindOutcome, IdentityError};
+pub use store::{AccountStore, BindOutcome, CooldownEntry, IdentityError};
 pub use window::{
     admit_binding_event, RateRefusal, BINDING_RATE_CAP_24H, BINDING_RATE_CAP_30D,
     BINDING_RATE_WINDOW_24H_MS, BINDING_RATE_WINDOW_30D_MS,

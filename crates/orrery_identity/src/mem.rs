@@ -22,7 +22,7 @@
 //! `orrery_persistd::gateway::SnapshotBindingAuthority` from a store rather
 //! than from a table somebody typed.
 
-use crate::store::{AccountStore, BindOutcome, IdentityError};
+use crate::store::{AccountStore, BindOutcome, CooldownEntry, IdentityError};
 use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
 use orrery_persistd::gateway::BindingAuthority;
@@ -51,6 +51,8 @@ struct State {
     /// the same critical section as `da`, `db` and `dh`, never before the
     /// refusal checks.
     windows: HashMap<AccountId, Vec<u64>>,
+    /// `dc ‖ account` — D33's identity-owned current cooldown entry.
+    cooldowns: HashMap<AccountId, CooldownEntry>,
 }
 
 /// An in-process account store.
@@ -284,6 +286,55 @@ impl AccountStore for MemAccountStore {
             .get(node)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn observe_cooldown(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+        newest_live_strike_ms: Option<u64>,
+    ) -> Result<CooldownEntry, IdentityError> {
+        let mut state = Self::lock(&self.state);
+        if !state.accounts.contains_key(&account) {
+            return Err(IdentityError::UnknownAccount(account));
+        }
+        let entry = state.cooldowns.entry(account).or_insert(CooldownEntry {
+            entered_at_ms: observed_at_ms,
+        });
+        if newest_live_strike_ms.is_some_and(|issued_at_ms| issued_at_ms > entry.entered_at_ms) {
+            *entry = CooldownEntry {
+                entered_at_ms: observed_at_ms,
+            };
+        }
+        Ok(*entry)
+    }
+
+    async fn cooldown_entry(
+        &self,
+        account: AccountId,
+    ) -> Result<Option<CooldownEntry>, IdentityError> {
+        let state = Self::lock(&self.state);
+        if !state.accounts.contains_key(&account) {
+            return Err(IdentityError::UnknownAccount(account));
+        }
+        Ok(state.cooldowns.get(&account).copied())
+    }
+
+    async fn clear_cooldown_if(
+        &self,
+        account: AccountId,
+        expected: CooldownEntry,
+    ) -> Result<bool, IdentityError> {
+        let mut state = Self::lock(&self.state);
+        if !state.accounts.contains_key(&account) {
+            return Err(IdentityError::UnknownAccount(account));
+        }
+        if state.cooldowns.get(&account) == Some(&expected) {
+            state.cooldowns.remove(&account);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
