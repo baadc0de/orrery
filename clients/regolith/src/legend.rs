@@ -35,6 +35,8 @@ pub enum Bound {
     Fire,
     /// Pick the locked target with the mouse.
     Select,
+    /// Move the lock to the next visible target.
+    CycleTarget,
     /// Move the chase camera in and out.
     Zoom,
     /// Toggle the F3 correctness overlay.
@@ -44,11 +46,12 @@ pub enum Bound {
 }
 
 /// Every binding a row must exist for.
-pub const BOUND: [Bound; 7] = [
+pub const BOUND: [Bound; 8] = [
     Bound::Yaw,
     Bound::Thrust,
     Bound::Fire,
     Bound::Select,
+    Bound::CycleTarget,
     Bound::Zoom,
     Bound::Overlay,
     Bound::Legend,
@@ -81,7 +84,7 @@ pub struct Row {
 /// The legend, in the order it is drawn.
 ///
 /// Flight first, because a player who cannot move has no use for the rest.
-pub const ROWS: [Row; 7] = [
+pub const ROWS: [Row; 8] = [
     Row {
         bound: Bound::Yaw,
         keys: "Left / Right",
@@ -101,6 +104,11 @@ pub const ROWS: [Row; 7] = [
         bound: Bound::Select,
         keys: "Click a ship",
         action: "pick it as your target",
+    },
+    Row {
+        bound: Bound::CycleTarget,
+        keys: "Tab",
+        action: "next target on screen",
     },
     Row {
         bound: Bound::Zoom,
@@ -383,6 +391,9 @@ pub fn note_used_inputs(
     }
     if buttons.just_pressed(MouseButton::Left) {
         state.mark(Bound::Select);
+    }
+    if keys.just_pressed(KeyCode::Tab) {
+        state.mark(Bound::CycleTarget);
     }
     if keys.just_pressed(KeyCode::F3) {
         state.mark(Bound::Overlay);
@@ -690,6 +701,21 @@ mod tests {
                             app.world().resource::<LegendState>().visible(),
                             before,
                             "{code:?} is named as the legend key and hides nothing"
+                        );
+                    }
+                    Bound::CycleTarget => {
+                        let mut app = App::new();
+                        app.init_resource::<crate::SelectedLock>()
+                            .insert_resource(crate::LockCandidates {
+                                visible: vec![PersistId::new(4), PersistId::new(9)],
+                            })
+                            .insert_resource(pressed(&[code]))
+                            .add_systems(Update, crate::cycle_lock_target);
+                        app.update();
+                        assert_eq!(
+                            app.world().resource::<crate::SelectedLock>().target,
+                            Some(PersistId::new(4)),
+                            "{code:?} is named as the target-cycle key and moves no lock"
                         );
                     }
                     Bound::Select | Bound::Zoom => unreachable!("mouse rows name no key"),
