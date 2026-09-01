@@ -116,8 +116,8 @@ where the archive has put it. All three pieces now exist in
 - **The retention clamp** (#817) adds the archive's verified-through watermark
   as a third term in the release floor, and names a guarded release
   `ReleaseBlocked::ArchiveLag`. It is **registered only under
-  `persistd --archive-retention`, which defaults off**; off is the pre-#817
-  floor exactly.
+  `persistd --archive-retention`, which defaults off**; off is the pre-clamp
+  floor exactly — the checkpoint-plus-chain minimum, unchanged.
 - **The record schema** (#821) settles the on-disk contract before the first
   object is written. The time axis is `lsn`, not `tick`: `tick` is
   client-supplied and never server-validated, so a griefer would otherwise
@@ -153,8 +153,10 @@ The enforcement ramp ([D32](docs/adr/0032-enforcement-ramp.md)) is built and
 measured shadow-first, per control, with a `ramp-shadow` nightly gate running a
 shadow and an enforcing gateway from one binary at once. **Nothing is promoted
 to live.** D32 clause (g) additionally blocks C3 — write refusal and annulment
-— until the economy-wide invariant auditor is live, which needs the archive
-above, which needs an object store.
+— until the economy-wide invariant auditor is live. Its hourly incremental over
+hot ledgers shipped and needs no archive; its daily full conservation sweep
+needs history, and per #833 the archive does not yet hold the economic effects
+that sweep must read. C3 therefore lands in P6, beside the tailer, not in P5.
 
 ### Terrain is not durable state in v1
 
@@ -305,7 +307,9 @@ exist in total: the root, eleven standalone tools under [`gates/`](gates/) —
 `p5-dupe-gauntlet`, `migration-bench` — and [`clients/regolith`](clients/regolith/).
 Each standalone tool carries its own `[workspace]` and lockfile so a harness
 cannot drag a dependency into the shipped graph, and each is consequently
-invisible to `cargo test --workspace`.
+invisible to `cargo test --workspace`. (`gates/p0-nat-lab` is deployment shell
+for the real-NAT cohort, not a Cargo project, which is why it is not in that
+list.)
 
 `./scripts/check.sh` runs CI's lanes locally and is the executable inventory
 (`--list`); `./scripts/gate-status.sh` reports where every gate stands, and
