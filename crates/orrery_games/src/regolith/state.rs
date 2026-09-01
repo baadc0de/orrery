@@ -464,6 +464,17 @@ pub const SECTION_PICKUP: StateSection = StateSection("pickup");
 pub const SECTION_BLOOM_DIRECTOR: StateSection = StateSection("bloom-director");
 
 /// Every state section the `regolith.world` module owns, in manifest order.
+///
+/// Historical lane-one rationale (the paragraph below describes the v23
+/// frontier and names the test as it existed in that lane):
+///
+/// This is the S7.4 migration frontier: the sections a decomposing host stores
+/// in their own component. It is `regolith.world` and not `regolith.craft`
+/// because the world module is the one whose population *changes inside a
+/// tick* — rocks are materialized by splits and blooms, pickups by the
+/// contest — so migrating it is the only choice that exercises a host's spawn
+/// path at all. Held against the manifest by
+/// `regolith::composition_tests::the_migration_frontier_is_a_declared_module`.
 pub const REGOLITH_WORLD_SECTIONS: &[StateSection] =
     &[SECTION_ROCK, SECTION_PICKUP, SECTION_BLOOM_DIRECTOR];
 
