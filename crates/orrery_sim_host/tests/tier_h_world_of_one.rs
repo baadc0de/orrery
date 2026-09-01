@@ -52,8 +52,8 @@ use orrery_sim_host::ecs::EcsBackend;
 
 fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
     EcsBackend::new(game, seed).with_migrated_module(
-        orrery_games::regolith::world_ecs::sync_migrated,
-        orrery_games::regolith::world_ecs::step_migrated,
+        orrery_games::regolith::native_ecs::sync_migrated,
+        orrery_games::regolith::native_ecs::step_migrated,
     )
 }
 

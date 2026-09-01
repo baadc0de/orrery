@@ -53,8 +53,8 @@ fn seed() -> UniverseSeed {
 
 fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
     EcsBackend::new(game, seed).with_migrated_module(
-        orrery_games::regolith::world_ecs::sync_migrated,
-        orrery_games::regolith::world_ecs::step_migrated,
+        orrery_games::regolith::native_ecs::sync_migrated,
+        orrery_games::regolith::native_ecs::step_migrated,
     )
 }
 
@@ -229,6 +229,20 @@ fn the_canonical_schedule_composes_unambiguously_and_the_unordered_mutant_does_n
     assert!(
         rendered.contains("Ambiguity"),
         "the native canary failed for the wrong reason: {rendered}"
+    );
+
+    let craft_native = orrery_games::regolith::craft_ecs::ambiguity_audit();
+    assert!(
+        craft_native.is_ok(),
+        "the craft module's native schedule did not compose cleanly: {craft_native:?}"
+    );
+    let craft_mutant = orrery_games::regolith::craft_ecs::ambiguity_audit_of_the_unordered_mutant();
+    let Err(rendered) = craft_mutant else {
+        panic!("the craft module's unordered native schedule escaped ambiguity detection");
+    };
+    assert!(
+        rendered.contains("Ambiguity"),
+        "the craft native canary failed for the wrong reason: {rendered}"
     );
 }
 

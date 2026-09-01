@@ -1,9 +1,8 @@
 //! Native ECS execution for the `regolith.world` module (S7.4, #745).
 //!
-//! The host's migration frontier selects exactly this module: rock, pickup and
-//! bloom-director own state is held as concrete components and the module's
-//! named rules run as chained Bevy systems. `regolith.craft` stays on the
-//! ordinary `Ruleset::step` path.
+//! Rock, pickup and bloom-director own state is held as concrete components
+//! and the module's named rules run as chained Bevy systems. S7.4 lane two
+//! adds `regolith.craft` beside this module without merging their schedules.
 //!
 //! The host still keeps the whole [`RegolithState`] beside a migrated entity.
 //! That cache is required by `TickBackend::state -> &CoreState` and is the only
@@ -215,9 +214,7 @@ pub fn sync_migrated(world: &mut World, entity: Entity, state: Option<&RegolithS
         Some(RegolithState::BloomDirector(director)) => {
             held.insert(director.clone());
         }
-        Some(RegolithState::Craft(_)) => {
-            unreachable!("the migrated module cannot contain a craft")
-        }
+        Some(RegolithState::Craft(_)) => {}
         None => {}
     }
 }

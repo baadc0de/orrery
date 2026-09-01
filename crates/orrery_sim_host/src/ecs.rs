@@ -6,7 +6,7 @@
 //! [`SimulationHost::on_backend`](crate::SimulationHost::on_backend) accepts
 //! it wherever it accepts the executor.
 //!
-//! # The unit of migration: one module's state sections
+//! # The unit of migration: complete modules' state sections
 //!
 //! Canonical state is not one component. Entities whose declared state section
 //! is past the ruleset's migration frontier
@@ -16,12 +16,12 @@
 //! migrated module's population is a set of archetypes and a query for it
 //! visits no other entity.
 //!
-//! Regolith's frontier is `regolith.world` — the `rock`, `pickup` and
-//! `bloom-director` sections of #737's split. `regolith.craft` is the
-//! remainder. World goes first because it has no module dependencies while
-//! craft depends on it, and because its materialized rocks and pickups exercise
-//! the only path that adds archetypes during a tick. The whole blast radius is
-//! measured by `tests/ecs_differential.rs`.
+//! Regolith moved `regolith.world` first — it has no module dependencies while
+//! craft depends on it, and its materialized rocks and pickups exercise the
+//! only path that adds archetypes during a tick. Lane two advances the frontier
+//! by the remaining `regolith.craft` module. The generic migrated/remainder
+//! split remains even though every current Regolith section is now past it.
+//! The whole blast radius is measured by `tests/ecs_differential.rs`.
 //!
 //! # Native own-state components, with the whole-state seam intact
 //!
@@ -125,7 +125,7 @@ pub type MigratedStep<R> = for<'state, 'input> fn(
     &mut TickRng,
 ) -> StepOutput<<R as Ruleset>::CoreEvent>;
 
-/// The one module currently past the migration frontier.
+/// The ruleset-owned adapter for every module currently past the frontier.
 #[derive(Resource)]
 struct MigratedModule<R: EcsHostable> {
     sync: MigratedSync<R>,
@@ -165,8 +165,7 @@ pub const CANONICAL_TICK_STAGES: [&str; 3] = [
 struct Identity(PersistId);
 
 /// One entity's canonical core state when its state section is **past the
-/// migration frontier** — for Regolith, the `regolith.world` module's `rock`,
-/// `pickup` and `bloom-director` sections (S7.4, #745).
+/// migration frontier** — for Regolith after S7.4 lane two, all four sections.
 ///
 /// This is a different Rust type from [`RemainderSection`] and therefore a
 /// different `bevy_ecs` component, which is the whole of the decomposition:
@@ -180,7 +179,7 @@ struct Identity(PersistId);
 struct MigratedSection<R: EcsHostable>(R::CoreState);
 
 /// One entity's canonical core state when its section has **not** been
-/// migrated. The undivided remainder: for Regolith, `regolith.craft`.
+/// migrated. The generic undivided remainder; Regolith currently has none.
 #[derive(Component, Debug, Clone)]
 struct RemainderSection<R: EcsHostable>(R::CoreState);
 
@@ -543,11 +542,11 @@ fn install_materializations<R: EcsHostable>(world: &mut World) {
     let settled = Tick::new(settled.0.saturating_add(1));
     for materialized in spawned {
         // A newborn is placed by its own declared section, so a rock materialized
-        // by a split lands directly in the migrated module's archetype and is
-        // never briefly a member of the remainder. This is the only place in the
+        // by a split lands directly past the migration frontier and is never
+        // briefly a member of the remainder. This is the only place in the
         // substrate where a spawn's archetype is chosen, and it is why
-        // `regolith.world` — the module whose population changes mid-tick — is
-        // the one migrated first.
+        // `regolith.world` — the module whose population changes mid-tick — was
+        // migrated first.
         let side = Side::of(&materialized.state);
         let native_state = (side == Side::Migrated).then(|| materialized.state.clone());
         let mut spawn = world.spawn((Identity(materialized.entity), ObservedAt(settled)));
@@ -799,7 +798,7 @@ impl<R: EcsHostable> EcsBackend<R> {
         }
     }
 
-    /// Every entity of the **migrated module**, in ascending `PersistId` order.
+    /// Every entity past the **migration frontier**, in ascending `PersistId` order.
     ///
     /// The point of the decomposition, in one signature. On the `BTreeMap`
     /// store the same question is `entities()` — the whole population — filtered
@@ -899,11 +898,11 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
     /// are answered here from the [`Slot`] alone, and the entity's canonical
     /// state is never touched.
     ///
-    /// What is *not* answered from this generic layout is which of the migrated
-    /// module's three sections a migrated entity occupies. Regolith now keeps
-    /// those own-state projections as concrete game components for its rules,
-    /// but this read API returns a borrow tied to the whole-state cache, so the
-    /// generic accessor still projects here. See the module note.
+    /// What is *not* answered from this generic layout is which concrete
+    /// section a migrated entity occupies. Regolith keeps those own-state
+    /// projections as concrete game components for its rules, but this read API
+    /// returns a borrow tied to the whole-state cache, so the generic accessor
+    /// still projects here. See the module note.
     fn section_state<S>(&self, entity: PersistId) -> Option<&S::State>
     where
         S: Section<Root = R::CoreState>,

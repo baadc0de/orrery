@@ -1,9 +1,9 @@
-//! S7.4: the `regolith.world` module, stored in its own components (#745).
+//! S7.4: Regolith's migrated modules, stored in their own components (#745).
 //!
 //! `tests/ecs_differential.rs` proves the ECS-backed host *behaves* identically
 //! to the store. This file proves the thing that differential cannot see: that
-//! the migrated module is genuinely stored apart, that the substrate — not the
-//! caller — is what knows which entities belong to it, and that the two
+//! the migrated modules are genuinely stored past the frontier, that the
+//! substrate — not the caller — knows which entities belong there, and that the
 //! hazards a decomposition introduces are actually closed.
 //!
 //! Every assertion here is about storage. None of it may move a canonical byte,
@@ -27,8 +27,8 @@ fn seed() -> UniverseSeed {
 
 fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
     EcsBackend::new(game, seed).with_migrated_module(
-        orrery_games::regolith::world_ecs::sync_migrated,
-        orrery_games::regolith::world_ecs::step_migrated,
+        orrery_games::regolith::native_ecs::sync_migrated,
+        orrery_games::regolith::native_ecs::step_migrated,
     )
 }
 
@@ -62,16 +62,15 @@ fn declared_migrated(backend: &EcsBackend<Regolith>) -> Vec<PersistId> {
         .collect()
 }
 
-/// The migrated module's population comes out of the storage layout, and it
+/// The migrated modules' population comes out of the storage layout, and it
 /// agrees with the ruleset's declaration.
 ///
-/// The second assertion is the anti-vacuity twin of the first: a
-/// `migrated_population` that returned the entire store would agree with a
-/// `declared_migrated` that was also wrong, so the test also pins that the two
-/// are a *strict* subset relation with both sides non-empty. Four crafts stay
-/// out; eight world seeds go in.
+/// Lane two intentionally advances every Regolith section past the frontier,
+/// so the expected population is the entire seeded store. The section counts
+/// are the anti-vacuity half: both declared modules and multiple world-owned
+/// variants must actually be present.
 #[test]
-fn the_migrated_module_is_selected_by_the_storage_layout() {
+fn both_migrated_modules_are_selected_by_the_storage_layout() {
     let mut backend = seeded_world();
     let population = TickBackend::entities(&backend);
     let migrated = backend.migrated_population();
@@ -79,21 +78,21 @@ fn the_migrated_module_is_selected_by_the_storage_layout() {
     assert_eq!(
         migrated,
         declared_migrated(&backend),
-        "the migrated archetype's population disagrees with RegolithState::is_migrated"
+        "the migrated archetypes' population disagrees with RegolithState::is_migrated"
     );
     assert!(
         !migrated.is_empty(),
-        "no entity is in the migrated module, so nothing above was compared"
+        "no entity is past the migration frontier, so nothing above was compared"
     );
-    assert!(
-        migrated.len() < population.len(),
-        "every entity is in the migrated module, so a query that returned the \
-         whole store would pass this file"
+    assert_eq!(
+        migrated, population,
+        "lane two moved every declared Regolith module, so no Regolith entity \
+         may remain on the generic remainder side"
     );
     assert_eq!(
         migrated.len(),
-        WORLD_SCENARIO.world_entities as usize,
-        "the world scenario's eight world seeds are the migrated population"
+        (WORLD_SCENARIO.entities + WORLD_SCENARIO.world_entities) as usize,
+        "the migrated population must contain both crafts and world seeds"
     );
     // A section is a *set* of state variants, not a synonym for one enum arm:
     // `regolith.world` owns `rock`, `pickup` and `bloom-director`, and the
@@ -113,13 +112,14 @@ fn the_migrated_module_is_selected_by_the_storage_layout() {
             "{section:?} is in the migrated archetype but not past the frontier"
         );
     }
+    assert!(sections.contains(&SECTION_CRAFT));
     assert!(sections.contains(&SECTION_ROCK));
     sections.sort_unstable();
     sections.dedup();
     assert!(
-        sections.len() > 1,
-        "every migrated entity has the same section, so this migration is \
-         indistinguishable from migrating one enum variant"
+        sections.len() > 2,
+        "the seeded population did not exercise both modules and more than one \
+         world-owned section"
     );
 }
 
@@ -154,18 +154,16 @@ fn a_materialized_entity_is_born_into_the_migrated_archetype() {
     );
 }
 
-/// An install that crosses the frontier moves the entity; it does not leave it
-/// carrying both components.
+/// An install that crosses native modules replaces the entity; it does not
+/// duplicate or double-step it.
 ///
 /// The hazard is specific to the decomposition and invisible to the
 /// differential over the corpus, because the corpus never reuses an id across
-/// sections. An entity holding `MigratedSection` and `RemainderSection` at once
-/// is matched by *both* of `seal_population`'s queries, so it would be sealed
-/// twice, step twice in one tick, and draw its per-entity RNG stream twice —
-/// with the second step's neighbour read served from a map the first step
-/// already overwrote.
+/// sections. Both sections are now past the generic frontier, but they have
+/// different concrete game components and different module schedules. A stale
+/// component or duplicate host entity would make one stable id step twice.
 #[test]
-fn an_install_across_the_frontier_moves_the_entity_rather_than_duplicating_it() {
+fn an_install_across_native_modules_replaces_the_entity_rather_than_duplicating_it() {
     let game = Regolith::honest();
     let mut backend = regolith_ecs(game, seed());
     let entity = PersistId::new(1);
@@ -175,20 +173,22 @@ fn an_install_across_the_frontier_moves_the_entity_rather_than_duplicating_it() 
         TickBackend::state(&backend, entity).map(RegolithState::section),
         Some(SECTION_CRAFT),
     );
-    assert!(
-        backend.migrated_population().is_empty(),
-        "a craft is not in the migrated module"
+    assert_eq!(
+        backend.migrated_population(),
+        vec![entity],
+        "craft is now in the migrated craft module"
     );
 
     let rock = game
         .spawn_world(entity, 0)
         .expect("Regolith seeds every world slot");
+    let world_section = rock.section();
     TickBackend::insert(&mut backend, entity, rock);
 
     assert_eq!(
         backend.migrated_population(),
         vec![entity],
-        "the replacing install did not move the entity into the migrated module"
+        "the replacing install lost the entity from the migrated frontier"
     );
     assert_eq!(
         TickBackend::entities(&backend),
@@ -199,7 +199,12 @@ fn an_install_across_the_frontier_moves_the_entity_rather_than_duplicating_it() 
     assert_eq!(
         stepped.len(),
         1,
-        "the entity was sealed by both section queries and stepped twice in one tick"
+        "the entity was duplicated or selected by both native module schedules"
+    );
+    assert_eq!(
+        TickBackend::state(&backend, entity).map(RegolithState::section),
+        Some(world_section),
+        "the craft-to-world replacement ran the wrong native module"
     );
 }
 
@@ -209,9 +214,7 @@ fn an_install_across_the_frontier_moves_the_entity_rather_than_duplicating_it() 
 // `self.state(entity).and_then(S::project)` — which fetches a whole state and
 // only then asks whether it was the section the caller named. This backend
 // overrides it, because its storage already answers half of that question:
-// the migration frontier says a `regolith.world` section cannot be held by an
-// entity filed on the remainder side, and `regolith.craft` cannot be held by
-// one filed past it.
+// every declared Regolith section is now filed past the frontier.
 //
 // These two tests are the pair the override needs. The first pins the answers
 // themselves — the `None` half over the full cross product, not just the
@@ -220,7 +223,7 @@ fn an_install_across_the_frontier_moves_the_entity_rather_than_duplicating_it() 
 // drift apart. `state_at` reads exactly one component now, chosen by the index,
 // so a drifted row is an entity whose canonical state silently disappears.
 
-/// Every section, over every entity, on both sides of the frontier.
+/// Every section, over every entity past the frontier.
 #[test]
 fn the_section_accessor_answers_every_section_over_every_entity() {
     let mut backend = seeded_world();
@@ -273,10 +276,16 @@ fn the_section_accessor_answers_every_section_over_every_entity() {
             "the override disagrees with `state().and_then(project)` for {entity:?}",
         );
     }
-    // Anti-vacuity: a population that was entirely crafts would pass every
-    // assertion above while testing only one arm of the frontier.
-    assert!(seen[0] > 0, "no craft: the remainder side was never asked");
-    assert!(seen[1] > 0, "no rock: the migrated side was never asked");
+    // Anti-vacuity: a population that exercised only one module would pass
+    // every assertion above while never asking the accessor about the other.
+    assert!(
+        seen[0] > 0,
+        "no craft: the second migrated module was never asked"
+    );
+    assert!(
+        seen[1] > 0,
+        "no rock: the first migrated module was never asked"
+    );
     assert!(
         seen[1] + seen[2] + seen[3] > seen[1],
         "the migrated module contributed only rocks, so the accessor was never \
@@ -285,7 +294,7 @@ fn the_section_accessor_answers_every_section_over_every_entity() {
 }
 
 /// The index's recorded side and the entity's actual component agree, for
-/// every entity, across installs, frontier crossings and materializations.
+/// every entity, across installs, module replacements and materializations.
 ///
 /// This is the invariant `state_at` now trusts: it reads the one component the
 /// slot names instead of probing both. If a row drifted, `state()` would answer
@@ -300,9 +309,8 @@ fn the_index_and_the_archetypes_agree_on_every_entity() {
     for tick in 0..WORLD_SCENARIO.ticks {
         backend.step_tick(Tick::new(tick), &empty);
     }
-    // A replacing install that crosses the frontier in both directions, which
-    // is the one path that has to *rewrite* a recorded side rather than write
-    // a fresh one.
+    // Replacing installs across native modules in both directions exercise the
+    // concrete-component synchronizers without changing the generic side.
     let crossing = PersistId::new(1);
     let rock = game
         .spawn_world(crossing, 0)
@@ -328,10 +336,10 @@ fn the_index_and_the_archetypes_agree_on_every_entity() {
     assert_eq!(
         TickBackend::state(&backend, crossing).map(RegolithState::section),
         Some(SECTION_CRAFT),
-        "the second crossing install did not rewrite the recorded side back"
+        "the second module replacement did not restore craft state"
     );
     assert!(
-        !backend.migrated_population().contains(&crossing),
-        "the entity crossed back to the remainder but the archetype kept it"
+        backend.migrated_population().contains(&crossing),
+        "the craft module is past the migration frontier but its entity was lost"
     );
 }
