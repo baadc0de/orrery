@@ -390,8 +390,11 @@ scanner greps text, so a crate could evade by constructing the trait name
 dynamically — accepted residual risk, identical in kind to every grep gate
 here, backstopped by symptom tests.
 
-**Tier H — host machinery (exists only if A3's trigger T3 ever fires).** A
-crate hosting canonical state in a `bevy_ecs::World`:
+**Tier H — host machinery (landed 2026-08-31 as `scripts/core-gates.sh`
+section 6, #771, armed per declared host — D43 (e)(1); at plan time it
+existed only if A3's trigger T3 ever fired, and the admitted host was
+sanctioned directly instead).** A crate hosting canonical state in a
+`bevy_ecs::World`:
 
 - must appear on an explicit, review-required host allowlist (no discovery
   here: hosting ECS is always a decision);
@@ -407,8 +410,10 @@ crate hosting canonical state in a `bevy_ecs::World`:
   per-entity replay contract (A3 E-8 / second-opinion E-8) is not renegotiable
   at this node; the rollback unit itself stays A7's.
 
-Until a trigger fires, Tier H is empty and the tree is exactly Tier V plus
-the unchanged witness adapter situation.
+Tier H is no longer vacant: it landed (#771) and arms per declared host
+(`DECLARED_HOST_CRATES` — `orrery_sim_host` holds the row), with the host
+admitted by owner sanction (#757) rather than a fired trigger. The
+witness-adapter exception stands unchanged.
 
 ### 5.3 Strength accounting against today's gate
 
@@ -444,8 +449,10 @@ as strong" but should then be recorded as such, not as stronger.
 `scripts/core-gates.sh` is outside the P4 digest (p4-ledger.sh hashes
 `orrery_witness`, `orrery_core`, `orrery_games`, `gates/p1-swarm`; scripts/
 is not hashed — p4-ledger.sh:33-35). The discovery clause can land whenever
-review allows; Tier H lands only with, and gated behind, an actual ECS-host
-trigger. Neither touches a hashed crate.
+review allows; Tier H was to land only with, and gated behind, an actual
+ECS-host trigger — overtaken 2026-08-31: it landed (#771) with the host
+admitted by owner sanction (#757), arming per declared host (D43 (e)(1)).
+Neither touches a hashed crate.
 
 ---
 
@@ -600,10 +607,13 @@ Stated as unsure rather than smoothed over:
    profiles for canonical crates; a game needing wrapping semantics could
    instead pin `wrapping_*` explicitly. Either works; silence does not. The
    owner should pick.
-5. **Tier H remains entirely conditional.** If no trigger ever fires, every
-   Tier-H clause here is unused specification. That is deliberate (A3 V5's
-   posture), but it means most of this document's *new* enforcement is
-   untested against production pressure until/unless ECS is admitted.
+5. **Tier H is no longer conditional-vacant.** At plan time, had no trigger
+   ever fired, every Tier-H clause here would have been unused specification —
+   that posture was deliberate (A3 V5's). Since then ECS was admitted: the
+   host by owner sanction (#757), the battery by #771 — enforced and
+   demonstrated mutation-style in full (D43 clause (e)'s amendments), so
+   this document's *new* enforcement is no longer untested against
+   production pressure.
 
 Deliberately not done:
 

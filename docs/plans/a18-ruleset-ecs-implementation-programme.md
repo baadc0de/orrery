@@ -358,8 +358,10 @@ acceptance criterion, not a slogan.
   role discovery: scan for `impl .* Ruleset for` and `: Ruleset` bounds with
   `cfg(test)` stripped and qualified paths handled, then take the union of
   discovered and declared. The declared list stays as a floor; discovery adds.
-  No Tier H clauses - D43 clause (e) arms only on a D42 trigger, and none has
-  fired.
+  No Tier H clauses in this stage's scope. (At plan time D43 clause (e) armed
+  only on a D42 trigger and none had fired; since then Tier H landed - #771 -
+  and arms per declared host, `DECLARED_HOST_CRATES`, with the host admitted
+  by owner sanction rather than a fired trigger.)
 - **Files (exclusive):** `scripts/core-gates.sh`.
 - **Entry:** none.
 - **Exit:** on this tree discovery reproduces exactly
@@ -485,26 +487,41 @@ executor and the harness-side frame/claim assembly A11 wanted promoted).
   committed values. A revert that does not is itself a finding (A11 section
   5.4, and I would keep that rule).
 
-### S7 - Conditional; nothing here is scheduled
+### S7 - Entry sanctioned 2026-08-30; the seam substrate landed 2026-08-31
 
-D42 clause (d) admits a dedicated `bevy_ecs::World` behind the seam only on
-pre-registered triggers T1 (per-component storage measurably needed),
-T2 (measured tick cost dominated by the `BTreeMap` store), T3 (Tier H landed
-and demonstrated at least as strong as what it replaces). **T3 is a necessary
-precondition regardless of T1/T2.** None has fired; Tier H is empty by D43
-clause (e)'s own accounting.
+D42 clause (d)'s automatic entry path is the pre-registered triggers
+T1 (per-component storage measurably needed), T2 (measured tick cost
+dominated by the `BTreeMap` store), T3 (Tier H landed and demonstrated at
+least as strong as what it replaces), with **T3 a necessary precondition
+regardless of T1/T2.** No trigger fired; the owner sanctioned S7 entry
+directly on 2026-08-30 (#745). Tier H is no longer empty: it landed (#771),
+its battery enforced mutation-style (`scripts/core-gates.sh` section 6), and
+the first lane in landed the next day as `orrery_sim_host`'s `EcsBackend`
+(#757), at four-class F-4 parity - the admission D42 clause (d)'s amendment
+blockquote records. Where S7 stands now: the seam substrate is in; the
+`orrery_games` side of the acceptance (#793, 2026-08-31 - `bevy_ecs`
+first-class, ECS as idiomatic storage, systems and tick driving over
+`World`) is recorded but the dependency is not yet taken - the manifest
+declares no Bevy and `BEVY_PERMITTED_CRATES` carries the crate
+(`scripts/core-gates.sh:259`).
 
-- **Entry:** a trigger fires *and* the precondition package is complete: Tier
-  H demonstrated, A5's capability registry live, the four-class differential
-  harness live, capacity-scale mirror numbers replacing A3's indicative
-  bounds.
+- **Entry:** the owner's sanction (#745, 2026-08-30), not a fired trigger.
+  Of the precondition package: Tier H demonstrated (#771); the four-class
+  differential harness live (`crates/orrery_games/src/diff.rs`, A10 §4.1's
+  four classes, generalized across substrates at #757); A5's capability
+  registry partial (declaration data plane live; IV-7's engine-handle
+  refusal and the persistd linkage open, D45); capacity-scale mirror
+  numbers not met and partly overtaken (source half measured, docs/14
+  §12.6; the consumer half does not exist).
 - **Exit:** not specifiable before entry, and specifying it now would be the
   kind of unused specification D43 clause (e) already admits to carrying.
-- **Detector:** the trigger itself is the detector, and it is a measurement,
-  not a judgement. T2 in particular is arithmetic: publish the measured share
-  of tick cost attributable to the store. A3 measured the mirror cost the
-  shared world would save at ~9 us per 10k entities, ~1.5% of a tick. A store
-  that "feels slow" is not T2.
+  The seam-substrate lane's acceptance, stated at its landing: four-class
+  F-4 parity (#757).
+- **Detector:** the trigger list remains the automatic path's detector, and
+  it is a measurement, not a judgement. T2 in particular is arithmetic:
+  publish the measured share of tick cost attributable to the store. A3
+  measured the mirror cost the shared world would save at ~9 us per 10k
+  entities, ~1.5% of a tick. A store that "feels slow" is not T2.
 
 ## 6. The dependency graph, and where it is actually serial
 
@@ -526,7 +543,7 @@ S0.a S0.b S0.c   S1.b S1.c S1.d S1.e   S2   S3.a S3.b S3.c S3.d
                         S6.a          S6.b          S6.c
                                         |
                                         v
-                                       S7 (conditional; no date)
+                                       S7 (entry sanctioned 2026-08-30; #757 landed)
 ```
 
 Twelve of the sixteen non-conditional lanes are parallel. **The serial spine

@@ -422,8 +422,11 @@ E-15 all held as cited.
   resolution of the three unused `bevy_reflect` entries (E-8, A5's open
   question); whether the observer proof (§5) becomes an implementation issue
   after the #395 ADRs land.
-- **A4's owner artifacts**: the Tier-H gate bundle remains conditional on
-  A3's triggers; nothing here arms it.
+- **A4's owner artifacts**: the Tier-H gate bundle was conditional on A3's
+  triggers when this document was written, and nothing here armed it. Since
+  then it landed (#771) — battery at `scripts/core-gates.sh` section 6,
+  enforced mutation-style, D43 (e)(1) — and arms per declared host, with the
+  host admitted by owner sanction (#757) rather than a fired trigger.
 
 ## 9. Unsure
 
