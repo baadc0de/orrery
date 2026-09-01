@@ -360,6 +360,63 @@ pub fn verify_bundle<R: Ruleset>(
     verify_bundle_on(Executor::new(ruleset, universe_seed), authority, bundle)
 }
 
+/// Check that the claims are a complete sequence for the window they name.
+///
+/// Completeness here means *claim-link* contiguity, not one claim per tick:
+/// [`orrery_protocol::StateClaim`] carries no cadence, and an authority may
+/// legitimately produce no claim on some ticks. A matching `prev_claim`
+/// proves that no predecessor on the presented history was omitted between
+/// two claims. An unexplained break proves no such thing — from the bundle
+/// alone it is indistinguishable from the reporter withholding that
+/// predecessor — so it is incomplete evidence, never evidence of deviation.
+///
+/// The exception is two distinct, valid claims for the same tick. The pair is
+/// self-contained proof that the authority signed twice and does not require
+/// an inference from a broken link. `Ok(Some(tick))` reports that equivocation;
+/// `Ok(None)` is one complete, strictly increasing claim sequence.
+fn complete_claim_sequence(bundle: &EvidenceBundle) -> Result<Option<Tick>, UnadjudicableReason> {
+    let anchor = &bundle.t0_claim;
+    if anchor.entity != bundle.entity
+        || anchor.ruleset != bundle.ruleset
+        || anchor.tick != bundle.window_start
+    {
+        return Err(UnadjudicableReason::Malformed);
+    }
+    let Some(last) = bundle.disputed_claims.last() else {
+        return Err(UnadjudicableReason::IncompleteChain);
+    };
+    if last.tick != bundle.window_end {
+        return Err(UnadjudicableReason::IncompleteChain);
+    }
+    if bundle.disputed_claims.iter().any(|claim| {
+        claim.entity != bundle.entity
+            || claim.ruleset != bundle.ruleset
+            || claim.chain_epoch != anchor.chain_epoch
+            || claim.tick > bundle.window_end
+    }) {
+        return Err(UnadjudicableReason::Malformed);
+    }
+
+    let mut previous = anchor;
+    for claim in &bundle.disputed_claims {
+        if claim.tick < previous.tick {
+            return Err(UnadjudicableReason::IncompleteChain);
+        }
+        if claim.tick == previous.tick {
+            if claim_hash(claim) != claim_hash(previous) {
+                return Ok(Some(claim.tick));
+            }
+            return Err(UnadjudicableReason::IncompleteChain);
+        }
+        if claim.prev_claim != claim_hash(previous) {
+            return Err(UnadjudicableReason::IncompleteChain);
+        }
+        previous = claim;
+    }
+
+    Ok(None)
+}
+
 /// Adjudicate a bundle on a given substrate — D43 clause (e)(5)'s adjudication
 /// half.
 ///
@@ -406,6 +463,17 @@ pub fn verify_bundle_on<R: Ruleset, B: TickBackend<R>>(
         }
     }
 
+    match complete_claim_sequence(bundle) {
+        Ok(Some(at)) => {
+            return Verdict::Confirms {
+                at,
+                kind: DeviationKind::DiscreteMismatch,
+            };
+        }
+        Ok(None) => {}
+        Err(reason) => return Verdict::Unadjudicable(reason),
+    }
+
     let mut harness = ReplayHarness::on(backend);
     if let Err(error) = harness.load_claimed_snapshot(&bundle.t0_claim, &bundle.t0_snapshot) {
         return match error {
@@ -445,24 +513,9 @@ pub fn verify_bundle_on<R: Ruleset, B: TickBackend<R>>(
     // supposed to make impossible. The signed assertions are the `StateClaim`s,
     // so those are what the replay is judged against.
     //
-    // This is why a window must end at a claim tick (docs/06 §7): a window with
-    // no signed claim in it contains nothing the subject can be held to.
-    if bundle.disputed_claims.is_empty() {
-        return Verdict::Unadjudicable(UnadjudicableReason::Malformed);
-    }
-
-    let mut previous = claim_hash(&bundle.t0_claim);
+    // `complete_claim_sequence` has already established that the final claim
+    // closes the window and every claim links directly to its predecessor.
     for claim in &bundle.disputed_claims {
-        // Claims must chain, or the authority equivocated about its own
-        // history even though every individual signature checks out.
-        if claim.prev_claim != previous {
-            return Verdict::Confirms {
-                at: claim.tick,
-                kind: DeviationKind::DiscreteMismatch,
-            };
-        }
-        previous = claim_hash(claim);
-
         // A claim at tick T commits to the state *before* T executes, which is
         // the state after T-1. Comparing against T itself would accuse every
         // honest authority of being one tick ahead of itself.
