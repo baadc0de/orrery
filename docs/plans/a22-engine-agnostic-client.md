@@ -10,8 +10,11 @@
 > Repository facts verified at `0c01d4e` on 2026-08-30; every `path:line`
 > below was read before being cited. **Propose, not decide** - section 7
 > lists what stays with the owner. Nothing here amends D42 or any other ADR,
-> and nothing here authorises an ECS adoption: D42 clause (d) trigger-gates
-> that and no trigger has fired.
+> and nothing here authorises an ECS adoption. D42 clause (d) trigger-gates
+> the automatic path and no trigger has fired; the owner sanctioned S7 entry
+> directly on 2026-08-30 (#745) and accepted `bevy_ecs` first-class for
+> `orrery_games` on 2026-08-31 (#793, "OWNER ACCEPTANCE, 2026-08-31") -
+> recorded owner decisions, neither one this document's.
 
 ## 1. The decision that is already made
 
@@ -24,8 +27,11 @@ is Accepted** and states the rule directly:
 > consumer of engine-neutral canonical bytes.**
 
 Unreal is therefore the already-sanctioned case, not a new one, and
-`scripts/core-gates.sh` clause 1 enforces the boundary today by scanning
-`GATED_CRATES=(orrery_core orrery_games orrery_conformance)` for Bevy.
+`scripts/core-gates.sh` clause 1 enforces the boundary by scanning the gated
+set (`orrery_core`, `orrery_games`, `orrery_conformance`) for Bevy -
+narrowed 2026-08-31: `orrery_games` is the scan's single permitted exception
+(`BEVY_PERMITTED_CRATES`; `bevy_ecs` accepted first-class for it, #793),
+while `orrery_core` and `orrery_conformance` stay Bevy-free unconditionally.
 
 What is missing is not a decision but a **seam**: D42 clause (b)(2)'s
 `SimulationHost`, *"one kernel-owned driver owning tick advance, stable-id
@@ -38,15 +44,17 @@ serial spine is four deep: **S1.a -> S4.1 -> S4.2 -> S5**.
 | Goal | What it actually needs | Gate |
 |---|---|---|
 | A second engine in front of the ruleset | **S5**, the host seam | A18's serial spine |
-| `bevy_ecs` behind the ruleset | **S7** | D42 (d) trigger: T1, T2 or T3 |
+| `bevy_ecs` behind the ruleset | **S7** | owner-sanctioned entry, 2026-08-30 (#745); no D42 (d) trigger fired |
 
 **An Unreal client does not need the ECS move.** S7 is a substrate swap
 *behind* the seam; a second engine consumes the seam *in front* of it. D42
-(d) admits a canonical `bevy_ecs::World` only when T1 (`CoreState`-as-one-
-enum measurably stops scaling), T2 (the `BTreeMap` store dominating measured
-tick cost) or T3 (A4's Tier-H gate bundle demonstrated at least as strong as
-what it replaces) fires. None has. A18 records S7 as *"not specifiable
-before entry"*.
+(d)'s automatic path admits a canonical `bevy_ecs::World` when T1
+(`CoreState`-as-one-enum measurably stops scaling), T2 (the `BTreeMap` store
+dominating measured tick cost) or T3 (A4's Tier-H gate bundle demonstrated
+at least as strong as what it replaces) fires. None has; the owner
+sanctioned S7 entry directly on 2026-08-30 (#745), and the seam substrate
+landed the next day as `orrery_sim_host`'s `EcsBackend` (#757), at
+four-class F-4 parity. A18 records S7 as *"not specifiable before entry"*.
 
 Adding a second engine arguably **weakens** the ECS case rather than
 strengthening it: it makes the engine-neutral byte boundary more
@@ -137,7 +145,7 @@ signature answers to a real C++ call site instead of a guess.
 | **B. Serial spine** | S1.a -> S4.1 -> S4.2 -> S5 | playtest-quiet windows | yes - S4's entry is *regolith quiet* |
 | **C. First person** | unlock `pitch_urad`, encounter tuning, camera and input on the Bevy skin | between playtests, versioned normally | yes, ruleset bump |
 | **D. Unreal client** | the real thing, consuming S5 | after S5 | no |
-| **E. `bevy_ecs` (S7)** | only on a fired D42 (d) trigger | last, or never | - |
+| **E. `bevy_ecs` (S7)** | sanctioned directly, 2026-08-30 (#745); no D42 (d) trigger fired | substrate landed 2026-08-31 (#757), ahead of this table's "last, or never" | - |
 
 ### 6.1 What the spike must answer
 
@@ -193,6 +201,9 @@ Three questions, in order, each cheap and each able to invalidate the next:
    *"whether S1.a lands before #329's quiet point"* as item 9, calling it
    *"the single decision that shapes this epic"*; a second engine is now a
    third pull on the same four trees.
-4. **Any ECS adoption** - D42 (d), unchanged and untouched here.
+4. **Any ECS adoption** - still the owner's. Recorded so far: the S7 entry
+   sanction (#745, 2026-08-30) and the `orrery_games` first-class acceptance
+   (#793, 2026-08-31); neither was this document's act, and D42 (d) is not
+   amended here.
 5. **Unlocking `pitch_urad`**, which changes canonical behaviour and the
    ruleset digest.
