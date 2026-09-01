@@ -41,9 +41,10 @@ pub use provisional::{
 
 pub mod shadow;
 pub use shadow::{
-    CountingShadowObserver, ShadowObservation, ShadowObservationLog, ShadowObserver,
-    ShadowUnevaluated, ShadowVerdict, SharedShadowObserver, ATTESTATION_QUORUM_CONTROL,
-    SHADOW_TARGET,
+    CountingShadowObserver, QuarantineValidationObservation, QuarantineValidationObserver,
+    ShadowObservation, ShadowObservationLog, ShadowObserver, ShadowUnevaluated, ShadowVerdict,
+    SharedQuarantineValidationObserver, SharedShadowObserver, ATTESTATION_QUORUM_CONTROL,
+    QUARANTINE_VALIDATION_CONTROL, SHADOW_TARGET,
 };
 
 pub mod ramp;
@@ -811,6 +812,7 @@ impl RejectionCause {
 #[derive(Default, Clone)]
 pub struct BaselineIntentValidator {
     enforcement: AttestationPosture,
+    quarantine_validation: QuarantineValidation,
     epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     interest: Option<Arc<dyn crate::gateway::InterestAuthority>>,
     bindings: Option<crate::gateway::SharedBindingAuthority>,
@@ -823,6 +825,9 @@ pub struct BaselineIntentValidator {
     /// for the collector and the gate leg that want the observations back
     /// rather than in a log.
     observer: Option<SharedShadowObserver>,
+    /// Optional in-process C2 shadow sink. Tracing is emitted even when this
+    /// is absent, so a deployment never silently loses its observation.
+    quarantine_observer: Option<SharedQuarantineValidationObserver>,
 }
 
 /// Written out rather than derived because [`crate::gateway::InterestAuthority`]
@@ -834,10 +839,12 @@ impl core::fmt::Debug for BaselineIntentValidator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BaselineIntentValidator")
             .field("enforcement", &self.enforcement.get())
+            .field("quarantine_validation", &self.quarantine_validation)
             .field("epochs", &self.epochs)
             .field("interest", &self.interest.is_some())
             .field("bindings", &self.bindings.is_some())
             .field("observer", &self.observer.is_some())
+            .field("quarantine_observer", &self.quarantine_observer.is_some())
             .finish()
     }
 }
@@ -937,6 +944,52 @@ impl core::str::FromStr for AttestationEnforcement {
             other => Err(format!(
                 "unknown attestation enforcement mode `{other}` \
                  (expected one of: off, shadow, required)"
+            )),
+        }
+    }
+}
+
+/// D32 control C2's startup posture.
+///
+/// `Live` is the default because it is the already-landed behaviour: a
+/// quarantined session validates its attestation set before cheap shape
+/// checks. `Off` is specified by D32 for incident response symmetry, though
+/// its practical coherence remains D32 open question 3.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineValidation {
+    /// Treat a quarantined session as `Good` on this intent path: do not
+    /// observe or force the early full-validation path.
+    Off,
+    /// Record each quarantined shortcut incidence, then use the ordinary path.
+    Shadow,
+    /// Force quarantined sessions through full validation before cheap checks.
+    #[default]
+    Live,
+}
+
+impl QuarantineValidation {
+    /// The CLI spelling D32 clause (c) assigns this posture.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Live => "live",
+        }
+    }
+}
+
+impl core::str::FromStr for QuarantineValidation {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "live" => Ok(Self::Live),
+            other => Err(format!(
+                "unknown quarantine validation mode `{other}` \
+                 (expected one of: off, shadow, live)"
             )),
         }
     }
@@ -1043,6 +1096,28 @@ impl BaselineIntentValidator {
         Self::default()
     }
 
+    /// Set C2's startup posture on this validator.
+    ///
+    /// Unlike C1, C2 has no durable runtime posture row yet; this is the
+    /// startup-only lever D32's inventory specifies.
+    #[must_use]
+    pub fn with_quarantine_validation(mut self, mode: QuarantineValidation) -> Self {
+        self.quarantine_validation = mode;
+        self
+    }
+
+    /// Set C2's posture and retain its shadow observations in-process.
+    #[must_use]
+    pub fn with_quarantine_validation_observing(
+        mut self,
+        mode: QuarantineValidation,
+        observer: SharedQuarantineValidationObserver,
+    ) -> Self {
+        self.quarantine_validation = mode;
+        self.quarantine_observer = Some(observer);
+        self
+    }
+
     /// A validator that requires no quorum but still refuses **party**
     /// attestations at the account level, resolved through `bindings`.
     ///
@@ -1092,10 +1167,12 @@ impl BaselineIntentValidator {
     ) -> Self {
         Self {
             enforcement: AttestationPosture::new(AttestationEnforcement::Required),
+            quarantine_validation: QuarantineValidation::Live,
             epochs: Some(epochs),
             interest: Some(interest),
             bindings: Some(bindings),
             observer: None,
+            quarantine_observer: None,
         }
     }
 
@@ -1124,10 +1201,12 @@ impl BaselineIntentValidator {
     ) -> Self {
         Self {
             enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            quarantine_validation: QuarantineValidation::Live,
             epochs: Some(epochs),
             interest: Some(interest),
             bindings: Some(bindings),
             observer: None,
+            quarantine_observer: None,
         }
     }
 
@@ -1577,7 +1656,33 @@ impl BaselineIntentValidator {
     /// pays for signature verification. A quarantined session verifies its
     /// bounded attestation set before returning any other rejection.
     pub fn check(intent: &Intent, cx: &IntentContext) -> Result<IntentPrecheck, RejectionCause> {
-        if cx.standing == SessionStanding::Quarantined {
+        Self::check_with_quarantine_validation(intent, cx, QuarantineValidation::Live, None, 0)
+    }
+
+    fn check_with_quarantine_validation(
+        intent: &Intent,
+        cx: &IntentContext,
+        quarantine_validation: QuarantineValidation,
+        quarantine_observer: Option<&dyn QuarantineValidationObserver>,
+        now_ms: u64,
+    ) -> Result<IntentPrecheck, RejectionCause> {
+        let force_full_validation = cx.standing == SessionStanding::Quarantined
+            && quarantine_validation == QuarantineValidation::Live;
+        if cx.standing == SessionStanding::Quarantined
+            && quarantine_validation == QuarantineValidation::Shadow
+        {
+            shadow::emit_quarantine_validation(
+                quarantine_observer,
+                QuarantineValidationObservation {
+                    intent_id: intent.intent_id,
+                    issuer: intent.issuer,
+                    subject: cx.account,
+                    cell_epoch: intent.cell_epoch,
+                    observed_at_ms: now_ms,
+                },
+            );
+        }
+        if force_full_validation {
             if intent.attestations.len() > MAX_ATTESTATIONS {
                 return Err(RejectionCause::TooManyAttestations);
             }
@@ -1713,7 +1818,7 @@ impl BaselineIntentValidator {
         // never pay it. Quarantined sessions paid this bounded cost before
         // shape validation so a forged co-signature cannot hide behind a
         // cheaper rejection.
-        if cx.standing == SessionStanding::Good {
+        if !force_full_validation {
             check_attestations(intent)?;
         }
 
@@ -1799,7 +1904,13 @@ impl BaselineIntentValidator {
         if let Some(observer) = self.observer.as_deref() {
             observer.record_qualifying(cx.account);
         }
-        let precheck = Self::check(intent, cx)?;
+        let precheck = Self::check_with_quarantine_validation(
+            intent,
+            cx,
+            self.quarantine_validation,
+            self.quarantine_observer.as_deref(),
+            now_ms,
+        )?;
 
         // The resolver, or the honest absence of one. A validator built
         // without bindings answers `None` to every `owner(n)`, which leaves
@@ -3797,10 +3908,12 @@ mod tests {
         let cacheless_log = Arc::new(ShadowObservationLog::default());
         let cacheless = BaselineIntentValidator {
             enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            quarantine_validation: QuarantineValidation::Live,
             epochs: None,
             interest: None,
             bindings: None,
             observer: Some(Arc::clone(&cacheless_log) as SharedShadowObserver),
+            quarantine_observer: None,
         };
         assert!(
             cacheless.check_at(&intent, &cx(Some(7)), 2_000).is_ok(),
@@ -3815,10 +3928,12 @@ mod tests {
         let standingless_log = Arc::new(ShadowObservationLog::default());
         let standingless = BaselineIntentValidator {
             enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            quarantine_validation: QuarantineValidation::Live,
             epochs: Some(epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000)),
             interest: None,
             bindings: Some(distinct_bindings(&announced)),
             observer: Some(Arc::clone(&standingless_log) as SharedShadowObserver),
+            quarantine_observer: None,
         };
         assert!(standingless.check_at(&intent, &cx(Some(7)), 2_000).is_ok());
         assert_eq!(
@@ -4733,10 +4848,12 @@ mod tests {
         // open, which is the direction a misconfiguration must take.
         let blind = BaselineIntentValidator {
             enforcement: AttestationPosture::new(AttestationEnforcement::Required),
+            quarantine_validation: QuarantineValidation::Live,
             epochs: None,
             interest: None,
             bindings: None,
             observer: None,
+            quarantine_observer: None,
         };
         assert_eq!(
             blind.check_at(&intent, &cx(Some(7)), 2_000),
@@ -4750,10 +4867,12 @@ mod tests {
         let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
         let standingless = BaselineIntentValidator {
             enforcement: AttestationPosture::new(AttestationEnforcement::Required),
+            quarantine_validation: QuarantineValidation::Live,
             epochs: Some(epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000)),
             interest: None,
             bindings: Some(distinct_bindings(&announced)),
             observer: None,
+            quarantine_observer: None,
         };
         assert_eq!(
             standingless.check_at(&intent, &cx(Some(7)), 2_000),
@@ -5475,6 +5594,81 @@ mod tests {
             ),
             Err(RejectionCause::BadAttestation),
             "a quarantined session observes the forged co-signature first"
+        );
+    }
+
+    /// C2's three positions differ at the validator, where its action really
+    /// is: live forces early full validation, shadow records that it would
+    /// have done so and takes the ordinary path, and off does not observe.
+    #[test]
+    fn quarantine_validation_postures_are_distinguishable_at_the_validator() {
+        #[derive(Default)]
+        struct ObservationLog(std::sync::Mutex<Vec<QuarantineValidationObservation>>);
+
+        impl QuarantineValidationObserver for ObservationLog {
+            fn record(&self, observation: QuarantineValidationObservation) {
+                self.0
+                    .lock()
+                    .expect("quarantine observation log lock")
+                    .push(observation);
+            }
+        }
+
+        let witness = iroh_base::SecretKey::from_bytes(&[9u8; 32]);
+        let mut intent = intent_with(
+            (0..=MAX_OPS_PER_INTENT)
+                .map(|_| IntentOp {
+                    op: 0xFFFF,
+                    args: bytes::Bytes::new(),
+                })
+                .collect(),
+        );
+        intent.attestations.push(Attestation {
+            witness: witness.public(),
+            signature: witness.sign(b"forged attestation"),
+        });
+        let quarantined = cx_with_standing(Some(7), SessionStanding::Quarantined);
+
+        let off = BaselineIntentValidator::permissive()
+            .with_quarantine_validation(QuarantineValidation::Off);
+        assert_eq!(
+            off.check_at(&intent, &quarantined, 10),
+            Err(RejectionCause::TooManyOps),
+            "C2 off takes the ordinary path and does not force validation"
+        );
+
+        let observations = Arc::new(ObservationLog::default());
+        let shadow = BaselineIntentValidator::permissive().with_quarantine_validation_observing(
+            QuarantineValidation::Shadow,
+            Arc::clone(&observations) as SharedQuarantineValidationObserver,
+        );
+        assert_eq!(
+            shadow.check_at(&intent, &quarantined, 11),
+            Err(RejectionCause::TooManyOps),
+            "C2 shadow suppresses the forcing action"
+        );
+        assert_eq!(
+            observations
+                .0
+                .lock()
+                .expect("quarantine observation log lock")
+                .as_slice(),
+            &[QuarantineValidationObservation {
+                intent_id: intent.intent_id,
+                issuer: intent.issuer,
+                subject: quarantined.account,
+                cell_epoch: intent.cell_epoch,
+                observed_at_ms: 11,
+            }],
+            "C2 shadow records the quarantined shortcut incidence it would force"
+        );
+
+        let live = BaselineIntentValidator::permissive()
+            .with_quarantine_validation(QuarantineValidation::Live);
+        assert_eq!(
+            live.check_at(&intent, &quarantined, 12),
+            Err(RejectionCause::BadAttestation),
+            "C2 live forces full validation before the cheap shape rejection"
         );
     }
 

@@ -44,6 +44,9 @@ use super::RejectionCause;
 /// posture row an operator writes to demote it.
 pub const ATTESTATION_QUORUM_CONTROL: &str = "attestation_quorum";
 
+/// The name D32 clause (c) gives control C2.
+pub const QUARANTINE_VALIDATION_CONTROL: &str = "quarantine_validation";
+
 /// The `tracing` target every shadow observation is emitted on.
 ///
 /// A stable target rather than a stable message, so an out-of-process reader
@@ -220,6 +223,61 @@ pub trait ShadowObserver: Send + Sync {
 
 /// A shared [`ShadowObserver`], the shape a validator holds.
 pub type SharedShadowObserver = Arc<dyn ShadowObserver>;
+
+/// One shadow-mode observation for C2.
+///
+/// C2 has no refusal cause: its action is to make a quarantined session take
+/// the full attestation-validation path before the ordinary cheap checks. A
+/// shadow observation therefore records the shortcut incidence itself — the
+/// action live mode would have taken — while the submission continues on the
+/// ordinary path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineValidationObservation {
+    /// The intent that arrived from a quarantined session.
+    pub intent_id: u128,
+    /// The submitting NodeId.
+    pub issuer: NodeId,
+    /// The session account whose quarantine would have forced validation.
+    pub subject: Option<AccountId>,
+    /// The cell epoch the intent named.
+    pub cell_epoch: CellEpoch,
+    /// The clock on the admission call, in milliseconds.
+    pub observed_at_ms: u64,
+}
+
+/// Optional in-process sink for C2's shortcut-incidence observations.
+///
+/// Implementations must not block: it is called on the admission path.
+pub trait QuarantineValidationObserver: Send + Sync {
+    /// Record one quarantined session that live mode would force through full
+    /// validation.
+    fn record(&self, observation: QuarantineValidationObservation);
+}
+
+/// A shared C2 observer.
+pub type SharedQuarantineValidationObserver = Arc<dyn QuarantineValidationObserver>;
+
+/// Emit C2's observation to the optional in-process observer and its stable
+/// tracing target.
+pub fn emit_quarantine_validation(
+    observer: Option<&dyn QuarantineValidationObserver>,
+    observation: QuarantineValidationObservation,
+) {
+    if let Some(observer) = observer {
+        observer.record(observation);
+    }
+    tracing::info!(
+        target: SHADOW_TARGET,
+        control = QUARANTINE_VALIDATION_CONTROL,
+        intent_id = observation.intent_id,
+        issuer = %observation.issuer,
+        subject = ?observation.subject,
+        cell_epoch = ?observation.cell_epoch,
+        observed_at_ms = observation.observed_at_ms,
+        would_force_full_validation = true,
+        "ramp shadow observation"
+    );
+}
 
 /// The observer a validator built without one uses: counts, keeps nothing.
 ///

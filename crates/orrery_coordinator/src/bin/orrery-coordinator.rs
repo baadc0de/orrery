@@ -14,7 +14,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::Parser;
-use orrery_coordinator::server::{ServerConfig, SystemPresenceClock, SystemUnixClock};
+use orrery_coordinator::server::{
+    ServerConfig, StrikesMode, StrikesPosture, SystemPresenceClock, SystemUnixClock,
+};
 use orrery_coordinator::{CoordinatorServer, InterestIssuer, WitnessEpochIssuer};
 use orrery_protocol::{GridId, IssuerKey, IssuerKeyId, NodeId};
 
@@ -82,6 +84,18 @@ struct Cli {
     /// names when it says which witness set it was collected under.
     #[arg(long, default_value_t = 1, env = "ORRERY_WITNESS_INCARNATION")]
     witness_incarnation: u64,
+
+    /// D32 control C5: strike enforcement posture for this coordinator.
+    ///
+    /// The default is `off`, preserving the absence of strike actions until
+    /// an operator deliberately selects shadow or live.
+    #[arg(
+        long,
+        value_name = "off|shadow|live",
+        default_value = "off",
+        env = "ORRERY_STRIKES"
+    )]
+    strikes: StrikesMode,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -129,6 +143,7 @@ fn main() -> anyhow::Result<()> {
         grid: GridId::new(cli.grid),
         token_clock: Arc::new(SystemUnixClock),
         presence_clock: Arc::new(SystemPresenceClock::default()),
+        strikes_posture: strikes_posture(&cli),
         ..ServerConfig::new(cli.issuer_key.iter().map(|key| key.0.clone()), issuer)
     };
 
@@ -222,4 +237,79 @@ fn decode_key(value: &str) -> anyhow::Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("secret keys are 32 bytes"))
+}
+
+/// C5's startup default reaches the one posture cell every coordinator
+/// standing consumer shares.
+fn strikes_posture(cli: &Cli) -> StrikesPosture {
+    StrikesPosture::new(cli.strikes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static RAMP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn strikes_flag_selects_all_three_modes_at_the_coordinator_posture() {
+        let _lock = RAMP_ENV_LOCK.lock().expect("ramp environment lock");
+        let defaulted =
+            Cli::try_parse_from(["orrery-coordinator", "--interest-secret", &"00".repeat(32)])
+                .expect("bare C5 invocation parses");
+        assert_eq!(defaulted.strikes, StrikesMode::Off);
+
+        for (spelling, expected) in [
+            ("off", StrikesMode::Off),
+            ("shadow", StrikesMode::Shadow),
+            ("live", StrikesMode::Live),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "orrery-coordinator",
+                "--interest-secret",
+                &"00".repeat(32),
+                "--strikes",
+                spelling,
+            ])
+            .expect("C5 posture parses");
+            let config = ServerConfig {
+                strikes_posture: strikes_posture(&parsed),
+                ..ServerConfig::new(
+                    std::iter::empty(),
+                    InterestIssuer::new(iroh::SecretKey::from_bytes(&[1; 32]), IssuerKeyId::new(1)),
+                )
+            };
+            assert_eq!(config.strikes_posture.get(), expected);
+        }
+    }
+
+    #[test]
+    fn strikes_environment_fallback_yields_to_an_explicit_flag() {
+        const NAME: &str = "ORRERY_STRIKES";
+        let _lock = RAMP_ENV_LOCK.lock().expect("ramp environment lock");
+        let previous = std::env::var_os(NAME);
+        std::env::set_var(NAME, "shadow");
+        let from_env =
+            Cli::try_parse_from(["orrery-coordinator", "--interest-secret", &"00".repeat(32)]);
+        let from_flag = Cli::try_parse_from([
+            "orrery-coordinator",
+            "--interest-secret",
+            &"00".repeat(32),
+            "--strikes",
+            "live",
+        ]);
+        match previous {
+            Some(value) => std::env::set_var(NAME, value),
+            None => std::env::remove_var(NAME),
+        }
+
+        assert_eq!(
+            from_env.expect("environment fallback parses").strikes,
+            StrikesMode::Shadow
+        );
+        assert_eq!(
+            from_flag.expect("explicit flag parses").strikes,
+            StrikesMode::Live
+        );
+    }
 }

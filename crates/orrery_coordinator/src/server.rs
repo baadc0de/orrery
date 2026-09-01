@@ -228,6 +228,21 @@ pub enum StrikesMode {
     Live,
 }
 
+impl core::str::FromStr for StrikesMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "live" => Ok(Self::Live),
+            other => Err(format!(
+                "unknown strikes mode `{other}` (expected one of: off, shadow, live)"
+            )),
+        }
+    }
+}
+
 /// The runtime half of C5's lever on this process: a posture cell shared by
 /// everything that consults standing state here.
 ///

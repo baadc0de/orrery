@@ -50,10 +50,12 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
-use orrery_persistd::gateway::SessionTokenV1Authorizer;
+use orrery_persistd::gateway::{SessionTokenV1Authorizer, StrikesEnforcement, StrikesPosture};
 #[cfg(feature = "fdb")]
 use orrery_persistd::intent::FdbRampPostureStore;
-use orrery_persistd::intent::{AttestationEnforcement, BaselineIntentValidator};
+use orrery_persistd::intent::{
+    AttestationEnforcement, BaselineIntentValidator, QuarantineValidation,
+};
 #[cfg(any(feature = "fdb", test))]
 use orrery_persistd::intent::{RampMode, RampPosture};
 use orrery_persistd::journal::{
@@ -178,6 +180,16 @@ struct Cli {
     #[arg(long, value_name = "off|shadow|required", default_value = "off")]
     attestation_enforcement: AttestationEnforcement,
 
+    /// D32 control C2: quarantined-session full-validation posture.
+    ///
+    /// `live` is the default because it is this binary's already-landed
+    /// behaviour. `shadow` records each quarantined shortcut incidence while
+    /// taking the ordinary path; `off` takes that path without observing.
+    /// This is a startup selector only: D32's posture writer authentication
+    /// remains open, so no durable-row writer is invented here.
+    #[arg(long, value_name = "off|shadow|live", default_value = "live")]
+    quarantine_validation: QuarantineValidation,
+
     /// D32 control C4: guilty-verdict authority correction posture.
     ///
     /// `shadow` constructs, signs, hashes and addresses exactly the payload
@@ -186,6 +198,14 @@ struct Cli {
     /// startup default within the one-second poll interval.
     #[arg(long, value_name = "off|shadow|live", default_value = "off")]
     authority_correction: AuthorityCorrectionEnforcement,
+
+    /// D32 control C5: strike enforcement posture for this gateway.
+    ///
+    /// The default is `off`; a configured invalidation feed remains inert
+    /// until an operator selects shadow or live. The existing posture cell is
+    /// the runtime seam, but this flag supplies only its startup default.
+    #[arg(long, value_name = "off|shadow|live", default_value = "off")]
+    strikes: StrikesEnforcement,
 
     /// Hex-encoded iroh secret key, pinning the gateway's NodeId across runs.
     /// When absent a fresh identity is generated per boot.
@@ -2494,22 +2514,24 @@ where
     // asked for. `off` keeps the landed constructor untouched — including its
     // absent resolver, which is honest rather than degraded (a validator with
     // no `id/` rows has no account to compare and says so by having none).
-    let validator: Arc<dyn orrery_persistd::intent::IntentValidator> = match &attestation {
-        None => Arc::new(BaselineIntentValidator::permissive()),
+    let validator = match &attestation {
+        None => BaselineIntentValidator::permissive(),
         Some(wiring) => match wiring.mode {
-            AttestationEnforcement::Off => Arc::new(BaselineIntentValidator::permissive()),
-            AttestationEnforcement::Shadow => Arc::new(BaselineIntentValidator::shadow(
+            AttestationEnforcement::Off => BaselineIntentValidator::permissive(),
+            AttestationEnforcement::Shadow => BaselineIntentValidator::shadow(
                 Arc::clone(&wiring.epochs),
                 Arc::clone(&interest_authority),
                 Arc::clone(&wiring.bindings),
-            )),
-            AttestationEnforcement::Required => Arc::new(BaselineIntentValidator::enforcing(
+            ),
+            AttestationEnforcement::Required => BaselineIntentValidator::enforcing(
                 Arc::clone(&wiring.epochs),
                 Arc::clone(&interest_authority),
                 Arc::clone(&wiring.bindings),
-            )),
+            ),
         },
     };
+    let validator: Arc<dyn orrery_persistd::intent::IntentValidator> =
+        Arc::new(validator.with_quarantine_validation(cli.quarantine_validation));
 
     Ok(GatewayConfig {
         witness_epochs: attestation
@@ -2531,6 +2553,7 @@ where
         // exactly what it does not check — every durable invariant, which a
         // linked `Ruleset` and the FDB transaction still owe.
         validator,
+        strikes_posture: StrikesPosture::new(cli.strikes),
         authority_correction_posture: AuthorityCorrectionPosture::new(cli.authority_correction),
         ..GatewayConfig::default()
     })
@@ -3243,6 +3266,10 @@ mod tests {
             );
         }
     }
+    // clap reads process-global environment during parsing. Tests that inspect
+    // a default and tests that temporarily set one of these fallbacks must not
+    // race each other.
+    static RAMP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn cli_env_fallback_and_flag_precedence() {
@@ -3332,7 +3359,9 @@ mod tests {
             ))],
             coordinator_key: Vec::new(),
             attestation_enforcement: AttestationEnforcement::Off,
+            quarantine_validation: QuarantineValidation::Live,
             authority_correction: AuthorityCorrectionEnforcement::Off,
+            strikes: StrikesEnforcement::Off,
             no_journal_retention: false,
             archive_retention: false,
             archive_dir: None,
@@ -3739,6 +3768,64 @@ mod tests {
                     .expect("C4 posture reaches gateway config");
             assert_eq!(config.authority_correction_posture.get(), expected);
         }
+    }
+
+    /// C5 reaches the gateway's posture cell, rather than stopping at clap.
+    #[test]
+    fn strikes_flag_selects_all_three_modes_at_the_gateway_posture() {
+        let _lock = RAMP_ENV_LOCK.lock().expect("ramp environment lock");
+        let defaulted = Cli::try_parse_from(["persistd"]).expect("bare invocation parses");
+        assert_eq!(defaulted.strikes, StrikesEnforcement::Off);
+
+        for (spelling, expected) in [
+            ("off", StrikesEnforcement::Off),
+            ("shadow", StrikesEnforcement::Shadow),
+            ("live", StrikesEnforcement::Live),
+        ] {
+            let parsed = Cli::try_parse_from(["persistd", "--strikes", spelling])
+                .expect("C5 posture parses");
+            let config =
+                gateway_config(&parsed, None, |_cluster_file, _grid, _attestation| Ok(None))
+                    .expect("C5 posture reaches gateway config");
+            assert_eq!(config.strikes_posture.get(), expected);
+        }
+    }
+
+    /// C2 and C5 are posture mode selectors, so they take no environment
+    /// fallback — the same rule that removed C1's and C4's in #869.
+    ///
+    /// D32 makes promoting a control an operator decision. A variable a
+    /// process inherits from its parent is not one, and a supervisor that
+    /// exports it arms every persistd it spawns at once.
+    #[test]
+    fn c2_and_c5_postures_do_not_read_the_environment() {
+        let _lock = RAMP_ENV_LOCK.lock().expect("ramp environment lock");
+        const C2: &str = "ORRERY_QUARANTINE_VALIDATION";
+        const C5: &str = "ORRERY_STRIKES";
+        let old_c2 = std::env::var_os(C2);
+        let old_c5 = std::env::var_os(C5);
+        std::env::set_var(C2, "off");
+        std::env::set_var(C5, "live");
+        let parsed = Cli::try_parse_from(["persistd"]).expect("bare invocation parses");
+        match old_c2 {
+            Some(value) => std::env::set_var(C2, value),
+            None => std::env::remove_var(C2),
+        }
+        match old_c5 {
+            Some(value) => std::env::set_var(C5, value),
+            None => std::env::remove_var(C5),
+        }
+
+        assert_eq!(
+            parsed.quarantine_validation,
+            QuarantineValidation::Live,
+            "{C2} moved C2 off its D32 default of live"
+        );
+        assert_eq!(
+            parsed.strikes,
+            StrikesEnforcement::Off,
+            "{C5} moved C5 off its D32 default of off"
+        );
     }
 
     #[test]
