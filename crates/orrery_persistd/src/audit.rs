@@ -5,11 +5,10 @@
 //! start cadence (daily full conservation sweep, hourly incremental over hot
 //! ledgers), and emitting findings into the audit pipeline", and gates C3's
 //! promotion review on it. That liveness has two halves with very different
-//! readiness. The **daily full conservation sweep** reads history, which D20's
-//! bounded journal means exists only where P6's archive tailer has put it —
-//! that half is #224's and P6's. This module is the **hourly incremental**: it
-//! reads *current ledger state*, every key it touches is landed, and it is
-//! buildable at P5 today. It does not settle cadence, ownership or the
+//! readiness. The **daily full conservation sweep** reads history from Shape
+//! C's receipt archive and now lives in [`conservation`]. The body below is the
+//! **hourly incremental**: it reads *current ledger state*. It does not settle
+//! cadence, ownership or the
 //! time-to-detection target — ADR-0032 leaves those to #224; it produces the
 //! measured time-to-detection figure #224 needs to settle them from evidence.
 //!
@@ -54,8 +53,8 @@
 //!   durable trace after the hour-old intent row is swept is the balance it
 //!   created. "Nonzero balance with no provenance" is therefore not a finding
 //!   any incremental reader may raise; separating sanctioned from unsanctioned
-//!   creation needs history, which is the daily sweep's problem and waits for
-//!   the archive.
+//!   creation needs history, which [`conservation`] now reads from the receipt
+//!   archive.
 //! - **Magnitude.** A finding says *that* current state contradicts an
 //!   invariant; quantifying the leak against sanctioned flows is the daily
 //!   full sweep's job.
@@ -90,6 +89,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::keyspace::{self, ReceiptRow};
 
+pub mod conservation;
+
 /// The schema string every report this module writes carries.
 ///
 /// Versioned from the first write, for the reason
@@ -98,7 +99,7 @@ use crate::keyspace::{self, ReceiptRow};
 /// absent.
 pub const SWEEP_REPORT_SCHEMA: &str = "orrery.audit.sweep/1";
 
-/// What a finding found, one variant per swept invariant.
+/// What a finding found, one variant per incremental or full-sweep invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FindingKind {
     /// Two or more rows in `ledger/item`'s sub-span name the same item: the
@@ -117,6 +118,18 @@ pub enum FindingKind {
     /// A row inside an economic sub-span whose key or value will not decode.
     /// Carries the raw key; the family decides what "will not decode" means.
     UndecodableLedgerRow,
+    /// The full archive sweep found that an asset's observed signed deltas do
+    /// not equal its receipted sanctioned-source deltas over the window.
+    GlobalConservationBreak,
+    /// A new item-owner interval began before the preceding owner interval
+    /// ended.
+    OverlappingItemOwnership,
+    /// An item was already owned after a recorded burn, without an intervening
+    /// `None -> Some` mint transition.
+    UnreceiptedItemOwnership,
+    /// A receipt's interpreted op ids and effect-vector lengths disagree, so
+    /// the sweep cannot derive the sanctioned side of its conservation sum.
+    ReceiptEffectShapeMismatch,
 }
 
 impl FindingKind {
@@ -132,11 +145,15 @@ impl FindingKind {
             Self::UnbackedReceiptParty => "unbacked_receipt_party",
             Self::StrayLedgerRow => "stray_ledger_row",
             Self::UndecodableLedgerRow => "undecodable_ledger_row",
+            Self::GlobalConservationBreak => "global_conservation_break",
+            Self::OverlappingItemOwnership => "overlapping_item_ownership",
+            Self::UnreceiptedItemOwnership => "unreceipted_item_ownership",
+            Self::ReceiptEffectShapeMismatch => "receipt_effect_shape_mismatch",
         }
     }
 }
 
-/// One contradiction between current ledger state and a swept invariant.
+/// One contradiction between ledger state/history and a swept invariant.
 ///
 /// Findings are **reports, never actions**: the auditor does not quarantine,
 /// strike, annul or roll anything back. C3 is the control, and whether a
@@ -147,9 +164,9 @@ pub struct AuditFinding {
     pub kind: FindingKind,
     /// The item named by an ownership finding, when there is one.
     pub item: Option<ItemUid>,
-    /// The account named by a balance or receipt finding, when there is one.
+    /// The account named by a balance, receipt, or ownership finding.
     pub account: Option<AccountId>,
-    /// The asset named by a balance finding, when there is one.
+    /// The asset named by a balance or conservation finding.
     pub asset: Option<AssetId>,
     /// The intent id of a receipt finding, when there is one.
     pub receipt_intent_id: Option<u128>,

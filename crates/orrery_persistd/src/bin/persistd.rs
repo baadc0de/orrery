@@ -298,6 +298,19 @@ struct Cli {
     )]
     receipt_archive_page_rows: usize,
 
+    /// Full conservation-sweep cadence in milliseconds; 0 disables it.
+    ///
+    /// Enabled as part of the explicit `--receipt-archive` role and defaulted
+    /// to D32 clause (g)'s daily start cadence. Each pass reads every receipt
+    /// object visible at its start; findings are reports on `orrery_audit` and
+    /// never write, annul, or enforce.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = orrery_persistd::audit::conservation::DEFAULT_FULL_SWEEP_INTERVAL_MS
+    )]
+    full_conservation_sweep_interval_ms: u64,
+
     /// Checkpoint cadence in milliseconds, overriding D16's 20 s (jitter is
     /// held at a quarter of it, as the default pair is).
     ///
@@ -1560,6 +1573,24 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
+    let full_conservation_sweeper =
+        if cli.receipt_archive && cli.full_conservation_sweep_interval_ms != 0 {
+            let sweeper = orrery_persistd::audit::conservation::ReceiptArchiveSweeper::open(
+                cli.archive_dir.as_ref().expect("validated archive dir"),
+                cli.archive_prefix.clone(),
+            )?;
+            tracing::info!(
+                interval_ms = cli.full_conservation_sweep_interval_ms,
+                "daily full conservation sweeper started"
+            );
+            Some(spawn_full_conservation_sweeper(
+                sweeper,
+                Duration::from_millis(cli.full_conservation_sweep_interval_ms),
+            ))
+        } else {
+            None
+        };
+
     tracing::info!(
         gateway = %gateway.id(),
         node_id = topology.node_id,
@@ -1567,6 +1598,7 @@ async fn main() -> anyhow::Result<()> {
         role = topology.role.name(),
         archive_tailer = archive_tailer.is_some(),
         receipt_archive_tailer = receipt_archive_tailer.is_some(),
+        full_conservation_sweeper = full_conservation_sweeper.is_some(),
         startup_elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd cluster up"
     );
@@ -1615,6 +1647,11 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(reporter) = metrics_reporter {
         reporter.shutdown().await;
+    }
+
+    if let Some(sweeper) = full_conservation_sweeper {
+        sweeper.abort();
+        let _ = sweeper.await;
     }
 
     if let Some(tailer) = receipt_archive_tailer {
@@ -2576,6 +2613,64 @@ fn spawn_hot_ledger_sweeper(
     })
 }
 
+/// Run D32 clause (g)'s archive-consuming pass on its daily start cadence.
+///
+/// The blocking Parquet scan stays off Tokio's executor. A pass captures its
+/// object list before reading, so concurrently published objects wait for the
+/// next cadence rather than extending an in-flight window indefinitely.
+fn spawn_full_conservation_sweeper(
+    sweeper: orrery_persistd::audit::conservation::ReceiptArchiveSweeper,
+    interval: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let started = Instant::now();
+            let started_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since_epoch| since_epoch.as_millis() as u64);
+            let pass = sweeper.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut report = pass.run_pass(started_at_ms, started_at_ms)?;
+                report.finished_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(started_at_ms, |since_epoch| since_epoch.as_millis() as u64);
+                Ok::<_, orrery_persistd::audit::conservation::FullSweepError>(report)
+            })
+            .await;
+            match result {
+                Ok(Ok(report)) => tracing::info!(
+                    target: "orrery_audit",
+                    objects = report.population.objects,
+                    object_bytes = report.population.object_bytes,
+                    receipts = report.population.receipts,
+                    legacy_receipts = report.population.legacy_receipts,
+                    balance_deltas = report.population.balance_deltas,
+                    ownership_transitions = report.population.ownership_transitions,
+                    ownership_resort_bytes_bound = report.ownership_resort.memory_bytes_bound,
+                    findings = report.findings.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    first_receipt_key = %report.first_receipt_key,
+                    last_receipt_key = %report.last_receipt_key,
+                    "full conservation sweep pass complete"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    target: "orrery_audit",
+                    %error,
+                    "full conservation sweep pass failed"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "orrery_audit",
+                    %error,
+                    "full conservation sweep worker failed"
+                ),
+            }
+        }
+    })
+}
+
 /// Build C1's wiring from the CLI, or refuse a mode that could never evaluate.
 ///
 /// `None` is `off`: no cache, no resolver, and the landed permissive validator
@@ -3129,6 +3224,8 @@ mod tests {
             archive_prefix: String::new(),
             receipt_archive: false,
             receipt_archive_page_rows: orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS,
+            full_conservation_sweep_interval_ms:
+                orrery_persistd::audit::conservation::DEFAULT_FULL_SWEEP_INTERVAL_MS,
             checkpoint_interval_ms: None,
             hot_ledger_sweep_interval_ms: 3_600_000,
             dev_seed: None,
@@ -3481,16 +3578,24 @@ mod tests {
             orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS
         );
         assert_eq!(orrery_persistd::archive::RECEIPT_ARCHIVE_SCANNERS, 1);
+        assert_eq!(
+            defaulted.full_conservation_sweep_interval_ms,
+            orrery_persistd::audit::conservation::DEFAULT_FULL_SWEEP_INTERVAL_MS,
+            "the explicit receipt archive role carries the daily sweep cadence"
+        );
 
         let configured = Cli::try_parse_from([
             "persistd",
             "--receipt-archive",
             "--receipt-archive-page-rows",
             "256",
+            "--full-conservation-sweep-interval-ms",
+            "60000",
         ])
         .expect("receipt scanner flags parse");
         assert!(configured.receipt_archive);
         assert_eq!(configured.receipt_archive_page_rows, 256);
+        assert_eq!(configured.full_conservation_sweep_interval_ms, 60_000);
     }
 
     #[test]
