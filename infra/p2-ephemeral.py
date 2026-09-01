@@ -555,6 +555,15 @@ def qualify_once(candidate: dict[str, Any], amis: dict[str, str], attempt: int) 
             qualification_user_data(candidate),
             f"qualify-{candidate['instance_type']}-a{attempt}",
         )
+    except RunInstancesThrottled as exc:
+        return {**candidate, "status": "throttled", "qualified": False, "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - launch refusal is evidence, not a hardware result
+        # Keep a refusal before RunInstances succeeds distinct from a launched
+        # device that returned a bad fio result.  The former means there was no
+        # device to qualify at all; collapsing it into `error` made #623 read
+        # like a fleet-wide storage verdict.
+        return {**candidate, "status": "launch_failed", "qualified": False, "reason": str(exc)}
+    try:
         marker, payload = wait_for_marker(instance_id, (QUAL_MARKER, INTERRUPT_MARKER), 1200)
         if marker == INTERRUPT_MARKER:
             return {**candidate, "status": "interrupted", "qualified": False, "reason": payload.get("reason", "spot interruption")}
@@ -583,8 +592,6 @@ def qualify_once(candidate: dict[str, Any], amis: dict[str, str], attempt: int) 
         )
         payload["status"] = "qualified" if payload.get("qualified") else "rejected"
         return payload
-    except RunInstancesThrottled as exc:
-        return {**candidate, "status": "throttled", "qualified": False, "reason": str(exc)}
     except Exception as exc:  # noqa: BLE001 - each loser must remain in the table
         return {**candidate, "status": "error", "qualified": False, "reason": str(exc)}
     finally:
@@ -691,6 +698,21 @@ def write_nonverdict(
                 "reason": "the D16 latency verdict was not evaluated because RunInstances throttling prevented a complete qualification pass",
             },
         }
+    if result == "provisioning_failed":
+        launch_failed_count = sum(row.get("status") == "launch_failed" for row in rows)
+        proofs = {
+            "device_qualification": {
+                "qualified": None,
+                "candidate_count": len(rows),
+                "qualified_count": qualified_count,
+                "launch_failed_count": launch_failed_count,
+                "selected": None,
+            },
+            "latency": {
+                "gate": "not_evaluated",
+                "reason": "the D16 latency verdict was not evaluated because no candidate instance launched to run fio job A",
+            },
+        }
     artifact = {
         "kind": "p2_two_process_kill9_gate",
         "created_at": dt.datetime.now(dt.UTC).isoformat(),
@@ -731,6 +753,15 @@ def select_gate_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         )
         write_nonverdict("interrupted", reason, rows)
         return None
+    launch_failed_count = sum(row.get("status") == "launch_failed" for row in rows)
+    if launch_failed_count == len(rows):
+        reason = (
+            f"device provisioning failed: zero of {len(rows)} candidates launched; no device was selected. "
+            "The D16 latency verdict was not evaluated because fio job A did not run. "
+            "Inspect the candidate qualification reasons for the RunInstances failure."
+        )
+        write_nonverdict("provisioning_failed", reason, rows)
+        raise ControllerError(reason)
     throttled_count = sum(row.get("status") == "throttled" for row in rows)
     if throttled_count:
         reason = (
@@ -945,6 +976,22 @@ def self_test() -> int:
             f"{throttled.get('status')!r}, not the distinct throttled outcome"
         )
 
+    # A RunInstances refusal is also controller evidence, but unlike throttling
+    # it cannot become a device result by retrying.  Keep it out of the fio
+    # qualification population entirely.
+    globals()["launch"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        ControllerError("failed (254): aws: (Blocked) RunInstances account verification hold")
+    )
+    try:
+        blocked = qualify_once(candidate, {"x86_64": "ami-self-test"}, 1)
+    finally:
+        globals()["launch"] = original_launch
+    if blocked.get("status") != "launch_failed" or "Blocked" not in blocked.get("reason", ""):
+        raise ControllerError(
+            "self-test: RunInstances refusal was recorded as "
+            f"{blocked.get('status')!r}, not the distinct launch_failed outcome"
+        )
+
     # The resolver may only select what the policy names, and both sides read
     # the same list. A copy on either side drifts into an IAM denial whose
     # message says nothing about a stale pin.
@@ -1059,22 +1106,74 @@ def self_test() -> int:
     original_out = OUT
     with tempfile.TemporaryDirectory(prefix="p2-ephemeral-verdict-") as tmp:
         OUT = Path(tmp)
-        unqualified = [
-            {"instance_type": f"synthetic-{index}.2xlarge", "architecture": "x86_64", "status": "error", "qualified": False}
+        not_launched = [
+            {
+                "instance_type": f"synthetic-unavailable-{index}.2xlarge",
+                "architecture": "x86_64",
+                "status": "launch_failed",
+                "qualified": False,
+                "reason": "RunInstances Blocked: account verification hold",
+            }
             for index in range(3)
+        ]
+        try:
+            select_gate_candidate(not_launched)
+        except ControllerError as exc:
+            provisioning_failure = str(exc)
+        else:
+            raise ControllerError("self-test: no-device-selected synthetic run unexpectedly passed")
+        if (
+            "device provisioning failed: zero of 3 candidates launched" not in provisioning_failure
+            or "fio job A did not run" not in provisioning_failure
+            or "no device passed fio job A" in provisioning_failure
+        ):
+            raise ControllerError(
+                "self-test: no-device-selected failure did not name provisioning rather than fio qualification: "
+                f"{provisioning_failure}"
+            )
+        print(f"p2-ephemeral: synthetic no-device-selected case failed as required: {provisioning_failure}")
+        artifact = json.loads((OUT / "artifact.json").read_text(encoding="utf-8"))
+        if (
+            artifact.get("result") != "provisioning_failed"
+            or artifact.get("proofs", {}).get("latency", {}).get("gate") != "not_evaluated"
+            or artifact.get("proofs", {}).get("device_qualification", {}).get("launch_failed_count") != 3
+        ):
+            raise ControllerError("self-test: no-device-selected synthetic run lost its distinct provisioning verdict")
+
+        # The opposite mutation must still fail as a device qualification, not
+        # turn a D16-ineligible device into a selected gate host.
+        unqualified = [
+            {
+                "instance_type": "synthetic-slow.2xlarge",
+                "architecture": "x86_64",
+                "status": "rejected",
+                "qualified": False,
+                "measured": {
+                    "aggregate_barriers_per_s": 940.0,
+                    "worst_sync_p99_ms": 0.185,
+                    "worst_sync_max_ms": 1.001,
+                },
+                "reason": "job 1 fdatasync max 1.001 ms; required < 1.000 ms",
+            }
         ]
         try:
             select_gate_candidate(unqualified)
         except ControllerError as exc:
-            failure = str(exc)
+            qualification_failure = str(exc)
         else:
-            raise ControllerError("self-test: selected None synthetic run unexpectedly passed")
-        if "zero of 3 candidates qualified" not in failure or "D16 latency verdict was not evaluated" not in failure:
-            raise ControllerError(f"self-test: unqualified failure did not name its basis: {failure}")
-        print(f"p2-ephemeral: synthetic unqualified case failed as required: {failure}")
+            raise ControllerError("self-test: D16-ineligible synthetic device unexpectedly passed")
+        if (
+            "no device passed fio job A" not in qualification_failure
+            or "device provisioning failed" in qualification_failure
+        ):
+            raise ControllerError(
+                "self-test: D16-ineligible device was not reported as a fio qualification failure: "
+                f"{qualification_failure}"
+            )
         artifact = json.loads((OUT / "artifact.json").read_text(encoding="utf-8"))
         if artifact.get("result") != "unqualified" or artifact.get("proofs", {}).get("latency", {}).get("gate") != "unqualified":
-            raise ControllerError("self-test: unqualified synthetic run lost its distinct artifact verdict")
+            raise ControllerError("self-test: D16-ineligible synthetic device lost its unqualified verdict")
+        print("p2-ephemeral: synthetic D16-ineligible device remained unqualified")
 
         qualified = [{
             "instance_type": "synthetic-pass.2xlarge", "architecture": "x86_64", "status": "measured", "qualified": True,
