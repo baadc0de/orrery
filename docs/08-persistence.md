@@ -3669,9 +3669,23 @@ analysis.
   (overwritten) checkpoint.
 
 - **Daily conservation sweep (#615).** Needs per-asset global conservation and
-  per-item ownership continuity across history. The schema stores every record
-  with its `entity`, `kind`, and opaque payload, so the sweep can see every
-  balance delta and ownership change. However, the primary clustering is
+  per-item ownership continuity across history. **The archive cannot serve this
+  today, and the schema is not what is missing** (#832). D11 splits the write
+  classes: bulk diffs go to the journal, economic intents go directly to
+  FoundationDB (`docs/adr/0011-persistence.md`). The only production
+  `JournalRecord` producer consumes `DiffUplink` component payloads, and the
+  archive stores only journal records — so balance and ownership effects, which
+  are written inside the FDB transaction, never reach it. Pure credits produce
+  no receipt at all, and `ReceiptRow` carries `{ intent_id, parties, ops }` —
+  op *ids*, not deltas, item ids or ownership transitions.
+
+  A durable economic-effect record on a path the archive can see is the
+  prerequisite, and it is an owner decision (#832) because it touches the intent
+  path's transaction. Until it lands, this bullet describes an intent, not a
+  capability.
+
+  When it does land, the layout question below still applies. The primary
+  clustering is
   `(grid, cell, lsn)`, while per-item ownership continuity is a
   per-`PersistId` history; an item that moves between cells has its history
   scattered across every cell's objects. Serving #615 efficiently from this
