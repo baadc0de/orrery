@@ -30,10 +30,17 @@ bevy_ecs = { workspace = true }
 iroh = { workspace = true }
 
 [dev-dependencies]
+aeronet_io = { workspace = true }
+aeronet_iroh = { workspace = true }
 bevy = { workspace = true }
 # lightyear's replication backend calls `init_state`, which needs the
 # `StateTransition` schedule `StatesPlugin` installs; `MinimalPlugins` has no
 # states. A real game gets it from `DefaultPlugins`.
 bevy_state = { workspace = true }
+lightyear = { workspace = true }
+# The headless facade fixture registers one engine-handle-free payload through
+# the guarded registration surface before proving that no transport bridge
+# carries it between the two real iroh sessions.
+orrery_replicon = { path = "../orrery_replicon" }
 # The test `Ruleset`: real, Bevy-free, and already in the workspace.
 orrery_games = { path = "../orrery_games" }
