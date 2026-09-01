@@ -64,7 +64,7 @@ right column; discrepancies found during verification are in §7.
 | E-12 | A3, twice independently: the dedicated-store topology already ships and the shared application world is rejected outright | `docs/plans/a3-simulation-host-comparison.md` (V2 rejected at 268/500; "uniquely hostile to the Unreal direction"); `docs/plans/a3-simulation-host-second-opinion.md` §2 ("The `BTreeMap` inside `Executor` *is* the dedicated canonical world, minus the word 'world'") and §6 ("dedicated, permanently; it is what already ships") |
 | E-13 | Sorted-by-stable-id projection agrees across entity insertion orders; raw world iteration does not; observed stability proves nothing (ambiguous schedules ran 200/200 stable in one lane) | Found independently three times (A3 P1/P2, second opinion P-2, A4 E-3); stability caveat A3 P3, restated at A7 §5.2. Relied on as recorded — the three independent reproductions are the point; not re-run |
 | E-14 | Wire and id types are engine-free and fixed-width: `Tick(pub u64)`, `PersistId(pub u64)`; `cargo tree -p orrery_protocol \| grep -ci bevy` = 0 | `crates/orrery_protocol/src/persist.rs:28,46`; tree count re-run for this document |
-| E-15 | No field host exists; the `SimulationHost` seam is recommendation, not code | A3 G14; `docs/10-crates.md` documents `orrery_field_host` which does not exist — already filed as #414, confirmed still open and still absent from `crates/` today |
+| E-15 | No field host exists; the `SimulationHost` seam is recommendation, not code (as written. The seam half is history: it landed 2026-08-30 as `crates/orrery_sim_host` (#738) — `SimulationHost` at `src/lib.rs:248`, the existing `Ruleset` hosted through an adapter — with the `EcsBackend` substrate admitted behind it on 2026-08-31 (#757; `src/ecs.rs:653`). The field-host half stands: no field host is built on the seam yet — its one dependent crate is `gates/migration-bench`) | A3 G14; `docs/10-crates.md` documents `orrery_field_host` which does not exist — already filed as #414, confirmed still open and still absent from `crates/` today (still absent — the crate that landed is `orrery_sim_host`, not the census's `orrery_field_host`, annotated "planned P6, not built" at `docs/10-crates.md:83`; #414 itself has since closed) |
 
 ---
 
@@ -260,9 +260,12 @@ emits what the Bevy mirror consumes today, keyed the same way:
   "an admission uni-stream, then tagged datagrams" over iroh, and persistd
   serves gRPC (`crates/orrery_persistd/src/journal/chain_grpc.rs`) — the
   sidecar adds no novel transport class. Note honestly: the host the sidecar
-  would wrap — the `SimulationHost` seam — **does not exist yet** (E-15);
-  the sidecar is therefore two absences deep: no host seam, no Unreal
-  consumer. Both A3 lanes recommend building the seam first for reasons
+  would wrap — the `SimulationHost` seam — **does not exist yet** (E-15;
+  as written — overtaken 2026-08-30, when the seam landed as
+  `crates/orrery_sim_host` (#738), with the `EcsBackend` substrate admitted
+  behind it 2026-08-31, #757). What was two absences deep — no host seam,
+  no Unreal consumer — is one: the host seam exists, the Unreal consumer
+  does not. Both A3 lanes recommend building the seam first for reasons
   independent of Unreal.
 - **Embedded (second): a static/dynamic library owning the same canonical
   store behind a C ABI.** Same crates, same store, no process boundary.
@@ -340,7 +343,8 @@ holds no authority, predicts nothing, persists nothing. (Brief phase 8,
 
 **Components (three, no more):**
 
-1. **Sidecar binary**: the `SimulationHost` seam (must exist first — E-15)
+1. **Sidecar binary**: the `SimulationHost` seam (must exist first — E-15;
+   it does — landed 2026-08-30, #738)
    hosting `Regolith` via the existing `Ruleset` adapter, plus an IPC adapter
    speaking length-prefixed postcard frames over a local transport (the
    persistd/coordinator session pattern — §4.3). Links no render, no winit,
