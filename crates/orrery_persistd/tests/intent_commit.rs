@@ -823,8 +823,8 @@ async fn reset_ledger(
                     false,
                 );
                 while let Some(kv) = stream.try_next().await? {
-                    if let Ok(row) =
-                        postcard::from_bytes::<orrery_persistd::keyspace::ReceiptRow>(kv.value())
+                    if let Ok((row, _version)) =
+                        orrery_persistd::keyspace::decode_receipt_row(kv.value())
                     {
                         if intents.contains(&row.intent_id) {
                             stale.push(kv.key().to_vec());
@@ -903,9 +903,7 @@ async fn receipts_for(
             false,
         );
         while let Some(kv) = stream.try_next().await? {
-            if let Ok(row) =
-                postcard::from_bytes::<orrery_persistd::keyspace::ReceiptRow>(kv.value())
-            {
+            if let Ok((row, _version)) = orrery_persistd::keyspace::decode_receipt_row(kv.value()) {
                 if row.intent_id == intent_id {
                     // The versionstamp is 10 bytes at offset 2, so a receipt
                     // key is 12 bytes and the placeholder is gone.
@@ -988,6 +986,79 @@ async fn fdb_item_transfer_moves_the_row_and_both_balances() {
         receipts[0].ops,
         vec![orrery_persistd::LEDGER_ITEM_TRANSFER_OP]
     );
+    assert_eq!(
+        receipts[0].balance_deltas,
+        vec![
+            orrery_persistd::keyspace::ReceiptBalanceDelta {
+                account: orrery_protocol::AccountId::new(buyer),
+                asset: orrery_protocol::AssetId::new(asset),
+                delta: -price,
+            },
+            orrery_persistd::keyspace::ReceiptBalanceDelta {
+                account: orrery_protocol::AccountId::new(seller),
+                asset: orrery_protocol::AssetId::new(asset),
+                delta: price,
+            },
+        ]
+    );
+    assert_eq!(
+        receipts[0].ownership,
+        vec![orrery_persistd::keyspace::ReceiptOwnershipTransition {
+            item: orrery_protocol::ItemUid::new(item),
+            before: Some(orrery_protocol::AccountId::new(seller)),
+            after: Some(orrery_protocol::AccountId::new(buyer)),
+        }]
+    );
+}
+
+/// Shape C closes the original hole: a pure balance credit is a ledger
+/// mutation and therefore banks one account-scoped delta receipt in the same
+/// FDB transaction.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_pure_credit_banks_a_mandatory_effect_receipt() {
+    use orrery_persistd::IntentExecutor;
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let (account, asset, delta) = (0x8320_0001u64, 83u64, 68i64);
+    let id = 0x8320_0001u128;
+    let exec = connect_fresh(
+        &cluster,
+        GridId::new(9383),
+        &[],
+        &[(account, asset, 0)],
+        &[id],
+    )
+    .await;
+    let outcome = exec
+        .execute(&signed_intent(
+            id,
+            &secret(83),
+            orrery_persistd::LEDGER_CREDIT_OP,
+            &credit_args(account, asset, delta),
+        ))
+        .await
+        .expect("credit executes");
+    assert!(matches!(outcome, IntentOutcome::Committed { .. }));
+    assert_eq!(
+        read_balance(exec.database(), account, asset).await,
+        Some(delta)
+    );
+
+    let receipts = receipts_for(exec.database(), id).await;
+    assert_eq!(receipts.len(), 1, "pure credit banks exactly one receipt");
+    assert_eq!(
+        receipts[0].balance_deltas,
+        vec![orrery_persistd::keyspace::ReceiptBalanceDelta {
+            account: orrery_protocol::AccountId::new(account),
+            asset: orrery_protocol::AssetId::new(asset),
+            delta,
+        }]
+    );
+    assert!(receipts[0].ownership.is_empty());
 }
 
 /// Each durable refusal names itself, and none of them writes anything.

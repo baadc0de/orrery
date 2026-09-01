@@ -21,7 +21,7 @@
 //!
 //!    **Every read happens before every write**, across the whole intent and
 //!    not merely within one op: [`plan_ops`] reads and checks all the ops,
-//!    then [`apply_plan`] writes. Two reasons, and the second is a
+//!    then [`stage_ledger_mutation`] writes. Two reasons, and the second is a
 //!    correctness bug rather than a style preference. It is §7's order; and
 //!    `db.run` commits whatever the closure staged, so an executor that wrote
 //!    as it went and returned early on the third op's refusal would commit the
@@ -36,7 +36,7 @@
 //! transfers of the same item share: at most one of them can commit, and the
 //! loser's `db.run` retry re-reads the winner's owner and refuses with
 //! `REASON_NOT_ITEM_OWNER` — §7's "fails the check honestly". A durable
-//! refusal returns before [`apply_plan`] runs, so it writes nothing at all,
+//! refusal returns before [`stage_ledger_mutation`] runs, so it writes nothing at all,
 //! not even an `intent/` row: a rejected intent is not a durable fact and a
 //! later resubmission must be free to succeed if the ledger has moved.
 //!
@@ -70,8 +70,8 @@ use crate::FdbContext;
 use super::provisional::{self, ProvisionalStore};
 use super::stages;
 use super::{
-    IntentError, IntentExecutor, IntentPlan, ItemTransferArgs, OpsVerdict, PlannedWrite,
-    LEDGER_CREDIT_OP, LEDGER_ITEM_TRANSFER_OP,
+    IntentError, IntentExecutor, IntentPlan, ItemTransferArgs, LedgerMutation, OpsVerdict,
+    PlannedWrite, LEDGER_CREDIT_OP, LEDGER_ITEM_TRANSFER_OP,
 };
 
 /// The retry bound on `not_committed` conflicts (docs/08-persistence.md §7:
@@ -170,6 +170,8 @@ pub struct FdbIntentExecutor {
     ///
     /// [#222]: https://github.com/baadc0de/orrery/issues/222
     witness_enforcement: super::AttestationPosture,
+    #[cfg(test)]
+    abort_after_ledger_stage: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The active shard ownership an intent executor is allowed to write under.
@@ -197,6 +199,12 @@ pub struct IntentFence {
 }
 
 impl FdbIntentExecutor {
+    #[cfg(test)]
+    fn inject_abort_after_ledger_stage(&self) {
+        self.abort_after_ledger_stage
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Replace the shard set this executor admits intents under.
     ///
     /// Called after a live shard handover commits (either side of it): the
@@ -232,6 +240,8 @@ impl FdbIntentExecutor {
             witness_epochs: None,
             witness_bindings: None,
             witness_enforcement: super::AttestationPosture::new(super::AttestationEnforcement::Off),
+            #[cfg(test)]
+            abort_after_ledger_stage: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -252,6 +262,8 @@ impl FdbIntentExecutor {
             witness_epochs: None,
             witness_bindings: None,
             witness_enforcement: super::AttestationPosture::new(super::AttestationEnforcement::Off),
+            #[cfg(test)]
+            abort_after_ledger_stage: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -609,6 +621,8 @@ impl FdbIntentExecutor {
         let minted = self.allocate_ids(intent.ops.len() as u64).await?;
         let epochs = self.witness_epochs.clone();
         let bindings = self.witness_bindings.clone();
+        #[cfg(test)]
+        let abort_after_ledger_stage = Arc::clone(&self.abort_after_ledger_stage);
         // Read once, here, and used for the whole of this intent's commit.
         // D32 clause (c): "intents already past validation complete under the
         // prior mode" — so a posture write landing mid-transaction must not
@@ -650,6 +664,8 @@ impl FdbIntentExecutor {
                 let fence = fence.clone();
                 let epochs = epochs.clone();
                 let bindings = bindings.clone();
+                #[cfg(test)]
+                let abort_after_ledger_stage = Arc::clone(&abort_after_ledger_stage);
                 let epoch_row_seen = std::sync::Arc::clone(&epoch_row_seen);
                 let named = named.clone();
                 let hooks = std::sync::Arc::clone(&hooks);
@@ -822,7 +838,7 @@ impl FdbIntentExecutor {
                     // index read (`is_committed`), so the steady-state cost is
                     // exactly zero operations.
                     //
-                    // **Above `apply_plan`, and that is not cosmetic.** This
+                    // **Above the mutation stage, and that is not cosmetic.** This
                     // step can refuse (a draw key that was never this
                     // cell-epoch's, see `record_witness_epoch`), and `db.run`
                     // commits whatever a closure staged whether or not the
@@ -848,8 +864,20 @@ impl FdbIntentExecutor {
                         EpochRecord::NotApplicable => {}
                     }
 
-                    // Step 3: apply the ops' ledger effects (see `apply_plan`).
-                    apply_plan(&trx, &plan, &intent)?;
+                    // Step 3: consume the plan into the guarded bundle and
+                    // stage its effects and mandatory receipt together.
+                    let mutation = plan.into_mutation(&intent);
+                    stage_ledger_mutation(&trx, mutation.as_ref())?;
+                    #[cfg(test)]
+                    if abort_after_ledger_stage.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        hooks.mark_closure_end();
+                        return Err(FdbBindingError::new_custom_error(Box::new(
+                            IntentError::Store(
+                                "injected crash after staging ledger effects and receipt"
+                                    .to_owned(),
+                            ),
+                        )));
+                    }
 
                     // Step 4 (§7 step 3): the outcome row, same transaction —
                     // and, on the low-population path, the hold row beside it.
@@ -868,7 +896,12 @@ impl FdbIntentExecutor {
                             row.holds.push(keyspace::ProvisionalHold {
                                 intent_id: intent.intent_id,
                                 account,
-                                writes: provisional::provisional_writes(plan.writes()),
+                                writes: provisional::provisional_writes(
+                                    mutation.as_ref().map_or(
+                                        &[] as &[PlannedWrite],
+                                        LedgerMutation::writes,
+                                    ),
+                                ),
                                 committed_ms,
                                 finalize_by_ms: finalize_by,
                                 // Present by construction: admission refuses a
@@ -1360,18 +1393,20 @@ async fn plan_ops(
     Ok(PlanOutcome::Planned(plan))
 }
 
-/// Apply a checked plan's writes, then bank the trade receipt.
+/// Stage a checked mutation's writes and mandatory receipt in one transaction.
 ///
-/// Called only after [`plan_ops`] has accepted every op, so nothing here can
-/// fail a durable check — which is the property that makes an early return
-/// impossible past this line, and therefore makes a partially applied intent
-/// impossible too.
-fn apply_plan(
+/// `LedgerMutation` has no writes-only constructor. This function is the only
+/// production stage that emits `ledger/bal` or `ledger/item` writes, and it
+/// accepts the coupled type rather than a write slice. `None` means the intent
+/// carried only opaque ops and attempted no ledger mutation.
+fn stage_ledger_mutation(
     trx: &foundationdb::Transaction,
-    plan: &IntentPlan,
-    intent: &Intent,
+    mutation: Option<&LedgerMutation>,
 ) -> Result<(), FdbBindingError> {
-    for write in plan.writes() {
+    let Some(mutation) = mutation else {
+        return Ok(());
+    };
+    for write in mutation.writes() {
         match write {
             PlannedWrite::BalanceAdd {
                 account,
@@ -1387,23 +1422,22 @@ fn apply_plan(
                 let param = i128::from(*delta).to_le_bytes();
                 trx.atomic_op(&key, &param, MutationType::Add);
             }
-            PlannedWrite::ItemOwner { item, row } => {
+            PlannedWrite::ItemOwner { item, row, .. } => {
                 let key = keyspace::ledger_item_key(*item);
                 let encoded = postcard::to_stdvec(row).map_err(store_err("item row encode"))?;
                 trx.set(&key, &encoded);
             }
         }
     }
-    if let Some(receipt) = plan.receipt(intent) {
-        // `ledger/receipt/{versionstamp}`: the key's 10-byte placeholder is
-        // replaced with this transaction's commit versionstamp, so the audit
-        // trail is ordered by commit order itself and needs no clock. One per
-        // intent — every versionstamped write in a transaction gets the same
-        // 10 bytes, so a second would be the same key written twice.
-        let key = keyspace::ledger_receipt_versionstamped_key();
-        let encoded = postcard::to_stdvec(&receipt).map_err(store_err("receipt row encode"))?;
-        trx.atomic_op(&key, &encoded, MutationType::SetVersionstampedKey);
-    }
+    // `ledger/receipt/{versionstamp}`: the key's 10-byte placeholder is
+    // replaced with this transaction's commit versionstamp, so the audit
+    // trail is ordered by commit order itself and needs no clock. This call is
+    // deliberately in the same function and receives the same transaction as
+    // every effect above: there is no effect-to-receipt durability boundary.
+    let key = keyspace::ledger_receipt_versionstamped_key();
+    let encoded = keyspace::encode_receipt_row(mutation.receipt())
+        .map_err(store_err("receipt row encode"))?;
+    trx.atomic_op(&key, &encoded, MutationType::SetVersionstampedKey);
     Ok(())
 }
 
@@ -1537,31 +1571,26 @@ impl ProvisionalStore for FdbIntentExecutor {
                         return Ok(());
                     }
 
-                    // The forward-written inverse. `MutationType::Add` with a
-                    // negated delta, in the same 16-byte sign-extended
-                    // little-endian form `apply_plan` writes, so the reversal
-                    // is arithmetically the commit's mirror and not a
-                    // recomputation of what the balance "should" be.
-                    for write in &hold.writes {
-                        let key = keyspace::ledger_bal_key(write.account, write.asset);
-                        let param = i128::from(write.delta).wrapping_neg().to_le_bytes();
-                        trx.atomic_op(&key, &param, MutationType::Add);
-                    }
-
-                    // The compensating receipt. Appended, never substituted:
-                    // `ledger/receipt/{versionstamp}` is a strictly-ordered
-                    // history, and a reader of it sees the commit and then the
-                    // reversal — which is what an auditor needs and what a
-                    // player owed an explanation needs.
-                    let receipt = keyspace::ReceiptRow {
-                        intent_id: hold.intent_id,
-                        parties: hold.writes.iter().map(|write| write.account).collect(),
-                        ops: Vec::new(),
-                    };
-                    let rkey = keyspace::ledger_receipt_versionstamped_key();
-                    let encoded =
-                        postcard::to_stdvec(&receipt).map_err(store_err("receipt row encode"))?;
-                    trx.atomic_op(&rkey, &encoded, MutationType::SetVersionstampedKey);
+                    // The forward-written inverse and compensating receipt use
+                    // the same guarded mutation stage as an ordinary commit.
+                    // A reader sees the original and then this reversal; no
+                    // second receipt-less balance writer exists.
+                    let writes = hold
+                        .writes
+                        .iter()
+                        .map(|write| PlannedWrite::BalanceAdd {
+                            account: write.account,
+                            asset: write.asset,
+                            delta: -write.delta,
+                        })
+                        .collect();
+                    let mutation = LedgerMutation::from_writes(
+                        hold.intent_id,
+                        hold.writes.iter().map(|write| write.account).collect(),
+                        Vec::new(),
+                        writes,
+                    );
+                    stage_ledger_mutation(&trx, mutation.as_ref())?;
 
                     row.finality = keyspace::IntentFinality::Annulled;
                     row.finalize_by_ms = 0;
@@ -1873,6 +1902,27 @@ mod tests {
                     AccountId::new(account),
                     AssetId::new(GOLD),
                 ));
+                let receipt_start = keyspace::ledger_receipt_range_start();
+                let receipt_end = keyspace::ledger_receipt_range_end();
+                let mut stream = trx.get_ranges_keyvalues(
+                    foundationdb::RangeOption::from((
+                        receipt_start.as_slice(),
+                        receipt_end.as_slice(),
+                    )),
+                    false,
+                );
+                let mut stale = Vec::new();
+                while let Some(kv) = stream.try_next().await? {
+                    if let Ok((receipt, _version)) = keyspace::decode_receipt_row(kv.value()) {
+                        if ids.contains(&receipt.intent_id) {
+                            stale.push(kv.key().to_vec());
+                        }
+                    }
+                }
+                drop(stream);
+                for key in stale {
+                    trx.clear(&key);
+                }
                 Ok(())
             }
         })
@@ -1886,6 +1936,28 @@ mod tests {
         })
         .await
         .expect("balance")
+    }
+
+    async fn receipt_count(db: &Database, intent_id: u128) -> usize {
+        db.run(|trx, _| async move {
+            let receipt_start = keyspace::ledger_receipt_range_start();
+            let receipt_end = keyspace::ledger_receipt_range_end();
+            let mut stream = trx.get_ranges_keyvalues(
+                foundationdb::RangeOption::from((receipt_start.as_slice(), receipt_end.as_slice())),
+                true,
+            );
+            let mut count = 0;
+            while let Some(kv) = stream.try_next().await? {
+                if keyspace::decode_receipt_row(kv.value())
+                    .is_ok_and(|(receipt, _)| receipt.intent_id == intent_id)
+                {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await
+        .expect("receipt count")
     }
 
     async fn intent_row(db: &Database, id: u128) -> Option<keyspace::IntentRow> {
@@ -1949,6 +2021,45 @@ mod tests {
 
         exec.annul(&holds[0]).await.expect("annul");
         reset(&db, ALICE, &[0xd29_0001]).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_guarded_ledger_stage_commits_neither_effect_nor_receipt() {
+        const ACCOUNT: u64 = 0x9602_0000_0000_0083;
+        const INTENT: u128 = 0xd29_0083;
+        let Some(cluster) = fdb_cluster_file() else {
+            eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+            return;
+        };
+        let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID)).expect("connect");
+        let db = Arc::clone(exec.database());
+        reset(&db, ACCOUNT, &[INTENT]).await;
+
+        exec.inject_abort_after_ledger_stage();
+        let error = exec
+            .execute(&credit(ACCOUNT, INTENT, 83))
+            .await
+            .expect_err("the injected pre-commit crash aborts the transaction");
+        assert!(
+            error
+                .to_string()
+                .contains("injected crash after staging ledger effects and receipt"),
+            "the named injection fired: {error}"
+        );
+        assert_eq!(
+            balance(&db, ACCOUNT).await,
+            0,
+            "the staged balance Add was not committed"
+        );
+        assert_eq!(
+            receipt_count(&db, INTENT).await,
+            0,
+            "the staged versionstamped receipt was not committed"
+        );
+        assert!(
+            intent_row(&db, INTENT).await.is_none(),
+            "the outcome row shared the same aborted transaction"
+        );
     }
 
     #[tokio::test]

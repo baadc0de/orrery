@@ -786,8 +786,8 @@ impl HotLedgerSweeper {
         let mut receipts = Vec::new();
         let pairs = Self::scan_range(trx, begin, keyspace::ledger_receipt_range_end()).await?;
         for (key, value) in pairs {
-            match postcard::from_bytes::<ReceiptRow>(&value) {
-                Ok(row) => receipts.push(JudgedReceipt { key, row }),
+            match keyspace::decode_receipt_row(&value) {
+                Ok((row, _version)) => receipts.push(JudgedReceipt { key, row }),
                 Err(error) => structural.push(AuditFinding {
                     kind: FindingKind::UndecodableLedgerRow,
                     item: None,
@@ -890,6 +890,8 @@ mod tests {
                     .map(|account| AccountId::new(*account))
                     .collect(),
                 ops: vec![],
+                balance_deltas: vec![],
+                ownership: vec![],
             },
         }
     }
