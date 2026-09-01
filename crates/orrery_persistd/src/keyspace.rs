@@ -2269,6 +2269,20 @@ pub fn strike_key(account: AccountId) -> [u8; 20] {
     key
 }
 
+/// `yb || account:u64-be || blake3(ruleset, episode):[u8;32]`.
+///
+/// The marker makes a confirmed divergence episode idempotent without
+/// changing D33's immutable `ya` strike-row value format.
+#[must_use]
+pub fn strike_episode_key(account: AccountId, episode_digest: &[u8; 32]) -> [u8; 42] {
+    let mut key = [0; 42];
+    key[0] = b'y';
+    key[1] = b'b';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key[10..].copy_from_slice(episode_digest);
+    key
+}
+
 /// [`strike_key`] in `SetVersionstampedKey` parameter form.
 #[must_use]
 pub fn strike_versionstamped_key(account: AccountId) -> [u8; 24] {
@@ -3828,11 +3842,18 @@ mod tests {
                 prefix: b'y',
                 name: "strike",
                 kinds: Kinds::SubKinds {
-                    table: vec![SubKind {
-                        discriminator: b'a',
-                        name: "strike/ya account facts",
-                        sample: strike_key(AccountId::new(1)).to_vec(),
-                    }],
+                    table: vec![
+                        SubKind {
+                            discriminator: b'a',
+                            name: "strike/ya account facts",
+                            sample: strike_key(AccountId::new(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'b',
+                            name: "strike/yb episode dedup",
+                            sample: strike_episode_key(AccountId::new(1), &[0; 32]).to_vec(),
+                        },
+                    ],
                 },
             },
             Family {
