@@ -1,6 +1,6 @@
 # Crate architecture
 
-This document expands [ADR-0015](adr/0015-crate-set.md) into a concrete Cargo workspace: the layout tree, the dependency spine and its layering rules, a per-crate reference (purpose, public API sketch, dependencies, feature flags, Bevy status) for every first-party `orrery_*` crate (fifteen at present), the games-bring-rules linking pattern, client app composition, the lockstep versioning/release policy, and the upstreaming plan plus the replicon-direct plan B. All code below is **sketch-grade**: signatures are indicative of shape and naming, not guaranteed to compile.
+This document expands [ADR-0015](adr/0015-crate-set.md) into a concrete Cargo workspace: the layout tree, the dependency spine and its layering rules, a per-crate reference (purpose, public API sketch, dependencies, feature flags, Bevy status) for every first-party `orrery_*` crate (twenty at present — the reference table below lists all of them; the numbered sections predate the five crates it adds), the games-bring-rules linking pattern, client app composition, the lockstep versioning/release policy, and the upstreaming plan plus the replicon-direct plan B. All code below is **sketch-grade**: signatures are indicative of shape and naming, not guaranteed to compile.
 
 Normative source: [ADR-0015](adr/0015-crate-set.md), drawing on [D4](adr/0004-bevy-netcode-stack.md), [D12](adr/0012-backend-services.md), [D14](adr/0014-pinned-versions.md), and [D17](adr/0017-risks-and-open-questions.md).
 
@@ -15,7 +15,9 @@ orrery/
 ├── crates/                     # first-party members
 │   ├── orrery_protocol/        # lib · engine-agnostic · wire & data types
 │   ├── orrery_core/            # lib · engine-agnostic · verifiable core / Ruleset
+│   ├── orrery_compose/         # lib · link-time composition manifest for rulesets (D43 (g))
 │   ├── orrery_net/             # Bevy plugin · sessions, coordinator client, channels
+│   ├── orrery_replicon/        # lib · replicon facade — the only crate declaring bevy_replicon (D45 IV-7)
 │   ├── orrery_spatial/         # Bevy plugin · CellId math, AOI, visibility mapping
 │   ├── orrery_authority/       # Bevy plugin · claims, leases, handoff
 │   ├── orrery_predict/         # Bevy plugin · lightyear config, rollback guard
@@ -24,7 +26,10 @@ orrery/
 │   ├── orrery/                 # lib · facade: OrreryClientPlugins + prelude
 │   ├── orrery_persistd/        # lib + reference bin · persistence cluster harness
 │   ├── orrery_seed/            # lib + bin · world seeder: TOML scenario runner (12-world-seeding.md)
+│   ├── orrery_ruleset_digest/  # lib · build-script source-closure encoder behind RulesetId (D49)
 │   ├── orrery_games/           # lib · reference Rulesets + tampered variants (P4's measurement)
+│   ├── orrery_sim/             # lib · pre-S5 C ABI spike: the engine-neutral simulation boundary
+│   ├── orrery_sim_host/        # lib · engine-neutral fixed-step host seam (bevy_ecs backend, D42)
 │   ├── orrery_conformance/     # lib + bin · determinism-matrix reference ruleset + golden corpus
 │   ├── orrery_coordinator/     # bin · presence, islands, promotion
 │   └── orrery_identity/        # bin · accounts, tokens, strikes
@@ -40,22 +45,28 @@ orrery/
 └── deploy/                     # iroh-relay config, FDB manifests, otel collector
 ```
 
-The `orrery` facade is a fifteenth, purely compositional workspace member: it defines the `OrreryClientPlugins` plugin group named in D15 and a `prelude`. It contains no logic; a `PluginGroup` must live in a crate that depends on every member plugin, and none of the fourteen functional crates can do that without inverting the spine.
+The `orrery` facade is purely compositional: it defines the `OrreryClientPlugins` plugin group named in D15 and a `prelude`. It contains no logic; a `PluginGroup` must live in a crate that depends on every member plugin, and none of the other nineteen crates can do that without inverting the spine.
 
 ## Dependency spine
 
-Arrows read "depends on". Transitive edges are elided; **every first-party crate depends on `orrery_protocol`**. The exception is structural, not accidental: the three vendored crates under `vendor/` depend on no orrery crate — the IO layer stays orrery-free so it can be upstreamed verbatim, see [Upstreaming](#upstreaming-plan).
+Arrows read "depends on". Transitive edges are elided; **every first-party crate depends on `orrery_protocol`**. Dotted arrows are build dependencies. The exception is structural, not accidental: the three vendored crates under `vendor/` depend on no orrery crate — the IO layer stays orrery-free so it can be upstreamed verbatim, see [Upstreaming](#upstreaming-plan).
 
 ```mermaid
 graph BT
-    subgraph agnostic["Engine-agnostic — no Bevy (D15)"]
+    subgraph agnostic["Engine-agnostic core — no Bevy (D15)"]
         protocol["orrery_protocol"]
         core["orrery_core"]
+    end
+    subgraph headless["Bevy-free today — orrery_games permitted bevy_ecs, not taken (D42 (a) amended, D43 (e)(1))"]
+        compose["orrery_compose"]
+        ruleset_digest["orrery_ruleset_digest (build-time)"]
         games["orrery_games"]
+        sim["orrery_sim"]
         conf["orrery_conformance"]
     end
     subgraph client["Client plugin stack — Bevy 0.19"]
         iroh_io["aeronet_iroh (vendored)"]
+        replicon["orrery_replicon — replicon facade"]
         net["orrery_net"]
         spatial["orrery_spatial"]
         authority["orrery_authority"]
@@ -73,42 +84,53 @@ graph BT
     end
     classDef planned stroke-dasharray: 5 5;
     class fhost planned;
+    sim_host["orrery_sim_host — fixed-step host seam (bevy_ecs)"]
     game["game crates: rules, client, binaries"]
 
     core --> protocol
+    compose --> core
     net --> protocol
     net --> iroh_io
     spatial --> net
-    authority --> spatial
-    predict --> authority
+    spatial --> replicon
+    authority --> protocol
+    predict --> protocol
+    witness --> net
     witness --> core
-    witness --> predict
     pclient --> spatial
+    pclient --> authority
     facade --> predict
     facade --> witness
     facade --> pclient
     games --> core
+    games --> compose
     games --> protocol
     conf --> core
     conf --> protocol
+    sim --> games
+    sim_host --> core
     seed --> persistd
-    seed --> protocol
+    persistd --> witness
     persistd --> core
     coord --> protocol
-    identity --> protocol
+    identity --> persistd
     fhost --> facade
     fhost --> core
     game --> facade
     game --> core
     game --> persistd
+    games -.-> ruleset_digest
+    conf -.-> ruleset_digest
 ```
+
+Bevy status, stated so this document and `scripts/core-gates.sh` cannot quietly disagree. The gate's Bevy-free graph scan binds exactly `orrery_core` and `orrery_conformance` (`orrery_protocol` is engine-free by the spine rule above); `orrery_games` is the scan's single permitted exception — `BEVY_PERMITTED_CRATES` carries it and nothing else. On 2026-08-31 the owner accepted `bevy_ecs` as a first-class, non-dev dependency of `orrery_games` (#793, amending D42 (a) and D43 (e)(1); #805 wrote the amendments and the gate row), so the crate is **Bevy-free today, no longer required to be** — and it has taken no Bevy dependency: the manifest declares `orrery_core`, `orrery_protocol` and `orrery_compose`, so the permission lives in the records and the gate, not yet in the graph. Everything else in the headless group is Bevy-free as a plain fact, ungated by any clause. `orrery_sim_host` is where `bevy_ecs` *did* land first-party, as the backend of D42's host seam. None of this touches `orrery_core`: its ban is a separate live rule with its own reason — one build of it links into the client that re-executes, the host that steps and the adjudicator that convicts (`crates/orrery_core/Cargo.toml:8-12`) — and it is not part of the games carve-out.
 
 Layering rules (the first two are normative from D15; the rest are containment rules this doc establishes):
 
 1. `orrery_protocol` ← everything. Wire types are defined once, engine-free.
 2. `orrery_core` ← {`orrery_witness`, `orrery_persistd`, game}. The same `Ruleset` executes on peers and the cluster today (D9); the field host is the designed third execution site and is **planned, not built** — no such crate exists anywhere in the tree ([D29](adr/0029-low-population-path.md) holds it in P6). See §14.
 3. **lightyear types appear only inside `orrery_predict`.** No other crate names a lightyear type in its public API. This is the plan-B blast radius (see below).
-4. **replicon types appear only in `orrery_spatial`** (visibility mapping) **and `orrery_persist_client`** (change-detection uplink). **aeronet types appear only in `vendor/aeronet_iroh` and `orrery_net`.**
+4. **replicon types appear only inside `orrery_replicon`** — the engine-handle-free facade that is the only first-party crate permitted to declare `bevy_replicon` (D45 IV-7; a cargo-metadata clause in `core-gates.sh` refuses any other direct declaration). `orrery_spatial` (visibility mapping) and `orrery_persist_client` (change-detection uplink) consume the facade. **aeronet types appear only in `vendor/aeronet_iroh` and `orrery_net`.**
 5. `orrery_witness` and `orrery_persist_client` do not depend on each other: the witness emits `orrery_protocol` event types (`EvidenceBundle`, `AttestationGrant`) as Bevy messages; the persist client drains and transmits them.
 6. Bevy-free services speak iroh directly (tokio-native endpoints); `vendor/aeronet_iroh` exists only for Bevy processes, because [`aeronet_io`](https://github.com/aecsocket/aeronet) is `bevy_ecs`-based. Both sides interoperate because framing lives in `orrery_protocol`, not in the IO layer. `orrery-coordinator` and `persistd` are both this shape, and deliberately share one session pattern — an admission uni-stream, then tagged datagrams — so a peer needs one client for both.
 
@@ -118,8 +140,10 @@ Layering rules (the first two are normative from D15; the rest are containment r
 |---|---|---|---|
 | `orrery_protocol` | lib | none | postcard/bitcode, serde, glam, iroh-base, lindel (opt) |
 | `orrery_core` | lib | none | rand_chacha 0.9, libm, blake3, ed25519 (iroh-base) |
+| `orrery_compose` | lib | none | blake3 |
 | `aeronet_iroh` (vendored) | lib | via `aeronet_io` | aeronet 0.21, iroh 1.0.x, tokio |
 | `orrery_net` | plugin | yes | aeronet 0.21, iroh 1.0.x, tokio |
+| `orrery_replicon` | lib | yes | bevy_replicon 0.42, bevy_ecs, bevy_app |
 | `orrery_spatial` | plugin | yes | big_space 0.12 (0.19 port), bevy_replicon 0.42, kiddo 6.x |
 | `orrery_authority` | plugin | yes | — |
 | `orrery_predict` | plugin | yes | lightyear 0.29, avian3d 0.7 (opt) |
@@ -128,10 +152,15 @@ Layering rules (the first two are normative from D15; the rest are containment r
 | `orrery` (facade) | lib | yes | all six client plugins |
 | `orrery_persistd` | lib+bin | **none** | foundationdb-rs 0.11, wal-db 1.0.0 (default), fjall 3.x (fallback), iroh, tokio, tonic |
 | `orrery_seed` | lib+bin | **none** | toml, serde, blake3, rand_chacha 0.9, postcard, foundationdb-rs 0.11 (opt, `fdb` feature) |
-| `orrery_games` | lib | **none** | libm, rand_chacha 0.9, blake3 |
+| `orrery_ruleset_digest` | lib | **none** | blake3, syn/quote/proc-macro2, toml |
+| `orrery_games` | lib | **none** (permitted — D42 (a) amended; not taken) | libm, rand_chacha 0.9, blake3 |
+| `orrery_sim` | lib (rlib+cdylib) | **none** | orrery_core, orrery_games |
+| `orrery_sim_host` | lib | `bevy_ecs` | orrery_core |
 | `orrery_conformance` | lib+bin | **none** | libm, rand_chacha 0.9, serde |
 | `orrery_coordinator` | bin | **none** | iroh, tokio, tonic |
 | `orrery_identity` | bin | **none** | iroh, tokio, foundationdb-rs 0.11, argon2 |
+
+The five rows this table adds beyond the original fifteen — `orrery_compose`, `orrery_replicon`, `orrery_ruleset_digest`, `orrery_sim`, `orrery_sim_host` — have no numbered sections; their one-line purposes are in the layout tree above, and the records that specify them are named there.
 
 ### 1. `orrery_protocol` — wire and data types
 
@@ -588,7 +617,7 @@ fn main() {
 
 ## Games bring the rules
 
-The cluster re-executes the same rules it stores (D9–D11), so a game's `Ruleset` must be *linked into* the persistence binary — there is no dynamic rules loading (recompiling `persistd` is the accepted answer per D17.6). The rules crate itself must be engine-agnostic (it depends only on `orrery_core`/`orrery_protocol`), which the dependency spine enforces mechanically: `orrery_core` has no Bevy dependency to leak.
+The cluster re-executes the same rules it stores (D9–D11), so a game's `Ruleset` must be *linked into* the persistence binary — there is no dynamic rules loading (recompiling `persistd` is the accepted answer per D17.6). The rules crate itself is engine-agnostic **by default, not by rule**: `orrery_games` depends on `orrery_core`, `orrery_protocol` and `orrery_compose` and takes no Bevy dependency, but since the 2026-08-31 amendments a ruleset crate may host `bevy_ecs` — the dependency is gate-permitted (`BEVY_PERMITTED_CRATES`), and actually driving a `World` as D42 (a)'s store of record fails `core-gates.sh`'s escape check by name until the crate is declared in `DECLARED_HOST_CRATES` and takes the whole Tier-H battery (`orrery_sim_host` holds that row today; `orrery_games` is eligible and has not joined). What the spine still enforces mechanically is the other half: `orrery_core` has no Bevy dependency to leak, and its ban is untouched.
 
 ```rust
 //! examples/mygame/mygame_persistd/src/main.rs
@@ -607,9 +636,9 @@ The same `MyRules` value is linked into two other places today — the client (w
 
 ### The reference games in-tree
 
-`orrery_games` is that shape, shipped: `Ruleset` implementations depending only on `orrery_core` and `orrery_protocol`, with no Bevy and no tokio. It exists because P4's exit gate is a *measurement* — a false-positive rate over honest play — and a measurement needs rules that can refuse. `orrery_conformance`'s kernel deliberately cannot: it has no caps, no cooldowns, no reach, so nothing about it can be checked cheaply or disagreed with, and a false-positive rate taken over it would be a statement about arithmetic rather than about play.
+`orrery_games` is that shape, shipped: `Ruleset` implementations depending on `orrery_core`, `orrery_protocol` and `orrery_compose`, with no Bevy and no tokio — Bevy-free today, no longer required to be (see the spine above). It exists because P4's exit gate is a *measurement* — a false-positive rate over honest play — and a measurement needs rules that can refuse. `orrery_conformance`'s kernel deliberately cannot: it has no caps, no cooldowns, no reach, so nothing about it can be checked cheaply or disagreed with, and a false-positive rate taken over it would be a statement about arithmetic rather than about play.
 
-Three things distinguish it from an example game. It is **plural** — the harness is generic over a `Game` trait and the test battery runs over a catalogue, because the false-positive rate is a property of the rules being played and one kernel cannot tell you which shape of play a number came from. It ships **cheats** — P4's demo criterion is a modified client, so each game builds its own tampered variants, which keep the honest `RulesetId` because a cheater claims to be running the rules. And it is held to the **determinism gates**: `scripts/core-gates.sh` scans it alongside `orrery_core`, and its committed golden chains are checked on all four targets of the determinism matrix.
+Three things distinguish it from an example game. It is **plural** — the harness is generic over a `Game` trait and the test battery runs over a catalogue, because the false-positive rate is a property of the rules being played and one kernel cannot tell you which shape of play a number came from. It ships **cheats** — P4's demo criterion is a modified client, so each game builds its own tampered variants, which keep the honest `RulesetId` because a cheater claims to be running the rules. And it is held to the **determinism gates**: `scripts/core-gates.sh` still gates it — role discovery, VC-4, VC-6, VC-8, the async-runtime ban and the neighbour-read scan all bind it, though since the 2026-08-31 amendment the Bevy-free graph scan no longer does (D43 (e)(1)) — and its committed golden chains are checked on all four targets of the determinism matrix.
 
 ## Client app composition
 
@@ -643,7 +672,7 @@ fn main() {
 
 ## Versioning and release policy
 
-- **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. All fifteen currently sit at `0.1.0`. The release automation that would enforce it — an `xtask release` that bumps the workspace atomically and runs a wire-corpus test — is designed and unbuilt: there is no `xtask/` in the tree and no wire-corpus tests, so the invariant is held by hand today.
+- **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. All twenty currently sit at `0.1.0`. The release automation that would enforce it — an `xtask release` that bumps the workspace atomically and runs a wire-corpus test — is designed and unbuilt: there is no `xtask/` in the tree and no wire-corpus tests, so the invariant is held by hand today.
 - **Pinned upstreams per release.** `[workspace.dependencies]` carries the D14 pin table; the churn-prone trio is pinned exactly — `lightyear = "=0.29.0"`, `bevy_replicon = "=0.42.1"`, `aeronet = "=0.21.0"` — because [lightyear shipped four breaking releases in ten months](https://github.com/cBournhonesque/lightyear/releases) (0.25→0.29: Predicted/Confirmed entity merge, timeline refactor, tick `u16`→`u32`). [iroh is semver-stable since 1.0](https://crates.io/crates/iroh) and gets a caret req. Upstream upgrades land only at Orrery minor releases, each with a migration note.
 - **Wire compatibility is decoupled from crate versions.** `orrery_protocol::PROTOCOL_VERSION` governs interop; services accept **that version only** — D29 clause 5 closed the N/N−1 rolling window for all traffic — enforced by `GatewayMsg::protocol_accepted` against the version a client names in `GatewayMsg::VersionedHello`. That is the only live bootstrap: the unversioned `GatewayMsg::Hello` is retired and a gateway refuses it with `GatewayReply::HelloRefused`, never a silent drop, so enforcement is universal rather than opt-in. The variant stays on the wire only so the refusal can be legible — postcard keys variants positionally, and deleting it would renumber every later arm. A byte-golden corpus of encoded messages guarding decode compatibility across releases is designed and unbuilt, deferred until the wire format settles.
 - **`RULES_DIGEST` is exact-match**, versioned by the game, orthogonal to both of the above.

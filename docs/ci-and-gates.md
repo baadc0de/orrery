@@ -77,7 +77,7 @@ issue priced an S3 remote for it and did not wire one; the numbers and the three
 reasons are in the `gates:` block of `.github/workflows/ci.yml` and in
 [docs/spikes/kache-remote-on-the-gates-lane.md](docs/spikes/kache-remote-on-the-gates-lane.md).
 
-### Twelve workspaces, and only one of them is "the" workspace
+### Thirteen workspaces, and only one of them is "the" workspace
 
 `cargo test --workspace` reaches the root workspace. Each standalone tool
 declares its own `[workspace]` table, so it reaches none of *them* — three red
@@ -86,7 +86,7 @@ CIs in one week came from that blind spot. The inventory, which is also
 
 | Workspace | Role in the lanes |
 |---|---|
-| `.` (root, 15 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other |
+| `.` (root, 20 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other |
 | `gates/p1-swarm` | `cargo test` in `gates` |
 | `gates/p2-load` | `cargo test` in `gates` |
 | `gates/p2-dashboard` | `cargo test` in `gates` |
@@ -97,14 +97,15 @@ CIs in one week came from that blind spot. The inventory, which is also
 | `gates/p3-siblings` | `cargo test` in `gates`; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `gates/p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
 | `gates/p5-dupe-gauntlet` | `cargo test`; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB. Its `ramp` subcommand carries D32's enforcement-ramp arms too, asserted by the nightly `ramp-shadow` gate, which runs a shadow and an enforcing gateway from this one binary at the same time. Its additive measurement tests pin #153's p99 population and stage-count guards |
 | `gates/p2-journal-bench` | `cargo check --all-targets` — no tests |
+| `gates/migration-bench` | `cargo check --all-targets` — no tests |
 | `clients/regolith` | `cargo test` in `gates`; the Bevy 0.19 keyboard/rendering skin over the headless Regolith intent and replay pipeline |
 
-The eight standalone test suites, and the three tools checked without tests, are the work
+The eight standalone test suites, and the four tools checked without tests, are the work
 that would go unrun if the `gates` lane stopped visiting them. Do not hand-copy
 test totals here: `./scripts/check.sh --list` is the executable inventory.
 
 `--self-test` compares that table against the filesystem — every directory
-whose `Cargo.toml` declares `[workspace]` must appear in it — so a thirteenth
+whose `Cargo.toml` declares `[workspace]` must appear in it — so a fourteenth
 workspace cannot be added and silently go unchecked. It is a two-source check
 by construction: the table cannot match itself.
 
@@ -175,8 +176,9 @@ mechanism. That is backwards, and adopting the table wholesale is still its own
 piece of work.
 
 But do not read it as "no lint levels apply to `crates/*`", because one of them
-does and it bites. All fifteen first-party crates set
-`#![warn(missing_docs)]` in their own `lib.rs`, and CI runs `clippy --workspace
+does and it bites. Nineteen of the twenty first-party crates set
+`#![warn(missing_docs)]` in their own `lib.rs` — the exception is
+`orrery_ruleset_digest`, the build-time encoder — and CI runs `clippy --workspace
 --all-targets --no-deps -- -D warnings`, which promotes that warning to an
 error. **An undocumented
 public item fails CI today.** What is genuinely unadopted is the rest:
@@ -289,7 +291,7 @@ per-commit, alongside every other self-test in `scripts/`.
 **The standalone tools are tested per-commit too.** Each declares its own
 `[workspace]`, so `cargo test --workspace` reaches none of them; the `gates`
 lane runs `cargo test` in its eight test workspaces and `cargo check --all-targets`
-in its three check-only workspaces — see the inventory above, which is the table
+in its four check-only workspaces — see the inventory above, which is the table
 the lane iterates.
 `gates/p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that
 job installs the FoundationDB *client* on the hosted path.

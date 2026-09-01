@@ -120,4 +120,5 @@ ADR file. D19 deliberately follows that reserved gap.
 | [12-world-seeding.md](12-world-seeding.md) | D11, D22 | World seeding, deterministic generation, content diff and patch |
 | [13-chain-replication.md](13-chain-replication.md) | D11, D12, D20, D23 | Cross-process journal mirroring and recovery |
 | [14-capacity.md](14-capacity.md) | D11, D12, D16, D19 | Measured single-box capacity envelope: the knee, what binds first, entities and players |
+| [15-asset-provenance.md](15-asset-provenance.md) | — | Asset licensing bar, the provenance manifest, and the guard that keeps the record true |
 | [references.md](references.md) | D1–D17, D19 | Annotated bibliography |
