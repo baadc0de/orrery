@@ -126,14 +126,14 @@ claim; anything else is not.
 script is the body of those four jobs and nothing else — not `determinism`, not
 `nightly.yml`.
 
-### Twelve workspaces, and only one of them is "the" workspace
+### Thirteen workspaces, and only one of them is "the" workspace
 
 `cargo test --workspace` reaches the root workspace only. Each standalone tool
 declares its own `[workspace]` table, so it reaches none of *them* — three red
 CIs in one week came from that blind spot, and `cargo fmt --all` had the same
 hole. `./scripts/check.sh --list` is the executable inventory; do not hand-copy
 it. `--self-test` compares the lane table against the filesystem, so a
-thirteenth workspace cannot be added and silently go unchecked.
+fourteenth workspace cannot be added and silently go unchecked.
 
 Everything else about CI — the full workspace table, the self-test clauses, the
 determinism matrix, `gate-status.sh`, and the hosted timing and disk

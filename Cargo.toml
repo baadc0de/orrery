@@ -15,8 +15,9 @@ members = [
     "crates/orrery_authority",
     "crates/orrery_persist_client",
     "crates/orrery_persistd",
-    # D12's first service row. A root member, not a ninth workspace: the
-    # eight-workspace table in AGENTS.md and `check.sh --self-test` police that.
+    # D12's first service row. A root member, not a fourteenth workspace: the
+    # thirteen-workspace table in docs/ci-and-gates.md and `check.sh
+    # --self-test` police that.
     "crates/orrery_identity",
     "crates/orrery_seed",
     "crates/orrery_games",

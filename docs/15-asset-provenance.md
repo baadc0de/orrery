@@ -2,8 +2,10 @@
 
 The licensing bar for third-party game assets, the record that stands behind
 it, and the guard that keeps the record true. Written before the first real
-asset arrives (#332); the client that will load these files does not exist yet
-(#327). The machinery is normative now; the art can wait.
+asset arrives (#332) — still true; both manifested files are fixtures.
+`clients/regolith` (#327) has since landed and been played, and it loads
+nothing from `assets/`: no required assets, primitives only. The machinery is
+normative now; the art can wait.
 
 The guard is [`scripts/asset-provenance.sh`](../scripts/asset-provenance.sh)
 and the record is [`assets/provenance.toml`](../assets/provenance.toml). Its
@@ -118,8 +120,9 @@ accident.
 `assets/fixtures/fixture-empty-scene.{glb,gltf}` are self-authored empty glTF
 2.0 scenes generated inside this repository, dedicated CC0-1.0, 84 and 62
 bytes. They exist only so the guard asserts something true before the first
-third-party asset arrives, and they are never loaded by anything — no client
-exists yet (#327). When real assets land they should be deleted, keeping at
+third-party asset arrives, and they are never loaded by anything —
+`clients/regolith` renders primitives and reads no file from `assets/`. When
+real assets land they should be deleted, keeping at
 least one manifested file so the guard cannot rot into checking nothing.
 
 ## §7 Assets stay cosmetic
@@ -143,8 +146,8 @@ Extracted game assets of any kind (excluded at #320, unchanged here); audio;
 original commissioned art; raster or AI-generated imagery (#332 records why:
 the licensing status of generated imagery is unsettled, and marketplace
 licences meet §1 more honestly). The client and its asset-path indirection is
-#327; when it lands, it must run with `assets/` absent entirely, falling back
-to primitives, so a licence problem is never a broken build.
+#327; landed as `clients/regolith`, it must run with `assets/` absent entirely,
+falling back to primitives, so a licence problem is never a broken build.
 
 ## §9 Why there is no separate CI job
 

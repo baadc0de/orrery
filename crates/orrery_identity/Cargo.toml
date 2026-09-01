@@ -9,9 +9,9 @@ license = "MIT OR Apache-2.0"
 # the write half of the `id/` subspace D31 specifies and the issuing half of the
 # session token `orrery_protocol::identity` already verifies.
 #
-# A root workspace member, deliberately: the eight-workspace table in AGENTS.md
-# and `scripts/check.sh --self-test` police standalone `[workspace]` tables, and
-# a ninth workspace fails that gate by design.
+# A root workspace member, deliberately: the thirteen-workspace table in
+# docs/ci-and-gates.md and `scripts/check.sh --self-test` police standalone
+# `[workspace]` tables, and a fourteenth workspace fails that gate by design.
 [features]
 default = []
 # FoundationDB-backed account store over D31's `d` family. Links the C client
