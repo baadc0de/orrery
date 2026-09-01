@@ -497,7 +497,7 @@ express — see §6):
 | Profile | P | R | W | N | A | In-tree example |
 |---|---|---|---|---|---|---|
 | **Core** (verifiable) | P1/P2 | per A7 | W2 | N1 | A1 | `RegolithState` via `components::STATE` (`regolith/mod.rs:79-84`, classified Core at `:129-135`) |
-| **Bulk** | P1 | R0 | W1 | N1 | A1 | docs/06 §2's bulk class; terrain deltas (`RecordKind::TerrainDelta`) |
+| **Bulk** | P1 | R0 | W1 | N1 | A1 | docs/06 §2's bulk class; terrain deltas would be Bulk if durable terrain existed (`RecordKind::TerrainDelta` removed in v1 by [D51](../adr/0051-v1-terrain-is-not-durable-state.md)) |
 | **Cosmetic-local** | P0 | R0 | W0 | N0 | A0 | UI/selection state; anything undeclared (the default) |
 | **Ephemeral-shared** | P0 | R0 | W0 | N1 | A2 | Projectiles/VFX under `EphemeralId` (§2.5) |
 | **Critical/ledger** | P2 | R0 | W0* | N0 | A3 | Balances, item ownership; *audited by receipts and the anti-dupe row, not by replay |

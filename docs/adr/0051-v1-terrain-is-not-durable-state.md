@@ -14,10 +14,17 @@ it; flipping this record to Accepted is the owner's act alone.
 **Supersedes on acceptance:** the terrain allocation in [D11] — its bulk-state
 and checkpoint bullets' `TerrainDelta` / `chunk/` promises, including seeded
 `chunk/` rows — and the resulting `k` family allocation. It amends [D32]
-clause (c)'s byte ledger and [D35] §4's zero-clean-byte proof: removing `k`
-changes `26 - 17 registered families - 6 exclusive ends - 2 accepted
-allocations` from zero to **one clean prefix byte**. While Proposed, this draft
-does not silently alter any accepted record.
+clause (c)'s byte ledger and [D35] §4's zero-clean-byte proof: [D35] §4
+currently lists **18** registered families, including `k` for `chunk/` (line 134),
+and records **zero** clean bytes (line 142); [D32] clause (c) at line 720 notes
+that accepted arithmetic closes only because `z` is allocated to `jarchive/`.
+Removing `k` changes the sum `26 - 18 registered families - 6 exclusive ends -
+2 accepted allocations` from zero to `26 - 17 registered families - 6 exclusive
+ends - 2 accepted allocations` = **one clean prefix byte**. The recovered byte
+is **not pre-spent** by this decision (see §(c) below). While Proposed, this
+draft does not silently alter any accepted record; on acceptance, [D32] and
+[D35] would be amended through their own records, not by this draft rewriting
+them.
 
 Out of scope, owner-reserved: replacing or deferring the P6 bulldozed-town
 criterion in [docs/11](../11-roadmap.md). That demonstration cannot claim a

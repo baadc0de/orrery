@@ -210,6 +210,11 @@ Two rules bound the dial:
 The measurement is in §8.
 ### 5.4 Terrain replication
 
+**Status:** Durable terrain is not implemented in v1; `RecordKind::TerrainDelta`
+and the `chunk/` family were removed by
+[D51](adr/0051-v1-terrain-is-not-durable-state.md). This section documents the
+replication design for if/when durable terrain returns.
+
 Terrain edits do not ride the datagram path. The **editing peer broadcasts each `TerrainDelta` on the reliable per-cell stream, ordered by `(cell, tick)`** (D11): edits are rare relative to movement, must never be lost, and must apply in one consistent order on every replica. Every delta is **attributed to and fenced by the editing player's own `PLAYER_BOUND` lease** and invariant-checked at the cell actor (reach, rate, tool — [08-persistence.md](08-persistence.md)); destructive or high-value edits route through the intent path instead. Live peers apply received deltas directly to their local chunk copies; **late joiners never replay delta history** — they fetch compacted chunk snapshot rows from the gateway (§6) and pick up the live per-cell delta stream from there.
 
 ## 6. Late join / area entry
@@ -345,6 +350,11 @@ Two near-tied entities alternating in and out of the 24-slot set would each suff
 Covered in §7: staggered init over ~1 s under the accumulator. Demotion (field host drains below threshold with hysteresis, D6) is gentler: leases transfer incrementally to interacting peers ([04-authority.md](04-authority.md)), so baselines reset entity-by-entity, not cell-at-once.
 
 ### 9.7 Terrain↔entity seam replication
+
+**Status:** Durable terrain is not implemented in v1; the whole promotion/demotion
+surface depends on `chunk/` and `TerrainDelta`, both removed by
+[D51](adr/0051-v1-terrain-is-not-durable-state.md). This section documents the
+planned replication design.
 
 *The replication face of the promotion mechanism ([08-persistence.md](08-persistence.md) §10.1 — non-normative proposal, pending D18).* The `TerrainPromotion` record rides the **reliable per-cell stream**, ordered by `(cell, tick)` with the cell's `TerrainDelta`s (§5.4) — ordering against in-flight deltas is thereby automatic: a replica applies the representation switch at exactly the tick the journal does, and a delta for a section that arrives after its `Pin` is stale by construction (the Pin consumed all deltas up to `tick_pin`) and discarded. Client-side handling per direction:
 
