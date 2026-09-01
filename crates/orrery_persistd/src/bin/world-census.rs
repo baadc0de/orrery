@@ -14,11 +14,11 @@ use orrery_persistd::{scan_world_census_fdb, FdbContext, DEFAULT_PAGE_ROWS};
 )]
 struct Cli {
     /// FoundationDB cluster file to inspect.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
     fdb_cluster_file: PathBuf,
 
     /// Maximum world rows read in one FoundationDB transaction.
-    #[arg(long, default_value_t = DEFAULT_PAGE_ROWS)]
+    #[arg(long, default_value_t = DEFAULT_PAGE_ROWS, env = "ORRERY_PAGE_ROWS")]
     page_rows: usize,
 }
 

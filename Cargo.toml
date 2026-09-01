@@ -117,7 +117,7 @@ big_space = { git = "https://github.com/aevyrie/big_space", branch = "bevy-0.19"
 # Async / utility
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
 hyper = "1.11.0"

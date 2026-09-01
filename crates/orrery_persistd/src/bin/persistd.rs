@@ -83,26 +83,26 @@ type SharedExecutor = Arc<dyn IntentExecutor>;
 struct Cli {
     /// Stable process/node identity. Accepted in single-node mode so a process
     /// can keep the same runtime identity across restarts.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_NODE_ID")]
     node_id: Option<u64>,
 
     /// Base directory for node journals. Node `i` uses `{dir}/node-{i}`.
-    #[arg(long, default_value = "persistd-data")]
+    #[arg(long, default_value = "persistd-data", env = "ORRERY_PERSISTD_DIR")]
     dir: PathBuf,
 
     /// Local chain listen address for clustered topology.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_CHAIN_LISTEN")]
     chain_listen: Option<SocketAddr>,
 
     /// Stable primary process identity for a follower. Used with
     /// `--chain-listen`; the follower never accepts gateway writes.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_CHAIN_PRIMARY")]
     chain_primary: Option<u64>,
 
     /// Fencing epoch for this static chain assignment. Required in clustered
     /// mode so a chain never silently resumes under a different ownership
     /// epoch.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_CHAIN_EPOCH")]
     chain_epoch: Option<u64>,
 
     /// Promote this passive follower after the named primary has failed.  The
@@ -113,17 +113,17 @@ struct Cli {
 
     /// A follower node and its listen address in `<node-id>@<addr>` form.
     /// Repeated to describe the follower chain order.
-    #[arg(long, value_name = "NODE_ID@ADDR")]
+    #[arg(long, value_name = "NODE_ID@ADDR", env = "ORRERY_CHAIN_FOLLOWER")]
     chain_follower: Vec<ChainFollower>,
 
     /// The gateway bind address.
-    #[arg(long, default_value = "127.0.0.1:0")]
+    #[arg(long, default_value = "127.0.0.1:0", env = "ORRERY_PERSISTD_BIND")]
     bind: String,
 
     /// FoundationDB cluster file path. When set, the binary connects to FDB for
     /// checkpoint storage, fencing, and intent execution; without it the
     /// in-memory stores are used.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
     fdb_cluster_file: Option<PathBuf>,
 
     /// Permit the volatile in-memory lease store for local development and
@@ -132,7 +132,7 @@ struct Cli {
     allow_volatile_leases: bool,
 
     /// Trusted identity issuer key in `<key-id>@<public-key>` form.
-    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY", env = "ORRERY_ISSUER_KEY")]
     issuer_key: Vec<IssuerKeySpec>,
 
     /// Development affordance: spawn `<count>@<cell>` placeholder entities at
@@ -152,7 +152,7 @@ struct Cli {
     /// Repeatable, so a key rotation can be deployed with an overlap. Without
     /// at least one, no peer has coordinator-confirmed interest: weak claims
     /// are refused and a lost lease parks instead of moving to a successor.
-    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY", env = "ORRERY_COORDINATOR_KEY")]
     coordinator_key: Vec<IssuerKeySpec>,
 
     /// D27's K-of-N attestation quorum: `off`, `shadow` or `required`.
@@ -175,7 +175,12 @@ struct Cli {
     /// intent against a coordinator-signed announcement, and a gateway that
     /// trusts no coordinator key caches none. Startup refuses the combination
     /// rather than running a mode that can never evaluate anything.
-    #[arg(long, value_name = "off|shadow|required", default_value = "off")]
+    #[arg(
+        long,
+        value_name = "off|shadow|required",
+        default_value = "off",
+        env = "ORRERY_ATTESTATION_ENFORCEMENT"
+    )]
     attestation_enforcement: AttestationEnforcement,
 
     /// D32 control C4: guilty-verdict authority correction posture.
@@ -184,7 +189,12 @@ struct Cli {
     /// live mode would emit, while suppressing both registrar revocation and
     /// broadcast. A durable `ramp/authority_correction` row overrides this
     /// startup default within the one-second poll interval.
-    #[arg(long, value_name = "off|shadow|live", default_value = "off")]
+    #[arg(
+        long,
+        value_name = "off|shadow|live",
+        default_value = "off",
+        env = "ORRERY_AUTHORITY_CORRECTION"
+    )]
     authority_correction: AuthorityCorrectionEnforcement,
 
     /// Hex-encoded iroh secret key, pinning the gateway's NodeId across runs.
@@ -194,7 +204,7 @@ struct Cli {
 
     /// Local shard specification. Accepts raw `CellId` bits (`0x...` or
     /// decimal) or coordinate form `x,y,z@level`.
-    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
+    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL", env = "ORRERY_SHARD")]
     shard: Vec<ShardSpec>,
 
     /// A shard this node may **adopt** from a live sibling, but does not
@@ -213,7 +223,7 @@ struct Cli {
     /// `--shard` for overlap exactly as `--shard` values are against each
     /// other, because "`--shard` sets across siblings must not overlap" (D26)
     /// is worth catching within one process too.
-    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
+    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL", env = "ORRERY_STANDBY_SHARD")]
     standby_shard: Vec<ShardSpec>,
 
     /// Path to a JSON file this node watches for a shard-handover request.
@@ -232,7 +242,7 @@ struct Cli {
     ///
     /// `successor_gateway` is optional and is what lets the refusals this node
     /// then issues be *redirects* — see `DenyReason::WrongOwner`.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_HANDOVER_REQUEST")]
     handover_request: Option<PathBuf>,
 
     /// Retain every journal segment: never release the ones the checkpoints
@@ -244,7 +254,7 @@ struct Cli {
     /// operator wants when a journal has to be preserved for forensics. It is
     /// not a tuning knob: with retention off, journal disk and the index
     /// rebuilt from it at every open grow with the node's uptime.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_NO_JOURNAL_RETENTION")]
     no_journal_retention: bool,
 
     /// Hold journal release behind the verified archive watermark (D20).
@@ -252,7 +262,7 @@ struct Cli {
     /// Default off: there is no archive tailer yet, so enabling this claim on
     /// every node would pin every journal. An operator opts in only where a
     /// tailer is running. Flipping the default is owner-reserved.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_ARCHIVE_RETENTION")]
     archive_retention: bool,
 
     /// Run the journal-to-archive tailer, writing Parquet objects under this
@@ -272,12 +282,17 @@ struct Cli {
     /// `jarchive/{node_id}` metadata range — so a node whose identity is minted
     /// afresh each start would archive into a new namespace every run and
     /// recover a watermark of zero from an empty range every time.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", env = "ORRERY_ARCHIVE_DIR")]
     archive_dir: Option<std::path::PathBuf>,
 
     /// Key prefix inside the archive store, so one store can hold several
     /// clusters. Objects land at `{prefix}/jarchive/{node hex}/{seq}.parquet`.
-    #[arg(long, value_name = "PREFIX", default_value = "")]
+    #[arg(
+        long,
+        value_name = "PREFIX",
+        default_value = "",
+        env = "ORRERY_ARCHIVE_PREFIX"
+    )]
     archive_prefix: String,
 
     /// Archive the global FDB `ledger/receipt/` stream into receipt Parquet
@@ -287,14 +302,15 @@ struct Cli {
     /// persistd process. The implementation has one sequential range scanner;
     /// parallel scanners are deliberately not a tuning knob after #837
     /// measured avoidable intent-path interference at four.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_RECEIPT_ARCHIVE")]
     receipt_archive: bool,
 
     /// Rows per short read-only receipt archive transaction.
     #[arg(
         long,
         value_name = "ROWS",
-        default_value_t = orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS
+        default_value_t = orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS,
+        env = "ORRERY_RECEIPT_ARCHIVE_PAGE_ROWS"
     )]
     receipt_archive_page_rows: usize,
 
@@ -307,7 +323,8 @@ struct Cli {
     #[arg(
         long,
         value_name = "MS",
-        default_value_t = orrery_persistd::audit::conservation::DEFAULT_FULL_SWEEP_INTERVAL_MS
+        default_value_t = orrery_persistd::audit::conservation::DEFAULT_FULL_SWEEP_INTERVAL_MS,
+        env = "ORRERY_FULL_CONSERVATION_SWEEP_INTERVAL_MS"
     )]
     full_conservation_sweep_interval_ms: u64,
 
@@ -319,7 +336,7 @@ struct Cli {
     /// jittered 20 s timers happen to fall — which is exactly why D20 could
     /// only report that retention was harmless where it happened to fire. A
     /// gate that has to *prove* retention sets a cadence it can outlast.
-    #[arg(long, value_name = "MS")]
+    #[arg(long, value_name = "MS", env = "ORRERY_CHECKPOINT_INTERVAL_MS")]
     checkpoint_interval_ms: Option<u64>,
 
     /// Hot-ledger sweep cadence in milliseconds; 0 disables the sweep.
@@ -331,7 +348,12 @@ struct Cli {
     /// time-to-detection is #224's to settle, so an operator (or a gate leg)
     /// can run it faster without a rebuild. Findings are reports, never
     /// actions — C3 remains the control.
-    #[arg(long, value_name = "MS", default_value_t = 3_600_000)]
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 3_600_000,
+        env = "ORRERY_HOT_LEDGER_SWEEP_INTERVAL_MS"
+    )]
     hot_ledger_sweep_interval_ms: u64,
 
     /// Append server-internal latency batches and gateway counter records to
@@ -344,7 +366,7 @@ struct Cli {
     /// move. Its `journal_commit_ms` is the follower's local commit latency,
     /// not the primary's — do not merge the two files and read one p99 off
     /// the result.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_METRICS_JSONL")]
     metrics_jsonl: Option<PathBuf>,
 }
 
@@ -3158,6 +3180,36 @@ fn parse_shard_coords(s: &str) -> Result<CellId, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_env_fallback_and_flag_precedence() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        const NAME: &str = "ORRERY_CHECKPOINT_INTERVAL_MS";
+
+        let _lock = ENV_LOCK.lock().expect("environment lock");
+        let previous = std::env::var_os(NAME);
+        std::env::set_var(NAME, "111");
+        let from_env = Cli::try_parse_from(["persistd"]);
+        let from_flag = Cli::try_parse_from(["persistd", "--checkpoint-interval-ms", "222"]);
+        match previous {
+            Some(value) => std::env::set_var(NAME, value),
+            None => std::env::remove_var(NAME),
+        }
+
+        assert_eq!(
+            from_env
+                .expect("environment fallback parses")
+                .checkpoint_interval_ms,
+            Some(111)
+        );
+        assert_eq!(
+            from_flag
+                .expect("explicit flag parses")
+                .checkpoint_interval_ms,
+            Some(222),
+            "an explicit flag must beat the environment fallback"
+        );
+    }
 
     /// The filter an unset `RUST_LOG` produces must admit exactly what the
     /// unfiltered `fmt()` builder admitted, or every harness that reads this

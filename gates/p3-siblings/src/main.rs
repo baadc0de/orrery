@@ -137,13 +137,13 @@ impl From<ClaimTier> for ClaimKind {
 )]
 struct Cli {
     /// Gateway A's `bind_addr` from its readiness line.
-    #[arg(long, value_name = "IP:PORT")]
+    #[arg(long, value_name = "IP:PORT", env = "ORRERY_GATEWAY_A_ADDR")]
     gateway_a_addr: String,
     /// Gateway A's `node_id` from its readiness line.
-    #[arg(long, value_name = "NODE_ID")]
+    #[arg(long, value_name = "NODE_ID", env = "ORRERY_GATEWAY_A_NODE")]
     gateway_a_node: String,
     /// Gateway A's `--metrics-jsonl` file.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_METRICS_A")]
     metrics_a: Option<PathBuf>,
     /// The shard cells gateway A activated, one per line.
     ///
@@ -151,20 +151,20 @@ struct Cli {
     /// from the `--shard` flags it passed: D26 rule 1 makes the durable
     /// `actor/{grid}/{shard}` row the ownership rule, and a process's flags
     /// and its activation are two different facts.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_SHARDS_A")]
     shards_a: Option<PathBuf>,
 
     /// Gateway B's `bind_addr`.
-    #[arg(long, value_name = "IP:PORT")]
+    #[arg(long, value_name = "IP:PORT", env = "ORRERY_GATEWAY_B_ADDR")]
     gateway_b_addr: String,
     /// Gateway B's `node_id`.
-    #[arg(long, value_name = "NODE_ID")]
+    #[arg(long, value_name = "NODE_ID", env = "ORRERY_GATEWAY_B_NODE")]
     gateway_b_node: String,
     /// Gateway B's `--metrics-jsonl` file.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_METRICS_B")]
     metrics_b: Option<PathBuf>,
     /// The shard cells gateway B activated, one per line.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_SHARDS_B")]
     shards_b: Option<PathBuf>,
     /// Gateway B's process id: the second `kill -9` this harness issues.
     ///
@@ -175,10 +175,10 @@ struct Cli {
     gateway_b_pid: Option<u32>,
 
     /// The coordinator's `bind_addr`.
-    #[arg(long, value_name = "IP:PORT")]
+    #[arg(long, value_name = "IP:PORT", env = "ORRERY_COORDINATOR_ADDR")]
     coordinator_addr: String,
     /// The coordinator's `node_id`.
-    #[arg(long, value_name = "NODE_ID")]
+    #[arg(long, value_name = "NODE_ID", env = "ORRERY_COORDINATOR_NODE")]
     coordinator_node: String,
 
     /// Hex-encoded identity issuer secret; its public half must be both
@@ -192,11 +192,11 @@ struct Cli {
     /// and one lease tier is the whole topology, `--dev-seed` refuses to run
     /// with `--fdb-cluster-file` set (`bin/persistd.rs`), and a registrar only
     /// grants a lease for an entity whose committed cell it can resolve.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_MANIFEST")]
     manifest: Option<PathBuf>,
 
     /// Peers in the island. The criterion's number is 8.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8, env = "ORRERY_P3_SIBLINGS_PEERS")]
     peers: u8,
 
     /// The shard gateway A hands to gateway B mid-run, as raw `CellId` bits
@@ -241,19 +241,24 @@ struct Cli {
     /// `handoff_deadline_ms` (300 ms) in front of it. Both halves are reported
     /// separately so the comparison against the 1 s figure is legible on its
     /// own.
-    #[arg(long, default_value_t = 1300)]
+    #[arg(long, default_value_t = 1300, env = "ORRERY_HANDOVER_BUDGET_MS")]
     handover_budget_ms: u64,
 
     /// The tier the victim claims its rows at.
-    #[arg(long, value_enum, default_value_t = ClaimTier::Weak)]
+    #[arg(long, value_enum, default_value_t = ClaimTier::Weak, env = "ORRERY_VICTIM_CLAIM_KIND")]
     victim_claim_kind: ClaimTier,
 
     /// How long peers keep simulating. Must outlast both settle windows.
-    #[arg(long, default_value_t = 75)]
+    #[arg(long, default_value_t = 75, env = "ORRERY_DURATION_SECS")]
     duration_secs: u64,
 
     /// Where to put peer logs and the report.
-    #[arg(long, value_name = "DIR", default_value = "p3-sibling-out")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "p3-sibling-out",
+        env = "ORRERY_OUT"
+    )]
     out: PathBuf,
 
     /// Print the public half of the identity issuer secret as JSON and exit.
@@ -267,7 +272,7 @@ struct Cli {
     /// settled, and a verdict read from the two acks instead would be a
     /// statement about what the gateways *said*, which is the thing under
     /// test. Without it the leg does not run and the report says so.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_FDB_CLUSTER_FILE")]
     fdb_cluster_file: Option<String>,
 
     /// How many times the same item is offered twice at once (issue #152).
@@ -275,7 +280,7 @@ struct Cli {
     /// Repeated because a single round is a coin flip: the failure mode this
     /// leg is written against is a race that quietly degenerated into a
     /// sequence, and that is only visible across a distribution of overlaps.
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 24, env = "ORRERY_RACE_ROUNDS")]
     race_rounds: u32,
 
     /// Milliseconds between race rounds.
@@ -283,7 +288,7 @@ struct Cli {
     /// Long enough that a round's two acks are back before the next one fires
     /// — the loser's answer costs a conflict, a retry and a re-read — and
     /// short enough that the whole leg fits inside the peers' lifetime.
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 250, env = "ORRERY_RACE_PERIOD_MS")]
     race_period_ms: u64,
 
     /// Internal: run as one peer rather than the orchestrator.

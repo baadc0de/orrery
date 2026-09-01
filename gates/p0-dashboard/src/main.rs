@@ -32,7 +32,7 @@ struct Cli {
     files: Vec<PathBuf>,
     /// Emit a machine-readable JSON summary (for CI gating) instead of the
     /// human report.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_JSON")]
     json: bool,
     /// Fail (exit non-zero) if the direct-path rate is below the baseline.
     ///
@@ -40,15 +40,15 @@ struct Cli {
     /// numbers; a small soak (e.g. 7 pairs with one forced-relay peer) lands
     /// below them by design. Override with `--min-direct-rate`/`--min-direct-bytes`
     /// for the sample size, or omit `--gate` to report without failing.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_GATE")]
     gate: bool,
     /// Gate threshold for the direct-path rate (0..=1). Defaults to the iroh
     /// baseline.
-    #[arg(long, default_value_t = BASELINE_DIRECT_RATE)]
+    #[arg(long, default_value_t = BASELINE_DIRECT_RATE, env = "ORRERY_MIN_DIRECT_RATE")]
     min_direct_rate: f64,
     /// Gate threshold for the direct-bytes fraction (0..=1). Defaults to the
     /// iroh baseline.
-    #[arg(long, default_value_t = BASELINE_DIRECT_BYTES)]
+    #[arg(long, default_value_t = BASELINE_DIRECT_BYTES, env = "ORRERY_MIN_DIRECT_BYTES")]
     min_direct_bytes: f64,
 }
 

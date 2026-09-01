@@ -257,11 +257,11 @@ impl From<ClaimTier> for ClaimKind {
 )]
 struct Cli {
     /// The gateway's `bind_addr` from persistd's readiness line.
-    #[arg(long, value_name = "IP:PORT")]
+    #[arg(long, value_name = "IP:PORT", env = "ORRERY_GATEWAY_ADDR")]
     gateway_addr: String,
 
     /// The gateway's `node_id` from persistd's readiness line.
-    #[arg(long, value_name = "NODE_ID")]
+    #[arg(long, value_name = "NODE_ID", env = "ORRERY_GATEWAY_NODE")]
     gateway_node: String,
 
     /// Hex-encoded identity issuer secret; its public half must be persistd's
@@ -270,19 +270,19 @@ struct Cli {
     issuer_secret: String,
 
     /// The coordinator's `bind_addr` from its readiness line.
-    #[arg(long, value_name = "IP:PORT")]
+    #[arg(long, value_name = "IP:PORT", env = "ORRERY_COORDINATOR_ADDR")]
     coordinator_addr: String,
 
     /// The coordinator's `node_id` from its readiness line.
-    #[arg(long, value_name = "NODE_ID")]
+    #[arg(long, value_name = "NODE_ID", env = "ORRERY_COORDINATOR_NODE")]
     coordinator_node: String,
 
     /// Peers in the island. The criterion's number is 8.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8, env = "ORRERY_P3_ISLAND_PEERS")]
     peers: u8,
 
     /// Entities each peer claims. The criterion's victim holds ~50.
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 50, env = "ORRERY_ENTITIES_PER_PEER")]
     entities_per_peer: u32,
 
     /// The tier the victim claims its entities at.
@@ -293,24 +293,29 @@ struct Cli {
     /// for every one of the victim's entities. Both are correct registrar
     /// behaviour and the criterion accepts both, which is exactly why the gate
     /// has to be able to run — and stop its clock — on either.
-    #[arg(long, value_enum, default_value_t = ClaimTier::Weak)]
+    #[arg(long, value_enum, default_value_t = ClaimTier::Weak, env = "ORRERY_VICTIM_CLAIM_KIND")]
     victim_claim_kind: ClaimTier,
 
     /// The cell the island occupies.
-    #[arg(long, default_value = "0x8000000000000000")]
+    #[arg(long, default_value = "0x8000000000000000", env = "ORRERY_CELL")]
     cell: String,
 
     /// How long peers keep simulating. Must outlast the settle window with
     /// margin, so survivors are still logging while the proof is collected.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, env = "ORRERY_DURATION_SECS")]
     duration_secs: u64,
 
     /// Where to put peer logs and the report.
-    #[arg(long, value_name = "DIR", default_value = "p3-island-out")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "p3-island-out",
+        env = "ORRERY_OUT"
+    )]
     out: PathBuf,
 
     /// persistd's `--metrics-jsonl` file, read for `duplicate_authority`.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_METRICS_JSONL")]
     metrics_jsonl: Option<PathBuf>,
 
     /// Run the D24 island-drain proof after the kill-9 criterion settles.

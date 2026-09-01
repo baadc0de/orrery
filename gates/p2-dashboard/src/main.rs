@@ -468,32 +468,32 @@ struct Cli {
     files: Vec<PathBuf>,
     /// Emit the machine-readable JSON summary (the stable machine contract)
     /// instead of the human report.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_JSON")]
     json: bool,
     /// Exit non-zero when any series' p99 misses its threshold. The D16 demo
     /// criterion gates on this flag; a series with no samples fails the gate.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_GATE")]
     gate: bool,
     /// D19 device-qualification JSON emitted before the P2 load starts. If it
     /// says the device is unqualified, latency comparisons are withheld while
     /// missing telemetry still fails.
-    #[arg(long)]
+    #[arg(long, env = "ORRERY_DEVICE_QUALIFICATION")]
     device_qualification: Option<PathBuf>,
     /// Threshold override for `journal_commit_ms` (µs). Default: the D16 2 ms
     /// target.
-    #[arg(long, default_value_t = ThresholdsUs::D16.journal_commit_ms)]
+    #[arg(long, default_value_t = ThresholdsUs::D16.journal_commit_ms, env = "ORRERY_JOURNAL_COMMIT_MS")]
     journal_commit_ms: u64,
     /// Threshold override for `bulk_ack_ms` (µs). Default: the D16 5 ms
     /// target.
-    #[arg(long, default_value_t = ThresholdsUs::D16.bulk_ack_ms)]
+    #[arg(long, default_value_t = ThresholdsUs::D16.bulk_ack_ms, env = "ORRERY_BULK_ACK_MS")]
     bulk_ack_ms: u64,
     /// Threshold override for `intent_commit_ms` (µs). Default: the D16 10 ms
     /// target.
-    #[arg(long, default_value_t = ThresholdsUs::D16.intent_commit_ms)]
+    #[arg(long, default_value_t = ThresholdsUs::D16.intent_commit_ms, env = "ORRERY_INTENT_COMMIT_MS")]
     intent_commit_ms: u64,
     /// Threshold override for `area_first_page_ms` (µs). Default: the D16 50
     /// ms target.
-    #[arg(long, default_value_t = ThresholdsUs::D16.area_first_page_ms)]
+    #[arg(long, default_value_t = ThresholdsUs::D16.area_first_page_ms, env = "ORRERY_AREA_FIRST_PAGE_MS")]
     area_first_page_ms: u64,
 }
 

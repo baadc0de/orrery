@@ -40,32 +40,37 @@ const DEFAULT_DURATION_SECS: u64 = 30;
 #[command(name = "p0-nat-test", version, about)]
 pub struct Cli {
     /// The iroh relay URL used as the punch rendezvous and fallback path.
-    #[arg(long, global = true, default_value_t = default_relay())]
+    #[arg(long, global = true, default_value_t = default_relay(), env = "ORRERY_RELAY")]
     pub relay: String,
 
     /// The remote peer's NodeId to dial. Omit to act as the host (rendezvous).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "ORRERY_PEER")]
     pub peer: Option<PublicKey>,
 
     /// Host mode: accept this many simultaneous connections (local mesh test).
     /// Defaults to 1; only meaningful when `--peer` is absent.
-    #[arg(long, global = true, default_value_t = 1)]
+    #[arg(long, global = true, default_value_t = 1, env = "ORRERY_P0_NAT_PEERS")]
     pub peers: u32,
 
     /// State datagram send rate, in ticks per second (P0 stress = 60).
-    #[arg(long, global = true, default_value_t = 60)]
+    #[arg(long, global = true, default_value_t = 60, env = "ORRERY_TICK_HZ")]
     pub tick_hz: u32,
 
     /// Payload size of each state datagram, in bytes.
-    #[arg(long, global = true, default_value_t = 64)]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 64,
+        env = "ORRERY_PAYLOAD_BYTES"
+    )]
     pub payload_bytes: usize,
 
     /// Roundtrip ping rate, in pings per second (for P50/P95 latency).
-    #[arg(long, global = true, default_value_t = 1)]
+    #[arg(long, global = true, default_value_t = 1, env = "ORRERY_PING_HZ")]
     pub ping_hz: u32,
 
     /// Total test window, in seconds.
-    #[arg(long, global = true, default_value_t = DEFAULT_DURATION_SECS)]
+    #[arg(long, global = true, default_value_t = DEFAULT_DURATION_SECS, env = "ORRERY_DURATION_SECS")]
     pub duration_secs: u64,
 
     /// Print the NodeId and exit without dialing or sending (host helper).
@@ -76,12 +81,12 @@ pub struct Cli {
     /// included). Dials every node after us in the list, accepts every node
     /// before us, so each pair connects exactly once. Combine with
     /// `--mesh-index` to identify this node's position.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "ORRERY_MESH")]
     pub mesh: Option<PathBuf>,
 
     /// This node's index in the `--mesh` roster (0-based). Required with
     /// `--mesh` if the roster cannot be matched to the local NodeId.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "ORRERY_MESH_INDEX")]
     pub mesh_index: Option<usize>,
 
     /// A stable secret key (hex) so this node keeps the same NodeId across
@@ -92,7 +97,7 @@ pub struct Cli {
 
     /// Emit telemetry as one JSON object per line on stdout (machine-parseable
     /// for the punch-rate dashboard). Tracing logs go to stderr.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "ORRERY_JSON")]
     pub json: bool,
 }
 
@@ -109,6 +114,32 @@ mod tests {
     use clap::Parser;
     use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    fn cli_env_fallback_and_flag_precedence() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        const NAME: &str = "ORRERY_MESH_INDEX";
+
+        let _lock = ENV_LOCK.lock().expect("environment lock");
+        let previous = std::env::var_os(NAME);
+        std::env::set_var(NAME, "7");
+        let from_env = Cli::try_parse_from(["p0-nat-test"]);
+        let from_flag = Cli::try_parse_from(["p0-nat-test", "--mesh-index", "3"]);
+        match previous {
+            Some(value) => std::env::set_var(NAME, value),
+            None => std::env::remove_var(NAME),
+        }
+
+        assert_eq!(
+            from_env.expect("environment fallback parses").mesh_index,
+            Some(7)
+        );
+        assert_eq!(
+            from_flag.expect("explicit flag parses").mesh_index,
+            Some(3),
+            "an explicit flag must beat the environment fallback"
+        );
+    }
 
     #[test]
     fn nat_lab_and_cli_derive_the_same_default_relay() {
