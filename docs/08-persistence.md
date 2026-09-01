@@ -67,7 +67,7 @@ control messages and rekey bulk records are rejected at the gateway.
 
 ## 2. The two write classes
 
-Everything durable enters through exactly one of two paths. The split is `Ruleset`-classified (D9): anything touching persistent *value* (items, currency, progression, structure placement) is critical; everything else (positions, health, world-entity state, terrain deltas) is bulk.
+Everything durable enters through exactly one of two paths. The split is `Ruleset`-classified (D9): anything touching persistent *value* (items, currency, progression, structure placement) is critical; everything else (positions, health, world-entity state) is bulk. Terrain deltas are not durable in v1 ([D51](adr/0051-v1-terrain-is-not-durable-state.md)); when durable terrain exists it will be bulk-class, but that requires a new ADR and allocation.
 
 | Property | Bulk state | Critical operations |
 |---|---|---|
@@ -2026,7 +2026,7 @@ Because the alternative was surveyed and loses: Redis-class stores acknowledge w
 On assuming shard `S` (cold start, node replacement, or relocation):
 
 1. **Fence:** CAS `actor/{S}` from `(old_node, e)` to `(self, e+1)` in one FDB transaction. The new epoch `e+1` is the fencing token; every subsequent checkpoint transaction *reads* `actor/{S}` and aborts if the epoch moved — a zombie actor (network-partitioned former owner) can never commit a stale checkpoint, because its commit would conflict with the CAS.
-2. **Load checkpoint:** range-scan `world/{cell_id}/…` for all interest cells in `S`, plus `chunk/{cell_id}/…`; read `ckpt/{S}` for the journal watermark `(node_id, lsn)` of the last checkpoint.
+2. **Load checkpoint:** range-scan `world/{cell_id}/…` for all interest cells in `S`; read `ckpt/{S}` for the journal watermark `(node_id, lsn)` of the last checkpoint. v1 checkpoints do not include terrain; `chunk/` is not a live family ([D51](adr/0051-v1-terrain-is-not-durable-state.md)).
 3. **Replay tail:** replay journal records for `S`'s cells with `lsn > watermark` — from the local journal if restarting in place, from the **chain-replication follower** if the node died, from the archive if both are gone.
 4. **Open mailbox**, bump gateway routing.
 
@@ -2124,8 +2124,8 @@ pub struct JournalRecord {
     pub tick: Tick,           // u64 universe tick (D8)
     pub epoch: Epoch,         // shard-ownership epoch at append (§2.1/§3.4 fence)
     pub author: NodeId,       // authoritative peer that produced the op
-    pub kind: RecordKind,     // ComponentDiff | TerrainDelta | Spawn | Despawn | Rekey | CheckpointMark
-                              // | TerrainPin | TerrainDemote  (§10.1 — pending D18)
+    pub kind: RecordKind,     // ComponentDiff | Spawn | Despawn | Rekey | CheckpointMark
+                              // | TerrainPin | TerrainDemote  (§10.1 — pending D18; durable terrain not v1, D51)
     pub payload: Bytes,       // postcard
     pub crc: u32,
 }
@@ -3205,7 +3205,7 @@ The [known limits](https://apple.github.io/foundationdb/known-limitations.html) 
 |---|---|
 | 5 s transaction duration | all transactions are short read–check–write sets (intents) or bounded checkpoint batches; long scans (area load, archive) use continuation ranges across transactions |
 | ~10 KB key | keys are tuple-encoded ids, tens of bytes |
-| ~100 KB value | entity rows sharded if oversized; terrain chunks stored as ≤100 KB shard rows `chunk/{cell_id}/{n}` |
+| ~100 KB value | entity rows sharded if oversized; no terrain shard rows in v1 (`chunk/` deleted, [D51](adr/0051-v1-terrain-is-not-durable-state.md)) |
 | 10 MB transaction | checkpoints split into multiple transactions by key range; the per-shard watermark row commits **last**, so a partially applied checkpoint is simply re-run (rows are idempotent overwrites) |
 | multi-DC commit tail (~22 ms mean / 281 ms p99.9 with satellites) | one FDB cluster **per region**; no cross-region transactions (D11 latency targets are in-region) |
 
@@ -3227,9 +3227,7 @@ Hot-key conflict retries are application responsibility under optimistic concurr
 | `ledger/receipt/{versionstamp}` | `(intent_id, parties, ops)` | FDB txn (versionstamped key) | trade audit trail, strictly ordered |
 | `intent/{intent_id}` | `(outcome, gc_deadline_ms)` | FDB txn | idempotency: a duplicate submission returns the recorded outcome. Retention is bounded — default **1 h**, swept by the same checkpoint pass that GCs despawn tombstones. A client's offline intent queue TTL must be shorter than this, or a replay after a long netsplit can double-apply |
 | `lease/{entity_id}` | `(holder NodeId, seq: SeqPair(auth_seq, own_seq), lease_id, expires_at, flags, group)` | lease registrar (CAS) | D7; TTL 10 s, heartbeat 2.5 s; `lease_id` = monotonic fencing token (gateway drops stale-`lease_id` uplinks); `flags`: `PLAYER_BOUND`/`STRONG_HELD`/`PROVISIONAL`/`PARKED`; `group` = attached children; full field semantics in [04-authority.md](04-authority.md) (canonical) |
-| `chunk/{grid_id}/{cell_id}/{n}` | terrain shard ≤ 100 KB | cell actor (compaction) · offline import tool | §8; `n` is a big-endian `u16` so a cell's sections sort together |
-| `chunk/{grid_id}/{cell_id}/meta` | `(shard_count, base_version, encoding)` | cell actor | |
-| `section_pin/{section_key}` | `(entity PersistId, cell, status: pin_pending\|live\|dormant\|cooling(until), tick_pin, tick_promote, tick_demote, demote_image_hash, demote_chunk_ref)` | transition intents (§10.1) | terrain↔entity promotion anchor — D17.7, pending D18 |
+| `section_pin/{section_key}` | `(entity PersistId, cell, status: pin_pending\|live\|dormant\|cooling(until), tick_pin, tick_promote, tick_demote, demote_image_hash, demote_chunk_ref)` | transition intents (§10.1) | terrain↔entity promotion anchor — D17.7, pending D18; `chunk/` is not a live v1 family ([D51](adr/0051-v1-terrain-is-not-durable-state.md)) |
 | `actor/{shard_cell_id}` | `(owner node, epoch, status)` | split/fence protocol | placement + fencing (§3.4) |
 | `ckpt/{grid_id}/{shard_cell_id}` | `(node_id, journal lsn, epoch, time)` | cell actor | recovery watermark, and **nothing else** — the entity bag lives in `world/` rows only (P-8) |
 | `jarchive/{node_id}/{segment_seq}` | `(object key, cell ranges, lsn span, checksum)` | archive tailer | journal-archive metadata |
@@ -3246,9 +3244,11 @@ Hot-key conflict retries are application responsibility under optimistic concurr
 `orrery_persistd::keyspace` — one module used by the checkpointer, the cold
 reader, the intent path and the offline seeder alike, so a key convention
 cannot drift between its writers. Each family carries a one-byte discriminator
-in place of the logical string prefix (`w` world, `c` ckpt, `k` chunk, `a`
+in place of the logical string prefix (`w` world, `c` ckpt, `a`
 actor, `i` intent, `s` seedmap, `p` seedprog, `v` content/version, `z`
-jarchive); the families are provably range-disjoint and a test asserts it
+jarchive); the `k` byte formerly allocated to `chunk/` was retired by
+[D51](adr/0051-v1-terrain-is-not-durable-state.md) and is not a live family
+prefix. The families are provably range-disjoint and a test asserts it
 pairwise. `jarchive/` wears the `z` byte with an ASCII sub-discriminator `a`
 (`za`) to match the discriminated-family pattern already used by `strike/`
 (`ya`) and `id/` (`da`, `db`, `dh`, `dw`).
@@ -3310,7 +3310,7 @@ Cell actors checkpoint **copy-on-update**: applying a diff to a dirty-flagged en
 
 ## 9. Area load
 
-Client enters an area → `orrery_persist_client` requests the 27-cell neighborhood (D5) over a reliable stream. The gateway partitions the cells: **live cells** (an actor holds them) are served from actor memory — authoritative, ≥ checkpoint freshness; **cold cells** are served by FDB range scans over `world/{cell_id}/…` + `chunk/{cell_id}/…` (contiguous by Morton prefix). Pages stream **nearest-first** (center cell, then face/edge/corner neighbors by distance), so the client can spawn-in against page one; target **< 50 ms to first page-in** (one actor snapshot or one in-region range scan — FDB reads are 0.1–1 ms — plus serialization and one RTT). Subsequent motion turns loads into incremental single-cell fetches at the AOI leading edge, and live diffs flow via replication (03-replication.md), not the load path. For a nested-grid area (a ship's interior, [01-spatial-model.md](01-spatial-model.md) §13) the load is one `grid/{grid_id}` frame read plus the normal 27-cell scans *in the ship's grid* — the frame row tells the client where the ship is; the contents come from the ship's own `CellId` space.
+Client enters an area → `orrery_persist_client` requests the 27-cell neighborhood (D5) over a reliable stream. The gateway partitions the cells: **live cells** (an actor holds them) are served from actor memory — authoritative, ≥ checkpoint freshness; **cold cells** are served by FDB range scans over `world/{cell_id}/…` (`chunk/` is not a v1 family, [D51](adr/0051-v1-terrain-is-not-durable-state.md)). Pages stream **nearest-first** (center cell, then face/edge/corner neighbors by distance), so the client can spawn-in against page one; target **< 50 ms to first page-in** (one actor snapshot or one in-region range scan — FDB reads are 0.1–1 ms — plus serialization and one RTT). Subsequent motion turns loads into incremental single-cell fetches at the AOI leading edge, and live diffs flow via replication (03-replication.md), not the load path. For a nested-grid area (a ship's interior, [01-spatial-model.md](01-spatial-model.md) §13) the load is one `grid/{grid_id}` frame read plus the normal 27-cell scans *in the ship's grid* — the frame row tells the client where the ship is; the contents come from the ship's own `CellId` space.
 
 **A requested cell matches stored cells by prefix, and an unmatched request is an empty page, not an error.** `read_snapshot` admits an entity when the requested cell is a prefix of the entity's stored cell, so `CellId::ROOT` is a covering scan of the whole grid while a request at `INTEREST_LEVEL` — the deepest level — matches only itself. That asymmetry is what makes a *wrong* cell indistinguishable from an *empty* one: both answer with a well-formed page carrying no entities, and only a genuinely failed read becomes an `AreaLoadError`. Any reader that proves durability per entity must therefore name the cell the write was acknowledged at, not a cell it derived independently; the P2 kill-9 verifier reads its leaves straight out of the ack log for exactly this reason (`scripts/p2-kill9-gate.sh`, `gates/p2-load`'s `recovery_leaf_cells`). Measured 2026-08-17: a verifier that synthesised its own lattice reported 99 of 100 durable entities missing against a promoted node that held all 100, with no error anywhere in the path.
 
@@ -3380,6 +3380,12 @@ cohort a shadow period would protect — it is fail-closed machinery, on by
 default wherever a grant can exist.
 
 ## 10. Terrain and bulk edits
+
+**Status:** The durable terrain surface described in this section was removed
+from v1 by [D51](adr/0051-v1-terrain-is-not-durable-state.md). `chunk/` is not
+a live keyspace family; `RecordKind::TerrainDelta` has no fold, no writer, and
+no checkpoint. What follows documents the design that was planned; a future
+terrain proposal requires a new ADR and a new prefix allocation.
 
 Terrain is chunk-oriented and cell-aligned (one chunk = one interest cell subdivided into sections). Edits are **bulk-class**: a `TerrainDelta{cell, section, op}` journal record on the standard bulk ack path (§2.1). Every delta is **attributed to and fenced by the editing player's own `PLAYER_BOUND` lease** — the record's author must hold that lease, so edits are attributable per account and a peer cannot edit as someone else. The cell actor invariant-checks each delta before applying: **reach** (the edit lies within interaction range of the editor's committed position), **rate** (per-account edit-rate caps), **tool** (the `Ruleset` confirms the editor holds the claimed capability); violations are rejected or flagged (§2.1). **Destructive or high-value edits** (`Ruleset`-classified — structure demolition, protected-region changes) are not bulk at all: they route through the witness-attested intent path (§2.2). Live edits replicate peer-to-peer on the reliable per-cell stream ordered by `(cell, tick)`, with late joiners fetching compacted chunks from the gateway — the replication side is specified in [03-replication.md](03-replication.md) (terrain delta replication). The actor holds `base + delta list` per chunk; compaction (on checkpoint cadence, or when deltas exceed 25% of base size) folds deltas into a new base and rewrites `chunk/{cell_id}/{n}` snapshot rows, each ≤ 100 KB to respect the value limit. **Sparse elision** is mandatory: empty/homogeneous sections are not stored — the [Minecraft chunk format](https://minecraft.wiki/w/Chunk_format) precedent (empty sections elided; [region files](https://minecraft.wiki/w/Region_file_format) bundling nearby chunks is exactly our Morton-prefix locality, done with files). Untouched procedural terrain costs zero rows: absence of `chunk/` keys means "regenerate from seed".
 
@@ -3789,9 +3795,8 @@ the selection will ever read.
 
 **What is never written — the ledger is out of scope explicitly, not
 incidentally.** A restore may write the bulk families the owning cell actor
-already checkpoints — `world/` and `grid/`, and `chunk/` once the terrain
-substrate exists (§8) — and nothing else: it introduces no new writer into the
-keyspace, so its tier boundary is the checkpoint writer's boundary. It may not
+already checkpoints — `world/` and `grid/` — and nothing else: it introduces no new writer into the
+keyspace, so its tier boundary is the checkpoint writer's boundary. (`chunk/` is not a v1 family; durable terrain was removed by [D51](adr/0051-v1-terrain-is-not-durable-state.md). If terrain is reintroduced, it needs a new ADR and a new prefix allocation — it cannot be implied by this parenthetical.) It may not
 write `ledger/bal`, `ledger/item`, `ledger/receipt`, `intent/`, `player/`,
 `strike/`, `epoch/`, `id/`, `actor/`, `lease/`, `section_pin/`, `ckpt/`
 (watermarks advance only through ordinary checkpoints), or `pid/next`. This is
@@ -3848,13 +3853,14 @@ selection predicate (this contract selects on nothing else); #808's restore
 path owns the `RecordKind::Restore` fold, the request/outcome surface, and the
 hold detection; #106's account binding is what an account-named selection
 waits on. And one prerequisite this contract surfaces but does not fix: **the
-terrain substrate does not exist** — `RecordKind::TerrainDelta` folds to the
-empty arm at all three fold sites (`actor.rs:1409`, `:1426`;
+terrain substrate does not exist in v1** — durable terrain was removed by
+[D51](adr/0051-v1-terrain-is-not-durable-state.md); `RecordKind::TerrainDelta`
+folds to the empty arm at all three fold sites (`actor.rs:1409`, `:1426`;
 `runtime.rs:2135`), `chunk_key` has no caller outside `keyspace.rs`'s own
 tests, and the seeder says so (*"v1 has no `chunk/` rows"*,
-`orrery_seed/src/plan.rs:98`). Until it lands, a restore covers `world/`
-entities only, which is a prerequisite of the demo criterion rather than of
-this contract.
+`orrery_seed/src/plan.rs:98`). Until a future terrain ADR lands, a restore
+covers `world/` entities only, which is a prerequisite of the demo criterion
+rather than of this contract.
 
 ### 11.6 The tailer
 
@@ -4095,7 +4101,7 @@ The floor is *derived from* the bag it describes rather than being an independen
 
 A designed world has to get *into* the keyspace before the first player connects:
 
-- **Offline import tool, built on the `persistd` harness.** The importer links the same library as the server binary (D12) and bulk-writes designed content — entities into `world/{cell_id}/{entity_id}`, terrain into `chunk/{cell_id}/{n}` — via direct FDB batch loads (no gateway, no journal: there is nothing to replay yet), minting `PersistId`s from the same `pid/next` allocator (§6) so designed and dynamic entities share one id space.
+- **Offline import tool, built on the `persistd` harness.** The importer links the same library as the server binary (D12) and bulk-writes designed content — entities into `world/{cell_id}/{entity_id}` — via direct FDB batch loads (no gateway, no journal: there is nothing to replay yet), minting `PersistId`s from the same `pid/next` allocator (§6) so designed and dynamic entities share one id space. Terrain is not a v1 durable-state import; `chunk/` was removed by [D51](adr/0051-v1-terrain-is-not-durable-state.md).
 - **Content-version row.** Each import records a content build id + manifest digest under `content/version` (§6). Later deploys **diff** the new manifest against the recorded one and **patch** only changed rows; seeded rows that players have since modified are not clobbered — they are flagged for a `Ruleset`-defined merge policy instead of overwritten.
 - **Full specification.** The import tool's scenario format, generator bank, targeting model, determinism contract, manifest/diff/patch mechanics and acceptance criteria are specified in [12-world-seeding.md](12-world-seeding.md), which expands this section. This section stays normative over it.
 - **`universe_seed` custody.** The universe's procedural seed is generated **once per universe** and held in the operator's secret store — it is security-relevant per D9 (the verifiable core's per-entity, per-tick deterministic RNG derives from it). `persistd` nodes and the import tool read it from the secret store at startup; it never appears in the keyspace or in client-visible state.

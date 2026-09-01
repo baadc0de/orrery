@@ -27,7 +27,7 @@ They pull in different directions — designed content wants *stability under ch
 
 ## 2. Prerequisites: eight defects the seeder depends on
 
-The seeder writes `world/` and `chunk/` rows and its whole value proposition is that those rows are then **readable by area load and survive a restart**. Tracing that path through the current tree found eight defects that break it. They are listed here because the seeder's acceptance criteria (§14) cannot be met until they are fixed, and because several of them change what the seeder is allowed to write.
+The seeder writes `world/` rows and its whole value proposition is that those rows are then **readable by area load and survive a restart**. (`chunk/` is not a v1 durable family; durable terrain was removed by [D51](adr/0051-v1-terrain-is-not-durable-state.md).) Tracing that path through the current tree found eight defects that break it. They are listed here because the seeder's acceptance criteria (§14) cannot be met until they are fixed, and because several of them change what the seeder is allowed to write.
 
 | # | Location | Defect | Consequence for the seeder |
 |---|---|---|---|
@@ -250,7 +250,7 @@ where = "solid > 0.15 and solid < 0.85"
 
 **Ordering rules.** Layers evaluate in declaration order; a layer may reference only accumulators defined above it (forward references are a static error, making the file a DAG in reading order); `"main"` exists implicitly at 0. Field values clamp to `[0, field_clamp]` (default 64.0) after each fold, and the plan reports how many cells clamped — a non-zero count is almost always a `blend`-weight bug, not intent.
 
-**Conflicts.** Entity emits never conflict: each mints its own `PersistId` block, so two emits into one cell simply both write rows. Terrain emits *do* conflict, because `chunk/{cell_id}/{n}` is one row per (cell, section); the default `on_conflict = "error"` is detected at **plan** time by intersecting occupied-cell sets and reported with both emit names and the offending `CellRef`. `priority`, `replace` and `merge` are explicit opt-ins. A silent clobber is not reachable.
+**Conflicts.** Entity emits never conflict: each mints its own `PersistId` block, so two emits into one cell simply both write rows. Terrain emits *would* conflict, because `chunk/{cell_id}/{n}` is one row per (cell, section); the default `on_conflict = "error"` is detected at **plan** time by intersecting occupied-cell sets and reported with both emit names and the offending `CellRef`. `priority`, `replace` and `merge` are explicit opt-ins. A silent clobber is not reachable. Terrain emits are not durable in v1 (`chunk/` deleted, [D51](adr/0051-v1-terrain-is-not-durable-state.md)); this rule documents the planned behavior if durable terrain returns.
 
 ### 5.4 `[[emit]]` — realization
 
@@ -374,7 +374,7 @@ These are the generators that serve §17's actual purpose. What separates them f
 | `explicit` | an authored list of cells/positions | `entries` | Set pieces, quest hubs, spawn points. Always exact, never sampled. |
 | `import` | a serialized fragment, translated and repeated | `path`, `displacement_cells`, `repeat` | OpenSim OAR's `--merge`/`--displacement` semantics: stamp a known-good fragment. Repeating produces perfectly periodic density — a deliberately adversarial input for HRW. |
 
-Chunked simple-tiled **WFC / model synthesis** (Merrell's modification-in-blocks) — constraint propagation over a tile grid, structurally a Sudoku solver whose rules are tile adjacencies (→ **A.13**) — is the strongest authored-looking generator in the survey and is specified as the first v2 addition, not v1. Block-wise solving is not merely a scaling trick, it is the *patch unit*: a block plus its margin is the reachable set of any change, and at `block = 8 slots × tile_size = 4 m = 32 m` a block maps 1:1 onto a `chunk/{cell}/{n}` section and 64:1 onto a 128 m interest cell. It is deferred because it needs a tile-set authoring format that does not exist yet, and v1 must not block on one.
+Chunked simple-tiled **WFC / model synthesis** (Merrell's modification-in-blocks) — constraint propagation over a tile grid, structurally a Sudoku solver whose rules are tile adjacencies (→ **A.13**) — is the strongest authored-looking generator in the survey and is specified as the first v2 addition, not v1. Block-wise solving is not merely a scaling trick, it is the *patch unit*: a block plus its margin is the reachable set of any change, and at `block = 8 slots × tile_size = 4 m = 32 m` a block maps 1:1 onto a `chunk/{cell}/{n}` section and 64:1 onto a 128 m interest cell. (`chunk/` is not a v1 family; this mapping describes the planned v2 design, [D51](adr/0051-v1-terrain-is-not-durable-state.md).) It is deferred because it needs a tile-set authoring format that does not exist yet, and v1 must not block on one.
 
 Overlapping-model WFC is rejected outright: 10–100× the memory in 3D for an exemplar you cannot parameterize, with no derivation path at all.
 
@@ -412,7 +412,7 @@ The measured numbers settle two design arguments outright:
 | cross-cell handoff and interest churn | `boids` | correlated crossings, 70–100% duty |
 | shard *merge* | any + `[schedule]` | nothing else empties a shard on a timetable |
 | nested reference frames | `kepler` | gated on P-7 |
-| terrain rows and size limits | `heightfield` | the only `chunk/` writer |
+| terrain rows and size limits | `heightfield` | the only `chunk/` writer; not durable in v1 ([D51](adr/0051-v1-terrain-is-not-durable-state.md)) |
 | a realistic patch workload | `ca`, re-run at generation `g+Δ` | large, reproducible, density-preserving diff |
 
 ### 6.7 Rejected, and why
@@ -602,7 +602,7 @@ On a later deploy, the seeder generates the new manifest, loads the recorded one
 
 ### 9.5 Wipe and re-seed
 
-`wipe` clears the scenario's `world/`, `chunk/` and `seedmap/` ranges by real subtree spans (blocked on **P-3**), then clears `content/version`. It requires `--yes` plus the `content_build` string typed back, refuses outright when any `actor/{shard}` fence row in range is live, and refuses when `[limits] protect = true` — the production-wipe guard.
+`wipe` clears the scenario's `world/` and `seedmap/` ranges by real subtree spans (blocked on **P-3**), then clears `content/version`. It no longer clears `chunk/` because `chunk/` is not a v1 durable family ([D51](adr/0051-v1-terrain-is-not-durable-state.md)). It requires `--yes` plus the `content_build` string typed back, refuses outright when any `actor/{shard}` fence row in range is live, and refuses when `[limits] protect = true` — the production-wipe guard.
 
 ---
 
@@ -620,7 +620,7 @@ Checked before any write, in this order, with the config span quoted in the erro
 | V6 | `bounds = "all"` not combined with an operator needing a normalization sweep (§5.1) |
 | V7 | terrain emit conflicts, by intersecting occupied-cell sets (§5.3) |
 | V8 | targets not over-constrained beyond the declared knobs (§7.2) |
-| V9 | projected `ckpt/{shard}` value size, `world/` row size and `chunk/` shard size against FDB limits — **an over-limit projection is an error, not a warning** |
+| V9 | projected `ckpt/{shard}` value size and `world/` row size against FDB limits — **an over-limit projection is an error, not a warning** |
 | V10 | `[limits]` guards: `max_entities`, `max_bytes`, `max_wall_clock`, `protect` |
 | V11 | cluster preflight (with `--probe`): health, free space, existing rows in target ranges |
 
@@ -731,7 +731,7 @@ Reads the world back and asserts it matches the manifest.
 | Morton locality — do 27-cell neighbourhood scans read contiguously? | sampled cells | one scan per sample |
 | orphans — `world/` rows with no manifest entry | exhaustive | one scan |
 | id-space integrity — `pid/next` exceeds every minted id, no duplicates | exhaustive (manifest-local) | in-memory |
-| `chunk/` shard sizes ≤ 100 KB | exhaustive | metadata only |
+| `chunk/` shard sizes ≤ 100 KB | n/a in v1 | `chunk/` deleted ([D51](adr/0051-v1-terrain-is-not-durable-state.md)) |
 
 ### 12.3 The rig and demo seam
 
@@ -1149,7 +1149,7 @@ count     = 25_000
 tolerance = 0.02
 ```
 
-**On elision.** `elide = "empty"` writes a `chunk/` row only for sections the scenario actually authored as non-empty. The seeder does **not** evaluate the client's runtime terrain function to decide whether a section equals the procedural default — it cannot, without linking the client's generator, and pretending otherwise was an early draft's mistake. "Absence of `chunk/` keys means regenerate from seed" ([08-persistence.md](08-persistence.md) §10) stays the client's contract; the seeder's contribution is to record the terrain generator's parameters in the manifest so the client can reproduce the base.
+**On elision.** `elide = "empty"` would write a `chunk/` row only for sections the scenario actually authored as non-empty. The seeder does **not** evaluate the client's runtime terrain function to decide whether a section equals the procedural default — it cannot, without linking the client's generator, and pretending otherwise was an early draft's mistake. "Absence of `chunk/` keys means regenerate from seed" ([08-persistence.md](08-persistence.md) §10) is the client's contract for the planned design; in v1 there are no `chunk/` rows because durable terrain was removed by [D51](adr/0051-v1-terrain-is-not-durable-state.md). The seeder's contribution is to record the terrain generator's parameters in the manifest so the client can reproduce the base.
 
 ### 18.5 `solar.toml` — the showcase (gated on P-7)
 
@@ -1985,7 +1985,7 @@ while some slot has more than one option:
 
 It is a Sudoku solver whose constraints are "which tiles may sit next to which", and the failure mode is the same one Sudoku has: a bad early choice makes a later slot unsatisfiable.
 
-**Merrell's model synthesis** solves that at world scale by working in **blocks with margins** — re-solve one block at a time, keeping its surroundings fixed. That is not merely a scaling trick, it is the *patch unit*: a block plus its margin is exactly the reachable set of any change. At `block = 8 slots × tile_size = 4 m = 32 m`, a block maps 1:1 onto a `chunk/{cell}/{n}` section and 64:1 onto a 128 m interest cell.
+**Merrell's model synthesis** solves that at world scale by working in **blocks with margins** — re-solve one block at a time, keeping its surroundings fixed. That is not merely a scaling trick, it is the *patch unit*: a block plus its margin is exactly the reachable set of any change. At `block = 8 slots × tile_size = 4 m = 32 m`, a block maps 1:1 onto a `chunk/{cell}/{n}` section and 64:1 onto a 128 m interest cell. (`chunk/` is not a v1 family; this mapping describes the planned design, [D51](adr/0051-v1-terrain-is-not-durable-state.md).)
 
 ### A.14 Machinery
 
