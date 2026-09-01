@@ -3224,13 +3224,14 @@ Hot-key conflict retries are application responsibility under optimistic concurr
 | `player/{account_id}/loc` | `(cell_id, entity_id)` | cell actor on rekey | login placement pointer. **Not yet written:** the rekey path relocates the durable *lease* location index, not this row; the key builder exists and no writer calls it |
 | `ledger/bal/{account_id}/{asset_id}` | integer balance | **FDB txn only** | currency; integer math (D9) |
 | `ledger/item/{item_uid}` | `(owner_ref, item_state)` | **FDB txn only** | unique items; single ownership row = anti-dupe invariant |
-| `ledger/receipt/{versionstamp}` | `(intent_id, parties, ops)` | FDB txn (versionstamped key) | trade audit trail, strictly ordered |
+| `ledger/receipt/{versionstamp}` | `(intent_id, parties: AccountId[], ops, balance_deltas, ownership: { item, before, after }[])` | FDB txn (versionstamped key) | complete economic-effect trail, strictly ordered; every balance/item mutation writes one |
 | `intent/{intent_id}` | `(outcome, gc_deadline_ms)` | FDB txn | idempotency: a duplicate submission returns the recorded outcome. Retention is bounded — default **1 h**, swept by the same checkpoint pass that GCs despawn tombstones. A client's offline intent queue TTL must be shorter than this, or a replay after a long netsplit can double-apply |
 | `lease/{entity_id}` | `(holder NodeId, seq: SeqPair(auth_seq, own_seq), lease_id, expires_at, flags, group)` | lease registrar (CAS) | D7; TTL 10 s, heartbeat 2.5 s; `lease_id` = monotonic fencing token (gateway drops stale-`lease_id` uplinks); `flags`: `PLAYER_BOUND`/`STRONG_HELD`/`PROVISIONAL`/`PARKED`; `group` = attached children; full field semantics in [04-authority.md](04-authority.md) (canonical) |
 | `section_pin/{section_key}` | `(entity PersistId, cell, status: pin_pending\|live\|dormant\|cooling(until), tick_pin, tick_promote, tick_demote, demote_image_hash, demote_chunk_ref)` | transition intents (§10.1) | terrain↔entity promotion anchor — D17.7, pending D18; `chunk/` is not a live v1 family ([D51](adr/0051-v1-terrain-is-not-durable-state.md)) |
 | `actor/{shard_cell_id}` | `(owner node, epoch, status)` | split/fence protocol | placement + fencing (§3.4) |
 | `ckpt/{grid_id}/{shard_cell_id}` | `(node_id, journal lsn, epoch, time)` | cell actor | recovery watermark, and **nothing else** — the entity bag lives in `world/` rows only (P-8) |
 | `jarchive/{node_id}/{segment_seq}` | `(object key, cell ranges, lsn span, checksum)` | archive tailer | journal-archive metadata |
+| `rarchive/{last_receipt_versionstamp}` | `(object key, first/last receipt key, rows, checksum)` | receipt archive scanner | verified economic-receipt page and restart cursor (`zr` inside the `z` family) |
 | `id/{account_id}` | account record, bound NodeIds, tokens | `orrery_identity` | canonical identity subspace; Sybil cost anchor (D10) |
 | `strike/{account_id}/{versionstamp}` | `(weight, decay t½=14 d, evidence ref)` | adjudication executor | read by identity for quarantine/ban thresholds |
 | `epoch/{cell_id}` | witness-epoch record: seed-key commitment (blake3), epoch bounds, revealed key at epoch end | coordinator (via gateway) | D10 witness-set seeding; commitment published in the epoch announcement, key revealed for retroactive verifiability |
@@ -3251,7 +3252,9 @@ jarchive); the `k` byte formerly allocated to `chunk/` was retired by
 prefix. The families are provably range-disjoint and a test asserts it
 pairwise. `jarchive/` wears the `z` byte with an ASCII sub-discriminator `a`
 (`za`) to match the discriminated-family pattern already used by `strike/`
-(`ya`) and `id/` (`da`, `db`, `dh`, `dw`).
+(`ya`) and `id/` (`da`, `db`, `dh`, `dw`). Receipt archive metadata shares
+that `z` family under discriminator `r` (`zr`); `za` and `zr` are disjoint
+sub-spans with independent scan profiles.
 
 **No split rows (P2 decision, 2026-08-13).** An earlier revision of this table
 specified that a `world/` value above FDB's 100 KB limit splits into
@@ -3286,11 +3289,9 @@ db.run(|trx, _| async move {
     ensure!(Item::decode(&item)?.owner == a,   Reject::NotOwner);
     ensure!(u64_le(&bal_b) >= 500,             Reject::Insufficient);
     ruleset.validate_trade(&trx_view, &intent).await?;  // game-level durable rules
-    // 3. Writes.
-    trx.set(&key_item(x_uid), &Item { owner: b, ..item }.encode());
-    trx.atomic_op(&key_bal(b, GOLD), &(-500i64).to_le_bytes(), MutationType::Add);
-    trx.atomic_op(&key_bal(a, GOLD), &500i64.to_le_bytes(),  MutationType::Add);
-    trx.set_versionstamped_key(&key_receipt_vs(), &receipt.encode());
+    // 3. One guarded mutation bundle: effects and its mandatory receipt.
+    let mutation = checked_plan.into_mutation(intent_id).expect("ledger writes");
+    stage_ledger_mutation(&trx, &mutation); // item + balances + receipt, same trx
     trx.set(&key_intent(intent_id), &Outcome::Committed.encode());
     Ok(Outcome::Committed)
 }).await
@@ -3300,6 +3301,11 @@ Semantics that make this the anti-dupe mechanism:
 
 - **Serializable read–check–write.** If any concurrent transaction commits a write intersecting this transaction's read set between our read version and commit (B spends the same gold elsewhere; A trades X to C), the resolver rejects the commit with `not_committed`; `db.run` re-runs the closure — which then re-reads the new state and *fails the check honestly* (`Insufficient` / `NotOwner`). Double-spend requires two commits over the same `ledger/item/{X}` read — impossible by construction.
 - **Atomic adds** on balances avoid read conflicts on the *credit* side (A's balance is blind-incremented) while the *debit* side keeps its read so the balance check is enforced.
+- **Mandatory effect receipt.** The mutation stage accepts a coupled
+  `LedgerMutation { writes, receipt }`, not a write slice. Pure credits bank a
+  balance delta; ownership writes bank item id and `before`/`after`
+  `AccountId`s (`None → Some` is a mint). Effects and receipt are staged on the
+  same FDB transaction, so there is no effect-to-receipt crash boundary.
 - **Idempotency row** converts at-least-once intent delivery (client retries on timeout) into exactly-once outcomes.
 - **Id minting in the receipt:** intents that create entities (crafting outputs, loot grants) allocate `PersistId`s inside the transaction (atomic add on `pid/next`, §6) and return them in the commit receipt — the client's predicted entity binds to its durable id on ack (§4 covers the peer-side block-grant path for bulk-class spawns).
 - **Bounded retries:** after 5 conflict retries or `Reject`, the gateway returns a definitive refusal; the client's predicted intent outcome (D8) rolls back. Cross-cell trades need nothing special — the transaction spans arbitrary keys regardless of which nodes host the parties' cell actors.
@@ -3674,30 +3680,21 @@ analysis.
   current (overwritten) checkpoint.
 
 - **Daily conservation sweep (#615).** Needs per-asset global conservation and
-  per-item ownership continuity across history. **The archive cannot serve this
-  today, and the schema is not what is missing** (#832). D11 splits the write
-  classes: bulk diffs go to the journal, economic intents go directly to
-  FoundationDB (`docs/adr/0011-persistence.md`). The only production
-  `JournalRecord` producer consumes `DiffUplink` component payloads, and the
-  archive stores only journal records — so balance and ownership effects, which
-  are written inside the FDB transaction, never reach it. Pure credits produce
-  no receipt at all, and `ReceiptRow` carries `{ intent_id, parties, ops }` —
-  op *ids*, not deltas, item ids or ownership transitions.
+  per-item ownership continuity across history. Shape C (#832) supplies that
+  prerequisite without weakening D11's split: journal objects stay bulk-only,
+  while every FDB ledger mutation banks an enriched `ReceiptRow` in the *same
+  serializable transaction*. The row carries signed balance deltas keyed by
+  `AccountId` and ownership transitions keyed by `ItemUid`, including both
+  `before` and `after` (`None` expresses mint/burn). Pure credits now bank a
+  receipt too. The receipt scanner archives those rows into the separate
+  `rarchive/` Parquet family (§11.7), so #615 needs no `id/db` join and no
+  invented journal record.
 
-  A durable economic-effect record on a path the archive can see is the
-  prerequisite, and it is an owner decision (#832) because it touches the intent
-  path's transaction. Until it lands, this bullet describes an intent, not a
-  capability.
-
-  When it does land, the layout question below still applies. The primary
-  clustering is
-  `(grid, cell, lsn)`, while per-item ownership continuity is a
-  per-`PersistId` history; an item that moves between cells has its history
-  scattered across every cell's objects. Serving #615 efficiently from this
-  layout requires a full scan of the relevant time window plus an in-memory
-  re-sort by `PersistId`. Whether that cost is acceptable is part of #615's
-  measurement charter; this schema intentionally does not add a secondary
-  clustering by `PersistId` today.
+  The sweep itself remains #615. Its archive read scans the relevant receipt
+  objects and re-sorts ownership transitions by `ItemUid`; receipt objects are
+  ordered on their FDB commit versionstamp, not the journal's spatial
+  `(grid, cell, lsn)` clustering. That full-window cost and the findings are
+  #615's measurement charter, not this producer's.
 
 - **Offline progress / parked-cell catch-up.** Needs the input history for a
   cell. The `(grid, cell, lsn)` clustering serves this directly.
@@ -3999,6 +3996,43 @@ physical types, so §11.1's `u64` columns ride INT64 and its `u32`/`u8` columns
 ride INT32, with the same bit patterns; `kind` discriminants are pinned in
 source rather than derived, because a variant inserted in the middle would
 otherwise silently re-number every object ever written.
+
+### 11.7 Economic receipt scanner (Shape C)
+
+`persistd --receipt-archive --archive-dir <DIR>` selects one process as the
+global economic archive role; it also requires `--fdb-cluster-file`. This is
+explicit rather than enabled on every journal node because the source range is
+global. The implementation exposes `scanners = 1` as a constant, not a
+parallelism dial, and reports the configured page size (default **4,096**),
+rows/s, and full-pass duration.
+
+One bounded pass captures the greatest `ledger/receipt/` key — therefore a
+fixed upper FDB commit versionstamp — before reading any page. It then walks
+strictly after the durable cursor and at or below that upper key in short,
+snapshot-only transactions of at most `page_rows`. Writes arriving during the
+pass sort above the captured bound and wait for the next pass; a growing hot
+range therefore cannot make a pass infinite or hold one FDB read transaction
+open. Each page becomes a deterministic Parquet object under
+`rarchive/{last versionstamp}.parquet`, with columns for receipt key,
+`intent_id`, parties, ops, balance deltas, ownership transitions, and receipt
+encoding version.
+
+Publication repeats §11.6's verified order: encode, upload, re-read and hash,
+then commit `zr ‖ last_versionstamp` metadata. The greatest `zr` row is the
+restart cursor, so there is no separately stored watermark to disagree with
+the page markers. A crash before metadata costs a deterministic re-upload; a
+crash after it resumes strictly after that page. Receipt rows remain the
+authoritative atomic record in FDB — archiving them creates no second intent
+transaction boundary and does not delete them.
+
+#837 measured this discipline on a single-process development FDB cluster.
+One continuous 4,096-row scanner did not move intent commit p50/p99 outside
+the no-scan baseline variation. Four continuous scanners raised p50 about
+**19%** and p99 **9–16%**, to an absolute p99 of **1.279 ms**. That remains
+below D11's **10 ms** target, but it makes parallel unpaced scanners the wrong
+default. Repeat the contention arm on deployment-shaped FDB; one scanner
+failing to keep up, or intent p99 approaching 10 ms, reopens Shape B rather
+than authorizing more scanners in passing.
 
 ## 12. Hotspot management
 

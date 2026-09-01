@@ -2081,9 +2081,86 @@ pub(crate) enum PlannedWrite {
     ItemOwner {
         /// The item whose ownership row moves.
         item: orrery_protocol::ItemUid,
+        /// Owner observed inside the transaction before this write. `None`
+        /// is the honest prior state of a mint.
+        before: Option<AccountId>,
         /// The row's new value.
         row: crate::keyspace::ItemRow,
     },
+}
+
+/// A non-empty set of ledger writes coupled to its mandatory receipt.
+///
+/// There is deliberately no constructor taking writes alone. Both executors
+/// accept this bundle at their guarded mutation stage, so adding a new ledger
+/// write cannot compile there unless the receipt generated from the same plan
+/// travels with it. The fields stay private to keep that invariant local to
+/// [`IntentPlan::into_mutation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LedgerMutation {
+    writes: Vec<PlannedWrite>,
+    receipt: crate::keyspace::ReceiptRow,
+}
+
+impl LedgerMutation {
+    /// Build a receipt from the exact writes it guards. An empty write set is
+    /// not a ledger mutation and therefore produces no bundle.
+    fn from_writes(
+        intent_id: u128,
+        parties: Vec<AccountId>,
+        ops: Vec<u16>,
+        writes: Vec<PlannedWrite>,
+    ) -> Option<Self> {
+        if writes.is_empty() {
+            return None;
+        }
+        let balance_deltas = writes
+            .iter()
+            .filter_map(|write| match write {
+                PlannedWrite::BalanceAdd {
+                    account,
+                    asset,
+                    delta,
+                } => Some(crate::keyspace::ReceiptBalanceDelta {
+                    account: *account,
+                    asset: *asset,
+                    delta: *delta,
+                }),
+                PlannedWrite::ItemOwner { .. } => None,
+            })
+            .collect();
+        let ownership = writes
+            .iter()
+            .filter_map(|write| match write {
+                PlannedWrite::ItemOwner { item, before, row } => {
+                    Some(crate::keyspace::ReceiptOwnershipTransition {
+                        item: *item,
+                        before: *before,
+                        after: Some(row.owner),
+                    })
+                }
+                PlannedWrite::BalanceAdd { .. } => None,
+            })
+            .collect();
+        Some(Self {
+            writes,
+            receipt: crate::keyspace::ReceiptRow {
+                intent_id,
+                parties,
+                ops,
+                balance_deltas,
+                ownership,
+            },
+        })
+    }
+
+    fn writes(&self) -> &[PlannedWrite] {
+        &self.writes
+    }
+
+    fn receipt(&self) -> &crate::keyspace::ReceiptRow {
+        &self.receipt
+    }
 }
 
 /// The in-flight decision about one intent: what the ledger currently says,
@@ -2109,9 +2186,6 @@ pub(crate) struct IntentPlan {
     /// The accounts a transfer moved value between, first-seen order — the
     /// `parties` field of the `ledger/receipt/` row.
     parties: Vec<AccountId>,
-    /// Whether any op transferred an item, and therefore whether this intent
-    /// banks a receipt.
-    transferred: bool,
 }
 
 impl IntentPlan {
@@ -2145,6 +2219,7 @@ impl IntentPlan {
             asset,
             delta,
         });
+        self.note_party(account);
     }
 
     /// Check a transfer against the current view and, if it passes, stage its
@@ -2163,22 +2238,23 @@ impl IntentPlan {
             .get(&t.item)
             .and_then(Clone::clone)
             .expect("checked present");
+        let before = Some(row.owner);
         row.owner = t.buyer;
         self.items.insert(t.item, Some(row.clone()));
-        self.writes
-            .push(PlannedWrite::ItemOwner { item: t.item, row });
+        self.writes.push(PlannedWrite::ItemOwner {
+            item: t.item,
+            before,
+            row,
+        });
+        for party in [t.seller, t.buyer] {
+            self.note_party(party);
+        }
         // The debit side keeps its read (the balance check above); the credit
         // side is blind, exactly as §7 specifies. Both are `Add`s here — what
         // makes the debit safe is that it was *checked* against a value read
         // in this same transaction, not that it is written differently.
         self.balance_delta(t.buyer, t.asset, -t.price);
         self.balance_delta(t.seller, t.asset, t.price);
-        for party in [t.seller, t.buyer] {
-            if !self.parties.contains(&party) {
-                self.parties.push(party);
-            }
-        }
-        self.transferred = true;
         OpsVerdict::Applied
     }
 
@@ -2192,22 +2268,27 @@ impl IntentPlan {
             asset,
             delta,
         });
+        self.note_party(account);
     }
 
-    /// The staged writes, in application order.
-    fn writes(&self) -> &[PlannedWrite] {
-        &self.writes
+    fn note_party(&mut self, account: AccountId) {
+        if !self.parties.contains(&account) {
+            self.parties.push(account);
+        }
     }
 
-    /// The `ledger/receipt/` row this intent banks, or `None` if it moved no
-    /// item. A pure credit writes no receipt: the audit trail of §6 is
-    /// `(intent_id, parties, ops)` for a *trade*.
-    fn receipt(&self, intent: &Intent) -> Option<crate::keyspace::ReceiptRow> {
-        self.transferred.then(|| crate::keyspace::ReceiptRow {
-            intent_id: intent.intent_id,
-            parties: self.parties.clone(),
-            ops: intent.ops.iter().map(|op| op.op).collect(),
-        })
+    /// Consume the plan into the only type the mutation stage accepts.
+    ///
+    /// An intent carrying only Ruleset-opaque ops has no cluster-interpreted
+    /// ledger writes and therefore no mutation bundle. Every non-empty write
+    /// set gets exactly one receipt generated from those same writes.
+    fn into_mutation(self, intent: &Intent) -> Option<LedgerMutation> {
+        LedgerMutation::from_writes(
+            intent.intent_id,
+            self.parties,
+            intent.ops.iter().map(|op| op.op).collect(),
+            self.writes,
+        )
     }
 }
 
@@ -2554,23 +2635,27 @@ impl MemIntentExecutor {
             }
         }
 
-        // Step 3 (§7): the writes, now that every check has passed.
-        for write in plan.writes() {
-            match write {
-                PlannedWrite::BalanceAdd {
-                    account,
-                    asset,
-                    delta,
-                } => {
-                    *ledger.balances.entry((*account, *asset)).or_insert(0) += i128::from(*delta);
-                }
-                PlannedWrite::ItemOwner { item, row } => {
-                    ledger.items.insert(*item, row.clone());
+        // Step 3 (§7): the guarded mutation bundle. A non-empty write set
+        // cannot reach this stage without its receipt because the type carries
+        // both and exposes no writes-only constructor.
+        let mutation = plan.into_mutation(intent);
+        if let Some(mutation) = &mutation {
+            for write in mutation.writes() {
+                match write {
+                    PlannedWrite::BalanceAdd {
+                        account,
+                        asset,
+                        delta,
+                    } => {
+                        *ledger.balances.entry((*account, *asset)).or_insert(0) +=
+                            i128::from(*delta);
+                    }
+                    PlannedWrite::ItemOwner { item, row, .. } => {
+                        ledger.items.insert(*item, row.clone());
+                    }
                 }
             }
-        }
-        if let Some(receipt) = plan.receipt(intent) {
-            ledger.receipts.push(receipt);
+            ledger.receipts.push(mutation.receipt().clone());
         }
 
         // Mint one PersistId per op (the harness default; a linked Ruleset
@@ -2591,7 +2676,11 @@ impl MemIntentExecutor {
             ),
             Some(account) => {
                 let finalize_by = provisional::finalize_by(now_ms);
-                let writes = provisional::provisional_writes(plan.writes());
+                let writes = provisional::provisional_writes(
+                    mutation
+                        .as_ref()
+                        .map_or(&[] as &[PlannedWrite], LedgerMutation::writes),
+                );
                 // The commitment is present: `provisional::classify` refuses
                 // an intent without one before the gateway ever reaches this
                 // executor, and an executor reached without that check is a
@@ -2736,24 +2825,36 @@ impl ProvisionalStore for MemIntentExecutor {
 
     async fn annul(&self, hold: &crate::keyspace::ProvisionalHold) -> Result<(), IntentError> {
         let mut ledger = self.ledger.lock().expect("mutex");
-        // The forward-written inverse. Nothing is deleted: the original
-        // commit's effects were applied, these are their negation, and both
-        // are in the history.
-        for write in &hold.writes {
-            *ledger
-                .balances
-                .entry((write.account, write.asset))
-                .or_insert(0) -= i128::from(write.delta);
+        let writes = hold
+            .writes
+            .iter()
+            .map(|write| PlannedWrite::BalanceAdd {
+                account: write.account,
+                asset: write.asset,
+                delta: -write.delta,
+            })
+            .collect();
+        if let Some(mutation) = LedgerMutation::from_writes(
+            hold.intent_id,
+            hold.writes.iter().map(|write| write.account).collect(),
+            Vec::new(),
+            writes,
+        ) {
+            // The forward-written inverse and its compensating receipt travel
+            // through the same coupled bundle as an ordinary intent commit.
+            for write in mutation.writes() {
+                let PlannedWrite::BalanceAdd {
+                    account,
+                    asset,
+                    delta,
+                } = write
+                else {
+                    unreachable!("provisional item transfers are ineligible")
+                };
+                *ledger.balances.entry((*account, *asset)).or_insert(0) += i128::from(*delta);
+            }
+            ledger.receipts.push(mutation.receipt().clone());
         }
-        // The compensating receipt. An annulment *adds* a receipt; it never
-        // removes one. A reader of the trade history sees the commit and the
-        // reversal, in that order, which is what an auditor needs and what a
-        // player owed an explanation needs.
-        ledger.receipts.push(crate::keyspace::ReceiptRow {
-            intent_id: hold.intent_id,
-            parties: hold.writes.iter().map(|write| write.account).collect(),
-            ops: Vec::new(),
-        });
         if let Some(row) = ledger.outcomes.get_mut(&hold.intent_id) {
             row.finality = crate::keyspace::IntentFinality::Annulled;
             row.finalize_by_ms = 0;
@@ -5491,6 +5592,54 @@ mod tests {
             vec![AccountId::new(7), AccountId::new(8)]
         );
         assert_eq!(receipts[0].ops, vec![LEDGER_ITEM_TRANSFER_OP]);
+        assert_eq!(
+            receipts[0].balance_deltas,
+            vec![
+                crate::keyspace::ReceiptBalanceDelta {
+                    account: AccountId::new(8),
+                    asset: AssetId::new(GOLD),
+                    delta: -500,
+                },
+                crate::keyspace::ReceiptBalanceDelta {
+                    account: AccountId::new(7),
+                    asset: AssetId::new(GOLD),
+                    delta: 500,
+                },
+            ],
+            "both sides of the trade are recoverable as account deltas"
+        );
+        assert_eq!(
+            receipts[0].ownership,
+            vec![crate::keyspace::ReceiptOwnershipTransition {
+                item: orrery_protocol::ItemUid::new(1),
+                before: Some(AccountId::new(7)),
+                after: Some(AccountId::new(8)),
+            }],
+            "item id and ownership before/after are recoverable"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_credit_banks_a_mandatory_effect_receipt() {
+        let exec = MemIntentExecutor::new();
+        let intent = intent_with(vec![ledger_op(7, GOLD, 83)]);
+        let outcome = exec.execute(&intent).await.expect("execute credit");
+        assert!(matches!(outcome, IntentOutcome::Committed { .. }));
+        assert_eq!(exec.balance(AccountId::new(7), AssetId::new(GOLD)), 83);
+        let receipts = exec.receipts();
+        assert_eq!(receipts.len(), 1, "one ledger mutation banks one receipt");
+        assert_eq!(receipts[0].intent_id, intent.intent_id);
+        assert_eq!(receipts[0].parties, vec![AccountId::new(7)]);
+        assert_eq!(receipts[0].ops, vec![LEDGER_CREDIT_OP]);
+        assert_eq!(
+            receipts[0].balance_deltas,
+            vec![crate::keyspace::ReceiptBalanceDelta {
+                account: AccountId::new(7),
+                asset: AssetId::new(GOLD),
+                delta: 83,
+            }]
+        );
+        assert!(receipts[0].ownership.is_empty());
     }
 
     /// Each durable refusal is its own reason code, and each leaves the rows

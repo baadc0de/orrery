@@ -280,6 +280,24 @@ struct Cli {
     #[arg(long, value_name = "PREFIX", default_value = "")]
     archive_prefix: String,
 
+    /// Archive the global FDB `ledger/receipt/` stream into receipt Parquet
+    /// objects under `--archive-dir` (#832).
+    ///
+    /// This is an explicit deployment-role flag: enable it on exactly one
+    /// persistd process. The implementation has one sequential range scanner;
+    /// parallel scanners are deliberately not a tuning knob after #837
+    /// measured avoidable intent-path interference at four.
+    #[arg(long)]
+    receipt_archive: bool,
+
+    /// Rows per short read-only receipt archive transaction.
+    #[arg(
+        long,
+        value_name = "ROWS",
+        default_value_t = orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS
+    )]
+    receipt_archive_page_rows: usize,
+
     /// Checkpoint cadence in milliseconds, overriding D16's 20 s (jitter is
     /// held at a quarter of it, as the default pair is).
     ///
@@ -881,6 +899,15 @@ async fn main() -> anyhow::Result<()> {
     }
     if matches!(topology.role, TopologyRole::Promotion { .. }) && cli.fdb_cluster_file.is_none() {
         anyhow::bail!("--promote-from requires --fdb-cluster-file for durable fencing");
+    }
+    if cli.receipt_archive && cli.archive_dir.is_none() {
+        anyhow::bail!("--receipt-archive requires --archive-dir");
+    }
+    if cli.receipt_archive && cli.fdb_cluster_file.is_none() {
+        anyhow::bail!("--receipt-archive requires --fdb-cluster-file");
+    }
+    if cli.receipt_archive && cli.receipt_archive_page_rows == 0 {
+        anyhow::bail!("--receipt-archive-page-rows must be nonzero");
     }
     if cli.fdb_cluster_file.is_none() && !cli.allow_volatile_leases {
         anyhow::bail!(
@@ -1487,12 +1514,59 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+    // The economic receipt archive is global rather than node-local. It is an
+    // explicit role (`--receipt-archive`) so a deployment starts one scanner,
+    // not one per journal-originating node. Each page is a short read-only FDB
+    // transaction bounded by a fixed upper versionstamp captured per pass.
+    let receipt_archive_tailer: Option<orrery_persistd::archive::ReceiptArchiveTailerHandle> =
+        if cli.receipt_archive {
+            #[cfg(not(feature = "fdb"))]
+            {
+                anyhow::bail!(
+                    "--receipt-archive requires the `fdb` feature and --fdb-cluster-file"
+                );
+            }
+            #[cfg(feature = "fdb")]
+            {
+                let context = fdb_context.as_ref().expect("validated FDB context");
+                let source_and_index = Arc::new(orrery_persistd::archive::FdbReceiptArchive::new(
+                    context.database(),
+                ));
+                let store = Arc::new(orrery_persistd::archive::FsArchiveStore::open(
+                    cli.archive_dir.as_ref().expect("validated archive dir"),
+                )?);
+                let tailer = orrery_persistd::archive::ReceiptArchiveTailer::open(
+                    source_and_index.clone(),
+                    store,
+                    source_and_index,
+                    cli.archive_prefix.clone(),
+                    orrery_persistd::archive::ReceiptArchiveConfig {
+                        page_rows: cli.receipt_archive_page_rows,
+                        ..orrery_persistd::archive::ReceiptArchiveConfig::default()
+                    },
+                )
+                .await?;
+                tracing::info!(
+                    scanners = orrery_persistd::archive::RECEIPT_ARCHIVE_SCANNERS,
+                    page_rows = cli.receipt_archive_page_rows,
+                    status = ?tailer.status(),
+                    "receipt archive scanner started"
+                );
+                Some(orrery_persistd::archive::spawn_receipt_archive_tailer(
+                    tailer,
+                ))
+            }
+        } else {
+            None
+        };
+
     tracing::info!(
         gateway = %gateway.id(),
         node_id = topology.node_id,
         shards = topology.shards.len(),
         role = topology.role.name(),
         archive_tailer = archive_tailer.is_some(),
+        receipt_archive_tailer = receipt_archive_tailer.is_some(),
         startup_elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd cluster up"
     );
@@ -1541,6 +1615,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(reporter) = metrics_reporter {
         reporter.shutdown().await;
+    }
+
+    if let Some(tailer) = receipt_archive_tailer {
+        tailer.shutdown().await;
     }
 
     // Before the journal close below: the tailer holds an `Arc<Journal>`, and
@@ -1791,9 +1869,11 @@ impl HandoverContext {
                     }
                     outcome.error = Some("drain did not complete inside the deadline; handover aborted and the shard is unchanged".into());
                 }
-                Err(error) => outcome.error = Some(format!(
-                    "drain did not complete inside the deadline, and the abort CAS also failed: {error}"
-                )),
+                Err(error) => {
+                    outcome.error = Some(format!(
+                        "drain did not complete inside the deadline, and the abort CAS also failed: {error}"
+                    ))
+                }
             }
             outcome.total_ms = started.elapsed().as_millis() as u64;
             outcome.finished_at_unix_ms = unix_now_ms();
@@ -2000,6 +2080,11 @@ fn spawn_handover_control(
 /// Run the passive half of a static chain topology. It opens no actor runtime,
 /// scheduler, fence store, or gateway: mirrored records are its only writes.
 async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
+    if cli.receipt_archive {
+        anyhow::bail!(
+            "--receipt-archive is not valid for a chain follower; it has no FDB ledger role"
+        );
+    }
     if cli.fdb_cluster_file.is_some() {
         anyhow::bail!(
             "--fdb-cluster-file is not valid for a chain follower; a follower hosts only its mirrored journal"
@@ -2175,7 +2260,10 @@ async fn activate_topology(
                     anyhow::bail!("cannot promote shard {shard:?}: no primary fence row");
                 };
                 if row.owner != primary {
-                    anyhow::bail!("cannot promote shard {shard:?}: expected failed primary {primary}, found owner {}", row.owner);
+                    anyhow::bail!(
+                        "cannot promote shard {shard:?}: expected failed primary {primary}, found owner {}",
+                        row.owner
+                    );
                 }
                 if let Some(epoch) = source_epoch {
                     if epoch != row.epoch.0 {
@@ -2716,7 +2804,12 @@ fn resolve_topology(cli: &Cli) -> anyhow::Result<Topology> {
     );
     validate_followers(&cli.chain_follower, node_id)?;
 
-    let role = match (cli.chain_listen, cli.chain_follower.as_slice(), cli.chain_primary, cli.promote_from) {
+    let role = match (
+        cli.chain_listen,
+        cli.chain_follower.as_slice(),
+        cli.chain_primary,
+        cli.promote_from,
+    ) {
         (None, [follower], None, None) => TopologyRole::Primary {
             follower: *follower,
         },
@@ -2730,8 +2823,14 @@ fn resolve_topology(cli: &Cli) -> anyhow::Result<Topology> {
             TopologyRole::Follower { primary, listen }
         }
         (Some(listen), [], Some(primary), Some(promote_from)) => {
-            if promote_from != primary { anyhow::bail!("--promote-from must equal --chain-primary for the follower being promoted"); }
-            if primary == node_id { anyhow::bail!("--chain-primary cannot name the local --node-id {node_id}"); }
+            if promote_from != primary {
+                anyhow::bail!(
+                    "--promote-from must equal --chain-primary for the follower being promoted"
+                );
+            }
+            if primary == node_id {
+                anyhow::bail!("--chain-primary cannot name the local --node-id {node_id}");
+            }
             TopologyRole::Promotion { primary, listen }
         }
         (None, [], _, _) => anyhow::bail!(
@@ -2827,7 +2926,9 @@ fn resolve_standby_shards(cli: &Cli, topology: &Topology) -> anyhow::Result<Vec<
         return Ok(Vec::new());
     }
     if matches!(topology.role, TopologyRole::Follower { .. }) {
-        anyhow::bail!("--standby-shard is not valid for a chain follower: a follower is never a gateway and adopts no shard");
+        anyhow::bail!(
+            "--standby-shard is not valid for a chain follower: a follower is never a gateway and adopts no shard"
+        );
     }
     if cli.fdb_cluster_file.is_none() {
         anyhow::bail!(
@@ -3026,6 +3127,8 @@ mod tests {
             archive_retention: false,
             archive_dir: None,
             archive_prefix: String::new(),
+            receipt_archive: false,
+            receipt_archive_page_rows: orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS,
             checkpoint_interval_ms: None,
             hot_ledger_sweep_interval_ms: 3_600_000,
             dev_seed: None,
@@ -3362,6 +3465,32 @@ mod tests {
         let enabled = Cli::try_parse_from(["persistd", "--archive-retention"])
             .expect("archive-retention flag parses");
         assert!(enabled.archive_retention);
+    }
+
+    #[test]
+    fn receipt_archive_defaults_to_one_observable_4096_row_scanner() {
+        use clap::Parser;
+
+        let defaulted = Cli::try_parse_from(["persistd"]).expect("bare invocation parses");
+        assert!(
+            !defaulted.receipt_archive,
+            "the global scanner is an explicit role"
+        );
+        assert_eq!(
+            defaulted.receipt_archive_page_rows,
+            orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS
+        );
+        assert_eq!(orrery_persistd::archive::RECEIPT_ARCHIVE_SCANNERS, 1);
+
+        let configured = Cli::try_parse_from([
+            "persistd",
+            "--receipt-archive",
+            "--receipt-archive-page-rows",
+            "256",
+        ])
+        .expect("receipt scanner flags parse");
+        assert!(configured.receipt_archive);
+        assert_eq!(configured.receipt_archive_page_rows, 256);
     }
 
     #[test]

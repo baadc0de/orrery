@@ -178,10 +178,12 @@ async fn bank_receipt(db: &foundationdb::Database, parties: &[AccountId]) {
             intent_id: u128::from(unix_ms()),
             parties: parties.to_vec(),
             ops: vec![],
+            balance_deltas: vec![],
+            ownership: vec![],
         };
         trx.atomic_op(
             &param,
-            &postcard::to_stdvec(&row).unwrap(),
+            &keyspace::encode_receipt_row(&row).unwrap(),
             foundationdb::options::MutationType::SetVersionstampedKey,
         );
         Ok(())

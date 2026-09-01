@@ -31,6 +31,8 @@
 
 pub mod index;
 pub mod object;
+pub mod receipt_object;
+pub mod receipt_tailer;
 pub mod store;
 pub mod tailer;
 
@@ -42,6 +44,18 @@ pub use index::{
 pub use object::{
     decode_object, encode_object, sort_for_archive, ArchiveObjectError, ArchiveSortKey,
     ARCHIVE_COLUMNS,
+};
+pub use receipt_object::{
+    decode_receipt_object, encode_receipt_object, ReceiptArchiveRow, ReceiptObjectError,
+    RECEIPT_ARCHIVE_COLUMNS,
+};
+#[cfg(feature = "fdb")]
+pub use receipt_tailer::FdbReceiptArchive;
+pub use receipt_tailer::{
+    receipt_object_key, spawn_receipt_archive_tailer, MemReceiptArchiveIndex, MemReceiptSource,
+    ReceiptArchiveConfig, ReceiptArchiveError, ReceiptArchiveIndex, ReceiptArchiveStatus,
+    ReceiptArchiveTailer, ReceiptArchiveTailerHandle, ReceiptSource, ReceiptTailerPass,
+    DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS, RECEIPT_ARCHIVE_SCANNERS,
 };
 pub use store::{ArchiveStore, ArchiveStoreError, FsArchiveStore};
 pub use tailer::{

@@ -9,7 +9,7 @@
 //! Normative source: docs/08-persistence.md §6, docs/12-world-seeding.md §9.2,
 //! §9.3, §11.1, and docs/adr/0011-persistence.md.
 
-use orrery_protocol::atrest::{SchemaVersion, SCHEMA_V0};
+use orrery_protocol::atrest::{EncodingVersion, SchemaVersion, SCHEMA_V0};
 use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, Lsn, NodeId, PersistId};
 
 use crate::actor::Tombstone;
@@ -1733,8 +1733,40 @@ pub struct ItemRow {
     pub state: Vec<u8>,
 }
 
-/// The value stored at [`ledger_receipt_key`]: the `(intent_id, parties, ops)`
-/// audit record of docs/08-persistence.md §6.
+/// One balance mutation recorded in a [`ReceiptRow`].
+///
+/// `AccountId`, rather than the transport's `NodeId`, is deliberate: ledger
+/// rows are account-scoped, so a conservation reader can sum this record
+/// without joining P5's `id/db` binding history (#832).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReceiptBalanceDelta {
+    /// Account whose balance changed.
+    pub account: AccountId,
+    /// Asset in which the balance is denominated.
+    pub asset: AssetId,
+    /// Signed amount applied to the balance row.
+    pub delta: i64,
+}
+
+/// One item-ownership mutation recorded in a [`ReceiptRow`].
+///
+/// Both ends are optional so the same honest shape covers transfers
+/// (`Some -> Some`), mints (`None -> Some`) and burns (`Some -> None`). The
+/// current cluster-interpreted item op is a transfer; making the endpoints
+/// explicit now prevents a future mint writer from inventing an audit shape
+/// that cannot express its missing prior owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReceiptOwnershipTransition {
+    /// Stable unique item whose ownership row changed.
+    pub item: ItemUid,
+    /// Owner before this transaction, or `None` for a mint.
+    pub before: Option<AccountId>,
+    /// Owner after this transaction, or `None` for a burn.
+    pub after: Option<AccountId>,
+}
+
+/// The value stored at [`ledger_receipt_key`]: the complete economic effects
+/// of one intent transaction.
 ///
 /// Strictly ordered by construction — the key is the commit versionstamp, so
 /// receipt order *is* commit order and no clock is involved. This is the row
@@ -1742,13 +1774,10 @@ pub struct ItemRow {
 /// happened, in what order", independently of the `intent/` idempotency rows,
 /// which are swept after an hour.
 ///
-/// **Unversioned for now, on [`ItemRow`]'s recorded reason** (D38 clause
-/// (d)(1)): the trailer codec exists, this row's shape is not changing here,
-/// and the deadline is the next field added to it rather than a date. Note
-/// what makes the wait affordable *and* what makes it a real deadline: a
-/// receipt is permanent by design — it is the row that outlives the swept
-/// `intent/` row — so nothing sweeps this family the way retention rescued the
-/// `attest/`/`enforced` shape change.
+/// Every balance or ownership write represented by the intent is present in
+/// `balance_deltas` or `ownership`, including pure credits. This is the source
+/// #615's archive sweep can reconcile; `ops` alone remains useful provenance
+/// but is not treated as an effect.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReceiptRow {
     /// The intent that committed these effects.
@@ -1758,6 +1787,83 @@ pub struct ReceiptRow {
     /// The op ids the intent carried, in op order — including the
     /// `Ruleset`-opaque ones, which the cluster records without interpreting.
     pub ops: Vec<u16>,
+    /// Every signed balance mutation staged by the intent, in write order.
+    pub balance_deltas: Vec<ReceiptBalanceDelta>,
+    /// Every ownership mutation staged by the intent, in write order.
+    pub ownership: Vec<ReceiptOwnershipTransition>,
+}
+
+/// Encoding trailer written by the first enriched receipt shape.
+pub const RECEIPT_ENCODING_V1: EncodingVersion = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReceiptRowV0 {
+    intent_id: u128,
+    parties: Vec<AccountId>,
+    ops: Vec<u16>,
+}
+
+/// A receipt value could not be decoded according to its at-rest generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptDecodeError(String);
+
+impl core::fmt::Display for ReceiptDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl core::error::Error for ReceiptDecodeError {}
+
+/// Encode an enriched receipt with D38's version trailer.
+///
+/// # Errors
+///
+/// Returns postcard's serialization error if the row cannot be encoded.
+pub fn encode_receipt_row(row: &ReceiptRow) -> Result<Vec<u8>, postcard::Error> {
+    orrery_protocol::atrest::encode_versioned(row, RECEIPT_ENCODING_V1)
+}
+
+/// Decode a permanent receipt row, including the pre-Shape-C v0 generation.
+///
+/// The bootstrap is deterministic: a v0 body consumes the complete value. If
+/// bytes remain after that body, the final byte is the D38 trailer and the
+/// whole preceding body is decoded according to that named generation. Old
+/// receipts necessarily recover with empty effect vectors; they remain honest
+/// provenance but cannot retroactively supply effects that were never stored.
+///
+/// # Errors
+///
+/// Returns [`ReceiptDecodeError`] for a corrupt body or an unsupported trailer.
+pub fn decode_receipt_row(
+    bytes: &[u8],
+) -> Result<(ReceiptRow, EncodingVersion), ReceiptDecodeError> {
+    let (legacy, rest) = postcard::take_from_bytes::<ReceiptRowV0>(bytes)
+        .map_err(|error| ReceiptDecodeError(format!("receipt body decode: {error}")))?;
+    if rest.is_empty() {
+        return Ok((
+            ReceiptRow {
+                intent_id: legacy.intent_id,
+                parties: legacy.parties,
+                ops: legacy.ops,
+                balance_deltas: Vec::new(),
+                ownership: Vec::new(),
+            },
+            orrery_protocol::atrest::ENCODING_V0,
+        ));
+    }
+
+    let (&version, body) = bytes
+        .split_last()
+        .ok_or_else(|| ReceiptDecodeError("receipt value is empty".to_owned()))?;
+    if version != RECEIPT_ENCODING_V1 {
+        return Err(ReceiptDecodeError(format!(
+            "unsupported receipt encoding version {version}"
+        )));
+    }
+    let row = postcard::from_bytes(body)
+        .map_err(|error| ReceiptDecodeError(format!("receipt v1 body decode: {error}")))?;
+    Ok((row, version))
 }
 
 /// Key for the hot-ledger sweep's resumable cursor:
@@ -2048,6 +2154,102 @@ pub fn encode_jarchive_metadata(meta: &JarchiveMetadata) -> Result<Vec<u8>, Chec
 pub fn decode_jarchive_metadata(bytes: &[u8]) -> Result<JarchiveMetadata, CheckpointError> {
     postcard::from_bytes(bytes)
         .map_err(|e| CheckpointError::Store(format!("jarchive metadata decode: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Receipt archive metadata: `rarchive/{last receipt versionstamp}`
+// ---------------------------------------------------------------------------
+//
+// Shares the archive `z` family under ASCII discriminator `r`. One row is the
+// durable publication marker for one bounded receipt page. The key uses the
+// page's last commit versionstamp, so the greatest row is also the restart
+// cursor and no second durable watermark can disagree with it.
+
+/// Sub-kind discriminator for receipt-archive metadata inside the `z` family.
+pub const RARCHIVE_DISCRIMINATOR: u8 = b'r';
+/// At-rest encoding generation of [`RarchiveMetadata`].
+pub const RARCHIVE_METADATA_ENCODING: EncodingVersion = 1;
+
+/// Durable publication record for one archived receipt page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RarchiveMetadata {
+    /// Object-store key of the page's Parquet object.
+    pub object_key: String,
+    /// Complete first `ledger/receipt/` key included in the page.
+    pub first_receipt_key: [u8; 12],
+    /// Complete last `ledger/receipt/` key included in the page.
+    pub last_receipt_key: [u8; 12],
+    /// Number of receipt rows in the page.
+    pub rows: u32,
+    /// BLAKE3 digest verified by re-reading the uploaded object.
+    pub checksum: [u8; 32],
+}
+
+/// `zr || last receipt versionstamp:[u8;10]`.
+///
+/// `last_receipt_key` must be a complete `lr` key. Keeping the prefix check in
+/// the constructor makes it impossible to file an arbitrary cursor as receipt
+/// archive progress.
+#[must_use]
+pub fn rarchive_key(last_receipt_key: &[u8; 12]) -> Option<[u8; 12]> {
+    if &last_receipt_key[..2] != b"lr" {
+        return None;
+    }
+    let mut key = [0u8; 12];
+    key[0] = b'z';
+    key[1] = b'r';
+    key[2..].copy_from_slice(&last_receipt_key[2..]);
+    Some(key)
+}
+
+/// Decode a receipt-archive metadata key back to the complete `lr` cursor.
+#[must_use]
+pub fn decode_rarchive_key(key: &[u8]) -> Option<[u8; 12]> {
+    if key.len() != 12 || key[0] != JARCHIVE_PREFIX || key[1] != RARCHIVE_DISCRIMINATOR {
+        return None;
+    }
+    let mut receipt_key = [0u8; 12];
+    receipt_key[..2].copy_from_slice(b"lr");
+    receipt_key[2..].copy_from_slice(&key[2..]);
+    Some(receipt_key)
+}
+
+/// Inclusive start of receipt-archive metadata.
+#[must_use]
+pub fn rarchive_range_start() -> Vec<u8> {
+    vec![JARCHIVE_PREFIX, RARCHIVE_DISCRIMINATOR]
+}
+
+/// Exclusive end of receipt-archive metadata.
+#[must_use]
+pub fn rarchive_range_end() -> Vec<u8> {
+    vec![JARCHIVE_PREFIX, RARCHIVE_DISCRIMINATOR.wrapping_add(1)]
+}
+
+/// Encode receipt-archive metadata with its D38 trailer.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] if postcard serialization fails.
+pub fn encode_rarchive_metadata(meta: &RarchiveMetadata) -> Result<Vec<u8>, CheckpointError> {
+    orrery_protocol::atrest::encode_versioned(meta, RARCHIVE_METADATA_ENCODING)
+        .map_err(|e| CheckpointError::Store(format!("rarchive metadata encode: {e}")))
+}
+
+/// Decode receipt-archive metadata and require its known generation.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] for corrupt bytes or an unknown version.
+pub fn decode_rarchive_metadata(bytes: &[u8]) -> Result<RarchiveMetadata, CheckpointError> {
+    let (meta, version) = orrery_protocol::atrest::decode_versioned(bytes)
+        .map_err(|e| CheckpointError::Store(format!("rarchive metadata decode: {e}")))?;
+    if version != RARCHIVE_METADATA_ENCODING {
+        return Err(CheckpointError::Store(format!(
+            "unsupported rarchive metadata encoding version {version}"
+        )));
+    }
+    Ok(meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -3635,13 +3837,22 @@ mod tests {
             },
             Family {
                 prefix: b'z',
-                name: "jarchive",
+                name: "archive metadata",
                 kinds: Kinds::SubKinds {
-                    table: vec![SubKind {
-                        discriminator: b'a',
-                        name: "jarchive/za metadata",
-                        sample: jarchive_key(&node(1), 0).to_vec(),
-                    }],
+                    table: vec![
+                        SubKind {
+                            discriminator: b'a',
+                            name: "jarchive/za journal metadata",
+                            sample: jarchive_key(&node(1), 0).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'r',
+                            name: "rarchive/zr receipt metadata",
+                            sample: rarchive_key(&ledger_receipt_key())
+                                .expect("receipt key is an lr cursor")
+                                .to_vec(),
+                        },
+                    ],
                 },
             },
         ]
@@ -4331,6 +4542,78 @@ mod tests {
         let key = jarchive_key(&node(1), 0);
         assert_eq!(key[0], b'z', "jarchive family prefix is z");
         assert_eq!(key[1], b'a', "jarchive sub-kind discriminator is a");
+    }
+
+    #[test]
+    fn enriched_receipt_round_trips_every_economic_effect() {
+        let receipt = ReceiptRow {
+            intent_id: 0x832,
+            parties: vec![AccountId::new(7), AccountId::new(9)],
+            ops: vec![3, 5],
+            balance_deltas: vec![
+                ReceiptBalanceDelta {
+                    account: AccountId::new(7),
+                    asset: AssetId::new(11),
+                    delta: -40,
+                },
+                ReceiptBalanceDelta {
+                    account: AccountId::new(9),
+                    asset: AssetId::new(11),
+                    delta: 40,
+                },
+            ],
+            ownership: vec![ReceiptOwnershipTransition {
+                item: ItemUid::new(13),
+                before: Some(AccountId::new(9)),
+                after: Some(AccountId::new(7)),
+            }],
+        };
+        let encoded = encode_receipt_row(&receipt).expect("encode enriched receipt");
+        let (decoded, version) = decode_receipt_row(&encoded).expect("decode enriched receipt");
+        assert_eq!(version, RECEIPT_ENCODING_V1);
+        assert_eq!(decoded, receipt, "deltas, item id and both owners recover");
+    }
+
+    #[test]
+    fn legacy_receipt_bootstraps_as_v0_without_inventing_effects() {
+        let legacy = ReceiptRowV0 {
+            intent_id: 77,
+            parties: vec![AccountId::new(5)],
+            ops: vec![1],
+        };
+        let bytes = postcard::to_stdvec(&legacy).expect("encode legacy row");
+        let (decoded, version) = decode_receipt_row(&bytes).expect("decode legacy row");
+        assert_eq!(version, orrery_protocol::atrest::ENCODING_V0);
+        assert_eq!(decoded.intent_id, legacy.intent_id);
+        assert_eq!(decoded.parties, legacy.parties);
+        assert_eq!(decoded.ops, legacy.ops);
+        assert!(decoded.balance_deltas.is_empty());
+        assert!(decoded.ownership.is_empty());
+    }
+
+    #[test]
+    fn rarchive_metadata_key_and_value_round_trip() {
+        let mut receipt_key = ledger_receipt_key();
+        receipt_key[2..].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let key = rarchive_key(&receipt_key).expect("an lr cursor is accepted");
+        assert_eq!(&key[..2], b"zr");
+        assert_eq!(decode_rarchive_key(&key), Some(receipt_key));
+        assert!(key.as_slice() >= rarchive_range_start().as_slice());
+        assert!(key.as_slice() < rarchive_range_end().as_slice());
+
+        let meta = RarchiveMetadata {
+            object_key: "archive/rarchive/00010203040506070809.parquet".to_owned(),
+            first_receipt_key: receipt_key,
+            last_receipt_key: receipt_key,
+            rows: 1,
+            checksum: [0x83; 32],
+        };
+        let encoded = encode_rarchive_metadata(&meta).expect("encode rarchive metadata");
+        assert_eq!(
+            *encoded.last().expect("version trailer"),
+            RARCHIVE_METADATA_ENCODING
+        );
+        assert_eq!(decode_rarchive_metadata(&encoded).expect("decode"), meta);
     }
 
     /// The registry is written in prefix order, and that order is load-bearing
