@@ -231,9 +231,13 @@ pub struct StandingScores {
 
 /// Evaluate D33's decay at `now_ms`, without mutating any row.
 ///
-/// Each contribution is rounded toward positive infinity. At a threshold this
-/// is conservative for both positive findings and negative appeal facts: a
-/// platform approximation cannot make the account appear safer.
+/// Positive findings round upward, while negative appeal facts round downward.
+///
+/// A positive fraction must not make a player safer at a threshold. The same
+/// `ceil` rule on a negative fraction would make an upheld appeal *smaller in
+/// magnitude* and therefore round against the appellant, so its direction is
+/// intentionally the opposite. Keep this sign-aware rule: changing both arms
+/// to `ceil` would reintroduce that ledger bias.
 #[must_use]
 pub fn score_rows(rows: &[StrikeRow], now_ms: u64) -> StandingScores {
     let mut scores = StandingScores::default();
@@ -243,7 +247,12 @@ pub fn score_rows(rows: &[StrikeRow], now_ms: u64) -> StandingScores {
         }
         let age_ms = now_ms - row.issued_at_ms;
         let exponent = -(age_ms as f64) / (STRIKE_HALF_LIFE_MS as f64);
-        let contribution = (f64::from(row.weight_milli) * exponent.exp2()).ceil() as i64;
+        let raw = f64::from(row.weight_milli) * exponent.exp2();
+        let contribution = if raw.is_sign_negative() {
+            raw.floor() as i64
+        } else {
+            raw.ceil() as i64
+        };
         scores.shadow_milli = scores.shadow_milli.saturating_add(contribution);
         if row.mode == StrikeMode::Live {
             scores.live_milli = scores.live_milli.saturating_add(contribution);
@@ -378,10 +387,14 @@ fn maximum_strike_weight_milli() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::StandingSource;
+    use crate::AccountStore;
     use orrery_persistd::adjudication::{
         StrikeEvidenceRef, StrikeKind, MAJOR_STRIKE_WEIGHT_MILLI, STRIKE_RETENTION_MS,
     };
+    use orrery_protocol::SessionStanding;
     use orrery_protocol::{PersistId, RulesetId, Tick};
+    use std::sync::Arc;
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -592,5 +605,83 @@ mod tests {
             DEFAULT_STANDING_THRESHOLDS.classify(scores.live_milli),
             StandingLevel::Good
         );
+    }
+
+    #[test]
+    fn upheld_appeal_moves_an_account_out_of_quarantine_on_recomputation() {
+        let account = AccountId::new(77);
+        let strike = row(0, StrikeMode::Live);
+        let mut appeal = strike.clone();
+        appeal.kind = StrikeKind::Appeal;
+        appeal.weight_milli = -strike.weight_milli;
+        appeal.issued_at_ms = 1;
+        appeal.expires_at_ms = STRIKE_RETENTION_MS + 1;
+
+        assert_eq!(
+            DEFAULT_STANDING_THRESHOLDS
+                .classify(score_rows(std::slice::from_ref(&strike), 1).live_milli),
+            StandingLevel::Quarantined,
+            "without the compensating fact the original finding still quarantines"
+        );
+        let scores = score_rows(&[strike, appeal], 1);
+        assert_eq!(scores.live_milli, 0);
+        assert_eq!(
+            DEFAULT_STANDING_THRESHOLDS.classify(scores.live_milli),
+            StandingLevel::Good,
+            "the compensating fact changes the derived classification"
+        );
+
+        // And the same reversal is observable through the scorer the identity
+        // service actually mints from, not only through `score_rows`.
+        let store = Arc::new(crate::MemAccountStore::new());
+        futures::executor::block_on(store.create_account(account, 0)).expect("create account");
+        let convicted = ComputedStanding::new(
+            StaticStrikeRows::new([(account, vec![row(0, StrikeMode::Live)])]),
+            || 1,
+            DEFAULT_STANDING_THRESHOLDS,
+        )
+        .expect("default thresholds are coherent");
+        assert_ne!(
+            futures::executor::block_on(convicted.standing(account, store.as_ref())),
+            Ok(SessionStanding::Good),
+            "the unappealed conviction is not Good"
+        );
+
+        let appealed = ComputedStanding::new(
+            StaticStrikeRows::new([(
+                account,
+                vec![row(0, StrikeMode::Live), {
+                    let mut appeal = row(0, StrikeMode::Live);
+                    appeal.kind = StrikeKind::Appeal;
+                    appeal.weight_milli = -MAJOR_STRIKE_WEIGHT_MILLI;
+                    appeal.issued_at_ms = 1;
+                    appeal.expires_at_ms = STRIKE_RETENTION_MS + 1;
+                    appeal
+                }],
+            )]),
+            || 1,
+            DEFAULT_STANDING_THRESHOLDS,
+        )
+        .expect("default thresholds are coherent");
+        assert_eq!(
+            futures::executor::block_on(appealed.standing(account, store.as_ref())),
+            Ok(SessionStanding::Good),
+            "recomputation after the appeal restores the account"
+        );
+    }
+
+    #[test]
+    fn negative_appeal_contributions_round_away_from_zero_not_against_the_appellant() {
+        let mut appeal = row(0, StrikeMode::Live);
+        appeal.kind = StrikeKind::Appeal;
+        appeal.weight_milli = -1_001;
+        // At one half-life this is -500.5, so ceil would produce -500 and
+        // silently leave 1 milli-point of the reversed finding behind.
+        assert_eq!(score_rows(&[appeal], 14 * DAY_MS).live_milli, -501);
+
+        let mut fractional = row(0, StrikeMode::Live);
+        fractional.kind = StrikeKind::Appeal;
+        fractional.weight_milli = -1_001;
+        assert_eq!(score_rows(&[fractional], 7 * DAY_MS).live_milli, -708);
     }
 }

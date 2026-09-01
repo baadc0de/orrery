@@ -21,8 +21,8 @@ use orrery_protocol::{
 #[cfg(feature = "fdb")]
 use {
     orrery_persistd::adjudication::{
-        FdbStrikeLedger, StrikeEvidenceRef, StrikeKind, StrikeLedger, StrikeMode, StrikeRow,
-        STRIKE_RETENTION_MS,
+        FdbStrikeLedger, OffenceTime, StrikeEvidenceRef, StrikeKind, StrikeLedger, StrikeMode,
+        StrikeRow, STRIKE_RETENTION_MS,
     },
     orrery_protocol::{AccountId, RulesetId},
 };
@@ -789,6 +789,7 @@ async fn later_filed_strike_holds_restore_and_applier_writes_no_record() {
     ledger
         .file(
             target,
+            OffenceTime::Unknown,
             &StrikeRow {
                 issued_at_ms: 1,
                 weight_milli: 3_000,
