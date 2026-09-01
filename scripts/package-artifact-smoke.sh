@@ -156,19 +156,32 @@ list_entries() { # directory
 }
 
 sha256_of() { # path
+    # GNU coreutils escapes a checksum line whose *filename* contains a
+    # backslash by prefixing the whole line with one, so on Windows — where
+    # every extraction path does — the first field comes back as `\HASH`
+    # rather than `HASH`. Strip it, or a digest compares unequal to itself.
+    local line
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | cut -d' ' -f1
+        line="$(sha256sum "$1")"
     else
-        shasum -a 256 "$1" | cut -d' ' -f1
+        line="$(shasum -a 256 "$1")"
     fi
+    printf '%s' "${line%% *}" | sed 's/^\\//'
 }
 
 # ── Read-only directories, both conventions ─────────────────────────────────
 
 make_read_only() { # directory
     if [[ $(host_platform) == windows ]] && command -v icacls >/dev/null 2>&1; then
+        # Granting Everyone read-execute is not enough on a runner: the
+        # account that created the directory keeps enough implicit access to
+        # add a file, so the write probe succeeded and the precondition
+        # failed. An explicit deny for this account is what actually makes
+        # the directory read-only *to this process*, which is what the check
+        # is about.
         icacls "$(cygpath -w "$1")" /inheritance:r \
             /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1
+        icacls "$(cygpath -w "$1")" /deny "$(whoami):(OI)(CI)(WD,AD)" >/dev/null 2>&1
     else
         chmod -R a-w "$1" 2>/dev/null
         chmod 555 "$1" 2>/dev/null
@@ -177,6 +190,7 @@ make_read_only() { # directory
 
 make_writable() { # directory
     if [[ $(host_platform) == windows ]] && command -v icacls >/dev/null 2>&1; then
+        icacls "$(cygpath -w "$1")" /remove:d "$(whoami)" >/dev/null 2>&1
         icacls "$(cygpath -w "$1")" /inheritance:e \
             /grant '*S-1-1-0:(OI)(CI)(F)' >/dev/null 2>&1
     else
@@ -348,7 +362,17 @@ run_smoke() {
         else
             result FAIL checksum "the shipped digest is $recorded and the shipped binary hashes to $computed"
         fi
-        if grep -qF " $asset" "$extraction/$asset.sha256"; then
+        # Three spellings are all correct, and Windows produces the two
+        # that a leading-space search misses: GNU text mode writes
+        # `HASH  NAME`, GNU binary mode — the Git for Windows default —
+        # writes `HASH *NAME`, and a name containing a backslash escapes
+        # the line. Compare the recorded name as a field instead.
+        if awk -v want="$asset" '{
+               name = $NF
+               sub(/^\*/, "", name)
+               gsub(/\\\\/, "\\", name)
+               if (name == want || name ~ ("(^|[/\\\\])" want "$")) { found = 1 }
+           } END { exit found ? 0 : 1 }' "$extraction/$asset.sha256"; then
             result PASS checksum-names-binary "$asset"
         else
             result FAIL checksum-names-binary \
