@@ -172,19 +172,41 @@ sha256_of() { # path
 # ── Read-only directories, both conventions ─────────────────────────────────
 
 make_read_only() { # directory
-    if [[ $(host_platform) == windows ]] && command -v icacls >/dev/null 2>&1; then
-        # Granting Everyone read-execute is not enough on a runner: the
-        # account that created the directory keeps enough implicit access to
-        # add a file, so the write probe succeeded and the precondition
-        # failed. An explicit deny for this account is what actually makes
-        # the directory read-only *to this process*, which is what the check
-        # is about.
-        icacls "$(cygpath -w "$1")" /inheritance:r \
-            /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1
-        icacls "$(cygpath -w "$1")" /deny "$(whoami):(OI)(CI)(WD,AD)" >/dev/null 2>&1
+    # Reports how it made the directory read-only, or why it could not. The
+    # previous version suppressed every error, so when Windows reported the
+    # folder "still writable by this process" there was nothing in the log to
+    # say whether icacls had failed, whether cygpath was missing, or whether
+    # the branch had been taken at all. A precondition that cannot be
+    # established must say which step did not hold.
+    read_only_method=''
+    read_only_why=''
+    if [[ $(host_platform) == windows ]]; then
+        if ! command -v icacls >/dev/null 2>&1; then
+            read_only_why='icacls is not on PATH'
+        elif ! command -v cygpath >/dev/null 2>&1; then
+            read_only_why='cygpath is not on PATH, so the Windows path is unknown'
+        else
+            local win_path account
+            win_path="$(cygpath -w "$1")"
+            account="$(whoami 2>/dev/null)"
+            if [[ -z $account ]]; then
+                read_only_why='whoami named no account to deny'
+            else
+                icacls "$win_path" /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1 \
+                    || read_only_why='icacls could not reset inheritance'
+                if icacls "$win_path" /deny "$account:(OI)(CI)(WD,AD)" >/dev/null 2>&1; then
+                    read_only_method="icacls deny for $account"
+                else
+                    read_only_why="icacls could not deny writes to $account"
+                fi
+            fi
+        fi
     else
-        chmod -R a-w "$1" 2>/dev/null
-        chmod 555 "$1" 2>/dev/null
+        if chmod -R a-w "$1" 2>/dev/null && chmod 555 "$1" 2>/dev/null; then
+            read_only_method='chmod a-w'
+        else
+            read_only_why='chmod could not clear the write bits'
+        fi
     fi
 }
 
@@ -465,7 +487,8 @@ INFO
     ro_data_dir="$(data_dir_for_label "$LABEL" "$ro_home")"
     make_read_only "$read_only"
     if directory_denies_writes "$read_only"; then
-        result PASS read-only-precondition "$read_only refuses a write probe"
+        result PASS read-only-precondition \
+            "$read_only refuses a write probe (${read_only_method:-unknown method})"
 
         # The rendered mode, because that is the launch a volunteer performs:
         # a window, an identity key, a recording stream, all resolved from
@@ -505,7 +528,8 @@ INFO
     else
         make_writable "$read_only"
         result FAIL read-only-precondition \
-            "$read_only is still writable by this process, so the read-only launch cannot be observed here"
+            "$read_only is still writable by this process, so the read-only launch cannot be observed here" \
+            "(${read_only_why:-${read_only_method:-no method reported}})"
     fi
 
     # ── the deployed campaign, from this platform's artifact ──
