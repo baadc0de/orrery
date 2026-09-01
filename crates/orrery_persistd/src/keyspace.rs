@@ -521,71 +521,8 @@ pub fn decode_seedprog_key(key: &[u8]) -> Option<([u8; 8], GridId, CellId)> {
     Some((emit_hash, grid, cell))
 }
 
-// ---------------------------------------------------------------------------
-// Terrain chunk family: `chunk/{grid}/{cell}/{n}`
-// ---------------------------------------------------------------------------
-//
-// Terrain shard rows (docs/08-persistence.md §6, §8). Each row is a ≤100 KB
-// compressed terrain section. `n` is the section index, big-endian u16, so
-// sections of one cell sort together and a whole cell's sections form one
-// contiguous key range.
-
-/// Key for a terrain chunk row: `chunk/{grid_id}/{cell_id}/{n}`.
-///
-/// `n` is the section index, a big-endian `u16`. The same grid scoping and
-/// subtree-span reasoning as `world/` (docs/08-persistence.md §6, §8).
-#[must_use]
-pub fn chunk_key(grid: GridId, cell: CellId, section: u16) -> [u8; 15] {
-    let mut key = [0u8; 15];
-    key[0] = b'k';
-    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
-    key[5..13].copy_from_slice(&cell.to_bits().to_be_bytes());
-    key[13..15].copy_from_slice(&section.to_be_bytes());
-    key
-}
-
-/// The first key of the `chunk/{grid_id}/{cell_id}/…` span for `shard` in
-/// `grid`.
-///
-/// Same subtree-span reasoning as [`world_range_start`] — a shard's chunk
-/// subtree is one contiguous range (D11 §6, parent = prefix). The span
-/// includes all chunk rows for every interest cell in the shard's subtree,
-/// at every section index.
-#[must_use]
-pub fn chunk_range_start(grid: GridId, shard: CellId) -> Vec<u8> {
-    let range = shard.subtree_range();
-    let mut key = Vec::with_capacity(13);
-    key.push(b'k');
-    key.extend_from_slice(&grid.0.to_be_bytes());
-    key.extend_from_slice(&range.start().to_be_bytes());
-    key
-}
-
-/// The exclusive end of the `chunk/{grid_id}/{cell_id}/…` subtree span for
-/// `shard` in `grid`.
-///
-/// Same edge-case handling as [`world_range_end`]: when the subtree abuts
-/// `u64::MAX` the bound reaches into the next grid, and at the topmost grid
-/// id the bound is the single byte past the `'k'` prefix.
-#[must_use]
-pub fn chunk_range_end(grid: GridId, shard: CellId) -> Vec<u8> {
-    let range = shard.subtree_range();
-    let end = *range.end();
-    if end < u64::MAX {
-        let mut key = Vec::with_capacity(13);
-        key.push(b'k');
-        key.extend_from_slice(&grid.0.to_be_bytes());
-        key.extend_from_slice(&(end + 1).to_be_bytes());
-        key
-    } else if grid.0 < u32::MAX {
-        let mut key = Vec::with_capacity(5);
-        key.push(b'k');
-        key.extend_from_slice(&(grid.0 + 1).to_be_bytes());
-        key
-    } else {
-        vec![b'l']
-    }
-}
+// D51 intentionally leaves one clean prefix byte rather than retaining an
+// unwritten durable family as a placeholder. A later allocation is its own ADR.
 
 // ---------------------------------------------------------------------------
 // Content version row: `content/version`
@@ -2719,90 +2656,7 @@ mod tests {
         assert!(key.as_slice() < end.as_slice());
     }
 
-    // -----------------------------------------------------------------------
-    // Terrain chunk key layout
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn chunk_key_is_15_bytes_with_k_prefix() {
-        let grid = GridId::new(7);
-        let cell = CellId::from_bits(SHARD).unwrap();
-        let key = chunk_key(grid, cell, 42);
-        assert_eq!(key.len(), 15, "chunk key is 15 bytes");
-        assert_eq!(key[0], b'k', "first byte is 'k'");
-        assert_eq!(
-            u32::from_be_bytes(key[1..5].try_into().unwrap()),
-            grid.0,
-            "bytes 1-4 are the grid id"
-        );
-        assert_eq!(
-            u64::from_be_bytes(key[5..13].try_into().unwrap()),
-            cell.to_bits(),
-            "bytes 5-12 are the cell id"
-        );
-        assert_eq!(
-            u16::from_be_bytes(key[13..15].try_into().unwrap()),
-            42,
-            "bytes 13-14 are the section index"
-        );
-
-        // Independently computed.
-        let mut expected = [0u8; 15];
-        expected[0] = b'k';
-        expected[1..5].copy_from_slice(&7u32.to_be_bytes());
-        expected[5..13].copy_from_slice(&cell.to_bits().to_be_bytes());
-        expected[13..15].copy_from_slice(&42u16.to_be_bytes());
-        assert_eq!(key, expected);
-    }
-
-    #[test]
-    fn chunk_key_sections_sort_contiguously() {
-        let cell = CellId::from_bits(SHARD).unwrap();
-        let keys: Vec<[u8; 15]> = (0..5).map(|n| chunk_key(GRID, cell, n)).collect();
-        for i in 1..keys.len() {
-            assert!(
-                keys[i - 1].as_slice() < keys[i].as_slice(),
-                "chunk sections sort by section index"
-            );
-        }
-    }
-
-    #[test]
-    fn chunk_range_uses_subtree_same_as_world() {
-        let shard = CellId::from_bits(SHARD).unwrap();
-        let w_start = world_range_start(GRID, shard);
-        let w_end = world_range_end(GRID, shard);
-        let c_start = chunk_range_start(GRID, shard);
-        let c_end = chunk_range_end(GRID, shard);
-
-        // Same cell-id span as world; only the prefix byte differs.
-        assert_eq!(c_start[0], b'k');
-        assert_eq!(c_end[0], b'k');
-        assert_eq!(c_start[1..], w_start[1..], "same subtree start as world");
-        assert_eq!(c_end[1..], w_end[1..], "same subtree end as world");
-
-        // A chunk key inside the span sorts in.
-        let inner = chunk_key(GRID, CellId::from_bits(CELL).unwrap(), 0);
-        assert!(inner.as_slice() >= c_start.as_slice());
-        assert!(inner.as_slice() < c_end.as_slice());
-    }
-
-    #[test]
-    fn chunk_subtree_is_unbounded_at_root() {
-        // Same as world's root: the whole grid's chunk rows.
-        let start = chunk_range_start(GRID, CellId::ROOT);
-        let end = chunk_range_end(GRID, CellId::ROOT);
-        assert_eq!(
-            start,
-            [b'k', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            "root chunk starts at cell 1"
-        );
-        assert_eq!(
-            end,
-            [b'k', 0, 0, 0, 1],
-            "root's grid-0 chunk subtree spans every chunk key of grid 0"
-        );
-    }
+    // D51: v1 has no retired-terrain key layout to exercise here.
 
     // -----------------------------------------------------------------------
     // Intent-adjacent families: player, pid, ledger
@@ -3670,13 +3524,8 @@ mod tests {
                     sample: intent_key(42).to_vec(),
                 },
             },
-            Family {
-                prefix: b'k',
-                name: "chunk",
-                kinds: Kinds::WholeSpan {
-                    sample: chunk_key(GRID, shard, 0).to_vec(),
-                },
-            },
+            // D51 deliberately leaves the next prefix byte clean; do not
+            // reintroduce a registry row without its own allocation decision.
             Family {
                 prefix: b'l',
                 name: "ledger",

@@ -270,6 +270,13 @@ lane_gates() {
     # docs/06-verifiable-core.md §8's static gates.
     run scripts/core-gates.sh
 
+    # #830's owner decision removes the terrain record and `k` key family,
+    # instead of leaving another no-op durable surface. This gate scans the
+    # production seams and its own fixtures prove both a variant and a key
+    # prefix return fail by name.
+    run scripts/terrain-substrate-gate.sh
+    run scripts/terrain-substrate-gate.sh --self-test
+
     # The clause-link shape check, both halves. ADR-0046 shipped six
     # `[D43](f)`s — a reference-style id with the clause letter glued into
     # what Markdown parses as an inline link destination — after twenty of

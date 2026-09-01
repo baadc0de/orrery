@@ -2132,7 +2132,7 @@ fn fold(
                 },
             );
         }
-        RecordKind::TerrainDelta | RecordKind::Rekey | RecordKind::CheckpointMark => {}
+        RecordKind::Rekey | RecordKind::CheckpointMark => {}
     }
 }
 

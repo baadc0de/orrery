@@ -26,8 +26,13 @@ pub struct WipeOptions {
 }
 
 #[cfg(feature = "fdb")]
-/// Wipe the seeded-world families from FDB after confirming the operator's
+/// Wipe the seeded v1 durable families from FDB after confirming the operator's
 /// typed input and checking that no live fence row overlaps the target range.
+///
+/// Terrain is not durable state in v1 (D51, proposed), so this deliberately
+/// does not clear the retired `k` range. A wipe continues to clear every
+/// family the v1 seeder can write; it no longer names a nonexistent terrain
+/// family or treats arbitrary stale keys as supported durable state.
 pub async fn run(
     _source: &str,
     mut scenario: ResolvedScenario,
@@ -93,13 +98,9 @@ pub async fn run(
         }
         let world_start = keyspace::world_range_start(*grid, CellId::ROOT);
         let world_end = keyspace::world_range_end(*grid, CellId::ROOT);
-        let chunk_start = keyspace::chunk_range_start(*grid, CellId::ROOT);
-        let chunk_end = keyspace::chunk_range_end(*grid, CellId::ROOT);
         db.run(|trx, _| {
             let world_start = world_start.clone();
             let world_end = world_end.clone();
-            let chunk_start = chunk_start.clone();
-            let chunk_end = chunk_end.clone();
             async move {
                 // `seedmap/` and `seedprog/` are global families, but each
                 // row is grid-scoped. Clearing either whole family here would
@@ -150,7 +151,6 @@ pub async fn run(
                     }
                 }
                 trx.clear_range(&world_start, &world_end);
-                trx.clear_range(&chunk_start, &chunk_end);
                 trx.clear(&keyspace::content_version_key());
                 Ok::<_, foundationdb::FdbBindingError>(())
             }

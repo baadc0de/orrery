@@ -90,6 +90,13 @@ rules H1-H6. The owner signalled acceptance in principle on 2026-08-27 while
 explicitly reserving the right to change their mind; it is non-normative
 until the owner flips its status.
 
+D51 is **proposed, not accepted**:
+[ADR-0051](adr/0051-v1-terrain-is-not-durable-state.md) drafts the owner's
+2026-09-01 #830 decision to remove v1 durable terrain. It is deliberately
+absent from the index above until the owner accepts it; the draft names its
+supersession of D11's terrain allocation and D32/D35's reclaimed-byte
+arithmetic without changing those accepted records while Proposed.
+
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
 ADR file. D19 deliberately follows that reserved gap.
