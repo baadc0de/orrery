@@ -51,6 +51,13 @@ fn seed() -> UniverseSeed {
     UniverseSeed([0x7c; 32])
 }
 
+fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
+    EcsBackend::new(game, seed).with_migrated_module(
+        orrery_games::regolith::world_ecs::sync_migrated,
+        orrery_games::regolith::world_ecs::step_migrated,
+    )
+}
+
 /// The insertion orders under test, as slot indices.
 ///
 /// More than one, and provably distinct — a single-row table would make every
@@ -122,7 +129,7 @@ fn project<B: TickBackend<Regolith>>(backend: &B, order: &[PersistId]) -> [u8; 3
 
 /// Run the population on an `EcsBackend`, inserting in `insertion_order`.
 fn run_on_ecs(insertion_order: &[u64]) -> Run {
-    let mut backend = EcsBackend::new(Regolith::honest(), seed());
+    let mut backend = regolith_ecs(Regolith::honest(), seed());
     for slot in insertion_order {
         let entity = PersistId::new(slot + 1);
         backend.insert(entity, Regolith::honest().spawn(entity, *slot));
@@ -207,6 +214,21 @@ fn the_canonical_schedule_composes_unambiguously_and_the_unordered_mutant_does_n
         rendered.contains("Ambiguity"),
         "the canary mutant failed for a reason other than ambiguity, so this proves the wrong \
          rejector is awake: {rendered}"
+    );
+
+    let native = orrery_games::regolith::world_ecs::ambiguity_audit();
+    assert!(
+        native.is_ok(),
+        "the migrated module's native schedule did not compose cleanly: {native:?}"
+    );
+    let native_mutant =
+        orrery_games::regolith::world_ecs::ambiguity_audit_of_the_unordered_mutant();
+    let Err(rendered) = native_mutant else {
+        panic!("the migrated module's unordered native schedule escaped ambiguity detection");
+    };
+    assert!(
+        rendered.contains("Ambiguity"),
+        "the native canary failed for the wrong reason: {rendered}"
     );
 }
 

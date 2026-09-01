@@ -18,9 +18,10 @@ use std::collections::{btree_map::Entry, BTreeMap};
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
 use crate::quantize::Quantized;
-use crate::rng::tick_rng;
+use crate::rng::{tick_rng, TickRng};
 use crate::ruleset::{
     state_hash, CoreCodec, EntityMaterialization, OrderedInputs, Ruleset, Section, StateView,
+    StepOutput,
 };
 
 /// The fixed simulation rate (VC-1, D8).
@@ -463,6 +464,34 @@ pub fn canonical_step<R: Ruleset>(
     own: &mut R::CoreState,
     neighbors: NeighborSnapshot<'_, R::CoreState>,
 ) -> CanonicalOutcome<R> {
+    canonical_step_with(step, own, neighbors, |ruleset, view, inputs, rng| {
+        ruleset.step(view, inputs, rng)
+    })
+}
+
+/// Run the canonical stage while delegating only the rules body to `run_rules`.
+///
+/// This is the native-rules counterpart of [`canonical_step`]. A dedicated
+/// host may drive a ruleset-owned ECS schedule for one entity, but it still
+/// enters and leaves through this function: RNG derivation, recorded-neighbour
+/// framing, quantization, hashing and materialization attribution remain the
+/// one implementation in `orrery_core`. The callback receives the same closed
+/// inputs as [`Ruleset::step`] and cannot replace any byte-producing stage.
+pub fn canonical_step_with<R, F>(
+    step: CanonicalStep<'_, R>,
+    own: &mut R::CoreState,
+    neighbors: NeighborSnapshot<'_, R::CoreState>,
+    run_rules: F,
+) -> CanonicalOutcome<R>
+where
+    R: Ruleset,
+    F: FnOnce(
+        &R,
+        &mut StateView<'_, R::CoreState>,
+        &OrderedInputs<'_, R::CoreInput>,
+        &mut TickRng,
+    ) -> StepOutput<R::CoreEvent>,
+{
     let CanonicalStep {
         ruleset,
         seed,
@@ -480,7 +509,7 @@ pub fn canonical_step<R: Ruleset>(
     let ordered = OrderedInputs::new(inputs);
     let mut rng = tick_rng(seed, entity, tick);
 
-    let output = ruleset.step(&mut view, &ordered, &mut rng);
+    let output = run_rules(ruleset, &mut view, &ordered, &mut rng);
     let neighbor_reads = view.recorded_reads().to_vec();
     let neighbor_frames = neighbor_reads
         .iter()

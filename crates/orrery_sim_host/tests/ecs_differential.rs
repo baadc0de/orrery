@@ -398,6 +398,13 @@ fn subject(label: &'static str) -> Subject<Regolith> {
     }
 }
 
+fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
+    EcsBackend::new(game, seed).with_migrated_module(
+        orrery_games::regolith::world_ecs::sync_migrated,
+        orrery_games::regolith::world_ecs::step_migrated,
+    )
+}
+
 /// The four-class parity verdict, with nothing left uncompared.
 fn four_class_parity() -> Verdict {
     Verdict::Parity {
@@ -421,7 +428,7 @@ fn differential(scenario: &Scenario) -> Verdict {
         Some(&regolith_baseline()),
         Backends {
             legacy: Executor::new,
-            candidate: EcsBackend::new,
+            candidate: regolith_ecs,
         },
     )
 }
@@ -436,8 +443,10 @@ fn the_ecs_backend_reaches_four_class_parity_with_the_store() {
         "no scenario populates a world domain, so the substrate's materialization stage is never exercised"
     );
     for scenario in &scenarios {
+        let verdict = differential(scenario);
+        eprintln!("VERDICT regolith/{} = {verdict:?}", scenario.name);
         assert_eq!(
-            differential(scenario),
+            verdict,
             four_class_parity(),
             "regolith/{}: the ECS-backed host did not reach four-class parity",
             scenario.name
@@ -516,7 +525,7 @@ fn the_candidate_side_stored_and_grew_its_population_in_a_world() {
     let seed = UniverseSeed([scenario.seed_byte; 32]);
     let seeded = scenario.entities + scenario.world_entities;
 
-    let mut backend = EcsBackend::new(Regolith::honest(), seed);
+    let mut backend = regolith_ecs(Regolith::honest(), seed);
     let mut store = Executor::new(Regolith::honest(), seed);
     for slot in 0..scenario.entities {
         let entity = PersistId::new(slot + 1);
@@ -543,7 +552,7 @@ fn the_candidate_side_stored_and_grew_its_population_in_a_world() {
 
     // Now play the whole world scenario on the ECS and count what the
     // materialization stage was actually asked to do.
-    let played = play_with(Regolith::honest(), scenario, EcsBackend::new);
+    let played = play_with(Regolith::honest(), scenario, regolith_ecs);
     let materialized: usize = played
         .outcome_entries
         .iter()
@@ -579,7 +588,7 @@ fn the_candidate_side_stored_and_grew_its_population_in_a_world() {
 #[test]
 fn a_single_entity_step_on_the_ecs_advances_only_that_entity() {
     let seed = UniverseSeed([0x33; 32]);
-    let mut ecs = EcsBackend::new(Regolith::honest(), seed);
+    let mut ecs = regolith_ecs(Regolith::honest(), seed);
     let mut store = Executor::new(Regolith::honest(), seed);
     for slot in 0..4u64 {
         let entity = PersistId::new(slot + 1);
@@ -635,7 +644,7 @@ fn the_two_hosts_agree_on_report_events_and_state_bytes() {
     let mut store_host = SimulationHost::new(config, Regolith::honest(), RegolithAdapter);
     let mut ecs_host = SimulationHost::on_backend(
         config,
-        EcsBackend::new(Regolith::honest(), seed),
+        regolith_ecs(Regolith::honest(), seed),
         RegolithAdapter,
     );
     for slot in 0..4u64 {
@@ -689,7 +698,7 @@ fn the_adjudicator_still_convicts_a_damage_inflating_candidate_on_the_ecs() {
     // sealed inputs on the ECS, so the only difference between the sides is
     // the tamper.
     let legacy_played = play_with(honest, scenario, Executor::new);
-    let candidate_played = replay_with(tampered, &legacy_played.sealed, EcsBackend::new);
+    let candidate_played = replay_with(tampered, &legacy_played.sealed, regolith_ecs);
     let legacy = collect_artifacts_on(
         &honest,
         &legacy_played,
@@ -702,7 +711,7 @@ fn the_adjudicator_still_convicts_a_damage_inflating_candidate_on_the_ecs() {
         &candidate_played,
         Side::Candidate,
         regolith_axes(),
-        EcsBackend::new,
+        regolith_ecs,
     );
 
     let cross = cross_replay_on(
@@ -719,7 +728,7 @@ fn the_adjudicator_still_convicts_a_damage_inflating_candidate_on_the_ecs() {
         legacy_played.sealed.seed,
         &Backends {
             legacy: Executor::new,
-            candidate: EcsBackend::new,
+            candidate: regolith_ecs,
         },
     );
 

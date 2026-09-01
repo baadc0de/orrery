@@ -93,6 +93,8 @@ pub mod state;
 mod visibility;
 pub mod weapon;
 mod world;
+#[doc(hidden)]
+pub mod world_ecs;
 
 use crate::game::{Game, GameMeta, Tamper};
 use archetype::Archetype;
@@ -331,7 +333,15 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
-/// Regolith v22's rules identity: v21's gameplay rules under protocol v7.
+/// Regolith v23's rules identity: v22's canonical behaviour under protocol v7,
+/// with `regolith.world` executed as native ECS components and systems.
+///
+/// The F-4 differential compares the legacy and native paths over D-1 through
+/// D-4 and requires byte parity. The version still advances because D49's
+/// source identity moved; the unchanged component schema and projection axes
+/// remain independently equal.
+///
+/// Regolith v22's rules identity was v21's gameplay rules under protocol v7.
 /// Adding the server-owned restore record moved the pinned first-party source
 /// closure, so the identity advances even though the canonical step does not.
 ///
@@ -351,7 +361,7 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
 /// would let them enter one session and disagree before the first input; v21
 /// makes admission refuse that mixed campaign instead.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 22,
+    version: 23,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 

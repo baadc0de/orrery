@@ -42,8 +42,15 @@ use orrery_games::diff::{collect_witness_on, cross_replay_on, Backends, WitnessA
 use orrery_games::regolith::Regolith;
 use orrery_games::scenario::{play_with, Play, Scenario, SCENARIOS};
 use orrery_games::Game;
-use orrery_protocol::{PersistId, Tick};
+use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use orrery_sim_host::ecs::EcsBackend;
+
+fn regolith_ecs(game: Regolith, seed: UniverseSeed) -> EcsBackend<Regolith> {
+    EcsBackend::new(game, seed).with_migrated_module(
+        orrery_games::regolith::world_ecs::sync_migrated,
+        orrery_games::regolith::world_ecs::step_migrated,
+    )
+}
 
 /// A substrate that counts the single-entity steps taken on it, and otherwise
 /// is exactly the substrate it wraps.
@@ -166,11 +173,11 @@ fn scenario() -> Scenario {
 /// One honest Regolith run, played on the ECS — so the claims under
 /// adjudication really are ECS-authored.
 fn played_on_the_ecs(scenario: &Scenario) -> Play<Regolith> {
-    play_with(Regolith::honest(), scenario, EcsBackend::new)
+    play_with(Regolith::honest(), scenario, regolith_ecs)
 }
 
 fn witness_on_the_ecs(played: &Play<Regolith>) -> WitnessArtifact {
-    collect_witness_on(&Regolith::honest(), played, EcsBackend::new)
+    collect_witness_on(&Regolith::honest(), played, regolith_ecs)
         .expect("an honest ECS run authors D-4 evidence")
 }
 
@@ -194,7 +201,7 @@ fn adjudication_re_executes_on_the_substrate_that_authored_the_claims() {
 
     let steps = Arc::new(AtomicUsize::new(0));
     let ecs = |game, seed| Counting {
-        inner: EcsBackend::new(game, seed),
+        inner: regolith_ecs(game, seed),
         steps: Arc::clone(&steps),
     };
     let cross = cross_replay_on(
@@ -241,7 +248,7 @@ fn the_d4_evidence_is_authored_on_the_substrate_that_ran_the_scenario() {
 
     let steps = Arc::new(AtomicUsize::new(0));
     let witness = collect_witness_on(&Regolith::honest(), &played, |game, seed| Counting {
-        inner: EcsBackend::new(game, seed),
+        inner: regolith_ecs(game, seed),
         steps: Arc::clone(&steps),
     })
     .expect("an honest ECS run authors D-4 evidence");
@@ -271,7 +278,7 @@ fn the_substrate_the_adjudicator_was_handed_is_what_the_verdict_rests_on() {
     let witness = witness_on_the_ecs(&played);
 
     let swapped = |game, seed| Swapped {
-        inner: EcsBackend::new(game, seed),
+        inner: regolith_ecs(game, seed),
     };
     let cross = cross_replay_on(
         &Regolith::honest(),
@@ -341,7 +348,7 @@ fn the_adjudicating_substrate_holds_a_world_of_one() {
 
     let widest = Arc::new(AtomicUsize::new(0));
     let ecs = |game, seed| Widest {
-        inner: EcsBackend::new(game, seed),
+        inner: regolith_ecs(game, seed),
         widest: Arc::clone(&widest),
     };
     let cross = cross_replay_on(

@@ -5,10 +5,12 @@ edition = "2021"
 description = "Orrery's reference games: complete Ruleset implementations the trust apparatus is measured against, plus the deterministic harness that plays, replays and adjudicates them (docs/11-roadmap.md §P4)"
 license = "MIT OR Apache-2.0"
 
-# Bevy-free and headless, like `orrery_core` and `orrery_conformance`. A
-# reference game is built identically on every target in the determinism
-# matrix, so it takes no dependency that could differ between them: no tokio,
-# no OS services, no clock.
+# Headless, like `orrery_core` and `orrery_conformance`. A reference game is
+# built identically on every target in the determinism matrix, so it takes no
+# dependency that could differ between them: no tokio, no OS services, no
+# clock. S7.4 (#745) admits `bevy_ecs` alone for ruleset-owned components and
+# systems in a dedicated host world; no Bevy app, clock, renderer, or task-pool
+# feature enters the canonical graph.
 [dependencies]
 orrery_core = { path = "../orrery_core" }
 orrery_protocol = { path = "../orrery_protocol" }
@@ -33,6 +35,9 @@ iroh-base = { workspace = true }
 bytes = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
+# S7.4: native own-state components and systems for `regolith.world`.
+# `multi_threaded` remains off; canonical system order is explicit.
+bevy_ecs = { workspace = true }
 
 [build-dependencies]
 # D49's build identity is generated while this crate compiles. The encoder

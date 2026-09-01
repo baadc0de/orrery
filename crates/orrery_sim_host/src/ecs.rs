@@ -18,60 +18,33 @@
 //!
 //! Regolith's frontier is `regolith.world` — the `rock`, `pickup` and
 //! `bloom-director` sections of #737's split. `regolith.craft` is the
-//! remainder. Moving the next module across is a one-line edit to
-//! `MIGRATED_SECTIONS` and a field on [`SectionStore`]; no stage signature
-//! changes, and the whole blast radius is measured by
-//! `tests/ecs_differential.rs`.
+//! remainder. World goes first because it has no module dependencies while
+//! craft depends on it, and because its materialized rocks and pickups exercise
+//! the only path that adds archetypes during a tick. The whole blast radius is
+//! measured by `tests/ecs_differential.rs`.
 //!
-//! # The payload is the sum, and it is the seam that says so
+//! # Native own-state components, with the whole-state seam intact
 //!
-//! [`MigratedSection`] holds the whole `R::CoreState`, not the narrower
-//! `Rock`/`Pickup`/`BloomDirector` its section names. That is not a choice
-//! this file makes and not one it can unmake. [`TickBackend::state`] is
-//! declared as
+//! [`TickBackend::state`] remains declared as
 //!
 //! ```text
 //! fn state(&self, entity: PersistId) -> Option<&R::CoreState>;
 //! ```
 //!
-//! — a *reference* to the sum. A component holding one section's own payload
-//! can only ever yield an owned sum, because rebuilding a `RegolithState` from
-//! a `Rock` constructs a value; there is nothing for the returned reference to
-//! borrow from. Written out, rustc refuses it:
-//!
-//! ```text
-//! error[E0515]: cannot return value referencing temporary value
-//!     |     Some(&embed::<S>(held.0.clone()))
-//!     |     ^^^^^^--------------------------^
-//!     |     |     temporary value created here
-//!     |     returns a value referencing data owned by the current function
-//! ```
-//!
-//! So every decomposition of the payload — per section, per field, or the
-//! `bevy_ecs`-native ruleset of #793 — meets the same one line, and no amount
-//! of ECS idiom in this file gets past it. What a decomposing host *can* do
-//! without the seam moving is answered from the storage layout instead of the
-//! payload, and that is what [`Slot`] and this backend's
-//! [`TickBackend::section_state`] override do: the migration frontier decides
-//! the wrong-section case before any state is read, and only a migrated
-//! entity's choice *among* the migrated module's three sections still projects
-//! off the sum.
-//!
-//! #791 raised the consumer-facing half of this ceiling — a caller that wants
-//! a craft asks for [`orrery_core::Section`] and is handed a `&Craft` — and
-//! this file now answers that question from its own layout rather than taking
-//! the provided default. The stored payload is unchanged, and a narrow one is
-//! not reachable from here.
+//! so [`MigratedSection`] still holds the whole `R::CoreState` as the seam's
+//! readable cache. S7.4 adds the narrower game-owned components beside it and
+//! runs only those components through [`MigratedStep`]. [`MigratedSync`] holds
+//! the two representations equal on insert, materialization and post-step
+//! quantization. The cache is the only value canonical encoding reads; the
+//! concrete component is the own-state projection the rules mutate.
 //!
 //! # Why this is legal where the previous attempt was not
 //!
-//! ADR-0042 clause (d) admits a dedicated `bevy_ecs::World` as "a legal future
-//! host implementation … behind the seam", and refuses `bevy_ecs` inside a
-//! gated crate. The seam is *this* crate, which `core-gates.sh` clause 1 does
-//! not gate: its only `impl Ruleset` is under `#[cfg(test)]`, which the gate's
-//! role discovery strips before deciding. So this file needs no ADR amendment
-//! and no gate change, and `./scripts/core-gates.sh` still exits 0 with
-//! `bevy_ecs` a first-class dependency here.
+//! ADR-0042 clause (a) and ADR-0043 clause (e)(1) were amended under the owner
+//! acceptance recorded on #793: `orrery_games` may own ECS components and rule
+//! systems while `orrery_core` stays Bevy-free. This crate remains the declared
+//! Tier-H host and owns the dedicated world; the game receives it only for the
+//! duration of one closed, per-entity step.
 //!
 //! # D42 (a): canonical truth is not in an application world
 //!
@@ -86,23 +59,24 @@
 //!
 //! Every byte a tick commits to — the RNG stream (VC-3), the rule call, the
 //! neighbour framing, the VC-7 quantization, the state hash — is
-//! [`orrery_core::canonical_step`], which both backends call and neither
+//! [`orrery_core::canonical_step`] or its callback form
+//! [`orrery_core::canonical_step_with`], which both backends call and neither
 //! copies. This file owns *where the state was before the call and where it
-//! goes after*, plus the order the calls happen in. That is the entire claim
-//! being made, and it is a structural one: there is no expression in this file
-//! that can compute a hash.
+//! goes after*, plus the order the calls happen in. There is no expression in
+//! this file that can compute a hash.
 
 use std::collections::{btree_map, BTreeMap};
 use std::marker::PhantomData;
 
 use bevy_ecs::prelude::{
-    Component, Entity, IntoScheduleConfigs, Query, Res, ResMut, Resource, Schedule, World,
+    Component, Entity, IntoScheduleConfigs, Query, ResMut, Resource, Schedule, World,
 };
 use bevy_ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel};
 use orrery_core::{
-    canonical_step, sort_materialization_candidates, sort_stepped_entities, CanonicalOutcome,
-    CanonicalStep, NeighborSnapshot, Quantized, Ruleset, SealedTickInputs, Section, Sectioned,
-    SteppedEntity, TickBackend, TickOutcome,
+    canonical_step, canonical_step_with, sort_materialization_candidates, sort_stepped_entities,
+    CanonicalOutcome, CanonicalStep, NeighborSnapshot, OrderedInputs, Quantized, Ruleset,
+    SealedTickInputs, Section, Sectioned, StateView, StepOutput, SteppedEntity, TickBackend,
+    TickOutcome, TickRng,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
@@ -131,6 +105,40 @@ where
     R::CoreEvent: Send + Sync + 'static,
 {
 }
+
+/// Synchronize a migrated entity's whole-state cache into game-owned ECS
+/// components. `None` removes those components when the entity crosses back to
+/// the remainder.
+pub type MigratedSync<R> = fn(&mut World, Entity, Option<&<R as Ruleset>::CoreState>);
+
+/// Run one migrated entity's own-state rules as game-owned ECS systems.
+///
+/// The callback receives the same closed inputs as [`Ruleset::step`]. It runs
+/// inside [`orrery_core::canonical_step_with`], so it cannot replace RNG
+/// derivation, neighbour framing, quantization, hashing, or materialization.
+pub type MigratedStep<R> = for<'state, 'input> fn(
+    &mut World,
+    Entity,
+    &R,
+    &mut StateView<'state, <R as Ruleset>::CoreState>,
+    &OrderedInputs<'input, <R as Ruleset>::CoreInput>,
+    &mut TickRng,
+) -> StepOutput<<R as Ruleset>::CoreEvent>;
+
+/// The one module currently past the migration frontier.
+#[derive(Resource)]
+struct MigratedModule<R: EcsHostable> {
+    sync: MigratedSync<R>,
+    step: MigratedStep<R>,
+}
+
+impl<R: EcsHostable> Clone for MigratedModule<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R: EcsHostable> Copy for MigratedModule<R> {}
 
 /// The one schedule a tick runs.
 #[derive(ScheduleLabel, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -357,39 +365,6 @@ fn seal_population<R: EcsHostable>(
     plan.order = order;
 }
 
-/// Canonical state on both sides of the migration frontier, as one system
-/// param.
-///
-/// The decomposition's second ergonomic effect, after the archetype: a system
-/// that needs to advance an entity asks for [`SectionStore`] and does not have
-/// to know that "canonical state" is two components today and will be three
-/// when the next module crosses. Migrating a further module adds a field here
-/// and an arm to [`SectionStore::own_mut`]; no stage signature changes.
-#[derive(bevy_ecs::system::SystemParam)]
-struct SectionStore<'w, 's, R: EcsHostable> {
-    migrated: Query<'w, 's, &'static mut MigratedSection<R>>,
-    remainder: Query<'w, 's, &'static mut RemainderSection<R>>,
-    observed_at: Query<'w, 's, &'static mut ObservedAt>,
-}
-
-impl<R: EcsHostable> SectionStore<'_, '_, R> {
-    /// One sealed entity's canonical state, from the side its slot names.
-    fn own_mut(&mut self, slot: &StepSlot) -> Option<&mut R::CoreState> {
-        match slot.side {
-            Side::Migrated => self
-                .migrated
-                .get_mut(slot.entity)
-                .ok()
-                .map(|held| &mut held.into_inner().0),
-            Side::Remainder => self
-                .remainder
-                .get_mut(slot.entity)
-                .ok()
-                .map(|held| &mut held.into_inner().0),
-        }
-    }
-}
-
 /// Stage 2 — `host.advance-population`.
 ///
 /// Runs the canonical stage for each sealed entity, in order, mutating its
@@ -399,14 +374,26 @@ impl<R: EcsHostable> SectionStore<'_, '_, R> {
 /// tick it ran. The vector written to [`TickResults::stepped`] is sorted by
 /// ascending `PersistId` before it is returned, establishing the output order
 /// regardless of the iteration order used here.
-fn advance_population<R: EcsHostable>(
-    rules: Res<Rules<R>>,
-    plan: Res<TickPlan<R>>,
-    index: Res<Index>,
-    neighborhood: Res<Neighborhood<R>>,
-    mut results: ResMut<TickResults<R>>,
-    mut store: SectionStore<R>,
-) {
+///
+/// This is exclusive because a migrated module's own systems run over this
+/// same dedicated `World`. The whole-state component is taken out while those
+/// systems execute, then restored after `canonical_step_with` quantizes and
+/// hashes it; no aliased world borrow and no second byte path exists.
+fn advance_population<R: EcsHostable>(world: &mut World) {
+    let rules = world
+        .remove_resource::<Rules<R>>()
+        .expect("the canonical world holds its rules");
+    let plan = world
+        .remove_resource::<TickPlan<R>>()
+        .expect("the canonical world holds its tick plan");
+    let neighborhood = world
+        .remove_resource::<Neighborhood<R>>()
+        .expect("the canonical world holds its sealed neighborhood");
+    let mut results = world
+        .remove_resource::<TickResults<R>>()
+        .expect("the canonical world holds its tick results");
+    let migrated_module = world.get_resource::<MigratedModule<R>>().copied();
+
     let tick = plan.tick;
     let settled = Tick::new(tick.0.saturating_add(1));
     results.stepped.clear();
@@ -417,40 +404,58 @@ fn advance_population<R: EcsHostable>(
         if plan.only.is_some_and(|only| only != slot.persist) {
             continue;
         }
-        // Own state is mutated in place in its component, and stays in the
-        // sealed view for everyone else to read at its tick-start value. It is
-        // hidden from *this* step by identity, inside `StateView`, not by
-        // taking the row out of a map that other steps also read.
-        // The migrated module's state comes out of its own component, and the
-        // slot says which. Both arms yield `&mut R::CoreState` because the seam
-        // hands the host an opaque state type; what the decomposition buys is
-        // the archetype, not a narrower payload.
-        let Some(own) = store.own_mut(slot) else {
+        // The sealed view is a separate tick-start snapshot, so taking the live
+        // whole-state component out does not hide this entity from any reader.
+        let own = match slot.side {
+            Side::Migrated => world
+                .entity_mut(slot.entity)
+                .take::<MigratedSection<R>>()
+                .map(|held| held.0),
+            Side::Remainder => world
+                .entity_mut(slot.entity)
+                .take::<RemainderSection<R>>()
+                .map(|held| held.0),
+        };
+        let Some(mut own) = own else {
             continue;
+        };
+        let canonical = CanonicalStep {
+            ruleset: &rules.ruleset,
+            seed: rules.seed,
+            entity: slot.persist,
+            tick,
+            inputs: plan.inputs.for_entity(slot.persist),
+        };
+        let neighbors = NeighborSnapshot {
+            states: &neighborhood.states,
+            observed_ticks: &neighborhood.observed,
         };
         let CanonicalOutcome {
             outcome,
             materializations,
-        } = canonical_step(
-            CanonicalStep {
-                ruleset: &rules.ruleset,
-                seed: rules.seed,
-                entity: slot.persist,
-                tick,
-                inputs: plan.inputs.for_entity(slot.persist),
-            },
-            own,
-            NeighborSnapshot {
-                states: &neighborhood.states,
-                observed_ticks: &neighborhood.observed,
-            },
-        );
-        // The write has already happened, in the component; the stamp goes
-        // beside it rather than at the end of the tick, so a T+1 stamp is
-        // never paired with a pre-step state.
-        if let Ok(mut observed) = store.observed_at.get_mut(slot.entity) {
-            observed.0 = settled;
+        } = match (slot.side, migrated_module) {
+            (Side::Migrated, Some(module)) => canonical_step_with(
+                canonical,
+                &mut own,
+                neighbors,
+                |ruleset, view, inputs, rng| {
+                    (module.step)(world, slot.entity, ruleset, view, inputs, rng)
+                },
+            ),
+            _ => canonical_step(canonical, &mut own, neighbors),
+        };
+
+        if let (Side::Migrated, Some(module)) = (slot.side, migrated_module) {
+            (module.sync)(world, slot.entity, Some(&own));
         }
+        let mut held = world.entity_mut(slot.entity);
+        match slot.side {
+            Side::Migrated => held.insert(MigratedSection::<R>(own)),
+            Side::Remainder => held.insert(RemainderSection::<R>(own)),
+        };
+        // The stamp goes beside the post-step state, so a T+1 stamp is never
+        // paired with a pre-step value.
+        held.insert(ObservedAt(settled));
 
         candidates.extend(materializations);
         results.stepped.push(SteppedEntity {
@@ -467,7 +472,10 @@ fn advance_population<R: EcsHostable>(
     for candidate in candidates {
         let emitter = candidate.emitter;
         let description = candidate.description;
-        if index.0.contains_key(&description.entity)
+        if world
+            .resource::<Index>()
+            .0
+            .contains_key(&description.entity)
             || results
                 .spawned
                 .iter()
@@ -492,6 +500,11 @@ fn advance_population<R: EcsHostable>(
             state,
         });
     }
+
+    world.insert_resource(rules);
+    world.insert_resource(plan);
+    world.insert_resource(neighborhood);
+    world.insert_resource(results);
 }
 
 /// Stage 3 — `host.install-materializations`.
@@ -515,6 +528,7 @@ fn install_materializations<R: EcsHostable>(world: &mut World) {
         // `regolith.world` — the module whose population changes mid-tick — is
         // the one migrated first.
         let side = Side::of(&materialized.state);
+        let native_state = (side == Side::Migrated).then(|| materialized.state.clone());
         let mut spawn = world.spawn((Identity(materialized.entity), ObservedAt(settled)));
         match side {
             Side::Migrated => spawn.insert(MigratedSection::<R>(materialized.state)),
@@ -525,6 +539,9 @@ fn install_materializations<R: EcsHostable>(world: &mut World) {
             .resource_mut::<Index>()
             .0
             .insert(materialized.entity, Slot { entity, side });
+        if let Some(module) = world.get_resource::<MigratedModule<R>>().copied() {
+            (module.sync)(world, entity, native_state.as_ref());
+        }
     }
 }
 
@@ -627,6 +644,35 @@ impl<R: EcsHostable> EcsBackend<R> {
             schedule: canonical_schedule::<R>(Ordering::Chained),
             ruleset: PhantomData,
         }
+    }
+
+    /// Install the game-owned ECS implementation for the migrated module.
+    ///
+    /// The migration remains explicit at construction: [`EcsBackend::new`]
+    /// continues to host any [`EcsHostable`] ruleset through its ordinary
+    /// `Ruleset::step`, while this builder opts one declared module into native
+    /// components and systems. Existing entities are synchronized immediately,
+    /// so the builder is correct before or after seeding.
+    #[must_use]
+    pub fn with_migrated_module(mut self, sync: MigratedSync<R>, step: MigratedStep<R>) -> Self {
+        let module = MigratedModule { sync, step };
+        self.world.insert_resource(module);
+        let migrated: Vec<(Entity, R::CoreState)> = self
+            .world
+            .resource::<Index>()
+            .0
+            .values()
+            .filter(|slot| slot.side == Side::Migrated)
+            .filter_map(|slot| {
+                self.state_at(*slot)
+                    .cloned()
+                    .map(|state| (slot.entity, state))
+            })
+            .collect();
+        for (entity, state) in migrated {
+            (sync)(&mut self.world, entity, Some(&state));
+        }
+        self
     }
 
     /// D43 (c)(1)'s ambiguity canary, arming direction.
@@ -764,6 +810,7 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
         // first tick reads it.
         state.quantize();
         let side = Side::of(&state);
+        let native_state = (side == Side::Migrated).then(|| state.clone());
         let handle = match self.slot_for(entity) {
             Some(existing) => existing.entity,
             None => self
@@ -781,23 +828,28 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
                 side,
             },
         );
-        let mut held = self.world.entity_mut(handle);
-        held.insert(ObservedAt(observed_tick));
-        // A replacing install may cross the frontier — a replay harness reuses
-        // an id, and nothing in the `Ruleset` contract says a stable id keeps
-        // its section. The stale component is removed rather than left behind:
-        // an entity carrying both would be sealed twice, once per query, and
-        // the population would silently double.
-        match side {
-            Side::Migrated => {
-                held.remove::<RemainderSection<R>>();
-                held.insert(MigratedSection::<R>(state));
-            }
-            Side::Remainder => {
-                held.remove::<MigratedSection<R>>();
-                held.insert(RemainderSection::<R>(state));
-            }
-        };
+        {
+            let mut held = self.world.entity_mut(handle);
+            held.insert(ObservedAt(observed_tick));
+            // A replacing install may cross the frontier — a replay harness
+            // reuses an id, and nothing in the `Ruleset` contract says a stable
+            // id keeps its section. The stale component is removed rather than
+            // left behind: an entity carrying both would be sealed twice, once
+            // per query, and the population would silently double.
+            match side {
+                Side::Migrated => {
+                    held.remove::<RemainderSection<R>>();
+                    held.insert(MigratedSection::<R>(state));
+                }
+                Side::Remainder => {
+                    held.remove::<MigratedSection<R>>();
+                    held.insert(RemainderSection::<R>(state));
+                }
+            };
+        }
+        if let Some(module) = self.world.get_resource::<MigratedModule<R>>().copied() {
+            (module.sync)(&mut self.world, handle, native_state.as_ref());
+        }
     }
 
     /// Despawn the entity outright rather than only dropping its index row:
@@ -826,12 +878,11 @@ impl<R: EcsHostable> TickBackend<R> for EcsBackend<R> {
     /// are answered here from the [`Slot`] alone, and the entity's canonical
     /// state is never touched.
     ///
-    /// What is *not* answered from the layout is which of the migrated
-    /// module's three sections a migrated entity occupies, because all three
-    /// share one component. That case still projects, and it is the exact
-    /// residue of the payload still being the sum. Narrowing it needs a
-    /// component per section holding that section's own type, which
-    /// [`TickBackend::state`]'s return type refuses — see the module note.
+    /// What is *not* answered from this generic layout is which of the migrated
+    /// module's three sections a migrated entity occupies. Regolith now keeps
+    /// those own-state projections as concrete game components for its rules,
+    /// but this read API returns a borrow tied to the whole-state cache, so the
+    /// generic accessor still projects here. See the module note.
     fn section_state<S>(&self, entity: PersistId) -> Option<&S::State>
     where
         S: Section<Root = R::CoreState>,
