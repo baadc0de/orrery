@@ -365,6 +365,41 @@ fn seal_population<R: EcsHostable>(
     plan.order = order;
 }
 
+/// Canonical whole-state storage on both sides of the migration frontier.
+///
+/// #789 introduced this boundary as a `SystemParam`. Native game systems now
+/// need an exclusive borrow of the same dedicated world, so S7.4 keeps the
+/// boundary but makes its operations short-lived: take the seam cache before
+/// the nested module schedule runs, then restore the post-quantized cache
+/// afterwards. Callers still do not know which component type holds a side.
+struct SectionStore<R: EcsHostable>(PhantomData<fn() -> R>);
+
+impl<R: EcsHostable> SectionStore<R> {
+    /// Take one sealed entity's whole-state cache from the side its slot names.
+    fn take(world: &mut World, slot: &StepSlot) -> Option<R::CoreState> {
+        match slot.side {
+            Side::Migrated => world
+                .entity_mut(slot.entity)
+                .take::<MigratedSection<R>>()
+                .map(|held| held.0),
+            Side::Remainder => world
+                .entity_mut(slot.entity)
+                .take::<RemainderSection<R>>()
+                .map(|held| held.0),
+        }
+    }
+
+    /// Restore the post-step cache and observation stamp on its declared side.
+    fn restore(world: &mut World, slot: &StepSlot, state: R::CoreState, observed: Tick) {
+        let mut held = world.entity_mut(slot.entity);
+        match slot.side {
+            Side::Migrated => held.insert(MigratedSection::<R>(state)),
+            Side::Remainder => held.insert(RemainderSection::<R>(state)),
+        };
+        held.insert(ObservedAt(observed));
+    }
+}
+
 /// Stage 2 — `host.advance-population`.
 ///
 /// Runs the canonical stage for each sealed entity, in order, mutating its
@@ -406,16 +441,7 @@ fn advance_population<R: EcsHostable>(world: &mut World) {
         }
         // The sealed view is a separate tick-start snapshot, so taking the live
         // whole-state component out does not hide this entity from any reader.
-        let own = match slot.side {
-            Side::Migrated => world
-                .entity_mut(slot.entity)
-                .take::<MigratedSection<R>>()
-                .map(|held| held.0),
-            Side::Remainder => world
-                .entity_mut(slot.entity)
-                .take::<RemainderSection<R>>()
-                .map(|held| held.0),
-        };
+        let own = SectionStore::<R>::take(world, slot);
         let Some(mut own) = own else {
             continue;
         };
@@ -448,14 +474,9 @@ fn advance_population<R: EcsHostable>(world: &mut World) {
         if let (Side::Migrated, Some(module)) = (slot.side, migrated_module) {
             (module.sync)(world, slot.entity, Some(&own));
         }
-        let mut held = world.entity_mut(slot.entity);
-        match slot.side {
-            Side::Migrated => held.insert(MigratedSection::<R>(own)),
-            Side::Remainder => held.insert(RemainderSection::<R>(own)),
-        };
         // The stamp goes beside the post-step state, so a T+1 stamp is never
         // paired with a pre-step value.
-        held.insert(ObservedAt(settled));
+        SectionStore::<R>::restore(world, slot, own, settled);
 
         candidates.extend(materializations);
         results.stepped.push(SteppedEntity {
