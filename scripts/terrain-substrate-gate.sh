@@ -27,7 +27,7 @@ usage() {
 require_anchor() {
     local file=$1 pattern=$2 label=$3
     [[ -f $file ]] || die "anti-vacuity: missing $label source: ${file#"$ROOT/"}"
-    rg -q -- "$pattern" "$file" \
+    grep -qE -- "$pattern" "$file" \
         || die "anti-vacuity: $label source no longer carries its expected anchor"
 }
 
