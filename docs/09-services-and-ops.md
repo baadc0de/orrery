@@ -1,6 +1,6 @@
 # 09 — Backend Services & Operations
 
-Orrery's backend is deliberately small: five services, all Rust, all speaking iroh QUIC externally. None of them simulate the game — simulation lives on players' machines until a cell's population exceeds the mesh ceiling, at which point (and only at which point) the coordinator spins up a field host. This document specifies each service's operational contract: the state it holds, its scaling axis, its failure blast radius, and its HA strategy; the three reference deployment topologies; per-service ops procedures (relay fleet, FoundationDB, coordinator failover, field-host autoscaling, identity/key management); the observability and audit pipeline; runbook summaries for the major failure modes; and a worked capacity plan at 10k CCU.
+Orrery's backend is deliberately small: five services, all Rust, all speaking iroh QUIC externally. None of them simulate the game — simulation lives on players' machines until a cell's population exceeds the mesh ceiling, at which point (and only at which point) the coordinator spins up a field host. This document specifies each service's operational contract: the state it holds, its scaling axis, its failure blast radius, and its HA strategy; the three reference deployment topologies; per-service ops procedures (relay fleet, FoundationDB, coordinator failover, field-host autoscaling, identity/key management); the observability and audit pipeline; runbook summaries for the major failure modes; a worked capacity plan at 10k CCU; and the CLI environment-variable fallbacks every binary shares (§12).
 
 Normative source: [ADR-0012](adr/0012-backend-services.md) (expanding on [D3](adr/0003-transport.md), [D6](adr/0006-population-adaptive-topology.md), [D7](adr/0007-authority-and-leases.md), [D10](adr/0010-witnessing.md), [D11](adr/0011-persistence.md), [D16](adr/0016-parameter-reference.md), and [D17](adr/0017-risks-and-open-questions.md)).
 
@@ -211,7 +211,8 @@ mislocates it sends an operator to the wrong process on the worst day.
 
 **How these reach an operator today, and how they do not.** `persistd`
 collects every gateway counter unconditionally — the flag opens a sink, it
-does not start the measurement — and `--metrics-jsonl` appends them, plus the
+does not start the measurement — and `--metrics-jsonl` (env
+`ORRERY_METRICS_JSONL`) appends them, plus the
 latency `sample_batch` records, to a file. That is the whole surface: there is
 no scrape endpoint and no admin socket, so on a node started without the flag
 these counters are correct, live, and reachable by nothing until a restart.
@@ -230,7 +231,8 @@ metrics" means "restart with `--metrics-jsonl`".
 
 *Gap:* the **gateway-side bounded intent queue** this posture also calls for is not implemented. Today a client that reaches the gateway during a quorum loss gets the adapter's store error back and must fall back to its own offline queue; an intent already accepted by the gateway is not held for the cluster's return.
 
-**Archive unreachable (`--archive-dir` / `--archive-retention`).** Symptom: a
+**Archive unreachable (`--archive-dir` / `--archive-retention`; env
+`ORRERY_ARCHIVE_DIR` / `ORRERY_ARCHIVE_RETENTION`).** Symptom: a
 `warn` line from the checkpoint round — *"the archive is not keeping up; the
 journal cannot reclaim and will fill"* — carrying `segments_behind` and
 `bytes_behind`, and/or the tailer's own *"archive tailer is stalled"* naming a
@@ -296,3 +298,98 @@ Assumptions are the shared capacity table in [08-persistence.md](08-persistence.
 | Identity | patch-day login storm 10k / 5 min ≈ 33 auth/s | 2 small replicas |
 
 Total steady-state footprint: roughly fifteen modest VMs plus relay bandwidth — and the only line that grows super-linearly with player *density* (not count) is field hosts, which is the maxim of §2 doing its job. For contrast, the pathological ceiling (every cell hot) at 10k CCU is ~312 field hosts ≈ a conventional dedicated-server fleet: the architecture's worst case is the industry's normal case.
+
+## 12. CLI environment-variable fallbacks
+
+Every non-excluded flag on every CLI binary outside the frozen trees falls back to an `ORRERY_`-prefixed environment variable (#865, clap's `env` feature): 151 fallbacks across 14 binaries. The scheme is `ORRERY_` + subsystem + flag, upper snake case, with subsystem scoping wherever a bare flag name would be ambiguous — `--output` alone is useless as a variable name, so it is `ORRERY_ISSUER_KEY_GENERATE_OUTPUT`, `ORRERY_ISSUER_KEY_ESCROW_OUTPUT`, or `ORRERY_P2_LOAD_OUTPUT` depending on the binary and operation it feeds. No default changed and no flag went away — what changed, twice, is the set of variables: #865 gave one to every flag clap could carry, and the audit that followed took back the fifteen where inheritance is a hazard rather than a convenience (§12.3) and renamed the six whose names collided across gates (§12.2).
+
+**Precedence, stated once: an explicit flag beats the environment variable, which beats the default.** No default changed. `--help` prints each flag's variable beside it, so a binary's own help is the authoritative list; the tables here are the operator-facing copy of it. One pre-existing environment variable is *not* a clap fallback: `ORRERY_FDB_TRANSACTION_TIMEOUT_MS` (§10) is read directly by `FdbContext::connect` and has no flag counterpart.
+
+**Where this section meets the tree.** The removals and renames are decided and documented here as fact, but the code change sits on the audit's branch, `fix/env-fallbacks-that-should-not-exist`, which `main` had not merged when this was written. A binary built from unmerged `main` still reads every variable §12.1 omits and answers to the old gate names in §12.2 — set nothing from this section against such a build until the branch lands.
+
+### 12.1 Service binaries
+
+| Binary | Flag | Env var |
+|---|---|---|
+| `persistd` | `--dir` | `ORRERY_PERSISTD_DIR` |
+| `persistd` | `--fdb-cluster-file` | `ORRERY_FDB_CLUSTER_FILE` |
+| `persistd` | `--checkpoint-interval-ms` | `ORRERY_CHECKPOINT_INTERVAL_MS` |
+| `persistd` | `--archive-retention` | `ORRERY_ARCHIVE_RETENTION` |
+| `persistd` | `--archive-dir` | `ORRERY_ARCHIVE_DIR` |
+| `persistd` | `--archive-prefix` | `ORRERY_ARCHIVE_PREFIX` |
+| `persistd` | `--receipt-archive-page-rows` | `ORRERY_RECEIPT_ARCHIVE_PAGE_ROWS` |
+| `persistd` | `--hot-ledger-sweep-interval-ms` | `ORRERY_HOT_LEDGER_SWEEP_INTERVAL_MS` |
+| `persistd` | `--full-conservation-sweep-interval-ms` | `ORRERY_FULL_CONSERVATION_SWEEP_INTERVAL_MS` |
+| `persistd` | `--metrics-jsonl` | `ORRERY_METRICS_JSONL` |
+| `orrery-coordinator` | `--bind` | `ORRERY_COORDINATOR_BIND` |
+| `orrery-coordinator` | `--issuer-key` | `ORRERY_ISSUER_KEY` |
+| `orrery-coordinator` | `--interest-key-id` | `ORRERY_INTEREST_KEY_ID` |
+| `orrery-coordinator` | `--grid` | `ORRERY_GRID` |
+| `orrery-coordinator` | `--witness-incarnation` | `ORRERY_WITNESS_INCARNATION` |
+| `world-census` | `--fdb-cluster-file` | `ORRERY_FDB_CLUSTER_FILE` |
+| `world-census` | `--page-rows` | `ORRERY_PAGE_ROWS` |
+| `orrery-invite` | `--ledger` | `ORRERY_LEDGER` |
+| `orrery-invite` | `--label` | `ORRERY_LABEL` |
+| `orrery-invite` | `--issuer-credential` | `ORRERY_ISSUER_CREDENTIAL` |
+| `orrery-invite` | `--account` | `ORRERY_ACCOUNT` |
+| `orrery-invite` | `--node` | `ORRERY_NODE` |
+| `orrery-invite` | `--ttl-ms` | `ORRERY_TTL_MS` |
+| `orrery-invite` | `--join-file` | `ORRERY_JOIN_FILE` |
+| `orrery-invite` | `--host-node` | `ORRERY_HOST_NODE` |
+| `orrery-invite` | `--slot` | `ORRERY_SLOT` |
+| `orrery-invite` | `--session-id` | `ORRERY_SESSION_ID` |
+| `orrery-issuer-key` | `--key-id` (generate) | `ORRERY_KEY_ID` |
+| `orrery-issuer-key` | `--output` (generate) | `ORRERY_ISSUER_KEY_GENERATE_OUTPUT` |
+| `orrery-issuer-key` | `--credential` (escrow) | `ORRERY_CREDENTIAL` |
+| `orrery-issuer-key` | `--output` (escrow) | `ORRERY_ISSUER_KEY_ESCROW_OUTPUT` |
+| `orrery-issuer-key` | `--escrow` (restore, load) | `ORRERY_ESCROW` |
+| `orrery-issuer-key` | `--expect-public-key` (restore, load) | `ORRERY_EXPECT_PUBLIC_KEY` |
+| `orrery-issuer-key` | `--output` (load) | `ORRERY_ISSUER_KEY_LOAD_OUTPUT` |
+| `orrery-seed` | `--profile` (plan, apply, verify) | `ORRERY_PROFILE` |
+| `orrery-seed` | `--single-grid` (plan, apply, verify) | `ORRERY_SINGLE_GRID` |
+| `orrery-seed` | `--json` (plan, shards) | `ORRERY_JSON` |
+| `orrery-seed` | `--full` (verify) | `ORRERY_FULL` |
+| `orrery-seed` | `--emit-manifest` (verify) | `ORRERY_EMIT_MANIFEST` |
+| `orrery-seed` | `--grid` (shards) | `ORRERY_GRID` |
+
+(`wipe` also takes `--profile` and `--single-grid`, as flags only — and refuses to run while their variables are set; §12.4.)
+
+### 12.2 Gate harnesses
+
+The measurement rigs take the same scheme; their variables matter mainly to the scripts and harness runners that set them.
+
+| Binary | Env variables |
+|---|---|
+| `p0-nat-test` | `ORRERY_RELAY`, `ORRERY_PEER`, `ORRERY_P0_NAT_PEERS`, `ORRERY_TICK_HZ`, `ORRERY_PAYLOAD_BYTES`, `ORRERY_PING_HZ`, `ORRERY_P0_NAT_DURATION_SECS`, `ORRERY_MESH`, `ORRERY_MESH_INDEX`, `ORRERY_JSON` |
+| `p0-dashboard` | `ORRERY_JSON`, `ORRERY_GATE`, `ORRERY_MIN_DIRECT_RATE`, `ORRERY_MIN_DIRECT_BYTES` |
+| `p2-load` | `ORRERY_GATEWAY`, `ORRERY_ADDR`, `ORRERY_ENTITIES`, `ORRERY_CELLS`, `ORRERY_DIFF_HZ`, `ORRERY_INTENT_MIX`, `ORRERY_SESSIONS`, `ORRERY_P2_LOAD_DURATION_SECS`, `ORRERY_MANIFEST`, `ORRERY_SCENARIO`, `ORRERY_JSON`, `ORRERY_ACK_LOG`, `ORRERY_FDB_CLUSTER_FILE`, `ORRERY_RECOVERY_CUTOFF`, `ORRERY_P2_LOAD_OUTPUT`, `ORRERY_DIFF_PAYLOAD_BYTES`, `ORRERY_ISSUER_KEY_ID`, `ORRERY_ACCOUNT_ID` |
+| `p2-dashboard` | `ORRERY_JSON`, `ORRERY_GATE`, `ORRERY_DEVICE_QUALIFICATION`, `ORRERY_JOURNAL_COMMIT_MS`, `ORRERY_BULK_ACK_MS`, `ORRERY_INTENT_COMMIT_MS`, `ORRERY_AREA_FIRST_PAGE_MS` |
+| `p3-island` | `ORRERY_GATEWAY_ADDR`, `ORRERY_GATEWAY_NODE`, `ORRERY_COORDINATOR_ADDR`, `ORRERY_COORDINATOR_NODE`, `ORRERY_P3_ISLAND_PEERS`, `ORRERY_ENTITIES_PER_PEER`, `ORRERY_VICTIM_CLAIM_KIND`, `ORRERY_CELL`, `ORRERY_P3_ISLAND_DURATION_SECS`, `ORRERY_P3_ISLAND_OUT`, `ORRERY_METRICS_JSONL` |
+| `p3-siblings` | `ORRERY_GATEWAY_A_ADDR`, `ORRERY_GATEWAY_A_NODE`, `ORRERY_METRICS_A`, `ORRERY_SHARDS_A`, `ORRERY_GATEWAY_B_ADDR`, `ORRERY_GATEWAY_B_NODE`, `ORRERY_METRICS_B`, `ORRERY_SHARDS_B`, `ORRERY_COORDINATOR_ADDR`, `ORRERY_COORDINATOR_NODE`, `ORRERY_MANIFEST`, `ORRERY_P3_SIBLINGS_PEERS`, `ORRERY_HANDOVER_BUDGET_MS`, `ORRERY_VICTIM_CLAIM_KIND`, `ORRERY_P3_SIBLINGS_DURATION_SECS`, `ORRERY_P3_SIBLINGS_OUT`, `ORRERY_FDB_CLUSTER_FILE`, `ORRERY_RACE_ROUNDS`, `ORRERY_RACE_PERIOD_MS` |
+| `p4-streams-bench` | `ORRERY_TRANSPORT`, `ORRERY_SECONDS`, `ORRERY_LOSS`, `ORRERY_DELAY_MS`, `ORRERY_REPAIR_HZ`, `ORRERY_SEED`, `ORRERY_JSON` |
+| `p5-dupe-gauntlet` | `ORRERY_FDB_CLUSTER_FILE`, `ORRERY_DATA_DIR`, `ORRERY_ENFORCEMENT`, `ORRERY_POSTURE_FILE`, `ORRERY_GATEWAY_ADDR`, `ORRERY_GATEWAY_NODE`, `ORRERY_AUDIT_LOG`, `ORRERY_REPORT`, `ORRERY_ENFORCING_ADDR`, `ORRERY_ENFORCING_NODE`, `ORRERY_SHADOW_ADDR`, `ORRERY_SHADOW_NODE`, `ORRERY_ENFORCING_LOG`, `ORRERY_SHADOW_LOG`, `ORRERY_CONTROL_ADDR`, `ORRERY_CONTROL_NODE`, `ORRERY_ATTESTED_ADDR`, `ORRERY_ATTESTED_NODE`, `ORRERY_CONTROL_STAGES`, `ORRERY_ATTESTED_STAGES`, `ORRERY_SAMPLES`, `ORRERY_CONCURRENCY` |
+
+Six of these names were renamed by the audit, out of a collision rather than a hazard. `ORRERY_DURATION_SECS` was one variable answering for four gates whose defaults disagree — `p3-siblings` needs 75 s because it must outlast both settle windows, while the other three default to 30 — so a value exported for one gate silently re-timed the others. `ORRERY_OUT` was shared by the two p3 harnesses, which would otherwise write their peer logs and reports into one directory. Each gate now owns its names: `ORRERY_P0_NAT_DURATION_SECS`, `ORRERY_P2_LOAD_DURATION_SECS`, `ORRERY_P3_ISLAND_DURATION_SECS`, `ORRERY_P3_SIBLINGS_DURATION_SECS`, `ORRERY_P3_ISLAND_OUT`, and `ORRERY_P3_SIBLINGS_OUT`. A harness runner still setting an old name gets the default instead — a wrong run length or a different output directory, not a crash — which is precisely why the collision had to be renamed rather than left for operators to discover.
+
+### 12.3 What must never read the environment
+
+An environment variable is inherited by every process a shell spawns, and one setting arms a control in all of them at once — so what an operator must choose per process must not arrive by inheritance. #865's sweep applied exactly clap's mechanical exclusions; the audit that followed found that inadequate in a way a list of flags cannot express, and reduced the exclusions to a rule. **An environment fallback is wrong when the flag is:**
+
+- **a deployment role** — one process in a fleet must have it and the others must not. An inherited variable arms the role in every process a supervisor spawns, which is precisely the deployment the flag forbids. (`--receipt-archive`, whose own doc says to enable it on exactly one `persistd` after #837 measured avoidable intent-path interference at four parallel scanners; `--chain-primary`, which makes every inheriting process a follower. Both removed.)
+- **a mode selector that arms refusal, revocation or destruction** — promoting such a mode is an operator decision ([D32](adr/0032-enforcement-ramp.md)), and an inherited variable is not one. (`--attestation-enforcement` and `--authority-correction` were removed; both were on #865's own skip list and took a fallback anyway.)
+- **per-process identity** — a node id, a bind address. One value in a host's environment collides the moment a second copy of the process starts on that host. (`--node-id`, `--bind`, `--chain-listen`; removed.)
+- **a forensics or safety switch rather than a tuning knob** — the flag's value is that the default is the safe state and turning it is deliberate. (`--no-journal-retention`, documented as not a knob: with retention off, journal disk and the index rebuilt from it grow with the node's uptime; `--chain-epoch`, which exists so a chain never *silently resumes* under a different ownership epoch — a stale exported value causes exactly that. Both removed.)
+- **a `Vec` flag** — an environment value supplies exactly one element, silently, defeating the repeat-the-flag cases the flag exists for: the multi-shard set, the follower-chain order, and the key-rotation overlap. (`--chain-follower`, `--issuer-key`, `--coordinator-key`, `--shard`, `--standby-shard`; removed. Two `Vec` flags still read the environment — `orrery-coordinator --issuer-key` and `p4-streams-bench --transport` — and fail this clause while they do; they are recorded here so the next pass does not have to rediscover them.)
+- **a positional or subcommand selector** — clap's `env` feature attaches to named arguments only, and these choose *what* to act on: seed's scenario and manifest positionals plus its verb, both dashboards' `files` operands, identity's two `operation` subcommands (`orrery-invite`, `orrery-issuer-key`), and `p5-dupe-gauntlet`'s `command` never had one.
+- **a secret** — a credential in the environment outlives the process that read it — shell history, sibling processes, crash dumps. No fallback for `--secret-key` (`persistd`, `orrery-coordinator`, `p0-nat-test`, `p2-load`), `--interest-secret` and `--witness-master-secret` (`orrery-coordinator`), and `--issuer-secret` (`p2-load`, `p3-island`, `p3-siblings`).
+- **the driver of a single-writer transition** — one watcher of the request file is the design, and an inherited path invites a second. (`--handover-request`; removed. The audit added this kind itself: it is not a mode selector and not a role, and the list without it would have had nowhere to put the flag.)
+
+The flags that never had a fallback and that the audit did not need to touch, by class. **Destructive or safety-sensitive actions:** `--promote-from`, `--allow-volatile-leases`, and `--dev-seed` (`persistd`); seed `apply`'s `--allow-opaque`; the `wipe` verb and all four of its flags (`--profile`, `--yes`, `--content-build`, `--single-grid`; §12.4); `--drain` (`p3-island`); and the `p3-siblings` handover choreography flags (its own `--handover-shard`, `--handover-request`, `--handover-successor-node`, `--gateway-b-pid` — the harness's pointer to the request file, not the watcher flag the audit removed). **Action selectors** — what a process does this once, rather than how it runs: `--passphrase-stdin` (`orrery-issuer-key`), `--print-id` (`p0-nat-test`), `--verify-recovery` (`p2-load`), `--print-keys` (`p3-island`, `p3-siblings`), `--check-link` (`p4-streams-bench`), `--replay`, `--attestation`, `--quarantine` (`p5-dupe-gauntlet`), and the hidden `--peer-spec` / `--trader-spec` (both `p3` harnesses).
+
+**`gates/p1-swarm` has no fallbacks, and that is the freeze, not an oversight.** It is the largest CLI in the workspace — 44 args, more than any binary above — and it sits inside the P4 banking freeze (#329) alongside `orrery_witness`, `orrery_core`, `orrery_games`, and `clients/regolith`, none of which #865 touched. Its retrofit is deferred until the freeze window closes.
+
+### 12.4 `wipe` refuses an environment it ignores
+
+`plan`, `apply` and `verify` read `--profile` and `--single-grid` from `ORRERY_PROFILE` and `ORRERY_SINGLE_GRID`; `wipe` takes both as flags but deliberately has no fallback, because a destructive verb must not inherit a variable that silently selects what gets destroyed.
+
+The asymmetry is correct and it is also a trap. An operator who exported `ORRERY_PROFILE` for a plan and then runs `wipe` to undo that plan wipes the *default* profile — the wipe resolves a different scenario than the plan it was meant to undo, silently. So `wipe` **refuses to run while either variable is set**, before it parses any arguments. The refusal keys on the variable's presence, so passing the flag explicitly does not bypass it: unset the variable, and pass the flag if you want a non-default scope.
