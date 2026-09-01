@@ -280,7 +280,7 @@ impl<R: Ruleset> Executor<R> {
         // #800 establishes result order here rather than inheriting it from
         // the loop above. Materialization now does the analogous thing: its
         // winner order is established on the candidates below.
-        stepped.sort_by_key(|entry| entry.entity);
+        sort_stepped_entities(&mut stepped);
         sort_materialization_candidates(&mut candidates);
         for candidate in candidates {
             let emitter = candidate.emitter;
@@ -603,6 +603,16 @@ pub struct SteppedEntity<E> {
     pub outcome: TickOutcome<E>,
 }
 
+/// Establish canonical output order after a tick's entity steps complete.
+///
+/// Backends may execute independent S2 steps in any order, but consumers fold
+/// both results and their event vectors in the order returned. Sorting the
+/// completed entries here makes both orders ascending by [`PersistId`] across
+/// emitters while preserving each emitter's own event emission order.
+pub fn sort_stepped_entities<E>(stepped: &mut [SteppedEntity<E>]) {
+    stepped.sort_by_key(|entry| entry.entity);
+}
+
 /// The storage and scheduling substrate a fixed-step driver advances.
 ///
 /// [`Executor`] is the reference implementation and the canonical store. The
@@ -900,6 +910,96 @@ mod tests {
             vel: QVel::default(),
             rolls: 0,
         }
+    }
+
+    fn stepped(entity: u64, events: Vec<u64>) -> SteppedEntity<u64> {
+        SteppedEntity {
+            entity: PersistId::new(entity),
+            outcome: TickOutcome {
+                events,
+                materialized: Vec::new(),
+                neighbor_reads: Vec::new(),
+                neighbor_frames: Vec::new(),
+                state_hash: [0; 32],
+            },
+        }
+    }
+
+    /// #787 point 1: the collision winner key is data, not candidate arrival
+    /// order. Both backends call the helper this test exercises.
+    #[test]
+    fn materialization_candidates_choose_lowest_emitter_then_emission_index() {
+        let collision = PersistId::new(9_001);
+        let candidate = |emitter, emission_index, marker| MaterializationCandidate {
+            emitter: PersistId::new(emitter),
+            emission_index,
+            description: EntityMaterialization::new(
+                collision,
+                Body {
+                    pos: QPos {
+                        x: marker,
+                        ..QPos::default()
+                    },
+                    ..body()
+                },
+            ),
+        };
+        let mut candidates = vec![
+            candidate(2, 0, 20),
+            candidate(1, 1, 11),
+            candidate(1, 0, 10),
+        ];
+
+        sort_materialization_candidates(&mut candidates);
+
+        let order: Vec<(PersistId, usize, i64)> = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.emitter,
+                    candidate.emission_index,
+                    candidate.description.state.pos.x,
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (PersistId::new(1), 0, 10),
+                (PersistId::new(1), 1, 11),
+                (PersistId::new(2), 0, 20),
+            ],
+            "the first collision candidate was inherited from execution order"
+        );
+    }
+
+    /// #787 point 2: a backend's completed-step arrival order is not its
+    /// canonical result order.
+    #[test]
+    fn tick_outputs_are_sorted_by_ascending_persist_id() {
+        let mut outputs = vec![stepped(3, vec![]), stepped(1, vec![]), stepped(2, vec![])];
+
+        sort_stepped_entities(&mut outputs);
+
+        assert_eq!(
+            outputs.iter().map(|entry| entry.entity).collect::<Vec<_>>(),
+            [PersistId::new(1), PersistId::new(2), PersistId::new(3)]
+        );
+    }
+
+    /// #787 point 3: cross-emitter event collection rides the explicitly
+    /// sorted result vector, while each emitter's own event order is retained.
+    #[test]
+    fn event_collection_follows_persist_id_then_emission_order() {
+        let mut outputs = vec![stepped(2, vec![20, 21]), stepped(1, vec![10, 11])];
+
+        sort_stepped_entities(&mut outputs);
+        let events: Vec<u64> = outputs
+            .iter()
+            .flat_map(|entry| entry.outcome.events.iter().copied())
+            .collect();
+
+        assert_eq!(events, [10, 11, 20, 21]);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

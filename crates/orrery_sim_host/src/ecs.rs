@@ -100,9 +100,9 @@ use bevy_ecs::prelude::{
 };
 use bevy_ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel};
 use orrery_core::{
-    canonical_step, sort_materialization_candidates, CanonicalOutcome, CanonicalStep,
-    NeighborSnapshot, Quantized, Ruleset, SealedTickInputs, Section, Sectioned, SteppedEntity,
-    TickBackend, TickOutcome,
+    canonical_step, sort_materialization_candidates, sort_stepped_entities, CanonicalOutcome,
+    CanonicalStep, NeighborSnapshot, Quantized, Ruleset, SealedTickInputs, Section, Sectioned,
+    SteppedEntity, TickBackend, TickOutcome,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
@@ -895,7 +895,7 @@ impl<R: EcsHostable> EcsBackend<R> {
         self.schedule.run(&mut self.world);
         let mut results = self.world.resource_mut::<TickResults<R>>();
         let mut stepped = std::mem::take(&mut results.stepped);
-        stepped.sort_by_key(|entry| entry.entity);
+        sort_stepped_entities(&mut stepped);
         stepped
     }
 }
