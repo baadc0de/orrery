@@ -6611,7 +6611,10 @@ async fn handle_connection(
                 send(Bytes::from(encode_stream_frame(&reply)));
             }
             GatewayMsg::Diff { diff } => {
-                if diff.kind == orrery_protocol::RecordKind::Rekey {
+                if matches!(
+                    diff.kind,
+                    orrery_protocol::RecordKind::Rekey | orrery_protocol::RecordKind::Restore
+                ) {
                     send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
                         entity: diff.entity,
                         tick: diff.tick,

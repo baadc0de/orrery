@@ -33,6 +33,7 @@ pub mod index;
 pub mod object;
 pub mod receipt_object;
 pub mod receipt_tailer;
+pub mod restore;
 pub mod store;
 pub mod tailer;
 
@@ -56,6 +57,11 @@ pub use receipt_tailer::{
     ReceiptArchiveConfig, ReceiptArchiveError, ReceiptArchiveIndex, ReceiptArchiveStatus,
     ReceiptArchiveTailer, ReceiptArchiveTailerHandle, ReceiptSource, ReceiptTailerPass,
     DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS, RECEIPT_ARCHIVE_SCANNERS,
+};
+pub use restore::{
+    RestoreApplier, RestoreApplyDisposition, RestoreApplyEntity, RestoreApplyReport,
+    RestoreDisposition, RestoreError, RestoreHoldDetector, RestorePlan, RestorePlanEntity,
+    RestorePlanner, RestoreRefusal, RestoreRequest, RestoreSelection,
 };
 pub use store::{ArchiveStore, ArchiveStoreError, FsArchiveStore};
 pub use tailer::{

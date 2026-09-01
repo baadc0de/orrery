@@ -38,7 +38,7 @@ const DRAG_PER_SEC: f64 = 0.15;
 /// only meaningful against a fixed ruleset, and a silent rule change would
 /// present as a determinism failure rather than as what it is.
 pub const REFERENCE_RULESET: RulesetId = RulesetId {
-    version: 2,
+    version: 3,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 

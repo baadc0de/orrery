@@ -94,6 +94,7 @@ pub const fn kind_discriminant(kind: RecordKind) -> u8 {
         RecordKind::Despawn => 3,
         RecordKind::Rekey => 4,
         RecordKind::CheckpointMark => 5,
+        RecordKind::Restore => 6,
     }
 }
 
@@ -106,6 +107,7 @@ pub const fn kind_from_discriminant(value: u8) -> Option<RecordKind> {
         3 => Some(RecordKind::Despawn),
         4 => Some(RecordKind::Rekey),
         5 => Some(RecordKind::CheckpointMark),
+        6 => Some(RecordKind::Restore),
         _ => None,
     }
 }
@@ -494,10 +496,11 @@ mod tests {
             RecordKind::Despawn,
             RecordKind::Rekey,
             RecordKind::CheckpointMark,
+            RecordKind::Restore,
         ] {
             assert_eq!(kind_from_discriminant(kind_discriminant(kind)), Some(kind));
         }
-        assert_eq!(kind_from_discriminant(6), None);
+        assert_eq!(kind_from_discriminant(7), None);
     }
 
     #[test]

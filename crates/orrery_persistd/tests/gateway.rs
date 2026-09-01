@@ -2102,7 +2102,7 @@ fn gateway_lease_capacity_denies_before_actor_mutation_after_reconnect() {
 }
 
 #[test]
-fn gateway_rejects_client_rekey_without_mutation() {
+fn gateway_rejects_client_server_owned_records_without_mutation() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // Given: an authenticated holder, a committed source location, and a
@@ -2235,6 +2235,32 @@ fn gateway_rejects_client_rekey_without_mutation() {
                 lease: None,
                 ..
             }) if denied == entity && tick == Tick::new(9)
+        ));
+        connection.send_state(&GatewayMsg::Diff {
+            diff: DiffUplink {
+                cell: source,
+                grid: GridId::ROOT,
+                entity,
+                tick: Tick::new(10),
+                kind: RecordKind::Restore,
+                payload: Bytes::from_static(b"client-proposed restore"),
+                seq: 10,
+                lease_id: Some(lease_id),
+                authority_seq: Some(seq),
+            },
+        });
+        let packet = connection
+            .next_payload(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            decode_datagram(&packet),
+            Some(GatewayReply::BulkNack {
+                entity: denied,
+                tick,
+                lease: None,
+                ..
+            }) if denied == entity && tick == Tick::new(10)
         ));
         assert_eq!(
             runtime.lock().await.lease_location(entity).await.unwrap(),

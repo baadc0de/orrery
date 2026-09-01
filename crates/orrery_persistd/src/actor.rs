@@ -13,7 +13,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use orrery_protocol::{
     CellId, ClaimKind, EntityRekey, Epoch, GridId, JournalRecord, Lease, LeaseId, Lsn, NodeId,
-    PersistId, RecordKind, Tick, ENTITY_REKEY_VERSION,
+    PersistId, RecordKind, RestoreRecord, RestoreTarget, Tick, ENTITY_REKEY_VERSION,
+    RESTORE_RECORD_VERSION,
 };
 
 use crate::journal::{AppendHandle, Journal};
@@ -250,6 +251,53 @@ impl core::fmt::Display for RekeyError {
 }
 
 impl core::error::Error for RekeyError {}
+
+/// Why a server-owned restore record is not safe to fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestorePayloadError {
+    /// The journal envelope is not a restore record.
+    WrongRecordKind,
+    /// Payload bytes or their integrity checksum are invalid.
+    MalformedPayload,
+    /// Payload schema version is unsupported.
+    VersionMismatch,
+    /// The audit/idempotency key is absent.
+    MissingPlanId,
+    /// The operator attribution is absent.
+    MissingOperator,
+}
+
+impl core::fmt::Display for RestorePayloadError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl core::error::Error for RestorePayloadError {}
+
+/// Decode and validate a server-owned restoration journal envelope.
+pub(crate) fn decode_restore_record(
+    record: &JournalRecord,
+) -> Result<RestoreRecord, RestorePayloadError> {
+    if record.kind != RecordKind::Restore {
+        return Err(RestorePayloadError::WrongRecordKind);
+    }
+    if crate::payload_crc(&record.payload) != record.crc {
+        return Err(RestorePayloadError::MalformedPayload);
+    }
+    let restore: RestoreRecord =
+        postcard::from_bytes(&record.payload).map_err(|_| RestorePayloadError::MalformedPayload)?;
+    if restore.version != RESTORE_RECORD_VERSION {
+        return Err(RestorePayloadError::VersionMismatch);
+    }
+    if restore.plan_id.is_empty() {
+        return Err(RestorePayloadError::MissingPlanId);
+    }
+    if restore.operator.is_empty() {
+        return Err(RestorePayloadError::MissingOperator);
+    }
+    Ok(restore)
+}
 
 /// Decode and validate a server-owned committed-rekey journal envelope.
 pub(crate) fn decode_entity_rekey(record: &JournalRecord) -> Result<EntityRekey, RekeyError> {
@@ -1406,10 +1454,63 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
                 }
             }
         }
+        RecordKind::Restore => {
+            if let Ok(restore) = decode_restore_record(record) {
+                match restore.target {
+                    RestoreTarget::Present {
+                        components,
+                        schema_floor,
+                    } => {
+                        env.state.entities.insert(
+                            record.entity,
+                            EntityRecord {
+                                components,
+                                dirty: true,
+                                schema_floor,
+                            },
+                        );
+                        note_row_moved(
+                            &mut env.state.superseded,
+                            &env.state.by_cell,
+                            record.entity,
+                            Some(record.cell),
+                        );
+                        env.state.by_cell.insert(record.entity, record.cell);
+                        cancel_tombstone(
+                            &mut env.state.superseded,
+                            &mut env.state.tombstones,
+                            record.entity,
+                            Some(record.cell),
+                        );
+                    }
+                    RestoreTarget::Absent => {
+                        env.state.entities.remove(&record.entity);
+                        note_row_moved(
+                            &mut env.state.superseded,
+                            &env.state.by_cell,
+                            record.entity,
+                            Some(record.cell),
+                        );
+                        env.state.by_cell.remove(&record.entity);
+                        env.state.tombstones.insert(
+                            record.entity,
+                            Tombstone {
+                                cell: record.cell,
+                                tick: record.tick,
+                                gc_deadline_ms: now_ms + TOMBSTONE_RETENTION_MS,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         RecordKind::CheckpointMark => {}
     }
     match record.kind {
-        RecordKind::Spawn | RecordKind::ComponentDiff | RecordKind::Despawn => {
+        RecordKind::Spawn
+        | RecordKind::ComponentDiff
+        | RecordKind::Despawn
+        | RecordKind::Restore => {
             let watermark = env
                 .state
                 .entity_lsn

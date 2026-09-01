@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures::{StreamExt, TryStreamExt};
 
 use orrery_protocol::{
-    CellId, EntityRekey, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind,
+    CellId, EntityRekey, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, RestoreTarget,
 };
 
 use crate::actor::{
@@ -609,6 +609,14 @@ impl CellRuntime {
                 continue;
             };
             verify_crc(&rec)?;
+            if rec.kind == RecordKind::Restore {
+                actor::decode_restore_record(&rec).map_err(|error| {
+                    crate::journal::JournalError::Corrupt {
+                        lsn: rec.lsn,
+                        msg: error.to_string(),
+                    }
+                })?;
+            }
             if !gate.admit(shard, rec.epoch) {
                 continue;
             }
@@ -703,6 +711,12 @@ impl CellRuntime {
     /// grid-relative, and the actors write rows under this grid).
     pub fn grid(&self) -> GridId {
         self.grid
+    }
+
+    /// Cluster node id stored in this runtime's durable shard fence rows.
+    #[must_use]
+    pub fn cluster_node_id(&self) -> u64 {
+        self.node_id
     }
 
     /// Ask every live actor to park registrar rows whose monotonic TTL passed.
@@ -1771,6 +1785,11 @@ impl CellRuntime {
             } else {
                 None
             };
+            if rec.kind == RecordKind::Restore {
+                actor::decode_restore_record(rec).map_err(|error| {
+                    crate::checkpoint::CheckpointError::Store(error.to_string())
+                })?;
+            }
             let relevant = rekey.as_ref().map_or(owner == shard, |rekey| {
                 owner == shard || gate.owner(rekey.destination_cell) == Some(shard)
             });
@@ -2133,6 +2152,56 @@ fn fold(
             );
         }
         RecordKind::Rekey | RecordKind::CheckpointMark => {}
+        RecordKind::Restore => {
+            if let Ok(restore) = actor::decode_restore_record(record) {
+                match restore.target {
+                    RestoreTarget::Present {
+                        components,
+                        schema_floor,
+                    } => {
+                        state.insert(
+                            record.entity,
+                            EntityRecord {
+                                components,
+                                dirty: true,
+                                schema_floor,
+                            },
+                        );
+                        actor::note_row_moved(
+                            superseded,
+                            by_cell,
+                            record.entity,
+                            Some(record.cell),
+                        );
+                        by_cell.insert(record.entity, record.cell);
+                        actor::cancel_tombstone(
+                            superseded,
+                            tombstones,
+                            record.entity,
+                            Some(record.cell),
+                        );
+                    }
+                    RestoreTarget::Absent => {
+                        state.remove(&record.entity);
+                        actor::note_row_moved(
+                            superseded,
+                            by_cell,
+                            record.entity,
+                            Some(record.cell),
+                        );
+                        by_cell.remove(&record.entity);
+                        tombstones.insert(
+                            record.entity,
+                            Tombstone {
+                                cell: record.cell,
+                                tick: record.tick,
+                                gc_deadline_ms: now_ms + TOMBSTONE_RETENTION_MS,
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

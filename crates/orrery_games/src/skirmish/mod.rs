@@ -122,8 +122,12 @@ const GOLDEN_ANGLE_URAD: i64 = 2_399_963;
 /// stream of them. `skirmish.rs`'s `skirmish_declares_no_neighbour_reads`
 /// holds the premise, so the day Skirmish grows a neighbour read the decision
 /// is revisited rather than inherited.
+///
+/// Version 3 is a later identity bump: protocol v7 expands the shared
+/// `RecordKind` and therefore moves the pinned first-party source closure. It
+/// does not change the snapshot-isolation conclusion above.
 pub const SKIRMISH_RULESET: RulesetId = RulesetId {
-    version: 2,
+    version: 3,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 
@@ -278,7 +282,7 @@ pub const SKIRMISH_COMPONENT_SCHEMAS: &[ComponentSchemaManifest] = &[
 pub const SKIRMISH_COMPOSITION: CompatibilityManifest = CompatibilityManifest {
     game_id: GameId("skirmish"),
     manifest_format_version: ManifestFormatVersion(1),
-    protocol_version: 6,
+    protocol_version: 7,
     toolchain_stamp: "rust-2024",
     ruleset: SKIRMISH_RULESET,
     modules: SKIRMISH_MODULES,
