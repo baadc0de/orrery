@@ -49,8 +49,6 @@ pub struct EncodeCtx<'a> {
     pub rng: &'a mut ChaCha8Rng,
 }
 
-/// D51 intentionally keeps this trait limited to entity component bags.
-
 /// An encoder failure. Carries the archetype name when the failure is
 /// archetype-specific so the plan can name the offending table.
 #[derive(Debug)]
@@ -67,6 +65,7 @@ impl core::error::Error for EncodeError {}
 /// A game's bridge from scenario archetypes to component bags (docs/12
 /// §4.1). Implemented in the game's crate; linked into the game's seeder
 /// binary.
+/// D51 intentionally keeps this trait limited to entity component bags.
 pub trait SeedEncoder: Send + Sync {
     /// Encode one entity's component bag from its archetype and derived
     /// context. Returns the **bag only** — the writer prepends the storage
