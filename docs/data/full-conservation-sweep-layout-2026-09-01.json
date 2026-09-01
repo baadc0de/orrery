@@ -1,0 +1,48 @@
+{
+  "schema": "orrery.measurement.full-conservation-layout/1",
+  "date": "2026-09-01",
+  "issue": 615,
+  "producer_pr": 841,
+  "method": {
+    "check": "audit::conservation::tests::realistic_window_cost_inputs_are_machine_derived",
+    "archive_page_rows": 4096,
+    "archive_page_bytes_measured": 322293,
+    "archive_bytes_per_receipt_measured": 78.6848,
+    "ownership_event_bytes_measured": 56,
+    "object_compression": "none",
+    "notes": [
+      "The fixture uses one Shape-C item transfer, two balance deltas, and one ownership transition per receipt.",
+      "The Parquet byte count is measured from encode_receipt_object; the ownership entry size is size_of::<OwnershipEvent>() in this build.",
+      "The re-sort vector is shrink_to_fit before an in-place unstable sort, so entries * 56 is the sort-stage heap bound."
+    ]
+  },
+  "realistic_window": {
+    "source_rate": "P2/Shape-C spike workload",
+    "intents_per_second": 530,
+    "seconds": 86400,
+    "receipts": 45792000,
+    "ownership_transitions": 45792000,
+    "parquet_objects_bound": 11180,
+    "scan_bytes_bound": 3603235740,
+    "scan_gib_bound": 3.35577,
+    "ownership_resort_bytes": 2564352000,
+    "ownership_resort_gib": 2.38824
+  },
+  "full_fidelity_retention_projection": {
+    "days": 30,
+    "scan_bytes_bound": 108097072200,
+    "scan_gib_bound": 100.673,
+    "ownership_resort_bytes": 76930560000,
+    "ownership_resort_gib": 71.6472
+  },
+  "identity": {
+    "effect_identity": "AccountId",
+    "id_db_join_required": false,
+    "reason": "ReceiptBalanceDelta and ReceiptOwnershipTransition carry AccountId directly."
+  },
+  "layout_verdict": {
+    "daily_24h_window": "scan volume is plausible but a 2.39 GiB ownership sort allocation is too large for an in-process auditor default",
+    "full_30d_retention": "unacceptable: about 100.67 GiB scanned and 71.65 GiB retained for the ownership re-sort in the ownership-heavy arm",
+    "secondary_clustering": "evidence supports adding an item-clustered/indexed archive view in a separate schema decision; this change does not add one"
+  }
+}
