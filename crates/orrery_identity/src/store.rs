@@ -43,6 +43,18 @@ pub enum BindOutcome {
     AlreadyBound,
 }
 
+/// The identity-owned start instant of the current cooldown interval.
+///
+/// This is derived durable state, rather than part of the executor-owned
+/// strike ledger: identity alone decides standing and admission, and this
+/// value has to survive an identity restart. Its FDB representation is the
+/// `dc ‖ account` row in the `d` family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CooldownEntry {
+    /// Wall-clock instant at which identity entered or restarted cooldown.
+    pub entered_at_ms: u64,
+}
+
 /// A typed failure from the identity store or the service above it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -245,6 +257,39 @@ pub trait AccountStore: Send + Sync {
     /// get: the audit's question is `owner_t(n)` for the ≤ 7 announced NodeIds.
     async fn binding_history(&self, node: &NodeId)
         -> Result<Vec<BindingHistoryRow>, IdentityError>;
+
+    /// Observe a score at or above the cooldown boundary and return the
+    /// durable entry instant that governs its dwell floor.
+    ///
+    /// Creates an entry at `observed_at_ms` when one is absent. That is the
+    /// explicit rollout rule for an account already in cooldown when this row
+    /// ships: no historical entry instant exists, so first observation begins
+    /// a full conservative dwell rather than silently releasing it. A newer
+    /// positive live strike restarts the entry at `observed_at_ms`, but an
+    /// already-observed strike cannot repeatedly restart it.
+    async fn observe_cooldown(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+        newest_live_strike_ms: Option<u64>,
+    ) -> Result<CooldownEntry, IdentityError>;
+
+    /// Read the current durable cooldown entry, if this account has one.
+    async fn cooldown_entry(
+        &self,
+        account: AccountId,
+    ) -> Result<Option<CooldownEntry>, IdentityError>;
+
+    /// Clear one cooldown entry only if it is still the observation's entry.
+    ///
+    /// The boolean is false when a concurrent observation restarted the
+    /// cooldown (or no longer finds the expected row); callers must refuse in
+    /// that case rather than clear the newer interval.
+    async fn clear_cooldown_if(
+        &self,
+        account: AccountId,
+        expected: CooldownEntry,
+    ) -> Result<bool, IdentityError>;
 }
 
 /// Forward through a shared handle, so one store can back several services.
@@ -295,5 +340,31 @@ impl<T: AccountStore + ?Sized> AccountStore for std::sync::Arc<T> {
         node: &NodeId,
     ) -> Result<Vec<BindingHistoryRow>, IdentityError> {
         (**self).binding_history(node).await
+    }
+
+    async fn observe_cooldown(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+        newest_live_strike_ms: Option<u64>,
+    ) -> Result<CooldownEntry, IdentityError> {
+        (**self)
+            .observe_cooldown(account, observed_at_ms, newest_live_strike_ms)
+            .await
+    }
+
+    async fn clear_cooldown_if(
+        &self,
+        account: AccountId,
+        expected: CooldownEntry,
+    ) -> Result<bool, IdentityError> {
+        (**self).clear_cooldown_if(account, expected).await
+    }
+
+    async fn cooldown_entry(
+        &self,
+        account: AccountId,
+    ) -> Result<Option<CooldownEntry>, IdentityError> {
+        (**self).cooldown_entry(account).await
     }
 }

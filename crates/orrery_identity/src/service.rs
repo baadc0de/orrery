@@ -64,12 +64,15 @@ pub const DEFAULT_SESSION_TOKEN_TTL_MS: u64 = MAX_SESSION_TOKEN_TTL_MS;
 
 /// Where an account's enforcement standing comes from.
 ///
-/// D33 (proposed) puts standing behind the `ya` strike ledger, whose sole
+/// D33 puts standing behind the `ya` strike ledger, whose sole
 /// writer is the adjudication executor and whose scorer is this service:
 /// `S(t) = Σ wᵢ · 2^(−ageᵢ / 14 d)`, evaluated at read time, with
 /// quarantine/cooldown/ban at configured boundaries. The read-only
-/// implementation is [`crate::ComputedStanding`]; this trait remains the seam
-/// so issuance does not acquire a FoundationDB dependency in its hot logic.
+/// admission implementation is [`crate::CooldownStanding`] around the
+/// read-only [`crate::ComputedStanding`]. `ComputedStanding` also retains an
+/// instantaneous compatibility implementation for non-admission callers; this
+/// trait remains the seam so issuance does not acquire a FoundationDB
+/// dependency in its hot logic.
 ///
 /// `Err(IdentityError::StandingUnavailable)` is the honest answer to "the
 /// ledger could not be read", and the service refuses to mint on it. Returning
@@ -83,7 +86,11 @@ pub trait StandingSource: Send + Sync {
     ///
     /// [`IdentityError::StandingUnavailable`] when no answer can be
     /// established. It is never softened into `Good`.
-    async fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError>;
+    async fn standing(
+        &self,
+        account: AccountId,
+        store: &dyn AccountStore,
+    ) -> Result<SessionStanding, IdentityError>;
 }
 
 /// The default standing source: there is no ledger, so nothing resolves.
@@ -98,7 +105,11 @@ pub struct UnavailableStanding;
 
 #[async_trait::async_trait]
 impl StandingSource for UnavailableStanding {
-    async fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError> {
+    async fn standing(
+        &self,
+        account: AccountId,
+        _store: &dyn AccountStore,
+    ) -> Result<SessionStanding, IdentityError> {
         Err(IdentityError::StandingUnavailable(account))
     }
 }
@@ -142,7 +153,11 @@ impl StaticStanding {
 
 #[async_trait::async_trait]
 impl StandingSource for StaticStanding {
-    async fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError> {
+    async fn standing(
+        &self,
+        account: AccountId,
+        _store: &dyn AccountStore,
+    ) -> Result<SessionStanding, IdentityError> {
         self.standings
             .get(&account)
             .copied()
@@ -233,7 +248,8 @@ where
     /// The whole [`StandingThresholds`] rather than the one field it reads, so
     /// a deployment configures `Q`, `C`, `B`, intended major-finding count,
     /// minimum cooldown, and probation window as the single set D33 clause (d)
-    /// describes and hands the same value to [`crate::ComputedStanding`].
+    /// describes and hands the same value to the configured
+    /// [`crate::CooldownStanding`].
     ///
     /// # Errors
     ///
@@ -337,7 +353,7 @@ where
         }
 
         // 4. Standing is read, not computed, and an unreadable ledger refuses.
-        let standing = self.standing.standing(account).await?;
+        let standing = self.standing.standing(account, &self.store).await?;
 
         self.mint(account, node, ttl_ms, standing, row.created_ms)
     }

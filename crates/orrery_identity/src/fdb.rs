@@ -1,6 +1,6 @@
 //! The durable account store: D31's `d` family, written by this service alone.
 //!
-//! # One transaction, four rows
+//! # One transaction for bindings; five row kinds overall
 //!
 //! Every mutation here is a single `db.run` closure that stages `da`, `db`,
 //! `dh` — and D36's `dw` window — together. D31 clause (b) is explicit that
@@ -38,7 +38,7 @@
 //! wearing the signature of a hash probe. [`crate::MemAccountStore`] implements
 //! it because a lock-guarded map probe genuinely is tier 2.
 
-use crate::store::{AccountStore, BindOutcome, IdentityError};
+use crate::store::{AccountStore, BindOutcome, CooldownEntry, IdentityError};
 use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
 use foundationdb::options::MutationType;
@@ -268,6 +268,38 @@ async fn read_window(
         return Ok(Vec::new());
     };
     postcard::from_bytes(&raw).map_err(decode_err("binding window decode"))
+}
+
+/// Key for D33's identity-owned cooldown entry: `dc ‖ account:u64-be`.
+///
+/// `dc` is the formerly unused sub-span immediately after D31's `db` range
+/// end. This crate is the `d` family's sole writer; the key is local because
+/// cooldown is derived identity state rather than a persistd concern.
+fn cooldown_entry_key(account: AccountId) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'd';
+    key[1] = b'c';
+    key[2..].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// Read the fixed-width `dc` timestamp inside one transaction.
+async fn read_cooldown_entry(
+    trx: &foundationdb::RetryableTransaction,
+    account: AccountId,
+) -> Result<Option<CooldownEntry>, FdbBindingError> {
+    let key = cooldown_entry_key(account);
+    let Some(raw) = trx.get(&key, false).await? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 8] = raw.as_ref().try_into().map_err(|_| {
+        custom(IdentityError::Store(
+            "cooldown entry decode: expected 8 bytes".into(),
+        ))
+    })?;
+    Ok(Some(CooldownEntry {
+        entered_at_ms: u64::from_be_bytes(bytes),
+    }))
 }
 
 /// Stage the `dh` append.
@@ -508,6 +540,81 @@ impl AccountStore for FdbAccountStore {
                         rows.push(row);
                     }
                     Ok(rows)
+                }
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+
+    async fn observe_cooldown(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+        newest_live_strike_ms: Option<u64>,
+    ) -> Result<CooldownEntry, IdentityError> {
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                if read_account(&trx, account).await?.is_none() {
+                    return Err(custom(IdentityError::UnknownAccount(account)));
+                }
+                let current = read_cooldown_entry(&trx, account).await?;
+                let entry = match current {
+                    Some(entry)
+                        if newest_live_strike_ms
+                            .is_some_and(|issued_at_ms| issued_at_ms > entry.entered_at_ms) =>
+                    {
+                        CooldownEntry {
+                            entered_at_ms: observed_at_ms,
+                        }
+                    }
+                    Some(entry) => entry,
+                    // Rollout rule: an account which was already in cooldown
+                    // before `dc` existed starts a full dwell at first
+                    // observation, never gets an unearned early release.
+                    None => CooldownEntry {
+                        entered_at_ms: observed_at_ms,
+                    },
+                };
+                trx.set(
+                    &cooldown_entry_key(account),
+                    &entry.entered_at_ms.to_be_bytes(),
+                );
+                Ok(entry)
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+
+    async fn cooldown_entry(
+        &self,
+        account: AccountId,
+    ) -> Result<Option<CooldownEntry>, IdentityError> {
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                if read_account(&trx, account).await?.is_none() {
+                    return Err(custom(IdentityError::UnknownAccount(account)));
+                }
+                read_cooldown_entry(&trx, account).await
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+
+    async fn clear_cooldown_if(
+        &self,
+        account: AccountId,
+        expected: CooldownEntry,
+    ) -> Result<bool, IdentityError> {
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                if read_account(&trx, account).await?.is_none() {
+                    return Err(custom(IdentityError::UnknownAccount(account)));
+                }
+                if read_cooldown_entry(&trx, account).await? == Some(expected) {
+                    trx.clear(&cooldown_entry_key(account));
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
             })
             .await

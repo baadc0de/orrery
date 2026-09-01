@@ -5,13 +5,12 @@
 //! identity receives rows, applies continuous decay at the read instant, and
 //! turns the live-only score into the existing token/admission result.
 
-use crate::service::StandingSource;
 use crate::store::IdentityError;
 use async_trait::async_trait;
 use orrery_persistd::adjudication::{
     StrikeMode, StrikeRow, STRIKE_HALF_LIFE_MS, STRIKE_WEIGHT_TABLE_MILLI,
 };
-use orrery_protocol::{AccountId, SessionStanding};
+use orrery_protocol::AccountId;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -290,6 +289,26 @@ pub struct ComputedStanding<R, C> {
     thresholds: StandingThresholds,
 }
 
+/// One read of the executor-owned strike ledger.
+///
+/// This is deliberately only the score and facts derived from the immutable
+/// rows. Applying the cooldown dwell policy, including its durable mutation,
+/// belongs to [`crate::CooldownStanding`], not this read-only module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandingObservation {
+    /// The wall-clock instant at which the rows were scored.
+    pub now_ms: u64,
+    /// The live and shadow scores at [`Self::now_ms`].
+    pub scores: StandingScores,
+    /// The instantaneous score band before the cooldown dwell rule.
+    pub level: StandingLevel,
+    /// The newest active, positive, live strike observed in this read.
+    ///
+    /// An appeal has a negative weight and cannot restart a cooldown. A row
+    /// outside its live scoring interval cannot either.
+    pub newest_live_strike_ms: Option<u64>,
+}
+
 impl<R, C> ComputedStanding<R, C> {
     /// Assemble a scorer with an explicit policy package.
     ///
@@ -309,6 +328,43 @@ impl<R, C> ComputedStanding<R, C> {
             thresholds,
         })
     }
+
+    /// Read and score one account's immutable ledger rows.
+    ///
+    /// No durable state changes here. In particular, the result does not
+    /// itself apply the minimum-cooldown dwell rule; use
+    /// [`crate::CooldownStanding`] for the admission decision.
+    pub async fn observe(&self, account: AccountId) -> Result<StandingObservation, IdentityError>
+    where
+        R: StrikeRowSource,
+        C: Fn() -> u64,
+    {
+        let rows = self.rows.rows(account).await?;
+        let now_ms = (self.clock)();
+        let scores = score_rows(&rows, now_ms);
+        let newest_live_strike_ms = rows
+            .iter()
+            .filter(|row| {
+                row.mode == StrikeMode::Live
+                    && row.weight_milli > 0
+                    && row.issued_at_ms <= now_ms
+                    && row.expires_at_ms > now_ms
+            })
+            .map(|row| row.issued_at_ms)
+            .max();
+        Ok(StandingObservation {
+            now_ms,
+            scores,
+            level: self.thresholds.classify(scores.live_milli),
+            newest_live_strike_ms,
+        })
+    }
+
+    /// The policy package used to classify observations.
+    #[must_use]
+    pub const fn thresholds(&self) -> StandingThresholds {
+        self.thresholds
+    }
 }
 
 fn maximum_strike_weight_milli() -> i64 {
@@ -317,24 +373,6 @@ fn maximum_strike_weight_milli() -> i64 {
         .copied()
         .max()
         .map_or(0, i64::from)
-}
-
-#[async_trait]
-impl<R, C> StandingSource for ComputedStanding<R, C>
-where
-    R: StrikeRowSource,
-    C: Fn() -> u64 + Send + Sync,
-{
-    async fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError> {
-        let rows = self.rows.rows(account).await?;
-        let scores = score_rows(&rows, (self.clock)());
-        match self.thresholds.classify(scores.live_milli) {
-            StandingLevel::Good => Ok(SessionStanding::Good),
-            StandingLevel::Quarantined => Ok(SessionStanding::Quarantined),
-            StandingLevel::Cooldown => Err(IdentityError::Cooldown(account)),
-            StandingLevel::Banned => Err(IdentityError::Banned(account)),
-        }
-    }
 }
 
 #[cfg(test)]
