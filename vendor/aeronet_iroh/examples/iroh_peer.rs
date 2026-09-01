@@ -37,7 +37,7 @@ fn main() -> AppExit {
 #[command(about = "Open an Iroh endpoint and optionally connect to another peer")]
 struct Args {
     /// Endpoint ID to connect to.
-    #[arg(long, value_name = "ENDPOINT", env = "ORRERY_REMOTE")]
+    #[arg(long, value_name = "ENDPOINT")]
     remote: Option<EndpointId>,
 }
 
