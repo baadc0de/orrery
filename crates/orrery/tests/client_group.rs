@@ -20,8 +20,8 @@ use bevy_state::app::StatesPlugin;
 use orrery::{OrreryClientPlugins, OrreryConfig, OrreryIslandBindingPlugin};
 use orrery_authority::ephemeral::EphemeralRegistry;
 use orrery_authority::{
-    AuthorityState, ContactObservations, ContactTick, IslandBinding, OrreryAuthorityPlugin,
-    PoseHistory,
+    AuthorityState, CanonicalPosePublications, ContactObservations, ContactTick, IslandBinding,
+    OrreryAuthorityPlugin, PoseHistory,
 };
 use orrery_games::Skirmish;
 use orrery_net::island::IslandMembership;
@@ -289,12 +289,12 @@ fn driven_client(frames: usize) -> App {
 /// game would ship.
 ///
 /// The second list is *not* the same failure and must not be asserted as one:
-/// `ContactObservations`, `ContactTick::tick` and `WitnessClock` are the game's
-/// own physics report and universe tick, which no plugin in this workspace can
-/// synthesize. Nothing advancing them in a headless app is correct. They are
-/// pinned here so that the group's documented contract and this test move
-/// together, and so a future member plugin that starts writing one is a
-/// deliberate change rather than a surprise.
+/// `ContactObservations`, `ContactTick::tick`, `CanonicalPosePublications` and
+/// `WitnessClock` are the game's own observations and universe ticks, which no
+/// plugin in this workspace can synthesize. Nothing advancing them in a
+/// headless app is correct. They are pinned here so that the group's documented
+/// contract and this test move together, and so a future member plugin that
+/// starts writing one is a deliberate change rather than a surprise.
 #[test]
 fn host_driver_resources_either_advance_or_are_a_declared_host_contract() {
     let mut app = driven_client(4);
@@ -334,6 +334,10 @@ fn host_driver_resources_either_advance_or_are_a_declared_host_contract() {
         world.resource::<ContactTick>().tick,
         Tick::new(0),
         "the universe tick a contact happened on is the game's to publish"
+    );
+    assert!(
+        world.resource::<CanonicalPosePublications>().is_empty(),
+        "canonical poses come from the game's post-step publication"
     );
     assert_eq!(
         world.resource::<WitnessClock>().0,
