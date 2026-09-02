@@ -274,6 +274,35 @@ Triage, in order:
    `released journal below the checkpoint floor` line returns, and
    `segments_behind` goes to zero.
 
+**Operator restore (`--restore-request <PATH>`).** This is the file-backed
+mechanism from [08-persistence.md](08-persistence.md) §11.1, not an admin wire
+surface. Start the active archive-owning node with `--secret-key`,
+`--fdb-cluster-file`, `--archive-dir`, and one restore-request path. Drop a JSON
+`plan` request there with `action`, `plan_id`, `operator`, and `selection` (the
+source `NodeId`, grid, half-open cell range, inclusive LSN range, and optional
+author `NodeId`). `persistd` renames the file to the same path with extension
+`.taken`, then writes the inspectable plan to the path with extension `.result`;
+planning appends nothing. Inspect every named entity and its `Restorable`,
+`Refused`, or `Held` disposition. Only then drop
+`{"action":"apply","plan_id":"<the inspected id>"}` at the request path.
+The apply result is the `RestoreApplyReport`: one disposition per planned
+entity, and one forward `RecordKind::Restore` append per restorable entity.
+Retain both result files with the incident record because the apply result
+replaces the plan result.
+
+The result always says `hold_detection: "stub_no_schema_backed_implementation"`:
+the injectable hold detector has no schema-backed implementation yet, so the
+absence of `Held` dispositions is not authoritative. It also says
+`authorization: "unresolved_owner_reserved"`. That is literal: §11.1 reserves
+who may place this player-visible request file to the owner. No authorization
+policy is implemented here; anyone able to place the file can trigger the
+mechanism. A deployment may constrain filesystem access, but that is owner
+policy rather than a guarantee made by `persistd`. A malformed request, an
+unknown plan id, or a replay is written as a named refusal in `.result`; it is
+never silently retried. Verify after apply: every `Applied` LSN is above the
+pre-apply tail, the `ckpt/` watermark and epoch fence are unchanged, and the
+next ordinary checkpoint is the first operation allowed to advance `ckpt/`.
+
 **Coordinator loss.** §6: standby CAS-acquires the leader lease, peers re-report, < 30 s to full topology knowledge. Player-visible impact: newly-arriving players wait for island assignment; ongoing play unaffected. If both instances die, running islands continue indefinitely — the system degrades to "no new matchmaking," which is the designed posture.
 
 **Field host loss.** Two-tier recovery ([04-authority.md](04-authority.md) §8). **Fast path** — the gateway observes the host's connection drop: immediate **unconditional divestiture** of every lease the host held, coordinator re-promotes from the warm pool, authority hands back. Target: **< 10 s** player-facing. **Slow path** — a *zombie* host (connection alive, heartbeats silent, no clean drop): entity leases expire by TTL (10 s), entities orphan to the nearest interacting peers (D7), and the island degrades to interest-mesh at over-ceiling population (temporarily rough, not broken) until re-promotion. Target: **< 30 s** worst case, end-to-end.
@@ -382,9 +411,9 @@ An environment variable is inherited by every process a shell spawns, and one se
 - **a `Vec` flag** — an environment value supplies exactly one element, silently, defeating the repeat-the-flag cases the flag exists for: the multi-shard set, the follower-chain order, and the key-rotation overlap. (`--chain-follower`, `--issuer-key`, `--coordinator-key`, `--shard`, `--standby-shard`; removed. Two `Vec` flags still read the environment — `orrery-coordinator --issuer-key` and `p4-streams-bench --transport` — and fail this clause while they do; they are recorded here so the next pass does not have to rediscover them.)
 - **a positional or subcommand selector** — clap's `env` feature attaches to named arguments only, and these choose *what* to act on: seed's scenario and manifest positionals plus its verb, both dashboards' `files` operands, identity's two `operation` subcommands (`orrery-invite`, `orrery-issuer-key`), and `p5-dupe-gauntlet`'s `command` never had one.
 - **a secret** — a credential in the environment outlives the process that read it — shell history, sibling processes, crash dumps. No fallback for `--secret-key` (`persistd`, `orrery-coordinator`, `p0-nat-test`, `p2-load`), `--interest-secret` and `--witness-master-secret` (`orrery-coordinator`), and `--issuer-secret` (`p2-load`, `p3-island`, `p3-siblings`).
-- **the driver of a single-writer transition** — one watcher of the request file is the design, and an inherited path invites a second. (`--handover-request`; removed. The audit added this kind itself: it is not a mode selector and not a role, and the list without it would have had nowhere to put the flag.)
+- **the driver of a single-writer transition** — one watcher of the request file is the design, and an inherited path invites a second. (`--handover-request`; removed. `--restore-request` follows the same rule and never had a fallback. The audit added this kind itself: it is not a mode selector and not a role, and the list without it would have had nowhere to put the flag.)
 
-The flags that never had a fallback and that the audit did not need to touch, by class. **Destructive or safety-sensitive actions:** `--promote-from`, `--allow-volatile-leases`, and `--dev-seed` (`persistd`); seed `apply`'s `--allow-opaque`; the `wipe` verb and all four of its flags (`--profile`, `--yes`, `--content-build`, `--single-grid`; §12.4); `--drain` (`p3-island`); and the `p3-siblings` handover choreography flags (its own `--handover-shard`, `--handover-request`, `--handover-successor-node`, `--gateway-b-pid` — the harness's pointer to the request file, not the watcher flag the audit removed). **Action selectors** — what a process does this once, rather than how it runs: `--passphrase-stdin` (`orrery-issuer-key`), `--print-id` (`p0-nat-test`), `--verify-recovery` (`p2-load`), `--print-keys` (`p3-island`, `p3-siblings`), `--check-link` (`p4-streams-bench`), `--replay`, `--attestation`, `--quarantine` (`p5-dupe-gauntlet`), and the hidden `--peer-spec` / `--trader-spec` (both `p3` harnesses).
+The flags that never had a fallback and that the audit did not need to touch, by class. **Destructive or safety-sensitive actions:** `--promote-from`, `--allow-volatile-leases`, `--dev-seed`, and `--restore-request` (`persistd`); seed `apply`'s `--allow-opaque`; the `wipe` verb and all four of its flags (`--profile`, `--yes`, `--content-build`, `--single-grid`; §12.4); `--drain` (`p3-island`); and the `p3-siblings` handover choreography flags (its own `--handover-shard`, `--handover-request`, `--handover-successor-node`, `--gateway-b-pid` — the harness's pointer to the request file, not the watcher flag the audit removed). **Action selectors** — what a process does this once, rather than how it runs: `--passphrase-stdin` (`orrery-issuer-key`), `--print-id` (`p0-nat-test`), `--verify-recovery` (`p2-load`), `--print-keys` (`p3-island`, `p3-siblings`), `--check-link` (`p4-streams-bench`), `--replay`, `--attestation`, `--quarantine` (`p5-dupe-gauntlet`), and the hidden `--peer-spec` / `--trader-spec` (both `p3` harnesses).
 
 **`gates/p1-swarm` has no fallbacks, and that is the freeze, not an oversight.** It is the largest CLI in the workspace — 44 args, more than any binary above — and it sits inside the P4 banking freeze (#329) alongside `orrery_witness`, `orrery_core`, `orrery_games`, and `clients/regolith`, none of which #865 touched. Its retrofit is deferred until the freeze window closes.
 
