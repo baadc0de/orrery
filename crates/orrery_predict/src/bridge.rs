@@ -18,7 +18,7 @@ use lightyear::prelude::{
     ReplicationReceiver, ReplicationSender, P2P,
 };
 use lightyear_replication::channels::RepliconChannelMap;
-use orrery_net::channels::{tag, untag, Channel, TAG_REPLICATION};
+use orrery_net::channels::{tag, untag, Channel, TAG_REPLICATION, TAG_WITNESS_KEYFRAME};
 use orrery_net::peer_link::{payload_budget, PeerPacket, SendPacket};
 use orrery_net::plugin::{PeerMtu, PeerRegistry};
 use orrery_protocol::NodeId;
@@ -170,7 +170,7 @@ fn receive_replication_packets(
         let Some((sub_tag, payload)) = payload.split_first() else {
             continue;
         };
-        if *sub_tag != TAG_REPLICATION {
+        if *sub_tag != TAG_REPLICATION && *sub_tag != TAG_WITNESS_KEYFRAME {
             continue;
         }
         let Some((_, mut link)) = links.iter_mut().find(|(link, _)| link.peer == packet.from)
@@ -206,7 +206,7 @@ mod tests {
     use orrery_net::{
         channels::{
             decode_hit, decode_replication, decode_witness, encode_hit, encode_witness, tag, untag,
-            Channel, TAG_REPLICATION,
+            Channel, TAG_REPLICATION, TAG_WITNESS_KEYFRAME,
         },
         PeerPacket, SendPacket,
     };
@@ -261,6 +261,7 @@ mod tests {
                 encode_witness(&1u8),
                 hit_frame(),
                 tag(Channel::State, &[TAG_REPLICATION, 3, 4]),
+                tag(Channel::State, &[TAG_WITNESS_KEYFRAME, 5, 6]),
             ] {
                 packets.write(PeerPacket {
                     from: peer,
@@ -275,10 +276,11 @@ mod tests {
         let mut parser = world.get_mut::<Link>(link).expect("bridge link");
         assert_eq!(
             parser.recv.len(),
-            1,
-            "witness and hit frames must not reach Lightyear's parser"
+            2,
+            "only the two replication families reach Lightyear's parser"
         );
         assert_eq!(parser.recv.pop().as_deref(), Some(&[3, 4][..]));
+        assert_eq!(parser.recv.pop().as_deref(), Some(&[5, 6][..]));
     }
 
     #[test]

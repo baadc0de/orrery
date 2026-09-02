@@ -18,7 +18,9 @@ use bevy_ecs::message::Messages;
 use bevy_platform::time::Instant;
 
 use aeronet_iroh::stream::IrohStreamIo;
-use orrery_net::budget::{stream_wire_bytes, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES};
+use orrery_net::budget::{
+    stream_wire_bytes, Bandwidth, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES,
+};
 use orrery_net::channels::{untag, Channel};
 use orrery_net::peer_link::{forget_departed_links, send_peer_packets, PeerLinkCounters};
 use orrery_net::plugin::Peer;
@@ -26,8 +28,8 @@ use orrery_net::{SendPacket, StreamMode};
 use orrery_protocol::{
     channels::{
         encode_delivered_input, encode_delta_patch, encode_hit, encode_replication,
-        encode_replication_delta, ReplicationDelta, TAG_DELIVERED_INPUT, TAG_HIT, TAG_REPLICATION,
-        TAG_REPLICATION_DELTA,
+        encode_replication_delta, encode_witness_keyframe, ReplicationDelta, TAG_DELIVERED_INPUT,
+        TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_DELTA, TAG_WITNESS_KEYFRAME,
     },
     HitClaim, HitMsg, HitSurface, InterpBasis, LatticePoint, NodeId, PersistId, QuantizedDir,
     QuantizedRay, Tick, WeaponRef,
@@ -99,10 +101,11 @@ fn queued_for_io(app: &mut App) -> usize {
 
 /// Packets the budget allows in one window, at this test's packet size.
 fn allowance() -> usize {
-    (UploadBudget::default()
-        .sustained
-        .bytes_over(Duration::from_secs(1))
-        / WIRE) as usize
+    allowance_for(UploadBudget::default())
+}
+
+fn allowance_for(budget: UploadBudget) -> usize {
+    (budget.sustained.bytes_over(budget.window) / WIRE) as usize
 }
 
 fn state_subtag(payload: &[u8]) -> Option<u8> {
@@ -232,6 +235,56 @@ fn a_keyframe_is_shed_only_after_every_delta() {
 }
 
 #[test]
+fn a_witness_link_keyframe_survives_a_500_kbps_squeeze() {
+    // A20 §4 observed 89 false positives at 500 kbps when a witness lost the
+    // keyframe its deltas depend on. The distinct wire family, not a caller
+    // priority field, places this anchor on the unsheddable side of the meter.
+    let peer = secret(1).public();
+    let mut app = app(&[peer]);
+    let budget = UploadBudget {
+        sustained: Bandwidth::from_kbps(500),
+        ..UploadBudget::default()
+    };
+    *app.world_mut().resource_mut::<UploadBudget>() = budget;
+    queue(&mut app, peer, Channel::State, allowance_for(budget) + 200);
+    app.world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .write(SendPacket::state(
+            peer,
+            bytes::Bytes::from(encode_witness_keyframe(&vec![7u8; PAYLOAD])),
+        ));
+
+    app.update();
+
+    let sent = app
+        .world_mut()
+        .query::<&aeronet_io::Session>()
+        .iter(app.world())
+        .next()
+        .expect("test session")
+        .send
+        .iter()
+        .filter_map(|packet| replication_subtag(packet))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sent.iter()
+            .filter(|&&tag| tag == TAG_WITNESS_KEYFRAME)
+            .count(),
+        1,
+        "the witness-link keyframe must survive the squeeze"
+    );
+    let meter = app.world().resource::<UploadMeter>();
+    assert!(
+        meter.shed > 0,
+        "the replication flood must actually be shed"
+    );
+    assert!(
+        meter.lanes.witness_keyframe_bytes > 0,
+        "the preserved anchor gets its own audited lane"
+    );
+}
+
+#[test]
 fn control_still_goes_out_when_state_is_being_shed() {
     // Shedding a gap repair or a lease operation turns one dropped datagram
     // into a permanent hole — a repair that never arrives is indistinguishable
@@ -246,7 +299,7 @@ fn control_still_goes_out_when_state_is_being_shed() {
 
     let (shed, control) = {
         let meter = app.world().resource::<UploadMeter>();
-        (meter.shed, meter.control_over_budget)
+        (meter.shed, meter.unsheddable_over_budget)
     };
     assert!(shed > 0, "the state flood must actually be shed");
     assert_eq!(

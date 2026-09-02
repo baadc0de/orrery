@@ -266,7 +266,7 @@ pub fn send_peer_packets(
             // Counting without sending would understate the overrun; sending
             // without counting would hide one. See `is_sheddable` for why the
             // witness lane is on this side of the line.
-            meter.control_over_budget += 1;
+            meter.unsheddable_over_budget += 1;
         }
 
         meter.charge(*budget, now, packet.to, lane, wire);

@@ -108,13 +108,77 @@ pub fn untag(payload: &[u8]) -> Option<(Channel, &[u8])> {
     Some((channel, rest))
 }
 
+/// A protocol-owned family identified by the inner frame's sub-tag.
+///
+/// This is the authoritative list of non-opaque P2P wire families.  Keep the
+/// enum exhaustive at consumers: adding a sub-tag starts by adding one variant
+/// here, so `orrery_net` must make a delivery decision rather than inheriting
+/// its transport's default lane.  The enum describes bytes on the wire, not a
+/// caller-provided quality-of-service field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireFamily {
+    /// Absolute replicated state, also the keyframe for delta patches.
+    Replication,
+    /// Compressed absolute replicated state.
+    ReplicationCompressed,
+    /// A replication delta referring to a previous absolute keyframe.
+    ReplicationDelta,
+    /// An absolute keyframe sent to a witness-set link.
+    WitnessKeyframe,
+    /// A verifiable-core frame or state claim.
+    Witness,
+    /// Compressed verifiable-core traffic.
+    WitnessCompressed,
+    /// An addressed cross-authority canonical input.
+    DeliveredInput,
+    /// A hit claim or its verdict.
+    Hit,
+}
+
+impl WireFamily {
+    /// The stable one-byte discriminator for this family.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Replication => 0xE6,
+            Self::Witness => 0xE7,
+            Self::DeliveredInput => 0xE8,
+            Self::ReplicationCompressed => 0xE9,
+            Self::WitnessCompressed => 0xEA,
+            Self::ReplicationDelta => 0xEB,
+            Self::Hit => 0xEC,
+            Self::WitnessKeyframe => 0xED,
+        }
+    }
+
+    /// Recover a known family from its inner logical channel and sub-tag.
+    ///
+    /// This deliberately reads the inner frame rather than the transport that
+    /// happened to carry it.  In particular, a delivered input remains a
+    /// delivered input when a future transport moves it to a datagram.
+    #[must_use]
+    pub const fn from_frame(channel: Channel, tag: u8) -> Option<Self> {
+        match (channel, tag) {
+            (Channel::State, 0xE6) => Some(Self::Replication),
+            (Channel::State, 0xE9) => Some(Self::ReplicationCompressed),
+            (Channel::State, 0xEB) => Some(Self::ReplicationDelta),
+            (Channel::State, 0xED) => Some(Self::WitnessKeyframe),
+            (Channel::State, 0xE7) => Some(Self::Witness),
+            (Channel::State, 0xEA) => Some(Self::WitnessCompressed),
+            (Channel::Control, 0xE8) => Some(Self::DeliveredInput),
+            (Channel::State, 0xEC) => Some(Self::Hit),
+            _ => None,
+        }
+    }
+}
+
 /// Sub-tag marking a state datagram as replication traffic.
 ///
 /// Replication and witness traffic share `Channel::State`, so both have to be
 /// positively identified: tagging only one leaves the other as "everything
 /// else", and a receiver still hands foreign bytes to a decoder that reads
 /// length prefixes out of them.
-pub const TAG_REPLICATION: u8 = 0xE6;
+pub const TAG_REPLICATION: u8 = WireFamily::Replication.tag();
 
 /// Compressed sibling of [`TAG_REPLICATION`].
 ///
@@ -122,14 +186,22 @@ pub const TAG_REPLICATION: u8 = 0xE6;
 /// separate tag keeps the existing uncompressed wire readable during a
 /// rolling upgrade and lets receivers reject an oversized declaration before
 /// allocating its output buffer.
-pub const TAG_REPLICATION_COMPRESSED: u8 = 0xE9;
+pub const TAG_REPLICATION_COMPRESSED: u8 = WireFamily::ReplicationCompressed.tag();
 
 /// Sub-tag marking a keyframe-referenced replication delta.
 ///
 /// The postcard envelope is `(entity, tick, keyframe_age, cell, patch)`. The
 /// patch is a skip/write program over the canonical bytes of the referenced
 /// keyframe; see [`encode_delta_patch`] and [`apply_delta_patch`].
-pub const TAG_REPLICATION_DELTA: u8 = 0xEB;
+pub const TAG_REPLICATION_DELTA: u8 = WireFamily::ReplicationDelta.tag();
+
+/// Sub-tag for an absolute replication keyframe on a witness-set link.
+///
+/// A witness needs the anchor that makes subsequent deltas meaningful.  A20
+/// measured 89 false positives at 500 kbps when those anchors could be shed,
+/// so this is a distinct wire family rather than caller-declared priority.
+/// Receivers decode its body exactly like [`TAG_REPLICATION`].
+pub const TAG_WITNESS_KEYFRAME: u8 = WireFamily::WitnessKeyframe.tag();
 
 /// The decoded envelope of one keyframe-referenced replication delta.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +222,20 @@ pub struct ReplicationDelta {
 pub fn encode_replication<T: Serialize>(msg: &T) -> Vec<u8> {
     let mut payload = Vec::with_capacity(64);
     payload.push(TAG_REPLICATION);
+    payload.extend_from_slice(&postcard::to_stdvec(msg).expect("wire message is serializable"));
+    tag(Channel::State, &payload)
+}
+
+/// Encode an absolute replication keyframe for a witness-set link.
+///
+/// The payload is the ordinary replication postcard body under
+/// [`TAG_WITNESS_KEYFRAME`], so a receiver uses the same replication decoder.
+/// Its distinct family makes the upload meter preserve this adjudication
+/// anchor under pressure without accepting a caller-supplied lane field.
+#[must_use]
+pub fn encode_witness_keyframe<T: Serialize>(msg: &T) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64);
+    payload.push(TAG_WITNESS_KEYFRAME);
     payload.extend_from_slice(&postcard::to_stdvec(msg).expect("wire message is serializable"));
     tag(Channel::State, &payload)
 }
@@ -370,6 +456,14 @@ fn take_varint(bytes: &[u8]) -> Option<(u32, &[u8])> {
 
 /// Decode replication traffic from a state datagram.
 pub fn decode_replication<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
+    let (channel, rest) = untag(payload)?;
+    if channel != Channel::State {
+        return None;
+    }
+    let (marker, body) = rest.split_first()?;
+    if *marker == TAG_REPLICATION || *marker == TAG_WITNESS_KEYFRAME {
+        return postcard::from_bytes(body).ok();
+    }
     decode_sub_tagged(payload, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED)
 }
 
@@ -460,11 +554,11 @@ fn encode_sub_tagged_compressed<T: Serialize>(
 /// receiver never hands foreign bytes to a decoder that would read a length
 /// prefix out of them. Reliable delivered inputs have their own control-lane
 /// [`TAG_DELIVERED_INPUT`] discriminator.
-pub const TAG_WITNESS: u8 = 0xE7;
+pub const TAG_WITNESS: u8 = WireFamily::Witness.tag();
 
 /// Compressed sibling of [`TAG_WITNESS`], with the same bounded DEFLATE envelope
 /// as [`TAG_REPLICATION_COMPRESSED`].
-pub const TAG_WITNESS_COMPRESSED: u8 = 0xEA;
+pub const TAG_WITNESS_COMPRESSED: u8 = WireFamily::WitnessCompressed.tag();
 
 /// Sub-tag marking a reliable, addressed core input produced by
 /// `Game::deliver` from another authority's outcome.
@@ -473,7 +567,7 @@ pub const TAG_WITNESS_COMPRESSED: u8 = 0xEA;
 /// [canonical input]`. The input bytes belong to the negotiated ruleset; this
 /// envelope owns only routing/provenance and deliberately does not invent a
 /// second command schema.
-pub const TAG_DELIVERED_INPUT: u8 = 0xE8;
+pub const TAG_DELIVERED_INPUT: u8 = WireFamily::DeliveredInput.tag();
 
 /// One delivered core input addressed to the authority of `recipient`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,7 +641,7 @@ pub fn decode_witness<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
 /// Sub-tag marking hit-registration traffic (docs/05 §7): a [`HitMsg`]
 /// claim from a shooter, or the verdict back. Rides the unreliable state
 /// channel; the shooter resends a claim until a verdict names its key.
-pub const TAG_HIT: u8 = 0xEC;
+pub const TAG_HIT: u8 = WireFamily::Hit.tag();
 
 /// Encode one hit claim or verdict as a state datagram:
 /// `[TAG_STATE][TAG_HIT][postcard]`.
@@ -713,6 +807,22 @@ mod tests {
         let (_, small_body) = untag(&small).expect("state tag");
         assert_eq!(small_body[0], TAG_WITNESS);
         assert_eq!(decode_witness::<u8>(&small), Some(7));
+    }
+
+    #[test]
+    fn a_witness_keyframe_is_replication_with_a_distinct_wire_family() {
+        let keyframe = encode_witness_keyframe(&vec![0x5au8; 64]);
+        let (channel, body) = untag(&keyframe).expect("state tag");
+        assert_eq!(channel, Channel::State);
+        assert_eq!(body.first(), Some(&TAG_WITNESS_KEYFRAME));
+        assert_eq!(
+            WireFamily::from_frame(channel, TAG_WITNESS_KEYFRAME),
+            Some(WireFamily::WitnessKeyframe)
+        );
+        assert_eq!(
+            decode_replication::<Vec<u8>>(&keyframe),
+            Some(vec![0x5a; 64])
+        );
     }
 
     /// The declared-size bound, pinned on its own.
