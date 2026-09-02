@@ -74,6 +74,28 @@ pub struct OverlayMetrics {
     pub banked_minutes: f64,
     /// Minutes without player input.
     pub idle_minutes: f64,
+    /// Whether the idle banking allowance has been exhausted.
+    ///
+    /// Reachable for the first time in #947: while the campaign accumulator
+    /// was fed an order count that could never be zero, this could only ever
+    /// be `false`.
+    pub afk_capped: bool,
+    /// Uplink frames the bounded channel refused (visible backpressure).
+    ///
+    /// This and the three counters below are incremented on real failure
+    /// paths and, before #947, surfaced only in the F3 pane — which is closed
+    /// by default. None of them reached the JSONL a volunteer ships back, so
+    /// a lost session could not be diagnosed from the evidence sent with it.
+    /// They are additions to the schema; no existing key changed, because
+    /// `scripts/p4-attempt-accounting.py` reads `banked_minutes` off these
+    /// rows by name.
+    pub uplink_shed: u64,
+    /// Replication packets that decoded to nothing this client recognises.
+    pub downlink_undecodable: u64,
+    /// Ruleset deliveries for an entity this client could not route to.
+    pub delivered_unroutable: u64,
+    /// Delivered inputs addressed to another authority and refused here.
+    pub delivered_foreign: u64,
 }
 
 impl OverlayMetrics {
@@ -99,6 +121,11 @@ impl OverlayMetrics {
             session_record_path,
             banked_minutes: 0.0,
             idle_minutes: 0.0,
+            afk_capped: false,
+            uplink_shed: 0,
+            downlink_undecodable: 0,
+            delivered_unroutable: 0,
+            delivered_foreign: 0,
         }
     }
 }

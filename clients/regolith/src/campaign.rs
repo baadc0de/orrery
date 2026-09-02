@@ -37,6 +37,7 @@
 //! `SessionRecord::impairment_mismatch` is for.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -63,7 +64,7 @@ use crate::net::{
     self, CampaignLink, HearsayContacts, HostAddress, JoinRequest, Lane, UplinkAck, UplinkDatagram,
     UplinkOutcome,
 };
-use crate::session::{Actor, CampaignSession, ConfiguredImpairment, SessionRecord};
+use crate::session::{Actor, CampaignSession, ConfiguredImpairment, PlayerActivity, SessionRecord};
 
 /// Broadcasts per second the harness runs (`send_hz`), mirrored so the
 /// client's state cadence matches what a bot's `broadcast_state` does.
@@ -501,6 +502,35 @@ pub struct CampaignRuntime {
 
     campaign: CampaignSession,
     record_written: bool,
+    /// Where the finished row is appended the instant it is minted.
+    ///
+    /// The row used to be minted here and written by a Bevy system that read
+    /// it back. Any teardown that did not run that system — a panic unwinding
+    /// through `Drop`, a window closed before `AppExit` was observed — signed
+    /// a row and dropped it on the floor (#947). Durability now belongs to
+    /// the same call that mints it, so no later step can lose it.
+    record_path: Option<PathBuf>,
+    record_disposition: RecordDisposition,
+}
+
+/// How far this session's banking row got, for the exit writer's diagnostics.
+///
+/// The exit writer used to treat "no row" as one silent case. It is two, and
+/// they mean opposite things: a session that measured nothing legitimately
+/// has no row, while a row that was minted and never reached disk is the
+/// exact loss #947 was opened for. Only naming them apart makes the second
+/// one visible in a log a volunteer can send back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordDisposition {
+    /// No row has been minted yet; the session may still be measuring.
+    Unfinished,
+    /// The session reached no joined tick, so there is nothing to bank and
+    /// deliberately no row (`finish_record`'s zero-tick refusal).
+    NothingMeasured,
+    /// A row was minted, signed and appended to the record file.
+    Persisted,
+    /// A row was minted and signed but never reached durable storage.
+    Lost,
 }
 
 /// Canonical bytes and metadata carried by an absolute replication keyframe.
@@ -753,6 +783,8 @@ impl CampaignRuntime {
             broadcast_send_index: 0,
             hearsay: crate::hearsay::HearsayState::default(),
             record_written: false,
+            record_path: None,
+            record_disposition: RecordDisposition::Unfinished,
             config,
             executor,
             pipeline,
@@ -1011,6 +1043,22 @@ impl CampaignRuntime {
         self.undecodable
     }
 
+    /// Deliveries this ruleset produced for an entity this client cannot
+    /// route to. Incremented on a real failure path and, until #947, read by
+    /// nothing at all — so a session that lost deliveries looked identical to
+    /// one that did not.
+    #[must_use]
+    pub fn delivered_unroutable(&self) -> u64 {
+        self.delivered_unroutable
+    }
+
+    /// Delivered inputs addressed to some other authority, refused at this
+    /// one. Also had no reader before #947.
+    #[must_use]
+    pub fn delivered_foreign(&self) -> u64 {
+        self.delivered_foreign
+    }
+
     /// The most recent cell this craft's position committed to.
     #[must_use]
     pub fn latest_cell(&self) -> Option<CellId> {
@@ -1071,7 +1119,22 @@ impl CampaignRuntime {
             events: Vec::new(),
             delivered: Vec::new(),
         };
-        if let Ok(mut authored_orders) = decode_packet(&authored) {
+        // The offline path asserts on this same condition (`.expect("the
+        // local codec produced valid orders")`). Here a failure used to skip
+        // telemetry, the witness log, the executor step and routing for the
+        // tick with no `else` and no log on either branch — sixty-eight lines
+        // quietly not happening. The campaign path is now at least as loud as
+        // the offline one, without taking the process down mid-session (#947).
+        let decoded = decode_packet(&authored);
+        if let Err(error) = &decoded {
+            self.undecodable += 1;
+            bevy::log::error!(
+                "campaign tick {}: this client's own order packet did not decode ({error}); \
+                 no step, no witness entry and no telemetry for this tick",
+                tick.0
+            );
+        }
+        if let Ok(mut authored_orders) = decoded {
             if let Some(other) = self.executor.state(self.entity).and_then(|own| {
                 collision_candidate(
                     self.entity,
@@ -1404,7 +1467,19 @@ impl CampaignRuntime {
         }
 
         // ── The accumulator, fed by reality ───────────────────────────────
-        self.campaign.observe_tick(intents);
+        // `intents` counts orders, and the pilot pushes Thrust/Lock/Fire on
+        // every tick whether or not a key is down — the skin's idle gate only
+        // zeroes the acceleration and yaw inside `Thrust`. Feeding that count
+        // here made `local_intents != 0` true forever, so idle ticks never
+        // accrued, `banked_ticks` always equalled `connected_ticks` and
+        // `afk_capped` was unreachable: twenty idle minutes banked twenty
+        // minutes and the row claimed `afk_seconds: 0` (#947).
+        //
+        // The offline path had this right all along (`controls ==
+        // Controls::default()`); the mode that banks nothing was the mode
+        // that measured correctly. This is the same question, asked the same
+        // way, in the mode that banks.
+        self.campaign.observe_tick(player_activity(controls));
         self.tick = Tick::new(tick.0.saturating_add(1));
         self.ticks_driven = self.ticks_driven.saturating_add(1);
         report
@@ -1569,7 +1644,11 @@ impl CampaignRuntime {
     /// client-side session cannot know it yet (#387 assembles the report),
     /// so the field records that honestly instead of inventing a digest.
     pub fn finish_record(&mut self) -> Option<SessionRecord> {
-        if self.record_written || self.joined_ticks() == 0 {
+        if self.record_written {
+            return None;
+        }
+        if self.joined_ticks() == 0 {
+            self.record_disposition = RecordDisposition::NothingMeasured;
             return None;
         }
         self.record_written = true;
@@ -1582,7 +1661,62 @@ impl CampaignRuntime {
         record
             .sign(&self.config.transport_secret)
             .expect("SessionRecord signing payload serializes");
+        // Durable here, not in whatever runs next. `Drop` reaches this
+        // function during a panic unwind and during a window close that never
+        // produced an `AppExit`; both used to sign a row and discard it,
+        // because the only writer was a Bevy system reading the return value
+        // (#947). Nothing downstream can now lose what this call measured.
+        self.record_disposition = match &self.record_path {
+            Some(path) => match append_session_record(path, &record) {
+                Ok(()) => {
+                    bevy::log::info!(
+                        "campaign session {} recorded to {} ({} recorded min)",
+                        record.session_id,
+                        path.display(),
+                        record.banked_minutes
+                    );
+                    RecordDisposition::Persisted
+                }
+                Err(error) => {
+                    bevy::log::error!(
+                        "cannot write campaign record {}: {error}; upload not attempted so local evidence remains authoritative",
+                        path.display()
+                    );
+                    eprintln!(
+                        "regolith: your campaign record could not be saved to {}: {error}. \
+                         The minutes from this attempt were not recorded.",
+                        path.display()
+                    );
+                    RecordDisposition::Lost
+                }
+            },
+            None => {
+                // No path was ever named. A headless fixture is entitled to
+                // this; a shipped client is not, and says so.
+                bevy::log::warn!(
+                    "campaign session {} finished with no record path configured; \
+                     {} banked minutes exist only in memory",
+                    record.session_id,
+                    record.banked_minutes
+                );
+                RecordDisposition::Lost
+            }
+        };
         Some(record)
+    }
+
+    /// Name the file finished rows are appended to, before any tick is flown.
+    ///
+    /// Called once at session construction. Without it a finished row has
+    /// nowhere durable to go and `finish_record` reports [`RecordDisposition::Lost`].
+    pub fn set_record_path(&mut self, path: PathBuf) {
+        self.record_path = Some(path);
+    }
+
+    /// How far this session's banking row got. See [`RecordDisposition`].
+    #[must_use]
+    pub fn record_disposition(&self) -> RecordDisposition {
+        self.record_disposition
     }
 
     /// End the session: goodbye marker, grace period, final row.
@@ -1599,7 +1733,7 @@ impl CampaignRuntime {
     #[cfg(test)]
     pub(crate) fn finished_for_test(config: CampaignConfig, seed: UniverseSeed) -> Self {
         let mut runtime = Self::launch(config, seed);
-        runtime.campaign.observe_tick(1);
+        runtime.campaign.observe_tick(PlayerActivity::Active);
         runtime.ticks_driven = 1;
         runtime
     }
@@ -1617,6 +1751,13 @@ impl CampaignRuntime {
     #[cfg(test)]
     pub(crate) fn adopt_start_for_test(&mut self, start: crate::lobby::AcceptedStart) {
         self.start = Some(start);
+    }
+
+    /// A session the host admitted, without a live link behind it. The state
+    /// `Drop` keys its teardown on (#947).
+    #[cfg(test)]
+    pub(crate) fn join_for_test(&mut self) {
+        self.state = JoinState::Joined;
     }
 
     /// A dial the host turned away: no joined tick, nothing measured (#942).
@@ -1790,13 +1931,60 @@ fn capture_replica_event(
     }
 }
 
+/// Append one finished row to the campaign record file, durably.
+///
+/// `sync_all` is the point: a row buffered in the page cache when the process
+/// dies is not evidence. The file is append-only across every session this
+/// binary plays, so a partial write would corrupt earlier attempts too.
+///
+/// # Errors
+/// The record directory cannot be created, the file cannot be opened or
+/// appended to, or the flush to stable storage fails.
+pub fn append_session_record(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    crate::session::CampaignSession::write_record(&mut writer, record)?;
+    use std::io::Write as _;
+    writer.flush()?;
+    writer.get_ref().sync_all()
+}
+
 impl Drop for CampaignRuntime {
     fn drop(&mut self) {
         // Best effort: mark the goodbye so a host-side gate sees a clean end
         // even when the window closes mid-run. The 200 ms grace happens
         // inside `close`.
-        if matches!(self.state, JoinState::Joined) {
-            self.shutdown();
+        if !matches!(self.state, JoinState::Joined) {
+            return;
+        }
+        // `shutdown` mints, signs *and now persists* the row, so the value
+        // dropped here is a copy of something already on disk. Before #947
+        // this line was the whole loss: a joined session torn down by a panic
+        // or by a window close that never reached `AppExit` signed its record
+        // and discarded it, silently, on both branches.
+        let record = self.shutdown();
+        match (record, self.record_disposition) {
+            (Some(record), RecordDisposition::Persisted) => bevy::log::info!(
+                "campaign session {} banked {} minutes and was recorded during teardown",
+                record.session_id,
+                record.banked_minutes
+            ),
+            (Some(record), _) => bevy::log::error!(
+                "campaign session {} was torn down holding {} banked minutes that \
+                 could not be written: this session's evidence is lost",
+                record.session_id,
+                record.banked_minutes
+            ),
+            (None, _) => bevy::log::info!(
+                "campaign session torn down with no row to write ({:?})",
+                self.record_disposition
+            ),
         }
     }
 }
@@ -1842,6 +2030,20 @@ fn compose_delivered_first(
         orders,
         sources,
         delivered,
+    }
+}
+
+/// Does this tick's control state mean the player is flying, or resting?
+///
+/// The one question the banking accumulator needs, asked of the player's
+/// input rather than of the order vector the codec produced from it. See
+/// [`PlayerActivity`] for why the difference decided whether every banked
+/// hour in P4 was honest.
+fn player_activity(controls: Controls) -> PlayerActivity {
+    if controls == Controls::default() {
+        PlayerActivity::Idle
+    } else {
+        PlayerActivity::Active
     }
 }
 
@@ -1998,6 +2200,97 @@ fn platform_triple() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #947 defect 2: the accumulator was asked the wrong question.
+    ///
+    /// `observe_tick` was fed `authored.orders.len()`, and
+    /// `pilot::honest_orders` pushes `Thrust`, `Lock` and `Fire` every single
+    /// tick — the skin's idle gate only zeroes `accel_mmss` and the yaw inside
+    /// `Thrust`, it never drops the order. So the count could not be zero,
+    /// `idle_ticks` was permanently zero, `banked_ticks` always equalled
+    /// `connected_ticks`, and `afk_capped` was unreachable.
+    ///
+    /// The first assertion drives the *real* authoring path with the controls
+    /// a resting player produces, so it pins the cause rather than restating
+    /// the fix.
+    #[test]
+    fn a_resting_player_still_authors_orders_but_is_not_active() {
+        use crate::intent::{decode_packet, Controls, IntentPipeline};
+        use crate::session::PlayerActivity;
+        use orrery_protocol::{PersistId, Tick, UniverseSeed};
+
+        let pipeline = IntentPipeline::new(
+            UniverseSeed([7; 32]),
+            PersistId::new(1),
+            0,
+            vec![PersistId::new(2)],
+        );
+        let resting = pipeline.human_packet(Tick::new(0), Controls::default());
+        let orders = decode_packet(&resting).expect("the codec produced valid orders");
+        assert!(
+            !orders.is_empty(),
+            "the pilot authors orders even at rest; this is why an order count \
+             could never mean 'idle', and why counting them banked every AFK minute"
+        );
+        assert_eq!(
+            super::player_activity(Controls::default()),
+            PlayerActivity::Idle,
+            "a player touching nothing is idle, whatever the codec emitted"
+        );
+        assert_eq!(
+            super::player_activity(Controls {
+                thrust: true,
+                ..Controls::default()
+            }),
+            PlayerActivity::Active,
+        );
+    }
+
+    /// #947 defect 2, the consequence: the AFK cap must be reachable.
+    ///
+    /// Composes the real decision the campaign tick makes with the real
+    /// accumulator, over the controls a genuinely idle tester produces for
+    /// eleven minutes. Under the order-count signal this session banked all
+    /// eleven minutes and reported `afk_seconds: 0`.
+    #[test]
+    fn eleven_idle_minutes_do_not_all_bank() {
+        use crate::intent::Controls;
+        use crate::session::{Actor, CampaignSession, ConfiguredImpairment};
+
+        let mut session = CampaignSession::new(
+            "018f0f8a-0000-7000-8000-000000000001".to_owned(),
+            "2026-09-02T17:24:00Z".to_owned(),
+            Actor::Human,
+            ConfiguredImpairment {
+                loss_pct: 3.0,
+                jitter_p50_ms: 100,
+                jitter_p99_ms: 100,
+            },
+        );
+        let ticks = 11 * 60 * u64::from(orrery_core::TICK_HZ);
+        for _ in 0..ticks {
+            session.observe_tick(super::player_activity(Controls::default()));
+        }
+        let record = session.finish(
+            "2026-09-02T17:35:00Z".to_owned(),
+            "x86_64-unknown-linux-gnu".to_owned(),
+            "rev".to_owned(),
+            "pipeline".to_owned(),
+        );
+        assert!(
+            record.afk_capped,
+            "eleven idle minutes must exhaust the ten-minute idle allowance"
+        );
+        assert_eq!(
+            record.banked_minutes, 10.0,
+            "an idle session banks the allowance and no more"
+        );
+        assert_eq!(record.afk_seconds, 11 * 60);
+        assert!(
+            record.distinct_play_minutes > record.banked_minutes,
+            "connected time exceeds banked time once idling is measured at all"
+        );
+    }
+
     /// The client's own broadcast goes out compressed, like the harness's.
     ///
     /// #649 taught `decode_replication` both tags and switched the harness

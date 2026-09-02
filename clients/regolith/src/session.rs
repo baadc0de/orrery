@@ -208,6 +208,30 @@ pub struct LiveProgress {
     pub joined_session_ran: bool,
 }
 
+/// Whether the player supplied input on one campaign tick.
+///
+/// This exists because counting *orders* could not answer the question. The
+/// campaign path fed [`CampaignSession::observe_tick`] the length of the
+/// authored order vector, and `pilot::honest_orders` pushes `Thrust`, `Lock`
+/// and `Fire` on **every** tick — the skin's idle gate only zeroes
+/// `accel_mmss` and the yaw, it does not drop the order. So the count was
+/// never zero, `idle_ticks` was permanently zero, `banked_ticks` always
+/// equalled `connected_ticks`, and [`SessionRecord::afk_capped`] was
+/// unreachable: a tester who idled twenty minutes banked all twenty and the
+/// row asserted `afk_seconds: 0` (#947).
+///
+/// A count of orders is a fact about the codec. Naming the question as its
+/// own type makes the accumulator take a fact about the *player*, which is
+/// what it was always documented to measure, and makes both values something
+/// production actually produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerActivity {
+    /// The player's controls differed from rest on this tick.
+    Active,
+    /// No control was held: the tick is idle for banking purposes.
+    Idle,
+}
+
 /// Pure session accumulator used by both bot and human front ends.
 #[derive(Debug)]
 pub struct CampaignSession {
@@ -224,8 +248,6 @@ pub struct CampaignSession {
 }
 
 impl CampaignSession {
-    /// No local intent for this long is considered idle.
-    pub const IDLE_AFTER_SECONDS: u64 = 300;
     /// A session can bank at most this much idle time.
     pub const IDLE_BANK_CAP_SECONDS: u64 = 600;
 
@@ -251,10 +273,12 @@ impl CampaignSession {
         }
     }
 
-    /// Account for one simulation tick and its local input count.
-    pub fn observe_tick(&mut self, local_intents: usize) {
+    /// Account for one simulation tick and whether the player drove it.
+    ///
+    /// See [`PlayerActivity`] for why this is not an order count.
+    pub fn observe_tick(&mut self, activity: PlayerActivity) {
         self.connected_ticks = self.connected_ticks.saturating_add(1);
-        if local_intents != 0 {
+        if activity == PlayerActivity::Active {
             self.idle_ticks = 0;
             self.banked_ticks = self.banked_ticks.saturating_add(1);
             return;
@@ -556,7 +580,7 @@ mod tests {
         let mut active = session();
         let idle = u64::from(orrery_core::TICK_HZ) * 60;
         for _ in 0..idle {
-            active.observe_tick(1);
+            active.observe_tick(PlayerActivity::Active);
         }
         let progress = active.progress();
         assert_eq!(progress.banked_minutes, 1.0);
@@ -566,7 +590,7 @@ mod tests {
 
         let mut idle_run = session();
         for _ in 0..idle * 11 {
-            idle_run.observe_tick(0);
+            idle_run.observe_tick(PlayerActivity::Idle);
         }
         let capped = idle_run.progress();
         assert!(capped.afk_capped, "600 s cap then overflow trips the flag");
@@ -577,7 +601,7 @@ mod tests {
     fn idle_only_session_banks_at_most_six_hundred_seconds_and_sets_cap() {
         let mut session = session();
         for _ in 0..((CampaignSession::IDLE_BANK_CAP_SECONDS + 20) * u64::from(TICK_HZ)) {
-            session.observe_tick(0);
+            session.observe_tick(PlayerActivity::Idle);
         }
         let record = session.finish(
             "2026-08-23T12:11:00Z".into(),
@@ -594,9 +618,9 @@ mod tests {
     fn input_resumes_accrual_after_an_afk_cap() {
         let mut session = session();
         for _ in 0..(CampaignSession::IDLE_BANK_CAP_SECONDS * u64::from(TICK_HZ)) {
-            session.observe_tick(0);
+            session.observe_tick(PlayerActivity::Idle);
         }
-        session.observe_tick(1);
+        session.observe_tick(PlayerActivity::Active);
         let record = session.finish(
             "end".into(),
             "linux".into(),

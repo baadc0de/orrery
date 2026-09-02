@@ -693,11 +693,18 @@ impl Plugin for RegolithSkinPlugin {
         }
         // The joined session starts its dial here, at plugin build, so the
         // handshake overlaps window startup instead of serialising behind it.
+        // Before any session can measure a minute, make a panic say so (#947).
+        install_campaign_panic_hook();
         let session = match &self.campaign {
-            Some(config) => ActiveSession::Campaign(Box::new(campaign::CampaignRuntime::launch(
-                config.clone(),
-                SEED,
-            ))),
+            Some(config) => {
+                let mut runtime = campaign::CampaignRuntime::launch(config.clone(), SEED);
+                // Durability is the runtime's own job as of #947: the row is
+                // written by the call that mints it, so no teardown path can
+                // sign one and drop it. The path must therefore be known
+                // before the first tick is flown, not at exit.
+                runtime.set_record_path(campaign_record_path(&self.telemetry_path));
+                ActiveSession::Campaign(Box::new(runtime))
+            }
             None => ActiveSession::Local(Box::<LocalSession>::default()),
         };
         // A headless join builds its session here rather than through the
@@ -2799,6 +2806,13 @@ fn stream_metrics(
             let progress = runtime.accumulator().progress();
             metrics.banked_minutes = progress.banked_minutes;
             metrics.idle_minutes = progress.idle_minutes;
+            // The anomaly counters ride the stream a volunteer sends back,
+            // not just the F3 pane nobody opens (#947).
+            metrics.afk_capped = progress.afk_capped;
+            metrics.uplink_shed = runtime.uplink_shed();
+            metrics.downlink_undecodable = runtime.undecodable();
+            metrics.delivered_unroutable = runtime.delivered_unroutable();
+            metrics.delivered_foreign = runtime.delivered_foreign();
             let configured = &runtime.config().configured;
             metrics.configured_loss_pct = configured.loss_pct;
             metrics.configured_jitter_ms = configured.jitter_p50_ms;
@@ -2822,7 +2836,7 @@ fn stream_metrics(
 /// — which is what lets the client warn about all three at startup instead of
 /// discovering the record failure at exit, with no UI left to say so (#773).
 #[must_use]
-fn campaign_record_path(session_record_path: &Path) -> PathBuf {
+pub(crate) fn campaign_record_path(session_record_path: &Path) -> PathBuf {
     session_record_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -2857,104 +2871,112 @@ fn write_campaign_record_on_exit(
     metrics: Res<OverlayMetrics>,
     sink: Res<JsonlTelemetry>,
     upload: Option<Res<admission::UploadManager>>,
+    mut reported: Local<bool>,
 ) {
     let exiting = exited.read().count() > 0;
-    {
-        let ActiveSession::Campaign(runtime) = &mut *session else {
-            return;
-        };
-        // A dial still in flight has not ended; a joined session has not
-        // ended until the app does. Anything else is over.
-        let link_ended = !matches!(runtime.state(), JoinState::Dialing | JoinState::Joined);
-        if !exiting && !link_ended {
-            return;
+    let ActiveSession::Campaign(runtime) = &mut *session else {
+        return;
+    };
+    // A dial still in flight has not ended; a joined session has not
+    // ended until the app does. Anything else is over.
+    let link_ended = !matches!(runtime.state(), JoinState::Dialing | JoinState::Joined);
+    if !exiting && !link_ended {
+        return;
+    }
+    // On exit the link may still be up and is owed the goodbye marker.
+    // A session whose link already ended has nothing left to say to a
+    // host that is no longer there, and must not spend `close`'s grace
+    // period sleeping the render loop mid-frame.
+    let record = if exiting {
+        runtime.shutdown()
+    } else {
+        runtime.finish_record()
+    };
+    let Some(record) = record else {
+        // This `else` used to be a bare `return`, and it stood for two
+        // opposite facts: a session that legitimately measured nothing, and a
+        // row that had already been minted and consumed by something that
+        // then discarded it. The second is exactly the loss #947 was opened
+        // for, and the silence here is how it went unnoticed through a
+        // witnessed 900-second attempt. This branch runs on every frame after
+        // the link ends, so the diagnosis is latched and said once.
+        if !*reported {
+            *reported = true;
+            match runtime.record_disposition() {
+                campaign::RecordDisposition::NothingMeasured
+                | campaign::RecordDisposition::Unfinished => info!(
+                    "campaign session ended without reaching a joined tick: \
+                     nothing was measured and no row was written"
+                ),
+                campaign::RecordDisposition::Persisted => info!(
+                    "campaign record for this session is already on disk; \
+                     nothing further to write"
+                ),
+                campaign::RecordDisposition::Lost => error!(
+                    "campaign row was minted for this session but never reached \
+                     durable storage: the minutes this session flew are not recorded"
+                ),
+            }
         }
-        // On exit the link may still be up and is owed the goodbye marker.
-        // A session whose link already ended has nothing left to say to a
-        // host that is no longer there, and must not spend `close`'s grace
-        // period sleeping the render loop mid-frame.
-        let record = if exiting {
-            runtime.shutdown()
-        } else {
-            runtime.finish_record()
-        };
-        let Some(record) = record else {
-            return;
-        };
-        // Beside the telemetry stream, which since the 2026-09-02 owner
-        // decision resolves to the directory holding the executable — the
-        // folder a volunteer who has just extracted the release is already
-        // looking in (#942), superseding the same-day cwd decision and,
-        // before that, #766's per-user application-data directory. One
-        // directory for the stream, the banking record and the upload state
-        // is what makes `--telemetry-jsonl` a complete override, and what
-        // makes the startup writability check below cover all three (#773).
-        let record_path = campaign_record_path(&metrics.session_record_path);
-        let write = || -> std::io::Result<()> {
-            if let Some(parent) = record_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&record_path)?;
-            let mut writer = std::io::BufWriter::new(file);
-            crate::session::CampaignSession::write_record(&mut writer, &record)?;
-            use std::io::Write as _;
-            writer.flush()?;
-            writer.get_ref().sync_all()
-        };
-        match write() {
-            Ok(()) => {
-                info!(
-                    "campaign session {} recorded to {} ({} recorded min)",
-                    record.session_id,
-                    record_path.display(),
-                    record.banked_minutes
-                );
-                if let Some(upload) = &upload {
-                    admission::upload_finished_session(
-                        upload,
-                        &record,
-                        &record_path,
-                        &metrics.session_record_path,
-                        // Only this run's rows. The stream is append-only
-                        // across every session the binary played (#735).
-                        sink.session_start(),
-                    );
-                }
-            }
-            // The skip stands, and #773 asked for the reasoning rather than
-            // a change. Uploading a record the client could not persist would
-            // leave the service holding evidence its author cannot
-            // corroborate, which is the property #711 and #735 were careful
-            // about; a record that exists in one place only, and that place
-            // the server, is not the volunteer's evidence.
-            //
-            // What was wrong was never the skip but the silence: this fires
-            // when the session ends, which at app exit is a moment with no UI
-            // left to say anything, so an `error!` here is by construction a
-            // message the player may not be able to act on. The
-            // condition that produces it — a directory the client cannot write
-            // — is now detected at plugin build and carried on the scope
-            // banner for the whole session (`RECORDING_UNAVAILABLE_NOTICE`),
-            // so the volunteer is told before she flies rather than after she
-            // has quit. Only a failure that appears *between* those two
-            // moments, a disk filling mid-session, still reaches the player as
-            // stderr alone.
-            Err(error) => {
-                error!(
-                    "cannot write campaign record {}: {error}; upload not attempted so local evidence remains authoritative",
-                    record_path.display()
-                );
-                eprintln!(
-                    "regolith: your campaign record could not be saved to {}: {error}. \
-                     The minutes from this attempt were not recorded.",
-                    record_path.display()
+        return;
+    };
+    // The row is already durable: `finish_record` wrote and flushed it at the
+    // moment the session ended (#947), which is what makes it survive a panic
+    // unwind or a window close that never produces an `AppExit`. What is left
+    // here is the upload, which is deliberately *not* attempted for a row the
+    // client could not persist.
+    //
+    // The skip stands, and #773 asked for the reasoning rather than a change.
+    // Uploading a record the client could not persist would leave the service
+    // holding evidence its author cannot corroborate, which is the property
+    // #711 and #735 were careful about; a record that exists in one place
+    // only, and that place the server, is not the volunteer's evidence.
+    match runtime.record_disposition() {
+        campaign::RecordDisposition::Persisted => {
+            if let Some(upload) = &upload {
+                admission::upload_finished_session(
+                    upload,
+                    &record,
+                    &campaign_record_path(&metrics.session_record_path),
+                    &metrics.session_record_path,
+                    // Only this run's rows. The stream is append-only
+                    // across every session the binary played (#735).
+                    sink.session_start(),
                 );
             }
+        }
+        // `finish_record` has already logged the failure and told the player
+        // on stderr; what matters here is that nothing is uploaded.
+        disposition => {
+            error!("campaign record not uploaded: row disposition is {disposition:?}");
         }
     }
+}
+
+/// Make a panicking client say that it is tearing a measured session down.
+///
+/// The crate had no panic hook and no signal handler anywhere, so a panic in
+/// any Bevy system unwound in silence. Unwinding runs `Drop` for
+/// `CampaignRuntime`, and since #947 that is enough to make the row durable —
+/// the hook exists so the *reason* a session ended early is in the same log
+/// as the row, and so a volunteer's report carries the panic that caused it.
+///
+/// Deliberately chained rather than replacing the default hook: the backtrace
+/// is the diagnostic, and swallowing it to add a line would trade one silence
+/// for another.
+pub fn install_campaign_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            eprintln!(
+                "regolith: panicking. Any joined campaign session is being torn down now; \
+                 its record is written by that teardown, so check \
+                 campaign-records.jsonl before re-running."
+            );
+            previous(info);
+        }));
+    });
 }
 
 #[cfg(test)]
@@ -3048,10 +3070,13 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary client state");
         let telemetry_path = temporary.path().join("session.jsonl");
         let session_id = "01a06327-329f-7443-a211-11f3dee18418".to_owned();
-        let runtime = campaign::CampaignRuntime::finished_for_test(
+        let mut runtime = campaign::CampaignRuntime::finished_for_test(
             banking_campaign_config(&session_id),
             SEED,
         );
+        // The plugin names this path at construction; a hand-built runtime
+        // must too, since the row is written where it is minted (#947).
+        runtime.set_record_path(campaign_record_path(&telemetry_path));
         let mut app = banking_app(&telemetry_path);
         app.insert_resource(ActiveSession::Campaign(Box::new(runtime)));
 
@@ -3088,6 +3113,7 @@ mod tests {
             banking_campaign_config(&session_id),
             SEED,
         );
+        runtime.set_record_path(campaign_record_path(&telemetry_path));
         runtime.close_for_test();
         let mut app = banking_app(&telemetry_path);
         app.insert_resource(ActiveSession::Campaign(Box::new(runtime)));
@@ -3118,6 +3144,143 @@ mod tests {
         );
     }
 
+    /// #947 defect 1: a panic must not eat a session that measured minutes.
+    ///
+    /// `Drop` computed, cryptographically signed and then discarded a
+    /// `SessionRecord`, with no log on either branch. There is no panic hook
+    /// and no signal handler in this crate, so a panic in any Bevy system
+    /// unwound, `Drop` ate the row, and `write_campaign_record_on_exit` never
+    /// saw an `AppExit` to be told about it. Two witnessed 900-second human
+    /// sessions were lost this way.
+    ///
+    /// The input here is what production produces: a joined session holding
+    /// real banked ticks, torn down by an unwinding panic rather than by a
+    /// polite exit.
+    #[test]
+    fn a_panic_cannot_swallow_a_session_that_banked_minutes() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let record_path = temporary.path().join("campaign-records.jsonl");
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut runtime = campaign::CampaignRuntime::finished_for_test(
+                banking_campaign_config("01a06327-329f-7443-a211-11f3dee1841c"),
+                SEED,
+            );
+            runtime.set_record_path(record_path.clone());
+            runtime.join_for_test();
+            // Anywhere in any Bevy system. The runtime is dropped by the
+            // unwind, which is the only teardown this session will ever get.
+            panic!("a system panicked with a joined campaign session live");
+        }));
+        assert!(unwound.is_err(), "the panic must actually have unwound");
+
+        let rows = std::fs::read_to_string(&record_path).unwrap_or_else(|error| {
+            panic!(
+                "the banking row must survive a panic teardown, but {} could not be read: {error}",
+                record_path.display()
+            )
+        });
+        assert_eq!(
+            rows.lines().count(),
+            1,
+            "a panicking client banks exactly the one session it flew"
+        );
+        let row: serde_json::Value =
+            serde_json::from_str(rows.trim()).expect("one signed banking row");
+        assert_eq!(row["session_id"], "01a06327-329f-7443-a211-11f3dee1841c");
+        assert!(
+            row["measurement_signature"]
+                .as_str()
+                .is_some_and(|signature| !signature.is_empty()),
+            "the surviving row is the signed one, not a placeholder"
+        );
+    }
+
+    /// #947 defect 5: "no row" meant two opposite things and said neither.
+    ///
+    /// Both values here are production-reachable: a refused dial reaches
+    /// `NothingMeasured`, and a session whose row was minted with nowhere
+    /// durable to put it reaches `Lost` — which is the state defect 1
+    /// produced on every teardown before this change.
+    #[test]
+    fn a_finished_row_reports_where_it_ended_up() {
+        let mut nothing = campaign::CampaignRuntime::launch(
+            banking_campaign_config("01a06327-329f-7443-a211-11f3dee1841d"),
+            SEED,
+        );
+        nothing.refuse_for_test("the campaign is full");
+        assert!(nothing.finish_record().is_none());
+        assert_eq!(
+            nothing.record_disposition(),
+            campaign::RecordDisposition::NothingMeasured,
+            "a refused dial measured nothing; that is not an anomaly"
+        );
+
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let record_path = temporary.path().join("campaign-records.jsonl");
+        let mut banked = campaign::CampaignRuntime::finished_for_test(
+            banking_campaign_config("01a06327-329f-7443-a211-11f3dee1841e"),
+            SEED,
+        );
+        banked.set_record_path(record_path.clone());
+        assert!(banked.finish_record().is_some());
+        assert_eq!(
+            banked.record_disposition(),
+            campaign::RecordDisposition::Persisted,
+            "a row that reached disk says so"
+        );
+        assert!(record_path.exists());
+
+        let mut lost = campaign::CampaignRuntime::finished_for_test(
+            banking_campaign_config("01a06327-329f-7443-a211-11f3dee1841f"),
+            SEED,
+        );
+        assert!(lost.finish_record().is_some());
+        assert_eq!(
+            lost.record_disposition(),
+            campaign::RecordDisposition::Lost,
+            "a row minted with nowhere to go is the loss, and must be named one"
+        );
+    }
+
+    /// #947 defect 4: the anomaly counters must reach the file a volunteer
+    /// sends back, not only the F3 pane that is closed by default.
+    ///
+    /// `banked_minutes` is asserted alongside them because it is the wire
+    /// contract `scripts/p4-attempt-accounting.py` reads by name
+    /// (`row.get("banked_minutes")`); these fields are additions, and a rename
+    /// would break attempt assembly.
+    #[test]
+    fn the_telemetry_row_carries_the_anomaly_counters_and_keeps_banked_minutes() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let telemetry_path = temporary.path().join("session.jsonl");
+        let mut sink = JsonlTelemetry::open(&telemetry_path).expect("open telemetry");
+        sink.append(&OverlayMetrics::new(telemetry_path.clone()))
+            .expect("append one row");
+        drop(sink);
+
+        let rows = std::fs::read_to_string(&telemetry_path).expect("read telemetry");
+        let row: serde_json::Value =
+            serde_json::from_str(rows.lines().next().expect("one row")).expect("telemetry JSON");
+        let row = &row["values"];
+        assert!(
+            row.get("banked_minutes").is_some(),
+            "the assembly script reads this key by name; it must not move"
+        );
+        for field in [
+            "uplink_shed",
+            "downlink_undecodable",
+            "delivered_unroutable",
+            "delivered_foreign",
+            "afk_capped",
+        ] {
+            assert!(
+                row.get(field).is_some(),
+                "a lost session must be diagnosable from the shipped row: missing {field}"
+            );
+        }
+    }
+
     /// #942: a session that never reached a joined tick still banks nothing.
     ///
     /// The guard the two fixes above must not have loosened. `finish_record`
@@ -3133,6 +3296,7 @@ mod tests {
             banking_campaign_config("01a06327-329f-7443-a211-11f3dee1841a"),
             SEED,
         );
+        runtime.set_record_path(campaign_record_path(&telemetry_path));
         runtime.refuse_for_test("the campaign is full");
         let mut app = banking_app(&telemetry_path);
         app.insert_resource(ActiveSession::Campaign(Box::new(runtime)));
@@ -3400,7 +3564,8 @@ mod tests {
             island_seats: Some(1),
             roster_url: None,
         };
-        let runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
+        let mut runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
+        runtime.set_record_path(campaign_record_path(&telemetry_path));
         let mut app = App::new();
         app.insert_resource(ActiveSession::Campaign(Box::new(runtime)))
             .insert_resource(OverlayMetrics::new(telemetry_path.clone()))
@@ -3481,7 +3646,8 @@ mod tests {
                 island_seats: Some(1),
                 roster_url: None,
             };
-            let runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
+            let mut runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
+            runtime.set_record_path(campaign_record_path(&telemetry_path));
             let mut app = App::new();
             app.insert_resource(ActiveSession::Campaign(Box::new(runtime)))
                 .insert_resource(OverlayMetrics::new(telemetry_path.clone()))
