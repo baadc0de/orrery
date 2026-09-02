@@ -1145,4 +1145,248 @@ mod tests {
             wipe(&store, account, &[]).await;
         }
     );
+
+    // ---------------------------------------------------------------------
+    // #862 acceptance box 1: the executor writes a `ya` row and a *subsequent
+    // mint reads it*. Both halves are deployed —
+    // `orrery_persistd/src/bin/persistd.rs` builds `FdbStrikeLedger`, and
+    // `orrery_identity/src/bin/orrery-identity.rs` builds
+    // `FdbStrikeRowSource` — but until now nothing exercised the seam
+    // *between* them. The write was proven by a spawned binary
+    // (`persistd_ruleset_registration::reference_ruleset_binary_strike_modes_reach_the_durable_ledger`)
+    // and the refusal was proven over synthetic in-memory rows
+    // (`orrery_identity/tests/served.rs`), which is exactly the "two unit
+    // tests" the acceptance box refuses to accept. These two drive the real
+    // writer and the real reader against one cluster, so a divergence in the
+    // `ya` key layout or the postcard row encoding fails here rather than in
+    // a deployment.
+
+    /// The strike family is the executor's, so this suite clears its own
+    /// `ya` range as well as the `d` rows `wipe` already owns.
+    async fn wipe_strikes(store: &FdbAccountStore, account: AccountId) {
+        let db = Arc::clone(&store.db);
+        let start = strike_account_range_start(account);
+        let end = strike_account_range_end(account);
+        let _ = db
+            .run(|trx, _| {
+                let start = start.clone();
+                let end = end.clone();
+                async move {
+                    trx.clear_range(&start, &end);
+                    Ok(())
+                }
+            })
+            .await;
+    }
+
+    /// One D33 clause (a) major finding, distinguished by `seed` so the
+    /// ledger's evidence-digest dedup treats two calls as two facts.
+    fn major_row(
+        issued_at_ms: u64,
+        seed: u8,
+        mode: orrery_persistd::adjudication::StrikeMode,
+    ) -> StrikeRow {
+        StrikeRow {
+            issued_at_ms,
+            weight_milli: orrery_persistd::adjudication::MAJOR_STRIKE_WEIGHT_MILLI,
+            kind: orrery_persistd::adjudication::StrikeKind::Deviation,
+            evidence_ref: orrery_persistd::adjudication::StrikeEvidenceRef {
+                entity: orrery_protocol::PersistId::new(862),
+                window_start: orrery_protocol::Tick::new(1),
+                window_end: orrery_protocol::Tick::new(2),
+                digest: [seed; 32],
+            },
+            ruleset: orrery_protocol::RulesetId {
+                version: 1,
+                digest: [1; 32],
+            },
+            mode,
+            expires_at_ms: issued_at_ms + orrery_persistd::adjudication::STRIKE_RETENTION_MS,
+        }
+    }
+
+    /// Bind `node` to `account` through identity's own writer, then file
+    /// `rows` through the executor's own writer, and return the reader the
+    /// `orrery-identity` binary uses.
+    async fn file_through_the_real_ledger(
+        store: &FdbAccountStore,
+        account: AccountId,
+        node: &NodeId,
+        at_ms: u64,
+        rows: &[StrikeRow],
+    ) -> FdbStrikeRowSource {
+        use orrery_persistd::adjudication::{
+            FdbStrikeLedger, OffenceTime, StrikeFileOutcome, StrikeLedger,
+        };
+
+        store
+            .create_account(account, at_ms)
+            .await
+            .expect("create account");
+        assert_eq!(
+            store.bind(account, node, at_ms).await.expect("bind"),
+            BindOutcome::Bound
+        );
+
+        let ledger = FdbStrikeLedger::from_database(Arc::clone(&store.db));
+        for row in rows {
+            assert_eq!(
+                ledger
+                    .file(*node, OffenceTime::KnownMs(at_ms + 1), row, None)
+                    .expect("the executor files against the resolved binding"),
+                StrikeFileOutcome::Filed { account },
+                "attribution must resolve through the `db`/`dh` rows identity wrote"
+            );
+        }
+
+        FdbStrikeRowSource::from_database(Arc::clone(&store.db))
+    }
+
+    fdb_test!(
+        a_filed_ya_row_is_read_back_by_the_deployed_reader_and_refuses_the_mint,
+        |store| async move {
+            use crate::service::StandingSource;
+            use crate::ComputedStanding;
+            use orrery_persistd::adjudication::StrikeMode;
+
+            let account = account(0x8621);
+            let node = node(0x71);
+            wipe(&store, account, &[node]).await;
+            wipe_strikes(&store, account).await;
+
+            let at_ms = 1_000_000;
+            // Two majors is 6.0, over C (5.0) and under the ban band (7.0).
+            let source = file_through_the_real_ledger(
+                &store,
+                account,
+                &node,
+                at_ms,
+                &[
+                    major_row(at_ms + 1, 1, StrikeMode::Live),
+                    major_row(at_ms + 1, 2, StrikeMode::Live),
+                ],
+            )
+            .await;
+
+            // The reader decodes the writer's bytes: same count, same weights,
+            // same mode. A keyspace or postcard drift dies on this assertion.
+            let read = crate::standing::StrikeRowSource::rows(&source, account)
+                .await
+                .expect("the deployed reader reads the deployed writer's rows");
+            assert_eq!(
+                read.len(),
+                2,
+                "both filed `ya` rows are visible to identity"
+            );
+            assert!(
+                read.iter().all(|row| row.mode == StrikeMode::Live
+                    && row.weight_milli
+                        == orrery_persistd::adjudication::MAJOR_STRIKE_WEIGHT_MILLI),
+                "the round-trip preserves mode and weight: {read:?}"
+            );
+
+            // And the mint decision follows those rows, through the same
+            // `CooldownStanding` the `orrery-identity` binary constructs.
+            let store = Arc::new(store);
+            let scorer = ComputedStanding::new(
+                source,
+                move || at_ms + 1,
+                crate::standing::DEFAULT_STANDING_THRESHOLDS,
+            )
+            .expect("the default policy package is coherent");
+            let standing = crate::CooldownStanding::new(Arc::clone(&store), scorer);
+            assert!(
+                matches!(
+                    standing.standing(account, store.as_ref()).await,
+                    Err(IdentityError::Cooldown(refused)) if refused == account
+                ),
+                "a mint after a real filing is refused, not stamped Good"
+            );
+
+            // The refusal is what #934's producer publishes, so the same
+            // filing also reaches the coordinator's feed.
+            assert!(
+                store
+                    .cooldown_entry(account)
+                    .await
+                    .expect("read entry")
+                    .is_some(),
+                "the refused mint left the durable `dc` row the feed reads"
+            );
+
+            wipe_strikes(&store, account).await;
+            wipe(&store, account, &[node]).await;
+        }
+    );
+
+    // #862 acceptance box 4, on the wired path rather than the scorer's own
+    // fixtures: `standing.rs` proves shadow rows are inert against
+    // hand-built rows, and the spawned-binary test proves `--strikes shadow`
+    // stamps `Shadow` durably. This joins them — rows the executor really
+    // wrote, read through the reader the binary really uses, changing no
+    // standing.
+    fdb_test!(
+        shadow_ya_rows_read_through_the_deployed_reader_change_no_standing,
+        |store| async move {
+            use crate::service::StandingSource;
+            use crate::ComputedStanding;
+            use orrery_persistd::adjudication::StrikeMode;
+
+            let account = account(0x8622);
+            let node = node(0x72);
+            wipe(&store, account, &[node]).await;
+            wipe_strikes(&store, account).await;
+
+            let at_ms = 1_000_000;
+            // The same two majors that refused above, stamped shadow.
+            let source = file_through_the_real_ledger(
+                &store,
+                account,
+                &node,
+                at_ms,
+                &[
+                    major_row(at_ms + 1, 3, StrikeMode::Shadow),
+                    major_row(at_ms + 1, 4, StrikeMode::Shadow),
+                ],
+            )
+            .await;
+
+            let read = crate::standing::StrikeRowSource::rows(&source, account)
+                .await
+                .expect("read filed rows");
+            assert_eq!(read.len(), 2, "shadow filings are durable rows, not drops");
+            assert!(
+                read.iter().all(|row| row.mode == StrikeMode::Shadow),
+                "the mode stamp survives the round-trip: {read:?}"
+            );
+
+            let store = Arc::new(store);
+            let scorer = ComputedStanding::new(
+                source,
+                move || at_ms + 1,
+                crate::standing::DEFAULT_STANDING_THRESHOLDS,
+            )
+            .expect("the default policy package is coherent");
+            let standing = crate::CooldownStanding::new(Arc::clone(&store), scorer);
+            assert_eq!(
+                standing
+                    .standing(account, store.as_ref())
+                    .await
+                    .expect("a shadow ledger still mints"),
+                orrery_protocol::SessionStanding::Good,
+                "D32 C5 shadow files the fact and changes no standing"
+            );
+            assert!(
+                store
+                    .cooldown_entry(account)
+                    .await
+                    .expect("read entry")
+                    .is_none(),
+                "a shadow filing must not manufacture a `dc` row for the feed"
+            );
+
+            wipe_strikes(&store, account).await;
+            wipe(&store, account, &[node]).await;
+        }
+    );
 }
