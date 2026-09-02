@@ -304,42 +304,176 @@ pub trait RampPostureReader: Send + Sync {
 pub type SharedRampPostureReader = std::sync::Arc<dyn RampPostureReader>;
 
 /// FoundationDB adapter for D32's rarely-written, one-second-polled rows.
+///
+/// # Authentication happens here because this is where the bytes are
+///
+/// [`admitted`] is the seam every poller reads through, and it stays that way.
+/// It cannot do clause (i)'s job, and the reason is structural rather than a
+/// matter of preference: `admitted` takes a [`RampPosture`], and a
+/// `RampPosture` has no signature, no signer and no expiry. Those live in the
+/// [`super::posture::SignedRampPosture`] envelope, which exists only between
+/// the FoundationDB `get` and the postcard decode — inside this method and
+/// nowhere else. By the time a poller holds a row, the authenticator is gone.
+///
+/// So the two checks are one pipeline at two altitudes, not two competing
+/// seams:
+///
+/// | Layer | Question | Needs |
+/// |---|---|---|
+/// | `FdbRampPostureStore::read` | *who wrote this?* — signature, signer, control binding, expiry, C2's closed arm | the stored bytes |
+/// | [`admitted`] / [`RampPosture::admissible`] | *was anyone allowed to write this at all?* | the decoded row |
+/// | [`RampPosture::admissible_from`] | *is this a legal transition from what we are doing now?* | the poller's acting mode |
+///
+/// Each is strictly narrower than the last and each refuses independently. A
+/// row must clear all three, and a row that clears authentication still faces
+/// `admitted` at the poller — which is why deleting either layer is a real
+/// regression rather than a tidy-up.
+///
+/// **A refused row is reported as an absent one**, which is
+/// [`admitted`]'s landed convention and now this method's too. The control
+/// falls back to the startup default an operator chose at launch, rather than
+/// to any value a writer asserted. See [`super::posture::PostureVerdict`] for
+/// why that beats "fall to shadow".
 #[cfg(feature = "fdb")]
 pub struct FdbRampPostureStore {
     db: std::sync::Arc<foundationdb::Database>,
+    operator_keys: Vec<orrery_protocol::NodeId>,
 }
 
 #[cfg(feature = "fdb")]
 impl FdbRampPostureStore {
-    /// Construct from the process-scoped FDB context.
+    /// Construct from the process-scoped FDB context, trusting no operator key.
+    ///
+    /// The empty set is the safe default and not a placeholder: a process
+    /// configured with no `--operator-key` refuses every operator row it finds,
+    /// which is the correct posture for a process that has been told about no
+    /// operator. Add keys with [`Self::with_operator_keys`].
     #[must_use]
     pub fn from_context(context: &crate::FdbContext) -> Self {
         Self {
             db: context.database(),
+            operator_keys: Vec::new(),
         }
     }
 
-    /// Read one control's posture. An absent row means the CLI default.
+    /// Trust this `--operator-key` set for clause (i) verification.
+    #[must_use]
+    pub fn with_operator_keys(
+        mut self,
+        keys: impl IntoIterator<Item = orrery_protocol::NodeId>,
+    ) -> Self {
+        self.operator_keys = keys.into_iter().collect();
+        self
+    }
+
+    /// Read one control's posture, verified per D32 clause (i).
+    ///
+    /// See the type docs for the three outcomes. Wall clock is read here
+    /// because the expiry rule is about the fleet's time, not the row's; the
+    /// clock-injected form is [`super::posture::verdict`], which every unit
+    /// test uses.
+    ///
+    /// # Errors
+    ///
+    /// Only a FoundationDB transaction failure. A row this process refuses is
+    /// **not** an error — an error makes a poller retain its last known mode,
+    /// which is exactly the "retaining the unverified mode" clause (i) forbids.
     pub async fn read(&self, control: &str) -> Result<Option<RampPosture>, RampPostureError> {
+        let db = std::sync::Arc::clone(&self.db);
+        let key = crate::keyspace::ramp_key(control);
+        let value: Option<Vec<u8>> = db
+            .run(move |transaction, _| {
+                let key = key.clone();
+                async move {
+                    Ok(transaction
+                        .get(&key, false)
+                        .await?
+                        .map(|bytes| bytes.as_ref().to_vec()))
+                }
+            })
+            .await
+            .map_err(|error: foundationdb::FdbBindingError| {
+                RampPostureError(format!("read ramp posture transaction: {error}"))
+            })?;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        Ok(
+            match super::posture::verdict(control, value.as_deref(), &self.operator_keys, now_ms) {
+                super::posture::PostureVerdict::StartupDefault => None,
+                super::posture::PostureVerdict::Admitted(posture) => Some(posture),
+                super::posture::PostureVerdict::Refused(refusal) => {
+                    // `error`, and the same shape `admitted` logs in: a row that
+                    // reached FoundationDB and was refused is an incident, and
+                    // the two refusals should read alike in a log because they
+                    // are two halves of one rule.
+                    tracing::error!(
+                        control,
+                        %refusal,
+                        "refusing a durable ramp posture that failed D32 clause (i) \
+                         verification; falling back to this control's startup default"
+                    );
+                    None
+                }
+            },
+        )
+    }
+
+    /// Write one already-signed posture row.
+    ///
+    /// This takes a [`super::posture::SignedRampPosture`] and not a
+    /// [`RampPosture`], and there is no overload that takes the latter: the
+    /// type system is where "an unauthenticated posture write does not exist"
+    /// is stated. Signing is [`super::posture::sign_posture`], which needs the
+    /// operator secret this process does not hold — `persistd` links this
+    /// method and can never call it usefully.
+    ///
+    /// # Errors
+    ///
+    /// A FoundationDB transaction failure, or a postcard encoding failure.
+    pub async fn write(
+        &self,
+        control: &str,
+        row: &super::posture::SignedRampPosture,
+    ) -> Result<(), RampPostureError> {
+        let value = super::posture::encode(row)
+            .map_err(|error| RampPostureError(format!("encode ramp posture: {error}")))?;
+        let db = std::sync::Arc::clone(&self.db);
+        let key = crate::keyspace::ramp_key(control);
+        db.run(move |transaction, _| {
+            let (key, value) = (key.clone(), value.clone());
+            async move {
+                transaction.set(&key, &value);
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|error: foundationdb::FdbBindingError| {
+            RampPostureError(format!("write ramp posture transaction: {error}"))
+        })
+    }
+
+    /// Remove one control's posture row, restoring the CLI startup default.
+    ///
+    /// # Errors
+    ///
+    /// A FoundationDB transaction failure.
+    pub async fn clear(&self, control: &str) -> Result<(), RampPostureError> {
         let db = std::sync::Arc::clone(&self.db);
         let key = crate::keyspace::ramp_key(control);
         db.run(move |transaction, _| {
             let key = key.clone();
             async move {
-                let Some(bytes) = transaction.get(&key, false).await? else {
-                    return Ok(None);
-                };
-                let posture = postcard::from_bytes(bytes.as_ref()).map_err(|error| {
-                    foundationdb::FdbBindingError::new_custom_error(Box::new(RampPostureError(
-                        format!("decode ramp posture: {error}"),
-                    )))
-                })?;
-                Ok(Some(posture))
+                transaction.clear(&key);
+                Ok(())
             }
         })
         .await
         .map_err(|error: foundationdb::FdbBindingError| {
-            RampPostureError(format!("read ramp posture transaction: {error}"))
+            RampPostureError(format!("clear ramp posture transaction: {error}"))
         })
     }
 }

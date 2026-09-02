@@ -89,6 +89,14 @@ name = "world-census"
 path = "src/bin/world-census.rs"
 required-features = ["fdb"]
 
+# D32 clause (i)'s operator-plane signer. It writes FoundationDB, but its
+# authority is the operator key alone: every row it produces is re-verified by
+# every `persistd` on the next poll.
+[[bin]]
+name = "orrery-ramp"
+path = "src/bin/orrery-ramp.rs"
+required-features = ["fdb"]
+
 [[bench]]
 name = "journal_latency"
 harness = false

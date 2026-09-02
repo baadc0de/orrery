@@ -37,6 +37,42 @@ invariant auditor that clause (g) wires into the ramp as a gate. Where a
 decision belongs to those records, it is listed under Open questions rather
 than guessed.
 
+**Amended 2026-09-02, after acceptance ([#863], [#875], spike [#932]).** Open
+question 1 (the posture row's writer authentication) and open question 3 (C2's
+`off` arm) are closed by the new clause **(i)**, which is written below and
+struck through where it replaces them. The amendment rules three things: posture
+writes are authenticated at the *reader* by an operator signature carried in the
+row; C2's `off` arm does not exist, leaving `live → shadow` as its only
+demotion; and a write that leaves a control below its clause (c) default carries
+a mandatory expiry, after which every poller reverts to the startup default.
+Clauses (a) through (h) are untouched — in particular clause (f)'s asymmetry is
+unchanged, and clause (i) makes it a verifier predicate rather than a property
+of how auto-suspend happens to be written. The spike's proposed text called the
+new clause "(h)"; that letter was already taken by D29's annulment-on-expiry
+ruling, so it lands as (i) with no other change of substance.
+
+**Two defects in the spike's own statement, corrected here and flagged rather
+than reworded quietly.** The owner accepted the *substance* — reader-side
+verification, no C2 `off` arm, a mandatory expiry on de-hardening — and none of
+that changes. What changes is two places where the spike's prose did not say
+what it meant, both found by [#876](https://github.com/baadc0de/orrery/issues/876)'s
+lane while implementing clause (f):
+
+1. **The automation arm is a conjunction, not a rank comparison.** The spike
+   wrote it as `rank(row.mode) >= rank(current) => refuse`. Because `off` ranks
+   *below* `live`, that admits `AutoSuspend → off` from a live control — the
+   exact "induce spikes, blind the cluster" lever clause (f) forbids by name.
+   Clause (i) below states both halves: `shadow` only (the row), **and** a
+   strict lowering of the acting rank (the transition).
+2. **A refused row falls back to the startup default, not to `shadow`.** The
+   spike said `shadow`. That would hand anyone who can write FoundationDB a way
+   to push all four `off`-default controls into `shadow` and make the fleet pay
+   clause (d)'s write tax — a denial-of-service against enforcement wearing the
+   costume of a safe fallback. Falling back to the operator's launch-time
+   default gives that writer nothing, and matches what the shipped seam already
+   does for the row-class refusal.
+
+
 ## Context
 
 Seven facts about the landed tree, each read before it was written here.
@@ -671,6 +707,90 @@ question by declining to create the flag. Expiry remains instrumented and
 alarms as an incident per D29 clause 9(b) — a nonzero annulment rate is
 either an attack or a ruleset bug, and both page somebody.
 
+### (i) Posture writes are authenticated at the reader, by an operator signature in the row
+
+> **A `ramp/{control}` row whose `source` is `Operator` takes effect only if it
+> carries an Ed25519 signature by a key in the process's `--operator-key` set,
+> over the domain-separated preimage below, and every `persistd` verifies it on
+> the poll before applying the mode. Possession of the FoundationDB cluster file
+> is therefore not authority over fleet enforcement posture. An unsigned or
+> badly-signed row is refused, and a refused row is treated exactly as an
+> **absent** one: the control falls back to the startup default an operator
+> chose at launch, never to the unverified mode and never to any mode a writer
+> asserted. A row whose `source` is `AutoSuspend` needs no signature — a
+> tripping gateway holds no operator key and must not — and is admitted only if
+> it satisfies **both** halves of clause (f)'s asymmetry: it selects `shadow`
+> (a property of the row), **and** it strictly lowers the rank the control is
+> acting at (a property of the transition, applied by the poller, which is the
+> only thing that knows the acting mode). The two are a conjunction and not a
+> rank comparison — `off` ranks below `live`, so a rank test alone would admit
+> automation blinding a live control, which is the denial-of-service clause (f)
+> forbids by name.**
+
+```
+preimage = blake3("orrery/d32/ramp-posture/v1\0"
+                ‖ u32le(len(control)) ‖ control
+                ‖ u8(mode) ‖ u8(source) ‖ u64le(set_at_ms)
+                ‖ u32le(len(reason)) ‖ reason
+                ‖ opt(incident_id) ‖ opt(expires_at_ms))
+```
+
+`Off=0 Shadow=1 Live=2` for mode; `Default=0 Operator=1 AutoSuspend=2` for
+source; `opt(x)` is `0x00` or `0x01 ‖ x`. The domain-separation constant is
+first so a posture signature can never be replayed as any other Orrery
+signature, and the control name is bound second so a signature for one control
+cannot be replayed at another's key — a legitimately signed
+`ramp/authority_correction = off` could otherwise be copied to `ramp/strikes`
+by anyone with write access, a valid signature authorising a posture nobody
+authorised. Both fields are load-bearing and the implementing change carries a
+failing-if-removed check for each.
+
+**Why a refusal falls back to the startup default and not to `shadow`.** The
+startup default is a value an operator chose at launch; `shadow` on a refusal
+would be a value a *forger* selected. Under "fall to shadow", anyone who can
+write FoundationDB can move all four `off`-default controls into `shadow` and
+make the fleet pay clause (d)'s write tax for as long as the row sits there —
+the same "induce spikes, blind the cluster" shape clause (f) refuses for
+auto-suspend, pointed the other way. Falling back to the startup default gives
+that writer nothing at all. It also keeps **one** fallback in the system rather
+than two, so a refused row lands in the same place whichever check refused it.
+The refusal is logged at `error` per control per poll with its reason, so the
+row is visible as an incident rather than as a quiet mode change.
+
+`--operator-key` follows `--coordinator-key`'s shape and convention exactly: a
+repeatable `<key-id>@<public-key>` verifying-key set on the CLI, checked at the
+consumer, so a rotation deploys with an overlap. Operator key custody, issuance
+and rotation are [D41](0041-offline-identity-issuer-custody-and-lifecycle.md)'s,
+not this record's; this clause names the dependency and invents no custody
+scheme.
+
+**The row gains an at-rest schema discriminant rather than appended fields.**
+Measured 2026-09-02 against a live cluster: appending the authenticator to
+`RampPosture` yields bytes the pre-amendment reader decodes *successfully*,
+silently discarding the signature, because postcard is positional and
+prefix-tolerant. A rolling upgrade would therefore leave un-upgraded processes
+obeying unauthenticated rows while the mechanism appeared deployed. The value
+is therefore tagged per [D38](0038-at-rest-schema-versioning.md) with a leading
+schema byte the pre-amendment reader **refuses**, and the implementing change
+proves that refusal with a test that decodes a new value with the old reader.
+Schema numbers `0`–`2` are unallocated by construction: the pre-amendment value
+is untagged, and those three byte values are exactly `RampMode`'s postcard
+discriminants, which an old reader would half-read instead of rejecting. The
+first tagged schema is **3**.
+
+**A write that leaves a control below its clause (c) startup default carries a
+mandatory `expires_at_ms`, and is refused without one; past that instant every
+poller reverts to the startup default.** Promotions carry none, so clause (f)'s
+asymmetry is preserved exactly: the lever hardens freely and permanently, and
+weakens only temporarily, only under an operator signature, and only as far as
+`shadow`. De-hardening is defined against this record's own default table
+(`rank(mode) < rank(default(control))`, `Off=0 Shadow=1 Live=2`), not against
+intuition — `off` is not uniformly "safer", and for the four controls that
+default to `off` nothing can go below the default, so the rule binds exactly
+one control today. It exists so that an incident demotion cannot outlive its
+incident by inattention: nothing alerts on a posture row, because a posture row
+is supposed to sit there.
+
 ## Consequences
 
 - **Five CLI arguments and no new keyspace family land in `persistd`.** The
@@ -800,24 +920,36 @@ either an attack or a ruleset bug, and both page somebody.
 
 ## Open questions
 
-1. **The posture row's writer authentication.** Anything that can write
-   `ramp/strikes` can silence enforcement fleet-wide, so the row's trust
-   level is "coordinator-key-equivalent" at least. Whether posture writes
-   are direct FDB access by an ops tool (D12's operator plane) or a signed
-   envelope verified by `persistd` is deployment work this record does not
-   guess at.
+1. ~~**The posture row's writer authentication.**~~ **Closed 2026-09-02 by
+   clause (i): the operator's Ed25519 signature is stored in the row and
+   verified by every `persistd` before the posture may take effect.** The
+   record named two candidates — a direct FDB write by an ops tool, or a
+   signed envelope verified by `persistd`. The spike behind [#932] measured
+   both against a live cluster and found the second is really two mechanisms
+   with different trust boundaries: an envelope verified at *write* time
+   authenticates the API and leaves the stored row a plain byte string, and
+   the spike demonstrated the bypass by verifying the envelope and then
+   writing the row directly. Both of those make the row's trust level
+   "cluster-file-equivalent", which is strictly below this question's own
+   stated floor of "coordinator-key-equivalent", because the cluster file is
+   held by every process that stores anything. Verification at the *reader*
+   is the only candidate that clears the floor, and it is the same placement
+   that makes `--coordinator-key` mean anything.
 2. **Posture-row retention.** Incident history argues for keeping superseded
    rows (who suspended what, when, why); the checkpoint pass sweeps
    everything with a deadline. Keeping an append-only shadow of posture
    changes in the journal archive (D11's event source) is the likely answer
    and is [#221]-adjacent tooling, not keyspace design.
-3. **Whether C2's `off` arm should exist at all.** It is specified for
-   symmetry, but its only use is responding to a mass-quarantine bug by
-   treating quarantined sessions as `Good` on the intent path — and the same
-   incident also makes those accounts witness-eligible again only if the
-   *token* standing changes, which is identity's lever, not the gateway's.
-   If [#205]/[#219] conclude partial demotion is incoherent, dropping the
-   arm narrows the enum; the compiler will find every site either way.
+3. ~~**Whether C2's `off` arm should exist at all.**~~ **Closed 2026-09-02 in
+   the negative by clause (i): it does not exist.** C2's only durable
+   demotion is `live → shadow`, which keeps observing, matching clause (f)'s
+   "fallback is shadow, never off" applied to the operator's lever for
+   consistency. The arm's only use was to treat quarantined sessions as
+   `Good` on the intent path while witness eligibility stayed unchanged —
+   half of a two-sided property, which is a hole rather than a lever. The
+   verifier refuses `ramp/quarantine_validation = off` even when the row is
+   correctly signed, so no key holder can select it; the enum narrows and the
+   compiler finds every site.
 4. **Cross-process aggregation for the auto-suspend trigger.** Local
    detection with global effect is simple and conservative, but a fleet-wide
    median computed by the coordinator (or the ops plane) would see spikes
@@ -841,6 +973,9 @@ either an attack or a ruleset bug, and both page somebody.
 [#224]: https://github.com/baadc0de/orrery/issues/224
 [#226]: https://github.com/baadc0de/orrery/issues/226
 [#248]: https://github.com/baadc0de/orrery/issues/248
+[#863]: https://github.com/baadc0de/orrery/issues/863
+[#875]: https://github.com/baadc0de/orrery/issues/875
+[#932]: https://github.com/baadc0de/orrery/pull/932
 [ADR-0031]: 0031-id-account-subspace.md
 [ADR-0035]: 0035-lease-key-discriminator.md
 [ADR-0051]: 0051-v1-terrain-is-not-durable-state.md
