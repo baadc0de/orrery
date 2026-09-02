@@ -125,21 +125,42 @@ host.
 
 ### 4. The byte budget closes, recounted
 
+> **Amended 2026-09-02 (owner-authorised), on the acceptance of [ADR-0051].**
+> D51 withdraws the `k` family (`chunk/`, the v1 terrain allocation that no
+> writer ever populated), so the recount below drops from eighteen registered
+> families to seventeen and its last line goes from zero to **one clean prefix
+> byte**. The numbers in the block are corrected in place; the record of what
+> they were is this note. (One thing the block does not re-sort: `y` and `z`
+> have since landed as registered families — `strike/` and `jarchive/` — and
+> the block still counts them once, on the accepted-allocation line, so the
+> sum is the same whichever line they sit on; `registered_families()` in the
+> tree therefore lists nineteen prefixes today, seventeen of which are the
+> line above.) The recovered byte is **not pre-spent** — D51 §(c)
+> leaves it to the normal allocation decision [ADR-0032] clause (c)'s rule
+> requires — and nothing in this record's decision moves: the lease registrar
+> row is landed as `le` inside `l`, and it was [ADR-0032]'s rule directing
+> sub-discrimination, not only the arithmetic, that put it there. What this
+> amendment changes is the *second* sentence of the closing paragraph: the
+> own-prefix-byte option is no longer "closed by arithmetic"; it is closed by
+> this record's accepted decision, and reopening it would be spending the
+> recovered byte, which is a dedicated allocation decision and not a lease
+> question.
+
 [ADR-0032] clause (c)'s allocation rule — free list = lowercase bytes minus
 `registered_families()` minus every byte an accepted record allocates or
 earmarks — recomputed from the tree and the accepted record set alone:
 
 ```text
 lowercase bytes                              26
-taken as registered families                18   a c d e f g i k l m n o p r s u v w
-                                                 (keyspace.rs:2665-2764)
+taken as registered families                17   a c d e f g i l m n o p r s u v w
+                                                 (keyspace.rs; k withdrawn by [ADR-0051])
 in use as exclusive range ends               6   b h j q t x
                                                  fence→b (:183)  attest→h (:910)
                                                  intent→j (:495) seedprog→q (:333)
                                                  seedmap→t (:299) world→x (:82)
 allocated by accepted records                2   y → strike/, z → jarchive/
                                                  ([ADR-0031] resolved question 4)
-cleanly free                                 0
+cleanly free                                 1   not pre-spent ([ADR-0051] §(c))
 ```
 
 This does not depend on any proposed record: [ADR-0031] is Accepted and its
@@ -381,3 +402,4 @@ acceptance, which is the owner's, and implementation, which is #226's.
 [#234]: https://github.com/baadc0de/orrery/pull/234
 [ADR-0031]: 0031-id-account-subspace.md
 [ADR-0032]: 0032-enforcement-ramp.md
+[ADR-0051]: 0051-v1-terrain-is-not-durable-state.md
