@@ -59,8 +59,8 @@ pub struct RestoreRequest {
 /// Why one candidate cannot be restored automatically.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RestoreRefusal {
-    /// No complete state-bearing record exists before the cut and the archive
-    /// does not prove that its history begins at journal genesis.
+    /// No complete state-bearing record exists before the cut, and the
+    /// selected range contains no spawn that positively proves prior absence.
     PreimageUnavailable,
 }
 
@@ -263,19 +263,29 @@ impl RestorePlanner {
             .collect();
 
         let mut cache = HashMap::<u64, Vec<StoredRecord>>::new();
+        // A spawn in the selected LSN/cell window is positive evidence that
+        // the entity was absent immediately before that spawn. It is the one
+        // case with no earlier image where an absence target is safe to
+        // construct. This evidence is independent of the optional author
+        // filter, which only selects whose touches are restore candidates.
         let mut candidates = BTreeMap::<PersistId, CellId>::new();
+        let mut spawned_in_selection = BTreeSet::<PersistId>::new();
         for row in selected_rows {
             let records = self.read_row(row, &mut cache)?;
             for stored in records {
                 let record = &stored.record;
-                if record.grid == request.selection.grid
+                let in_selection = record.grid == request.selection.grid
                     && cell_contains(
                         request.selection.start_cell,
                         request.selection.end_cell,
                         record.cell,
                     )
                     && request.selection.start_lsn <= stored.lsn
-                    && stored.lsn <= request.selection.end_lsn
+                    && stored.lsn <= request.selection.end_lsn;
+                if in_selection && record.kind == RecordKind::Spawn {
+                    spawned_in_selection.insert(record.entity);
+                }
+                if in_selection
                     && request
                         .selection
                         .author
@@ -316,10 +326,6 @@ impl RestorePlanner {
             }
         }
 
-        // A metadata row for segment zero proves this archive began at the
-        // journal's origin. L0 == 0:0 proves absence without any object.
-        let genesis_covered = request.selection.start_lsn == Lsn::new(0, 0)
-            || rows.iter().any(|row| row.segment_seq == 0);
         let mut entities = Vec::with_capacity(candidates.len());
         for (entity, grief_cell) in candidates {
             let disposition =
@@ -330,7 +336,7 @@ impl RestorePlanner {
                         cell: image.cell,
                         target: image.target,
                     }
-                } else if genesis_covered {
+                } else if spawned_in_selection.contains(&entity) {
                     RestoreDisposition::Restorable {
                         cell: grief_cell,
                         target: RestoreTarget::Absent,
