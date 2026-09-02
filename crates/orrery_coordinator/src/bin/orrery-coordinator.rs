@@ -115,6 +115,52 @@ struct Cli {
     // inherited variable would arm every coordinator a supervisor spawns.
     #[arg(long, value_name = "off|shadow|live", default_value = "off")]
     strikes: StrikesMode,
+
+    /// FoundationDB cluster file for identity's durable `d` family, which
+    /// supplies D33 clause (e)'s standing-invalidation feed.
+    ///
+    /// Without it C5 has a posture and nothing to act on: `standing_feed`
+    /// stays `None` and the sweep returns immediately, which is the shipped
+    /// default and the behaviour every existing deployment keeps. Supplying it
+    /// does not by itself enforce anything — `--strikes` still governs whether
+    /// an invalidation refuses a `Hello` or ends a session, and its default is
+    /// `off`.
+    ///
+    /// This is a path to a cluster file, not a posture, so unlike `--strikes`
+    /// it takes an environment fallback: an inherited value cannot arm a
+    /// control, only tell the process where to read.
+    #[cfg(feature = "standing-feed")]
+    #[arg(long, value_name = "PATH", env = "ORRERY_IDENTITY_CLUSTER_FILE")]
+    identity_cluster_file: Option<String>,
+}
+
+/// Build C5's feed when the operator pointed this coordinator at identity.
+///
+/// Returns `None` when no cluster file was given, which leaves
+/// `ServerConfig::standing_feed` at its `None` default. A cluster file that
+/// cannot be opened is a hard startup failure rather than a warning: an
+/// operator who asked for the feed and silently got none would believe C5 was
+/// armed while every invalidation went unread.
+#[cfg(feature = "standing-feed")]
+fn standing_feed(
+    cli: &Cli,
+) -> anyhow::Result<Option<orrery_coordinator::server::SharedStandingInvalidationFeed>> {
+    let Some(cluster_file) = cli.identity_cluster_file.as_deref() else {
+        return Ok(None);
+    };
+    let store = orrery_identity::fdb::FdbAccountStore::connect(cluster_file)
+        .map_err(|error| anyhow::anyhow!("--identity-cluster-file {cluster_file}: {error}"))?;
+    Ok(Some(Arc::new(
+        orrery_coordinator::standing_feed::IdentityStandingFeed::new(std::sync::Arc::new(store)),
+    )))
+}
+
+/// The build with no identity linkage: C5 has no feed to poll.
+#[cfg(not(feature = "standing-feed"))]
+fn standing_feed(
+    _cli: &Cli,
+) -> anyhow::Result<Option<orrery_coordinator::server::SharedStandingInvalidationFeed>> {
+    Ok(None)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -173,6 +219,7 @@ fn main() -> anyhow::Result<()> {
         strikes_posture: strikes_posture(&cli),
         #[cfg(feature = "fdb-state")]
         strikes_posture_reader,
+        standing_feed: standing_feed(&cli)?,
         ..ServerConfig::new(cli.issuer_key.iter().map(|key| key.0.clone()), issuer)
     };
 

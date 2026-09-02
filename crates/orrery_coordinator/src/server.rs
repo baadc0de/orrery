@@ -417,8 +417,27 @@ impl StandingState {
             .is_some_and(|watermark| *watermark > issued_at_ms)
     }
 
+    /// What an *open session* should do when the invalidation set changes.
+    ///
+    /// Separate from [`Self::hello_verdict`] only so each enforcement point
+    /// counts and logs itself; the posture rule is deliberately identical.
+    /// It has to be: D32 clause (b)'s shadow arm is "observe, do not act", and
+    /// a coordinator that refused no `Hello` but still cut live sessions would
+    /// be acting in shadow at the one enforcement point that is hardest for an
+    /// operator to see. `orrery_persistd`'s gateway already branches this way
+    /// before terminating (`standing_sweep`), and the two consumers of the
+    /// same feed must not disagree about what shadow means.
+    async fn session_verdict(&self, account: AccountId, issued_at_ms: u64) -> StandingVerdict {
+        self.verdict(account, issued_at_ms).await
+    }
+
     /// What `Hello` should do with these claims under the current posture.
     async fn hello_verdict(&self, account: AccountId, issued_at_ms: u64) -> StandingVerdict {
+        self.verdict(account, issued_at_ms).await
+    }
+
+    /// The one posture rule both enforcement points apply.
+    async fn verdict(&self, account: AccountId, issued_at_ms: u64) -> StandingVerdict {
         // Off observes nothing: not the predicate, not even its evaluation.
         let mode = self.posture.get();
         if mode == StrikesMode::Off {
@@ -1539,17 +1558,41 @@ async fn handle_connection(
                     break;
                 }
                 if let Some((account, issued_at_ms)) = session_identity {
-                    if shared.standing.invalidates(account, issued_at_ms).await {
-                        warn!(
-                            issuer = %remote,
-                            account = account.0,
-                            "coordinator: terminating a session whose tokens identity invalidated"
-                        );
-                        shared.standing_sessions_terminated.fetch_add(1, Ordering::Relaxed);
-                        // Breaking runs the ordinary disconnect path below:
-                        // presence forgotten, island roster rebroadcast, the
-                        // account out of every witness pool it sat in.
-                        break;
+                    // Posture-gated, exactly as the `Hello` path above is.
+                    // This arm used to call `invalidates` directly and break,
+                    // so a coordinator in *shadow* really cut live sessions
+                    // while only pretending to refuse Hellos — D32 clause (b)
+                    // shadow acting, at the enforcement point an operator is
+                    // least likely to notice. It was unreachable in a
+                    // deployment only because no binary supplied a feed;
+                    // wiring one is what made it reachable.
+                    match shared.standing.session_verdict(account, issued_at_ms).await {
+                        StandingVerdict::Admit => {}
+                        StandingVerdict::WouldRefuse => {
+                            shared
+                                .shadow_sessions_would_terminate
+                                .fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                target: STRIKES_SHADOW_TARGET,
+                                control = STRIKES_CONTROL,
+                                issuer = %remote,
+                                account = account.0,
+                                action = "would_terminate_session",
+                                "standing invalidation would have terminated this session; left connected in shadow"
+                            );
+                        }
+                        StandingVerdict::Refuse => {
+                            warn!(
+                                issuer = %remote,
+                                account = account.0,
+                                "coordinator: terminating a session whose tokens identity invalidated"
+                            );
+                            shared.standing_sessions_terminated.fetch_add(1, Ordering::Relaxed);
+                            // Breaking runs the ordinary disconnect path below:
+                            // presence forgotten, island roster rebroadcast, the
+                            // account out of every witness pool it sat in.
+                            break;
+                        }
                     }
                 }
             }

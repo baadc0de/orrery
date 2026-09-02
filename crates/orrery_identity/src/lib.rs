@@ -71,6 +71,7 @@
 #![warn(missing_docs)]
 
 pub mod cooldown;
+pub mod invalidation;
 pub mod invite;
 pub mod issuer;
 pub mod issuer_key_lifecycle;
@@ -84,6 +85,7 @@ pub mod window;
 pub mod fdb;
 
 pub use cooldown::CooldownStanding;
+pub use invalidation::StandingInvalidationSource;
 pub use invite::{
     is_uuid_v7, mint_invite, redeem_invite, uuid_v7, InviteCodeGenerator, InviteError,
     InviteLedger, InviteRedemptionError, MintedInvite, OsInviteCodeGenerator,
@@ -102,7 +104,7 @@ pub use standing::{
     score_rows, ComputedStanding, StandingLevel, StandingObservation, StandingScores,
     StandingThresholdError, StandingThresholds, StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
 };
-pub use store::{AccountStore, BindOutcome, CooldownEntry, IdentityError};
+pub use store::{AccountStore, BindOutcome, CooldownEntry, CooldownRecord, IdentityError};
 pub use window::{
     admit_binding_event, RateRefusal, BINDING_RATE_CAP_24H, BINDING_RATE_CAP_30D,
     BINDING_RATE_WINDOW_24H_MS, BINDING_RATE_WINDOW_30D_MS,

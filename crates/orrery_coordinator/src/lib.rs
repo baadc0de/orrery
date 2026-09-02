@@ -25,6 +25,8 @@ pub mod client;
 pub mod interest;
 pub mod registry;
 pub mod server;
+#[cfg(feature = "standing-feed")]
+pub mod standing_feed;
 pub mod witness;
 
 pub use client::{ClientError, CoordinatorClient};

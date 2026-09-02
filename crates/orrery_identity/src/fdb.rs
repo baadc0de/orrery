@@ -38,7 +38,7 @@
 //! wearing the signature of a hash probe. [`crate::MemAccountStore`] implements
 //! it because a lock-guarded map probe genuinely is tier 2.
 
-use crate::store::{AccountStore, BindOutcome, CooldownEntry, IdentityError};
+use crate::store::{AccountStore, BindOutcome, CooldownEntry, CooldownRecord, IdentityError};
 use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
 use foundationdb::options::MutationType;
@@ -282,6 +282,18 @@ fn cooldown_entry_key(account: AccountId) -> [u8; 10] {
     key[2..].copy_from_slice(&account.0.to_be_bytes());
     key
 }
+
+/// Inclusive start of the whole `dc` family: every cooldown entry sorts at or
+/// after `dc\0…`.
+const COOLDOWN_RANGE_START: [u8; 2] = [b'd', b'c'];
+
+/// Exclusive end of the whole `dc` family.
+///
+/// `dd` is not a key this crate writes; it is simply the successor of the two
+/// byte `dc` prefix, so `[dc, dd)` contains every 10-byte `dc ‖ account` row
+/// and nothing else. Deriving the bound from the prefix rather than from
+/// `account = u64::MAX` keeps it correct if the row ever grows a suffix.
+const COOLDOWN_RANGE_END: [u8; 2] = [b'd', b'd'];
 
 /// Read the fixed-width `dc` timestamp inside one transaction.
 async fn read_cooldown_entry(
@@ -620,6 +632,54 @@ impl AccountStore for FdbAccountStore {
             .await
             .map_err(unwrap_binding_error)
     }
+
+    async fn cooldown_entries(&self) -> Result<Vec<CooldownRecord>, IdentityError> {
+        // A snapshot read. This is a reporting sweep, not an admission
+        // decision: taking read conflict ranges over the entire family would
+        // make every poll conflict with every concurrent `observe_cooldown`,
+        // and the feed contract already tolerates a poll being one interval
+        // stale. `FdbStrikeRowSource::rows` reads snapshot for the same
+        // reason.
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                let mut stream = trx.get_ranges_keyvalues(
+                    foundationdb::RangeOption {
+                        begin: foundationdb::KeySelector::first_greater_or_equal(
+                            COOLDOWN_RANGE_START.as_slice(),
+                        ),
+                        end: foundationdb::KeySelector::first_greater_or_equal(
+                            COOLDOWN_RANGE_END.as_slice(),
+                        ),
+                        ..foundationdb::RangeOption::default()
+                    },
+                    true,
+                );
+                let mut records = Vec::new();
+                while let Some(kv) = stream.try_next().await? {
+                    let key: [u8; 10] = kv.key().try_into().map_err(|_| {
+                        custom(IdentityError::Store(
+                            "cooldown entry key decode: expected 10 bytes".into(),
+                        ))
+                    })?;
+                    let value: [u8; 8] = kv.value().try_into().map_err(|_| {
+                        custom(IdentityError::Store(
+                            "cooldown entry decode: expected 8 bytes".into(),
+                        ))
+                    })?;
+                    let mut account = [0u8; 8];
+                    account.copy_from_slice(&key[2..]);
+                    records.push(CooldownRecord {
+                        account: AccountId(u64::from_be_bytes(account)),
+                        entry: CooldownEntry {
+                            entered_at_ms: u64::from_be_bytes(value),
+                        },
+                    });
+                }
+                Ok(records)
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
 }
 
 #[cfg(test)]
@@ -676,6 +736,10 @@ mod tests {
                 async move {
                     trx.clear(&keyspace::account_key(account));
                     trx.clear(&keyspace::binding_window_key(account));
+                    // D33's `dc` entry is this suite's row too: a leftover
+                    // cooldown would publish an invalidation for an account
+                    // the next run believes it just created clean.
+                    trx.clear(&cooldown_entry_key(account));
                     for node in &nodes {
                         trx.clear(&keyspace::binding_key(node));
                         trx.clear_range(
@@ -1006,6 +1070,79 @@ mod tests {
             assert_eq!(window_of(&store, account).await.len(), BINDING_RATE_CAP_24H);
 
             wipe(&store, account, &all).await;
+        }
+    );
+
+    // The durable half of D33 clause (e), against a real cluster: a cooldown
+    // entry written through the store is published as an
+    // `AccountInvalidation` by a separate reader that shares no memory with
+    // the writer — only the `dc` rows.
+    //
+    // The in-memory suite in `crate::invalidation` proves the mapping; this
+    // proves the key layout, the big-endian account decode and the range
+    // bounds, none of which `MemAccountStore` exercises at all.
+    //
+    // Filtered to this suite's own account rather than compared as a whole
+    // set: the range read covers the entire `dc` family, and the development
+    // cluster is shared with every other agent's run.
+    fdb_test!(
+        a_durable_cooldown_entry_is_published_as_an_invalidation,
+        |store| async move {
+            use crate::invalidation::StandingInvalidationSource;
+            use orrery_protocol::UnixMillis;
+
+            let account = account(9);
+            wipe(&store, account, &[]).await;
+            store
+                .create_account(account, 1_000)
+                .await
+                .expect("create account");
+
+            let source = StandingInvalidationSource::new(Arc::new(store.clone()));
+            let mine = |published: Vec<orrery_protocol::AccountInvalidation>| {
+                published
+                    .into_iter()
+                    .filter(|entry| entry.account == account)
+                    .collect::<Vec<_>>()
+            };
+
+            assert!(
+                mine(source.current().await.expect("read the family")).is_empty(),
+                "an account that has never crossed C publishes nothing"
+            );
+
+            store
+                .observe_cooldown(account, 7_000, None)
+                .await
+                .expect("the account crosses C");
+
+            assert_eq!(
+                mine(source.current().await.expect("publish")),
+                vec![orrery_protocol::AccountInvalidation {
+                    account,
+                    effective_from_ms: UnixMillis(7_000),
+                }],
+                "the durable `dc` row round-trips as the refusal watermark"
+            );
+
+            // Release, and the producer stops asserting a refusal it no longer
+            // holds. (The consumers' retention rule is theirs, and is tested
+            // where it lives.)
+            let entry = store
+                .cooldown_entry(account)
+                .await
+                .expect("read entry")
+                .expect("entry exists");
+            assert!(store
+                .clear_cooldown_if(account, entry)
+                .await
+                .expect("release"));
+            assert!(
+                mine(source.current().await.expect("publish")).is_empty(),
+                "a released account leaves the published set"
+            );
+
+            wipe(&store, account, &[]).await;
         }
     );
 }

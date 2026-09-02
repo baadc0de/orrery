@@ -22,7 +22,7 @@
 //! `orrery_persistd::gateway::SnapshotBindingAuthority` from a store rather
 //! than from a table somebody typed.
 
-use crate::store::{AccountStore, BindOutcome, CooldownEntry, IdentityError};
+use crate::store::{AccountStore, BindOutcome, CooldownEntry, CooldownRecord, IdentityError};
 use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
 use orrery_persistd::gateway::BindingAuthority;
@@ -335,6 +335,25 @@ impl AccountStore for MemAccountStore {
         } else {
             Ok(false)
         }
+    }
+
+    async fn cooldown_entries(&self) -> Result<Vec<CooldownRecord>, IdentityError> {
+        // Sorted by account so the in-memory backend agrees with the FDB one,
+        // whose range read is key-ordered. A publisher's output order is not
+        // semantically load-bearing, but a test that pins one must not pass
+        // against a map's iteration order and fail against the store it
+        // stands in for.
+        let state = Self::lock(&self.state);
+        let mut records: Vec<CooldownRecord> = state
+            .cooldowns
+            .iter()
+            .map(|(account, entry)| CooldownRecord {
+                account: *account,
+                entry: *entry,
+            })
+            .collect();
+        records.sort_unstable_by_key(|record| record.account.0);
+        Ok(records)
     }
 }
 
