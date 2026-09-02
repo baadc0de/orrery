@@ -554,7 +554,7 @@ impl SessionPresentation {
 /// drops, so `banked_minutes > 0` with `session_scope: "local"` is a
 /// contradiction the client cannot emit.
 const LOCAL_PRACTICE_BANNER: &str =
-    "LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN - NOTHING IS BEING BANKED";
+    "LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN - NOTHING IS BEING RECORDED";
 
 /// Conditions the player must be told about for the whole session.
 ///
@@ -592,7 +592,7 @@ impl SessionNotices {
 /// "telemetry unavailable" would leave the volunteer with exactly the wrong
 /// impression #769 is about — that her time still counted.
 const RECORDING_UNAVAILABLE_NOTICE: &str =
-    "SESSION NOT BEING RECORDED - NOTHING YOU FLY NOW WILL BE SAVED OR BANKED";
+    "SESSION NOT BEING RECORDED - NOTHING YOU FLY NOW WILL BE SAVED";
 
 /// The banner line for a presentation, and the campaign it names when live.
 ///
@@ -680,7 +680,7 @@ impl Plugin for RegolithSkinPlugin {
         if let Some(detail) = unavailable {
             // Before Bevy's log plugin is necessarily installed, so not `error!`.
             eprintln!(
-                "regolith: cannot open telemetry {detail}; this session will not be recorded or banked"
+                "regolith: cannot open telemetry {detail}; this session will not be recorded"
             );
             notices.push(RECORDING_UNAVAILABLE_NOTICE.to_owned());
         }
@@ -2721,7 +2721,7 @@ fn refresh_f3_pane(
             Display::None
         };
         **text = format!(
-            "adjudications {} | latency p50/p99 {}/{} ms\nprediction set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nattempt {:?} | cell {:?}\nbuild {}\nsession {}\nbanked {:.1} min | idle {:.1} min",
+            "adjudications {} | latency p50/p99 {}/{} ms\nprediction set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nattempt {:?} | cell {:?}\nbuild {}\nsession {}\nrecorded {:.1} min | idle {:.1} min",
             metrics.adjudications_completed, metrics.adjudication_latency_p50_ms,
             metrics.adjudication_latency_p99_ms, metrics.prediction_set_size,
             metrics.observed_loss_pct, metrics.configured_loss_pct,
@@ -2762,7 +2762,7 @@ fn refresh_f3_pane(
                 accumulator.progress().afk_capped,
             ));
         } else {
-            text.push_str("\noffline local session - not a campaign path, banks nothing");
+            text.push_str("\noffline local session - not a campaign path, records nothing");
         }
     }
 }
@@ -2907,7 +2907,7 @@ fn write_campaign_record_on_exit(
         match write() {
             Ok(()) => {
                 info!(
-                    "campaign session {} recorded to {} ({} banked min)",
+                    "campaign session {} recorded to {} ({} recorded min)",
                     record.session_id,
                     record_path.display(),
                     record.banked_minutes
@@ -2949,7 +2949,7 @@ fn write_campaign_record_on_exit(
                 );
                 eprintln!(
                     "regolith: your campaign record could not be saved to {}: {error}. \
-                     The banked minutes from this attempt were not recorded.",
+                     The minutes from this attempt were not recorded.",
                     record_path.display()
                 );
             }
@@ -4333,7 +4333,7 @@ mod tests {
                 "{presentation:?} shows {banner:?}, which does not tell a player she is out"
             );
             assert!(
-                banner.contains("NOTHING IS BEING BANKED"),
+                banner.contains("NOTHING IS BEING RECORDED"),
                 "{presentation:?} shows {banner:?}, which hides the consequence she cares about"
             );
             assert!(
@@ -4389,7 +4389,7 @@ mod tests {
             "{warned:?} dropped the notice the player must read"
         );
         assert!(
-            RECORDING_UNAVAILABLE_NOTICE.contains("BANKED"),
+            RECORDING_UNAVAILABLE_NOTICE.contains("NOTHING YOU FLY NOW WILL BE SAVED"),
             "the notice must name the consequence, not just the mechanism"
         );
 

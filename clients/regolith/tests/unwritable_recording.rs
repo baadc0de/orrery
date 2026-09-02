@@ -132,9 +132,9 @@ fn a_client_that_cannot_record_tells_the_player_nothing_is_being_banked() {
         "{notice:?} does not say the session is unrecorded"
     );
     assert!(
-        notice.contains("BANKED"),
+        notice.contains("NOTHING YOU FLY NOW WILL BE SAVED"),
         "{notice:?} does not say the consequence a volunteer cares about: \
-         that her time is not being banked"
+         that her time is not being saved"
     );
 
     // And a writable path says nothing, so the notice means something.

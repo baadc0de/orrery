@@ -51,7 +51,7 @@ game says it cannot reach the campaign service, check your connection and try
 again. If it says this build is refused or needs a different revision, download
 the newest archive from the Releases page and replace the whole extracted
 folder. A version refusal is intentional: the campaign only accepts the build
-and ruleset it has pinned, so every banked session remains auditable.
+and ruleset it has pinned, so every recorded session remains auditable.
 
 `--help` prints the available command-line options and exits without opening a
 window.
