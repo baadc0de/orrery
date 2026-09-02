@@ -53,6 +53,12 @@ note() { echo "$NAME: $*" >&2; }
 # discovery fail by name instead of silently shrinking coverage.
 readonly DECLARED_GATED_CRATES=(orrery_core orrery_games orrery_conformance)
 
+# Engine-boundary schema crates are not Ruleset-bearing and therefore cannot
+# be role-discovered above. Name them separately so clause 1 still makes their
+# Bevy-free dependency boundary mechanical. This list does not opt a crate into
+# the determinism source scans, which are meaningful only for canonical rules.
+readonly DECLARED_BEVY_FREE_CRATES=(orrery_ipc)
+
 # Crates whose sources are a `Ruleset` rather than the machinery around one.
 # The neighbour clause below applies to these only; `orrery_core` defines and
 # tests `StateView::neighbor`, so it must be able to name it.
@@ -259,7 +265,18 @@ while IFS= read -r file; do RULES_SOURCES+=("$file"); done < <(lib_sources "${RU
 readonly BEVY_PERMITTED_CRATES=(orrery_games)
 
 bevy_scanned=()
-for crate in "${GATED_CRATES[@]}"; do
+BEVY_FREE_CRATES=()
+while IFS= read -r crate; do BEVY_FREE_CRATES+=("$crate"); done < <(
+  printf '%s\n' "${GATED_CRATES[@]}" "${DECLARED_BEVY_FREE_CRATES[@]}" | sort -u
+)
+readonly -a BEVY_FREE_CRATES
+
+for crate in "${DECLARED_BEVY_FREE_CRATES[@]}"; do
+  [[ -n ${CRATE_DIRS[$crate]:-} ]] \
+    || die "no workspace library crate named by the Bevy-free boundary: $crate"
+done
+
+for crate in "${BEVY_FREE_CRATES[@]}"; do
   if printf '%s\n' "${BEVY_PERMITTED_CRATES[@]}" | grep -Fxq "$crate"; then
     continue
   fi
@@ -723,6 +740,7 @@ make_discovery_fixture() {
   mkdir -p \
     "$fixture/crates/bevy_replicon/src" \
     "$fixture/crates/orrery_core/src" \
+    "$fixture/crates/orrery_ipc/src" \
     "$fixture/crates/orrery_games/src/regolith" \
     "$fixture/crates/orrery_conformance/src" \
     "$fixture/crates/orrery_replicon/src" \
@@ -767,6 +785,18 @@ EOF
   cat >"$fixture/crates/orrery_core/src/lib.rs" <<'EOF'
 pub trait Ruleset {}
 pub trait TickBackend<R> {}
+EOF
+  # Clause 1 also carries one explicitly named, non-Ruleset schema crate. Keep
+  # it present in every synthetic workspace so discovery mutations reach the
+  # clauses they are intended to test instead of stopping on a stale name.
+  cat >"$fixture/crates/orrery_ipc/Cargo.toml" <<'EOF'
+[package]
+name = "orrery_ipc"
+version = "0.0.0"
+edition = "2024"
+EOF
+  cat >"$fixture/crates/orrery_ipc/src/lib.rs" <<'EOF'
+pub struct Schema;
 EOF
   cat >"$fixture/crates/orrery_games/Cargo.toml" <<'EOF'
 [package]

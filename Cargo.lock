@@ -8049,6 +8049,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_ipc"
+version = "0.1.0"
+dependencies = [
+ "orrery_protocol",
+]
+
+[[package]]
 name = "orrery_net"
 version = "0.1.0"
 dependencies = [
