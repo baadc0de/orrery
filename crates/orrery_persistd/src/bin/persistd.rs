@@ -181,6 +181,29 @@ struct Cli {
     #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
     coordinator_key: Vec<IssuerKeySpec>,
 
+    /// Trusted operator posture-signing key in `<key-id>@<public-key>` form.
+    ///
+    /// [D32](../../../docs/adr/0032-enforcement-ramp.md) clause (i)'s
+    /// verifying-key set, and the same shape and convention as
+    /// `--coordinator-key`: repeatable, so a rotation deploys with an overlap,
+    /// and checked at the *consumer*. A `ramp/{control}` row whose `source` is
+    /// `Operator` takes effect only if it carries an Ed25519 signature by one
+    /// of these keys over the row's domain-separated preimage.
+    ///
+    /// **Empty is safe, not permissive.** With no key configured this process
+    /// trusts no operator, so every operator row it finds is refused and the
+    /// control falls to `shadow` rather than retaining the unverified mode.
+    /// That is the correct posture for a process nobody has told about an
+    /// operator, and it is why possession of the FoundationDB cluster file is
+    /// not authority over this process's enforcement posture.
+    ///
+    /// Key custody, issuance and rotation are
+    /// [D41](../../../docs/adr/0041-offline-identity-issuer-custody-and-lifecycle.md)'s;
+    /// this flag consumes a public key and knows nothing about where it came
+    /// from. `orrery-ramp` is the signer.
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
+    operator_key: Vec<IssuerKeySpec>,
+
     /// D27's K-of-N attestation quorum: `off`, `shadow` or `required`.
     ///
     /// [D32](../../../docs/adr/0032-enforcement-ramp.md) clause (c)'s control
@@ -1431,8 +1454,17 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "fdb")]
     let (attestation_poller, strikes_poller, authority_correction_poller) =
         if let Some(context) = fdb_context.as_ref() {
-            let reader =
-                || Arc::new(FdbRampPostureStore::from_context(context)) as SharedRampPostureReader;
+            // One reader for all three pollers, and the `--operator-key` set
+            // goes on it rather than on any poller. D32 clause (i)'s
+            // verification therefore reaches C1, C4 and C5 the same way
+            // `admitted` reaches them: by being on the path they already
+            // share, not by three call sites each remembering.
+            let reader = || {
+                Arc::new(
+                    FdbRampPostureStore::from_context(context)
+                        .with_operator_keys(cli.operator_key.iter().map(|key| key.0.public_key)),
+                ) as SharedRampPostureReader
+            };
             // The same predicate `attestation_wiring` used. Without it the
             // executor still carries a posture cell of its own, and polling
             // *that* would arm the commit-time re-proof while admission stayed
@@ -3848,6 +3880,7 @@ mod tests {
                 iroh::SecretKey::from_bytes(&[9; 32]).public(),
             ))],
             coordinator_key: Vec::new(),
+            operator_key: Vec::new(),
             attestation_enforcement: AttestationEnforcement::Off,
             quarantine_validation: QuarantineValidation::Live,
             authority_correction: AuthorityCorrectionEnforcement::Off,

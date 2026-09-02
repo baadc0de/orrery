@@ -1,0 +1,16 @@
+# #875 / D32 clause (i): the authenticated ramp posture writer.
+#
+# `crates/orrery_persistd/tests/ramp_posture_authenticated.rs` adds four tests
+# that mean nothing without a cluster, because what they assert is what a
+# *running* fleet does with a durable row:
+#
+#   - decision-to-effect for a signed operator write, measured against the
+#     shipped `orrery-ramp` binary and clause (c)'s 2 s bound (five rounds);
+#   - removing the row restoring every process's startup default;
+#   - a raw cluster-file write being refused by the reader, which is clause
+#     (i)'s whole claim and is unfalsifiable against a memory store;
+#   - the D38 schema tag being the first byte actually stored, so an
+#     un-upgraded reader refuses the bytes the writer writes.
+#
+# The floor rises by all four: 513 -> 517.
+4

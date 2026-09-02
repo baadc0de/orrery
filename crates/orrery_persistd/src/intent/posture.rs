@@ -68,6 +68,29 @@
 //! first tagged schema number is 3 and not 1, and
 //! [`the_pre_amendment_reader_refuses_a_tagged_value`] for the proof.
 //!
+//! # Which controls this lever actually reaches
+//!
+//! Clause (i) puts the check in [`super::ramp::FdbRampPostureStore::read`], so
+//! a control is levered exactly when something polls that store for it. As this
+//! lands:
+//!
+//! | | Control | Poller | Note |
+//! |---|---|---|---|
+//! | C1 | `attestation_quorum` | yes ([#863](https://github.com/baadc0de/orrery/issues/863)) | |
+//! | C2 | `quarantine_validation` | **no** | see below |
+//! | C3 | write refusal / annulment | **no** | has no posture type at all — D32 clause (c) gives it a flag, and nothing in the tree carries a C3 mode, so there is no cell for a poller to refresh |
+//! | C4 | `authority_correction` | yes | `spawn_authority_correction_poller` |
+//! | C5 | `strikes` | yes ([#863](https://github.com/baadc0de/orrery/issues/863)) | two cells, gateway and coordinator |
+//!
+//! **C2's absence is a consequence of closing open question 3, not an
+//! oversight.** Its `off` arm does not exist, so the only row it could ever
+//! accept is `shadow` — and C2 has no shadow arm implemented: its check is
+//! unconditional on the intent path. A poller for a cell with one reachable
+//! value would refresh nothing. Building C2's shadow arm is the *control's*
+//! half of #863, not the lever's, and until it exists this verifier is what
+//! stands between C2 and a demotion nobody authorised: it refuses `off`
+//! outright and refuses `shadow` without an expiry.
+//!
 //! # What this module does not decide
 //!
 //! Operator key custody, issuance and rotation are
@@ -244,7 +267,11 @@ pub fn is_de_hardening(control: &str, mode: RampMode) -> bool {
 pub fn posture_preimage(control: &str, row: &SignedRampPosture) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(RAMP_POSTURE_V1_DOMAIN);
-    hasher.update(&u32::try_from(control.len()).unwrap_or(u32::MAX).to_le_bytes());
+    hasher.update(
+        &u32::try_from(control.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     hasher.update(control.as_bytes());
     hasher.update(&[match row.posture.mode {
         RampMode::Off => 0,
@@ -521,19 +548,41 @@ mod tests {
     }
 
     /// Failing-if-removed check for the preimage's **first** field.
+    ///
+    /// The alternative preimage below is [`posture_preimage`]'s body with the
+    /// domain constant and *nothing else* removed, so that deleting the
+    /// constant from the real function makes the two hashes equal, makes the
+    /// replayed signature verify, and fails this test. A test that hashed some
+    /// other byte string would pass either way and prove nothing — which is
+    /// what this test did until it was checked by mutation.
     #[test]
     fn the_domain_constant_is_not_decoration() {
         let operator = key(1);
         let row = sign_posture(STRIKES_CONTROL, posture(RampMode::Live), None, &operator);
         let with_domain = posture_preimage(STRIKES_CONTROL, &row);
 
-        // The same row hashed without the domain separator: a signature over
-        // this is what a cross-protocol replay would supply.
+        // Every field of the real preimage, in the real order, minus the
+        // domain separator: exactly what a cross-protocol replay would sign.
         let mut hasher = blake3::Hasher::new();
         hasher.update(&u32::try_from(STRIKES_CONTROL.len()).unwrap().to_le_bytes());
         hasher.update(STRIKES_CONTROL.as_bytes());
+        hasher.update(&[2u8]); // Live
+        hasher.update(&[1u8]); // Operator
+        hasher.update(&row.posture.set_at_ms.to_le_bytes());
+        hasher.update(
+            &u32::try_from(row.posture.reason.len())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        hasher.update(row.posture.reason.as_bytes());
+        hasher.update(&[0u8]); // no incident_id
+        hasher.update(&[0u8]); // no expires_at_ms
         let without_domain = *hasher.finalize().as_bytes();
-        assert_ne!(with_domain[..], without_domain[..]);
+        assert_ne!(
+            with_domain[..],
+            without_domain[..],
+            "the domain constant must be inside the hash, not beside it"
+        );
 
         let replayed = SignedRampPosture {
             signature: Some(operator.sign(&without_domain)),
@@ -560,7 +609,10 @@ mod tests {
             signer: None,
             signature: None,
         };
-        assert_eq!(admit(STRIKES_CONTROL, &row(RampMode::Shadow), &[], 0), Ok(()));
+        assert_eq!(
+            admit(STRIKES_CONTROL, &row(RampMode::Shadow), &[], 0),
+            Ok(())
+        );
         assert_eq!(
             admit(STRIKES_CONTROL, &row(RampMode::Live), &[], 0),
             Err(PostureRefusal::AutoSuspendMayOnlySelectShadow),

@@ -293,6 +293,12 @@ REQUIRED_TARGETS=(
   # effects, which is the property that makes a retrospective audit of the draw
   # non-vacuous, and there is no such transaction without a cluster.
   intent_witness_epoch
+  # D32 clause (i)'s reader-side authentication and clause (c)'s 2 s bound.
+  # The claim these carry — that possession of the cluster file is not
+  # authority over fleet enforcement posture — is a claim about what a real
+  # cluster's bytes do to a real poller, and the decision-to-effect number
+  # #875 asks for is meaningless without one.
+  ramp_posture_authenticated
 )
 
 # ── Assertions over a captured log ───────────────────────────────────────────
