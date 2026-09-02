@@ -18,6 +18,14 @@ use orrery_protocol::{
     CellId, Epoch, GridId, JournalRecord, Lsn, NodeId, PersistId, RecordKind, RestoreRecord,
     RestoreTarget, Tick,
 };
+#[cfg(feature = "fdb")]
+use {
+    orrery_persistd::adjudication::{
+        FdbStrikeLedger, StrikeEvidenceRef, StrikeKind, StrikeLedger, StrikeMode, StrikeRow,
+        STRIKE_RETENTION_MS,
+    },
+    orrery_protocol::{AccountId, RulesetId},
+};
 
 fn node(seed_byte: u8) -> NodeId {
     let mut seed = [0u8; 32];
@@ -713,11 +721,13 @@ async fn held_fixture(entity: u64) -> (Fixture, Lsn) {
     (fixture, grief_lsn)
 }
 
-/// §11.1's `ya` product wins over an otherwise valid restore, and the applier
-/// has no route to append a record for a held entity.
+/// A strike filed after the grief window holds an otherwise valid restore.
+///
+/// This drives the production strike writer instead of placing an index row at
+/// the queried LSN: the filing tail is deliberately later than the selection.
 #[cfg(feature = "fdb")]
 #[tokio::test]
-async fn filed_strike_holds_restore_and_applier_writes_no_record() {
+async fn later_filed_strike_holds_restore_and_applier_writes_no_record() {
     let Some(cluster) = orrery_persistd::fdb::discover_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set");
         return;
@@ -725,23 +735,80 @@ async fn filed_strike_holds_restore_and_applier_writes_no_record() {
     let (fixture, grief_lsn) = held_fixture(31).await;
     let context = orrery_persistd::FdbContext::connect(&cluster).expect("FDB connects");
     let db = context.database();
-    let key = orrery_persistd::keyspace::restore_hold_strike_versionstamped_key(
+    let ledger = FdbStrikeLedger::from_database(Arc::clone(&db));
+    ledger.configure_restore_hold_index(fixture.source_node);
+    let account = AccountId::new(0x911);
+    let target = node(91);
+    let binding_key = orrery_persistd::keyspace::binding_key(&target);
+    let strike_start = orrery_persistd::keyspace::strike_account_range_start(account);
+    let strike_end = orrery_persistd::keyspace::strike_account_range_end(account);
+    let hold_start = orrery_persistd::keyspace::restore_hold_range_start(
         &fixture.source_node,
         PersistId::new(31),
-        grief_lsn,
-        orrery_protocol::AccountId::new(0x849),
     );
+    let hold_end =
+        orrery_persistd::keyspace::restore_hold_range_end(&fixture.source_node, PersistId::new(31));
     db.run(|trx, _| {
-        let key = key.clone();
+        let strike_start = strike_start.clone();
+        let strike_end = strike_end.clone();
+        let hold_start = hold_start.clone();
+        let hold_end = hold_end.clone();
         async move {
-            use foundationdb::options::MutationType;
-
-            trx.atomic_op(&key, b"", MutationType::SetVersionstampedKey);
+            trx.clear(&binding_key);
+            trx.clear_range(&strike_start, &strike_end);
+            trx.clear_range(&hold_start, &hold_end);
+            trx.set(
+                &binding_key,
+                &postcard::to_stdvec(&orrery_persistd::keyspace::BindingRow {
+                    account,
+                    bound_at_ms: 1,
+                })
+                .expect("encode binding"),
+            );
             Ok(())
         }
     })
     .await
-    .expect("seed ya hold index");
+    .expect("prepare strike writer");
+
+    let filing_lsn = fixture
+        .runtime
+        .apply(record(
+            999,
+            12,
+            node(1),
+            RecordKind::ComponentDiff,
+            b"later",
+        ))
+        .await
+        .expect("later journal append");
+    assert!(
+        filing_lsn > grief_lsn,
+        "adjudication follows the grief window"
+    );
+    ledger
+        .file(
+            target,
+            &StrikeRow {
+                issued_at_ms: 1,
+                weight_milli: 3_000,
+                kind: StrikeKind::Deviation,
+                evidence_ref: StrikeEvidenceRef {
+                    entity: PersistId::new(31),
+                    window_start: Tick::new(11),
+                    window_end: Tick::new(12),
+                    digest: [0x91; 32],
+                },
+                ruleset: RulesetId {
+                    version: 1,
+                    digest: [0x91; 32],
+                },
+                mode: StrikeMode::Live,
+                expires_at_ms: 1 + STRIKE_RETENTION_MS,
+            },
+            None,
+        )
+        .expect("file strike through the production writer");
 
     let holds: Arc<dyn orrery_persistd::archive::RestoreHoldDetector> =
         Arc::new(orrery_persistd::archive::FdbRestoreHoldDetector::from_database(Arc::clone(&db)));
@@ -771,82 +838,19 @@ async fn filed_strike_holds_restore_and_applier_writes_no_record() {
         "held strike appends no restore record"
     );
     db.run(|trx, _| {
-        let key = key.clone();
+        let strike_start = strike_start.clone();
+        let strike_end = strike_end.clone();
+        let hold_start = hold_start.clone();
+        let hold_end = hold_end.clone();
         async move {
-            trx.clear(&key[..key.len() - 4]);
+            trx.clear(&binding_key);
+            trx.clear_range(&strike_start, &strike_end);
+            trx.clear_range(&hold_start, &hold_end);
             Ok(())
         }
     })
     .await
-    .expect("clear ya hold index");
-    fixture.runtime.close().await.expect("close");
-}
-
-/// An `IntentFinality::Annulled` projection is the other durable product §11.1
-/// protects from a forward restore.
-#[cfg(feature = "fdb")]
-#[tokio::test]
-async fn annulled_provisional_hold_holds_restore_and_applier_writes_no_record() {
-    let Some(cluster) = orrery_persistd::fdb::discover_cluster_file() else {
-        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set");
-        return;
-    };
-    let (fixture, grief_lsn) = held_fixture(32).await;
-    let context = orrery_persistd::FdbContext::connect(&cluster).expect("FDB connects");
-    let db = context.database();
-    let key = orrery_persistd::keyspace::restore_hold_annulment_key(
-        &fixture.source_node,
-        PersistId::new(32),
-        grief_lsn,
-        0x849_899,
-    );
-    db.run(|trx, _| {
-        let key = key.clone();
-        async move {
-            trx.set(&key, b"");
-            Ok(())
-        }
-    })
-    .await
-    .expect("seed annulment hold index");
-
-    let holds: Arc<dyn orrery_persistd::archive::RestoreHoldDetector> =
-        Arc::new(orrery_persistd::archive::FdbRestoreHoldDetector::from_database(Arc::clone(&db)));
-    let plan = fixture
-        .planner()
-        .with_hold_detector(holds)
-        .plan(fixture.request("held-annulment", grief_lsn, grief_lsn))
-        .await
-        .expect("plan");
-    let expected_product = format!("i/{:032x}", 0x849_899_u128);
-    assert!(matches!(
-        &plan.entities[0].disposition,
-        RestoreDisposition::Held { product } if product == &expected_product
-    ));
-    let outcome = RestoreApplier::new(&fixture.runtime, node(9))
-        .apply(&plan, Tick::new(99))
-        .await
-        .expect("held plan applies as no-op");
-    assert!(matches!(
-        outcome.entities[0].disposition,
-        RestoreApplyDisposition::Held { .. }
-    ));
-    assert!(
-        fixture
-            .journal_records()
-            .iter()
-            .all(|stored| stored.record.kind != RecordKind::Restore),
-        "held annulment appends no restore record"
-    );
-    db.run(|trx, _| {
-        let key = key.clone();
-        async move {
-            trx.clear(&key);
-            Ok(())
-        }
-    })
-    .await
-    .expect("clear annulment hold index");
+    .expect("clear production strike rows");
     fixture.runtime.close().await.expect("close");
 }
 

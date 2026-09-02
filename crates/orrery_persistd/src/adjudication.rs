@@ -728,7 +728,7 @@ fn episode_dedup_digest(ruleset: RulesetId, episode: &StrikeEpisodeRef) -> [u8; 
 }
 
 #[cfg(feature = "fdb")]
-type RestoreHoldIndex = Arc<std::sync::RwLock<Option<(NodeId, Arc<crate::journal::Journal>)>>>;
+type RestoreHoldIndex = Arc<std::sync::RwLock<Option<NodeId>>>;
 
 /// FoundationDB-backed executor-owned writer for D33's `ya` family.
 #[cfg(feature = "fdb")]
@@ -756,21 +756,12 @@ impl FdbStrikeLedger {
         }
     }
 
-    /// Attach the local journal coordinate used by the restore-hold index.
-    ///
-    /// The position is sampled immediately before the filing transaction and
-    /// written in that same transaction as the `ya` product.  A deployment
-    /// that does not install this seam has no archive restore surface and
-    /// therefore deliberately emits no incomplete index rows.
-    pub fn configure_restore_hold_index(
-        &self,
-        source_node: NodeId,
-        journal: Arc<crate::journal::Journal>,
-    ) {
+    /// Attach the archive source whose restores this ledger's products hold.
+    pub fn configure_restore_hold_index(&self, source_node: NodeId) {
         *self
             .restore_hold_index
             .write()
-            .expect("restore-hold index lock poisoned") = Some((source_node, journal));
+            .expect("restore-hold index lock poisoned") = Some(source_node);
     }
 
     /// Read one account's ledger rows in commit order.
@@ -842,7 +833,7 @@ impl StrikeLedger for FdbStrikeLedger {
             .read()
             .expect("restore-hold index lock poisoned")
             .as_ref()
-            .map(|(source_node, journal)| (*source_node, journal.committed()));
+            .copied();
         let episode = episode.map(|episode| episode_dedup_digest(row.ruleset, episode));
         futures::executor::block_on(async move {
             db.run(|trx, _| {
@@ -919,12 +910,11 @@ impl StrikeLedger for FdbStrikeLedger {
                         &encoded,
                         MutationType::SetVersionstampedKey,
                     );
-                    if let Some((source_node, filing_lsn)) = hold_location {
+                    if let Some(source_node) = hold_location {
                         trx.atomic_op(
                             &crate::keyspace::restore_hold_strike_versionstamped_key(
                                 &source_node,
                                 row.evidence_ref.entity,
-                                filing_lsn,
                                 account,
                             ),
                             b"",
@@ -1452,7 +1442,7 @@ mod tests {
             .expect("journal opens"),
         );
         let source_node = key(7).public();
-        ledger.configure_restore_hold_index(source_node, Arc::clone(&journal));
+        ledger.configure_restore_hold_index(source_node);
         let subject_account = AccountId(0x0215_0000_0000_0001);
         let reporter_account = AccountId(0x0215_0000_0000_0002);
         let subject_key = crate::keyspace::binding_key(&report.subject);
@@ -1462,16 +1452,9 @@ mod tests {
         let reporter_start = strike_account_range_start(reporter_account);
         let reporter_end = strike_account_range_end(reporter_account);
         let db = Arc::clone(&ledger.db);
-        let hold_start = crate::keyspace::restore_hold_range_start(
-            &source_node,
-            report.bundle.entity,
-            orrery_protocol::Lsn::new(0, 0),
-        );
-        let hold_end = crate::keyspace::restore_hold_range_end(
-            &source_node,
-            report.bundle.entity,
-            orrery_protocol::Lsn::new(0, 0),
-        );
+        let hold_start =
+            crate::keyspace::restore_hold_range_start(&source_node, report.bundle.entity);
+        let hold_end = crate::keyspace::restore_hold_range_end(&source_node, report.bundle.entity);
         db.run(|trx, _| {
             let subject_start = subject_start.clone();
             let subject_end = subject_end.clone();
@@ -1559,10 +1542,9 @@ mod tests {
             .expect("strike transaction wrote restore-hold index");
         assert!(matches!(
             crate::keyspace::decode_restore_hold_key(indexed.key()),
-            Some((source, entity, lsn, crate::keyspace::RestoreHoldProduct::Strike { account, .. }))
+            Some((source, entity, crate::keyspace::RestoreHoldProduct::Strike { account, .. }))
                 if source == source_node
                     && entity == report.bundle.entity
-                    && lsn == orrery_protocol::Lsn::new(0, 0)
                     && account == subject_account
         ));
 

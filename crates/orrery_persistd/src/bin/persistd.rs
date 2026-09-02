@@ -1605,10 +1605,7 @@ async fn main() -> anyhow::Result<()> {
                     .expect("intent executor capture lock poisoned")
                     .as_ref()
                 {
-                    executor.configure_restore_hold_index(
-                        gateway.id(),
-                        Arc::clone(runtime_for_shutdown.journal()),
-                    );
+                    executor.configure_restore_hold_index(gateway.id());
                 }
                 tracing::info!(
                     dir = %dir.display(),
