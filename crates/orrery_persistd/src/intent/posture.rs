@@ -68,6 +68,22 @@
 //! first tagged schema number is 3 and not 1, and
 //! [`the_pre_amendment_reader_refuses_a_tagged_value`] for the proof.
 //!
+//! # How this composes with #876's admission predicates
+//!
+//! Three checks, each strictly narrower than the last, each refusing
+//! independently, and each living where its inputs live:
+//!
+//! | Check | Question | Where |
+//! |---|---|---|
+//! | [`admit`] | who wrote this? | this module, from the store, over the signed bytes |
+//! | [`RampPosture::admissible`] | was anyone allowed to write this at all? | #876, row-local |
+//! | [`RampPosture::admissible_from`] | is this a legal transition from what we are doing now? | #876, at the poller |
+//!
+//! `admit` **calls** `admissible` rather than restating clause (f)'s rule, and
+//! it never relaxes it. The operator arm and the automation arm are disjoint —
+//! an `AutoSuspend` row is unsigned by design — so the composition has no
+//! precedence question to get wrong.
+//!
 //! # Which controls this lever actually reaches
 //!
 //! Clause (i) puts the check in [`super::ramp::FdbRampPostureStore::read`], so
@@ -200,8 +216,20 @@ pub enum PostureVerdict {
     StartupDefault,
     /// The row verified and its mode applies.
     Admitted(RampPosture),
-    /// The row was refused. Clause (i): the control falls to `shadow` rather
-    /// than retaining the unverified mode.
+    /// The row was refused, and is reported as absent.
+    ///
+    /// **This is a correction to the accepted spike's text, flagged not
+    /// silent.** The spike said a refused row makes the control fall to
+    /// `shadow`. Falling back to the *startup default* is what
+    /// [`super::ramp::admitted`] already does for the row-class refusal, and
+    /// it is the better rule for two reasons the spike did not price. It
+    /// denies a forger a lever: under "fall to shadow", anyone who can write
+    /// FoundationDB can move all four `off`-default controls into `shadow` and
+    /// make the fleet pay clause (d)'s write tax indefinitely, which is the
+    /// denial-of-service shape clause (f) refuses elsewhere by name. And it
+    /// keeps one fallback in the system instead of two: a refused row lands on
+    /// a value an operator chose at launch, whichever of the two checks
+    /// refused it.
     Refused(PostureRefusal),
 }
 
@@ -215,20 +243,9 @@ impl PostureVerdict {
     #[must_use]
     pub fn mode(&self, startup_default: RampMode) -> RampMode {
         match self {
-            Self::StartupDefault => startup_default,
+            Self::StartupDefault | Self::Refused(_) => startup_default,
             Self::Admitted(posture) => posture.mode,
-            Self::Refused(_) => RampMode::Shadow,
         }
-    }
-}
-
-/// Hardening rank: how much the control *acts*. Higher is not "safer".
-#[must_use]
-pub const fn rank(mode: RampMode) -> u8 {
-    match mode {
-        RampMode::Off => 0,
-        RampMode::Shadow => 1,
-        RampMode::Live => 2,
     }
 }
 
@@ -256,7 +273,7 @@ pub fn d32_default(control: &str) -> RampMode {
 /// behaviour. One control, one rule.
 #[must_use]
 pub fn is_de_hardening(control: &str, mode: RampMode) -> bool {
-    rank(mode) < rank(d32_default(control))
+    mode.rank() < d32_default(control).rank()
 }
 
 /// The signed preimage for one control's posture row.
@@ -390,20 +407,29 @@ pub fn admit(
         return Err(PostureRefusal::NoSuchArm);
     }
 
-    // Clause (f)'s asymmetry, as a reader-side predicate. `RampPosture::
-    // admissible` is #876's, and it is the whole of the source-class rule:
-    // automation may only select shadow. The strict-demotion half — that a
-    // poller applies such a row only where it lowers the mode it is currently
-    // acting under — belongs to the poller, which is the only thing that knows
-    // its acting mode; this function is stateless by construction so that a
-    // store can run it.
+    // Clause (f)'s asymmetry is #876's, and this ANDs onto it rather than
+    // restating it. `RampPosture::admissible` is the row-local half — an
+    // automation row is admissible only at `shadow` — and
+    // `RampPosture::admissible_from` is the transition half, applied by the
+    // poller because it is the only thing that knows the acting mode.
+    //
+    // **Not a rank comparison.** The spike stated this arm as
+    // `rank(row.mode) >= rank(current) => refuse`, and that is a defect in the
+    // spike: `off` ranks *below* `live`, so a rank test alone admits
+    // `AutoSuspend -> off` from a live control — precisely the "induce spikes,
+    // blind the cluster" lever clause (f) forbids by name. #876 found it and
+    // ships the conjunction; nothing here may loosen it back.
     if !row.posture.admissible() {
         return Err(PostureRefusal::AutoSuspendMayOnlySelectShadow);
     }
     if row.posture.source == PostureSource::AutoSuspend {
-        // Unsigned by design, and therefore nothing further to check: a forged
-        // demotion is still only a demotion, which clause (f) permits without
-        // asking.
+        // The two arms are disjoint, which is why they compose without a
+        // precedence question: an automation row is unsigned *by design*,
+        // because a tripping gateway holds no operator key and must not. So
+        // there is nothing for the signature check below to say about it, and a
+        // forged demotion is still only a demotion — which clause (f) permits
+        // without asking, and which `admissible_from` will still refuse at the
+        // poller if it is not a strict lowering.
         return Ok(());
     }
 
@@ -625,6 +651,64 @@ mod tests {
         );
     }
 
+    /// The composition with #876, pinned so neither lane can loosen the other.
+    ///
+    /// `admit` is not the whole automation rule and must not become it: it
+    /// clears an `AutoSuspend` row that `admissible` allows, and that row still
+    /// faces `admissible_from` at the poller. The `shadow -> shadow` case is
+    /// the one that shows the two are independent — `admit` says yes, the
+    /// transition rule says no, and the row is refused.
+    #[test]
+    fn admit_ands_onto_876s_predicates_rather_than_replacing_them() {
+        let idempotent = SignedRampPosture {
+            posture: RampPosture {
+                mode: RampMode::Shadow,
+                source: PostureSource::AutoSuspend,
+                set_at_ms: 1,
+                reason: "verdict rate".to_string(),
+                incident_id: Some([7; 16]),
+            },
+            expires_at_ms: None,
+            signer: None,
+            signature: None,
+        };
+        assert_eq!(
+            admit(STRIKES_CONTROL, &idempotent, &[], 0),
+            Ok(()),
+            "authentication has nothing to say about an unsigned automation row"
+        );
+        assert!(
+            idempotent.posture.admissible(),
+            "and neither has the row-local half"
+        );
+        assert!(
+            !idempotent.posture.admissible_from(RampMode::Shadow),
+            "the transition half still refuses it: automation may only STRICTLY \
+             lower the acting rank, and the poller is where that is decided"
+        );
+
+        // And the defect the spike's rank-only phrasing would have reintroduced:
+        // `off` ranks below `live`, so a rank comparison alone would admit this.
+        let blinding = SignedRampPosture {
+            posture: RampPosture {
+                mode: RampMode::Off,
+                ..idempotent.posture.clone()
+            },
+            ..idempotent
+        };
+        assert!(
+            blinding.posture.mode.rank() < RampMode::Live.rank(),
+            "a rank comparison alone would call this a demotion"
+        );
+        assert_eq!(
+            admit(STRIKES_CONTROL, &blinding, &[], 0),
+            Err(PostureRefusal::AutoSuspendMayOnlySelectShadow),
+            "and it is refused anyway: blinding the cluster during the incident \
+             that tripped the breaker is clause (f)'s named denial-of-service"
+        );
+        assert!(!blinding.posture.admissible_from(RampMode::Live));
+    }
+
     #[test]
     fn c2s_off_arm_does_not_exist_even_for_a_key_holder() {
         let operator = key(1);
@@ -721,9 +805,16 @@ mod tests {
         );
         assert_eq!(
             verdict.mode(RampMode::Live),
-            RampMode::Shadow,
-            "clause (i): the control falls to shadow, and the claimed mode is \
-             not reachable from a refusal"
+            RampMode::Live,
+            "a refused row is reported as an absent one, so the control falls \
+             back to the startup default an operator chose at launch — never \
+             to the claimed mode, and never to a mode a forger selected"
+        );
+        assert_eq!(
+            verdict.mode(RampMode::Off),
+            RampMode::Off,
+            "and a forger cannot move an off-default control into shadow to \
+             make the fleet pay clause (d)'s write tax"
         );
     }
 

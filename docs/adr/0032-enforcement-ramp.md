@@ -51,6 +51,28 @@ of how auto-suspend happens to be written. The spike's proposed text called the
 new clause "(h)"; that letter was already taken by D29's annulment-on-expiry
 ruling, so it lands as (i) with no other change of substance.
 
+**Two defects in the spike's own statement, corrected here and flagged rather
+than reworded quietly.** The owner accepted the *substance* — reader-side
+verification, no C2 `off` arm, a mandatory expiry on de-hardening — and none of
+that changes. What changes is two places where the spike's prose did not say
+what it meant, both found by [#876](https://github.com/baadc0de/orrery/issues/876)'s
+lane while implementing clause (f):
+
+1. **The automation arm is a conjunction, not a rank comparison.** The spike
+   wrote it as `rank(row.mode) >= rank(current) => refuse`. Because `off` ranks
+   *below* `live`, that admits `AutoSuspend → off` from a live control — the
+   exact "induce spikes, blind the cluster" lever clause (f) forbids by name.
+   Clause (i) below states both halves: `shadow` only (the row), **and** a
+   strict lowering of the acting rank (the transition).
+2. **A refused row falls back to the startup default, not to `shadow`.** The
+   spike said `shadow`. That would hand anyone who can write FoundationDB a way
+   to push all four `off`-default controls into `shadow` and make the fleet pay
+   clause (d)'s write tax — a denial-of-service against enforcement wearing the
+   costume of a safe fallback. Falling back to the operator's launch-time
+   default gives that writer nothing, and matches what the shipped seam already
+   does for the row-class refusal.
+
+
 ## Context
 
 Seven facts about the landed tree, each read before it was written here.
@@ -692,13 +714,18 @@ either an attack or a ruleset bug, and both page somebody.
 > over the domain-separated preimage below, and every `persistd` verifies it on
 > the poll before applying the mode. Possession of the FoundationDB cluster file
 > is therefore not authority over fleet enforcement posture. An unsigned or
-> badly-signed row is refused and the control falls to `shadow` rather than
-> retaining the unverified mode. A row whose `source` is `AutoSuspend` needs no
-> signature — a tripping gateway holds no operator key and must not — and is
-> admitted only if it selects `shadow`, which is clause (f)'s "fallback is
-> shadow, never off, and never a promotion" enforced by the verifier rather
-> than by its writer; a poller applies such a row only where it lowers the mode
-> that poller is currently acting under.**
+> badly-signed row is refused, and a refused row is treated exactly as an
+> **absent** one: the control falls back to the startup default an operator
+> chose at launch, never to the unverified mode and never to any mode a writer
+> asserted. A row whose `source` is `AutoSuspend` needs no signature — a
+> tripping gateway holds no operator key and must not — and is admitted only if
+> it satisfies **both** halves of clause (f)'s asymmetry: it selects `shadow`
+> (a property of the row), **and** it strictly lowers the rank the control is
+> acting at (a property of the transition, applied by the poller, which is the
+> only thing that knows the acting mode). The two are a conjunction and not a
+> rank comparison — `off` ranks below `live`, so a rank test alone would admit
+> automation blinding a live control, which is the denial-of-service clause (f)
+> forbids by name.**
 
 ```
 preimage = blake3("orrery/d32/ramp-posture/v1\0"
@@ -718,13 +745,16 @@ by anyone with write access, a valid signature authorising a posture nobody
 authorised. Both fields are load-bearing and the implementing change carries a
 failing-if-removed check for each.
 
-**Falling to `shadow` on a refusal is priced, not free.** A forged or corrupt
-row cannot select a mode, but it can still move a control off its startup
-default and into `shadow`, which pays clause (d)'s shadow write tax for as long
-as the row sits there. That is accepted for the reason clause (f) already gives
-for auto-suspend's fallback: shadow keeps observing, and blindness during the
-exact period something is writing forged rows throws away the evidence that
-explains it. The refusal is logged per control per poll with the reason, so the
+**Why a refusal falls back to the startup default and not to `shadow`.** The
+startup default is a value an operator chose at launch; `shadow` on a refusal
+would be a value a *forger* selected. Under "fall to shadow", anyone who can
+write FoundationDB can move all four `off`-default controls into `shadow` and
+make the fleet pay clause (d)'s write tax for as long as the row sits there —
+the same "induce spikes, blind the cluster" shape clause (f) refuses for
+auto-suspend, pointed the other way. Falling back to the startup default gives
+that writer nothing at all. It also keeps **one** fallback in the system rather
+than two, so a refused row lands in the same place whichever check refused it.
+The refusal is logged at `error` per control per poll with its reason, so the
 row is visible as an incident rather than as a quiet mode change.
 
 `--operator-key` follows `--coordinator-key`'s shape and convention exactly: a

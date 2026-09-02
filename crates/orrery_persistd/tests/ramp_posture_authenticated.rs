@@ -322,19 +322,36 @@ async fn a_raw_cluster_file_write_is_refused_by_a_running_poller() {
     let seen = store
         .read(STRIKES_CONTROL)
         .await
-        .expect("a refused row is not a transaction error")
-        .expect("a refusal is reported, not silently dropped");
+        .expect("a refused row is not a transaction error");
     assert_eq!(
-        seen.mode,
-        RampMode::Shadow,
-        "clause (i): the control falls to shadow, never to the claimed mode"
+        seen, None,
+        "clause (i): a refused row is reported as an absent one, so the control \
+         falls back to the startup default an operator chose at launch — the \
+         forger's `off` never reaches a poller, and neither does any other mode \
+         the forger could have selected instead"
     );
+
+    // The same row, through the poller-facing seam every control reads: the two
+    // refusals compose, and neither is reachable around the other.
     assert_eq!(
-        seen.source,
-        PostureSource::Default,
-        "nothing that failed verification is passed on as a writer's claim"
+        orrery_persistd::intent::ramp::admitted(seen.as_ref(), STRIKES_CONTROL),
+        None
     );
-    assert!(seen.reason.contains("refused"));
+
+    // "Absent" is the right *outcome* for a refusal and a lousy assertion on
+    // its own: a store that returned `None` for everything — a broken refresh —
+    // would satisfy every line above. So prove the refusal is selective by
+    // showing the same store admits a correctly signed row at the same key.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let secret = secret_file(dir.path());
+    assert!(ramp_set(&cluster, &secret, "live").status.success());
+    let admitted = store
+        .read(STRIKES_CONTROL)
+        .await
+        .expect("read the signed row")
+        .expect("a signed row from a trusted key is admitted, or the refusal above proves nothing");
+    assert_eq!(admitted.mode, RampMode::Live);
+    assert_eq!(admitted.source, PostureSource::Operator);
 
     store.clear(STRIKES_CONTROL).await.expect("leave clean");
 }
