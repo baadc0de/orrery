@@ -65,13 +65,15 @@ use orrery_persistd::intent::{RampMode, RampPosture};
 use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
+#[cfg(feature = "reference-ruleset")]
+use orrery_persistd::AdjudicationExecutor;
 use orrery_persistd::{
     ActivationOutcome, AreaInterestScoping, AuthorityCorrectionEnforcement,
     AuthorityCorrectionPosture, AuthorityMetrics, CellRuntime, CheckpointScheduler,
     CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceFreshnessMonitor,
     FenceRow, FenceStore, GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
     GatewayServerLatencySnapshot, GrpcChainTransport, IntentExecutor, JournalConfig,
-    MemCheckpointStore, RuntimeConfig, ShardActivation,
+    MemCheckpointStore, RuntimeConfig, ShardActivation, SharedAdjudicator,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
@@ -79,7 +81,7 @@ use orrery_protocol::metrics::{
     SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER, SERIES_GATEWAY_BULK_SERVER,
     SERIES_GATEWAY_INTENT_SERVER, SERIES_JOURNAL_COMMIT,
 };
-use orrery_protocol::{CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId};
+use orrery_protocol::{CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId, UniverseSeed};
 
 type SharedExecutor = Arc<dyn IntentExecutor>;
 type OperatorControl = (oneshot::Sender<()>, JoinHandle<()>);
@@ -132,6 +134,17 @@ struct Cli {
     /// in-memory stores are used.
     #[arg(long, env = "ORRERY_FDB_CLUSTER_FILE")]
     fdb_cluster_file: Option<PathBuf>,
+
+    /// The 32-byte universe seed, as 64 hexadecimal characters.
+    ///
+    /// Required when this binary is compiled with a Ruleset-registration
+    /// feature. The executor must replay with the same VC-3 key that produced
+    /// the evidence, so a process-local default or a fresh random seed would
+    /// make every stochastic report untrustworthy. The deployment supplies it
+    /// directly until the owner selects a durable universe-configuration
+    /// source.
+    #[arg(long, env = "ORRERY_UNIVERSE_SEED", value_name = "HEX")]
+    universe_seed: Option<UniverseSeedSpec>,
 
     /// Permit the volatile in-memory lease store for local development and
     /// tests. Production authority requires `--fdb-cluster-file` instead.
@@ -1375,6 +1388,16 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         })?;
+    // D21's composition boundary: the stock harness has no Ruleset, while a
+    // binary compiled with a registration feature supplies its concrete build
+    // here. Keep this after the generic gateway construction so a game-owned
+    // binary can use the same hand-off without changing the harness default.
+    let adjudicator = configured_adjudicator(cli.universe_seed)?;
+    let adjudicator_rulesets: Vec<_> = adjudicator
+        .as_ref()
+        .map(|executor| executor.retained().collect())
+        .unwrap_or_default();
+    gateway_config.adjudicator = adjudicator;
     #[cfg(feature = "fdb")]
     let authority_correction_poller = fdb_context.as_ref().map(|context| {
         spawn_authority_correction_poller(
@@ -1399,9 +1422,8 @@ async fn main() -> anyhow::Result<()> {
     // line because "can this cluster adjudicate a discrepancy report" is not
     // otherwise observable from outside the process: without an adjudicator
     // every report comes back `REPORT_REFUSED_NO_ADJUDICATOR`, which a witness
-    // sees and an operator does not. It is `false` in a stock build by design
-    // — registering a build means linking a `Ruleset`
-    // (docs/09-services-and-ops.md §1).
+    // sees and an operator does not. It is `false` in a stock build by design;
+    // a linked Ruleset is the game-owned deployment composition D21 reserves.
     let adjudicator_configured = gateway_config.adjudicator.is_some();
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis(),
@@ -1512,6 +1534,7 @@ async fn main() -> anyhow::Result<()> {
             "journal_open_ms": journal_open_ms,
             "bulk_ack_fence_monitor": fence_freshness_monitor.is_some(),
             "adjudicator": adjudicator_configured,
+            "adjudicator_rulesets": adjudicator_rulesets,
             "dev_seeded_entities": dev_seeded,
         });
         // Write manually so a BrokenPipe (harness closed stdout) does not
@@ -2628,6 +2651,38 @@ where
     })
 }
 
+/// Compose the Ruleset builds this `persistd` artifact linked into its process.
+///
+/// The reference feature is deliberately only a proof of this binary seam. It
+/// neither picks the game-owned artifact location D21 reserves nor introduces
+/// a dynamic loading path: a production composition replaces this function's
+/// concrete registration at link time.
+#[cfg(feature = "reference-ruleset")]
+fn configured_adjudicator(
+    universe_seed: Option<UniverseSeedSpec>,
+) -> anyhow::Result<Option<SharedAdjudicator>> {
+    let seed = universe_seed.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--universe-seed (or ORRERY_UNIVERSE_SEED) is required when persistd is compiled \
+             with `reference-ruleset`: replay must use the universe's VC-3 seed"
+        )
+    })?;
+    let mut executor = AdjudicationExecutor::new(seed.0);
+    executor.register(|| orrery_conformance::Reference);
+    Ok(Some(Arc::new(executor)))
+}
+
+/// The library harness's shipped default: no linked Ruleset means no
+/// adjudicator. Keeping this as an explicit composition result, rather than a
+/// `GatewayConfig` default side effect, leaves the binary hand-off visible.
+#[cfg(not(feature = "reference-ruleset"))]
+fn configured_adjudicator(
+    universe_seed: Option<UniverseSeedSpec>,
+) -> anyhow::Result<Option<SharedAdjudicator>> {
+    let _ = universe_seed;
+    Ok(None)
+}
+
 #[cfg(feature = "fdb")]
 fn spawn_authority_correction_poller(
     store: FdbRampPostureStore,
@@ -2847,6 +2902,53 @@ impl FromStr for DevSeedSpec {
             count,
             cell: cell.parse::<ShardSpec>()?.0,
         })
+    }
+}
+
+/// A parsed `--universe-seed` value.
+///
+/// This is a CLI-owned deployment input, not generated process state: the
+/// adjudicator must replay the same keyed RNG stream that made the evidence.
+#[cfg_attr(
+    not(feature = "reference-ruleset"),
+    allow(
+        dead_code,
+        reason = "the stock binary intentionally parses no registration seed because it links no Ruleset"
+    )
+)]
+#[derive(Debug, Clone, Copy)]
+struct UniverseSeedSpec(UniverseSeed);
+
+impl FromStr for UniverseSeedSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err("expected a 32-byte universe seed as 64 hexadecimal characters".into());
+        }
+        let mut seed = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let decode = |digit: u8| match digit {
+                b'0'..=b'9' => Some(digit - b'0'),
+                b'a'..=b'f' => Some(digit - b'a' + 10),
+                b'A'..=b'F' => Some(digit - b'A' + 10),
+                _ => None,
+            };
+            let high = decode(pair[0]).ok_or_else(|| {
+                format!(
+                    "invalid hexadecimal digit at byte {} in universe seed",
+                    index * 2
+                )
+            })?;
+            let low = decode(pair[1]).ok_or_else(|| {
+                format!(
+                    "invalid hexadecimal digit at byte {} in universe seed",
+                    index * 2 + 1
+                )
+            })?;
+            seed[index] = (high << 4) | low;
+        }
+        Ok(Self(UniverseSeed(seed)))
     }
 }
 
@@ -3441,6 +3543,7 @@ mod tests {
             chain_follower: Vec::new(),
             bind: "127.0.0.1:0".parse().expect("valid loopback bind"),
             fdb_cluster_file,
+            universe_seed: None,
             allow_volatile_leases: false,
             issuer_key: vec![IssuerKeySpec(IssuerKey::new(
                 IssuerKeyId::new(1),

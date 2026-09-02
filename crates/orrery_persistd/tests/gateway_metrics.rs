@@ -584,6 +584,10 @@ async fn a_persistd_run_emits_the_two_server_spans_and_never_a_gated_name() {
         .read_line(&mut line)
         .expect("read readiness document");
     let ready: serde_json::Value = serde_json::from_str(line.trim()).expect("readiness JSON");
+    assert_eq!(
+        ready["adjudicator"], false,
+        "the stock binary must preserve D21's no-Ruleset default"
+    );
     let gateway: NodeId = ready["node_id"]
         .as_str()
         .expect("gateway node id")

@@ -8124,6 +8124,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "iroh-base",
+ "orrery_conformance",
  "orrery_core",
  "orrery_protocol",
  "orrery_witness",

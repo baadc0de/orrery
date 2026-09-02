@@ -27,6 +27,10 @@ chain-grpc = ["dep:hyper", "dep:hyper-util", "dep:prost", "dep:tonic"]
 # and links the C client (`libfdb_c`). Tests that need a live cluster are
 # compiled here and self-skip when no cluster is reachable.
 fdb = ["dep:foundationdb"]
+# Reference-only composition proof for the `persistd` binary's adjudication
+# seam. This deliberately does not select the game-owned deployed artifact
+# D21 reserves for an owner decision.
+reference-ruleset = ["dep:orrery_conformance"]
 
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
@@ -34,6 +38,9 @@ orrery_protocol = { path = "../orrery_protocol" }
 orrery_core = { path = "../orrery_core" }
 # Bevy-free service: the witness plugin adapter stays out of this binary.
 orrery_witness = { path = "../orrery_witness", default-features = false }
+# An opt-in, Bevy-free Ruleset used to exercise the binary composition seam.
+# Production games link their own Ruleset through the same seam.
+orrery_conformance = { path = "../orrery_conformance", optional = true }
 bytes = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
