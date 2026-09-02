@@ -32,9 +32,9 @@ use orrery_persistd::FdbContext;
 #[cfg(feature = "fdb")]
 use orrery_protocol::{AccountId, GridId};
 use orrery_protocol::{
-    CellId, ChainHash, DiscrepancyReport, EvidenceBundle, GatewayMsg, GatewayReply, NodeId,
-    PersistId, RulesetId, StateClaim, Tick, UnadjudicableReason, Verdict, REPORT_ADJUDICATED,
-    REPORT_REFUSED_NO_ADJUDICATOR,
+    CellId, ChainHash, DiscrepancyReport, EntitySlice, EvidenceBundle, GatewayMsg, GatewayReply,
+    LogFrame, NodeId, PersistId, RulesetId, StateClaim, Tick, UnadjudicableReason, Verdict,
+    REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR,
 };
 
 const ENTITY: PersistId = PersistId::new(880);
@@ -106,6 +106,32 @@ fn signed_report(reporter: &iroh_base::SecretKey, ruleset: RulesetId) -> Box<Dis
     ))
 }
 
+/// One signed, record-free frame spanning the guilty bundle's window.
+#[cfg(feature = "fdb")]
+fn covering_frame(subject: &iroh_base::SecretKey) -> LogFrame {
+    let slice = EntitySlice {
+        entity: ENTITY,
+        chain_epoch: 0,
+        prev_head: ChainHash::EMPTY.rolling(),
+        records: Vec::new(),
+        head: ChainHash::EMPTY.rolling(),
+    };
+    let transitions = vec![orrery_core::log::HeadTransition {
+        entity: ENTITY,
+        prev_head: ChainHash::EMPTY,
+        head: ChainHash::EMPTY,
+    }];
+    let preimage =
+        orrery_core::log::frame_preimage(REFERENCE_RULESET, Tick::new(10), 1, &transitions);
+    LogFrame {
+        ruleset: REFERENCE_RULESET,
+        first_tick: Tick::new(10),
+        tick_count: 1,
+        entities: vec![slice],
+        sig: subject.sign(&preimage),
+    }
+}
+
 /// A valid one-tick Reference bundle whose closing signed claim lies about the
 /// resulting state. Unlike [`thin_bundle`], this reaches `Verdict::Confirms`
 /// and therefore exercises the deployed strike side effect.
@@ -149,8 +175,11 @@ fn guilty_report(reporter: &iroh_base::SecretKey) -> Box<DiscrepancyReport> {
         window_end: Tick::new(11),
         t0_claim: anchor,
         t0_snapshot: Bytes::from(state.to_canonical()),
-        frames: Vec::new(),
-        sibling_heads: Vec::new(),
+        // The window's input frames, which a bundle must carry in full: an
+        // adjudicator that accepted a window with frames missing would convict
+        // on ticks it could not see the inputs for (#874).
+        frames: vec![covering_frame(&subject)],
+        sibling_heads: vec![Vec::new()],
         disputed_claims: vec![disputed],
         claimed_hashes: Vec::new(),
         computed_hashes: Vec::new(),

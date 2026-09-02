@@ -14,9 +14,9 @@ use orrery_core::{
     StateView, StepOutput, TickRng,
 };
 use orrery_protocol::{
-    ChainHash, DeviationKind, EntitySlice, EvidenceBundle, ForgeryProof, InputRecord, LogFrame,
-    PersistId, RecordSource, RulesetId, StateClaim, Tick, UnadjudicableReason, UniverseSeed,
-    Verdict,
+    ChainHash, DeviationKind, DiscrepancyReport, EntitySlice, EvidenceBundle, ForgeryProof,
+    InputRecord, LogFrame, PersistId, RecordSource, RulesetId, StateClaim, Tick,
+    UnadjudicableReason, UniverseSeed, Verdict,
 };
 use rand_chacha::rand_core::RngCore;
 
@@ -191,7 +191,9 @@ struct Produced {
     t0_claim: StateClaim,
     t0_snapshot: Vec<u8>,
     frames: Vec<LogFrame>,
+    frame_heads: Vec<ChainHash>,
     claimed_hashes: Vec<[u8; 32]>,
+    tick_snapshots: Vec<Vec<u8>>,
     end_claim: StateClaim,
 }
 
@@ -214,7 +216,9 @@ fn produce(authority: &iroh_base::SecretKey) -> Produced {
 
     // One frame per three ticks: 60 Hz simulation, 20 Hz send.
     let mut frames = Vec::new();
+    let mut frame_heads = Vec::new();
     let mut claimed_hashes = Vec::new();
+    let mut tick_snapshots = Vec::new();
     let mut head = ChainHash::EMPTY;
 
     for frame_index in 0..(WINDOW / 3) {
@@ -237,6 +241,12 @@ fn produce(authority: &iroh_base::SecretKey) -> Produced {
                 .step_entity(ENTITY, Tick::new(tick), &inputs_at(tick))
                 .expect("entity present");
             claimed_hashes.push(outcome.state_hash);
+            tick_snapshots.push(
+                executor
+                    .state(ENTITY)
+                    .expect("entity present")
+                    .to_canonical(),
+            );
         }
 
         let prev_head = head;
@@ -260,6 +270,7 @@ fn produce(authority: &iroh_base::SecretKey) -> Produced {
             entities: vec![slice],
             sig: sign_frame(authority, RULESET, Tick::new(first_tick), 3, &transitions),
         });
+        frame_heads.push(head);
     }
 
     let mut end_claim = StateClaim {
@@ -284,9 +295,32 @@ fn produce(authority: &iroh_base::SecretKey) -> Produced {
         t0_claim,
         t0_snapshot,
         frames,
+        frame_heads,
         claimed_hashes,
+        tick_snapshots,
         end_claim,
     }
+}
+
+fn claim_at(
+    produced: &Produced,
+    authority: &iroh_base::SecretKey,
+    offset: u64,
+    previous: &StateClaim,
+) -> StateClaim {
+    assert!(offset > 0 && offset <= WINDOW && offset.is_multiple_of(3));
+    let mut claim = StateClaim {
+        entity: ENTITY,
+        chain_epoch: 0,
+        tick: Tick::new(T0 + offset),
+        input_head: produced.frame_heads[(offset / 3 - 1) as usize],
+        state_hash: produced.claimed_hashes[(offset - 1) as usize],
+        prev_claim: claim_hash(previous),
+        ruleset: RULESET,
+        sig: authority.sign(b"unsigned"),
+    };
+    sign_claim(authority, &mut claim);
+    claim
 }
 
 fn bundle(produced: &Produced) -> EvidenceBundle {
@@ -303,6 +337,29 @@ fn bundle(produced: &Produced) -> EvidenceBundle {
         disputed_claims: vec![produced.end_claim.clone()],
         claimed_hashes: produced.claimed_hashes.clone(),
         computed_hashes: produced.claimed_hashes.clone(),
+    }
+}
+
+fn signed_report(
+    reporter: &iroh_base::SecretKey,
+    subject: &iroh_base::SecretKey,
+    bundle: EvidenceBundle,
+) -> DiscrepancyReport {
+    // The report signature contract from orrery_witness: domain, subject,
+    // reporter, then the canonical bundle digest. Keeping the probe here avoids
+    // a dependency cycle from core's tests back through witness.
+    let reporter_id = reporter.public();
+    let encoded = postcard::to_stdvec(&bundle).expect("bundle encodes");
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"orrery/discrepancy-report/v1");
+    preimage.extend_from_slice(subject.public().as_bytes());
+    preimage.extend_from_slice(reporter_id.as_bytes());
+    preimage.extend_from_slice(blake3::hash(&encoded).as_bytes());
+    DiscrepancyReport {
+        subject: subject.public(),
+        bundle,
+        reporter: reporter_id,
+        reporter_sig: reporter.sign(&preimage),
     }
 }
 
@@ -391,7 +448,7 @@ fn a_window_with_no_signed_claim_proves_nothing() {
 
     assert_eq!(
         verify_bundle(Kinematic, SEED, authority.public(), &bundle),
-        Verdict::Unadjudicable(UnadjudicableReason::Malformed)
+        Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain)
     );
 }
 
@@ -493,24 +550,120 @@ fn an_oversized_window_is_refused_before_it_is_replayed() {
 }
 
 #[test]
-fn claims_inside_the_window_must_chain_to_the_starting_claim() {
-    // Every signature can be valid while the authority still equivocates about
-    // its own history. The claim chain is what catches that.
+fn omitting_an_intermediate_signed_claim_cannot_convict() {
+    // Every presented signature is genuine. The missing predecessor could be
+    // either reporter omission or authority equivocation, and the bundle alone
+    // cannot distinguish them, so a verdict about the authority is impossible.
     let authority = key(1);
     let produced = produce(&authority);
     let mut bundle = bundle(&produced);
-    let mut orphan = bundle.disputed_claims[0].clone();
-    orphan.prev_claim = [0x11; 32];
-    sign_claim(&authority, &mut orphan);
-    bundle.disputed_claims = vec![orphan];
+    let first = claim_at(&produced, &authority, 3, &produced.t0_claim);
+    let omitted = claim_at(&produced, &authority, 6, &first);
+    let end = claim_at(&produced, &authority, WINDOW, &omitted);
+    bundle.disputed_claims = vec![first, end];
 
-    assert!(matches!(
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain)
+    );
+}
+
+#[test]
+fn two_distinct_signed_claims_at_one_tick_convict_the_equivocating_authority() {
+    // Unlike a lone broken link, this pair needs no missing history to explain
+    // it: the authority signed two incompatible assertions for one claim tick.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    let first = claim_at(&produced, &authority, WINDOW, &produced.t0_claim);
+    let mut conflicting = first.clone();
+    conflicting.state_hash = [0xE1; 32];
+    sign_claim(&authority, &mut conflicting);
+    bundle.disputed_claims = vec![first, conflicting];
+
+    assert_eq!(
         verify_bundle(Kinematic, SEED, authority.public(), &bundle),
         Verdict::Confirms {
+            at: Tick::new(T0 + WINDOW),
             kind: DeviationKind::DiscreteMismatch,
-            ..
         }
-    ));
+    );
+}
+
+#[test]
+fn the_swarm_duplicate_anchor_shape_is_incomplete_at_the_adjudicator() {
+    // gates/p1-swarm once signed the anchor tick twice, then chained later
+    // claims from the run-loop duplicate. Presenting the older anchor while
+    // withholding that duplicate creates the exact broken link that used to
+    // convict honest bots. This drives verify_bundle directly, bypassing the
+    // store's chain-aware assembler fix.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    let mut duplicate = produced.t0_claim.clone();
+    duplicate.prev_claim = claim_hash(&produced.t0_claim);
+    sign_claim(&authority, &mut duplicate);
+    let end = claim_at(&produced, &authority, WINDOW, &duplicate);
+    bundle.disputed_claims = vec![end];
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain)
+    );
+}
+
+#[test]
+fn reslicing_one_divergence_stacks_strike_dedup_keys() {
+    // One bad end claim can be replayed from either of two genuine anchors.
+    // Both reports therefore convict the same signed divergence. Persistd's
+    // duplicate key is (BLAKE3(postcard(report)), StrikeKind); if these report
+    // digests differ, the current ledger admits both major-strike rows.
+    let authority = key(1);
+    let reporter = key(2);
+    let produced = produce(&authority);
+    let middle = claim_at(&produced, &authority, 3, &produced.t0_claim);
+    let mut bad_end = claim_at(&produced, &authority, WINDOW, &middle);
+    bad_end.state_hash = [0xD1; 32];
+    sign_claim(&authority, &mut bad_end);
+
+    let mut whole = bundle(&produced);
+    whole.disputed_claims = vec![middle.clone(), bad_end.clone()];
+
+    let mut tail = whole.clone();
+    tail.window_start = middle.tick;
+    tail.t0_claim = middle;
+    tail.t0_snapshot = bytes::Bytes::from(produced.tick_snapshots[2].clone());
+    tail.frames.remove(0);
+    tail.sibling_heads.remove(0);
+    tail.disputed_claims = vec![bad_end];
+    tail.claimed_hashes.drain(..3);
+    tail.computed_hashes.drain(..3);
+
+    let expected = Verdict::Confirms {
+        at: Tick::new(T0 + WINDOW),
+        kind: DeviationKind::DiscreteMismatch,
+    };
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &whole),
+        expected
+    );
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &tail),
+        expected
+    );
+
+    let whole = signed_report(&reporter, &authority, whole);
+    let tail = signed_report(&reporter, &authority, tail);
+    let digest = |report: &DiscrepancyReport| {
+        let encoded = postcard::to_stdvec(report).expect("report encodes");
+        *blake3::hash(&encoded).as_bytes()
+    };
+    let whole_key = (digest(&whole), "major");
+    let tail_key = (digest(&tail), "major");
+    assert_ne!(
+        whole_key, tail_key,
+        "reporter-chosen slices bypass (whole-report digest, strike kind) deduplication"
+    );
 }
 
 #[test]
@@ -766,4 +919,44 @@ fn a_multi_entity_frame_needs_its_sibling_heads_to_verify() {
         ),
         Verdict::Confirms { .. }
     ));
+}
+
+#[test]
+fn omitting_a_trailing_input_frame_cannot_convict() {
+    // The claim chain is complete and every signature is genuine; what the
+    // reporter withheld is the *input* frame covering the last three ticks.
+    // Replaying those ticks with no inputs diverges from what the subject
+    // signed, so an adjudicator that does not require the frames to cover the
+    // window convicts an honest authority with its own signatures.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Exonerates,
+        "the untouched bundle must exonerate, or the probe proves nothing"
+    );
+
+    bundle.frames.pop().expect("frames present");
+    bundle.sibling_heads.pop().expect("heads present");
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain)
+    );
+}
+
+#[test]
+fn omitting_a_leading_input_frame_cannot_convict() {
+    // The same withholding at the other end of the window.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    bundle.frames.remove(0);
+    bundle.sibling_heads.remove(0);
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain)
+    );
 }
