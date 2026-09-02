@@ -16,7 +16,21 @@ use std::process::{Child, Command, Stdio};
 
 use bytes::Bytes;
 use iroh::RelayMode;
+#[cfg(feature = "fdb")]
+use orrery_conformance::Body;
 use orrery_conformance::REFERENCE_RULESET;
+#[cfg(feature = "fdb")]
+use orrery_core::log::{claim_hash, sign_claim};
+#[cfg(feature = "fdb")]
+use orrery_core::{state_hash, CoreCodec};
+#[cfg(feature = "fdb")]
+use orrery_persistd::adjudication::{
+    strike_account_range_end, strike_account_range_start, FdbStrikeLedger, StrikeMode, StrikeRow,
+};
+#[cfg(feature = "fdb")]
+use orrery_persistd::FdbContext;
+#[cfg(feature = "fdb")]
+use orrery_protocol::{AccountId, GridId};
 use orrery_protocol::{
     CellId, ChainHash, DiscrepancyReport, EvidenceBundle, GatewayMsg, GatewayReply, NodeId,
     PersistId, RulesetId, StateClaim, Tick, UnadjudicableReason, Verdict, REPORT_ADJUDICATED,
@@ -90,6 +104,221 @@ fn signed_report(reporter: &iroh_base::SecretKey, ruleset: RulesetId) -> Box<Dis
         support::node(2),
         thin_bundle(ruleset),
     ))
+}
+
+/// A valid one-tick Reference bundle whose closing signed claim lies about the
+/// resulting state. Unlike [`thin_bundle`], this reaches `Verdict::Confirms`
+/// and therefore exercises the deployed strike side effect.
+#[cfg(feature = "fdb")]
+fn guilty_report(reporter: &iroh_base::SecretKey) -> Box<DiscrepancyReport> {
+    let subject = support::secret(2);
+    let state = Body {
+        pos: Default::default(),
+        vel: Default::default(),
+        heading_urad: 0,
+        hp: 100,
+        shield: 25,
+        roll_fold: 0,
+    };
+    let mut anchor = StateClaim {
+        entity: ENTITY,
+        chain_epoch: 0,
+        tick: Tick::new(10),
+        input_head: ChainHash::EMPTY,
+        state_hash: state_hash(&state),
+        prev_claim: [0; 32],
+        ruleset: REFERENCE_RULESET,
+        sig: subject.sign(b"placeholder"),
+    };
+    sign_claim(&subject, &mut anchor);
+    let mut disputed = StateClaim {
+        entity: ENTITY,
+        chain_epoch: 0,
+        tick: Tick::new(11),
+        input_head: ChainHash::EMPTY,
+        state_hash: [0x86; 32],
+        prev_claim: claim_hash(&anchor),
+        ruleset: REFERENCE_RULESET,
+        sig: subject.sign(b"placeholder"),
+    };
+    sign_claim(&subject, &mut disputed);
+    let bundle = EvidenceBundle {
+        ruleset: REFERENCE_RULESET,
+        entity: ENTITY,
+        window_start: Tick::new(10),
+        window_end: Tick::new(11),
+        t0_claim: anchor,
+        t0_snapshot: Bytes::from(state.to_canonical()),
+        frames: Vec::new(),
+        sibling_heads: Vec::new(),
+        disputed_claims: vec![disputed],
+        claimed_hashes: Vec::new(),
+        computed_hashes: Vec::new(),
+    };
+    Box::new(orrery_witness::sign_report(
+        reporter,
+        subject.public(),
+        bundle,
+    ))
+}
+
+#[cfg(feature = "fdb")]
+fn strike_episode_range(account: AccountId) -> (Vec<u8>, Vec<u8>) {
+    let mut start = b"yb".to_vec();
+    start.extend_from_slice(&account.0.to_be_bytes());
+    let mut end = b"yb".to_vec();
+    end.extend_from_slice(
+        &account
+            .0
+            .checked_add(1)
+            .expect("test account has a successor")
+            .to_be_bytes(),
+    );
+    (start, end)
+}
+
+#[cfg(feature = "fdb")]
+async fn prepare_strike_account(context: &FdbContext, account: AccountId) {
+    let db = context.database();
+    let binding_key = orrery_persistd::keyspace::binding_key(&support::node(2));
+    let binding = postcard::to_stdvec(&orrery_persistd::keyspace::BindingRow {
+        account,
+        bound_at_ms: 1,
+    })
+    .expect("binding encodes");
+    let strike_start = strike_account_range_start(account);
+    let strike_end = strike_account_range_end(account);
+    let (episode_start, episode_end) = strike_episode_range(account);
+    db.run(|trx, _| {
+        let binding = binding.clone();
+        let strike_start = strike_start.clone();
+        let strike_end = strike_end.clone();
+        let episode_start = episode_start.clone();
+        let episode_end = episode_end.clone();
+        async move {
+            trx.clear_range(&strike_start, &strike_end);
+            trx.clear_range(&episode_start, &episode_end);
+            trx.set(&binding_key, &binding);
+            Ok(())
+        }
+    })
+    .await
+    .expect("prepare strike account");
+}
+
+#[cfg(feature = "fdb")]
+async fn clean_strike_account(context: &FdbContext, account: AccountId, shard: CellId) {
+    let db = context.database();
+    let binding_key = orrery_persistd::keyspace::binding_key(&support::node(2));
+    let fence_key = orrery_persistd::keyspace::fence_key(GridId::ROOT, shard);
+    let strike_start = strike_account_range_start(account);
+    let strike_end = strike_account_range_end(account);
+    let (episode_start, episode_end) = strike_episode_range(account);
+    db.run(|trx, _| {
+        let strike_start = strike_start.clone();
+        let strike_end = strike_end.clone();
+        let episode_start = episode_start.clone();
+        let episode_end = episode_end.clone();
+        async move {
+            trx.clear(&binding_key);
+            trx.clear(&fence_key);
+            trx.clear_range(&strike_start, &strike_end);
+            trx.clear_range(&episode_start, &episode_end);
+            Ok(())
+        }
+    })
+    .await
+    .expect("clean strike fixture");
+}
+
+#[cfg(feature = "fdb")]
+async fn run_strike_mode(
+    cluster: &str,
+    context: &FdbContext,
+    account: AccountId,
+    mode: Option<&str>,
+) -> Vec<StrikeRow> {
+    prepare_strike_account(context, account).await;
+    let shard = CellId::ROOT.children()[7];
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bind = free_loopback_addr();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_persistd"));
+    command
+        .arg("--dir")
+        .arg(dir.path())
+        .arg("--bind")
+        .arg(bind.to_string())
+        .arg("--node-id")
+        .arg("862")
+        .arg("--allow-volatile-leases")
+        .arg("--fdb-cluster-file")
+        .arg(cluster)
+        .arg("--issuer-key")
+        .arg(issuer_key_arg())
+        .arg("--shard")
+        .arg(format!("0x{:x}", shard.to_bits()))
+        .arg("--universe-seed")
+        .arg(TEST_UNIVERSE_SEED)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    if let Some(mode) = mode {
+        command.arg("--strikes").arg(mode);
+    }
+    let mut child = command.spawn().expect("spawn FDB-backed persistd");
+
+    let stdout = child.stdout.take().expect("stdout captured");
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read readiness document");
+    let ready: serde_json::Value = serde_json::from_str(line.trim()).expect("readiness JSON");
+    let gateway: NodeId = ready["node_id"]
+        .as_str()
+        .expect("gateway node id")
+        .parse()
+        .expect("valid gateway node id");
+
+    let reporter = iroh::SecretKey::generate();
+    let client = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
+        .alpns(vec![orrery_persistd::GATEWAY_ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .secret_key(reporter.clone())
+        .bind()
+        .await
+        .expect("client endpoint");
+    let raw = client
+        .connect(
+            iroh::EndpointAddr::new(gateway).with_ip_addr(bind),
+            orrery_persistd::GATEWAY_ALPN,
+        )
+        .await
+        .expect("connect to persistd");
+    let mut admission = raw.accept_uni().await.expect("gateway admission");
+    assert_eq!(admission.read_to_end(16).await.expect("admission"), vec![0]);
+    let conn = lanes::GatewayLanes::attach(raw);
+    conn.send_control(&GatewayMsg::VersionedHello {
+        token: process_session_token(reporter.public()),
+        node: reporter.public(),
+        version: orrery_protocol::PROTOCOL_VERSION,
+    })
+    .await;
+    lanes::expect_hello_ack(&conn).await;
+
+    let (verdict, reason) = file(&conn, guilty_report(&reporter)).await;
+    assert_eq!(reason, REPORT_ADJUDICATED);
+    assert!(
+        matches!(verdict, Some(Verdict::Confirms { .. })),
+        "the deployed Reference worker must produce the guilty verdict that triggers filing: {verdict:?}"
+    );
+
+    conn.conn().close(0u32.into(), b"test complete");
+    client.close().await;
+    stop(&mut child);
+
+    let ledger = FdbStrikeLedger::from_database(context.database());
+    let rows = ledger.rows(account).await.expect("read filed strike rows");
+    clean_strike_account(context, account, shard).await;
+    rows
 }
 
 async fn file(
@@ -199,4 +428,47 @@ async fn reference_ruleset_binary_adjudicates_registered_builds_and_marks_unknow
     conn.conn().close(0u32.into(), b"test complete");
     client.close().await;
     stop(&mut child);
+}
+
+/// This is intentionally one named test: the mutation proof removes the
+/// composition-root `with_strike_ledger` call and must fail this exact binary
+/// path rather than merely exercising the library filer again.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn reference_ruleset_binary_strike_modes_reach_the_durable_ledger() {
+    let Some(cluster) = support::fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let context = FdbContext::connect(&cluster).expect("configured FDB cluster file opens");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_nanos() as u64;
+    let base = 0x0862_0000_0000_0000 | (nonce & 0x0000_ffff_ffff_fff0);
+
+    let off = run_strike_mode(&cluster, &context, AccountId::new(base), None).await;
+    assert!(
+        off.is_empty(),
+        "the default --strikes off deployment must install no filer"
+    );
+
+    let shadow =
+        run_strike_mode(&cluster, &context, AccountId::new(base + 1), Some("shadow")).await;
+    assert_eq!(shadow.len(), 1, "shadow must persist one durable ya row");
+    assert_eq!(shadow[0].mode, StrikeMode::Shadow);
+    assert_eq!(
+        shadow
+            .iter()
+            .filter(|row| row.mode == StrikeMode::Live)
+            .map(|row| i64::from(row.weight_milli))
+            .sum::<i64>(),
+        0,
+        "D33 standing counts live rows only, so a shadow filing changes no standing"
+    );
+
+    let live = run_strike_mode(&cluster, &context, AccountId::new(base + 2), Some("live")).await;
+    assert_eq!(live.len(), 1, "live must persist one durable ya row");
+    assert_eq!(live[0].mode, StrikeMode::Live);
+    assert_eq!(live[0].weight_milli, 3_000);
 }
