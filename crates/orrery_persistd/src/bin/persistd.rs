@@ -58,14 +58,16 @@ use orrery_persistd::adjudication::FdbStrikeLedger;
 #[cfg(feature = "reference-ruleset")]
 use orrery_persistd::adjudication::StrikeMode;
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
+#[cfg(feature = "fdb")]
+use orrery_persistd::gateway::spawn_strikes_posture_poller;
 use orrery_persistd::gateway::{SessionTokenV1Authorizer, StrikesEnforcement, StrikesPosture};
 #[cfg(feature = "fdb")]
 use orrery_persistd::intent::FdbRampPostureStore;
 use orrery_persistd::intent::{
-    AttestationEnforcement, BaselineIntentValidator, QuarantineValidation,
+    AttestationEnforcement, AttestationPosture, BaselineIntentValidator, QuarantineValidation,
 };
 #[cfg(any(feature = "fdb", test))]
-use orrery_persistd::intent::{RampMode, RampPosture};
+use orrery_persistd::intent::{RampMode, RampPosture, SharedRampPostureReader};
 use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
@@ -1385,22 +1387,14 @@ async fn main() -> anyhow::Result<()> {
                 // D32 clause (d)'s corollary: the executor's re-proof and the
                 // `attest/` marker have to agree with the mode admission ran
                 // under, so the same cache and the same resolver are wired into
-                // both sides here rather than configured twice. Under `off` the
-                // executor holds no authority and writes no row, which is the
-                // state this binary shipped in.
+                // both sides here rather than configured twice.
                 let exec = match attestation {
                     None => exec,
-                    Some(wiring) => match wiring.mode {
-                        AttestationEnforcement::Off => exec,
-                        AttestationEnforcement::Shadow => exec.shadowing_epochs(
-                            Arc::clone(&wiring.epochs),
-                            Arc::clone(&wiring.bindings),
-                        ),
-                        AttestationEnforcement::Required => exec.recording_epochs(
-                            Arc::clone(&wiring.epochs),
-                            Arc::clone(&wiring.bindings),
-                        ),
-                    },
+                    Some(wiring) => exec.tracking_posture(
+                        Arc::clone(&wiring.epochs),
+                        Arc::clone(&wiring.bindings),
+                        wiring.posture.clone(),
+                    ),
                 };
                 let exec = Arc::new(exec);
                 *captured_intent_executor
@@ -1435,13 +1429,41 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
     gateway_config.adjudicator = adjudicator;
     #[cfg(feature = "fdb")]
-    let authority_correction_poller = fdb_context.as_ref().map(|context| {
-        spawn_authority_correction_poller(
-            FdbRampPostureStore::from_context(context),
-            gateway_config.authority_correction_posture.clone(),
-            cli.authority_correction,
-        )
-    });
+    let (attestation_poller, strikes_poller, authority_correction_poller) =
+        if let Some(context) = fdb_context.as_ref() {
+            let reader =
+                || Arc::new(FdbRampPostureStore::from_context(context)) as SharedRampPostureReader;
+            // The same predicate `attestation_wiring` used. Without it the
+            // executor still carries a posture cell of its own, and polling
+            // *that* would arm the commit-time re-proof while admission stayed
+            // permissive — a split D32 clause (d) forbids.
+            let attestation_posture = c1_posture_is_wired(&cli)
+                .then(|| {
+                    intent_executor
+                        .lock()
+                        .expect("intent executor capture lock poisoned")
+                        .as_ref()
+                        .map(|executor| executor.attestation_posture())
+                })
+                .flatten();
+            (
+                attestation_posture.map(|posture| {
+                    spawn_attestation_posture_poller(reader(), posture, cli.attestation_enforcement)
+                }),
+                Some(spawn_strikes_posture_poller(
+                    reader(),
+                    gateway_config.strikes_posture.clone(),
+                    cli.strikes,
+                )),
+                Some(spawn_authority_correction_poller(
+                    reader(),
+                    gateway_config.authority_correction_posture.clone(),
+                    cli.authority_correction,
+                )),
+            )
+        } else {
+            (None, None, None)
+        };
     #[cfg(feature = "fdb")]
     if let (Some(context), false) = (fdb_context.as_ref(), cli.hot_ledger_sweep_interval_ms == 0) {
         spawn_hot_ledger_sweeper(
@@ -1788,7 +1810,14 @@ async fn main() -> anyhow::Result<()> {
     gateway.shutdown().await;
 
     #[cfg(feature = "fdb")]
-    if let Some(poller) = authority_correction_poller {
+    for poller in [
+        attestation_poller,
+        strikes_poller,
+        authority_correction_poller,
+    ]
+    .into_iter()
+    .flatten()
+    {
         poller.abort();
         let _ = poller.await;
     }
@@ -2579,13 +2608,14 @@ async fn dev_seed_entities(
 /// anything but `off` must wire the epoch authority into **both** the
 /// validator and the executor".
 ///
-/// Handed to the executor factory rather than applied after it, because
-/// [`FdbIntentExecutor::recording_epochs`] consumes `self` and the binary
-/// wraps the executor in an `Arc` the moment it is built. `None` is `off`,
-/// where the executor writes no row and the two sides have nothing to agree
-/// about.
+/// Handed to the executor factory rather than applied after it, because the
+/// binary wraps the executor in an `Arc` the moment it is built. An FDB-backed
+/// gateway retains this wiring even when its startup posture is `off`, so a
+/// later poll can move admission and commit together. `None` is for a gateway
+/// with no durable posture to poll — a volatile one, or one with no
+/// `--coordinator-key` and so no reachable C1 verdict ([`c1_posture_is_wired`]).
 struct AttestationWiring {
-    mode: AttestationEnforcement,
+    posture: AttestationPosture,
     epochs: Arc<orrery_persistd::witness_epoch::WitnessEpochAuthority>,
     bindings: orrery_persistd::gateway::SharedBindingAuthority,
 }
@@ -2643,25 +2673,17 @@ where
         None
     };
 
-    // The admission filter, in whichever of the three postures the operator
-    // asked for. `off` keeps the landed constructor untouched — including its
-    // absent resolver, which is honest rather than degraded (a validator with
-    // no `id/` rows has no account to compare and says so by having none).
+    // The admission filter and commit-time re-proof share one posture cell.
+    // Without that identity a runtime demotion could stop admission refusals
+    // while the executor continued refusing the same intent at commit.
     let validator = match &attestation {
         None => BaselineIntentValidator::permissive(),
-        Some(wiring) => match wiring.mode {
-            AttestationEnforcement::Off => BaselineIntentValidator::permissive(),
-            AttestationEnforcement::Shadow => BaselineIntentValidator::shadow(
-                Arc::clone(&wiring.epochs),
-                Arc::clone(&interest_authority),
-                Arc::clone(&wiring.bindings),
-            ),
-            AttestationEnforcement::Required => BaselineIntentValidator::enforcing(
-                Arc::clone(&wiring.epochs),
-                Arc::clone(&interest_authority),
-                Arc::clone(&wiring.bindings),
-            ),
-        },
+        Some(wiring) => BaselineIntentValidator::tracking_posture(
+            Arc::clone(&wiring.epochs),
+            Arc::clone(&interest_authority),
+            Arc::clone(&wiring.bindings),
+            wiring.posture.clone(),
+        ),
     };
     let validator: Arc<dyn orrery_persistd::intent::IntentValidator> =
         Arc::new(validator.with_quarantine_validation(cli.quarantine_validation));
@@ -2768,9 +2790,15 @@ fn configured_adjudicator(
     Ok(None)
 }
 
-#[cfg(feature = "fdb")]
+/// Poll D32 control C4's durable posture into a running gateway.
+///
+/// An absent row restores `startup_default`. A read failure is
+/// [`AuthorityCorrectionPosture::auto_suspend`] — `Live → Shadow`, and nothing
+/// else — replacing the "retain the last known mode" arm this poller landed
+/// with. See [`spawn_attestation_posture_poller`] for why.
+#[cfg(any(feature = "fdb", test))]
 fn spawn_authority_correction_poller(
-    store: FdbRampPostureStore,
+    store: SharedRampPostureReader,
     posture: AuthorityCorrectionPosture,
     startup_default: AuthorityCorrectionEnforcement,
 ) -> JoinHandle<()> {
@@ -2787,14 +2815,95 @@ fn spawn_authority_correction_poller(
                     posture.set(mode);
                 }
                 Err(error) => {
+                    let suspended = posture.auto_suspend();
                     tracing::warn!(
                         control = orrery_persistd::AUTHORITY_CORRECTION_CONTROL,
                         %error,
-                        "could not refresh enforcement posture; retaining last known mode"
+                        suspended,
+                        "could not refresh enforcement posture; suppressing any live action"
                     );
                 }
             }
         }
+    })
+}
+
+/// Poll D32 control C1's durable posture into a running gateway's validator
+/// **and** its commit-time re-proof, which share one
+/// [`AttestationPosture`] cell.
+///
+/// An absent row restores `startup_default`.
+///
+/// # Why a failed read demotes instead of retaining the last known mode
+///
+/// The three pollers all take [`AttestationPosture::auto_suspend`]'s shape:
+/// `Required`/`Live → Shadow`, never a promotion and never `Off`.
+///
+/// The alternative — hold the last value read — is what a durable control
+/// *looks* like it should do, and it is the defect that took p1-swarm's
+/// supervisor down (#926): a campaign pin read once kept refusing every client
+/// against a value the file no longer held, silently, until a restart. The
+/// property that failed there is the one D32 clause (c) is for: a posture is
+/// only a lever if the operator's *demotion* can still arrive. A read arm that
+/// keeps acting while the store is unreadable has armed enforcement that no
+/// operator can now switch off — the one state a ramp must not reach.
+///
+/// Demoting rather than promoting is D32 clause (f)'s asymmetry: automation may
+/// make the fleet safer without asking, never less safe. So `Off` and `Shadow`
+/// are left alone (a failure must not start an evaluation nobody asked for, and
+/// must not blind a control that is recording evidence), and the demotion stops
+/// at `Shadow` rather than `Off` so the incident that tripped it is still
+/// observed.
+///
+/// This is deliberately *not* D33 clause (f)'s fail-closed standing read, and
+/// the difference is what the unreadable value is. There, it is a fact about a
+/// subject, and an unknown standing must not be read as good. Here, it is the
+/// operator's own lever position, and an unknown lever must not be read as
+/// authority to act. Both are least-authority-on-doubt; only one of them is a
+/// refusal.
+///
+/// The reader's transactions are bounded by
+/// [`orrery_persistd::fdb::bound_transactions`], so an error reaching this arm
+/// has already exhausted FDB's retry limit — it is a store that is down, not a
+/// blip, and the demotion does not flap on one lost packet.
+#[cfg(any(feature = "fdb", test))]
+fn spawn_attestation_posture_poller(
+    store: SharedRampPostureReader,
+    posture: AttestationPosture,
+    startup_default: AttestationEnforcement,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            match store
+                .read(orrery_persistd::intent::ATTESTATION_QUORUM_CONTROL)
+                .await
+            {
+                Ok(row) => posture.set(attestation_mode(row.as_ref(), startup_default)),
+                Err(error) => {
+                    let suspended = posture.auto_suspend();
+                    tracing::warn!(
+                        control = orrery_persistd::intent::ATTESTATION_QUORUM_CONTROL,
+                        %error,
+                        suspended,
+                        "could not refresh enforcement posture; suppressing any required action"
+                    );
+                }
+            }
+        }
+    })
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn attestation_mode(
+    durable: Option<&RampPosture>,
+    startup_default: AttestationEnforcement,
+) -> AttestationEnforcement {
+    durable.map_or(startup_default, |row| match row.mode {
+        RampMode::Off => AttestationEnforcement::Off,
+        RampMode::Shadow => AttestationEnforcement::Shadow,
+        RampMode::Live => AttestationEnforcement::Required,
     })
 }
 
@@ -2922,11 +3031,44 @@ fn spawn_full_conservation_sweeper(
     })
 }
 
-/// Build C1's wiring from the CLI, or refuse a mode that could never evaluate.
+/// Whether this process has a C1 posture worth polling.
 ///
-/// `None` is `off`: no cache, no resolver, and the landed permissive validator
-/// — which is why `off` is byte-for-byte the behaviour this binary had before
-/// the flag existed.
+/// The quorum is judged against a coordinator-signed witness-set announcement,
+/// so a gateway that trusts no coordinator key can reach no C1 verdict in any
+/// of the three modes. Promoting such a process from a durable row would move
+/// an atomic byte and change nothing an intent can observe.
+///
+/// # Why a keyless FDB gateway is not refused at startup
+///
+/// It is tempting to bail instead — a durable control with no lever is exactly
+/// the silent half-configuration #863 is about. But `--fdb-cluster-file` with
+/// no `--coordinator-file` is a configuration this repository already runs:
+/// `scripts/p2-kill9-gate.sh`, `scripts/p2-abba-load.sh` and
+/// `scripts/p2-capacity-sweep.sh` all start a durable persistd with no
+/// coordinator key, and none of them exercises C1. Refusing would turn three
+/// recovery and load harnesses red for a control they do not use. So the
+/// keyless case keeps the landed behaviour and [`attestation_wiring`] logs the
+/// absence once, where an operator reading startup can see it.
+///
+/// [`attestation_wiring`] returns `Some` for an FDB gateway exactly when this
+/// is true, and `main` gates the C1 poller on the same predicate, so the two
+/// cannot drift into a poller writing a cell no validator shares.
+fn c1_posture_is_wired(cli: &Cli) -> bool {
+    !cli.coordinator_key.is_empty()
+}
+
+/// Build C1's startup and runtime wiring, or refuse a process that could enter
+/// an acting mode it cannot evaluate.
+///
+/// `None` is the landed `off` shape: no cache, no resolver, the permissive
+/// validator, and — the part this function exists to decide — **no C1 posture
+/// cell for the poller to write into**. An FDB-backed process that could
+/// actually evaluate the quorum keeps its wiring even at `off`, so that a
+/// durable row arriving later arms admission and the commit-time re-proof
+/// together instead of moving an atomic byte nothing reads.
+///
+/// Whether it *could* evaluate is [`c1_posture_is_wired`]; see there for why a
+/// keyless FDB gateway is left alone rather than refused.
 ///
 /// # The resolver is deliberately the one that resolves nothing
 ///
@@ -2950,10 +3092,7 @@ fn spawn_full_conservation_sweeper(
 /// [`UnboundBindingAuthority`]: orrery_persistd::gateway::UnboundBindingAuthority
 /// [`ShadowVerdict::Unevaluated`]: orrery_persistd::intent::ShadowVerdict::Unevaluated
 fn attestation_wiring(cli: &Cli) -> anyhow::Result<Option<AttestationWiring>> {
-    if cli.attestation_enforcement == AttestationEnforcement::Off {
-        return Ok(None);
-    }
-    if cli.coordinator_key.is_empty() {
+    if cli.attestation_enforcement != AttestationEnforcement::Off && !c1_posture_is_wired(cli) {
         anyhow::bail!(
             "--attestation-enforcement {} requires at least one --coordinator-key: \
              the K-of-N quorum judges an intent against a coordinator-signed witness-set \
@@ -2961,8 +3100,27 @@ fn attestation_wiring(cli: &Cli) -> anyhow::Result<Option<AttestationWiring>> {
             cli.attestation_enforcement.as_str()
         );
     }
+    if cli.attestation_enforcement == AttestationEnforcement::Off {
+        // A process with no durable tier has no row to poll, so `off` is the
+        // landed no-authority shape and stays that way.
+        if cli.fdb_cluster_file.is_none() {
+            return Ok(None);
+        }
+        // A durable process that cannot evaluate the quorum has no lever
+        // either, and says so once at startup rather than presenting a
+        // posture cell a durable row would move without changing a verdict.
+        if !c1_posture_is_wired(cli) {
+            tracing::warn!(
+                control = orrery_persistd::intent::ATTESTATION_QUORUM_CONTROL,
+                "no --coordinator-key: this gateway has no C1 runtime posture, and a \
+                 durable ramp row for this control will not take effect until it is \
+                 restarted with a coordinator key"
+            );
+            return Ok(None);
+        }
+    }
     Ok(Some(AttestationWiring {
-        mode: cli.attestation_enforcement,
+        posture: AttestationPosture::new(cli.attestation_enforcement),
         epochs: Arc::new(orrery_persistd::witness_epoch::WitnessEpochAuthority::new(
             cli.coordinator_key.iter().map(|key| key.0.clone()),
         )),
@@ -3457,6 +3615,49 @@ fn parse_shard_coords(s: &str) -> Result<CellId, String> {
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    enum FakePostureRead {
+        Row(Option<RampPosture>),
+        Failure,
+    }
+
+    struct MutablePostureReader(std::sync::Mutex<FakePostureRead>);
+
+    impl MutablePostureReader {
+        fn new(read: FakePostureRead) -> Arc<Self> {
+            Arc::new(Self(std::sync::Mutex::new(read)))
+        }
+
+        fn set(&self, read: FakePostureRead) {
+            *self.0.lock().expect("posture reader lock") = read;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl orrery_persistd::intent::RampPostureReader for MutablePostureReader {
+        async fn read(
+            &self,
+            _control: &str,
+        ) -> Result<Option<RampPosture>, orrery_persistd::intent::RampPostureError> {
+            match self.0.lock().expect("posture reader lock").clone() {
+                FakePostureRead::Row(row) => Ok(row),
+                FakePostureRead::Failure => Err(orrery_persistd::intent::RampPostureError(
+                    "injected failure".into(),
+                )),
+            }
+        }
+    }
+
+    fn operator_posture(mode: RampMode) -> RampPosture {
+        RampPosture {
+            mode,
+            source: orrery_persistd::intent::PostureSource::Operator,
+            set_at_ms: 1,
+            reason: "test override".into(),
+            incident_id: None,
+        }
+    }
+
     /// The flags that must **never** read the environment, and why.
     ///
     /// #865 gave these fallbacks; an audit found each one wrong in a different
@@ -3920,7 +4121,8 @@ mod tests {
             &cli_enforcing(mode),
             None,
             move |_cluster_file, _grid, attestation| {
-                *capture.lock().expect("capture lock") = attestation.map(|wiring| wiring.mode);
+                *capture.lock().expect("capture lock") =
+                    attestation.map(|wiring| wiring.posture.get());
                 Ok(None)
             },
         )
@@ -4056,6 +4258,51 @@ mod tests {
         }
     }
 
+    /// C4's durable row reaches the cell a *running* gateway reads.
+    ///
+    /// The landed C4 coverage
+    /// ([`durable_authority_correction_posture_overrides_cli_and_absence_restores_it`])
+    /// asserts the pure `Option<&RampPosture> -> mode` mapping and stops there,
+    /// so it would still pass against a poller that read the store once at
+    /// startup — the shape of the p1-swarm defect (#926). This drives the
+    /// poller task and reads the cell `gateway_config` handed the gateway.
+    #[tokio::test(start_paused = true)]
+    async fn c4_poller_applies_store_changes_without_a_restart() {
+        let config = gateway_config(&cli(None), None, |_cluster_file, _grid, _attestation| {
+            Ok(None)
+        })
+        .expect("gateway config");
+        let posture = config.authority_correction_posture.clone();
+        assert_eq!(posture.get(), AuthorityCorrectionEnforcement::Off);
+
+        let reader = MutablePostureReader::new(FakePostureRead::Row(None));
+        let poller = spawn_authority_correction_poller(
+            Arc::clone(&reader) as SharedRampPostureReader,
+            posture.clone(),
+            AuthorityCorrectionEnforcement::Off,
+        );
+        tokio::task::yield_now().await;
+
+        reader.set(FakePostureRead::Row(Some(operator_posture(RampMode::Live))));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            posture.get(),
+            AuthorityCorrectionEnforcement::Live,
+            "the durable live row must reach the running gateway's C4 cell"
+        );
+
+        reader.set(FakePostureRead::Row(None));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            posture.get(),
+            AuthorityCorrectionEnforcement::Off,
+            "removing the row restores the off startup default"
+        );
+        poller.abort();
+    }
+
     /// C5 reaches the gateway's posture cell, rather than stopping at clap.
     #[test]
     fn strikes_flag_selects_all_three_modes_at_the_gateway_posture() {
@@ -4134,17 +4381,132 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn c1_poller_changes_running_validation_without_a_restart() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let config = gateway_config(
+            &cli_enforcing(AttestationEnforcement::Off),
+            None,
+            move |_cluster_file, _grid, attestation| {
+                *capture.lock().expect("capture lock") =
+                    attestation.map(|wiring| wiring.posture.clone());
+                Ok(None)
+            },
+        )
+        .expect("gateway config");
+        let posture = captured
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("FDB C1 wiring has a runtime posture");
+        let reader = MutablePostureReader::new(FakePostureRead::Row(None));
+        let poller = spawn_attestation_posture_poller(
+            Arc::clone(&reader) as SharedRampPostureReader,
+            posture,
+            AttestationEnforcement::Off,
+        );
+        tokio::task::yield_now().await;
+
+        let (intent, key) = unannounced_intent();
+        let context = orrery_persistd::intent::IntentContext {
+            issuer: key.public(),
+            account: Some(orrery_protocol::AccountId::new(7)),
+            standing: orrery_protocol::SessionStanding::Good,
+        };
+        assert!(matches!(
+            config.validator.validate(&intent, &context),
+            orrery_persistd::intent::IntentVerdict::Admit(_)
+        ));
+
+        reader.set(FakePostureRead::Row(Some(operator_posture(RampMode::Live))));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                config.validator.validate(&intent, &context),
+                orrery_persistd::intent::IntentVerdict::Reject { .. }
+            ),
+            "the durable required row must arm C1 in the running validator"
+        );
+
+        reader.set(FakePostureRead::Row(None));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                config.validator.validate(&intent, &context),
+                orrery_persistd::intent::IntentVerdict::Admit(_)
+            ),
+            "removing the durable row must restore the off startup default"
+        );
+        poller.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c1_posture_read_failure_demotes_required_but_does_not_promote_off() {
+        let reader = MutablePostureReader::new(FakePostureRead::Failure);
+        let posture = AttestationPosture::new(AttestationEnforcement::Required);
+        let poller = spawn_attestation_posture_poller(
+            Arc::clone(&reader) as SharedRampPostureReader,
+            posture.clone(),
+            AttestationEnforcement::Required,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(posture.get(), AttestationEnforcement::Shadow);
+        poller.abort();
+
+        let posture = AttestationPosture::new(AttestationEnforcement::Off);
+        let poller = spawn_attestation_posture_poller(
+            reader as SharedRampPostureReader,
+            posture.clone(),
+            AttestationEnforcement::Off,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(posture.get(), AttestationEnforcement::Off);
+        poller.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c4_posture_read_failure_demotes_live_but_does_not_promote_off() {
+        let reader = MutablePostureReader::new(FakePostureRead::Failure);
+        let posture = AuthorityCorrectionPosture::new(AuthorityCorrectionEnforcement::Live);
+        let poller = spawn_authority_correction_poller(
+            Arc::clone(&reader) as SharedRampPostureReader,
+            posture.clone(),
+            AuthorityCorrectionEnforcement::Live,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(posture.get(), AuthorityCorrectionEnforcement::Shadow);
+        poller.abort();
+
+        let posture = AuthorityCorrectionPosture::new(AuthorityCorrectionEnforcement::Off);
+        let poller = spawn_authority_correction_poller(
+            reader as SharedRampPostureReader,
+            posture.clone(),
+            AuthorityCorrectionEnforcement::Off,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(posture.get(), AuthorityCorrectionEnforcement::Off);
+        poller.abort();
+    }
+
     /// Each of the three positions reaches the validator, the epoch cache and
     /// the executor — not merely the argument parser.
     #[test]
     fn the_attestation_flag_selects_all_three_modes_at_the_validator() {
         use orrery_persistd::intent::IntentVerdict;
 
-        // `off`: nothing is evaluated, nothing is wired, the intent commits.
+        // Durable `off`: nothing is evaluated and the intent commits, while
+        // the cache and executor posture remain wired so a later row can arm
+        // the running process rather than merely changing an atomic byte.
         let (verdict, cached, executor) = wiring_reached_by(AttestationEnforcement::Off);
         assert!(matches!(verdict, IntentVerdict::Admit(_)));
-        assert!(!cached, "`off` configures no witness-epoch cache");
-        assert_eq!(executor, None);
+        assert!(
+            cached,
+            "durable `off` retains the cache needed by a promotion"
+        );
+        assert_eq!(executor, Some(AttestationEnforcement::Off));
 
         // `shadow`: the predicate is evaluated against a cache that resolves
         // nothing, the verdict is recorded, and the intent commits anyway.
@@ -4206,6 +4568,39 @@ mod tests {
                 "the refusal must name the missing argument: {error}"
             );
         }
+    }
+
+    /// A durable `off` gateway keeps its C1 wiring — the cell the poller
+    /// writes into — but only when it could reach a verdict at all.
+    ///
+    /// Both halves matter. Without the first, #863's C1 lever exists only for
+    /// a process that already started above `off`, which is the one case an
+    /// operator does not need it for. Without the second, a keyless gateway
+    /// would present a posture a durable row could move while every intent
+    /// still answered the same way — the "control that only looks reversible"
+    /// this issue is about, rebuilt one layer down.
+    #[test]
+    fn a_durable_off_gateway_has_a_c1_posture_exactly_when_it_could_use_one() {
+        let keyless = cli(Some(PathBuf::from("/tmp/fdb.cluster")));
+        assert_eq!(keyless.attestation_enforcement, AttestationEnforcement::Off);
+        assert!(!c1_posture_is_wired(&keyless));
+        assert!(
+            attestation_wiring(&keyless)
+                .expect("a keyless durable gateway still starts")
+                .is_none(),
+            "no coordinator key means no C1 verdict, so no posture to poll"
+        );
+
+        let keyed = cli_enforcing(AttestationEnforcement::Off);
+        assert!(c1_posture_is_wired(&keyed));
+        let wiring = attestation_wiring(&keyed)
+            .expect("a keyed durable gateway starts")
+            .expect("a keyed durable `off` gateway retains its C1 wiring");
+        assert_eq!(
+            wiring.posture.get(),
+            AttestationEnforcement::Off,
+            "the retained cell still starts at the CLI default"
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use orrery_persistd::gateway::{SharedBindingAuthority, SnapshotBindingAuthority};
+use orrery_persistd::intent::AttestationEnforcement;
 use orrery_persistd::witness_epoch::WitnessEpochAuthority;
 use orrery_persistd::{keyspace, FdbIntentExecutor, IntentExecutor};
 use orrery_protocol::{
@@ -537,6 +538,74 @@ async fn an_executor_with_no_epoch_cache_records_nothing() {
     assert_eq!(
         read_key(&db, keyspace::epoch_handle_key(handle).to_vec()).await,
         None
+    );
+}
+
+/// The same "off records nothing" property, for the gateway shape #863
+/// introduced — an executor that *has* the epoch cache and is merely posted
+/// `off`.
+///
+/// [`an_executor_with_no_epoch_cache_records_nothing`] proves the old
+/// structural reason: `off` was handed no cache, so `record_witness_epoch`'s
+/// `let else` caught it. A durable gateway now retains its C1 wiring at `off`
+/// so a later posture row arms admission and the commit-time re-proof
+/// together, which means that `let else` no longer fires and the property has
+/// to be carried by the posture itself. Without the guard this test's first
+/// half writes `epoch/`, the handle index and an `AttestRow { enforced:
+/// false }` — bytes an auditor cannot tell apart from a shadow commit, in the
+/// one mode D32 clause (d) says writes nothing.
+///
+/// The second half is the other side of the same seam: flipping the cell —
+/// which is exactly what the C1 poller does when a durable row arrives —
+/// starts the recording without rebuilding the executor.
+#[tokio::test]
+async fn a_durable_off_executor_that_holds_an_epoch_cache_still_records_nothing() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let handle = 0x9601_0000_0000_000B;
+    let (epochs, witnesses) = accepted_epoch(11, handle);
+    let posture = orrery_persistd::intent::AttestationPosture::new(AttestationEnforcement::Off);
+    let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+        .unwrap()
+        .tracking_posture(
+            Arc::clone(&epochs),
+            fixture_bindings(&witnesses),
+            posture.clone(),
+        );
+    let db = Arc::clone(exec.database());
+    reset(&db, 11, handle, &[0x9601_00B1, 0x9601_00B2]).await;
+
+    let key = secret(19);
+    let intent = attested_intent(0x9601_00B1, &key, handle, &epochs, &witnesses);
+    assert!(matches!(
+        exec.execute(&intent).await.unwrap(),
+        IntentOutcome::Committed { .. }
+    ));
+    assert_eq!(
+        read_key(&db, keyspace::attest_key(intent.intent_id).to_vec()).await,
+        None,
+        "`off` must write no AttestRow even when the epoch cache is wired"
+    );
+    assert_eq!(
+        read_key(&db, keyspace::epoch_handle_key(handle).to_vec()).await,
+        None,
+        "`off` must not make the draw commitment durable"
+    );
+
+    // The poller's promotion, on the cell the executor already holds.
+    posture.set(AttestationEnforcement::Shadow);
+    let intent = attested_intent(0x9601_00B2, &key, handle, &epochs, &witnesses);
+    assert!(matches!(
+        exec.execute(&intent).await.unwrap(),
+        IntentOutcome::Committed { .. }
+    ));
+    assert!(
+        read_key(&db, keyspace::attest_key(intent.intent_id).to_vec())
+            .await
+            .is_some(),
+        "promoting the cell to shadow must start recording without a restart"
     );
 }
 

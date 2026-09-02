@@ -52,8 +52,8 @@ pub mod ramp;
 pub use ramp::FdbRampPostureStore;
 pub use ramp::{
     AbsentControl, CohortEvidence, HonestCohort, PostureSource, Provenance, RampArtifact,
-    RampMeter, RampMode, RampPosture, RampPostureError, RampSnapshot, UnattributedTally,
-    RAMP_ARTIFACT_SCHEMA,
+    RampMeter, RampMode, RampPosture, RampPostureError, RampPostureReader, RampSnapshot,
+    SharedRampPostureReader, UnattributedTally, RAMP_ARTIFACT_SCHEMA,
 };
 
 pub mod stages;
@@ -1167,6 +1167,30 @@ impl BaselineIntentValidator {
     ) -> Self {
         Self {
             enforcement: AttestationPosture::new(AttestationEnforcement::Required),
+            quarantine_validation: QuarantineValidation::Live,
+            epochs: Some(epochs),
+            interest: Some(interest),
+            bindings: Some(bindings),
+            observer: None,
+            quarantine_observer: None,
+        }
+    }
+
+    /// A validator whose quorum mode follows a caller-owned runtime posture.
+    ///
+    /// This is the admission half of the same D32 clause (c) seam as
+    /// [`crate::intent::FdbIntentExecutor::tracking_posture`]. A deployed
+    /// gateway gives both halves the same cell, so one poll cannot demote
+    /// admission while leaving commit-time re-proof armed.
+    #[must_use]
+    pub fn tracking_posture(
+        epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        interest: Arc<dyn crate::gateway::InterestAuthority>,
+        bindings: crate::gateway::SharedBindingAuthority,
+        posture: AttestationPosture,
+    ) -> Self {
+        Self {
+            enforcement: posture,
             quarantine_validation: QuarantineValidation::Live,
             epochs: Some(epochs),
             interest: Some(interest),

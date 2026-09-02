@@ -70,8 +70,8 @@ use crate::adjudication::{AdjudicationExecutor, AdjudicationOutcome};
 use crate::cluster::{LeaseRenewal, Router};
 use crate::intent::stages::{self, intent_stage_metrics, IntentStageSnapshot, IntentTrace};
 use crate::intent::{
-    error_outcome, IntentContext, IntentVerdict, PermissiveValidator, RampMeter, SharedExecutor,
-    SharedValidator,
+    error_outcome, IntentContext, IntentVerdict, PermissiveValidator, RampMeter, RampMode,
+    SharedExecutor, SharedRampPostureReader, SharedValidator,
 };
 use crate::lease::registrar_now_ms;
 use crate::lease::stages::{elapsed_us as lease_stage_us, lease_stage_metrics, HeartbeatTrace};
@@ -266,6 +266,26 @@ impl AuthorityCorrectionPosture {
         self.0.store(Self::code(mode), Ordering::Relaxed);
     }
 
+    /// D32 clause (f)'s trip: demote an acting control to shadow, and refuse
+    /// to do anything else.
+    ///
+    /// The same asymmetry [`crate::intent::AttestationPosture::auto_suspend`]
+    /// carries, and for the same reason — automation may make the fleet safer
+    /// without asking, never less safe. Returns whether the posture moved;
+    /// `false` is the ordinary answer for a control already `Shadow` or `Off`.
+    /// A compare-exchange rather than a `get`-then-`set` pair, so that the trip
+    /// can never overwrite an operator promotion that landed between the two.
+    pub fn auto_suspend(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::code(AuthorityCorrectionEnforcement::Live),
+                Self::code(AuthorityCorrectionEnforcement::Shadow),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     const fn code(mode: AuthorityCorrectionEnforcement) -> u8 {
         match mode {
             AuthorityCorrectionEnforcement::Off => 0,
@@ -364,6 +384,25 @@ impl StrikesPosture {
             .store(Self::code(mode), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// D32 clause (f)'s trip: demote an acting control to shadow, and refuse
+    /// to do anything else.
+    ///
+    /// The same asymmetry [`crate::intent::AttestationPosture::auto_suspend`]
+    /// carries. Returns whether the posture moved; `false` is the ordinary
+    /// answer for a control already `Shadow` or `Off`, where there is no action
+    /// left to suspend and an `Off → Shadow` move would be automation starting
+    /// an evaluation nobody asked for.
+    pub fn auto_suspend(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::code(StrikesEnforcement::Live),
+                Self::code(StrikesEnforcement::Shadow),
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     const fn code(mode: StrikesEnforcement) -> u8 {
         match mode {
             StrikesEnforcement::Off => 0,
@@ -371,6 +410,57 @@ impl StrikesPosture {
             StrikesEnforcement::Live => 2,
         }
     }
+}
+
+/// Poll D32 control C5's durable posture into a running gateway.
+///
+/// The first tick is immediate and subsequent ticks run once per second, the
+/// same cadence as C4 and the gateway maintenance sweep. An absent row restores
+/// `startup_default`, so deleting an override reverts to the CLI.
+///
+/// # A failed read demotes rather than retaining the last known mode
+///
+/// [`StrikesPosture::auto_suspend`], i.e. `Live → Shadow` and nothing else.
+/// Retaining the last known mode — what C4's landed poller did — leaves
+/// punitive action armed at exactly the moment the operator's demotion lever
+/// cannot be read, which is the shape of the p1-swarm incident (#926): a
+/// durable value the process could no longer re-read kept refusing every
+/// client, and only a restart cleared it. `Off` and `Shadow` are left alone, so
+/// a read failure can never promote a control or blind one that is recording
+/// evidence. The reader's transactions are bounded by
+/// [`crate::fdb::bound_transactions`], so an error reaching this arm has
+/// already exhausted FDB's retries rather than being one transient blip.
+#[must_use]
+pub fn spawn_strikes_posture_poller(
+    reader: SharedRampPostureReader,
+    posture: StrikesPosture,
+    startup_default: StrikesEnforcement,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            match reader.read(STRIKES_CONTROL).await {
+                Ok(row) => {
+                    let mode = row.as_ref().map_or(startup_default, |row| match row.mode {
+                        RampMode::Off => StrikesEnforcement::Off,
+                        RampMode::Shadow => StrikesEnforcement::Shadow,
+                        RampMode::Live => StrikesEnforcement::Live,
+                    });
+                    posture.set(mode);
+                }
+                Err(error) => {
+                    let suspended = posture.auto_suspend();
+                    warn!(
+                        control = STRIKES_CONTROL,
+                        %error,
+                        suspended,
+                        "could not refresh enforcement posture; suppressing any live action"
+                    );
+                }
+            }
+        }
+    })
 }
 
 /// Why reading the invalidation feed failed.
@@ -9301,6 +9391,49 @@ mod tests {
     };
     use orrery_protocol::{LeaseFlags, SeqPair};
 
+    #[derive(Clone)]
+    enum FakePostureRead {
+        Row(Option<crate::intent::RampPosture>),
+        Failure,
+    }
+
+    struct MutablePostureReader(Mutex<FakePostureRead>);
+
+    impl MutablePostureReader {
+        fn new(read: FakePostureRead) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(read)))
+        }
+
+        fn set(&self, read: FakePostureRead) {
+            *self.0.lock().expect("posture reader lock") = read;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::intent::RampPostureReader for MutablePostureReader {
+        async fn read(
+            &self,
+            _control: &str,
+        ) -> Result<Option<crate::intent::RampPosture>, crate::intent::RampPostureError> {
+            match self.0.lock().expect("posture reader lock").clone() {
+                FakePostureRead::Row(row) => Ok(row),
+                FakePostureRead::Failure => {
+                    Err(crate::intent::RampPostureError("injected failure".into()))
+                }
+            }
+        }
+    }
+
+    fn operator_posture(mode: RampMode) -> crate::intent::RampPosture {
+        crate::intent::RampPosture {
+            mode,
+            source: crate::intent::PostureSource::Operator,
+            set_at_ms: 1,
+            reason: "test override".into(),
+            incident_id: None,
+        }
+    }
+
     fn successor_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
@@ -10120,6 +10253,80 @@ mod tests {
             session.intent_context().standing,
             SessionStanding::Quarantined
         );
+    }
+
+    /// A durable C5 change reaches the same cell a running gateway's session
+    /// consumer reads; neither the process nor the session is rebuilt.
+    #[tokio::test(start_paused = true)]
+    async fn c5_gateway_poller_applies_store_changes_without_a_restart() {
+        let reader = MutablePostureReader::new(FakePostureRead::Row(None));
+        let (feed, _standings, posture, registry) = standing_registry(StrikesEnforcement::Off);
+        let poller = spawn_strikes_posture_poller(
+            Arc::clone(&reader) as SharedRampPostureReader,
+            posture.clone(),
+            StrikesEnforcement::Off,
+        );
+        tokio::task::yield_now().await;
+
+        let node = iroh::SecretKey::from_bytes(&[58; 32]).public();
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(standing_claims(58, SessionStanding::Good, 1_000)),
+                b"good",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+        feed.publish(standing_assertion(58, SessionStanding::Quarantined, 2_000));
+        assert!(registry.apply_standing_updates(2_500).await.is_empty());
+        assert_eq!(session.intent_context().standing, SessionStanding::Good);
+
+        reader.set(FakePostureRead::Row(Some(operator_posture(RampMode::Live))));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        registry.apply_standing_updates(3_000).await;
+        assert_eq!(
+            session.intent_context().standing,
+            SessionStanding::Quarantined,
+            "the durable live row must change the running gateway's C5 action"
+        );
+
+        reader.set(FakePostureRead::Row(None));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            posture.get(),
+            StrikesEnforcement::Off,
+            "removing the row restores the startup default"
+        );
+        poller.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c5_gateway_posture_read_failure_demotes_live_but_does_not_promote_off() {
+        let reader = MutablePostureReader::new(FakePostureRead::Failure);
+        let posture = StrikesPosture::new(StrikesEnforcement::Live);
+        let poller = spawn_strikes_posture_poller(
+            Arc::clone(&reader) as SharedRampPostureReader,
+            posture.clone(),
+            StrikesEnforcement::Live,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(posture.get(), StrikesEnforcement::Shadow);
+        poller.abort();
+
+        let posture = StrikesPosture::new(StrikesEnforcement::Off);
+        let poller = spawn_strikes_posture_poller(
+            reader as SharedRampPostureReader,
+            posture.clone(),
+            StrikesEnforcement::Off,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(posture.get(), StrikesEnforcement::Off);
+        poller.abort();
     }
 
     /// `Off` observes nothing (D32 clause (b)): the feed is not even drained,

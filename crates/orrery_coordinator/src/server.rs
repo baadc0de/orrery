@@ -284,6 +284,24 @@ impl StrikesPosture {
             .store(Self::code(mode), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// D32 clause (f)'s trip: demote an acting control to shadow, and refuse
+    /// to do anything else.
+    ///
+    /// Automation may make the fleet safer without asking, never less safe, so
+    /// this moves `Live → Shadow` and nothing else. Returns whether the posture
+    /// moved; `false` is the ordinary answer for a control already `Shadow` or
+    /// `Off`.
+    pub fn auto_suspend(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::code(StrikesMode::Live),
+                Self::code(StrikesMode::Shadow),
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     const fn code(mode: StrikesMode) -> u8 {
         match mode {
             StrikesMode::Off => 0,
@@ -291,6 +309,58 @@ impl StrikesPosture {
             StrikesMode::Live => 2,
         }
     }
+}
+
+/// Read-only access to the coordinator's C5 durable posture.
+///
+/// The interface intentionally contains no write operation: authenticating
+/// operator posture writes is D32 open question 1. `None` means the startup
+/// default stands.
+#[async_trait::async_trait]
+pub trait StrikesPostureReader: Send + Sync {
+    /// Read the current durable C5 mode.
+    async fn read_strikes(&self) -> Result<Option<StrikesMode>, String>;
+}
+
+/// A process-shared C5 posture reader.
+pub type SharedStrikesPostureReader = Arc<dyn StrikesPostureReader>;
+
+/// Poll C5's durable posture into the cell every coordinator consumer shares.
+///
+/// The cadence and immediate first tick match persistd's C1/C4/C5 pollers, and
+/// an absent row restores `startup_default`.
+///
+/// Read failure is [`StrikesPosture::auto_suspend`]: `Live → Shadow`,
+/// suppressing punitive action while retaining incident evidence. `Off` and
+/// `Shadow` remain unchanged, so a failure never promotes or blinds the
+/// control. Retaining the last known mode instead would leave refusals armed at
+/// exactly the moment the operator's demotion lever is unreadable — the
+/// p1-swarm incident's shape (#926), where a value the process could no longer
+/// re-read kept refusing every client until a restart.
+#[must_use]
+pub fn spawn_strikes_posture_poller(
+    reader: SharedStrikesPostureReader,
+    posture: StrikesPosture,
+    startup_default: StrikesMode,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            match reader.read_strikes().await {
+                Ok(mode) => posture.set(mode.unwrap_or(startup_default)),
+                Err(error) => {
+                    let suspended = posture.auto_suspend();
+                    warn!(
+                        control = STRIKES_CONTROL,
+                        %error,
+                        suspended,
+                        "could not refresh enforcement posture; suppressing any live action"
+                    );
+                }
+            }
+        }
+    })
 }
 
 /// What a `Hello` should do about standing, given the posture in force.
@@ -458,6 +528,8 @@ pub struct ServerConfig {
     /// are both C5, so a clause (f) auto-suspend that demoted only one of them
     /// would not have demoted C5.
     pub strikes_posture: StrikesPosture,
+    /// Durable C5 posture reader. `None` leaves the startup posture in force.
+    pub strikes_posture_reader: Option<SharedStrikesPostureReader>,
     /// Identity's standing assertions for accounts whose sessions are already
     /// open (D33 clause (e), the **quarantine** half).
     ///
@@ -493,6 +565,7 @@ impl ServerConfig {
             identity_health: Arc::new(AvailableIdentityHealth),
             standing_feed: None,
             strikes_posture: StrikesPosture::default(),
+            strikes_posture_reader: None,
             standing_updates: Arc::new(AccountStandings::inert()),
         }
     }
@@ -940,6 +1013,7 @@ pub struct CoordinatorServer {
     shared: Arc<Shared>,
     shutdown: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
+    posture_poller: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CoordinatorServer {
@@ -957,10 +1031,14 @@ impl CoordinatorServer {
         let endpoint = Arc::new(builder.bind().await.map_err(ServerError::Bind)?);
 
         let token_clock = Arc::clone(&config.token_clock);
+        let startup_strikes = config.strikes_posture.get();
         let standing = Arc::new(StandingState::new(
             config.standing_feed,
-            config.strikes_posture,
+            config.strikes_posture.clone(),
         ));
+        let posture_poller = config.strikes_posture_reader.map(|reader| {
+            spawn_strikes_posture_poller(reader, config.strikes_posture, startup_strikes)
+        });
         let shared = Arc::new(Shared {
             registry: tokio::sync::Mutex::new(IslandRegistry::new()),
             peers: tokio::sync::Mutex::new(HashMap::new()),
@@ -1006,6 +1084,7 @@ impl CoordinatorServer {
             shared,
             shutdown,
             join,
+            posture_poller,
         })
     }
 
@@ -1054,6 +1133,10 @@ impl CoordinatorServer {
         let _ = self.shutdown.send(());
         self.endpoint.close().await;
         let _ = self.join.await;
+        if let Some(poller) = self.posture_poller {
+            poller.abort();
+            let _ = poller.await;
+        }
     }
 }
 
@@ -1517,4 +1600,113 @@ pub fn presence_for(centre: CellId) -> Vec<CellId> {
     let mut cells = centre.neighbors27();
     cells.truncate(MAX_PRESENCE_CELLS);
     cells
+}
+
+#[cfg(test)]
+mod posture_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    enum FakeRead {
+        Mode(Option<StrikesMode>),
+        Failure,
+    }
+
+    struct MutableReader(Mutex<FakeRead>);
+
+    impl MutableReader {
+        fn new(read: FakeRead) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(read)))
+        }
+
+        fn set(&self, read: FakeRead) {
+            *self.0.lock().expect("posture reader lock") = read;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StrikesPostureReader for MutableReader {
+        async fn read_strikes(&self) -> Result<Option<StrikesMode>, String> {
+            match self.0.lock().expect("posture reader lock").clone() {
+                FakeRead::Mode(mode) => Ok(mode),
+                FakeRead::Failure => Err("injected failure".into()),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c5_coordinator_poller_applies_store_changes_without_a_restart() {
+        let reader = MutableReader::new(FakeRead::Mode(None));
+        let posture = StrikesPosture::new(StrikesMode::Off);
+        let state = StandingState::new(None, posture.clone());
+        let account = AccountId::new(7);
+        state.entries.write().await.insert(account, 2_000);
+        let poller = spawn_strikes_posture_poller(
+            Arc::clone(&reader) as SharedStrikesPostureReader,
+            posture.clone(),
+            StrikesMode::Off,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.hello_verdict(account, 1_000).await,
+            StandingVerdict::Admit
+        );
+
+        reader.set(FakeRead::Mode(Some(StrikesMode::Live)));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.hello_verdict(account, 1_000).await,
+            StandingVerdict::Refuse,
+            "the durable live row must change the running coordinator's C5 action"
+        );
+
+        reader.set(FakeRead::Mode(None));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.hello_verdict(account, 1_000).await,
+            StandingVerdict::Admit,
+            "removing the row restores the off startup default"
+        );
+        poller.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c5_coordinator_posture_read_failure_demotes_live_but_does_not_promote_off() {
+        let reader = MutableReader::new(FakeRead::Failure);
+        let posture = StrikesPosture::new(StrikesMode::Live);
+        let state = StandingState::new(None, posture.clone());
+        let account = AccountId::new(8);
+        state.entries.write().await.insert(account, 2_000);
+        let poller = spawn_strikes_posture_poller(
+            Arc::clone(&reader) as SharedStrikesPostureReader,
+            posture,
+            StrikesMode::Live,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.hello_verdict(account, 1_000).await,
+            StandingVerdict::WouldRefuse,
+            "an unreadable posture suppresses C5 action but preserves evaluation"
+        );
+        poller.abort();
+
+        let posture = StrikesPosture::new(StrikesMode::Off);
+        let state = StandingState::new(None, posture.clone());
+        state.entries.write().await.insert(account, 2_000);
+        let poller = spawn_strikes_posture_poller(
+            reader as SharedStrikesPostureReader,
+            posture,
+            StrikesMode::Off,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.hello_verdict(account, 1_000).await,
+            StandingVerdict::Admit,
+            "an unreadable posture must not promote off into observation"
+        );
+        poller.abort();
+    }
 }

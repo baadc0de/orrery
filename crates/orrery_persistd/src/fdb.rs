@@ -102,6 +102,19 @@ pub struct FdbContext {
 }
 
 impl FdbContext {
+    /// Start the FDB client network and open the platform's default cluster
+    /// configuration.
+    ///
+    /// Services without a cluster-file CLI surface use FoundationDB's normal
+    /// `FDB_CLUSTER_FILE`/platform-default resolution while retaining the same
+    /// transaction bounds as [`Self::connect`].
+    pub fn connect_default() -> Result<Self, FdbContextError> {
+        boot_network();
+        let db = Database::default().map_err(|e| FdbContextError(format!("connect: {e}")))?;
+        bound_transactions(&db)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     /// Start the FDB client network and open `cluster_file`, with every
     /// transaction on the resulting handle bounded.
     ///

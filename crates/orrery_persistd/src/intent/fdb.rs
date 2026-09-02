@@ -1047,6 +1047,23 @@ async fn record_witness_epoch(
     enforcement: super::AttestationEnforcement,
     intent: &Intent,
 ) -> Result<EpochRecord, FdbBindingError> {
+    // **`off` writes nothing, and that is the posture's business rather than
+    // the wiring's.** D32 clause (d) is explicit — "`off` continues to write
+    // nothing (`NotApplicable`)" — and until #863 that held for a structural
+    // reason: `off` was handed no epoch cache, so the next `let else` caught
+    // it. That reason is gone. A durable gateway now retains its C1 wiring at
+    // `off` so a later posture row can arm admission and this re-proof
+    // together, which means `epochs` is `Some` in a mode that must still
+    // record nothing. Without this guard such a gateway resolves epochs and
+    // writes `epoch/`, the handle index and an `AttestRow{enforced: false}` —
+    // bytes indistinguishable from a shadow commit, which would tell an
+    // auditor the cluster evaluated a quorum it never looked at, and would
+    // pay clause (d)'s ~250 B shadow tax in the one mode that buys nothing
+    // for it.
+    if !enforcement.evaluates() {
+        return Ok(EpochRecord::NotApplicable);
+    }
+
     // No cache is the enforcement-off build, and an unresolvable handle is an
     // intent this executor was handed without admission having enforced
     // anything (the permissive validator, or an epoch that aged out between
@@ -1159,10 +1176,14 @@ async fn record_witness_epoch(
         }
     }
 
-    // D32 clause (d)'s marker. The row is written in every mode that resolved
-    // an epoch at all; what the mode decides is whether it claims the cluster
-    // stood behind the quorum. `off` never reaches this line — it resolves no
-    // epoch and returns `NotApplicable` above.
+    // D32 clause (d)'s marker. The row is written in every *evaluating* mode
+    // that resolved an epoch; what the mode decides is whether it claims the
+    // cluster stood behind the quorum. `off` never reaches this line — it is
+    // turned back by the posture guard at the top of this function. That used
+    // to be phrased as "it resolves no epoch", which stopped being true when
+    // a durable `off` gateway started retaining its C1 wiring (#863): the
+    // guard is now the reason, and `enforced: false` therefore still means
+    // shadow and only shadow.
     let row = keyspace::AttestRow {
         epoch_handle: intent.cell_epoch.0,
         eligible,

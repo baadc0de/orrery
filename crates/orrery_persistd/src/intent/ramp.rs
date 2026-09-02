@@ -156,6 +156,21 @@ impl std::fmt::Display for RampPostureError {
 
 impl std::error::Error for RampPostureError {}
 
+/// Read-only access to D32's durable posture rows.
+///
+/// The operator-plane writer is deliberately not part of this interface:
+/// authenticating posture writes is D32 open question 1. Production readers
+/// use [`FdbRampPostureStore`], while poller tests provide an in-memory reader
+/// and never acquire a production write capability.
+#[async_trait::async_trait]
+pub trait RampPostureReader: Send + Sync {
+    /// Read one control's posture. An absent row means the startup default.
+    async fn read(&self, control: &str) -> Result<Option<RampPosture>, RampPostureError>;
+}
+
+/// A process-shared durable posture reader.
+pub type SharedRampPostureReader = std::sync::Arc<dyn RampPostureReader>;
+
 /// FoundationDB adapter for D32's rarely-written, one-second-polled rows.
 #[cfg(feature = "fdb")]
 pub struct FdbRampPostureStore {
@@ -194,6 +209,14 @@ impl FdbRampPostureStore {
         .map_err(|error: foundationdb::FdbBindingError| {
             RampPostureError(format!("read ramp posture transaction: {error}"))
         })
+    }
+}
+
+#[cfg(feature = "fdb")]
+#[async_trait::async_trait]
+impl RampPostureReader for FdbRampPostureStore {
+    async fn read(&self, control: &str) -> Result<Option<RampPosture>, RampPostureError> {
+        Self::read(self, control).await
     }
 }
 
