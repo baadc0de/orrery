@@ -41,10 +41,17 @@ pub use provisional::{
 
 pub mod shadow;
 pub use shadow::{
-    CountingShadowObserver, QuarantineValidationObservation, QuarantineValidationObserver,
-    ShadowObservation, ShadowObservationLog, ShadowObserver, ShadowUnevaluated, ShadowVerdict,
-    SharedQuarantineValidationObserver, SharedShadowObserver, ATTESTATION_QUORUM_CONTROL,
-    QUARANTINE_VALIDATION_CONTROL, SHADOW_TARGET,
+    CountingShadowObserver, NetworkQuality, PathSample, QuarantineValidationObservation,
+    QuarantineValidationObserver, ShadowObservation, ShadowObservationLog, ShadowObserver,
+    ShadowUnevaluated, ShadowVerdict, SharedQuarantineValidationObserver, SharedShadowObserver,
+    ATTESTATION_QUORUM_CONTROL, LOSS_BAD_PPM, LOSS_DEGRADED_PPM, QUARANTINE_VALIDATION_CONTROL,
+    RTT_BAD_MS, RTT_DEGRADED_MS, SHADOW_TARGET,
+};
+
+pub mod autosuspend;
+pub use autosuspend::{
+    ControlEvent, ControlLever, Demotion, IncidentId, SuspendMonitor, TriggerScope, TripReason,
+    WindowStats, BASELINE_HOURS, MEDIAN_MULTIPLE, RATE_FLOOR_PER_HOUR, SPREAD_THRESHOLD, WINDOW_MS,
 };
 
 pub mod ramp;
@@ -134,6 +141,19 @@ pub struct IntentContext {
     /// The standing the gateway read from the connection's verified session
     /// token. A quarantined standing requires full admission validation.
     pub standing: SessionStanding,
+    /// D32 clause (f)'s network-quality bucket for this connection.
+    ///
+    /// A fact about the transport, like [`Self::issuer`], and for the same
+    /// reason: the peer does not get to describe its own path quality. The
+    /// gateway samples QUIC's own RTT and lost-packet counters for the
+    /// selected path, so a peer claiming to be on a bad link cannot buy itself
+    /// the widened treatment the bucket is evidence for.
+    ///
+    /// [`NetworkQuality::Unknown`] where no sampler runs. Nothing on the
+    /// admission path branches on this value — it is carried, counted, and
+    /// read only by clause (f)'s monitor, which never acts on a *single*
+    /// observation.
+    pub network: NetworkQuality,
 }
 
 impl IntentContext {
@@ -145,7 +165,15 @@ impl IntentContext {
             issuer,
             account: None,
             standing: SessionStanding::Quarantined,
+            network: NetworkQuality::Unknown,
         }
+    }
+
+    /// The same context with a sampled network-quality bucket.
+    #[must_use]
+    pub const fn with_network(mut self, network: NetworkQuality) -> Self {
+        self.network = network;
+        self
     }
 }
 
@@ -1083,6 +1111,28 @@ impl AttestationPosture {
             AttestationEnforcement::Shadow => 1,
             AttestationEnforcement::Required => 2,
         }
+    }
+}
+
+/// C1's lever, as clause (f)'s monitor sees it.
+///
+/// The mode mapping is the one D32 clause (c)'s inventory uses: the durable
+/// row's `live` is C1's `Required`, because "acting" for an attestation quorum
+/// means *requiring* the quorum. [`AttestationPosture::auto_suspend`] is
+/// already a compare-exchange from `Required`, so this implementation adds no
+/// new authority — it only lets the shared monitor reach a lever that was
+/// always demote-only.
+impl autosuspend::ControlLever for AttestationPosture {
+    fn mode(&self) -> RampMode {
+        match self.get() {
+            AttestationEnforcement::Off => RampMode::Off,
+            AttestationEnforcement::Shadow => RampMode::Shadow,
+            AttestationEnforcement::Required => RampMode::Live,
+        }
+    }
+
+    fn suspend(&self) -> bool {
+        self.auto_suspend()
     }
 }
 
@@ -2098,6 +2148,7 @@ impl BaselineIntentValidator {
                 cell_epoch: intent.cell_epoch,
                 verdict,
                 observed_at_ms: now_ms,
+                network: cx.network,
             },
         );
         Admission::Attested(precheck)
@@ -3233,7 +3284,13 @@ mod tests {
             issuer: issuer_key().public(),
             account: account.map(AccountId::new),
             standing,
+            network: NetworkQuality::Unknown,
         }
+    }
+
+    /// A context whose connection was measured, for the clause (f) dimension.
+    fn cx_on_network(account: Option<u64>, network: NetworkQuality) -> IntentContext {
+        cx(account).with_network(network)
     }
 
     #[test]
@@ -3694,6 +3751,71 @@ mod tests {
             "shadow records exactly one observation per evaluated intent"
         );
         observations[0]
+    }
+
+    /// D32 clause (f)'s network-quality dimension reaches the observation.
+    ///
+    /// The gap this closes was documented in `ramp.rs` by name: *"`ShadowObservation`
+    /// carries no RTT or loss, and neither does `IntentContext` … so the bucket
+    /// cannot be measured from what is emitted today."* It now can, and this
+    /// test is the proof that the value the gateway sampled is the value the
+    /// monitor reads — not a default that happens to look plausible.
+    #[test]
+    fn the_shadow_observation_carries_the_network_quality_bucket() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+
+        for network in [
+            NetworkQuality::Unknown,
+            NetworkQuality::Clean,
+            NetworkQuality::Degraded,
+            NetworkQuality::Bad,
+        ] {
+            let (shadow, log) = watching(&enforcing);
+            let mut short = attestable_intent(60);
+            attest_required(&mut short, &witnesses, &epochs);
+            short.attestations.pop();
+
+            let cx = cx_on_network(Some(ISSUER_ACCOUNT), network);
+            assert_eq!(cx.network, network);
+            assert!(
+                shadow.check_at(&short, &cx, 2_000).is_ok(),
+                "shadow still acts on nothing"
+            );
+            assert_eq!(
+                only(&log).network,
+                network,
+                "the bucket the gateway measured is the bucket the observation carries"
+            );
+        }
+    }
+
+    /// The bucket is carried and never consulted by the admission decision.
+    ///
+    /// A control that widened or narrowed its own predicate on network quality
+    /// would be acting on peer-adjacent evidence at the one point D32 clause
+    /// (b) says shadow must not act, and would hand a peer on a bad link a
+    /// different answer to the same intent. The dimension is for the *monitor*.
+    #[test]
+    fn the_network_bucket_changes_no_admission_verdict() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let mut short = attestable_intent(60);
+        attest_required(&mut short, &witnesses, &epochs);
+        short.attestations.pop();
+
+        let baseline = enforcing.check_at(&short, &cx(Some(ISSUER_ACCOUNT)), 2_000);
+        for network in [
+            NetworkQuality::Clean,
+            NetworkQuality::Degraded,
+            NetworkQuality::Bad,
+        ] {
+            assert_eq!(
+                enforcing.check_at(&short, &cx_on_network(Some(ISSUER_ACCOUNT), network), 2_000),
+                baseline,
+                "the same intent gets the same answer on every path quality"
+            );
+        }
     }
 
     /// Obligations (2) and (3) on one intent, in both directions.

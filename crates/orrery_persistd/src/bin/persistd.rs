@@ -2900,7 +2900,11 @@ fn attestation_mode(
     durable: Option<&RampPosture>,
     startup_default: AttestationEnforcement,
 ) -> AttestationEnforcement {
-    durable.map_or(startup_default, |row| match row.mode {
+    orrery_persistd::intent::ramp::admitted(
+        durable,
+        orrery_persistd::intent::ATTESTATION_QUORUM_CONTROL,
+    )
+    .map_or(startup_default, |row| match row.mode {
         RampMode::Off => AttestationEnforcement::Off,
         RampMode::Shadow => AttestationEnforcement::Shadow,
         RampMode::Live => AttestationEnforcement::Required,
@@ -2912,11 +2916,12 @@ fn authority_correction_mode(
     durable: Option<&RampPosture>,
     startup_default: AuthorityCorrectionEnforcement,
 ) -> AuthorityCorrectionEnforcement {
-    durable.map_or(startup_default, |row| match row.mode {
-        RampMode::Off => AuthorityCorrectionEnforcement::Off,
-        RampMode::Shadow => AuthorityCorrectionEnforcement::Shadow,
-        RampMode::Live => AuthorityCorrectionEnforcement::Live,
-    })
+    orrery_persistd::intent::ramp::admitted(durable, orrery_persistd::AUTHORITY_CORRECTION_CONTROL)
+        .map_or(startup_default, |row| match row.mode {
+            RampMode::Off => AuthorityCorrectionEnforcement::Off,
+            RampMode::Shadow => AuthorityCorrectionEnforcement::Shadow,
+            RampMode::Live => AuthorityCorrectionEnforcement::Live,
+        })
 }
 
 /// Run the hot-ledger incremental sweep on its cadence until shutdown.
@@ -4135,6 +4140,7 @@ mod tests {
                 issuer: key.public(),
                 account: Some(orrery_protocol::AccountId::new(7)),
                 standing: orrery_protocol::SessionStanding::Good,
+                network: orrery_persistd::intent::NetworkQuality::Unknown,
             },
         );
         let executor_mode = *seen.lock().expect("capture lock");
@@ -4176,6 +4182,7 @@ mod tests {
                     issuer: key.public(),
                     account: Some(orrery_protocol::AccountId::new(7)),
                     standing: orrery_protocol::SessionStanding::Good,
+                    network: orrery_persistd::intent::NetworkQuality::Unknown,
                 },
             ),
             orrery_persistd::intent::IntentVerdict::Admit(_)
@@ -4381,6 +4388,92 @@ mod tests {
         }
     }
 
+    /// A row no writer was permitted to produce does not reach a live control.
+    ///
+    /// D32 clause (f) lets automation demote and nothing else, and #876 makes
+    /// that a property the *reader* re-derives rather than one the writer is
+    /// trusted to have honoured. These are the rows a compromised monitor, a
+    /// buggy future writer, or someone with the cluster file would produce to
+    /// turn the breaker into a promotion lever or a blinding lever; the poller
+    /// falls back to the operator's startup default instead of obeying them.
+    #[test]
+    fn a_posture_row_automation_could_not_have_written_is_refused_by_the_pollers() {
+        let forged = |mode| RampPosture {
+            mode,
+            source: orrery_persistd::intent::PostureSource::AutoSuspend,
+            set_at_ms: 1,
+            reason: "forged".to_owned(),
+            incident_id: None,
+        };
+
+        // C1: the startup default survives a forged promotion and a forged
+        // blinding, and the one legitimate automation row still applies.
+        let c1 = AttestationEnforcement::Required;
+        assert_eq!(
+            attestation_mode(Some(&forged(RampMode::Live)), c1),
+            c1,
+            "an `AutoSuspend` row naming `live` is a promotion by automation"
+        );
+        assert_eq!(
+            attestation_mode(Some(&forged(RampMode::Off)), c1),
+            c1,
+            "and one naming `off` is the censorship lever clause (f) names"
+        );
+        assert_eq!(
+            attestation_mode(Some(&forged(RampMode::Shadow)), c1),
+            AttestationEnforcement::Shadow,
+            "the demotion automation *is* allowed to make still lands"
+        );
+
+        // C4: the same predicate, through a different control's poller,
+        // because it is one seam rather than three copies.
+        let c4 = AuthorityCorrectionEnforcement::Live;
+        assert_eq!(
+            authority_correction_mode(Some(&forged(RampMode::Live)), c4),
+            c4
+        );
+        assert_eq!(
+            authority_correction_mode(Some(&forged(RampMode::Off)), c4),
+            c4
+        );
+        assert_eq!(
+            authority_correction_mode(Some(&forged(RampMode::Shadow)), c4),
+            AuthorityCorrectionEnforcement::Shadow
+        );
+
+        // The operator's lever is untouched by this predicate: promotion is an
+        // operator act. Authenticating *that* writer is #932's accepted
+        // amendment and #875's lane, and it composes here by extending
+        // `RampPosture::admissible` rather than by editing these pollers.
+        for mode in [RampMode::Off, RampMode::Shadow, RampMode::Live] {
+            let operator = RampPosture {
+                mode,
+                source: orrery_persistd::intent::PostureSource::Operator,
+                set_at_ms: 1,
+                reason: "operator".to_owned(),
+                incident_id: None,
+            };
+            assert_eq!(
+                attestation_mode(Some(&operator), c1),
+                attestation_mode_unchecked(mode, c1),
+                "an operator row is applied as written"
+            );
+        }
+    }
+
+    /// The mode mapping alone, for comparing against the checked path.
+    fn attestation_mode_unchecked(
+        mode: RampMode,
+        startup_default: AttestationEnforcement,
+    ) -> AttestationEnforcement {
+        let _ = startup_default;
+        match mode {
+            RampMode::Off => AttestationEnforcement::Off,
+            RampMode::Shadow => AttestationEnforcement::Shadow,
+            RampMode::Live => AttestationEnforcement::Required,
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn c1_poller_changes_running_validation_without_a_restart() {
         let captured = Arc::new(std::sync::Mutex::new(None));
@@ -4413,6 +4506,7 @@ mod tests {
             issuer: key.public(),
             account: Some(orrery_protocol::AccountId::new(7)),
             standing: orrery_protocol::SessionStanding::Good,
+            network: orrery_persistd::intent::NetworkQuality::Unknown,
         };
         assert!(matches!(
             config.validator.validate(&intent, &context),
