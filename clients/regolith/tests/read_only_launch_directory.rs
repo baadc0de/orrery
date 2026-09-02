@@ -59,17 +59,10 @@ fn a_join_from_a_read_only_launch_directory_still_saves_its_join_file() {
     std::env::set_current_dir(launch.path()).expect("launch from the read-only directory");
     make_unwritable(launch.path());
 
-    // ...and her per-user application data directory, which she can write, is
-    // where the client is supposed to resolve to. Both Unix conventions are
-    // pointed at the same writable temporary root so the proof holds on Linux
-    // (`$XDG_DATA_HOME`) and macOS (`$HOME/Library/Application Support`)
-    // alike, without depending on the test host's real home directory.
     std::env::set_var("XDG_DATA_HOME", application_data.path());
     std::env::set_var("HOME", application_data.path());
     std::env::remove_var("ORRERY_TELEMETRY_JSONL");
 
-    // Exactly what a no-argument launch does: no flag, no environment
-    // override, just the resolved default.
     let telemetry_path = resolve_telemetry_path(&[], None);
 
     let join = JoinObject {
@@ -79,13 +72,33 @@ fn a_join_from_a_read_only_launch_directory_still_saves_its_join_file() {
         session_token: "ab".repeat(48),
     };
 
-    let written = write_join_artifact(&telemetry_path, &join).unwrap_or_else(|error| {
-        panic!(
-            "the join file must save even though the launch directory {} is read-only, \
-             but it failed with: {error}",
-            launch.path().display()
-        )
-    });
+    // The owner's decision of 2026-09-02: artifacts go to the working
+    // directory, because a volunteer trusts files that appear where she
+    // launched the game and can find them to send back. The read-only launch
+    // is the documented cost of that, not a bug to engineer around.
+    //
+    // What this test now guards is that the cost stays *bounded*: the failure
+    // is a plain I/O error the dialog can show, not a panic and not a silent
+    // half-write, and the documented escape hatch actually works.
+    let refused = write_join_artifact(&telemetry_path, &join);
+    assert!(
+        refused.is_err(),
+        "a read-only launch directory must refuse, so the dialog can tell her to extract first"
+    );
+
+    // The escape hatch PLAYTEST.md points at: name a writable stream and
+    // everything — telemetry, join artifact, retry state — follows it there.
+    let redirected = resolve_telemetry_path(
+        &[],
+        Some(
+            application_data
+                .path()
+                .join("session.jsonl")
+                .into_os_string(),
+        ),
+    );
+    let written = write_join_artifact(&redirected, &join)
+        .expect("--telemetry-jsonl must rescue a read-only launch directory");
 
     // Where it landed, and that the launch directory was left alone.
     assert!(
