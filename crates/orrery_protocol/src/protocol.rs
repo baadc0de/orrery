@@ -88,4 +88,17 @@
 /// arm fails to decode the verdict — and a verdict it cannot decode is
 /// exactly the silent non-answer the refusal exists to replace. Exact-version
 /// admission keeps that failure at the handshake.
-pub const PROTOCOL_VERSION: u16 = 9;
+///
+/// Version 10 adds the identity-service wire family —
+/// [`IdentityMsg`](crate::IdentityMsg) and
+/// [`IdentityReply`](crate::IdentityReply), spoken under
+/// [`IDENTITY_ALPN`](crate::IDENTITY_ALPN) (#861). The family never crosses a
+/// gateway or coordinator session, but the version doctrine is one number for
+/// the tree, not one per message family: a client build that knows the mint
+/// surface is a different build from one that does not, and the alternative
+/// to a bump is a fleet in which two client builds are indistinguishable at
+/// every handshake they share. The identity service enforces the same exact
+/// equality on its own `IdentityMsg::Hello` bootstrap, so a version-9 client
+/// is refused there by name with the accepted version in the reply, not left
+/// to discover the gap at first decode.
+pub const PROTOCOL_VERSION: u16 = 10;

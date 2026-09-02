@@ -481,9 +481,12 @@ mod tests {
     fn the_wrong_owner_refusal_decodes_without_moving_the_variants_before_it() {
         // Version 9 (#923) appended `HitRefusal::OverClaimRate`, a different
         // enum; `DenyReason` did not move, and the byte below says so.
+        // Version 10 (#861) added the identity wire family, also a different
+        // enum set; `DenyReason` still did not move, and the byte still says
+        // so.
         assert_eq!(
             crate::PROTOCOL_VERSION,
-            9,
+            10,
             "this test pins the wire under a specific version; re-check it when the version moves"
         );
 

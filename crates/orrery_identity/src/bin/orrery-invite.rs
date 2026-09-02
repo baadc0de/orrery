@@ -45,6 +45,18 @@ enum Operation {
         label: String,
     },
     /// Sign one session token, offline, against the issuer credential.
+    ///
+    /// This is the one mint path that stamps a constant
+    /// [`SessionStanding::Good`], and it does so on purpose (#861): there is
+    /// no standing ledger on an operator's offline laptop for D33 clause (f)'s
+    /// fail-closed read to consult, so the `Good` is the operator's own
+    /// attestation — the volunteer was handed the invite by name and is being
+    /// hosted by hand. It is exactly the posture the issue's acceptance
+    /// evidence exempts: the *served* mint path, `orrery-identity`, is the one
+    /// that must read real standing, and it does; this path exists so
+    /// shakedown hosting does not depend on that service being up. A token
+    /// signed here is indistinguishable on the wire from one minted there,
+    /// which is why the exemption is stated here rather than left implied.
     SessionToken {
         /// Plain runtime credential from `orrery-issuer-key generate`/`load`;
         /// must be owner-readable only and outside every repository.

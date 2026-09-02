@@ -70,12 +70,14 @@
 
 #![warn(missing_docs)]
 
+pub mod client;
 pub mod cooldown;
 pub mod invalidation;
 pub mod invite;
 pub mod issuer;
 pub mod issuer_key_lifecycle;
 pub mod mem;
+pub mod server;
 pub mod service;
 pub mod standing;
 pub mod store;
@@ -84,6 +86,7 @@ pub mod window;
 #[cfg(feature = "fdb")]
 pub mod fdb;
 
+pub use client::{IdentityClient, IdentityClientError};
 pub use cooldown::CooldownStanding;
 pub use invalidation::StandingInvalidationSource;
 pub use invite::{
@@ -96,6 +99,7 @@ pub use issuer_key_lifecycle::{
     restore_issuer_key, write_runtime_credential, IssuerKeyLifecycleError,
 };
 pub use mem::MemAccountStore;
+pub use server::{IdentityServer, IdentityServerConfig, IdentityServerError};
 pub use service::{
     IdentityService, IssuedSession, StandingSource, StaticStanding, SystemClock,
     UnavailableStanding, DEFAULT_SESSION_TOKEN_TTL_MS,
