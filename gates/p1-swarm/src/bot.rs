@@ -1653,6 +1653,28 @@ impl Bot {
         self.app.world().resource::<UploadMeter>().lanes
     }
 
+    /// What the peer link counted: what it moved, and what it could not.
+    ///
+    /// The fault counters in here — `no_session`, `oversized`, `untagged` —
+    /// must all be zero on a healthy run. The report carries them so a
+    /// non-zero value is seen by observation rather than found by reading
+    /// `send_peer_packets`, which is how #953's whole-attempt replication
+    /// failure was found (#954).
+    #[must_use]
+    pub fn peer_link_counters(&self) -> PeerLinkCounters {
+        *self.app.world().resource::<PeerLinkCounters>()
+    }
+
+    /// Unsheddable packets sent while over budget (docs/03-replication.md
+    /// §9.3) — the overrun the backstop could not shed away.
+    #[must_use]
+    pub fn unsheddable_over_budget(&self) -> u64 {
+        self.app
+            .world()
+            .resource::<UploadMeter>()
+            .unsheddable_over_budget
+    }
+
     /// Install the island roster this bot believes it is in.
     ///
     /// Stands in for the coordinator's manifest: the harness knows the true

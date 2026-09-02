@@ -33,6 +33,8 @@
 //! — pulling every consumer's types into the session crate. Decoding belongs to
 //! whoever owns the message; this owns only the routing and the channel policy.
 
+use std::collections::HashMap;
+
 use bevy_ecs::prelude::*;
 use bevy_time::{Real, Time};
 use bytes::Bytes;
@@ -140,6 +142,58 @@ pub struct PeerLinkCounters {
     pub untagged: u64,
 }
 
+/// Which fault a [`FaultWarns`] warn names. Several conditions share one
+/// counter shape but not one cause, so the warn can say which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Fault {
+    /// A send addressed to a peer with no session at all.
+    NoSession,
+    /// A session that exists but has no stream lane to carry control.
+    NoStreamLane,
+    /// A send refused for exceeding the lane's size limit.
+    Oversized,
+    /// An inbound packet with no channel tag, or an unknown one.
+    Untagged,
+}
+
+/// How long a warn for one fault on one peer keeps subsequent occurrences
+/// quiet while they accumulate into the next warn's count.
+const WARN_WINDOW: core::time::Duration = core::time::Duration::from_secs(1);
+
+/// Rate-limits the fault warns, per fault and per peer.
+///
+/// These conditions are faults — a healthy run produces none of them — so the
+/// first occurrence warns. The window is not courtesy to the condition, it is
+/// courtesy to the reader: the #953 shape was a keyframe per sender per second
+/// for a whole 900-second attempt, and a warn per occurrence would have been
+/// thousands of lines, which is how a loud signal trains its reader to stop
+/// reading. Occurrences inside the window are not lost — the counter keeps
+/// them and the next warn carries how many accrued.
+///
+/// Public because the systems that use it take it as a [`Local`]; its fields
+/// are not part of any surface.
+#[derive(Default)]
+pub struct FaultWarns {
+    last: HashMap<(Fault, NodeId), (Option<core::time::Duration>, u64)>,
+}
+
+impl FaultWarns {
+    /// Records one occurrence. Returns the number to report — the count
+    /// accrued since the last warn, one on the first — or `None` while the
+    /// window is still open.
+    fn due(&mut self, fault: Fault, peer: NodeId, now: core::time::Duration) -> Option<u64> {
+        let entry = self.last.entry((fault, peer)).or_insert((None, 0));
+        entry.1 += 1;
+        match entry.0 {
+            Some(last) if now.saturating_sub(last) < WARN_WINDOW => None,
+            _ => {
+                entry.0 = Some(now);
+                Some(core::mem::replace(&mut entry.1, 0))
+            }
+        }
+    }
+}
+
 /// Drains each session's receive buffers into [`PeerPacket`] messages.
 ///
 /// Both lanes are drained here, and both keep their channel tag on the wire.
@@ -151,11 +205,22 @@ pub fn receive_peer_packets(
     mut sessions: Query<(&Peer, &mut aeronet_io::Session, Option<&mut IrohStreamIo>)>,
     mut packets: MessageWriter<PeerPacket>,
     mut counters: ResMut<PeerLinkCounters>,
+    mut warns: Local<FaultWarns>,
+    time: Res<Time<Real>>,
 ) {
+    let now = time.elapsed();
     for (peer, mut session, streams) in &mut sessions {
         for received in session.recv.drain(..) {
             let Some((channel, payload)) = untag(&received.payload) else {
                 counters.untagged += 1;
+                if let Some(received) = warns.due(Fault::Untagged, peer.id, now) {
+                    tracing::warn!(
+                        peer = %peer.id,
+                        received_since_last = received,
+                        "untagged: inbound packet had no channel tag, or an unknown one; \
+                         the sender's framing has drifted from this crate's"
+                    );
+                }
                 continue;
             };
             counters.received += 1;
@@ -172,6 +237,14 @@ pub fn receive_peer_packets(
         for message in streams.recv.drain(..) {
             let Some((channel, payload)) = untag(&message.payload) else {
                 counters.untagged += 1;
+                if let Some(received) = warns.due(Fault::Untagged, peer.id, now) {
+                    tracing::warn!(
+                        peer = %peer.id,
+                        received_since_last = received,
+                        "untagged: inbound stream message had no channel tag, or an unknown \
+                         one; the sender's framing has drifted from this crate's"
+                    );
+                }
                 continue;
             };
             counters.stream_received += 1;
@@ -210,6 +283,7 @@ pub fn send_peer_packets(
     mut outbound: MessageReader<SendPacket>,
     mut sessions: Query<(&Peer, &mut aeronet_io::Session, Option<&mut IrohStreamIo>)>,
     mut counters: ResMut<PeerLinkCounters>,
+    mut warns: Local<FaultWarns>,
     budget: Res<UploadBudget>,
     mut meter: ResMut<UploadMeter>,
     time: Res<Time<Real>>,
@@ -226,6 +300,15 @@ pub fn send_peer_packets(
             sessions.iter_mut().find(|(peer, ..)| peer.id == packet.to)
         else {
             counters.no_session += 1;
+            if let Some(dropped) = warns.due(Fault::NoSession, packet.to, now) {
+                tracing::warn!(
+                    peer = %packet.to,
+                    dropped_since_last = dropped,
+                    "no_session: send addressed to a peer with no session; nothing it was \
+                     built for reaches it, keyframes included — a peer that is expected to \
+                     receive but has no session is a fault, not a network condition"
+                );
+            }
             continue;
         };
         let framed = tag(packet.channel, &packet.payload);
@@ -236,6 +319,14 @@ pub fn send_peer_packets(
             Channel::State => {
                 if framed.len() > mtu {
                     counters.oversized += 1;
+                    if let Some(refused) = warns.due(Fault::Oversized, packet.to, now) {
+                        tracing::warn!(
+                            peer = %packet.to,
+                            refused_since_last = refused,
+                            "oversized: state send refused over the session MTU; the caller \
+                             exceeded a budget it was sized against"
+                        );
+                    }
                     continue;
                 }
                 datagram_wire_bytes(framed.len())
@@ -245,6 +336,14 @@ pub fn send_peer_packets(
                     // Refused at this boundary rather than by the IO layer,
                     // which would drop the session over it.
                     counters.oversized += 1;
+                    if let Some(refused) = warns.due(Fault::Oversized, packet.to, now) {
+                        tracing::warn!(
+                            peer = %packet.to,
+                            refused_since_last = refused,
+                            "oversized: control send refused over the stream message limit; \
+                             the caller exceeded a budget it was sized against"
+                        );
+                    }
                     continue;
                 }
                 stream_wire_bytes(framed.len(), mtu)
@@ -284,6 +383,14 @@ pub fn send_peer_packets(
                     // sheddable, MTU-bounded, and exactly the thing this lane
                     // exists to stop being.
                     counters.no_session += 1;
+                    if let Some(dropped) = warns.due(Fault::NoStreamLane, packet.to, now) {
+                        tracing::warn!(
+                            peer = %packet.to,
+                            dropped_since_last = dropped,
+                            "no_session: control send refused — the session for this peer has \
+                             no stream lane, which is a wiring fault, not a network condition"
+                        );
+                    }
                     continue;
                 };
                 counters.stream_sent += 1;
