@@ -34,7 +34,7 @@ different scopes and cost shapes.
 | Sweep | Default / enablement | What one pass reads and checks | Known cost |
 |---|---|---|---|
 | Hot-ledger incremental | 3,600,000 ms; starts with an FDB context unless zeroed (crates/orrery_persistd/src/bin/persistd.rs:325-335, :1330-1334) | All current ledger/bal and ledger/item rows; receipt rows strictly after the durable versionstamp cursor; every gap in the ledger family (crates/orrery_persistd/src/audit.rs:603-667, :689-873). It catches duplicate ownership, negative balance, unbacked receipt party, and malformed/stray row findings; it does **not** prove global sanctioned-versus-observed conservation (audit.rs:15-60, :102-132). | No production byte/CPU/I/O cost. The only timing artifact is a 12-sample harness: 73 balance rows, 186 item claims, 150 ms interval, pass max 2 ms and sum 15 ms (docs/data/hot-ledger-sweep-ttd-2026-08-23.json). The daemon logs counts and elapsed time (persistd.rs:2569-2613). |
-| Full conservation | 86,400,000 ms, only in explicit --receipt-archive role and unless zeroed (crates/orrery_persistd/src/audit/conservation.rs; persistd.rs:301-312, :1576-1592) | Captures every visible rarchive/*.parquet object, decodes every row, folds account/asset balance effects against sanctioned source/sink ops, then external-merges page-bounded ownership runs by (item, receipt key, ordinal). It catches the same global conservation, continuity, and effect-shape findings (audit.rs:121-132). | Shape-C layout fixture projects a 24-hour all-transfer workload: 45,792,000 receipts and 3.35577 GiB read; the ownership external-sort working set is 230,272 bytes (224.875 KiB) per full pass, independent of retained transitions (docs/data/full-conservation-sweep-layout-2026-09-01.json). This is a byte/layout measurement, not a duration benchmark. |
+| Full conservation | 86,400,000 ms, only in explicit --receipt-archive role and unless zeroed (crates/orrery_persistd/src/audit/conservation.rs; persistd.rs:301-312, :1576-1592) | Captures every visible rarchive/*.parquet object, decodes every row, folds account/asset balance effects against sanctioned source/sink ops, then external-merges page-bounded ownership runs by (item, receipt key, ordinal). It catches the same global conservation, continuity, and effect-shape findings (audit.rs:121-132). | Shape-C layout fixture projects a 24-hour all-transfer workload: 45,792,000 receipts and 3.35577 GiB read; the ownership external-sort **heap** working set is 230,272 bytes (224.875 KiB) per full pass, independent of retained transitions, and its **spill** is 42 bytes per transition — 1,923,264,000 bytes (1.791 GiB) on the work directory for that window, held until the pass ends (docs/data/full-conservation-sweep-layout-2026-09-01.json). The work directory defaults to the OS temporary directory, tmpfs on systemd hosts; `--audit-work-dir` / `ORRERY_AUDIT_WORK_DIR` moves it to disk (#912). This is a byte/layout measurement, not a duration benchmark. |
 
 The full-sweep input is real Shape C: ReceiptRow records account-scoped signed
 balance deltas and item before/after ownership transitions
@@ -104,8 +104,35 @@ establish it.
 The full sweep keeps its no-cursor, complete-visible-window meaning. #890
 therefore uses a bounded external merge sort over the existing receipt objects:
 one 4,096-event run is sorted and spilled at a time, and merge passes retain at
-most 16 run heads. This makes ownership-sort memory O(page), not O(transitions
+most 16 run heads. This makes ownership-sort *heap* O(page), not O(transitions
 in retention), while preserving the same item history and findings in one pass.
+The transitions do not disappear: they are spilled at 42 bytes each to the
+sweep's work directory and stay there until the pass ends, and a consolidation
+stage transiently holds one merged output batch beside its unconsumed inputs,
+so the work directory needs headroom of under twice the spill.
+
+#### #912 correction: where the spill lives, and what a spill failure reports
+
+The first version of this section presented 224.875 KiB as the per-pass memory.
+That is the heap alone. The spill went to `std::env::temp_dir()`, which on a
+systemd host is RAM-backed tmpfs — so the 24 h window's 1.791 GiB and the
+30-day arm's 53.735 GiB were resident memory the artifact did not mention, on
+a filesystem that is often smaller than the spill. #912 adds
+`--audit-work-dir` (`ORRERY_AUDIT_WORK_DIR`), reports `spill_bytes` and
+`spill_record_bytes` beside `memory_bytes_bound` in every full-sweep report
+and in the daemon's pass-complete line, and restates the tables below with
+both numbers. Set the flag on any production-shaped host.
+
+The same review found that a spill failure discarded the verdict: the balance
+fold had already computed a `global_conservation_break`, and an ENOSPC in the
+ownership merge aborted the pass before the emit loop, every day, until the
+disk was fixed. The whole-window balance, effect-shape, and conservation
+findings are now emitted the moment the fold completes — before the merge,
+which is the only fallible host I/O left in the pass — and a merge failure
+returns them again inside `FullSweepFailure`, so the daemon's failure line
+counts `conservation_breaks_emitted` beside the error. Ownership-continuity
+findings are emitted only when the merge completes; a failure states that
+continuity is unverified for the window rather than implying it was clean.
 
 The other offered shapes lose here. A tailer-written item-clustered secondary
 Parquet object would add write-path work, a new `z` family sub-kind and an
@@ -116,12 +143,17 @@ make a pass incremental rather than a full-window proof, weakening D32 clause
 
 Using the fixture one-day archive projection as a per-pass assumption:
 
-| Full period | Passes/day | Read volume/day | Ownership re-sort working set/pass | Expected scheduling wait |
-|---:|---:|---:|---:|---:|
-| 24 h | 1 | 3.356 GiB | 224.875 KiB | 12 h |
-| 1 h | 24 | 80.538 GiB | 224.875 KiB | 30 min |
-| 15 min | 96 | 322.154 GiB | 224.875 KiB | 7 min 30 s |
-| 5 min | 288 | 966.462 GiB | 224.875 KiB | 5 min |
+| Full period | Passes/day | Read volume/day | Ownership re-sort heap/pass | Ownership spill on work dir/pass | Expected scheduling wait |
+|---:|---:|---:|---:|---:|---:|
+| 24 h | 1 | 3.356 GiB | 224.875 KiB | 1.791 GiB | 12 h |
+| 1 h | 24 | 80.538 GiB | 224.875 KiB | 1.791 GiB | 30 min |
+| 15 min | 96 | 322.154 GiB | 224.875 KiB | 1.791 GiB | 7 min 30 s |
+| 5 min | 288 | 966.462 GiB | 224.875 KiB | 1.791 GiB | 5 min |
+
+The spill column is per pass and does not multiply with cadence, because each
+pass removes its private subdirectory when it ends; it is the window size,
+not the period, that sets it. The work directory must hold it twice over
+during consolidation. On the default tmpfs location it is resident memory.
 
 The operational bend remains **daily, not faster**. Hourly to 15-minute full
 scans multiply I/O by four to remove 22 min 30 s expected wait; 15 to five
@@ -132,8 +164,10 @@ keeps the daily cadence appropriate.
 Because the code reads retained history, 30-day full-fidelity retention still
 projects 100.673 GiB read **per pass**
 (docs/data/full-conservation-sweep-layout-2026-09-01.json). Its ownership-sort
-working set stays 224.875 KiB. At daily cadence that read volume is the daily
-cost, not a one-time bootstrap; shortening cadence would multiply it.
+heap stays 224.875 KiB; its spill grows with the window to 57,697,920,000
+bytes (53.735 GiB) on the work directory per pass, needing under 107.47 GiB
+of headroom there. At daily cadence that read volume is the daily cost, not a
+one-time bootstrap; shortening cadence would multiply it.
 
 The hot sweep has a different steady-state model. If H is current
 balances/items/gaps read per pass, r receipt rate, and q receipt processing
@@ -148,10 +182,11 @@ so this spike does not invent its knee.
 * **Derived layout evidence, not production:** the test writes a real
   uncompressed 4,096-row Shape-C object, applies the prior 530 intents/s spike
   rate for 86,400 s, and uses compiled OwnershipEvent size plus the fixed
-  4,096-event run and 16-way merge fan-in for the ownership bound. The
-  45,792,000 / 3.35577 GiB / 224.875 KiB figures are recorded in the JSON; a
+  4,096-event run and 16-way merge fan-in for the ownership heap bound, and
+  the fixed 42-byte run record for the spill. The 45,792,000 / 3.35577 GiB /
+  224.875 KiB heap / 1.791 GiB spill figures are recorded in the JSON; a
   separate 30-page synthetic pass exercises the multi-stage merge below its
-  stated 256 KiB ceiling.
+  stated 256 KiB heap ceiling.
 * **Harness TTD only:** 12 planted duplicate-owner cases at 150 ms over the
   small ledger above; neither production traffic nor a full-pass duration.
 * **Instrumentation but no series:** hot passes log elapsed and row counts;
@@ -193,7 +228,8 @@ For the first production-shaped shadow window, run the current defaults:
   while global confirmation can tolerate about 12 hours;
 * full duration fits the derived two-hour allowance;
 * the worker has a reservation/isolation appropriate to the measured ownership
-  re-sort bound; and
+  re-sort heap bound, and `--audit-work-dir` points at a disk with room for
+  twice the reported spill rather than the default tmpfs; and
 * serving-path latency remains inside D11 budget while both read paths run.
 
 If any assumption fails, revisit before C3 promotion review. A shorter full
@@ -206,6 +242,7 @@ proposal-only and does not amend an ADR.
 ## Provenance
 
 Verified sequence: #615; Shape C (#832); enriched receipt/archive landing #841;
-daily full sweep #842. Governing records are D11/D20 for history
+daily full sweep #842; external merge sort #890; spill accounting and
+emit-before-spill #912. Governing records are D11/D20 for history
 (docs/adr/0011-persistence.md:10-21, docs/adr/0020-journal-retention.md:221-235)
 and D32 clause (g) for liveness (docs/adr/0032-enforcement-ramp.md:570-605).

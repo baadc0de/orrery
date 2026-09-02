@@ -330,7 +330,7 @@ Total steady-state footprint: roughly fifteen modest VMs plus relay bandwidth �
 
 ## 12. CLI environment-variable fallbacks
 
-Every non-excluded flag on every CLI binary outside the frozen trees falls back to an `ORRERY_`-prefixed environment variable (#865, clap's `env` feature): 151 fallbacks across 14 binaries. The scheme is `ORRERY_` + subsystem + flag, upper snake case, with subsystem scoping wherever a bare flag name would be ambiguous — `--output` alone is useless as a variable name, so it is `ORRERY_ISSUER_KEY_GENERATE_OUTPUT`, `ORRERY_ISSUER_KEY_ESCROW_OUTPUT`, or `ORRERY_P2_LOAD_OUTPUT` depending on the binary and operation it feeds. No default changed and no flag went away — what changed, twice, is the set of variables: #865 gave one to every flag clap could carry, and the audit that followed took back the fifteen where inheritance is a hazard rather than a convenience (§12.3) and renamed the six whose names collided across gates (§12.2).
+Every non-excluded flag on every CLI binary outside the frozen trees falls back to an `ORRERY_`-prefixed environment variable (#865, clap's `env` feature): 152 fallbacks across 14 binaries. The scheme is `ORRERY_` + subsystem + flag, upper snake case, with subsystem scoping wherever a bare flag name would be ambiguous — `--output` alone is useless as a variable name, so it is `ORRERY_ISSUER_KEY_GENERATE_OUTPUT`, `ORRERY_ISSUER_KEY_ESCROW_OUTPUT`, or `ORRERY_P2_LOAD_OUTPUT` depending on the binary and operation it feeds. No default changed and no flag went away — what changed, twice, is the set of variables: #865 gave one to every flag clap could carry, and the audit that followed took back the fifteen where inheritance is a hazard rather than a convenience (§12.3) and renamed the six whose names collided across gates (§12.2).
 
 **Precedence, stated once: an explicit flag beats the environment variable, which beats the default.** No default changed. `--help` prints each flag's variable beside it, so a binary's own help is the authoritative list; the tables here are the operator-facing copy of it. One pre-existing environment variable is *not* a clap fallback: `ORRERY_FDB_TRANSACTION_TIMEOUT_MS` (§10) is read directly by `FdbContext::connect` and has no flag counterpart.
 
@@ -349,6 +349,7 @@ Every non-excluded flag on every CLI binary outside the frozen trees falls back 
 | `persistd` | `--receipt-archive-page-rows` | `ORRERY_RECEIPT_ARCHIVE_PAGE_ROWS` |
 | `persistd` | `--hot-ledger-sweep-interval-ms` | `ORRERY_HOT_LEDGER_SWEEP_INTERVAL_MS` |
 | `persistd` | `--full-conservation-sweep-interval-ms` | `ORRERY_FULL_CONSERVATION_SWEEP_INTERVAL_MS` |
+| `persistd` | `--audit-work-dir` | `ORRERY_AUDIT_WORK_DIR` |
 | `persistd` | `--metrics-jsonl` | `ORRERY_METRICS_JSONL` |
 | `orrery-coordinator` | `--bind` | `ORRERY_COORDINATOR_BIND` |
 | `orrery-coordinator` | `--issuer-key` | `ORRERY_ISSUER_KEY` |

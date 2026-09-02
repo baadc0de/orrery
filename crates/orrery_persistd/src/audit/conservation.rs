@@ -12,8 +12,21 @@
 //! are ordered by commit, while ownership continuity is grouped by item. The
 //! balance fold streams, while ownership continuity is an external merge sort
 //! by `(ItemUid, receipt key, transition ordinal)`. The sorter writes bounded
-//! sorted runs to a private temporary directory and merges at most a fixed
-//! fan-in, so the ownership working set is independent of retained history.
+//! sorted runs to a private work directory and merges at most a fixed fan-in,
+//! so the ownership *heap* working set is independent of retained history.
+//! The spill is not: every transition in the window costs
+//! [`OWNERSHIP_RUN_RECORD_BYTES`] on the work directory's filesystem, and the
+//! default work directory is the OS temporary directory, which on systemd
+//! hosts is RAM-backed tmpfs. `--audit-work-dir` moves it (#912).
+//!
+//! Findings are established in two independent halves and each half is
+//! emitted the moment it is final. The balance, effect-shape, and global
+//! conservation findings are complete once the captured window has been
+//! folded; the ownership-continuity findings need the external merge, which
+//! is the only step between the fold and the report that performs fallible
+//! file I/O. A spill failure therefore returns a [`FullSweepFailure`] that
+//! carries and has already emitted the first half. It cannot silence a
+//! computed conservation break (#912).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -49,7 +62,12 @@ const OWNERSHIP_RUN_EVENTS: usize = 4_096;
 const OWNERSHIP_MERGE_FAN_IN: usize = 16;
 
 /// Fixed-size on-disk representation of one [`OwnershipEvent`] in a run.
-const OWNERSHIP_RUN_RECORD_BYTES: usize = 42;
+///
+/// This is the spill cost per ownership transition in the captured window.
+/// It lives on the work directory's filesystem for the duration of the pass,
+/// which is why it is reported beside the heap bound rather than folded into
+/// it.
+pub const OWNERSHIP_RUN_RECORD_BYTES: usize = 42;
 
 /// Maximum ownership-event working set for one full conservation pass.
 ///
@@ -77,14 +95,26 @@ pub struct FullSweepPopulation {
 }
 
 /// The measured layout cost of re-grouping commit-ordered ownership history.
+///
+/// Two numbers, deliberately not one. `memory_bytes_bound` is the heap the
+/// external merge holds and is independent of retention; `spill_bytes` is
+/// what the same merge writes to the work directory and scales with every
+/// transition in the window. Reporting only the first is what #912 corrected.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnershipResortCost {
     /// Events sorted by item and commit order across all external runs.
     pub entries: u64,
     /// Inline bytes per ownership-event working-set slot in this build.
     pub bytes_per_entry: u64,
-    /// Bounded ownership-sort working set: one run plus merge heads.
+    /// Bounded ownership-sort heap working set: one run plus merge heads.
     pub memory_bytes_bound: u64,
+    /// Fixed on-disk bytes per spilled event.
+    pub spill_record_bytes: u64,
+    /// Bytes the sorted runs occupy on the work directory's filesystem for
+    /// the pass: `entries * spill_record_bytes`. A consolidation stage
+    /// transiently holds one merged output batch beside its unconsumed
+    /// inputs, so the work directory needs headroom of under twice this.
+    pub spill_bytes: u64,
 }
 
 /// One side-by-side per-asset conservation sum.
@@ -115,7 +145,7 @@ pub struct FullSweepReport {
     pub last_receipt_key: String,
     /// Scan denominators. A pass with zero objects or rows is an error instead.
     pub population: FullSweepPopulation,
-    /// The in-memory item-history regrouping cost.
+    /// The item-history regrouping cost: bounded heap, window-sized spill.
     pub ownership_resort: OwnershipResortCost,
     /// Deterministic per-asset sums, ordered by asset id.
     pub assets: Vec<AssetConservation>,
@@ -148,11 +178,79 @@ impl std::fmt::Display for FullSweepError {
 
 impl std::error::Error for FullSweepError {}
 
+/// A full pass that did not complete, together with every finding it had
+/// already established and emitted before it stopped.
+///
+/// The operator's question when a pass fails is not only "why" but "what did
+/// it learn first". When the ledger is unbalanced *and* the spill disk is
+/// full, both facts must be visible: the conservation break has already gone
+/// out on `orrery_audit` by the time the spill fails, and this value carries
+/// it a second time so the failure log line can count it. The pre-image
+/// reported only the failure, every day, until the disk was fixed (#912).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullSweepFailure {
+    /// What stopped the pass.
+    pub error: FullSweepError,
+    /// Findings computed from the complete captured window and emitted
+    /// before the failure. Empty when the failure preceded the window fold,
+    /// in which case no whole-window verdict existed to lose.
+    pub emitted_findings: Vec<AuditFinding>,
+}
+
+impl FullSweepFailure {
+    /// How many emitted findings are whole-window conservation breaks.
+    #[must_use]
+    pub fn conservation_breaks(&self) -> usize {
+        self.emitted_findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::GlobalConservationBreak)
+            .count()
+    }
+}
+
+impl From<FullSweepError> for FullSweepFailure {
+    fn from(error: FullSweepError) -> Self {
+        Self {
+            error,
+            emitted_findings: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for FullSweepFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)?;
+        if !self.emitted_findings.is_empty() {
+            write!(
+                formatter,
+                "; {} finding(s) were established and emitted before the failure, {} of them \
+                 global_conservation_break; ownership continuity is unverified for this window",
+                self.emitted_findings.len(),
+                self.conservation_breaks()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FullSweepFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Read-only full sweep over the filesystem receipt-archive backend.
 #[derive(Debug, Clone)]
 pub struct ReceiptArchiveSweeper {
     archive_root: PathBuf,
     archive_prefix: String,
+    /// Where the ownership external sort spills. `None` is the OS temporary
+    /// directory, kept as the default so the flag is opt-in, but see
+    /// [`Self::with_work_dir`] for why a production host should set it.
+    work_dir: Option<PathBuf>,
+    /// Test-only fault injected into the first spill of the pass.
+    #[cfg(test)]
+    spill_fault: Option<String>,
 }
 
 impl ReceiptArchiveSweeper {
@@ -171,7 +269,41 @@ impl ReceiptArchiveSweeper {
         Ok(Self {
             archive_root: archive_root.into(),
             archive_prefix,
+            work_dir: None,
+            #[cfg(test)]
+            spill_fault: None,
         })
+    }
+
+    /// Spill the ownership external sort under `work_dir` instead of the OS
+    /// temporary directory.
+    ///
+    /// The sort writes [`OWNERSHIP_RUN_RECORD_BYTES`] per ownership transition
+    /// in the captured window and holds it until the pass ends. On a systemd
+    /// host `std::env::temp_dir()` is tmpfs, so the default turns that spill
+    /// into resident memory the reported heap bound does not include. Point
+    /// this at disk with room for twice the reported `spill_bytes`.
+    ///
+    /// The directory is created if missing. Each pass creates and removes a
+    /// private unique subdirectory beneath it.
+    #[must_use]
+    pub fn with_work_dir(mut self, work_dir: impl Into<PathBuf>) -> Self {
+        self.work_dir = Some(work_dir.into());
+        self
+    }
+
+    /// The configured spill root, when one is set.
+    #[must_use]
+    pub fn work_dir(&self) -> Option<&Path> {
+        self.work_dir.as_deref()
+    }
+
+    /// Fail the first spill of the next pass with `message`, after the window
+    /// has been folded. This stands in for ENOSPC on the work directory.
+    #[cfg(test)]
+    fn with_spill_fault(mut self, message: &str) -> Self {
+        self.spill_fault = Some(message.to_owned());
+        self
     }
 
     /// Run one full pass over the receipt objects visible when this call begins.
@@ -181,21 +313,27 @@ impl ReceiptArchiveSweeper {
     /// evidence and must never be reported as a healthy pass.
     ///
     /// Findings are returned and emitted on the shared `orrery_audit` target.
+    /// Emission happens in two halves, each as soon as it is final: the
+    /// whole-window balance, effect-shape, and conservation findings right
+    /// after the fold, and the ownership-continuity findings after the
+    /// external merge. A failure between the two returns the first half in
+    /// [`FullSweepFailure::emitted_findings`], already emitted.
     ///
     /// # Errors
     ///
-    /// Returns [`FullSweepError`] for directory reads, object reads, Parquet
-    /// decoding, non-monotone/duplicate receipt keys, or sum overflow.
+    /// Returns [`FullSweepFailure`] for directory reads, object reads, Parquet
+    /// decoding, non-monotone/duplicate receipt keys, sum overflow, or a
+    /// work-directory spill failure. Only the last can carry emitted findings.
     pub fn run_pass(
         &self,
         started_at_ms: u64,
         finished_at_ms: u64,
-    ) -> Result<FullSweepReport, FullSweepError> {
+    ) -> Result<FullSweepReport, FullSweepFailure> {
         let objects = self.capture_objects()?;
         if objects.is_empty() {
-            return Err(FullSweepError(
+            return Err(FullSweepFailure::from(FullSweepError(
                 "full conservation sweep captured zero receipt archive objects".to_owned(),
-            ));
+            )));
         }
 
         let mut population = FullSweepPopulation {
@@ -204,7 +342,11 @@ impl ReceiptArchiveSweeper {
         };
         let mut observed = BTreeMap::<AssetId, i128>::new();
         let mut receipted = BTreeMap::<AssetId, i128>::new();
-        let mut ownership = OwnershipExternalSorter::create()?;
+        let mut ownership = OwnershipExternalSorter::create(self.work_dir.as_deref())?;
+        #[cfg(test)]
+        {
+            ownership.spill_fault = self.spill_fault.clone();
+        }
         let mut findings = Vec::new();
         let mut first_key = None;
         let mut previous_key = None;
@@ -223,11 +365,11 @@ impl ReceiptArchiveSweeper {
             })?;
             for row in rows {
                 if previous_key.is_some_and(|previous| row.key <= previous) {
-                    return Err(FullSweepError(format!(
+                    return Err(FullSweepFailure::from(FullSweepError(format!(
                         "receipt archive keys are not strictly increasing: {} after {}",
                         hex(&row.key),
                         previous_key.map_or_else(String::new, |key| hex(&key))
-                    )));
+                    ))));
                 }
                 first_key.get_or_insert(row.key);
                 previous_key = Some(row.key);
@@ -258,9 +400,9 @@ impl ReceiptArchiveSweeper {
         }
 
         let Some(last_key) = previous_key else {
-            return Err(FullSweepError(
+            return Err(FullSweepFailure::from(FullSweepError(
                 "full conservation sweep decoded zero receipt rows".to_owned(),
-            ));
+            )));
         };
         let first_key = first_key.expect("last receipt implies first receipt");
 
@@ -300,12 +442,31 @@ impl ReceiptArchiveSweeper {
             }
         }
 
-        let ownership_resort = ownership.cost(population.ownership_transitions)?;
-        findings.extend(ownership.finish()?);
-
+        // The whole-window verdict is final here: every captured object has
+        // been folded, and nothing below can add to or retract these findings.
+        // Emit them before the external merge, whose spill is the one step
+        // left that can fail on the host rather than on the archive. A
+        // conservation break must not wait behind a full disk (#912).
         for finding in &findings {
             finding.emit();
         }
+
+        let ownership_findings = ownership
+            .cost(population.ownership_transitions)
+            .and_then(|cost| ownership.finish().map(|found| (cost, found)));
+        let (ownership_resort, ownership_findings) = match ownership_findings {
+            Ok(established) => established,
+            Err(error) => {
+                return Err(FullSweepFailure {
+                    error,
+                    emitted_findings: findings,
+                });
+            }
+        };
+        for finding in &ownership_findings {
+            finding.emit();
+        }
+        findings.extend(ownership_findings);
 
         Ok(FullSweepReport {
             schema: FULL_SWEEP_REPORT_SCHEMA.to_owned(),
@@ -368,20 +529,33 @@ struct OwnershipEvent {
 ///
 /// `tempfile` is intentionally only a test dependency in this crate. The
 /// daemon needs no new runtime dependency to obtain a best-effort-cleaned
-/// unique directory under the operating system temporary directory.
+/// unique directory under the configured work root, or under the operating
+/// system temporary directory when none is configured.
 #[derive(Debug)]
 struct SweepWorkDir(PathBuf);
 
 impl SweepWorkDir {
-    fn create() -> Result<Self, FullSweepError> {
+    fn create(root: Option<&Path>) -> Result<Self, FullSweepError> {
         static NEXT_WORK_DIR: AtomicU64 = AtomicU64::new(0);
 
+        let root = match root {
+            Some(root) => {
+                std::fs::create_dir_all(root).map_err(|error| {
+                    FullSweepError(format!(
+                        "create audit work directory {}: {error}",
+                        root.display()
+                    ))
+                })?;
+                root.to_path_buf()
+            }
+            None => std::env::temp_dir(),
+        };
         let epoch_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         for attempt in 0..64_u64 {
             let serial = NEXT_WORK_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = root.join(format!(
                 "orrery-conservation-{}-{epoch_nanos}-{serial}-{attempt}",
                 std::process::id()
             ));
@@ -418,11 +592,13 @@ struct OwnershipExternalSorter {
     work_dir: SweepWorkDir,
     buffer: Vec<OwnershipEvent>,
     runs: u64,
+    #[cfg(test)]
+    spill_fault: Option<String>,
 }
 
 impl OwnershipExternalSorter {
-    fn create() -> Result<Self, FullSweepError> {
-        let work_dir = SweepWorkDir::create()?;
+    fn create(root: Option<&Path>) -> Result<Self, FullSweepError> {
+        let work_dir = SweepWorkDir::create(root)?;
         std::fs::create_dir(work_dir.stage(0)).map_err(|error| {
             FullSweepError(format!(
                 "create ownership-sort initial run directory: {error}"
@@ -432,6 +608,8 @@ impl OwnershipExternalSorter {
             work_dir,
             buffer: Vec::with_capacity(OWNERSHIP_RUN_EVENTS),
             runs: 0,
+            #[cfg(test)]
+            spill_fault: None,
         })
     }
 
@@ -452,10 +630,15 @@ impl OwnershipExternalSorter {
         let memory_bytes_bound = (slots as u64)
             .checked_mul(size_of::<OwnershipEvent>() as u64)
             .ok_or_else(|| FullSweepError("ownership re-sort byte bound overflow".to_owned()))?;
+        let spill_bytes = entries
+            .checked_mul(OWNERSHIP_RUN_RECORD_BYTES as u64)
+            .ok_or_else(|| FullSweepError("ownership re-sort spill bound overflow".to_owned()))?;
         Ok(OwnershipResortCost {
             entries,
             bytes_per_entry: size_of::<OwnershipEvent>() as u64,
             memory_bytes_bound,
+            spill_record_bytes: OWNERSHIP_RUN_RECORD_BYTES as u64,
+            spill_bytes,
         })
     }
 
@@ -463,11 +646,15 @@ impl OwnershipExternalSorter {
         if self.buffer.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(message) = self.spill_fault.take() {
+            return Err(FullSweepError(format!(
+                "create ownership-sort run {}: {message}",
+                run_path(&self.work_dir, 0, self.runs).display()
+            )));
+        }
         self.buffer.sort_unstable_by(event_order);
-        let path = self
-            .work_dir
-            .stage(0)
-            .join(format!("{:020}.run", self.runs));
+        let path = run_path(&self.work_dir, 0, self.runs);
         write_run(&path, &self.buffer)?;
         self.buffer.clear();
         self.runs = checked_u64_add(self.runs, 1, "ownership external-sort run count")?;
@@ -482,12 +669,12 @@ impl OwnershipExternalSorter {
 
         let mut stage = 0_u32;
         while self.runs > OWNERSHIP_MERGE_FAN_IN as u64 {
-            self.runs = consolidate_stage(&self.work_dir, stage)?;
+            self.runs = consolidate_stage(&self.work_dir, stage, self.runs)?;
             stage = stage.checked_add(1).ok_or_else(|| {
                 FullSweepError("ownership external-sort stage counter overflow".to_owned())
             })?;
         }
-        ownership_findings_from_stage(&self.work_dir.stage(stage))
+        ownership_findings_from_stage(&self.work_dir.stage(stage), self.runs)
     }
 }
 
@@ -617,49 +804,48 @@ fn read_account(reader: &mut impl Read) -> Result<Option<AccountId>, FullSweepEr
     }
 }
 
+/// Name run `serial` of `stage`. Runs are written under their serial, so a
+/// stage's catalogue is the counter that produced it and never a directory
+/// listing.
+fn run_path(work_dir: &SweepWorkDir, stage: u32, serial: u64) -> PathBuf {
+    work_dir.stage(stage).join(format!("{serial:020}.run"))
+}
+
 /// Merge each bounded batch in one stage into the next, deleting inputs as
-/// they are consumed. A directory iterator and a batch of at most sixteen
-/// paths keep the run catalogue out of the process heap.
-fn consolidate_stage(work_dir: &SweepWorkDir, stage: u32) -> Result<u64, FullSweepError> {
+/// they are consumed. The input catalogue is the run counter, `runs`: every
+/// run in a stage is named by its serial, so the batch to merge is derived
+/// arithmetically and no directory is listed while files are being removed
+/// from it. A `read_dir` iterator live across `remove_file` on the same
+/// directory is unspecified under POSIX and observably skips or repeats
+/// entries on ext4 with `dir_index` at around eleven thousand files, which is
+/// one day of runs (#912). A batch of at most sixteen paths keeps the
+/// catalogue out of the process heap.
+fn consolidate_stage(
+    work_dir: &SweepWorkDir,
+    stage: u32,
+    runs: u64,
+) -> Result<u64, FullSweepError> {
     let input = work_dir.stage(stage);
-    let output = work_dir.stage(
-        stage
-            .checked_add(1)
-            .ok_or_else(|| FullSweepError("ownership external-sort stage overflow".to_owned()))?,
-    );
+    let next_stage = stage
+        .checked_add(1)
+        .ok_or_else(|| FullSweepError("ownership external-sort stage overflow".to_owned()))?;
+    let output = work_dir.stage(next_stage);
     std::fs::create_dir(&output).map_err(|error| {
         FullSweepError(format!(
             "create ownership-sort stage {}: {error}",
             output.display()
         ))
     })?;
-    let mut entries = std::fs::read_dir(&input).map_err(|error| {
-        FullSweepError(format!(
-            "read ownership-sort stage {}: {error}",
-            input.display()
-        ))
-    })?;
+    let mut first = 0_u64;
     let mut output_runs = 0_u64;
-    loop {
-        let mut batch = Vec::with_capacity(OWNERSHIP_MERGE_FAN_IN);
-        while batch.len() < OWNERSHIP_MERGE_FAN_IN {
-            let Some(entry) = entries.next() else {
-                break;
-            };
-            let path = entry
-                .map_err(|error| {
-                    FullSweepError(format!("read ownership-sort stage entry: {error}"))
-                })?
-                .path();
-            if path.extension().is_some_and(|extension| extension == "run") {
-                batch.push(path);
-            }
-        }
-        if batch.is_empty() {
-            break;
-        }
-        batch.sort();
-        let output_path = output.join(format!("{:020}.run", output_runs));
+    while first < runs {
+        let last = first
+            .saturating_add(OWNERSHIP_MERGE_FAN_IN as u64)
+            .min(runs);
+        let batch = (first..last)
+            .map(|serial| run_path(work_dir, stage, serial))
+            .collect::<Vec<_>>();
+        let output_path = run_path(work_dir, next_stage, output_runs);
         merge_runs(&batch, &output_path)?;
         for path in batch {
             std::fs::remove_file(&path).map_err(|error| {
@@ -670,6 +856,7 @@ fn consolidate_stage(work_dir: &SweepWorkDir, stage: u32) -> Result<u64, FullSwe
             })?;
         }
         output_runs = checked_u64_add(output_runs, 1, "ownership external-sort output run count")?;
+        first = last;
     }
     std::fs::remove_dir(&input).map_err(|error| {
         FullSweepError(format!(
@@ -716,28 +903,18 @@ fn smallest_cursor(cursors: &[RunCursor]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn ownership_findings_from_stage(stage: &Path) -> Result<Vec<AuditFinding>, FullSweepError> {
-    let entries = std::fs::read_dir(stage).map_err(|error| {
-        FullSweepError(format!(
-            "read final ownership-sort stage {}: {error}",
-            stage.display()
-        ))
-    })?;
-    let mut paths = Vec::with_capacity(OWNERSHIP_MERGE_FAN_IN);
-    for entry in entries {
-        let path = entry
-            .map_err(|error| FullSweepError(format!("read final ownership-sort entry: {error}")))?
-            .path();
-        if path.extension().is_some_and(|extension| extension == "run") {
-            if paths.len() == OWNERSHIP_MERGE_FAN_IN {
-                return Err(FullSweepError(
-                    "final ownership-sort stage exceeds merge fan-in".to_owned(),
-                ));
-            }
-            paths.push(path);
-        }
+fn ownership_findings_from_stage(
+    stage: &Path,
+    runs: u64,
+) -> Result<Vec<AuditFinding>, FullSweepError> {
+    if runs > OWNERSHIP_MERGE_FAN_IN as u64 {
+        return Err(FullSweepError(
+            "final ownership-sort stage exceeds merge fan-in".to_owned(),
+        ));
     }
-    paths.sort();
+    let paths = (0..runs)
+        .map(|serial| stage.join(format!("{serial:020}.run")))
+        .collect::<Vec<_>>();
     let mut cursors = paths
         .iter()
         .map(|path| RunCursor::open(path))
@@ -1249,16 +1426,274 @@ mod tests {
         );
     }
 
+    /// Everything `AuditFinding::emit` wrote on `orrery_audit` while `run`
+    /// executed, as the rendered log text.
+    fn captured_audit_log<T>(run: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let text = String::from_utf8(captured.0.lock().expect("log buffer").clone())
+            .expect("log text is UTF-8");
+        (result, text)
+    }
+
+    /// The slow-leak window from the guarded test above, unchanged.
+    fn leaking_window_rows() -> Vec<ReceiptArchiveRow> {
+        let item = ItemUid::new(55);
+        vec![
+            archived(
+                1,
+                1,
+                vec![LEDGER_CREDIT_OP],
+                vec![delta(1, 7, 1_000)],
+                Vec::new(),
+            ),
+            archived(
+                2,
+                2,
+                vec![LEDGER_ITEM_TRANSFER_OP],
+                vec![delta(1, 7, -100), delta(2, 7, 100)],
+                vec![ReceiptOwnershipTransition {
+                    item,
+                    before: Some(AccountId::new(1)),
+                    after: Some(AccountId::new(2)),
+                }],
+            ),
+            archived(
+                3,
+                3,
+                vec![LEDGER_ITEM_TRANSFER_OP],
+                vec![delta(2, 7, -100), delta(3, 7, 99)],
+                vec![ReceiptOwnershipTransition {
+                    item,
+                    before: Some(AccountId::new(2)),
+                    after: Some(AccountId::new(3)),
+                }],
+            ),
+        ]
+    }
+
+    /// THE #912 stage: the ledger is unbalanced *and* the spill fails. The
+    /// conservation break was computed before the spill and must reach the
+    /// audit log anyway; the spill failure must also be reported, carrying
+    /// the break, and must not be mistaken for a pass that found nothing.
+    #[test]
+    fn conservation_break_is_emitted_before_a_spill_failure_and_the_failure_is_reported() {
+        let rows = leaking_window_rows();
+        let (_directory, sweeper) = write_window_pages(&rows, 1);
+        let sweeper = sweeper.with_spill_fault("No space left on device (os error 28)");
+
+        let (result, audit_log) = captured_audit_log(|| sweeper.run_pass(10, 11));
+        let failure = result.expect_err("the injected spill failure must surface");
+
+        // The louder condition is reported, with the spill path it hit.
+        assert!(
+            failure.error.0.contains("No space left on device"),
+            "the spill failure names its cause: {}",
+            failure.error
+        );
+        assert!(
+            failure.error.0.contains("ownership-sort run"),
+            "the spill failure names the step that failed: {}",
+            failure.error
+        );
+
+        // The more serious condition was emitted before the failure, on the
+        // shared audit target, in the same shape a clean pass emits it.
+        assert!(
+            audit_log.contains(r#"kind="global_conservation_break""#),
+            "the computed break must be on the audit log before the spill failed:\n{audit_log}"
+        );
+        assert!(
+            audit_log.contains("unexplained delta -1"),
+            "the emitted break carries its magnitude:\n{audit_log}"
+        );
+        assert!(
+            !audit_log.contains("overlapping_item_ownership")
+                && !audit_log.contains("unreceipted_item_ownership"),
+            "ownership continuity was never established and must not be emitted:\n{audit_log}"
+        );
+
+        // And the failure carries what it had already told the operator, so
+        // the daemon's failure line can count it.
+        assert_eq!(failure.conservation_breaks(), 1);
+        let carried = failure
+            .emitted_findings
+            .iter()
+            .find(|finding| finding.kind == FindingKind::GlobalConservationBreak)
+            .expect("the failure carries the emitted break");
+        assert_eq!(carried.asset, Some(AssetId::new(7)));
+        let rendered = failure.to_string();
+        assert!(
+            rendered.contains("1 of them global_conservation_break")
+                && rendered.contains("ownership continuity is unverified"),
+            "the failure text states both what was found and what was not checked: {rendered}"
+        );
+    }
+
+    /// A clean window through the same seam: the failure is still a failure
+    /// with nothing carried, never a report with zero findings.
+    #[test]
+    fn spill_failure_on_a_clean_window_is_a_failure_not_a_green_pass() {
+        let item = ItemUid::new(55);
+        let rows = vec![
+            archived(
+                1,
+                1,
+                vec![LEDGER_CREDIT_OP],
+                vec![delta(1, 7, 1_000)],
+                Vec::new(),
+            ),
+            archived(
+                2,
+                2,
+                vec![LEDGER_ITEM_TRANSFER_OP],
+                vec![delta(1, 7, -100), delta(2, 7, 100)],
+                vec![ReceiptOwnershipTransition {
+                    item,
+                    before: Some(AccountId::new(1)),
+                    after: Some(AccountId::new(2)),
+                }],
+            ),
+        ];
+        let (_directory, sweeper) = write_window(&rows);
+        let sweeper = sweeper.with_spill_fault("No space left on device (os error 28)");
+        let (result, audit_log) = captured_audit_log(|| sweeper.run_pass(10, 11));
+        let failure = result.expect_err("the spill failure must surface");
+        assert!(failure.emitted_findings.is_empty());
+        assert!(
+            !audit_log.contains("ledger sweep finding"),
+            "nothing was found, so nothing is emitted:\n{audit_log}"
+        );
+        assert!(!failure.to_string().contains("emitted before the failure"));
+    }
+
+    /// A work directory that cannot take the spill is a reported failure with
+    /// the path in it. ENOTDIR stands in for ENOSPC: both are the host
+    /// refusing the spill root before any run is written, and neither must
+    /// become a report.
+    #[test]
+    fn unwritable_work_dir_is_a_reported_failure_not_a_clean_pass() {
+        let rows = leaking_window_rows();
+        let (_directory, sweeper) = write_window_pages(&rows, 1);
+        let blocker = tempfile::tempdir().expect("work root");
+        let not_a_directory = blocker.path().join("full-disk");
+        std::fs::write(&not_a_directory, b"occupied").expect("place a file where the root goes");
+        let work_dir = not_a_directory.join("spill");
+        let sweeper = sweeper.with_work_dir(&work_dir);
+
+        let failure = sweeper
+            .run_pass(10, 11)
+            .expect_err("an unusable work directory cannot produce a report");
+        assert!(
+            failure.error.0.contains("create audit work directory")
+                && failure.error.0.contains(&work_dir.display().to_string()),
+            "the failure names the configured work directory: {}",
+            failure.error
+        );
+        assert!(
+            failure.emitted_findings.is_empty(),
+            "the spill root is prepared before the window is folded, so nothing was established"
+        );
+    }
+
+    /// `--audit-work-dir` is where the runs go: the configured root is
+    /// created, the pass spills beneath it, and the pass cleans up after
+    /// itself. The injected fault reports the spill path it would have
+    /// written, which proves the location without racing the pass.
+    #[test]
+    fn audit_work_dir_selects_the_spill_location() {
+        let rows = leaking_window_rows();
+        let (_directory, sweeper) = write_window_pages(&rows, 1);
+        let root = tempfile::tempdir().expect("work root");
+        let work_dir = root.path().join("audit-spill");
+        assert!(!work_dir.exists());
+        let sweeper = sweeper.with_work_dir(&work_dir);
+        assert_eq!(sweeper.work_dir(), Some(work_dir.as_path()));
+
+        let failure = sweeper
+            .clone()
+            .with_spill_fault("probe")
+            .run_pass(10, 11)
+            .expect_err("the probe fault surfaces the spill path");
+        let spill_path = failure
+            .error
+            .0
+            .split("create ownership-sort run ")
+            .nth(1)
+            .and_then(|rest| rest.split(": probe").next())
+            .map(PathBuf::from)
+            .expect("the fault names the run it would have created");
+        assert!(
+            spill_path.starts_with(&work_dir),
+            "spill {} is not under the configured work directory {}",
+            spill_path.display(),
+            work_dir.display()
+        );
+        assert!(
+            spill_path.ends_with("stage-0/00000000000000000000.run"),
+            "the first run of the pass: {}",
+            spill_path.display()
+        );
+
+        let report = sweeper
+            .run_pass(10, 11)
+            .expect("the same window passes cleanly through disk");
+        assert_eq!(report.ownership_resort.entries, 2);
+        assert_eq!(
+            report.ownership_resort.spill_bytes,
+            2 * OWNERSHIP_RUN_RECORD_BYTES as u64
+        );
+        assert!(work_dir.is_dir(), "the configured root was created");
+        assert_eq!(
+            std::fs::read_dir(&work_dir)
+                .expect("list work root")
+                .count(),
+            0,
+            "each pass removes its private subdirectory"
+        );
+    }
+
     #[test]
     fn zero_object_window_is_not_a_green_pass() {
         let directory = tempfile::tempdir().expect("archive directory");
         std::fs::create_dir_all(directory.path().join("rarchive"))
             .expect("receipt object directory");
         let sweeper = ReceiptArchiveSweeper::open(directory.path(), "").expect("open sweeper");
-        let error = sweeper
+        let failure = sweeper
             .run_pass(0, 1)
             .expect_err("zero objects are vacuous");
-        assert!(error.0.contains("zero receipt archive objects"));
+        assert!(failure.error.0.contains("zero receipt archive objects"));
+        assert!(
+            failure.emitted_findings.is_empty(),
+            "no window was folded, so no verdict existed to emit"
+        );
     }
 
     /// Reproducible inputs for #890's layout-cost artifact. The source rate is
@@ -1293,6 +1728,13 @@ mod tests {
         let receipts_per_day = INTENTS_PER_SECOND * SECONDS_PER_DAY;
         let objects_per_day = receipts_per_day.div_ceil(PAGE_ROWS);
         let scan_bytes_per_day_bound = report.population.object_bytes * objects_per_day;
+        let ownership_spill_bytes_per_day =
+            receipts_per_day * report.ownership_resort.spill_record_bytes;
+        assert_eq!(
+            report.ownership_resort.spill_bytes,
+            PAGE_ROWS * OWNERSHIP_RUN_RECORD_BYTES as u64,
+            "the spill is window-sized: one record per transition"
+        );
         assert_eq!(
             report.ownership_resort.memory_bytes_bound,
             OWNERSHIP_RESORT_MEMORY_CEILING_BYTES,
@@ -1302,10 +1744,13 @@ mod tests {
             "measurement page_rows={PAGE_ROWS} page_bytes={} ownership_event_bytes={} \
              receipts_per_day={receipts_per_day} objects_per_day={objects_per_day} \
              scan_bytes_per_day_bound={scan_bytes_per_day_bound} \
-             ownership_resort_memory_bytes_bound={}",
+             ownership_resort_memory_bytes_bound={} \
+             ownership_spill_record_bytes={} \
+             ownership_spill_bytes_per_day={ownership_spill_bytes_per_day}",
             report.population.object_bytes,
             report.ownership_resort.bytes_per_entry,
             report.ownership_resort.memory_bytes_bound,
+            report.ownership_resort.spill_record_bytes,
         );
     }
 }
