@@ -25,8 +25,6 @@ members = [
     "crates/orrery_ruleset_digest",
     "crates/orrery_compose",
     "crates/orrery_conformance",
-    # Pre-S5 C ABI spike: proves the engine-neutral simulation boundary.
-    "crates/orrery_sim",
     "crates/orrery_sim_host",
     # The facade sits on top of the spine: it depends on every client plugin.
     "crates/orrery",

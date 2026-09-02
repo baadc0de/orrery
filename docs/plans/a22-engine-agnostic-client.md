@@ -173,7 +173,9 @@ Three questions, in order, each cheap and each able to invalidate the next:
 > reproduces host arithmetic **field-exactly** across fast, jittered and a
 > forced 250 ms hitch (120 ticks, craft 7, `(76097, -22824, 5756)` mm); and the
 > C ABI landed as `crates/orrery_sim/include/orrery_sim.h` (#727), which S5
-> (#738) was designed against. **Section 4's recommendation is therefore
+> (#738) was designed against — and which #872 later retired for the
+> ruleset-generic `crates/orrery_sim_host/include/orrery_sim_host.h`, re-proving
+> the accumulator-with-hitch property on that path from a C caller. **Section 4's recommendation is therefore
 > checkable rather than an opinion: let Unreal own the loop.** A bootstrap
 > owning `main()` buys lifecycle control, not deterministic arithmetic.
 >

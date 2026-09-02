@@ -10,6 +10,13 @@ bevy_ecs = { workspace = true }
 orrery_core = { path = "../orrery_core" }
 orrery_protocol = { path = "../orrery_protocol" }
 
+# The reference C library: the generic `orrery_host_*` exports from `abi`
+# plus one factory for the synthetic ruleset. `tests/c_consumer.rs` builds
+# it and drives it from a C program through `include/orrery_sim_host.h`.
+[[example]]
+name = "synthetic_abi"
+crate-type = ["cdylib"]
+
 [dev-dependencies]
 bevy_app = { workspace = true }
 blake3 = "1.8"

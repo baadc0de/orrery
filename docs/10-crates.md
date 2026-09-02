@@ -30,8 +30,7 @@ orrery/
 │   ├── orrery_seed/            # lib + bin · world seeder: TOML scenario runner (12-world-seeding.md)
 │   ├── orrery_ruleset_digest/  # lib · build-script source-closure encoder behind RulesetId (D49)
 │   ├── orrery_games/           # lib · reference Rulesets + tampered variants (P4's measurement)
-│   ├── orrery_sim/             # lib · pre-S5 C ABI spike: the engine-neutral simulation boundary
-│   ├── orrery_sim_host/        # lib · engine-neutral fixed-step host seam (bevy_ecs backend, D42)
+│   ├── orrery_sim_host/        # lib · engine-neutral fixed-step host seam (bevy_ecs backend, D42) + its ruleset-generic C ABI (include/orrery_sim_host.h) and snapshot/restore (#872)
 │   ├── orrery_conformance/     # lib + bin · determinism-matrix reference ruleset + golden corpus
 │   ├── orrery_coordinator/     # bin · presence, islands, promotion
 │   └── orrery_identity/        # bin · accounts, tokens, strikes
@@ -63,7 +62,6 @@ graph BT
         compose["orrery_compose"]
         ruleset_digest["orrery_ruleset_digest (build-time)"]
         games["orrery_games"]
-        sim["orrery_sim"]
         conf["orrery_conformance"]
     end
     subgraph client["Client plugin stack — Bevy 0.19"]
@@ -110,7 +108,6 @@ graph BT
     games --> protocol
     conf --> core
     conf --> protocol
-    sim --> games
     sim_host --> core
     seed --> persistd
     persistd --> witness
@@ -159,13 +156,12 @@ Layering rules (the first two are normative from D15; the rest are containment r
 | `orrery_seed` | lib+bin | **none** | toml, serde, blake3, rand_chacha 0.9, postcard, foundationdb-rs 0.11 (opt, `fdb` feature) |
 | `orrery_ruleset_digest` | lib | **none** | blake3, syn/quote/proc-macro2, toml |
 | `orrery_games` | lib | `bevy_ecs` — permitted (D42 (a) amended), taken 2026-09-01 (#855); **none**/"not taken" when this row was written | libm, rand_chacha 0.9, rand_core, blake3, iroh-base, bytes, postcard, serde (iroh-base, bytes, postcard and serde are the F-4 harness's, #749) |
-| `orrery_sim` | lib (rlib+cdylib) | **none** | orrery_core, orrery_games |
-| `orrery_sim_host` | lib | `bevy_ecs` | orrery_core |
+| `orrery_sim_host` | lib (+ a `cdylib` example carrying the C ABI) | `bevy_ecs` | orrery_core |
 | `orrery_conformance` | lib+bin | **none** | libm, rand_chacha 0.9, serde |
 | `orrery_coordinator` | bin | **none** | iroh, tokio, tonic |
 | `orrery_identity` | bin | **none** | iroh, tokio, foundationdb-rs 0.11, argon2 |
 
-The seven rows this table adds beyond the original fifteen — `orrery_compose`, `orrery_replicon`, `orrery_ruleset_digest`, `orrery_sim`, `orrery_sim_host`, `orrery_synthetic`, `orrery_sidecar` — have no numbered sections; their one-line purposes are in the layout tree above, and the records that specify them are named there.
+The six rows this table adds beyond the original fifteen — `orrery_compose`, `orrery_replicon`, `orrery_ruleset_digest`, `orrery_sim_host`, `orrery_synthetic`, `orrery_sidecar` — have no numbered sections; `orrery_sim`, the Regolith-typed pre-S5 C ABI spike, was retired by #872 once `orrery_sim_host` exported a ruleset-generic one; their one-line purposes are in the layout tree above, and the records that specify them are named there.
 
 ### 1. `orrery_protocol` — wire and data types
 
