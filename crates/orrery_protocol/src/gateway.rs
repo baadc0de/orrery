@@ -1054,8 +1054,11 @@ mod tests {
         // the same claims layout. D34 changed `WitnessEpochClaimsV1`'s
         // positional layout, and D33's probation field changes
         // `SessionTokenClaimsV1`'s, so pin the externally visible version as a
-        // literal.
-        assert_eq!(crate::PROTOCOL_VERSION, 9);
+        // literal. 10 is #861's identity wire family — no shared message
+        // changed shape, but the doctrine is one version number for the tree
+        // (see `PROTOCOL_VERSION`'s own doc for why a family that never
+        // crosses a gateway session still bumps it).
+        assert_eq!(crate::PROTOCOL_VERSION, 10);
     }
 
     #[test]

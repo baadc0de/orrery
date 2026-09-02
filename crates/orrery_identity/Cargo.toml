@@ -25,18 +25,27 @@ orrery_protocol = { path = "../orrery_protocol" }
 # For `keyspace`: #209 landed D31's `da`/`db`/`dh` key builders and row types in
 # persistd, and for `gateway::BindingAuthority`, the seam this crate's store
 # answers. Same direction and the same reason `orrery_seed` depends on it —
-# persistd owns the keyspace module, and a second copy of those bytes is the one
-# thing D31 clause (b) cannot survive.
+# persistd owns the keyspace module, and a second copy of those bytes is the
+# one thing D31 clause (b) cannot survive.
 orrery_persistd = { path = "../orrery_persistd" }
+# The served mint path (#861) owns a full iroh endpoint — docs/10-crates.md
+# §13's dependency row already priced this crate for iroh and tokio.
+iroh = { workspace = true }
 # The issuer's Ed25519 signing key. `SessionTokenV1::sign` takes an
-# `iroh_base::SecretKey`; nothing else in iroh is needed here.
+# `iroh_base::SecretKey`; nothing else in iroh-base is needed here.
 iroh-base = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 postcard = { workspace = true }
 serde = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
+# The `orrery-identity` binary mirrors the coordinator's deployment contract:
+# anyhow errors, a stderr tracing subscriber, and one JSON readiness line.
+anyhow = { workspace = true }
+serde_json = "1"
+tracing-subscriber = { workspace = true }
 sha2 = "0.10"
 rand = "0.9"
 tempfile = "3"

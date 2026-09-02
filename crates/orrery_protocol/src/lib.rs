@@ -73,9 +73,10 @@ pub use hit::{
     UNorm16, WeaponRef,
 };
 pub use identity::{
-    AccountInvalidation, FixedTokenClock, IssuerKey, IssuerKeyId, NodeId, SessionStanding,
-    SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, SessionTokenVerificationError,
-    SessionTokenVerifier, Signature, TokenClock, UnixMillis, MAX_SESSION_TOKEN_BYTES,
+    AccountInvalidation, FixedTokenClock, IdentityMsg, IdentityRefusal, IdentityReply, IssuerKey,
+    IssuerKeyId, NodeId, SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1,
+    SessionTokenVerificationError, SessionTokenVerifier, Signature, TokenClock, UnixMillis,
+    IDENTITY_ALPN, MAX_IDENTITY_REPLY_BYTES, MAX_IDENTITY_REQUEST_BYTES, MAX_SESSION_TOKEN_BYTES,
     MAX_SESSION_TOKEN_TTL_MS, SESSION_TOKEN_V1_DOMAIN, SESSION_TOKEN_V1_VERSION,
     SESSION_TOKEN_V2_VERSION,
 };

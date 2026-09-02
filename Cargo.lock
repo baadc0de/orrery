@@ -8033,10 +8033,12 @@ name = "orrery_identity"
 version = "0.1.0"
 dependencies = [
  "age",
+ "anyhow",
  "async-trait",
  "clap",
  "foundationdb",
  "futures",
+ "iroh",
  "iroh-base",
  "orrery_persistd",
  "orrery_protocol",
@@ -8044,10 +8046,12 @@ dependencies = [
  "rand 0.9.5",
  "rpassword",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

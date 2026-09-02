@@ -421,7 +421,14 @@ impl<C: TokenClock> SessionTokenVerifier<C> {
 }
 
 /// A typed rejection from V1 token framing or verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because the identity service's refresh arm
+/// reports a rejected presented token with the same taxonomy its own
+/// verifier used ([`IdentityRefusal::RefreshRejected`]) — a client that is
+/// told `Expired` re-logins, one told `WrongNode` has a transport bug, and a
+/// client that cannot tell the difference cannot react correctly. The
+/// variants and their order are unchanged; the derives are additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SessionTokenVerificationError {
     /// The encoded envelope exceeds its bound or is not a valid V1 postcard frame.
@@ -457,6 +464,191 @@ impl fmt::Display for SessionTokenVerificationError {
 }
 
 impl std::error::Error for SessionTokenVerificationError {}
+
+/// The application protocol an identity service speaks over iroh (#861,
+/// docs/09-services-and-ops.md §8).
+///
+/// A separate ALPN from the coordinator's: the identity service is its own
+/// process at its own well-known NodeId, and a dialler that asks for the
+/// coordinator must never be answered by identity or the reverse.
+pub const IDENTITY_ALPN: &[u8] = b"orrery/identity/0";
+
+/// The largest request a service reads off one bi-stream, before postcard
+/// decoding.
+///
+/// The heaviest live request is a `Refresh`, whose token is bounded by
+/// [`MAX_SESSION_TOKEN_BYTES`] (512); 4 KiB leaves room for framing growth
+/// without making an unauthenticated pre-bootstrap read a memory lever.
+pub const MAX_IDENTITY_REQUEST_BYTES: usize = 4 * 1024;
+/// The largest reply a client reads off one bi-stream, before postcard
+/// decoding.
+///
+/// Every reply is bounded above by an issued token (≤
+/// [`MAX_SESSION_TOKEN_BYTES`]) plus small fixed fields; 4 KiB is the same
+/// posture in the other direction.
+pub const MAX_IDENTITY_REPLY_BYTES: usize = 4 * 1024;
+
+/// One request from a client to a running identity service.
+///
+/// Each request travels on its own QUIC bi-stream: postcard bytes,
+/// stream finished, one [`IdentityReply`] back, stream finished. The
+/// transport identity is *not* a field anywhere in this enum — the service
+/// takes it from the verified QUIC connection ([`NodeId`] is the iroh key,
+/// D3), so a request body can never mint for a node its sender does not
+/// hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityMsg {
+    /// Connection bootstrap that names the [`crate::PROTOCOL_VERSION`] the
+    /// client speaks. **The only bootstrap**: the service answers
+    /// [`IdentityReply::HelloAccepted`] and admits further requests, or
+    /// [`IdentityReply::HelloRefused`] and closes the connection — exactly
+    /// the exact-equality rule `GatewayMsg::VersionedHello` established. A
+    /// request sent before an accepted `Hello` is answered with
+    /// `HelloRefused` as well: there is no unversioned back door.
+    Hello {
+        /// The `PROTOCOL_VERSION` this client was built against.
+        version: u16,
+    },
+    /// Mint a session token for the connecting node and the named account.
+    ///
+    /// No credential rides along. Authentication *is* the binding: the
+    /// service mints only when the connection's transport identity is the
+    /// NodeId bound to `account` (D31 clause (b)'s `db` index), and the four
+    /// questions of `IdentityService::issue` are answered in their written
+    /// order. A claim of someone else's account is therefore refused
+    /// `NotBound`/`NodeBoundElsewhere` rather than ever becoming a token.
+    Login {
+        /// The account asking to log in.
+        account: AccountId,
+        /// Requested lifetime; `None` for the service's default, capped by
+        /// `MAX_SESSION_TOKEN_TTL_MS`.
+        ttl_ms: Option<u64>,
+    },
+    /// Reissue for an established `(account, node)` — docs/09 §8's "clients
+    /// refresh at half-TTL over a reliable stream".
+    ///
+    /// The presented token is verified with the service's own published
+    /// issuer keys before its claims drive the refresh, so a token that has
+    /// left its issuer-key window is refused `RefreshRejected` with the
+    /// verifier's own reason (`UnknownIssuer` after a retire) instead of
+    /// being silently re-minted.
+    Refresh {
+        /// The postcard bytes of the token being refreshed.
+        token: Vec<u8>,
+        /// As in `Login`.
+        ttl_ms: Option<u64>,
+    },
+    /// Redeem an invite code: verify it, create the account, bind the
+    /// connecting node, and mint — `redeem_invite` as a deployment path
+    /// rather than a test-harness-only one (#861).
+    RedeemInvite {
+        /// The invite code as issued.
+        code: String,
+        /// As in `Login`.
+        ttl_ms: Option<u64>,
+    },
+}
+
+/// One answer from a running identity service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityReply {
+    /// The bootstrap was accepted; further requests may proceed.
+    HelloAccepted,
+    /// The bootstrap was refused. The service closes the connection after
+    /// this reply, so the client learns the accepted version once, by name,
+    /// rather than from decode failures.
+    HelloRefused {
+        /// The [`crate::PROTOCOL_VERSION`] the service accepts.
+        expected: u16,
+    },
+    /// A minted session. `token` is the postcard envelope exactly as
+    /// `SessionTokenV1::encode` produced it — the bytes a coordinator or
+    /// gateway verifier accepts unmodified — and `refresh_at_ms` is the
+    /// half-TTL instant the client should come back at.
+    Issued {
+        /// The encoded `SessionTokenV1`.
+        token: Vec<u8>,
+        /// `issued_at + ttl / 2`, computed by the issuer.
+        refresh_at_ms: UnixMillis,
+    },
+    /// The request was understood and refused, with the reason.
+    Refused(IdentityRefusal),
+}
+
+/// Why a request was refused.
+///
+/// A positional postcard enum shared by every request kind, so new refusal
+/// reasons append and never renumber the ones a client already matches on.
+/// It mirrors the mint-time refusals of `IdentityError` one-for-one — the
+/// service maps, it does not reinterpret — plus the two surfaces only the
+/// served path adds: a rejected presented refresh token, and an invite
+/// ledger the request could not use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityRefusal {
+    /// No account row exists for the named id (D33 clause (f)'s first
+    /// absence: authentication fails, no token).
+    UnknownAccount(AccountId),
+    /// The connecting node is not bound to the named account.
+    NotBound {
+        /// The node that asked.
+        node: NodeId,
+        /// The account it claimed.
+        account: AccountId,
+    },
+    /// The connecting node is bound, but to a different account.
+    NodeBoundElsewhere {
+        /// The node that asked.
+        node: NodeId,
+        /// The account that currently holds it.
+        account: AccountId,
+    },
+    /// The account is at D31 clause (g)'s bound-node cap.
+    TooManyBoundNodes {
+        /// The account at its cap.
+        account: AccountId,
+        /// The cap that was reached.
+        cap: usize,
+    },
+    /// The account's binding window is full (D31 clause (g)).
+    BindingRateLimited {
+        /// The account whose window is full.
+        account: AccountId,
+        /// The width of the window that tripped, in milliseconds.
+        window_ms: u64,
+        /// That window's cap.
+        cap: usize,
+    },
+    /// The requested lifetime exceeds the one-hour policy cap.
+    TtlAboveCap {
+        /// The lifetime the caller asked for, in milliseconds.
+        requested_ms: u64,
+        /// The policy cap, in milliseconds.
+        cap_ms: u64,
+    },
+    /// A zero-length lifetime was requested.
+    ZeroTtl,
+    /// Standing could not be established, so nothing was minted (D33 clause
+    /// (f): an unreadable ledger is never `Good`).
+    StandingUnavailable(AccountId),
+    /// The live score is at or above the cooldown threshold: no token.
+    Cooldown(AccountId),
+    /// The live score is at or above the ban threshold: no token.
+    Banned(AccountId),
+    /// The invite redemption tried to create an account that already exists.
+    AccountExists(AccountId),
+    /// No invite record matches the presented code.
+    InvalidInviteCode,
+    /// The invite was already consumed by an earlier redemption.
+    InviteAlreadyConsumed,
+    /// The invite ledger could not be read or durably updated.
+    InviteLedger(String),
+    /// The presented refresh token did not verify, with the verifier's own
+    /// reason — `Expired` means re-login; `UnknownIssuer` means the token's
+    /// issuer key has been retired underneath it.
+    RefreshRejected(SessionTokenVerificationError),
+    /// The durable store failed.
+    Store(String),
+}
 
 fn signature_payload(claims: &SessionTokenClaimsV1) -> Result<Vec<u8>, postcard::Error> {
     Ok(domain_separated(&postcard::to_stdvec(claims)?))
@@ -1077,5 +1269,100 @@ mod tests {
             recovered, real,
             "the probation byte displaces the signature rather than following it"
         );
+    }
+
+    #[test]
+    fn identity_service_messages_round_trip() {
+        // The mint surface is postcard on a QUIC bi-stream, so every variant
+        // must encode and decode unchanged — including the refusals, which
+        // are the legible half of the contract.
+        let messages = [
+            super::IdentityMsg::Hello {
+                version: crate::PROTOCOL_VERSION,
+            },
+            super::IdentityMsg::Login {
+                account: AccountId::new(42),
+                ttl_ms: None,
+            },
+            super::IdentityMsg::Login {
+                account: AccountId::new(42),
+                ttl_ms: Some(60_000),
+            },
+            super::IdentityMsg::Refresh {
+                token: vec![1, 2, 3],
+                ttl_ms: Some(30_000),
+            },
+            super::IdentityMsg::RedeemInvite {
+                code: "AAAA-BBBB".into(),
+                ttl_ms: None,
+            },
+        ];
+        for message in &messages {
+            let bytes = postcard::to_stdvec(message).unwrap();
+            assert!(
+                bytes.len() <= super::MAX_IDENTITY_REQUEST_BYTES,
+                "every live request must fit the service's read bound"
+            );
+            assert_eq!(
+                &postcard::from_bytes::<super::IdentityMsg>(&bytes).unwrap(),
+                message
+            );
+        }
+
+        let replies = [
+            super::IdentityReply::HelloAccepted,
+            super::IdentityReply::HelloRefused {
+                expected: crate::PROTOCOL_VERSION,
+            },
+            super::IdentityReply::Issued {
+                token: vec![4, 5, 6],
+                refresh_at_ms: super::UnixMillis::new(1_500),
+            },
+            super::IdentityReply::Refused(super::IdentityRefusal::NotBound {
+                node: node(7),
+                account: AccountId::new(42),
+            }),
+            super::IdentityReply::Refused(super::IdentityRefusal::StandingUnavailable(
+                AccountId::new(42),
+            )),
+            super::IdentityReply::Refused(super::IdentityRefusal::RefreshRejected(
+                super::SessionTokenVerificationError::Expired,
+            )),
+        ];
+        for reply in &replies {
+            let bytes = postcard::to_stdvec(reply).unwrap();
+            assert!(
+                bytes.len() <= super::MAX_IDENTITY_REPLY_BYTES,
+                "every live reply must fit the client's read bound"
+            );
+            assert_eq!(
+                &postcard::from_bytes::<super::IdentityReply>(&bytes).unwrap(),
+                reply
+            );
+        }
+    }
+
+    #[test]
+    fn the_verification_error_taxonomy_survives_the_wire() {
+        // The refresh arm reports a rejected token with the verifier's own
+        // reason. A client that can no longer tell `Expired` (re-login) from
+        // `UnknownIssuer` (key retired underneath it) cannot react correctly,
+        // so every arm must round-trip, not just the payload-free ones.
+        let reasons = [
+            super::SessionTokenVerificationError::Malformed,
+            super::SessionTokenVerificationError::UnknownIssuer(super::IssuerKeyId::new(8)),
+            super::SessionTokenVerificationError::BadSignature,
+            super::SessionTokenVerificationError::WrongNode,
+            super::SessionTokenVerificationError::Future,
+            super::SessionTokenVerificationError::Expired,
+            super::SessionTokenVerificationError::OverTtl,
+        ];
+        for reason in &reasons {
+            let bytes = postcard::to_stdvec(reason).unwrap();
+            assert_eq!(
+                &postcard::from_bytes::<super::SessionTokenVerificationError>(&bytes).unwrap(),
+                reason
+            );
+        }
     }
 }
