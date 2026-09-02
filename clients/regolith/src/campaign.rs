@@ -1078,6 +1078,25 @@ impl CampaignRuntime {
         self.hearsay.render_view(roster, self.tick.0)
     }
 
+    /// How many client ticks ago this entity's replicated state last
+    /// refreshed, or [`None`] for an entity this session holds no replica of
+    /// (a local craft, or one never installed).
+    ///
+    /// A replicated body is **frozen** between refreshes: the ingest path
+    /// installs decoded state verbatim and nothing advances it by its own
+    /// velocity, so its position is exactly as old as this number says. The
+    /// skin needs that number for the same reason every hearsay arrow prints
+    /// its age: without it the readout states an exact separation to a body
+    /// that may not have been there for two seconds (#940).
+    ///
+    /// Zero means the state refreshed on the current tick. The value is
+    /// bounded by [`REPLICA_TTL_TICKS`] while a replica is installed, because
+    /// `expire_stale_replicas` removes it past that.
+    #[must_use]
+    pub(crate) fn replica_age_ticks(&self, entity: PersistId) -> Option<u64> {
+        replica_age_ticks(&self.replica_freshness, self.tick.0, entity)
+    }
+
     /// Drive one simulation tick of the joined session.
     ///
     /// Order mirrors the runner: produce orders through the shared pipeline,
@@ -1862,6 +1881,24 @@ fn settle_broadcast_ack(
     if ack.outcome == UplinkOutcome::Delivered {
         settled.insert(recipient);
     }
+}
+
+/// Client ticks since `entity`'s replicated state last refreshed.
+///
+/// [`None`] for an entity with no *installed* replica: one never received, or
+/// one `expire_stale_replicas` has retired. An expired entry deliberately
+/// keeps its `last_refresh_tick` so a re-install can report the whole silent
+/// interval, so `installed` — not the presence of the entry — is what decides
+/// whether there is a live replica to age at all.
+fn replica_age_ticks(
+    freshness: &BTreeMap<PersistId, ReplicaFreshness>,
+    tick: u64,
+    entity: PersistId,
+) -> Option<u64> {
+    let replica = freshness.get(&entity)?;
+    replica
+        .installed
+        .then(|| tick.saturating_sub(replica.last_refresh_tick))
 }
 
 fn replication_is_mutual(
@@ -2665,6 +2702,70 @@ mod tests {
         assert_eq!(third_b.deviation_ms, Some(0));
         let spiky = tracker.record(1, 19, 280.0); // interval 125
         assert_eq!(spiky.deviation_ms, Some(60), "|125 − 65|");
+    }
+
+    /// #940: a replicated craft is frozen between refreshes — the ingest path
+    /// installs decoded state verbatim and nothing dead-reckons it — so the
+    /// skin's exact metre reading is only as good as the replica's age. This
+    /// pins that the age the skin can ask for is the real elapsed gap, taken
+    /// through the same `refresh_replica` / `expire_stale_replicas` path
+    /// production uses, at ages production actually produces (0 through the
+    /// TTL, since expiry retires anything older).
+    #[test]
+    fn a_replicas_age_is_readable_for_every_tick_it_stays_installed() {
+        let remote = PersistId::new(3);
+        let mut freshness = BTreeMap::new();
+
+        assert_eq!(
+            replica_age_ticks(&freshness, 500, remote),
+            None,
+            "an entity that has never been replicated has no age to report"
+        );
+
+        let install_tick = 1_000;
+        refresh_replica(&mut freshness, remote, 2, install_tick, 998);
+        for age in 0..=REPLICA_TTL_TICKS {
+            assert_eq!(
+                replica_age_ticks(&freshness, install_tick + age, remote),
+                Some(age),
+                "a replica installed at {install_tick} must read {age} ticks old"
+            );
+        }
+
+        // The staleness this discloses is not theoretical. At the
+        // interceptor's ceiling the frozen body has moved this far by the
+        // time the TTL retires it.
+        let ceiling_mms = orrery_games::regolith::archetype::Archetype::Interceptor
+            .limits()
+            .max_speed_mms;
+        let drift_m =
+            ceiling_mms * REPLICA_TTL_TICKS as i64 / i64::from(orrery_core::TICK_HZ) / 1_000;
+        assert!(
+            drift_m > 500,
+            "a full-TTL replica can be {drift_m} m from where it is drawn; \
+             an unqualified metre reading is not a measurement"
+        );
+
+        // A retired replica reports no age at all rather than a growing one:
+        // there is no live replica left to be stale.
+        let game = Regolith::honest();
+        let own = PersistId::new(9);
+        let mut executor = Executor::new(game, UniverseSeed([0x61; 32]));
+        executor.insert(own, game.spawn(own, 8));
+        executor.insert(remote, game.spawn(remote, 2));
+        let mut focus = Some(remote);
+        expire_stale_replicas(
+            &mut executor,
+            own,
+            install_tick + REPLICA_TTL_TICKS + 1,
+            &mut freshness,
+            &mut focus,
+        );
+        assert_eq!(
+            replica_age_ticks(&freshness, install_tick + REPLICA_TTL_TICKS + 1, remote),
+            None,
+            "an expired replica is not a very stale one, it is absent"
+        );
     }
 
     #[test]

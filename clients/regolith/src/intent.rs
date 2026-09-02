@@ -92,7 +92,7 @@ impl IntentPipeline {
                 Order::Thrust {
                     accel_mmss,
                     yaw_urad,
-                    pitch_urad,
+                    pitch_urad: _,
                 } => {
                     let yaw_urad = match (controls.left, controls.right) {
                         (true, false) => -yaw_urad.abs(),
@@ -102,7 +102,29 @@ impl IntentPipeline {
                     Some(Order::Thrust {
                         accel_mmss: if controls.thrust { accel_mmss } else { 0 },
                         yaw_urad,
-                        pitch_urad,
+                        // Elevation is gated for the same reason `Grab` is,
+                        // below: the headless pilot's `pitch_urad` is drawn
+                        // from its own RNG on a function of *tick*, so
+                        // passing it through has the player's craft climb and
+                        // dive on a walk no input of theirs authored (#940).
+                        //
+                        // It is not cosmetic. `craft.rs` integrates this into
+                        // `Craft::pitch_urad` on every `Thrust` order — even
+                        // one whose acceleration the line above gated to
+                        // zero — and thrust resolves as
+                        // `delta_vy = accel * sin(phi)`, so the walk moves the
+                        // craft vertically. `Controls` has no pitch field and
+                        // the legend lists no elevation key, so there is no
+                        // input that could have produced a nonzero value here
+                        // and none that could correct one. The renderer builds
+                        // craft attitude with `Quat::from_rotation_y` alone,
+                        // so the drift is invisible as well as uncommandable.
+                        //
+                        // The bot path (`bot_orders`) is untouched, which is
+                        // what keeps `PITCH_JITTER_URAD` doing its job: the
+                        // determinism matrix still evaluates `sin`/`cos` away
+                        // from their two exact points.
+                        pitch_urad: 0,
                     })
                 }
                 Order::Fire if !controls.fire => None,
@@ -188,6 +210,12 @@ mod tests {
         )
     }
 
+    /// A fully-held seat rides the bot's own order shape and encoder, order
+    /// for order and byte for byte — with the two axes the skin gates
+    /// normalised out. Elevation is zero for a human craft (#940) and the
+    /// pilot's scheduled `Grab` never reaches one (#568); everything else,
+    /// including acceleration, yaw magnitude, target choice, order sequence
+    /// and encoding, must still come from the headless path unchanged.
     #[test]
     fn human_full_controls_match_bot_order_bytes() {
         let pipeline = pipeline();
@@ -201,10 +229,34 @@ mod tests {
                 ..Controls::default()
             },
         );
-        let bot = encode_orders(&pipeline.bot_orders(tick));
+        let bot_orders = pipeline.bot_orders(tick);
+        assert!(
+            bot_orders
+                .iter()
+                .any(|order| matches!(order, Order::Thrust { pitch_urad, .. } if *pitch_urad != 0)),
+            "fixture is inert: the pilot scheduled no elevation on this tick, \
+             so this comparison would not exercise the gate at all"
+        );
+        let gated: Vec<_> = bot_orders
+            .into_iter()
+            .filter_map(|order| match order {
+                Order::Thrust {
+                    accel_mmss,
+                    yaw_urad,
+                    ..
+                } => Some(Order::Thrust {
+                    accel_mmss,
+                    yaw_urad,
+                    pitch_urad: 0,
+                }),
+                Order::Grab { .. } => None,
+                other => Some(other),
+            })
+            .collect();
         assert_eq!(
-            human.orders, bot,
-            "human and bot orders diverged on the wire"
+            human.orders,
+            encode_orders(&gated),
+            "human and bot orders diverged on the wire beyond the gated axes"
         );
     }
 
@@ -253,13 +305,103 @@ mod tests {
                 ..Controls::default()
             },
         );
-        // Elevation passes through the skin untouched: the ruleset owns it
-        // (v19), and the keyboard has no pitch control to gate it with.
+        // Elevation is gated to zero: the pilot's scheduled jitter is not a
+        // human-authored elevation, and the keyboard has no pitch control
+        // that could have produced one (#940).
+        assert!(
+            bot_pitch != 0,
+            "fixture is wrong: the pilot scheduled no elevation on this tick"
+        );
         assert!(matches!(
             left.first(),
             Some(Order::Thrust { accel_mmss: 60_000, yaw_urad, pitch_urad })
-                if *yaw_urad == -bot_yaw.abs() && *pitch_urad == bot_pitch
+                if *yaw_urad == -bot_yaw.abs() && *pitch_urad == 0
         ));
+    }
+
+    /// #940: the honest pilot draws a fresh `pitch_urad` every tick and the
+    /// craft step integrates it into `Craft::pitch_urad` on *every* `Thrust`
+    /// order -- including one whose acceleration the skin gated to zero.
+    /// Passing that through gave a human craft an elevation random walk it
+    /// could not command (no pitch key), could not see (the renderer builds
+    /// its attitude with `Quat::from_rotation_y` alone) and could not stop.
+    /// Elevation moves the craft: `delta_vy = accel * sin(phi)`.
+    ///
+    /// This is the same hazard `Order::Grab` was already gated for, and the
+    /// same remedy: a human craft acts only on axes its pilot authored.
+    #[test]
+    fn a_human_craft_is_never_given_an_elevation_it_did_not_author() {
+        let pipeline = pipeline();
+        // Every distinct control shape a seat can hold, over more than one
+        // full turn of the pilot's four-scenario schedule.
+        let shapes = [
+            Controls::default(),
+            Controls {
+                thrust: true,
+                ..Controls::default()
+            },
+            Controls {
+                left: true,
+                thrust: true,
+                fire: true,
+                ..Controls::default()
+            },
+            Controls {
+                right: true,
+                thrust: true,
+                fire: true,
+                lock_target: Some(PersistId::new(2)),
+                ..Controls::default()
+            },
+        ];
+        let mut scheduled_nonzero = 0u32;
+        for raw_tick in 0..(4 * 180 + 37) {
+            let tick = Tick::new(raw_tick);
+            if pipeline
+                .bot_orders(tick)
+                .iter()
+                .any(|order| matches!(order, Order::Thrust { pitch_urad, .. } if *pitch_urad != 0))
+            {
+                scheduled_nonzero += 1;
+            }
+            for controls in shapes {
+                for order in pipeline.human_orders(tick, controls) {
+                    if let Order::Thrust { pitch_urad, .. } = order {
+                        assert_eq!(
+                            pitch_urad, 0,
+                            "tick {raw_tick}: the craft was handed elevation \
+                             {pitch_urad} urad its pilot never authored"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            scheduled_nonzero > 0,
+            "fixture is inert: the pilot scheduled no elevation on any tick"
+        );
+    }
+
+    /// The bot path keeps its elevation. `PITCH_JITTER_URAD` exists so the
+    /// four-platform determinism matrix evaluates `sin`/`cos` away from their
+    /// two exact points; gating the *human* adapter must not disarm that.
+    #[test]
+    fn the_bot_pilot_keeps_flying_all_three_axes() {
+        let pipeline = pipeline();
+        let mut nonzero = 0u32;
+        for raw_tick in 0..600 {
+            for order in pipeline.bot_orders(Tick::new(raw_tick)) {
+                if let Order::Thrust { pitch_urad, .. } = order {
+                    if pitch_urad != 0 {
+                        nonzero += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            nonzero > 400,
+            "the headless pilot stopped exercising elevation ({nonzero}/600)"
+        );
     }
 
     /// A tick the pilot's schedule spends in `ContestedGrab`, which is when
@@ -365,5 +507,97 @@ mod tests {
         assert!(!orders
             .iter()
             .any(|order| matches!(order, Order::Lock { target } if *target != clicked)));
+    }
+}
+
+/// The end-to-end consequence of the elevation gate, flown against the real
+/// ruleset for the length of a real attempt.
+#[cfg(test)]
+mod attempt_length_flight {
+    use super::*;
+    use orrery_core::Executor;
+    use orrery_games::regolith::state::RegolithState;
+    use orrery_games::regolith::CAMPAIGN_CELL_EDGE_M;
+    use orrery_games::Game;
+
+    /// One witnessed attempt, as flown on 2026-09-02.
+    const ATTEMPT_TICKS: u64 = 900 * orrery_core::TICK_HZ as u64;
+
+    /// Fly one seat for `ATTEMPT_TICKS` and return its final craft state.
+    ///
+    /// `reinject_pilot_pitch` restores the pre-#940 behaviour, where the
+    /// headless pilot's scheduled `pitch_urad` reached a human craft.
+    fn fly(reinject_pilot_pitch: bool) -> (i32, i64, i64) {
+        let seed = UniverseSeed([0x61; 32]);
+        let me = PersistId::new(5);
+        let pipeline = IntentPipeline::new(seed, me, 5, vec![PersistId::new(6)]);
+        let game = Regolith::honest();
+        let mut executor = Executor::new(game, seed);
+        executor.insert(me, game.spawn(me, 5));
+        // A seat under power and turning: the ordinary way a craft is flown.
+        let controls = Controls {
+            thrust: true,
+            right: true,
+            ..Controls::default()
+        };
+        for raw in 0..ATTEMPT_TICKS {
+            let tick = Tick::new(raw);
+            let mut orders = pipeline.human_orders(tick, controls);
+            if reinject_pilot_pitch {
+                let scheduled =
+                    pipeline
+                        .bot_orders(tick)
+                        .into_iter()
+                        .find_map(|order| match order {
+                            Order::Thrust { pitch_urad, .. } => Some(pitch_urad),
+                            _ => None,
+                        });
+                for order in &mut orders {
+                    if let (Order::Thrust { pitch_urad, .. }, Some(scheduled)) =
+                        (&mut *order, scheduled)
+                    {
+                        *pitch_urad = scheduled;
+                    }
+                }
+            }
+            let _ = executor.step_entity(me, tick, &orders);
+        }
+        match executor.state(me) {
+            Some(RegolithState::Craft(craft)) => (craft.pitch_urad, craft.pos.y, craft.vel.y),
+            _ => panic!("the craft is installed"),
+        }
+    }
+
+    /// #940, the visible half: over one 900-second attempt the pilot's
+    /// per-tick elevation jitter integrated into a craft the player could not
+    /// command and the renderer never drew, carrying it tens of kilometres
+    /// off the plane every other craft was flying on.
+    ///
+    /// The control here is the interest cell edge, 512 m. Two seats drifting
+    /// independently by many multiples of that are not in each other's
+    /// interest set at all — no craft, no replication — and every shot
+    /// between them is far outside the resolver's ~373 m reach, which is
+    /// exactly the pair of symptoms the attempt reported.
+    #[test]
+    fn a_seat_flying_a_full_attempt_holds_the_plane_it_was_spawned_on() {
+        let (pitch, y_mm, vy_mms) = fly(false);
+        assert_eq!(
+            pitch, 0,
+            "a human craft accumulated an elevation it never authored"
+        );
+        assert_eq!(y_mm, 0, "a human craft left the plane it was spawned on");
+        assert_eq!(vy_mms, 0, "a human craft acquired a vertical velocity");
+
+        // And the hazard this is guarding is real, not hypothetical: the same
+        // flight with the pilot's scheduled elevation restored ends an
+        // attempt's worth of cells away from where it started.
+        let (drift_pitch, drift_y_mm, _) = fly(true);
+        assert_ne!(drift_pitch, 0);
+        let drift_cells = (drift_y_mm.abs() / 1_000) as f64 / CAMPAIGN_CELL_EDGE_M;
+        assert!(
+            drift_cells > 10.0,
+            "this test is inert: the un-gated flight drifted only {drift_cells:.1} \
+             interest cells, so it would not have hidden anything"
+        );
     }
 }

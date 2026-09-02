@@ -451,6 +451,21 @@ impl ActiveSession {
         }
     }
 
+    /// Age, in client ticks, of the replicated state this session is drawing
+    /// for `entity` — [`None`] when nothing is replicated for it.
+    ///
+    /// The offline sandbox holds every craft in one local executor, so its
+    /// state is never a replica and never has an age; saying "0 ticks stale"
+    /// there would be the skin inventing a freshness guarantee the run does
+    /// not have, exactly as [`Self::aoi_edge_m`] refuses to invent a boundary.
+    #[must_use]
+    pub(crate) fn replica_age_ticks(&self, entity: PersistId) -> Option<u64> {
+        match self {
+            Self::Local(_) => None,
+            Self::Campaign(runtime) => runtime.replica_age_ticks(entity),
+        }
+    }
+
     fn join_state(&self) -> Option<&JoinState> {
         match self {
             Self::Local(_) => None,
@@ -1671,8 +1686,17 @@ pub fn observe_skin_effects(
 }
 
 /// Copies this tick's combat state out of the executor for the overlay.
+///
+/// The executor holds *what* the target's state is; only the session knows
+/// *how old* it is, so the freshness the readout discloses is stamped on here
+/// rather than inside `CombatView::read` (#940).
 fn read_combat_state(session: Res<ActiveSession>, mut view: ResMut<CombatView>) {
-    *view = CombatView::read(session.executor(), session.local_entity());
+    let mut next = CombatView::read(session.executor(), session.local_entity());
+    next.target_age_ticks = next
+        .lock
+        .target
+        .and_then(|target| session.replica_age_ticks(target));
+    *view = next;
 }
 
 fn archetype_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<Archetype> {
