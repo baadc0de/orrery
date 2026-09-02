@@ -18,7 +18,7 @@ use lightyear::prelude::{
     ReplicationReceiver, ReplicationSender, P2P,
 };
 use lightyear_replication::channels::RepliconChannelMap;
-use orrery_net::channels::Channel;
+use orrery_net::channels::{tag, untag, Channel, TAG_REPLICATION};
 use orrery_net::peer_link::{payload_budget, PeerPacket, SendPacket};
 use orrery_net::plugin::{PeerMtu, PeerRegistry};
 use orrery_protocol::NodeId;
@@ -160,11 +160,24 @@ fn receive_replication_packets(
         if packet.channel != Channel::State {
             continue;
         }
+        // Replication shares State with witness and hit traffic. The peer-link
+        // boundary has removed its outer channel tag, but the logical payload
+        // still carries the protocol envelope that every State consumer uses.
+        // Do not let a foreign sub-tag reach Lightyear's packet parser.
+        let Some((Channel::State, payload)) = untag(&packet.payload) else {
+            continue;
+        };
+        let Some((sub_tag, payload)) = payload.split_first() else {
+            continue;
+        };
+        if *sub_tag != TAG_REPLICATION {
+            continue;
+        }
         let Some((_, mut link)) = links.iter_mut().find(|(link, _)| link.peer == packet.from)
         else {
             continue;
         };
-        link.recv.push_raw(BytesMut::from(packet.payload.as_ref()));
+        link.recv.push_raw(BytesMut::from(payload));
     }
 }
 
@@ -174,7 +187,129 @@ fn send_replication_packets(
 ) {
     for (peer, mut link) in &mut links {
         for payload in link.send.drain() {
-            packets.write(SendPacket::state(peer.peer, payload));
+            let mut replication = Vec::with_capacity(payload.len() + 1);
+            replication.push(TAG_REPLICATION);
+            replication.extend_from_slice(&payload);
+            packets.write(SendPacket::state(
+                peer.peer,
+                tag(Channel::State, &replication).into(),
+            ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy_ecs::{message::Messages, prelude::Entity, system::RunSystemOnce, world::World};
+    use bytes::Bytes;
+    use lightyear::prelude::Linked;
+    use orrery_net::{
+        channels::{
+            decode_hit, decode_replication, decode_witness, encode_hit, encode_witness, tag, untag,
+            Channel, TAG_REPLICATION,
+        },
+        PeerPacket, SendPacket,
+    };
+    use orrery_protocol::{
+        HitClaim, HitMsg, HitSurface, InterpBasis, LatticePoint, NodeId, PersistId, QuantizedDir,
+        QuantizedRay, Tick, WeaponRef,
+    };
+
+    use super::{receive_replication_packets, send_replication_packets, ReplicationPeerLink};
+    use lightyear::prelude::Link;
+
+    fn node() -> NodeId {
+        NodeId::from_bytes(&[0; 32]).expect("test NodeId")
+    }
+
+    fn hit_frame() -> Vec<u8> {
+        encode_hit(&HitMsg::Claim(HitClaim {
+            shooter: PersistId::new(1),
+            target: PersistId::new(2),
+            weapon: WeaponRef(1),
+            fire_tick: Tick::new(100),
+            basis: InterpBasis::exact(Tick::new(95)),
+            ray: QuantizedRay {
+                origin: LatticePoint::new(0, 0, 0),
+                direction: QuantizedDir::new(1, 0, 0),
+            },
+            claimed: HitSurface(0),
+            input_seq: 1,
+        }))
+    }
+
+    #[test]
+    fn only_replication_state_packets_reach_lightyears_parser() {
+        let peer = node();
+        let mut world = World::new();
+        world.init_resource::<Messages<PeerPacket>>();
+        let link = world
+            .spawn((
+                Link::default(),
+                ReplicationPeerLink {
+                    session: Entity::PLACEHOLDER,
+                    peer,
+                },
+            ))
+            .id();
+
+        {
+            let mut packets = world.resource_mut::<Messages<PeerPacket>>();
+            // All three State-channel participants arrive in one pass. Only
+            // the replication body is valid input for Lightyear's parser.
+            for payload in [
+                encode_witness(&1u8),
+                hit_frame(),
+                tag(Channel::State, &[TAG_REPLICATION, 3, 4]),
+            ] {
+                packets.write(PeerPacket {
+                    from: peer,
+                    channel: Channel::State,
+                    payload: Bytes::from(payload),
+                });
+            }
+        }
+
+        world.run_system_once(receive_replication_packets).unwrap();
+
+        let mut parser = world.get_mut::<Link>(link).expect("bridge link");
+        assert_eq!(
+            parser.recv.len(),
+            1,
+            "witness and hit frames must not reach Lightyear's parser"
+        );
+        assert_eq!(parser.recv.pop().as_deref(), Some(&[3, 4][..]));
+    }
+
+    #[test]
+    fn outbound_bridge_frames_are_replication_tagged_and_foreign_decoders_reject_them() {
+        let peer = node();
+        let mut world = World::new();
+        world.init_resource::<Messages<SendPacket>>();
+        let mut parser = Link::default();
+        parser.send.push(Bytes::from_static(&[42]));
+        world.spawn((
+            parser,
+            Linked,
+            ReplicationPeerLink {
+                session: Entity::PLACEHOLDER,
+                peer,
+            },
+        ));
+
+        world.run_system_once(send_replication_packets).unwrap();
+
+        let sent = world
+            .resource_mut::<Messages<SendPacket>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        let frame = &sent[0];
+        assert_eq!(frame.channel, Channel::State);
+        let (_, payload) = untag(&frame.payload).expect("logical state envelope");
+        assert_eq!(payload.first(), Some(&TAG_REPLICATION));
+        assert_eq!(decode_replication::<u8>(&frame.payload), Some(42));
+        assert_eq!(decode_witness::<u8>(&frame.payload), None);
+        assert_eq!(decode_hit(&frame.payload), None);
     }
 }

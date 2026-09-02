@@ -9,8 +9,9 @@
 //! already uses.
 
 pub use orrery_protocol::channels::{
-    decode_datagram, decode_replication, decode_stream_frame, decode_witness, encode_datagram,
-    encode_replication, encode_replication_compressed, encode_stream_frame, encode_witness,
-    encode_witness_compressed, tag, untag, Channel, TAG_CONTROL, TAG_REPLICATION,
-    TAG_REPLICATION_COMPRESSED, TAG_STATE, TAG_WITNESS, TAG_WITNESS_COMPRESSED,
+    decode_datagram, decode_hit, decode_replication, decode_stream_frame, decode_witness,
+    encode_datagram, encode_hit, encode_replication, encode_replication_compressed,
+    encode_stream_frame, encode_witness, encode_witness_compressed, tag, untag, Channel,
+    TAG_CONTROL, TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED, TAG_STATE, TAG_WITNESS,
+    TAG_WITNESS_COMPRESSED,
 };
