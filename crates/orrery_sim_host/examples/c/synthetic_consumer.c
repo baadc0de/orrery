@@ -10,6 +10,8 @@
  *   loop            a variable-rate frame loop with a fixed-step accumulator,
  *                   jitter and a 250 ms hitch, driving exactly 120 ticks
  *   rewind          snapshot, step, restore, replay; self-checks equality
+ *   events          step, then drain emitted events, decoding them in C;
+ *                   also proves a too-small buffer drains nothing
  *   panic           a poisoned command; the panic must arrive as a code
  *   fixture PATH    restore a snapshot the Rust host wrote, step once, print
  */
@@ -26,6 +28,7 @@
 #define STATE_BYTES 64u
 #define INPUT_IMPULSE 1u
 #define INPUT_POISON 3u
+#define EVENT_STRUCK 1u
 
 typedef struct synthetic_state {
     int64_t position_um[3];
@@ -432,6 +435,119 @@ static int run_rewind(void) {
                                                            : EXIT_FAILURE;
 }
 
+/* ── events ───────────────────────────────────────────────────────────── */
+
+/* The C mirror of the synthetic event's CoreCodec, the second and last piece
+ * of ruleset-specific code a consumer writes. */
+typedef struct struck_event {
+    uint64_t source;
+    uint64_t target;
+    int32_t damage;
+} struck_event;
+
+static int decode_struck(const uint8_t *bytes, size_t len, struck_event *out) {
+    if (len != 13u || bytes[0] != EVENT_STRUCK) {
+        return 0;
+    }
+    out->target = read_u64(bytes + 1);
+    out->damage = (int32_t)read_u32(bytes + 9);
+    return 1;
+}
+
+static orrery_host_result drain_events(orrery_host *host, uint8_t *out,
+                                       size_t capacity, size_t *required) {
+    return orrery_host_drain_events(host, out, capacity, required);
+}
+
+static int print_events(const uint8_t *records, size_t len) {
+    size_t at = 0;
+    size_t count = 0;
+    struck_event decoded[64];
+    while (at < len) {
+        uint64_t source;
+        uint32_t length;
+        if (len - at < 12u || count == sizeof decoded / sizeof *decoded) {
+            fprintf(stderr, "truncated or overlong event record stream\n");
+            return 0;
+        }
+        source = read_u64(records + at);
+        length = read_u32(records + at + 8);
+        at += 12;
+        if (len - at < length ||
+            !decode_struck(records + at, length, &decoded[count])) {
+            fprintf(stderr, "malformed event record\n");
+            return 0;
+        }
+        decoded[count].source = source;
+        at += length;
+        ++count;
+    }
+    printf("events=%zu\n", count);
+    for (size_t i = 0; i < count; ++i) {
+        printf("event source=%" PRIu64 " target=%" PRIu64 " damage=%" PRId32 "\n",
+               decoded[i].source, decoded[i].target, decoded[i].damage);
+    }
+    return 1;
+}
+
+static int run_events(void) {
+    orrery_host *host = create(0);
+    synthetic_state watcher = {{0, 0, 0}, {1000, 0, 0}, 100, 2, 0};
+    synthetic_state watched = {{5000, 0, 0}, {0, 1000, 0}, 100, 1, 0};
+    uint8_t *events;
+    size_t events_len = 0;
+    size_t required = 0;
+    size_t after = 0;
+
+    if (host == NULL || !install(host, 1, 0, &watcher) ||
+        !install(host, 2, 0, &watched) ||
+        !check(orrery_host_step(host, 2, NULL, NULL), "orrery_host_step")) {
+        return EXIT_FAILURE;
+    }
+
+    /* A buffer one byte short must drain nothing: the host encodes without
+     * clearing, so the caller can size its copy and retry without losing
+     * output it never received. */
+    if (orrery_host_drain_events(host, NULL, 0, &required) !=
+        ORRERY_HOST_BUFFER_TOO_SMALL) {
+        fprintf(stderr, "a zero-capacity drain did not report the size\n");
+        return EXIT_FAILURE;
+    }
+    printf("required=%zu\n", required);
+    {
+        uint8_t *narrow = malloc(required);
+        if (narrow == NULL) {
+            perror("narrow");
+            return EXIT_FAILURE;
+        }
+        if (orrery_host_drain_events(host, narrow, required - 1, &required) !=
+            ORRERY_HOST_BUFFER_TOO_SMALL) {
+            fprintf(stderr, "a short drain did not refuse\n");
+            free(narrow);
+            return EXIT_FAILURE;
+        }
+        free(narrow);
+    }
+
+    events = fetch_bytes(host, drain_events, "orrery_host_drain_events",
+                         &events_len);
+    if (events == NULL || !print_events(events, events_len)) {
+        free(events);
+        return EXIT_FAILURE;
+    }
+    free(events);
+
+    /* The successful drain emptied the buffer. */
+    if (!check(orrery_host_drain_events(host, NULL, 0, &after),
+               "orrery_host_drain_events")) {
+        return EXIT_FAILURE;
+    }
+    printf("events_after_drain=%zu\n", after);
+    return check(orrery_host_destroy(host), "orrery_host_destroy")
+               ? EXIT_SUCCESS
+               : EXIT_FAILURE;
+}
+
 /* ── panic ────────────────────────────────────────────────────────────── */
 
 static int run_panic(void) {
@@ -525,12 +641,15 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "rewind") == 0) {
         return run_rewind();
     }
+    if (argc >= 2 && strcmp(argv[1], "events") == 0) {
+        return run_events();
+    }
     if (argc >= 2 && strcmp(argv[1], "panic") == 0) {
         return run_panic();
     }
     if (argc >= 3 && strcmp(argv[1], "fixture") == 0) {
         return run_fixture(argv[2]);
     }
-    fprintf(stderr, "usage: %s loop|rewind|panic|fixture PATH\n", argv[0]);
+    fprintf(stderr, "usage: %s loop|rewind|events|panic|fixture PATH\n", argv[0]);
     return EXIT_FAILURE;
 }

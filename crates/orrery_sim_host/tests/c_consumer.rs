@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use orrery_core::CoreCodec;
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
-use synthetic::{Synthetic, SyntheticAdapter, SyntheticInput, SyntheticState};
+use synthetic::{Synthetic, SyntheticAdapter, SyntheticEvent, SyntheticInput, SyntheticState};
 
 #[path = "support/synthetic.rs"]
 mod synthetic;
@@ -291,6 +291,85 @@ fn a_c_caller_snapshots_steps_restores_and_replays_identically() {
     assert!(
         struck.health < 5,
         "the watcher's strikes reached the watched entity through the adapter"
+    );
+}
+
+/// The event drain, from C.  The output half of the boundary is covered by
+/// `collect_states` everywhere above; this covers the event half, which is
+/// the one that consumes what it hands out.
+///
+/// It also pins the no-loss property the `peek`-then-`clear` split exists
+/// for: a drain whose buffer is one byte short must report the size and
+/// clear nothing, or a consumer that guessed low would silently lose a tick's
+/// events.  The events themselves are decoded on the C side from the live
+/// records and compared against the same host driven from Rust.
+#[test]
+fn a_c_caller_drains_events_and_a_short_buffer_drains_nothing() {
+    let output = run(&["events"]);
+    let printed = stdout(&output);
+
+    let mut reference = host(0);
+    reference.install_state(
+        PersistId::new(1),
+        SyntheticState {
+            velocity_um_per_tick: [1_000, 0, 0],
+            health: 100,
+            target: 2,
+            ..SyntheticState::default()
+        },
+    );
+    reference.install_state(
+        PersistId::new(2),
+        SyntheticState {
+            position_um: [5_000, 0, 0],
+            velocity_um_per_tick: [0, 1_000, 0],
+            health: 100,
+            target: 1,
+            ..SyntheticState::default()
+        },
+    );
+    reference.step(TickCount::new(2));
+    let bytes = reference
+        .drain_event_bytes()
+        .expect("events fit the buffer")
+        .into_bytes();
+    assert!(
+        !bytes.is_empty(),
+        "the scenario emitted no events, so the C side would pass on an empty drain"
+    );
+
+    // Decode the reference records the same way the C consumer does.
+    let mut expected = vec![format!("required={}", bytes.len())];
+    let mut decoded = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let source = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("source"));
+        let length =
+            u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("length")) as usize;
+        at += 12;
+        let SyntheticEvent::Struck { target, damage } =
+            SyntheticEvent::decode(&bytes[at..at + length]).expect("event decodes");
+        at += length;
+        decoded.push(format!(
+            "event source={source} target={} damage={damage}",
+            target.0
+        ));
+    }
+    expected.push(format!("events={}", decoded.len()));
+    expected.extend(decoded);
+    expected.push("events_after_drain=0".to_owned());
+
+    assert_eq!(
+        printed.lines().collect::<Vec<_>>(),
+        expected,
+        "events output:\n{printed}"
+    );
+    assert!(
+        reference
+            .drain_event_bytes()
+            .expect("a second drain succeeds")
+            .is_empty(),
+        "the reference agrees that a successful drain empties the buffer"
     );
 }
 

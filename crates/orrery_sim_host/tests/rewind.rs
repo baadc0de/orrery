@@ -337,3 +337,150 @@ fn the_entry_points_refuse_null_and_report_a_panic_without_unwinding() {
         assert_eq!(orrery_host_destroy(handle), OrreryHostResult::Ok);
     }
 }
+
+/// The mutation check on the replay equality.
+///
+/// The tests above assert that a restored host replays to the same hashes and
+/// the same bytes.  That assertion is only worth something if a rewind point
+/// which *loses* part of itself fails it, so this module damages a real
+/// snapshot and requires the replay to diverge.
+///
+/// Both mutants are built by editing the snapshot's own encoded bytes, so
+/// they travel the live decode path rather than a back-door constructor, and
+/// both restore cleanly: the divergence is in the simulation, not in a
+/// rejected buffer.  They correspond one-to-one with the two things
+/// `HostSnapshot` carries beyond canonical state — which is exactly where a
+/// plausible implementation would have stopped.
+mod mutants {
+    use super::*;
+
+    const HEADER_BYTES: usize = 4 + 4 + 32 + 8;
+
+    /// Walk the documented framing: the offset of each entity record, and the
+    /// end of the entity section.
+    fn entity_offsets(bytes: &[u8]) -> (Vec<usize>, usize) {
+        let count = u64::from_le_bytes(
+            bytes[HEADER_BYTES..HEADER_BYTES + 8]
+                .try_into()
+                .expect("entity count"),
+        );
+        let mut at = HEADER_BYTES + 8;
+        let mut starts = Vec::new();
+        for _ in 0..count {
+            starts.push(at);
+            let length =
+                u32::from_le_bytes(bytes[at + 16..at + 20].try_into().expect("state length"));
+            at += 20 + length as usize;
+        }
+        (starts, at)
+    }
+
+    /// Drop the queued next-tick inputs, keeping every entity record.
+    fn without_queued_inputs(bytes: &[u8]) -> Vec<u8> {
+        let (_, end) = entity_offsets(bytes);
+        let mut mutant = bytes[..end].to_vec();
+        mutant.extend_from_slice(&0_u64.to_le_bytes()); // no recipients
+        mutant
+    }
+
+    /// Re-stamp every entity as observed at the snapshot's own next tick,
+    /// which is what a restore that ignored the stamp would produce.
+    fn restamped_as_freshly_observed(bytes: &[u8]) -> Vec<u8> {
+        let next_tick = u64::from_le_bytes(
+            bytes[HEADER_BYTES - 8..HEADER_BYTES]
+                .try_into()
+                .expect("next tick"),
+        );
+        let mut mutant = bytes.to_vec();
+        for start in entity_offsets(bytes).0 {
+            mutant[start + 8..start + 16].copy_from_slice(&next_tick.to_le_bytes());
+        }
+        mutant
+    }
+
+    /// Restore `snapshot_bytes` into a freshly seeded host and replay.
+    ///
+    /// The host is seeded and stepped exactly as the run that produced the
+    /// snapshot was, so the only thing distinguishing the mutant run from the
+    /// control is the bytes handed to `restore`.
+    fn replay_from(
+        seed: impl Fn(&mut Host<Executor<Synthetic>>),
+        snapshot_bytes: &[u8],
+    ) -> StepReport {
+        let snapshot = HostSnapshot::from_bytes(snapshot_bytes).expect("the mutant is well framed");
+        let mut host = executor_host(snapshot.next_tick().0);
+        seed(&mut host);
+        host.restore(&snapshot).expect("the mutant restores");
+        replay(&mut host)
+    }
+
+    /// Assert the control replays stably and the mutant does not.
+    fn mutation_moves_the_replay(
+        seed: impl Fn(&mut Host<Executor<Synthetic>>) + Copy,
+        bytes: &[u8],
+        mutant: Vec<u8>,
+        what: &str,
+    ) {
+        let truth = replay_from(seed, bytes);
+        assert_eq!(
+            truth,
+            replay_from(seed, bytes),
+            "the unmutated control did not replay stably, so a divergence \
+             below would not be attributable to the mutation"
+        );
+        assert_ne!(mutant, bytes, "the {what} mutation changed the bytes");
+        assert_ne!(
+            replay_from(seed, &mutant),
+            truth,
+            "a rewind point that lost {what} still replayed to the same \
+             hashes — the replay equality does not depend on it, so the \
+             equality assertions above prove less than they claim"
+        );
+    }
+
+    /// A strike routed by the adapter on the tick before the snapshot is
+    /// queued for the tick after it.  A snapshot carrying only entity state
+    /// would restore field-exact bytes and still step the next tick from a
+    /// sealed input set the original run never had.
+    #[test]
+    fn dropping_the_queued_next_tick_inputs_moves_the_replay() {
+        let seed = |host: &mut Host<Executor<Synthetic>>| {
+            host.install_state(WATCHER, watcher());
+            host.install_state(WATCHED, watched());
+            host.step(TickCount::new(3));
+        };
+        let mut host = executor_host(0);
+        seed(&mut host);
+        let bytes = host.snapshot().to_bytes().expect("snapshot encodes");
+        assert!(
+            host.snapshot().queued_inputs().count() > 0,
+            "the scenario must actually have inputs queued, or the mutant is inert"
+        );
+        mutation_moves_the_replay(
+            seed,
+            &bytes,
+            without_queued_inputs(&bytes),
+            "its queued inputs",
+        );
+    }
+
+    /// The observation stamps are what the ruleset's staleness bound reads.
+    /// A restore that re-stamped every entity as freshly observed would be
+    /// byte-exact on the state and still change which neighbours are visible.
+    ///
+    /// The snapshot is taken before any tick, because an executed tick stamps
+    /// the whole population alike and a mutant that rewrote equal stamps to
+    /// the same value would be inert.
+    #[test]
+    fn replacing_the_observation_stamps_with_the_restore_time_moves_the_replay() {
+        let seed = |host: &mut Host<Executor<Synthetic>>| {
+            host.install_state_observed(WATCHER, watcher(), Tick::new(10));
+            host.install_state_observed(WATCHED, watched(), Tick::new(0));
+        };
+        let mut host = executor_host(10);
+        seed(&mut host);
+        let bytes = host.snapshot().to_bytes().expect("snapshot encodes");
+        let mutant = restamped_as_freshly_observed(&bytes);
+        mutation_moves_the_replay(seed, &bytes, mutant, "its observation stamps");
+    }
+}
