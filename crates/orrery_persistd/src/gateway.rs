@@ -70,8 +70,8 @@ use crate::adjudication::{AdjudicationExecutor, AdjudicationOutcome};
 use crate::cluster::{LeaseRenewal, Router};
 use crate::intent::stages::{self, intent_stage_metrics, IntentStageSnapshot, IntentTrace};
 use crate::intent::{
-    error_outcome, IntentContext, IntentVerdict, PermissiveValidator, RampMeter, RampMode,
-    SharedExecutor, SharedRampPostureReader, SharedValidator,
+    error_outcome, IntentContext, IntentVerdict, NetworkQuality, PathSample, PermissiveValidator,
+    RampMeter, RampMode, SharedExecutor, SharedRampPostureReader, SharedValidator,
 };
 use crate::lease::registrar_now_ms;
 use crate::lease::stages::{elapsed_us as lease_stage_us, lease_stage_metrics, HeartbeatTrace};
@@ -3767,6 +3767,100 @@ type PeerNotifier = Arc<dyn Fn(Bytes) + Send + Sync>;
 /// on the sweep tick that already exists.
 const SESSION_SILENCE_LIMIT_MS: u64 = crate::lease::LEASE_TTL_MS;
 
+/// D32 clause (f)'s network-quality dimension, sampled from the connection
+/// the gateway already holds.
+///
+/// # Why the gateway measures this itself
+///
+/// `orrery_net::PathTelemetry` aggregates the same numbers, but it is a Bevy
+/// resource on the client plugin and `orrery_persistd` does not depend on
+/// `orrery_net` — adding that edge to pick up two integers would drag the
+/// whole client-side plugin graph into the server. QUIC already computes both
+/// numbers per path for its own congestion control, so the gateway reads them
+/// from `conn` and the dependency graph is unchanged.
+///
+/// # Why it is a fact and not a claim
+///
+/// The peer never states its own path quality. Everything here comes from the
+/// local QUIC state machine's view of the selected path, which is why the
+/// bucket can be trusted as evidence *for* a peer: a client that would like
+/// the widened treatment a bad bucket implies cannot ask for it.
+///
+/// # The throttle, and why a `&mut` local is the right shape
+///
+/// `Path::stats()` walks the connection's path table, so sampling it once per
+/// intent would put a table walk on the admission path D16 budgets at a 10 ms
+/// commit p99. The transport itself only refreshes these numbers on the order
+/// of 100 ms, so anything faster re-reads an unchanged value. This lives as a
+/// plain local in `handle_connection`'s receive loop rather than as a shared
+/// cell because that loop is the only reader and the only writer — a
+/// `SharedStanding`-style atomic would buy synchronisation nobody needs.
+#[derive(Debug)]
+struct PathQualitySampler {
+    last: Option<(Instant, NetworkQuality)>,
+}
+
+/// How stale a path-quality bucket may be before it is re-sampled.
+///
+/// Matched to `aeronet_iroh`'s own `PathReport` refresh cadence (~100 ms), so
+/// the gateway never samples faster than the transport updates.
+const PATH_QUALITY_REFRESH: Duration = Duration::from_millis(100);
+
+impl PathQualitySampler {
+    const fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// The bucket for this connection, re-measuring at most every
+    /// [`PATH_QUALITY_REFRESH`].
+    fn sample(&mut self, conn: &iroh::endpoint::Connection, now: Instant) -> NetworkQuality {
+        if let Some((measured_at, quality)) = self.last {
+            if now.duration_since(measured_at) < PATH_QUALITY_REFRESH {
+                return quality;
+            }
+        }
+        let quality = measure_path_quality(conn);
+        self.last = Some((now, quality));
+        quality
+    }
+}
+
+/// Read the selected path's RTT, loss and relay bit out of QUIC's own state.
+///
+/// `None`-shaped outcomes all collapse to [`NetworkQuality::Unknown`] rather
+/// than to a good bucket: a connection with no selected path (still
+/// establishing, or already gone) and a path that has sent nothing yet are
+/// both *unmeasured*, and D32 clause (f)'s correlation is worthless if
+/// unmeasured traffic is silently counted as clean.
+fn measure_path_quality(conn: &iroh::endpoint::Connection) -> NetworkQuality {
+    let paths = conn.paths();
+    let Some(path) = paths.iter().find(iroh::endpoint::Path::is_selected) else {
+        return NetworkQuality::Unknown;
+    };
+    let relayed = path.is_relay();
+    let stats = path.stats();
+    // Loss is cumulative over the path's life, not an instantaneous rate.
+    // That is the conservative direction for this dimension: a long-lived
+    // healthy connection dilutes a burst rather than inventing one, so the
+    // bucket under-reports impairment and never over-reports it.
+    // Nothing sent yet makes the loss ratio 0/0, and `checked_div` returns
+    // `None` for it. Reporting `0` there would be the "coverage 1.000 by
+    // construction" mistake D32 clause (e) names, one dimension over.
+    let Some(loss_ppm) = stats
+        .lost_packets
+        .saturating_mul(1_000_000)
+        .checked_div(stats.udp_tx.datagrams)
+    else {
+        return NetworkQuality::Unknown;
+    };
+    let loss_ppm = u32::try_from(loss_ppm).unwrap_or(u32::MAX);
+    NetworkQuality::of(PathSample {
+        rtt_ms: u32::try_from(stats.rtt.as_millis()).unwrap_or(u32::MAX),
+        loss_ppm,
+        relayed,
+    })
+}
+
 /// The standing in force for a peer's session *right now*, which is the
 /// token's until an [`AccountStandingUpdate`](orrery_protocol::AccountStandingUpdate)
 /// says otherwise (D33 clause (e), the quarantine half).
@@ -3910,6 +4004,10 @@ impl PeerSession {
             issuer: self.node,
             account: Some(self.account),
             standing: self.standing.get(),
+            // Overwritten by the receive loop, which owns the sampler. A
+            // `PeerSession` outlives any one path measurement, so caching a
+            // bucket on it would report a path the intent did not arrive over.
+            network: NetworkQuality::Unknown,
         }
     }
 
@@ -6462,6 +6560,9 @@ async fn handle_connection(
     let inflight_control = Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN));
     let inflight_intents = Arc::new(Semaphore::new(MAX_INFLIGHT_INTENT_ROUTES_PER_CONN));
     let mut session: Option<PeerSession> = None;
+    // D32 clause (f)'s network-quality dimension for this connection. Owned by
+    // the receive loop because the loop is its only reader and only writer.
+    let mut path_quality = PathQualitySampler::new();
 
     // Both lanes feed one queue, so the dispatch below is written once and does
     // not care which lane a message arrived on. The channel closes when both
@@ -6968,10 +7069,18 @@ async fn handle_connection(
                 // authorize against. An intent submitted before `Hello` is
                 // answered is quarantined: it has neither a verified account
                 // nor a standing that could warrant a shortcut.
-                let cx = session.as_ref().map_or_else(
-                    || IntentContext::unauthenticated(remote),
-                    PeerSession::intent_context,
-                );
+                let cx = session
+                    .as_ref()
+                    .map_or_else(
+                        || IntentContext::unauthenticated(remote),
+                        PeerSession::intent_context,
+                    )
+                    // D32 clause (f)'s required network-quality dimension.
+                    // Nothing on the admission path branches on it; it rides
+                    // the observation so the ramp meter and the auto-suspend
+                    // monitor can tell a misfiring control apart from a lossy
+                    // link.
+                    .with_network(path_quality.sample(&conn, received_at));
                 // The wait upstream of `received_at`, carried into the intent's
                 // own stage record. It is already summed into
                 // `gateway_ingress_queue_ms`, but that series is ~100:1 diffs
@@ -9502,6 +9611,9 @@ mod tests {
                 issuer: node,
                 account: Some(account),
                 standing: SessionStanding::Quarantined,
+                // The receive loop applies the sampled bucket; this helper
+                // calls `intent_context()` directly, so it is unmeasured.
+                network: NetworkQuality::Unknown,
             })
         );
     }

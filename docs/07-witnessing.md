@@ -212,7 +212,27 @@ Strikes live in `orrery_identity`'s reputation ledger, attached to **accounts, n
 | S ≥ 6 | **Cooldown** | Persistence writes suspended; may play in-island as a guest whose outcomes never commit; typically 24–72 h wall-clock (ops dial). |
 | S ≥ 10 | **Ban** | Account banned; bound NodeIds blacklisted; appeal path is human review of the (self-verifying) evidence bundles. |
 
-**False-positive protections** are load-bearing, not decorative (D17.3): continuous-state comparisons always use the ε bands (1 cm / 1 cm·s⁻¹) with the 250 ms sustained-error window, so float drift and platform variance never escalate; single reconciliation spikes are ignored — escalation requires *multiple rollbacks / sustained* violation; peers with measured packet loss or relay-path connections (known from `orrery_net` telemetry) get widened windows before escalation; and timing-manipulation verdicts are never issued on network evidence alone — only on signed-log self-contradiction (future-tick claims, non-monotonic tick stamps). Above all: **the strike pipeline launches in shadow mode** — for the first production period every verdict is telemetry-only, thresholds are calibrated against the observed honest-population distribution, and enforcement switches on only when the false-positive rate on known-honest cohorts is measurably negligible. This is a launch *requirement*, not an option.
+**False-positive protections** are load-bearing, not decorative (D17.3): continuous-state comparisons always use the ε bands (1 cm / 1 cm·s⁻¹) with the 250 ms sustained-error window, so float drift and platform variance never escalate; single reconciliation spikes are ignored — escalation requires *multiple rollbacks / sustained* violation; peers with measured packet loss or relay-path connections (known from `orrery_net` telemetry) get widened windows before escalation **— not implemented; see the note below**; and timing-manipulation verdicts are never issued on network evidence alone — only on signed-log self-contradiction (future-tick claims, non-monotonic tick stamps). Above all: **the strike pipeline launches in shadow mode** — for the first production period every verdict is telemetry-only, thresholds are calibrated against the observed honest-population distribution, and enforcement switches on only when the false-positive rate on known-honest cohorts is measurably negligible. This is a launch *requirement*, not an option.
+
+> **Recorded, 2026-09-02 (#876).** The widening clause above is a documented
+> claim with no code behind it. `Tolerance` (`crates/orrery_core/src/tolerance.rs`)
+> is ε-bands plus a sustain window and nothing else; nothing widens either on
+> measured loss or on a relay path. Two halves of the gap were closed
+> separately and this one was not:
+>
+> - The **input** now exists. D32 clause (f)'s network-quality bucket is
+>   measured by the gateway from QUIC's own path RTT and lost-packet counters
+>   and carried on `IntentContext` and `ShadowObservation`
+>   (`crates/orrery_persistd/src/intent/shadow.rs`, `NetworkQuality`), so
+>   "measured packet loss or relay-path connection" is a fact the server holds
+>   rather than a fact it would have to invent.
+> - The **widening** is not built, and is not an implementer's call. It changes
+>   a detection threshold inside the verifiable core, which is under the P4
+>   freeze, and it trades false negatives for false positives in the one place
+>   D17 risk 3 names the phase's primary tunable. Either the widening lands
+>   with a derivation for how much, or this sentence is struck. That decision
+>   is #876's remaining half and is tracked there; until it is made, the clause
+>   above describes an intention, not the system.
 
 **Sybil resistance** is economic, delegated to the identity service: accounts bind NodeIds and cost something to acquire — a game purchase, a verified payment method, or an equivalent the game chooses. Fresh accounts carry probation (no witness eligibility for 7 days, provisional-tier trust for durable writes), so a banned cheater re-entering pays both money and time before regaining the capabilities that matter for collusion. Witnessing itself makes no Sybil claims; it merely ensures that everything a Sybil does is signed by an account that was paid for.
 

@@ -4135,6 +4135,7 @@ mod tests {
                 issuer: key.public(),
                 account: Some(orrery_protocol::AccountId::new(7)),
                 standing: orrery_protocol::SessionStanding::Good,
+                network: orrery_persistd::intent::NetworkQuality::Unknown,
             },
         );
         let executor_mode = *seen.lock().expect("capture lock");
@@ -4176,6 +4177,7 @@ mod tests {
                     issuer: key.public(),
                     account: Some(orrery_protocol::AccountId::new(7)),
                     standing: orrery_protocol::SessionStanding::Good,
+                    network: orrery_persistd::intent::NetworkQuality::Unknown,
                 },
             ),
             orrery_persistd::intent::IntentVerdict::Admit(_)

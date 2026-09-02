@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use orrery_protocol::{AccountId, CellEpoch, NodeId};
+use serde::{Deserialize, Serialize};
 
 use super::RejectionCause;
 
@@ -46,6 +47,140 @@ pub const ATTESTATION_QUORUM_CONTROL: &str = "attestation_quorum";
 
 /// The name D32 clause (c) gives control C2.
 pub const QUARANTINE_VALIDATION_CONTROL: &str = "quarantine_validation";
+
+/// A measurement of the transport path an intent arrived over.
+///
+/// The gateway's own `iroh` connection is the source: QUIC's smoothed RTT for
+/// the selected path, that path's lost-packet counters, and whether the
+/// selected path is a relay hop. This is deliberately *not*
+/// `orrery_net::PathTelemetry` — that resource aggregates Bevy components on
+/// the client plugin and `orrery_persistd` does not depend on `orrery_net`.
+/// Taking the same two numbers from the connection the gateway already holds
+/// keeps the dependency edge out of the server entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathSample {
+    /// Smoothed round-trip time of the selected path, in milliseconds.
+    pub rtt_ms: u32,
+    /// Lost packets per million sent on the selected path.
+    ///
+    /// Parts-per-million rather than a float because this value is compared
+    /// against fixed thresholds and folded into counters, and a float that
+    /// crosses a threshold differently on two platforms would make the
+    /// dimension itself non-deterministic.
+    pub loss_ppm: u32,
+    /// Whether the selected path is a relay hop rather than a direct one.
+    pub relayed: bool,
+}
+
+/// RTT at or above which a path is [`NetworkQuality::Bad`].
+///
+/// Borrowed rather than invented: `orrery_predict`'s `presentation_cutoff_rtt`
+/// already puts D8's high-latency band at 250 ms
+/// (`crates/orrery_predict/src/config.rs`), and a second RTT band with a
+/// different number would make two subsystems disagree about what "far" means.
+pub const RTT_BAD_MS: u32 = 250;
+
+/// RTT at or above which a path is at least [`NetworkQuality::Degraded`].
+///
+/// A dial with no derivation, in D29's `C = 8` tradition and stated as such:
+/// low enough that the relay and long-haul population lands in it, high enough
+/// that a healthy regional path does not. It is a *reporting* boundary — no
+/// enforcement decision reads it directly — so being wrong costs resolution in
+/// the artifact, not a false strike.
+pub const RTT_DEGRADED_MS: u32 = 100;
+
+/// Loss at or above which a path is [`NetworkQuality::Bad`]: 5%.
+pub const LOSS_BAD_PPM: u32 = 50_000;
+
+/// Loss at or above which a path is at least [`NetworkQuality::Degraded`]: 1%.
+pub const LOSS_DEGRADED_PPM: u32 = 10_000;
+
+/// D32 clause (f)'s required network-quality dimension.
+///
+/// # Why this exists at all
+///
+/// Clause (f) calls RTT/loss correlation "a required dimension, not a
+/// nice-to-have", because R-6's early warning for a misfiring control is a
+/// discrepancy rate "correlating with peer RTT/loss rather than accounts" —
+/// *"packet loss wearing a cheat costume, exactly the false positive this
+/// machinery exists to prevent"*. A verdict rate that cannot be split by path
+/// quality cannot tell the two apart, so the split is carried on the
+/// observation rather than reconstructed later from logs that were never
+/// joined to one.
+///
+/// # Why a bucket and not the raw sample
+///
+/// The raw RTT is a per-connection number that changes every 100 ms; storing
+/// it per observation would make the meter's account tallies unmergeable and
+/// would put a peer-influenced high-cardinality value into a map reachable
+/// from the admission path. A four-valued bucket folds, compares, and cannot
+/// be used to grow memory.
+///
+/// [`Self::Unknown`] is a real population and not a gap, for the same reason
+/// [`ShadowObservation::subject`] is an `Option`: an intent that arrived
+/// before any path was selected, or on a connection the gateway samples no
+/// quality for, has *no* measurement — and folding it into a "good" bucket
+/// would report a clean correlation over traffic nobody measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NetworkQuality {
+    /// No path measurement was available for this connection.
+    #[default]
+    Unknown,
+    /// A direct path inside both the RTT and the loss band.
+    Clean,
+    /// A relay hop, or RTT/loss past the first band.
+    Degraded,
+    /// RTT/loss past the second band.
+    Bad,
+}
+
+impl NetworkQuality {
+    /// Bucket a measurement, taking the worst of the three signals.
+    ///
+    /// Worst-of rather than an average: the dimension exists to find traffic
+    /// whose *path* is a plausible alternative explanation for a verdict, and
+    /// one bad signal is such an explanation whatever the other two say.
+    #[must_use]
+    pub const fn of(sample: PathSample) -> Self {
+        if sample.rtt_ms >= RTT_BAD_MS || sample.loss_ppm >= LOSS_BAD_PPM {
+            return Self::Bad;
+        }
+        if sample.relayed
+            || sample.rtt_ms >= RTT_DEGRADED_MS
+            || sample.loss_ppm >= LOSS_DEGRADED_PPM
+        {
+            return Self::Degraded;
+        }
+        Self::Clean
+    }
+
+    /// Whether the path offers a network explanation for a would-be action.
+    ///
+    /// [`Self::Unknown`] is **not** impaired: an unmeasured path is not
+    /// evidence of a good one, and counting it here would let a gateway that
+    /// samples nothing manufacture a correlation.
+    #[must_use]
+    pub const fn is_impaired(self) -> bool {
+        matches!(self, Self::Degraded | Self::Bad)
+    }
+
+    /// Whether a measurement was available at all.
+    #[must_use]
+    pub const fn is_measured(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// The stable label, for `tracing` fields and the artifact.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Clean => "clean",
+            Self::Degraded => "degraded",
+            Self::Bad => "bad",
+        }
+    }
+}
 
 /// The `tracing` target every shadow observation is emitted on.
 ///
@@ -181,6 +316,14 @@ pub struct ShadowObservation {
     pub verdict: ShadowVerdict,
     /// The clock `check_at` was called with, in the same units.
     pub observed_at_ms: u64,
+    /// D32 clause (f)'s network-quality bucket for the connection this intent
+    /// arrived on.
+    ///
+    /// [`NetworkQuality::Unknown`] on any gateway that samples no path
+    /// quality, which is what every pre-existing deployment reports until the
+    /// sampler is wired — an honest "not measured", never a default that
+    /// flatters the correlation.
+    pub network: NetworkQuality,
 }
 
 /// Where a shadow observation goes.
@@ -435,6 +578,7 @@ pub(super) fn emit(observer: Option<&dyn ShadowObserver>, observation: ShadowObs
             would_act = true,
             verdict = observation.verdict.as_str(),
             observed_at_ms = observation.observed_at_ms,
+            network = observation.network.as_str(),
             "attestation quorum would have refused this intent; admitted in shadow"
         );
     } else {
@@ -448,6 +592,7 @@ pub(super) fn emit(observer: Option<&dyn ShadowObserver>, observation: ShadowObs
             would_act = false,
             verdict = observation.verdict.as_str(),
             observed_at_ms = observation.observed_at_ms,
+            network = observation.network.as_str(),
             "attestation quorum observed in shadow"
         );
     }
@@ -468,6 +613,7 @@ mod tests {
             cell_epoch: CellEpoch::new(9),
             verdict,
             observed_at_ms: 1_000,
+            network: NetworkQuality::Unknown,
         }
     }
 

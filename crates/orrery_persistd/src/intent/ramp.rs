@@ -144,6 +144,53 @@ pub struct RampPosture {
     pub incident_id: Option<[u8; 16]>,
 }
 
+impl RampPosture {
+    /// Whether this row is one its claimed writer was permitted to write.
+    ///
+    /// **Every poller must call this before applying a row.** D32 clause (f)
+    /// says automation *"may make the fleet safer without asking, never less
+    /// safe"*, and this is where that stops being a property of the code that
+    /// writes and becomes a property of the code that reads.
+    ///
+    /// The rule is one line: a row whose `source` is
+    /// [`PostureSource::AutoSuspend`] is admissible only at
+    /// [`RampMode::Shadow`].
+    ///
+    /// - `AutoSuspend` + `Live` is a **promotion by automation**, which clause
+    ///   (e)'s review gate exists to prevent.
+    /// - `AutoSuspend` + `Off` is the censorship lever the record names
+    ///   explicitly: *"induce spikes, blind the cluster"*. It is refused as
+    ///   hard as a promotion, and for a better reason — shadow keeps observing,
+    ///   and the incident is the calibration data.
+    ///
+    /// # Why the check lives here and not at the writer
+    ///
+    /// A writer-side check authenticates the API, not the row —
+    /// [#932](https://github.com/baadc0de/orrery/pull/932) demonstrated
+    /// exactly this against a real cluster by verifying an envelope and then
+    /// writing the plain row anyway. Placing the constraint at the reader
+    /// means it holds against a monitor that has been compromised, a future
+    /// writer that forgets it, and a raw FoundationDB write by hand: the fleet
+    /// refuses the row because of what it *says*, not because of who sent it.
+    ///
+    /// This is independent of #932's authenticator and does not wait on it. A
+    /// signature answers "who wrote this"; this answers "was anyone allowed to
+    /// write this at all", and for the demote-only source the second question
+    /// is the one that bounds the damage — a *forged* demotion is still only a
+    /// demotion, which clause (f) permits without asking.
+    ///
+    /// Operator rows are unconstrained here by design: promotion is an
+    /// operator act, and authenticating *that* writer is open question 1's
+    /// business, not this predicate's.
+    #[must_use]
+    pub const fn admissible(&self) -> bool {
+        match self.source {
+            PostureSource::AutoSuspend => matches!(self.mode, RampMode::Shadow),
+            PostureSource::Default | PostureSource::Operator => true,
+        }
+    }
+}
+
 /// Failure reading a durable ramp posture.
 #[derive(Debug)]
 pub struct RampPostureError(pub String);
@@ -826,6 +873,8 @@ mod tests {
     use crate::intent::RejectionCause;
     use orrery_protocol::{CellEpoch, NodeId};
 
+    use crate::intent::NetworkQuality;
+
     fn node() -> NodeId {
         iroh_base::SecretKey::from_bytes(&[5; 32]).public()
     }
@@ -838,6 +887,7 @@ mod tests {
             cell_epoch: CellEpoch::new(9),
             verdict,
             observed_at_ms: at_ms,
+            network: NetworkQuality::Unknown,
         }
     }
 
