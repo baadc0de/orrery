@@ -266,9 +266,9 @@ marker is written unless every arm and the honest attested control agree.
 
 ### Where Bevy is, and where it is not
 
-Eleven of the twenty first-party crates have no Bevy dependency at all:
+Ten of the nineteen first-party crates have no Bevy dependency at all:
 `orrery_protocol`, `orrery_core`, `orrery_games`, `orrery_conformance`,
-`orrery_compose`, `orrery_ruleset_digest`, `orrery_sim`, `orrery_persistd`,
+`orrery_compose`, `orrery_ruleset_digest`, `orrery_persistd`,
 `orrery_coordinator`, `orrery_identity`, `orrery_seed`.
 
 The old framing — that the rules layer is *strictly* engine-agnostic — is

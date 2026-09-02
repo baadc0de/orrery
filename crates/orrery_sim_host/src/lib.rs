@@ -8,23 +8,38 @@
 //! accumulator and calls [`SimulationHost::step`] with the exact number of
 //! ticks to execute.
 //!
-//! That shape is deliberately expressible across a C ABI.  A foreign caller
-//! owns an opaque `SimulationHost` handle, passes `(bytes, len)` command
+//! That shape is expressible across a C ABI, and [`abi`] exports it across
+//! one.  A foreign caller owns an opaque handle, passes `(bytes, len)` command
 //! buffers to [`SimulationHost::submit_command_bytes`], calls `step(ticks)`,
 //! then copies the buffers returned by [`SimulationHost::drain_event_bytes`]
 //! and [`SimulationHost::collect_output_bytes`].  No callback or Rust lifetime
 //! needs to cross that boundary.
+//!
+//! The host also rewinds.  [`SimulationHost::snapshot`] captures every
+//! installed entity as one per-entity record keyed by [`PersistId`] — the
+//! D47 (b) grain — and [`SimulationHost::restore`] puts that population back
+//! field-exactly, so a predicting consumer can snapshot, step forward, restore
+//! and replay from the same bytes on either side of the ABI.
 
 #![warn(missing_docs)]
 
+pub mod abi;
 pub mod ecs;
 
 use std::collections::BTreeMap;
 
 use orrery_core::{CoreCodec, Executor, Ruleset, SealedTickInputs, SteppedEntity, TickBackend};
-use orrery_protocol::{PersistId, Tick, UniverseSeed};
+use orrery_protocol::{PersistId, RulesetId, Tick, UniverseSeed};
 
 const PERSIST_ID_BYTES: usize = size_of::<u64>();
+const TICK_BYTES: usize = size_of::<u64>();
+const LENGTH_BYTES: usize = size_of::<u32>();
+
+/// The snapshot byte format this crate writes and accepts.
+///
+/// Bumped when the layout below changes; a snapshot carrying another version
+/// is refused as [`HostError::MalformedSnapshot`] rather than misread.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 /// Explicit construction parameters for one [`SimulationHost`] lifetime.
 ///
@@ -129,6 +144,262 @@ pub enum HostError {
     /// An event or state record exceeds the fixed-width `u32` length field of
     /// the C-friendly buffer format.
     BufferTooLarge,
+    /// Canonical state bytes offered for installation did not decode.
+    MalformedState,
+    /// A snapshot buffer was truncated, carried another format version, or
+    /// held a record that does not decode.  Nothing was restored.
+    MalformedSnapshot,
+    /// A snapshot was taken under a different [`RulesetId`] than the host
+    /// runs.  Nothing was restored.
+    SnapshotRulesetMismatch,
+}
+
+/// One entity's snapshotted canonical state, keyed by its stable id in a
+/// [`HostSnapshot`].
+///
+/// A record carries the two things the kernel keeps per entity: the quantized
+/// canonical bytes, and the tick the state was observed at, which the
+/// executor consults when the entity is read as a neighbour under
+/// [`Ruleset::max_neighbor_staleness_ticks`].  Restoring without the second
+/// would be field-exact on the bytes and still diverge on the next step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitySnapshot {
+    observed_tick: Tick,
+    canonical: Vec<u8>,
+}
+
+impl EntitySnapshot {
+    /// The tick this state was observed at.
+    #[must_use]
+    pub const fn observed_tick(&self) -> Tick {
+        self.observed_tick
+    }
+
+    /// The quantized canonical bytes.
+    #[must_use]
+    pub fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+
+/// A rewind point: the host's clock, every installed entity as its own
+/// [`EntitySnapshot`] ordered by [`PersistId`], and the inputs queued for the
+/// next tick.
+///
+/// This is the per-entity set D47 (b) names as the rollback unit.  A
+/// consumer that predicts a subset keeps one of these per tick in its own
+/// ring and may [`Self::remove`] entities it does not predict; a restore is
+/// all-or-nothing over whatever the snapshot holds (D47 (e)).
+///
+/// Queued inputs are part of the point because the host itself produces
+/// some of them: an event emitted on tick `T` is routed by the adapter into
+/// an input for `T + 1`, and a snapshot taken between the two that dropped
+/// it would step `T + 1` from a sealed set the original run never had.  The
+/// consumer's own commands queued at that moment travel with them.  A
+/// consumer replaying its input history after a restore therefore replays
+/// only what it submitted *after* the snapshot.
+///
+/// Flat encoding, little-endian throughout:
+/// `[format version: u32] [ruleset version: u32] [ruleset digest: 32 bytes]`
+/// `[next tick: u64] [entity count: u64]`, then per entity
+/// `[PersistId: u64] [observed tick: u64] [state length: u32] [state bytes]`,
+/// then `[recipient count: u64]` and per recipient, ascending,
+/// `[PersistId: u64] [input count: u32]` followed by that many
+/// `[input length: u32] [input bytes]` in submission order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSnapshot {
+    ruleset: RulesetId,
+    next_tick: Tick,
+    entities: BTreeMap<PersistId, EntitySnapshot>,
+    queued_inputs: BTreeMap<PersistId, Vec<Vec<u8>>>,
+}
+
+impl HostSnapshot {
+    /// The tick the host will execute next once this snapshot is restored.
+    #[must_use]
+    pub const fn next_tick(&self) -> Tick {
+        self.next_tick
+    }
+
+    /// The ruleset identity the snapshot was taken under.
+    #[must_use]
+    pub const fn ruleset(&self) -> RulesetId {
+        self.ruleset
+    }
+
+    /// Every snapshotted entity, ascending by id.
+    pub fn entities(&self) -> impl Iterator<Item = (PersistId, &EntitySnapshot)> {
+        self.entities
+            .iter()
+            .map(|(entity, record)| (*entity, record))
+    }
+
+    /// Whether the snapshot carries no entities.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+
+    /// How many entities the snapshot carries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// Drop one entity from the snapshot.
+    ///
+    /// Restoring the trimmed snapshot removes that entity from the host: the
+    /// population restored is exactly the population snapshotted.
+    pub fn remove(&mut self, entity: PersistId) -> Option<EntitySnapshot> {
+        self.entities.remove(&entity)
+    }
+
+    /// Encode to the flat format documented on the type.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::BufferTooLarge`] if one state exceeds the `u32` length
+    /// field.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, HostError> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.ruleset.version.to_le_bytes());
+        bytes.extend_from_slice(&self.ruleset.digest);
+        bytes.extend_from_slice(&self.next_tick.0.to_le_bytes());
+        let count = u64::try_from(self.entities.len()).map_err(|_| HostError::BufferTooLarge)?;
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for (entity, record) in &self.entities {
+            bytes.extend_from_slice(&entity.0.to_le_bytes());
+            bytes.extend_from_slice(&record.observed_tick.0.to_le_bytes());
+            append_length_prefixed(&mut bytes, &record.canonical)?;
+        }
+        let recipients =
+            u64::try_from(self.queued_inputs.len()).map_err(|_| HostError::BufferTooLarge)?;
+        bytes.extend_from_slice(&recipients.to_le_bytes());
+        for (recipient, inputs) in &self.queued_inputs {
+            bytes.extend_from_slice(&recipient.0.to_le_bytes());
+            let count = u32::try_from(inputs.len()).map_err(|_| HostError::BufferTooLarge)?;
+            bytes.extend_from_slice(&count.to_le_bytes());
+            for input in inputs {
+                append_length_prefixed(&mut bytes, input)?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// The inputs queued for the next tick, by recipient, in submission
+    /// order, as canonical bytes.
+    pub fn queued_inputs(&self) -> impl Iterator<Item = (PersistId, &[Vec<u8>])> {
+        self.queued_inputs
+            .iter()
+            .map(|(recipient, inputs)| (*recipient, inputs.as_slice()))
+    }
+
+    /// Decode from the flat format documented on the type.
+    ///
+    /// Decoding checks framing only; the state bytes are decoded by the host
+    /// that restores them, because only it knows the ruleset's state type.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::MalformedSnapshot`] for a truncated buffer, trailing
+    /// bytes, another format version, or a non-ascending entity order.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HostError> {
+        let mut reader = SnapshotReader { bytes, at: 0 };
+        if reader.u32()? != SNAPSHOT_FORMAT_VERSION {
+            return Err(HostError::MalformedSnapshot);
+        }
+        let version = reader.u32()?;
+        let digest: [u8; 32] = reader
+            .take(32)?
+            .try_into()
+            .map_err(|_| HostError::MalformedSnapshot)?;
+        let next_tick = Tick::new(reader.u64()?);
+        let count = reader.u64()?;
+        let mut entities = BTreeMap::new();
+        let mut previous: Option<PersistId> = None;
+        for _ in 0..count {
+            let entity = PersistId::new(reader.u64()?);
+            if previous.is_some_and(|last| last >= entity) {
+                return Err(HostError::MalformedSnapshot);
+            }
+            previous = Some(entity);
+            let observed_tick = Tick::new(reader.u64()?);
+            let length =
+                usize::try_from(reader.u32()?).map_err(|_| HostError::MalformedSnapshot)?;
+            let canonical = reader.take(length)?.to_vec();
+            entities.insert(
+                entity,
+                EntitySnapshot {
+                    observed_tick,
+                    canonical,
+                },
+            );
+        }
+        let recipients = reader.u64()?;
+        let mut queued_inputs = BTreeMap::new();
+        let mut previous: Option<PersistId> = None;
+        for _ in 0..recipients {
+            let recipient = PersistId::new(reader.u64()?);
+            if previous.is_some_and(|last| last >= recipient) {
+                return Err(HostError::MalformedSnapshot);
+            }
+            previous = Some(recipient);
+            let count = reader.u32()?;
+            let mut inputs = Vec::new();
+            for _ in 0..count {
+                let length =
+                    usize::try_from(reader.u32()?).map_err(|_| HostError::MalformedSnapshot)?;
+                inputs.push(reader.take(length)?.to_vec());
+            }
+            queued_inputs.insert(recipient, inputs);
+        }
+        if reader.at != bytes.len() {
+            return Err(HostError::MalformedSnapshot);
+        }
+        Ok(Self {
+            ruleset: RulesetId { version, digest },
+            next_tick,
+            entities,
+            queued_inputs,
+        })
+    }
+}
+
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl SnapshotReader<'_> {
+    fn take(&mut self, len: usize) -> Result<&[u8], HostError> {
+        let end = self
+            .at
+            .checked_add(len)
+            .ok_or(HostError::MalformedSnapshot)?;
+        let slice = self
+            .bytes
+            .get(self.at..end)
+            .ok_or(HostError::MalformedSnapshot)?;
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> Result<u32, HostError> {
+        let raw: [u8; LENGTH_BYTES] = self
+            .take(LENGTH_BYTES)?
+            .try_into()
+            .map_err(|_| HostError::MalformedSnapshot)?;
+        Ok(u32::from_le_bytes(raw))
+    }
+
+    fn u64(&mut self) -> Result<u64, HostError> {
+        let raw: [u8; TICK_BYTES] = self
+            .take(TICK_BYTES)?
+            .try_into()
+            .map_err(|_| HostError::MalformedSnapshot)?;
+        Ok(u64::from_le_bytes(raw))
+    }
 }
 
 /// One state hash produced by an executed canonical tick.
@@ -251,6 +522,16 @@ pub struct SimulationHost<R: Ruleset, A: RulesetAdapter<R>, B = Executor<R>> {
     next_tick: Tick,
     pending_inputs: BTreeMap<PersistId, PendingInputs<R::CoreInput>>,
     emitted_events: Vec<EmittedEvent>,
+    /// The observation stamps of entities installed since the last executed
+    /// tick — the stamp [`TickBackend::insert_observed`] takes and the kernel
+    /// keeps but does not read back out.  The host mirrors it so a snapshot
+    /// can carry it.  Every executed tick stamps the whole population to
+    /// `tick + 1` on both backends, stepped and materialized alike, so after
+    /// a tick this map is empty and [`Self::stepped_at`] answers instead.
+    installed_at: BTreeMap<PersistId, Tick>,
+    /// The stamp every entity not in [`Self::installed_at`] carries: the
+    /// `next_tick` after the last executed tick, or `None` before any tick.
+    stepped_at: Option<Tick>,
 }
 
 impl<R: Ruleset, A: RulesetAdapter<R>> SimulationHost<R, A, Executor<R>> {
@@ -285,7 +566,19 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
             next_tick: config.first_tick,
             pending_inputs: BTreeMap::new(),
             emitted_events: Vec::new(),
+            installed_at: BTreeMap::new(),
+            stepped_at: None,
         }
+    }
+
+    /// The identity of the rules this host runs.
+    ///
+    /// A foreign consumer that decodes state bytes itself compares this
+    /// against the identity it was built for, so a codec drift fails at
+    /// creation instead of misreading fields.
+    #[must_use]
+    pub fn ruleset_id(&self) -> RulesetId {
+        self.backend.ruleset().id()
     }
 
     /// Consume the host and return its substrate.
@@ -306,7 +599,172 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
     /// Hosts use this for deterministic setup or decoded replication; it does
     /// not put canonical state in an engine application world.
     pub fn install_state(&mut self, entity: PersistId, state: R::CoreState) {
-        self.backend.insert(entity, state);
+        self.install_state_observed(entity, state, Tick::new(0));
+    }
+
+    /// Install canonical state carrying the tick it was observed at.
+    ///
+    /// Replication consumers use this form: a state decoded from an
+    /// authority's claim at tick `T` is observed at `T`, and neighbours read
+    /// it under the ruleset's staleness bound from that stamp.
+    pub fn install_state_observed(
+        &mut self,
+        entity: PersistId,
+        state: R::CoreState,
+        observed_tick: Tick,
+    ) {
+        self.backend.insert_observed(entity, state, observed_tick);
+        self.installed_at.insert(entity, observed_tick);
+    }
+
+    /// Install canonical state from its flat bytes.
+    ///
+    /// This is the C-ABI-facing form of [`Self::install_state_observed`]: the
+    /// bytes are what [`Self::state_bytes`] and the output buffer hand out,
+    /// so a consumer can feed replicated or recorded state back in without
+    /// naming the state type.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::MalformedState`] if the bytes do not decode.
+    pub fn install_state_bytes(
+        &mut self,
+        entity: PersistId,
+        observed_tick: Tick,
+        bytes: &[u8],
+    ) -> Result<(), HostError> {
+        let state = R::CoreState::decode(bytes).map_err(|_| HostError::MalformedState)?;
+        self.install_state_observed(entity, state, observed_tick);
+        Ok(())
+    }
+
+    /// Remove one entity and return its state, or `None` if it was absent.
+    pub fn remove_state(&mut self, entity: PersistId) -> Option<R::CoreState> {
+        self.installed_at.remove(&entity);
+        self.pending_inputs.remove(&entity);
+        self.backend.take_state(entity)
+    }
+
+    /// The tick one installed entity's state was observed at.
+    #[must_use]
+    pub fn observed_tick(&self, entity: PersistId) -> Option<Tick> {
+        self.installed_at
+            .get(&entity)
+            .copied()
+            .or(self.stepped_at)
+            .filter(|_| self.backend.state(entity).is_some())
+    }
+
+    /// Capture the host's clock, every installed entity's quantized canonical
+    /// state as one record per entity keyed by [`PersistId`], and the inputs
+    /// queued for the next tick.
+    ///
+    /// Undrained events are not part of a snapshot: they are already the
+    /// consumer's output and stay in the drain buffer across a restore.
+    ///
+    /// # Panics
+    ///
+    /// If the backend's entity index and state store disagree, which no
+    /// backend in this crate permits.
+    #[must_use]
+    pub fn snapshot(&self) -> HostSnapshot {
+        let queued_inputs = self
+            .pending_inputs
+            .iter()
+            .map(|(recipient, pending)| {
+                let inputs = pending.inputs.iter().map(CoreCodec::to_canonical).collect();
+                (*recipient, inputs)
+            })
+            .collect();
+        let entities = self
+            .backend
+            .entities()
+            .into_iter()
+            .map(|entity| {
+                let state = self
+                    .backend
+                    .state(entity)
+                    .expect("backend entity index and state store agree");
+                let observed_tick = self
+                    .installed_at
+                    .get(&entity)
+                    .copied()
+                    .or(self.stepped_at)
+                    .unwrap_or(Tick::new(0));
+                (
+                    entity,
+                    EntitySnapshot {
+                        observed_tick,
+                        canonical: state.to_canonical(),
+                    },
+                )
+            })
+            .collect();
+        HostSnapshot {
+            ruleset: self.ruleset_id(),
+            next_tick: self.next_tick,
+            entities,
+            queued_inputs,
+        }
+    }
+
+    /// Put a snapshot's population back, all or nothing.
+    ///
+    /// After a successful restore the host holds exactly the snapshot's
+    /// entities — entities installed since are removed — each with its
+    /// snapshotted bytes and observation tick, the next tick is the
+    /// snapshot's, and the queued inputs are the snapshot's: anything queued
+    /// since is dropped.  Stepping the restored host with the same inputs
+    /// submitted after the snapshot reproduces the same state hashes and the
+    /// same output bytes as the original run, which is the guarantee
+    /// prediction needs and the one this crate's tests assert.
+    ///
+    /// The exactness rests on two contracts the kernel already imposes on
+    /// every ruleset: [`CoreCodec`] round-trips, and
+    /// [`orrery_core::Quantized::quantize`] is idempotent on state it already
+    /// produced — the executor re-quantizes on every install, so a state
+    /// that moved when re-quantized would already break the executor's own
+    /// install-then-hash path.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::SnapshotRulesetMismatch`] if the snapshot names another
+    /// ruleset; [`HostError::MalformedSnapshot`] if any record fails to
+    /// decode.  In both cases the host is untouched.
+    pub fn restore(&mut self, snapshot: &HostSnapshot) -> Result<(), HostError> {
+        if snapshot.ruleset != self.ruleset_id() {
+            return Err(HostError::SnapshotRulesetMismatch);
+        }
+        let mut decoded = Vec::with_capacity(snapshot.entities.len());
+        for (entity, record) in &snapshot.entities {
+            let state = R::CoreState::decode(&record.canonical)
+                .map_err(|_| HostError::MalformedSnapshot)?;
+            decoded.push((*entity, record.observed_tick, state));
+        }
+        let mut queued: BTreeMap<PersistId, PendingInputs<R::CoreInput>> = BTreeMap::new();
+        for (recipient, inputs) in &snapshot.queued_inputs {
+            let mut pending = PendingInputs::default();
+            for input in inputs {
+                pending
+                    .push(R::CoreInput::decode(input).map_err(|_| HostError::MalformedSnapshot)?);
+            }
+            queued.insert(*recipient, pending);
+        }
+
+        for entity in self.backend.entities() {
+            if !snapshot.entities.contains_key(&entity) {
+                self.backend.take_state(entity);
+            }
+        }
+        self.installed_at.clear();
+        self.stepped_at = None;
+        for (entity, observed_tick, state) in decoded {
+            self.backend.insert_observed(entity, state, observed_tick);
+            self.installed_at.insert(entity, observed_tick);
+        }
+        self.next_tick = snapshot.next_tick;
+        self.pending_inputs = queued;
+        Ok(())
     }
 
     /// Look up the current canonical bytes for one stable id.
@@ -377,6 +835,12 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
                 }
             }
             self.next_tick = Tick::new(self.next_tick.0.saturating_add(1));
+            // Every entity present at the boundary stepped and every
+            // materialization settled at T+1, on both backends; the mirror
+            // follows.  An entity installed since the last tick was stepped
+            // too, so its install stamp is superseded.
+            self.installed_at.clear();
+            self.stepped_at = Some(self.next_tick);
         }
 
         StepReport {
@@ -391,9 +855,29 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
     /// If an event cannot fit the specified `u32` length field, no event is
     /// drained and the caller can report the error without losing output.
     pub fn drain_event_bytes(&mut self) -> Result<EventBuffer, HostError> {
+        let buffer = self.peek_event_bytes()?;
+        self.clear_events();
+        Ok(buffer)
+    }
+
+    /// Encode emitted events without draining them.
+    ///
+    /// A caller-owned-buffer boundary sizes its copy from this and clears
+    /// with [`Self::clear_events`] only once the copy succeeded, so a buffer
+    /// that turned out too small loses nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::BufferTooLarge`] if one event exceeds the `u32` length
+    /// field.
+    pub fn peek_event_bytes(&self) -> Result<EventBuffer, HostError> {
         let bytes = encode_event_records(&self.emitted_events)?;
-        self.emitted_events.clear();
         Ok(EventBuffer { bytes })
+    }
+
+    /// Discard every emitted event not yet drained.
+    pub fn clear_events(&mut self) {
+        self.emitted_events.clear();
     }
 
     /// Collect current canonical states into one stable-id-ordered flat buffer.
@@ -429,8 +913,12 @@ fn encode_event_records(events: &[EmittedEvent]) -> Result<Vec<u8>, HostError> {
 }
 
 fn append_record(bytes: &mut Vec<u8>, entity: u64, payload: &[u8]) -> Result<(), HostError> {
-    let length = u32::try_from(payload.len()).map_err(|_| HostError::BufferTooLarge)?;
     bytes.extend_from_slice(&entity.to_le_bytes());
+    append_length_prefixed(bytes, payload)
+}
+
+fn append_length_prefixed(bytes: &mut Vec<u8>, payload: &[u8]) -> Result<(), HostError> {
+    let length = u32::try_from(payload.len()).map_err(|_| HostError::BufferTooLarge)?;
     bytes.extend_from_slice(&length.to_le_bytes());
     bytes.extend_from_slice(payload);
     Ok(())

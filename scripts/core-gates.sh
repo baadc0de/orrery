@@ -226,9 +226,9 @@ while IFS= read -r file; do RULES_SOURCES+=("$file"); done < <(lib_sources "${RU
 [[ ${#RULES_SOURCES[@]} -gt 0 ]] || die "no ruleset sources found"
 
 # ── 1. Bevy-free ────────────────────────────────────────────────────────
-# Why this still binds `orrery_core`. It is a non-dev dependency of eleven
+# Why this still binds `orrery_core`. It is a non-dev dependency of ten
 # crates — `clients/regolith`, `orrery`, `orrery_compose`, `orrery_conformance`,
-# `orrery_games`, `orrery_persistd`, `orrery_sim`, `orrery_sim_host`,
+# `orrery_games`, `orrery_persistd`, `orrery_sim_host`,
 # `orrery_witness`, `gates/migration-bench`, `gates/p1-swarm` — so one build of
 # it links into the client that re-executes, the host that steps and the
 # adjudicator that convicts. A Bevy dependency there would not just be weight;
@@ -239,9 +239,9 @@ while IFS= read -r file; do RULES_SOURCES+=("$file"); done < <(lib_sources "${RU
 # Why it never correctly bound `orrery_games`. Until 2026-08-31 the paragraph
 # above stood here as the justification for the whole gated set, copied from
 # that manifest. For `orrery_games` it was false in the checkable part: parsing
-# every manifest in the tree, `orrery_games` has exactly four non-dev
-# consumers — `clients/regolith` (already a Bevy app), `crates/orrery_sim`,
-# `gates/p1-swarm` and `gates/migration-bench` — and `orrery_persistd` and
+# every manifest in the tree, `orrery_games` had exactly four non-dev
+# consumers — `clients/regolith` (already a Bevy app), `crates/orrery_sim`
+# (retired by #872), `gates/p1-swarm` and `gates/migration-bench` — and `orrery_persistd` and
 # `orrery_witness` do not link it at all, not even as dev-dependencies. The
 # adjudication path never linked the crate this clause was protecting. The rule
 # was inherited from a manifest where it earns its keep.
@@ -256,9 +256,10 @@ while IFS= read -r file; do RULES_SOURCES+=("$file"); done < <(lib_sources "${RU
 # a `bevy_ecs::World`, section 6's escape check makes it fail by name until it
 # is declared in DECLARED_HOST_CRATES and takes the whole Tier-H battery.
 #
-# The consumer this costs is `crates/orrery_sim`: `crate-type = ["rlib",
-# "cdylib"]` behind a `#[repr(C)]` C ABI, which the Unreal seam (#744) consumes.
-# It has to keep building.
+# The consumer this costs was `crates/orrery_sim`, a Regolith-typed `cdylib`
+# behind a `#[repr(C)]` C ABI for the Unreal seam (#744). #872 retired it for
+# the ruleset-generic ABI in `orrery_sim_host::abi`, whose `cdylib` is that
+# crate's `synthetic_abi` example and links no game crate at all.
 #
 # Adding a row below is an amendment to D42 (a) / D43 (e)(1), not a
 # configuration change. Removing one is likewise.
