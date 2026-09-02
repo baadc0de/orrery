@@ -1,15 +1,15 @@
 # ADR-0051: v1 terrain is not durable state
 
-**Status:** Proposed · **Date:** 2026-09-01 · **Decision:** D51
+**Status:** Accepted · **Date:** 2026-09-01 · **Decision:** D51
 
-This record is non-normative until accepted. See the [ADR
+This record is accepted and normative. See the [ADR
 index](../DECISIONS.md) for precedence, scope, and the complete accepted
-decision set. Acceptance is reserved to the owner.
+decision set.
 
 **Acceptance provenance.** The owner's authoritative **"OWNER DECISION,
 2026-09-01"** comment on [#830] chose deletion after [#834]'s pricing: terrain
-is not durable state in v1. This draft records that choice without accepting
-it; flipping this record to Accepted is the owner's act alone.
+is not durable state in v1. The owner accepted this record on
+2026-09-02.
 
 **Supersedes on acceptance:** the terrain allocation in [D11] — its bulk-state
 and checkpoint bullets' `TerrainDelta` / `chunk/` promises, including seeded
