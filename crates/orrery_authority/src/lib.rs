@@ -35,8 +35,8 @@ pub use ephemeral::{
     IslandOutbox,
 };
 pub use hit::{
-    CanonicalPosePublications, ClaimAnswer, HitRules, PoseHistory, PoseRing, PoseSample,
-    MAX_CLAIM_SOURCES,
+    record_published_held_poses, CanonicalPosePublications, ClaimAnswer, HitRules, PoseHistory,
+    PoseRing, PoseSample, MAX_CLAIM_SOURCES,
 };
 
 /// Registrar TTL from D7/D16, in milliseconds.

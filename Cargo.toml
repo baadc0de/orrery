@@ -30,6 +30,13 @@ members = [
     "crates/orrery_sim_host",
     # The facade sits on top of the spine: it depends on every client plugin.
     "crates/orrery",
+    # The one shipped binary that builds a Bevy `App` over the facade (#871,
+    # #898 step 1): canonical rules inside Lightyear's tick, publishing poses
+    # and answering hit claims.
+    # The synthetic ruleset the sidecar runs: Bevy-free, so it can be a rules
+    # crate at all (D42 (a), D43 (e)(1)).
+    "crates/orrery_synthetic",
+    "crates/orrery_sidecar",
 ]
 
 # The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /

@@ -4,8 +4,6 @@
 //! discover the other peer, and carry one registered entity through the
 //! facade's production P2P replication bridge.
 
-mod support;
-
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,7 +25,7 @@ use orrery_protocol::PersistId;
 use orrery_replicon::{OrreryRepliconAppExt, ReplicatedPayload};
 use serde::{Deserialize, Serialize};
 
-use support::Synthetic;
+use orrery_games::Skirmish;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -75,7 +73,7 @@ fn client(seed: u8) -> App {
     // Missing consumer contract found by the pre-existing composition tests:
     // lightyear calls `init_state`, while MinimalPlugins has no state schedule.
     app.add_plugins(StatesPlugin);
-    app.add_plugins(OrreryClientPlugins::<Synthetic>::new(
+    app.add_plugins(OrreryClientPlugins::<Skirmish>::new(
         OrreryConfig::default().with_net(NetConfig {
             relay_mode: iroh::RelayMode::Disabled,
             secret_key: Some(secret(seed)),
