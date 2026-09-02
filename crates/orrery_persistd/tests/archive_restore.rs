@@ -480,3 +480,196 @@ async fn a_partial_apply_can_be_rerun_without_duplicate_entity_records() {
     }
     fixture.runtime.close().await.expect("close");
 }
+
+#[cfg(feature = "fdb")]
+async fn held_fixture(entity: u64) -> (Fixture, Lsn) {
+    let fixture = Fixture::open().await;
+    fixture
+        .runtime
+        .apply(record(entity, 10, node(1), RecordKind::Spawn, b"before"))
+        .await
+        .expect("preimage append");
+    let grief_lsn = fixture
+        .runtime
+        .apply(record(
+            entity,
+            11,
+            node(2),
+            RecordKind::ComponentDiff,
+            b"grief",
+        ))
+        .await
+        .expect("grief append");
+    fixture.publish_archive().await;
+    (fixture, grief_lsn)
+}
+
+/// §11.1's `ya` product wins over an otherwise valid restore, and the applier
+/// has no route to append a record for a held entity.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn filed_strike_holds_restore_and_applier_writes_no_record() {
+    let Some(cluster) = orrery_persistd::fdb::discover_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set");
+        return;
+    };
+    let (fixture, grief_lsn) = held_fixture(31).await;
+    let context = orrery_persistd::FdbContext::connect(&cluster).expect("FDB connects");
+    let db = context.database();
+    let key = orrery_persistd::keyspace::restore_hold_strike_versionstamped_key(
+        &fixture.source_node,
+        PersistId::new(31),
+        grief_lsn,
+        orrery_protocol::AccountId::new(0x849),
+    );
+    db.run(|trx, _| {
+        let key = key.clone();
+        async move {
+            use foundationdb::options::MutationType;
+
+            trx.atomic_op(&key, b"", MutationType::SetVersionstampedKey);
+            Ok(())
+        }
+    })
+    .await
+    .expect("seed ya hold index");
+
+    let holds: Arc<dyn orrery_persistd::archive::RestoreHoldDetector> =
+        Arc::new(orrery_persistd::archive::FdbRestoreHoldDetector::from_database(Arc::clone(&db)));
+    let plan = fixture
+        .planner()
+        .with_hold_detector(holds)
+        .plan(fixture.request("held-strike", grief_lsn, grief_lsn))
+        .await
+        .expect("plan");
+    assert!(matches!(
+        &plan.entities[0].disposition,
+        RestoreDisposition::Held { product } if product.starts_with("ya/")
+    ));
+    let outcome = RestoreApplier::new(&fixture.runtime, node(9))
+        .apply(&plan, Tick::new(99))
+        .await
+        .expect("held plan applies as no-op");
+    assert!(matches!(
+        outcome.entities[0].disposition,
+        RestoreApplyDisposition::Held { .. }
+    ));
+    assert!(
+        fixture
+            .journal_records()
+            .iter()
+            .all(|stored| stored.record.kind != RecordKind::Restore),
+        "held strike appends no restore record"
+    );
+    db.run(|trx, _| {
+        let key = key.clone();
+        async move {
+            trx.clear(&key[..key.len() - 4]);
+            Ok(())
+        }
+    })
+    .await
+    .expect("clear ya hold index");
+    fixture.runtime.close().await.expect("close");
+}
+
+/// An `IntentFinality::Annulled` projection is the other durable product §11.1
+/// protects from a forward restore.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn annulled_provisional_hold_holds_restore_and_applier_writes_no_record() {
+    let Some(cluster) = orrery_persistd::fdb::discover_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set");
+        return;
+    };
+    let (fixture, grief_lsn) = held_fixture(32).await;
+    let context = orrery_persistd::FdbContext::connect(&cluster).expect("FDB connects");
+    let db = context.database();
+    let key = orrery_persistd::keyspace::restore_hold_annulment_key(
+        &fixture.source_node,
+        PersistId::new(32),
+        grief_lsn,
+        0x849_899,
+    );
+    db.run(|trx, _| {
+        let key = key.clone();
+        async move {
+            trx.set(&key, b"");
+            Ok(())
+        }
+    })
+    .await
+    .expect("seed annulment hold index");
+
+    let holds: Arc<dyn orrery_persistd::archive::RestoreHoldDetector> =
+        Arc::new(orrery_persistd::archive::FdbRestoreHoldDetector::from_database(Arc::clone(&db)));
+    let plan = fixture
+        .planner()
+        .with_hold_detector(holds)
+        .plan(fixture.request("held-annulment", grief_lsn, grief_lsn))
+        .await
+        .expect("plan");
+    let expected_product = format!("i/{:032x}", 0x849_899_u128);
+    assert!(matches!(
+        &plan.entities[0].disposition,
+        RestoreDisposition::Held { product } if product == &expected_product
+    ));
+    let outcome = RestoreApplier::new(&fixture.runtime, node(9))
+        .apply(&plan, Tick::new(99))
+        .await
+        .expect("held plan applies as no-op");
+    assert!(matches!(
+        outcome.entities[0].disposition,
+        RestoreApplyDisposition::Held { .. }
+    ));
+    assert!(
+        fixture
+            .journal_records()
+            .iter()
+            .all(|stored| stored.record.kind != RecordKind::Restore),
+        "held annulment appends no restore record"
+    );
+    db.run(|trx, _| {
+        let key = key.clone();
+        async move {
+            trx.clear(&key);
+            Ok(())
+        }
+    })
+    .await
+    .expect("clear annulment hold index");
+    fixture.runtime.close().await.expect("close");
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn entity_without_a_hold_index_row_remains_restorable() {
+    let Some(cluster) = orrery_persistd::fdb::discover_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set");
+        return;
+    };
+    let (fixture, grief_lsn) = held_fixture(33).await;
+    let context = orrery_persistd::FdbContext::connect(&cluster).expect("FDB connects");
+    let holds: Arc<dyn orrery_persistd::archive::RestoreHoldDetector> = Arc::new(
+        orrery_persistd::archive::FdbRestoreHoldDetector::from_database(context.database()),
+    );
+    let plan = fixture
+        .planner()
+        .with_hold_detector(holds)
+        .plan(fixture.request("unheld", grief_lsn, grief_lsn))
+        .await
+        .expect("plan");
+    assert!(matches!(
+        plan.entities[0].disposition,
+        RestoreDisposition::Restorable { .. }
+    ));
+    let outcome = RestoreApplier::new(&fixture.runtime, node(9))
+        .apply(&plan, Tick::new(99))
+        .await
+        .expect("apply");
+    assert!(matches!(
+        outcome.entities[0].disposition,
+        RestoreApplyDisposition::Applied { .. }
+    ));
+    fixture.runtime.close().await.expect("close");
+}

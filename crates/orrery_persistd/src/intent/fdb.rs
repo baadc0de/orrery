@@ -58,7 +58,7 @@ use foundationdb::options::MutationType;
 use foundationdb::{Database, FdbBindingError};
 
 use orrery_protocol::{
-    AccountId, AssetId, CellId, Epoch, GridId, Intent, IntentOutcome, PersistId,
+    AccountId, AssetId, CellId, Epoch, GridId, Intent, IntentOutcome, NodeId, PersistId,
 };
 
 use futures::TryStreamExt as _;
@@ -124,6 +124,12 @@ pub struct FdbIntentExecutor {
     /// [`FdbIntentExecutor::refence`].
     fence: std::sync::RwLock<Option<IntentFence>>,
     allocator: Arc<tokio::sync::Mutex<PersistIdAllocator>>,
+    /// The local archive coordinate recorded beside an annulled product.
+    ///
+    /// It is installed only by a node that exposes archive restore. Keeping
+    /// it separate from the intent transaction's business inputs means the
+    /// usual executor remains usable by harnesses that have no journal.
+    restore_hold_index: std::sync::RwLock<Option<(NodeId, Arc<crate::journal::Journal>)>>,
     /// The epoch cache this executor records against, when the gateway
     /// enforces K-of-N.
     ///
@@ -237,6 +243,7 @@ impl FdbIntentExecutor {
             grid,
             fence: std::sync::RwLock::new(None),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
+            restore_hold_index: std::sync::RwLock::new(None),
             witness_epochs: None,
             witness_bindings: None,
             witness_enforcement: super::AttestationPosture::new(super::AttestationEnforcement::Off),
@@ -259,6 +266,7 @@ impl FdbIntentExecutor {
             grid,
             fence: std::sync::RwLock::new(Some(fence)),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
+            restore_hold_index: std::sync::RwLock::new(None),
             witness_epochs: None,
             witness_bindings: None,
             witness_enforcement: super::AttestationPosture::new(super::AttestationEnforcement::Off),
@@ -397,6 +405,19 @@ impl FdbIntentExecutor {
     #[must_use]
     pub fn database(&self) -> &Arc<Database> {
         &self.db
+    }
+
+    /// Attach the source-node journal used to index an annulment for archive
+    /// restore selection.
+    pub fn configure_restore_hold_index(
+        &self,
+        source_node: NodeId,
+        journal: Arc<crate::journal::Journal>,
+    ) {
+        *self
+            .restore_hold_index
+            .write()
+            .expect("restore-hold index lock poisoned") = Some((source_node, journal));
     }
 
     /// Allocate ids before entering the intent transaction.
@@ -1549,10 +1570,17 @@ impl ProvisionalStore for FdbIntentExecutor {
 
     async fn annul(&self, hold: &keyspace::ProvisionalHold) -> Result<(), IntentError> {
         let hold = hold.clone();
+        let hold_location = self
+            .restore_hold_index
+            .read()
+            .expect("restore-hold index lock poisoned")
+            .as_ref()
+            .map(|(source_node, journal)| (*source_node, journal.committed()));
         let result: Result<(), FdbBindingError> = self
             .db
             .run(|trx, _maybe_committed| {
                 let hold = hold.clone();
+                let hold_location = hold_location;
                 async move {
                     let ikey = keyspace::intent_key(hold.intent_id);
                     let previous = trx.get(&ikey, false).await?;
@@ -1604,6 +1632,17 @@ impl ProvisionalStore for FdbIntentExecutor {
                     let encoded =
                         postcard::to_stdvec(&row).map_err(store_err("intent row encode"))?;
                     trx.set(&ikey, &encoded);
+                    if let Some((source_node, filing_lsn)) = hold_location {
+                        trx.set(
+                            &keyspace::restore_hold_annulment_key(
+                                &source_node,
+                                hold.commitment.entity,
+                                filing_lsn,
+                                hold.intent_id,
+                            ),
+                            b"",
+                        );
+                    }
 
                     release_hold(&trx, &hold).await?;
                     Ok(())
@@ -2120,6 +2159,16 @@ mod tests {
         };
         let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID)).expect("connect");
         let db = Arc::clone(exec.database());
+        let journal_dir = tempfile::tempdir().expect("journal tempdir");
+        let journal = Arc::new(
+            crate::journal::Journal::open(&crate::journal::JournalConfig {
+                dir: journal_dir.path().to_path_buf(),
+                ..crate::journal::JournalConfig::default()
+            })
+            .expect("journal opens"),
+        );
+        let source_node = iroh_base::SecretKey::from_bytes(&[7; 32]).public();
+        exec.configure_restore_hold_index(source_node, Arc::clone(&journal));
         reset(&db, CAROL, &[0xd29_0004]).await;
 
         exec.execute_provisional(&credit(CAROL, 0xd29_0004, 100), AccountId::new(CAROL))
@@ -2127,6 +2176,24 @@ mod tests {
             .expect("no executor error");
         let hold = holds_of(&exec, CAROL).await.remove(0);
         exec.annul(&hold).await.expect("annul");
+
+        let hold_key = keyspace::restore_hold_annulment_key(
+            &source_node,
+            hold.commitment.entity,
+            orrery_protocol::Lsn::new(0, 0),
+            hold.intent_id,
+        );
+        let indexed = db
+            .run(|trx, _| {
+                let hold_key = hold_key.clone();
+                async move { Ok(trx.get(&hold_key, false).await?) }
+            })
+            .await
+            .expect("restore-hold index read");
+        assert!(
+            indexed.is_some(),
+            "annulment transaction writes its entity restore-hold index row"
+        );
 
         assert_eq!(
             balance(&db, CAROL).await,
@@ -2158,6 +2225,7 @@ mod tests {
         exec.annul(&hold).await.expect("second annul");
         assert_eq!(balance(&db, CAROL).await, 0);
         reset(&db, CAROL, &[0xd29_0004]).await;
+        journal.close().await.expect("journal closes");
     }
 
     #[tokio::test]

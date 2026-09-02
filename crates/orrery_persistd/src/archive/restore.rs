@@ -108,8 +108,7 @@ pub struct RestorePlan {
 }
 
 /// Read-only source of adjudication products that must hold an entity at its
-/// current value. The concrete join is deployment-specific: strike rows and
-/// annulled intent rows do not presently carry a direct entity key.
+/// current value.
 #[async_trait::async_trait]
 pub trait RestoreHoldDetector: Send + Sync {
     /// Return the product holding `entity`, or `None` when restoration may proceed.
@@ -131,6 +130,90 @@ impl RestoreHoldDetector for NoRestoreHolds {
         _entity: PersistId,
     ) -> Result<Option<String>, RestoreError> {
         Ok(None)
+    }
+}
+
+/// FoundationDB-backed join over the `yc` restore-hold index.
+///
+/// The index is ordered by `(source node, entity, filing LSN)`, so this reader
+/// has the same server-assigned LSN axis as [`RestoreSelection`].  It reads
+/// only products filed within the operator's selected range and returns the
+/// stable FDB key of the first one.
+#[cfg(feature = "fdb")]
+#[derive(Clone)]
+pub struct FdbRestoreHoldDetector {
+    db: Arc<foundationdb::Database>,
+}
+
+#[cfg(feature = "fdb")]
+impl FdbRestoreHoldDetector {
+    /// Bind the detector to a process-scoped FoundationDB handle.
+    #[must_use]
+    pub fn from_database(db: Arc<foundationdb::Database>) -> Self {
+        Self { db }
+    }
+}
+
+#[cfg(feature = "fdb")]
+#[async_trait::async_trait]
+impl RestoreHoldDetector for FdbRestoreHoldDetector {
+    async fn held_by(
+        &self,
+        selection: &RestoreSelection,
+        entity: PersistId,
+    ) -> Result<Option<String>, RestoreError> {
+        use futures::TryStreamExt as _;
+
+        let start = crate::keyspace::restore_hold_range_start(
+            &selection.source_node,
+            entity,
+            selection.start_lsn,
+        );
+        let end = crate::keyspace::restore_hold_range_end(
+            &selection.source_node,
+            entity,
+            selection.end_lsn,
+        );
+        self.db
+            .run(|trx, _| {
+                let start = start.clone();
+                let end = end.clone();
+                async move {
+                    let mut rows = trx.get_ranges_keyvalues(
+                        foundationdb::RangeOption {
+                            begin: foundationdb::KeySelector::first_greater_or_equal(
+                                start.as_slice(),
+                            ),
+                            end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
+                            limit: Some(1),
+                            ..foundationdb::RangeOption::default()
+                        },
+                        false,
+                    );
+                    let Some(row) = rows.try_next().await? else {
+                        return Ok(None);
+                    };
+                    let Some((source, indexed_entity, lsn, product)) =
+                        crate::keyspace::decode_restore_hold_key(row.key())
+                    else {
+                        return Err(foundationdb::FdbBindingError::new_custom_error(Box::new(
+                            RestoreError::Index("malformed restore-hold index key".into()),
+                        )));
+                    };
+                    if source != selection.source_node
+                        || indexed_entity != entity
+                        || lsn < selection.start_lsn
+                        || lsn > selection.end_lsn
+                    {
+                        return Err(foundationdb::FdbBindingError::new_custom_error(Box::new(
+                            RestoreError::Index("restore-hold index escaped its range".into()),
+                        )));
+                    }
+                    Ok(Some(product.stable_key()))
+                }
+            })
+            .await
+            .map_err(|error| RestoreError::Index(format!("restore-hold range read: {error}")))
     }
 }
 

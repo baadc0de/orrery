@@ -58,6 +58,8 @@ pub use receipt_tailer::{
     ReceiptArchiveTailer, ReceiptArchiveTailerHandle, ReceiptSource, ReceiptTailerPass,
     DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS, RECEIPT_ARCHIVE_SCANNERS,
 };
+#[cfg(feature = "fdb")]
+pub use restore::FdbRestoreHoldDetector;
 pub use restore::{
     RestoreApplier, RestoreApplyDisposition, RestoreApplyEntity, RestoreApplyReport,
     RestoreDisposition, RestoreError, RestoreHoldDetector, RestorePlan, RestorePlanEntity,
