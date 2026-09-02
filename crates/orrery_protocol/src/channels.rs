@@ -153,9 +153,20 @@ impl WireFamily {
 
     /// Recover a known family from its inner logical channel and sub-tag.
     ///
-    /// This deliberately reads the inner frame rather than the transport that
-    /// happened to carry it.  In particular, a delivered input remains a
-    /// delivered input when a future transport moves it to a datagram.
+    /// The sub-tag is the family; the channel byte is framing. Two families
+    /// are matched on both channels because their delivery class must not
+    /// depend on the channel: a **delivered input** is unsheddable by class,
+    /// so re-homing it onto the state channel — the move that made hits
+    /// sheddable — must not reclassify it; and the **witness envelope**
+    /// legitimately rides both channels (the log on state, range repair on
+    /// control), so the meter must recognize it either way and let the
+    /// transport say which lane it is. Every other family keeps its home
+    /// channel; an unknown pairing is not a family, and falls back to the
+    /// transport's default lane in `orrery_net`.
+    ///
+    /// The fallback cannot make traffic cheaper: every family it could
+    /// misname rides an unsheddable lane, so a mistake costs its sender
+    /// budget rather than buying it a shed.
     #[must_use]
     pub const fn from_frame(channel: Channel, tag: u8) -> Option<Self> {
         match (channel, tag) {
@@ -163,9 +174,9 @@ impl WireFamily {
             (Channel::State, 0xE9) => Some(Self::ReplicationCompressed),
             (Channel::State, 0xEB) => Some(Self::ReplicationDelta),
             (Channel::State, 0xED) => Some(Self::WitnessKeyframe),
-            (Channel::State, 0xE7) => Some(Self::Witness),
-            (Channel::State, 0xEA) => Some(Self::WitnessCompressed),
-            (Channel::Control, 0xE8) => Some(Self::DeliveredInput),
+            (_, 0xE7) => Some(Self::Witness),
+            (_, 0xEA) => Some(Self::WitnessCompressed),
+            (_, 0xE8) => Some(Self::DeliveredInput),
             (Channel::State, 0xEC) => Some(Self::Hit),
             _ => None,
         }

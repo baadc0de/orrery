@@ -801,6 +801,52 @@ mod tests {
     }
 
     #[test]
+    fn a_delivered_input_is_its_class_not_its_channel() {
+        // The delivered-input sub-tag names the class; the channel byte is
+        // framing. Today the frame rides the control channel; the move that
+        // made hits sheddable — re-homing the family onto the state channel —
+        // must leave the classification where the class put it. Both readings
+        // land on the same unsheddable lane.
+        use crate::channels::{tag, TAG_DELIVERED_INPUT};
+        let body = &[TAG_DELIVERED_INPUT, 1, 2, 3];
+        assert_eq!(
+            lane_of(Channel::Control, &tag(Channel::Control, body)),
+            Lane::Control
+        );
+        assert_eq!(
+            lane_of(Channel::State, &tag(Channel::State, body)),
+            Lane::Control
+        );
+    }
+
+    #[test]
+    fn the_witness_envelope_names_one_family_on_either_channel() {
+        // The log rides state and the meter reads it as witness; range repair
+        // shares the envelope on the control transport, where the transport —
+        // not a second caller field — puts it in the control lane.
+        use crate::channels::{encode_witness, encode_witness_compressed};
+        assert_eq!(
+            lane_of(Channel::State, &encode_witness(&[1u8, 2, 3])),
+            Lane::Witness
+        );
+        assert_eq!(
+            lane_of(
+                Channel::State,
+                &encode_witness_compressed(&vec![0u8; 4_096])
+            ),
+            Lane::Witness
+        );
+        assert_eq!(
+            lane_of(Channel::Control, &encode_witness(&[1u8, 2, 3])),
+            Lane::Control
+        );
+        assert_eq!(
+            lane_of(Channel::Control, &encode_witness_compressed(&[1u8, 2, 3])),
+            Lane::Control
+        );
+    }
+
+    #[test]
     fn a_delta_datagram_is_charged_to_the_replication_lane() {
         use orrery_protocol::channels::{
             encode_delta_patch, encode_replication_delta, ReplicationDelta, TAG_REPLICATION_DELTA,
