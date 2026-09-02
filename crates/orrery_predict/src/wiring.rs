@@ -52,22 +52,36 @@
 //! game must register correction for a component before its residuals become
 //! witness evidence.
 //!
+//! **The basis used by delayed interpolation.** The public timeline and
+//! `ConfirmedHistory<C>` are enough to calculate a plausible bracket after a
+//! component was written, but lightyear exposes no record of the bracket its
+//! built-in apply phase actually selected. [`AppInterpolationBasisExt`] uses
+//! lightyear's documented history-only path instead: one Orrery system selects
+//! the bracket once and co-produces the presented component and
+//! [`RenderedInterpBasis`]. This is deliberately a different apply path, not a
+//! reconstruction after the render value already exists.
+//!
 //! [`budget`]: crate::budget
 
 use bevy_app::prelude::*;
+use bevy_ecs::component::Mutable;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_platform::time::Instant;
+use lightyear::core::history_buffer::HistoryState;
 use lightyear::core::tick::TickDuration;
 use lightyear::prelude::client::ClientPlugins;
 use lightyear::prelude::client::InputDelayConfig;
 use lightyear::prelude::input::InputConfig;
-use lightyear::prelude::{InputTimelineConfig, SyncConfig};
 use lightyear::prelude::{
-    InterpolationConfig, LocalTimeline, Predicted, PredictionManager, PredictionMetrics,
-    ReplicationMetadata, RollbackMode, RollbackPolicy, RollbackSystems, VisualCorrection,
+    AppInterpolationExt as LightyearAppInterpolationExt, ConfirmedHistory, Interpolated,
+    InterpolationConfig, InterpolationFns, InterpolationFnsExt, InterpolationSystems,
+    InterpolationTimeline, LocalTimeline, NetworkTimeline, Predicted, PredictionManager,
+    PredictionMetrics, ReplicationMetadata, RollbackMode, RollbackPolicy, RollbackSystems,
+    VisualCorrection,
 };
-use orrery_protocol::{NodeId, PersistId};
+use lightyear::prelude::{InputTimelineConfig, SyncConfig};
+use orrery_protocol::{InterpBasis, NodeId, PersistId, UNorm16};
 use tracing::warn;
 
 use crate::budget::{ResimPlan, RollbackBudget};
@@ -152,15 +166,202 @@ impl AppReconciliationExt for App {
     }
 }
 
+/// Interpolates a component from two authoritative snapshots.
+///
+/// Implement this on the component that is actually presented for a remote
+/// entity, then register it with
+/// [`AppInterpolationBasisExt::interpolate_with_basis`]. `alpha` is already
+/// quantized through [`UNorm16`]: the visible value and a later `HitClaim`
+/// therefore use exactly the same fraction. `sample_delta` is the elapsed
+/// simulation time between the two snapshots when [`TickDuration`] is present,
+/// which lets transforms use Hermite interpolation with endpoint velocities.
+pub trait InterpolateWithBasis:
+    Component<Mutability = Mutable> + Clone + PartialEq + Send + Sync + 'static
+{
+    /// Produce the value presented between `from` and `to`.
+    fn interpolate(
+        from: Self,
+        to: Self,
+        alpha: f32,
+        sample_delta: Option<std::time::Duration>,
+    ) -> Self;
+}
+
+/// The interpolation basis that produced an entity's current presented value.
+///
+/// This component is inserted in the same producer system that writes the
+/// interpolated component. Systems that export a frame should order after
+/// [`PredictSystems::ProduceInterpolatedFrame`] and query both together. When
+/// interpolation cannot produce a new value, both the previous value and this
+/// basis remain unchanged, so they never describe different frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Component)]
+pub struct RenderedInterpBasis(pub InterpBasis);
+
+/// Registers delayed interpolation whose exact basis is exported with it.
+pub trait AppInterpolationBasisExt {
+    /// Let Lightyear maintain `C`'s confirmed history, while Orrery atomically
+    /// produces the presented `C` and its [`RenderedInterpBasis`].
+    ///
+    /// Use this instead of registering Lightyear's full interpolation pipeline
+    /// for the presented component. Lightyear 0.29 does not expose the bracket
+    /// selected by that pipeline after it writes `C`; its documented
+    /// history-only path is therefore the seam that makes an honest export
+    /// possible without reconstructing a plausible basis afterwards.
+    fn interpolate_with_basis<C>(&mut self) -> &mut Self
+    where
+        C: InterpolateWithBasis;
+}
+
+impl AppInterpolationBasisExt for App {
+    fn interpolate_with_basis<C>(&mut self) -> &mut Self
+    where
+        C: InterpolateWithBasis,
+    {
+        LightyearAppInterpolationExt::interpolate_with::<C>(
+            self,
+            // Delayed apply belongs to `produce_interpolated_frame`. Retaining
+            // this callback still lets Lightyear reuse the same interpolation
+            // for fixed-frame smoothing and visual correction.
+            InterpolationFns::history_only()
+                .interpolate_with_context(lightyear_frame_interpolate::<C>),
+        );
+        self.add_systems(
+            Update,
+            (produce_interpolated_frame::<C>, ApplyDeferred)
+                .chain()
+                .in_set(InterpolationSystems::Interpolate)
+                .in_set(PredictSystems::ProduceInterpolatedFrame),
+        )
+    }
+}
+
+fn lightyear_frame_interpolate<C>(
+    from: C,
+    to: C,
+    context: lightyear::prelude::InterpolationSampleContext,
+) -> C
+where
+    C: InterpolateWithBasis,
+{
+    C::interpolate(
+        from,
+        to,
+        context.t,
+        context
+            .sample_delta_secs
+            .map(std::time::Duration::from_secs_f32),
+    )
+}
+
 /// System sets this crate adds, so a game can order against them by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SystemSet)]
 pub enum PredictSystems {
+    /// Co-produces an interpolated component and the basis that produced it.
+    ProduceInterpolatedFrame,
     /// Samples the cost of one predicted-subset fixed step.
     MeasureStep,
     /// Applies the D8 degradation ladder to lightyear's rollback bound.
     EnforceBudget,
     /// Turns post-rollback corrections into monitor residuals.
     FeedMonitor,
+}
+
+type InterpolatedFrameQuery<'world, 'state, C> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static ConfirmedHistory<C>,
+        &'static mut C,
+        Option<&'static mut RenderedInterpBasis>,
+    ),
+    With<Interpolated>,
+>;
+
+fn produce_interpolated_frame<C>(
+    timeline: Res<InterpolationTimeline>,
+    bridge: Res<TickBridge>,
+    tick_duration: Option<Res<TickDuration>>,
+    mut commands: Commands,
+    mut interpolated: InterpolatedFrameQuery<C>,
+) where
+    C: InterpolateWithBasis,
+{
+    let interpolation_tick = timeline.now().tick();
+    let overstep = timeline.overstep().to_f32();
+
+    for (entity, history, mut presented, reported) in &mut interpolated {
+        let Some((value, basis)) = sample_presented(
+            history,
+            interpolation_tick,
+            overstep,
+            tick_duration.as_deref(),
+            &bridge,
+        ) else {
+            continue;
+        };
+
+        *presented = value;
+        if let Some(mut reported) = reported {
+            reported.0 = basis;
+        } else {
+            commands.entity(entity).insert(RenderedInterpBasis(basis));
+        }
+    }
+}
+
+fn sample_presented<C>(
+    history: &ConfirmedHistory<C>,
+    interpolation_tick: lightyear::core::tick::Tick,
+    overstep: f32,
+    tick_duration: Option<&TickDuration>,
+    bridge: &TickBridge,
+) -> Option<(C, InterpBasis)>
+where
+    C: InterpolateWithBasis,
+{
+    let from_index = (0..history.len())
+        .take_while(|index| {
+            history
+                .get_nth_tick(*index)
+                .is_some_and(|tick| tick <= interpolation_tick)
+        })
+        .last()?;
+    let (from_tick, from_state) = history.get_nth_state(from_index)?;
+    let HistoryState::Updated(from) = from_state else {
+        return None;
+    };
+
+    let Some((to_tick, HistoryState::Updated(to))) = history.get_nth_state(from_index + 1) else {
+        return Some((
+            from.clone(),
+            InterpBasis::exact(bridge.resolve(from_tick.0)),
+        ));
+    };
+    let tick_delta = to_tick - from_tick;
+    if tick_delta <= 0 {
+        return Some((
+            from.clone(),
+            InterpBasis::exact(bridge.resolve(from_tick.0)),
+        ));
+    }
+
+    let raw_alpha =
+        (((interpolation_tick - from_tick) as f32 + overstep) / tick_delta as f32).clamp(0.0, 1.0);
+    let alpha = UNorm16::from_f64(f64::from(raw_alpha));
+    let basis = InterpBasis {
+        from: bridge.resolve(from_tick.0),
+        to: bridge.resolve(to_tick.0),
+        alpha,
+    };
+    let sample_delta = tick_duration.map(|duration| duration.0 * tick_delta as u32);
+    let value = C::interpolate(
+        from.clone(),
+        to.clone(),
+        alpha.to_f64() as f32,
+        sample_delta,
+    );
+    Some((value, basis))
 }
 
 /// Wall-clock start of the current fixed step, for the cost EWMA.
@@ -389,6 +590,95 @@ fn feed_residuals<D>(
             tick,
             correction.error.pos_error_mm(),
             correction.error.vel_error_mms(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod interpolation_basis_tests {
+    use super::*;
+    use lightyear::core::history_buffer::HistoryState;
+    use lightyear::core::tick::Tick as LightyearTick;
+    use lightyear::core::time::{Overstep, TickInstant};
+    use lightyear::prelude::{
+        ConfirmedHistory, Interpolated, InterpolationTimeline, NetworkTimeline,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Component)]
+    struct PresentedAlpha(f32);
+
+    impl InterpolateWithBasis for PresentedAlpha {
+        fn interpolate(
+            _from: Self,
+            _to: Self,
+            alpha: f32,
+            _sample_delta: Option<std::time::Duration>,
+        ) -> Self {
+            Self(alpha)
+        }
+    }
+
+    fn move_timeline_after_frame(mut timeline: ResMut<InterpolationTimeline>) {
+        timeline.set_now(TickInstant::from_tick_and_overstep(
+            LightyearTick(15),
+            Overstep::from_f32(0.75),
+        ));
+    }
+
+    /// This is deliberately hostile to an after-the-fact exporter. The frame is
+    /// produced at 12.25 between ticks 10 and 16, then the timeline moves to
+    /// 15.75 before observation. A second bracket/fraction computation would
+    /// report the latter basis even though `PresentedAlpha` still contains the
+    /// former. Co-producing the component and basis is the only way this holds.
+    #[test]
+    fn exported_basis_survives_timeline_motion_after_the_frame_was_produced() {
+        let mut app = App::new();
+        let mut timeline = InterpolationTimeline::default();
+        timeline.set_now(TickInstant::from_tick_and_overstep(
+            LightyearTick(12),
+            Overstep::from_f32(0.25),
+        ));
+        app.insert_resource(timeline)
+            .insert_resource(TickBridge::anchor(orrery_protocol::Tick::new(1_000), 10))
+            .add_systems(
+                Update,
+                (
+                    produce_interpolated_frame::<PresentedAlpha>,
+                    move_timeline_after_frame,
+                )
+                    .chain(),
+            );
+
+        let mut history = ConfirmedHistory::default();
+        history.insert_explicit(
+            LightyearTick(10),
+            HistoryState::Updated(PresentedAlpha(-1.0)),
+        );
+        history.insert_explicit(
+            LightyearTick(16),
+            HistoryState::Updated(PresentedAlpha(-1.0)),
+        );
+        let entity = app
+            .world_mut()
+            .spawn((Interpolated, PresentedAlpha(-1.0), history))
+            .id();
+
+        app.update();
+
+        let presented = app.world().get::<PresentedAlpha>(entity).unwrap();
+        let exported = app.world().get::<RenderedInterpBasis>(entity).unwrap().0;
+        assert_eq!(exported.from, orrery_protocol::Tick::new(1_000));
+        assert_eq!(exported.to, orrery_protocol::Tick::new(1_006));
+        assert_eq!(
+            presented.0.to_bits(),
+            (exported.alpha.to_f64() as f32).to_bits(),
+            "the visible value and exported basis must use the same quantized alpha"
+        );
+
+        let independently_recomputed = orrery_protocol::UNorm16::from_f64(5.75 / 6.0);
+        assert_ne!(
+            exported.alpha, independently_recomputed,
+            "the moved timeline must make an independent recomputation disagree or the test is vacuous"
         );
     }
 }
