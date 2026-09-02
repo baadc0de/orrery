@@ -942,7 +942,9 @@ jobs:
           set -euo pipefail
           cargo build --release -p orrery_persistd --features fdb
           cargo build --release -p orrery_seed --features orrery_seed/fdb
-          cargo build --release -p orrery_coordinator
+          # See scripts/gate-status.sh: `standing-feed` is built here because
+          # this leg has a cluster. It arms nothing on its own.
+          cargo build --release -p orrery_coordinator --features standing-feed
 
       - name: Build the sibling harness
         working-directory: gates/p3-siblings

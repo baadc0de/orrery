@@ -99,11 +99,20 @@ fn main() -> anyhow::Result<()> {
         }
         tracing::info!(identity = %server.id(), "identity service up");
 
+        // D33 clause (e)'s filing-driven half. Spawned after readiness so a
+        // sweep can never delay the line a harness parses, and held only to
+        // be aborted at shutdown: a sweep that outlives the server would keep
+        // writing `dc` rows for a process that has stopped serving.
+        let filing = spawn_filing_reactor(&cli, &store, thresholds)?;
+
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("received Ctrl-C, shutting down"),
             _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        }
+        for task in filing {
+            task.abort();
         }
         server.shutdown().await;
         Ok::<_, anyhow::Error>(())
@@ -140,6 +149,83 @@ fn thresholds(cli: &Cli) -> anyhow::Result<StandingThresholds> {
     Ok(thresholds)
 }
 
+/// Start D33 clause (e)'s filing-driven evaluator and its C5 posture poller.
+///
+/// Returns the spawned tasks so `main` can abort them at shutdown. Two tasks
+/// rather than one because the posture poller must keep refreshing the cell
+/// even while a sweep is in flight — that is what makes D32 clause (f)'s
+/// auto-suspend able to demote this control mid-sweep rather than after it.
+///
+/// The startup posture is `off`, so this changes nothing for a deployment that
+/// does not ask for it: the queue is not even read. A `ramp/strikes` row, or
+/// `--strikes`, is what arms it — a runtime dial an operator can turn on a
+/// shipped binary, which is what a compile-time feature could never be.
+#[cfg(feature = "fdb")]
+fn spawn_filing_reactor(
+    cli: &Cli,
+    store: &std::sync::Arc<FdbAccountStore>,
+    thresholds: StandingThresholds,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    use orrery_persistd::gateway::{
+        spawn_strikes_posture_poller, StrikesEnforcement, StrikesPosture,
+    };
+
+    let startup: StrikesEnforcement = cli
+        .strikes
+        .parse()
+        .map_err(|error: String| anyhow::anyhow!("--strikes: {error}"))?;
+    let posture = StrikesPosture::new(startup);
+
+    let context = orrery_persistd::FdbContext::connect(&cli.cluster_file)
+        .map_err(|error| anyhow::anyhow!("--cluster-file {}: {error}", cli.cluster_file))?;
+    let reader = std::sync::Arc::new(orrery_persistd::intent::FdbRampPostureStore::from_context(
+        &context,
+    )) as orrery_persistd::intent::SharedRampPostureReader;
+    let poller = spawn_strikes_posture_poller(reader, posture.clone(), startup);
+
+    let scorer = ComputedStanding::new(
+        FdbStrikeRowSource::from_database(context.database()),
+        system_now_ms,
+        thresholds,
+    )
+    .map_err(|error| anyhow::anyhow!("standing thresholds: {error}"))?;
+    let reactor = StandingFilingReactor::new(
+        std::sync::Arc::clone(store),
+        FdbFilingNoticeQueue::from_database(context.database()),
+        scorer,
+        posture,
+    );
+
+    let period = std::time::Duration::from_millis(cli.filing_sweep_ms.max(1));
+    let sweeper = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        loop {
+            interval.tick().await;
+            match reactor.sweep().await {
+                Ok(sweep) if sweep.seen > 0 => tracing::info!(
+                    mode = ?sweep.mode,
+                    seen = sweep.seen,
+                    published = sweep.published,
+                    would_publish = sweep.would_publish,
+                    cleared = sweep.cleared,
+                    failed = sweep.failed,
+                    "swept the standing filing queue"
+                ),
+                Ok(_) => {}
+                // The queue read itself failed. Log and try again next tick:
+                // an identity replica that exits on a transient FoundationDB
+                // error stops minting too, which is a far larger outage than
+                // one late invalidation.
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not read the standing filing queue; retrying next sweep"
+                ),
+            }
+        }
+    });
+    Ok(vec![poller, sweeper])
+}
+
 /// The wall clock the scorer evaluates decay at.
 #[cfg(feature = "fdb")]
 fn system_now_ms() -> u64 {
@@ -173,7 +259,9 @@ fn decode_key(value: &str) -> anyhow::Result<[u8; 32]> {
 #[cfg(feature = "fdb")]
 use clap::Parser as _;
 #[cfg(feature = "fdb")]
-use orrery_identity::fdb::{FdbAccountStore, FdbStrikeRowSource};
+use orrery_identity::fdb::{FdbAccountStore, FdbFilingNoticeQueue, FdbStrikeRowSource};
+#[cfg(feature = "fdb")]
+use orrery_identity::filing::StandingFilingReactor;
 #[cfg(feature = "fdb")]
 use orrery_identity::server::{IdentityServer, IdentityServerConfig};
 #[cfg(feature = "fdb")]
@@ -242,4 +330,43 @@ struct Cli {
     /// How long a fresh account remains on probation, in milliseconds.
     #[arg(long, env = "ORRERY_IDENTITY_PROBATION_MS")]
     probation_ms: Option<u64>,
+
+    /// D32 control C5: this service's posture for D33 clause (e)'s
+    /// *filing-driven* standing evaluation.
+    ///
+    /// `off` — the executor's `yd` filing notices are not read at all, which
+    /// is the shipped default and the behaviour every existing deployment
+    /// keeps. Notices accumulate, so promoting the control later still acts
+    /// on everything filed while it was off.
+    /// `shadow` — every notice is evaluated exactly as `live` would and the
+    /// would-be invalidation is recorded on `orrery::ramp::shadow`, but no
+    /// `dc` row is written and no notice is drained.
+    /// `live` — an account found at or above `C` gets its durable `dc` entry,
+    /// which is what `orrery_identity::invalidation` publishes to gateways
+    /// and coordinators.
+    ///
+    /// This governs only the filing-driven sweep. The mint path's own refusal
+    /// is D33 clause (f) and is not a ramp control: a token is never stamped
+    /// `Good` against an unread ledger, at any posture.
+    ///
+    /// A durable `ramp/strikes` row overrides this within one poll interval;
+    /// this flag is the startup default the poller falls back to when no row
+    /// exists. Like every other posture selector in this tree it takes no
+    /// environment fallback — an inherited variable would arm every identity
+    /// replica a supervisor spawns.
+    #[arg(long, value_name = "off|shadow|live", default_value = "off")]
+    strikes: String,
+
+    /// How often the filing-driven sweep drains the `yd` queue, in
+    /// milliseconds.
+    ///
+    /// A cadence, not a posture, so it takes an environment fallback: an
+    /// inherited value cannot arm a control, only change how often an already
+    /// armed one looks.
+    #[arg(
+        long,
+        default_value_t = 15_000,
+        env = "ORRERY_IDENTITY_FILING_SWEEP_MS"
+    )]
+    filing_sweep_ms: u64,
 }

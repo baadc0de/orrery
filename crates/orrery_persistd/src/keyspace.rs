@@ -2539,6 +2539,82 @@ pub fn restore_hold_family_range_end() -> Vec<u8> {
     vec![b'y', RESTORE_HOLD_DISCRIMINATOR + 1]
 }
 
+// ---------------------------------------------------------------------------
+// Filing-notice queue: `yd || account:u64-be`
+// ---------------------------------------------------------------------------
+
+/// The `y`-family discriminator for D33 clause (e)'s filing-notice queue.
+///
+/// `ya` is the strike ledger, `yb` the episode-dedup marker and `yc` the
+/// restore-hold join. This fourth subspace is none of those: it is a *work
+/// queue*, written by the executor at the instant it files a strike and
+/// drained by identity once it has evaluated the account's standing.
+///
+/// It exists because D33 clause (e) requires standing to be evaluated "after
+/// every live filing", and the two halves of that sentence sit in different
+/// processes that may not call each other. `orrery_identity` depends on this
+/// crate and never the reverse, so the executor cannot notify identity
+/// in-process; a durable row it writes and identity reads is the only
+/// direction the dependency graph allows. See `orrery_identity::filing`.
+///
+/// The value is the filing instant, not a strike: a notice carries no verdict,
+/// no weight and no [`StrikeMode`](crate::adjudication::StrikeMode). The
+/// scorer over `ya` remains the sole authority on what an account's standing
+/// is, so a notice can never disagree with it — the worst a spurious notice
+/// can do is make identity re-score an account and find nothing.
+pub const FILING_NOTICE_DISCRIMINATOR: u8 = b'd';
+
+/// `yd || account:u64-be`, one account's pending filing notice.
+///
+/// Keyed by account rather than by versionstamp, so the family is bounded by
+/// the number of accounts awaiting evaluation rather than by the number of
+/// filings ever made. A second filing for an account already queued overwrites
+/// the notice with the later instant instead of appending, which is exactly
+/// the collapse a queue of "re-score this account" wants.
+#[must_use]
+pub fn filing_notice_key(account: AccountId) -> [u8; 10] {
+    let mut key = [0; 10];
+    key[0] = b'y';
+    // Spelled as a literal, not as [`FILING_NOTICE_DISCRIMINATOR`], for the
+    // same reason `restore_hold_prefix` spells `b'c'`: D35 clause (c)'s
+    // registry gate scans this module's *text* for a byte literal assigned to
+    // the second key byte, and a constructor that hides its discriminator
+    // behind a constant is invisible to it. The two are held together by
+    // [`tests::the_filing_notice_span_does_not_overlap_the_restore_hold_span`],
+    // which places this key inside the const-derived family span.
+    key[1] = b'd';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// First key in the whole `yd` filing-notice family.
+#[must_use]
+pub fn filing_notice_range_start() -> Vec<u8> {
+    vec![b'y', FILING_NOTICE_DISCRIMINATOR]
+}
+
+/// Exclusive end of the whole `yd` filing-notice family.
+#[must_use]
+pub fn filing_notice_range_end() -> Vec<u8> {
+    vec![b'y', FILING_NOTICE_DISCRIMINATOR + 1]
+}
+
+/// The account a [`filing_notice_key`] names, or `None` if it is not one.
+///
+/// Returns an option rather than panicking: this decodes keys a range read
+/// produced, and a foreign key in the span is a data fact to skip rather than
+/// a reason to take down the sweep.
+#[must_use]
+pub fn filing_notice_account(key: &[u8]) -> Option<AccountId> {
+    let key: &[u8; 10] = key.try_into().ok()?;
+    if key[0] != b'y' || key[1] != FILING_NOTICE_DISCRIMINATOR {
+        return None;
+    }
+    Some(AccountId::new(u64::from_be_bytes(
+        key[2..10].try_into().expect("8 bytes"),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3459,6 +3535,46 @@ mod tests {
     }
 
     #[test]
+    fn a_filing_notice_key_is_yd_account_and_round_trips() {
+        let account = AccountId::new(0x0862_0000_dead_beef);
+        let key = filing_notice_key(account);
+        assert_eq!(&key[..2], b"yd", "the notice family is `yd`");
+        assert_eq!(
+            filing_notice_account(&key),
+            Some(account),
+            "a sweep must recover the account a notice names"
+        );
+    }
+
+    /// The `yd` span must begin exactly where the `yc` span ends, or a
+    /// restore-hold retention sweep would delete identity's pending work.
+    #[test]
+    fn the_filing_notice_span_does_not_overlap_the_restore_hold_span() {
+        assert_eq!(
+            restore_hold_family_range_end(),
+            filing_notice_range_start(),
+            "`yc`'s exclusive end is `yd`'s inclusive start"
+        );
+        let key = filing_notice_key(AccountId::new(u64::MAX)).to_vec();
+        assert!(
+            key >= filing_notice_range_start() && key < filing_notice_range_end(),
+            "every notice key lies inside the family span"
+        );
+        assert!(
+            key >= restore_hold_family_range_end(),
+            "no notice key lies inside the restore-hold span"
+        );
+    }
+
+    /// A foreign key handed to the decoder is skipped, not fatal: the sweep
+    /// reads a range, and a range can contain something it did not write.
+    #[test]
+    fn a_foreign_key_is_not_read_as_a_filing_notice() {
+        assert_eq!(filing_notice_account(&strike_key(AccountId::new(1))), None);
+        assert_eq!(filing_notice_account(b"yd"), None);
+    }
+
+    #[test]
     fn id_keys_have_the_widths_and_discriminators_d31_specifies() {
         let account = account_key(AccountId::new(0x0102_0304_0506_0708));
         assert_eq!(account.len(), 10, "da ‖ account:u64 BE");
@@ -4109,6 +4225,11 @@ mod tests {
                             discriminator: b'c',
                             name: "strike/yc restore holds",
                             sample: restore_hold_annulment_key(&node(1), PersistId::new(1), 1),
+                        },
+                        SubKind {
+                            discriminator: FILING_NOTICE_DISCRIMINATOR,
+                            name: "strike/yd filing notices",
+                            sample: filing_notice_key(AccountId::new(1)).to_vec(),
                         },
                     ],
                 },
