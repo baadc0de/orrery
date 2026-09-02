@@ -990,6 +990,19 @@ pub struct CombatView {
     pub target: Option<CraftView>,
     /// The locked target's own state when it is a rock this client can see.
     pub rock_target: Option<RockView>,
+    /// How many client ticks old the locked target's replicated state is.
+    ///
+    /// [`None`] means there is no replica to age: no target, or a session
+    /// that replicates nothing (offline play holds every craft locally).
+    /// `Some(0)` means it refreshed on this tick.
+    ///
+    /// Nothing in this module extrapolates a stale body — the replication
+    /// ingest installs state verbatim and no dead reckoning advances it — so
+    /// `range_mm`, `band` and `hit_forecast` are all measured against a
+    /// position exactly this old. The number is carried so the readout can
+    /// say so instead of printing an exact separation to a body that has not
+    /// reported in (#940).
+    pub target_age_ticks: Option<u64>,
 }
 
 impl CombatView {
@@ -1012,7 +1025,25 @@ impl CombatView {
             lock,
             target,
             rock_target,
+            // The executor knows nothing about where its state came from.
+            // Freshness lives on the campaign runtime, so the system that
+            // holds both fills this in; `None` here is "not asked", and the
+            // readout treats it as "no replica to age" rather than "fresh".
+            target_age_ticks: None,
         }
+    }
+
+    /// Whether the locked target's replicated state is old enough that an
+    /// exact separation would be a claim the client cannot support.
+    ///
+    /// Any age at all qualifies: a replicated craft is frozen between
+    /// refreshes, and an interceptor at its ceiling covers 8 m in a single
+    /// tick. This deliberately does not pick a "safe" threshold, because
+    /// there is no age at which a frozen body's position is exact except
+    /// zero.
+    #[must_use]
+    pub fn target_is_stale(&self) -> bool {
+        self.target_age_ticks.is_some_and(|age| age > 0)
     }
 
     /// Straight-line separation to the locked target, in millimetres.
@@ -1096,6 +1127,85 @@ impl CombatView {
             self.hit_chance_ppm()
                 .map_or(HitBand::Unreadable, HitBand::of_chance_ppm),
         )
+    }
+
+    /// The resolver's frame for the shot this craft currently has in the air.
+    ///
+    /// [`None`] when there is nothing to read in that frame: no own craft, no
+    /// visible target, or no *ruleset-timed* shot of ours aimed at it. A
+    /// presentation-only muzzle is excluded on purpose — its origin is a
+    /// skin-side endpoint, not an `attacker_pos` the ruleset stamped, and
+    /// reading reach off it would be the skin asserting a fact the ruleset
+    /// never published.
+    ///
+    /// See [`FiringFrame`] for why this differs from [`Self::range_mm`].
+    #[must_use]
+    pub fn firing_frame(&self, tracks: &ProjectileTracks) -> Option<FiringFrame> {
+        let own = self.own?;
+        let track = tracks.own_shot(own.entity)?;
+        if !track.timed {
+            return None;
+        }
+        let (target_pos, radius) =
+            if let Some(target) = self.target.filter(|t| t.entity == track.target) {
+                (target.pos, target.archetype.limits().radius_mm)
+            } else {
+                let target = self.rock_target.filter(|t| t.entity == track.target)?;
+                (target.pos, target.tier.limits().radius_mm)
+            };
+        let range_mm = i64::try_from(separation_mm(target_pos, track.origin)).ok()?;
+        Some(FiringFrame {
+            range_mm,
+            reach_mm: reach_mm(track.weapon.weapon(), radius),
+        })
+    }
+}
+
+/// The separation the ruleset will judge a shot **already in the air** by.
+///
+/// `projectile_resolution` re-checks range on every tick of flight against a
+/// deliberately mixed time frame: the target's *current* position and the
+/// attacker's position at the tick the trigger was pulled, frozen onto the
+/// `Damage` order and never refreshed. That is the outrunning mechanic and
+/// the ruleset is right by definition.
+///
+/// The consequence for the skin is that its own live readout — `range_mm`,
+/// `band` and `hit_forecast`, all measured from where the attacker is *now*
+/// — is not the number the resolver is about to apply. An attacker closing on
+/// its target reads a shorter separation than the ruleset does, so the HUD
+/// can show a lock as in-range for the whole flight of a shot the ruleset is
+/// going to refuse with `RangeExceeded` (#940).
+///
+/// This is not a prediction and it invents nothing. Both terms are already on
+/// the client: the origin is `attacker_pos` lifted verbatim off the
+/// `Outcome::DamageDealt` that put this shot in the air ([`Track::origin`]),
+/// and the reach is [`reach_mm`], the resolver's own. It is the resolver's
+/// arithmetic transcribed, in the resolver's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FiringFrame {
+    /// `|target_now - attacker_at_fire|`: the resolver's own `range_sq` term,
+    /// square-rooted.
+    pub range_mm: i64,
+    /// `optimal + falloff + target_radius`: the resolver's own `reach`.
+    pub reach_mm: i64,
+}
+
+impl FiringFrame {
+    /// Whether the resolver would break this lock rather than roll.
+    #[must_use]
+    pub const fn exceeded(self) -> bool {
+        self.range_mm > self.reach_mm
+    }
+
+    /// How far past reach the firing frame puts the target, in millimetres.
+    /// Zero when the shot is still inside reach.
+    #[must_use]
+    pub const fn past_reach_mm(self) -> i64 {
+        if self.exceeded() {
+            self.range_mm.saturating_sub(self.reach_mm)
+        } else {
+            0
+        }
     }
 }
 
@@ -1729,6 +1839,7 @@ mod band_boundaries {
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &them)),
             rock_target: None,
+            target_age_ticks: None,
         }
     }
 
@@ -1915,6 +2026,7 @@ mod band_boundaries {
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &them)),
             rock_target: None,
+            target_age_ticks: None,
         };
         // That target is also far out of reach, and the reach guard is the
         // honest answer there: it is a fact about the geometry that needs no
@@ -1938,6 +2050,7 @@ mod band_boundaries {
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &close)),
             rock_target: None,
+            target_age_ticks: None,
         };
         assert_eq!(unreadable.hit_forecast(), Some(HitBand::Unreadable));
         assert_eq!(HitBand::Unreadable.label(), "NO READ");
@@ -2339,5 +2452,157 @@ mod ruleset_agreement {
                 ..
             }
         )));
+    }
+    /// #940: the skin showed a lock as in range and in arc while the ruleset
+    /// refused the shot with `RangeExceeded`.
+    ///
+    /// This reproduces that disagreement against the real resolver, and it is
+    /// not a bug in the resolver. `projectile_resolution` judges a shot in
+    /// flight from the attacker's position *at the tick the trigger was
+    /// pulled* — frozen onto the `Damage` order — against the target's
+    /// *current* position. That mixed time frame is the outrunning mechanic
+    /// and is documented as deliberate. The defect is that the skin measured
+    /// from where the attacker is *now*, so an attacker closing on its target
+    /// read a shorter separation than the resolver was applying, and printed
+    /// a healthy band for a shot already doomed.
+    ///
+    /// Every value here is one production can produce: the track is built by
+    /// `ProjectileTracks::observe` from a `DamageDealt` the resolver itself
+    /// emitted, so `origin` is a real stamped `attacker_pos`.
+    #[test]
+    fn the_skin_discloses_a_shot_the_resolver_will_refuse_for_range() {
+        let weapon = WEAPON.weapon();
+        let radius = target_radius_mm();
+        let reach = reach_mm(weapon, radius);
+        let origin = QPos { x: 0, y: 0, z: 0 };
+
+        // A craft at `x`, standing still, as the resolver sees it.
+        let at = |x: i64| {
+            let mut craft = Craft::spawned(Archetype::Interceptor, QPos { x, y: 0, z: 0 }, 0);
+            craft.vel = QVel { x: 0, y: 0, z: 0 };
+            craft
+        };
+        // One real resolution against `from_pos == origin`, the frozen muzzle.
+        let fire_at = |target: Craft, flight_ticks: Option<u16>| {
+            let mut executor = Executor::new(Regolith::honest(), UniverseSeed([9; 32]));
+            executor.insert(TARGET, RegolithState::Craft(target));
+            executor
+                .step_entity(
+                    TARGET,
+                    Tick::new(11),
+                    &[Order::Damage {
+                        amount: 1,
+                        from: SHOOTER,
+                        from_pos: origin,
+                        from_vel: QVel::default(),
+                        from_yaw_urad: 0,
+                        from_archetype: Archetype::Interceptor,
+                        from_weapon: WEAPON,
+                        flight_ticks,
+                    }],
+                )
+                .expect("the target is installed")
+                .events
+        };
+
+        // The shot leaves the muzzle while the target is inside reach, and
+        // the resolver puts it in the air with a real flight countdown.
+        let muzzle = fire_at(at(reach - 50_000), None);
+        let mut tracks = ProjectileTracks::default();
+        tracks.observe(&muzzle);
+        let track = tracks
+            .own_shot(SHOOTER)
+            .expect("the resolver put a shot in the air");
+        assert!(
+            track.timed,
+            "fixture is wrong: this must be a ruleset-timed flight, not a muzzle statement"
+        );
+        assert_eq!(
+            track.origin, origin,
+            "the track must carry the resolver's own stamped attacker_pos"
+        );
+
+        // During that flight the target runs past reach *of the muzzle*,
+        // while the attacker closes to well inside its own weapon envelope.
+        let escaped_x = reach + 50_000;
+        let refusal = fire_at(at(escaped_x), Some(track.remaining));
+        assert!(
+            refusal.iter().any(|event| matches!(
+                event,
+                Outcome::LockBroken {
+                    reason: LockBreakReason::RangeExceeded,
+                    ..
+                }
+            )),
+            "fixture is inert: the resolver did not refuse this shot for range"
+        );
+        assert!(
+            !refusal
+                .iter()
+                .any(|event| matches!(event, Outcome::ShotResolved { .. })),
+            "past reach the resolver never rolls"
+        );
+
+        // What the skin's live readout says at that same instant: the
+        // attacker has closed to 150 m of the target, which is inside optimal.
+        let mut me = Craft::spawned(
+            Archetype::Interceptor,
+            QPos {
+                x: escaped_x - 150_000,
+                y: 0,
+                z: 0,
+            },
+            0,
+        );
+        me.lock_target = Some(TARGET);
+        me.lock_class = Some(LockClass::Ship);
+        me.lock_progress = LOCK_ACQUISITION_TICKS;
+        let view = CombatView {
+            own: Some(CraftView::of(SHOOTER, &me)),
+            lock: LockView::of(&me),
+            target: Some(CraftView::of(TARGET, &at(escaped_x))),
+            rock_target: None,
+            target_age_ticks: None,
+        };
+        assert_eq!(
+            view.band(),
+            Some(RangeBand::Optimal),
+            "the live readout calls this an optimal-range shot"
+        );
+        assert_eq!(
+            view.hit_forecast(),
+            Some(HitBand::Perfect),
+            "and the live forecast calls it a certainty - this is the lie the \
+             player was shown while the resolver was refusing the shot"
+        );
+
+        // The firing frame is the resolver's own arithmetic, and it disagrees.
+        let frame = view
+            .firing_frame(&tracks)
+            .expect("a ruleset-timed shot of ours is in the air at this target");
+        assert!(
+            frame.exceeded(),
+            "the firing frame must reach the same verdict the resolver just \
+             reached: {} mm against a reach of {} mm",
+            frame.range_mm,
+            frame.reach_mm
+        );
+        assert_eq!(frame.range_mm, escaped_x, "judged from the frozen muzzle");
+        assert_eq!(frame.reach_mm, reach);
+        assert_eq!(frame.past_reach_mm(), 50_000);
+
+        // And the same craft, with the same shot in the air, at a target that
+        // has *not* outrun the muzzle: no disclosure, nothing to warn about.
+        let inside = CombatView {
+            target: Some(CraftView::of(TARGET, &at(reach - 50_000))),
+            ..view
+        };
+        let inside_frame = inside
+            .firing_frame(&tracks)
+            .expect("the shot is still in the air");
+        assert!(
+            !inside_frame.exceeded(),
+            "a shot still inside the muzzle's reach must not be flagged"
+        );
     }
 }

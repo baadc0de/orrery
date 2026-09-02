@@ -1291,7 +1291,21 @@ pub fn target_title(view: &CombatView) -> String {
 pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
     let mut parts = Vec::new();
     if let Some(range_mm) = view.range_mm() {
-        parts.push(format!("{} m", range_mm / 1_000));
+        // A replicated body is frozen between refreshes — nothing dead-reckons
+        // it — so the separation is exactly as old as the replica. Printing a
+        // bare metre count for a stale body states a precision the client does
+        // not have, which is the claim the hearsay arrows already refuse to
+        // make: every one of them wears its age (#940).
+        if view.target_is_stale() {
+            let age = view.target_age_ticks.unwrap_or_default();
+            parts.push(format!(
+                "~{} m ({:.1} s stale)",
+                range_mm / 1_000,
+                age as f64 / f64::from(orrery_core::TICK_HZ)
+            ));
+        } else {
+            parts.push(format!("{} m", range_mm / 1_000));
+        }
     }
     if let Some(band) = view.band() {
         parts.push(band.label().to_owned());
@@ -1308,6 +1322,19 @@ pub fn target_relation(view: &CombatView, tracks: &ProjectileTracks) -> String {
         )),
         Some(_) => parts.push("leaving muzzle".to_owned()),
         None => parts.push("nothing in the air".to_owned()),
+    }
+    // The metres above are measured from where this craft is *now*. The
+    // resolver measures a shot in the air from where it was when the trigger
+    // was pulled (#940), so when those two disagree the disagreement is
+    // printed rather than left for the player to discover as a refusal.
+    if let Some(frame) = view.firing_frame(tracks) {
+        if frame.exceeded() {
+            parts.push(format!(
+                "shot judged from {} m at fire | {} m past reach - RANGE EXCEEDED",
+                frame.range_mm / 1_000,
+                frame.past_reach_mm() / 1_000
+            ));
+        }
     }
     parts.join(" | ")
 }
@@ -1456,6 +1483,7 @@ mod tests {
                 },
                 target: Some(craft_view(THEM, Archetype::Cruiser, 120.0)),
                 rock_target: None,
+                target_age_ticks: None,
             });
             app.add_systems(Update, sync_lock_reticle);
             app.update();
@@ -1482,6 +1510,7 @@ mod tests {
             },
             target: Some(craft_view(THEM, Archetype::Cruiser, 120.0)),
             rock_target: None,
+            target_age_ticks: None,
         });
         app.add_systems(Update, sync_lock_reticle);
         app.update();
@@ -2263,6 +2292,7 @@ mod tests {
             },
             target: None,
             rock_target: None,
+            target_age_ticks: None,
         };
         let line = target_title(&view);
         assert!(line.contains("no window here"), "{line}");
@@ -2287,6 +2317,7 @@ mod tests {
             },
             target: Some(craft_view(THEM, Archetype::Cruiser, inside_optimal_m)),
             rock_target: None,
+            target_age_ticks: None,
         };
         let line = target_relation(&view, &tracks);
         assert!(
@@ -2349,6 +2380,62 @@ mod band_line {
             lock: LockView::of(&me),
             target: Some(CraftView::of(PersistId::new(2), &them)),
             rock_target: None,
+            target_age_ticks: None,
+        }
+    }
+
+    /// #940: the range readout printed an exact metre count for a replicated
+    /// craft that is *frozen* between refreshes — nothing dead-reckons it —
+    /// with no cue at all that the number was up to two seconds old. The
+    /// hearsay layer, carrying strictly weaker data, prints its age on every
+    /// arrow and refuses to draw past its horizon; the replicated layer made
+    /// the stronger claim with no disclosure.
+    ///
+    /// Ages here are the ones production produces: `replica_age_ticks` is
+    /// bounded by `REPLICA_TTL_TICKS` (120) because expiry retires anything
+    /// older, and `None` is offline play, which replicates nothing.
+    #[test]
+    fn a_stale_replica_is_never_reported_as_an_exact_separation() {
+        let tracks = ProjectileTracks::default();
+
+        // No replica to age: offline play, where the state is local and the
+        // separation really is exact. Disclosure here would be an invention.
+        let fresh = CombatView {
+            target_age_ticks: None,
+            ..locked_on(0)
+        };
+        let line = target_relation(&fresh, &tracks);
+        assert!(
+            line.contains("240 m") && !line.contains('~') && !line.contains("stale"),
+            "local state is exact and must be printed as such: {line}"
+        );
+
+        // Refreshed on this very tick: still exact.
+        let current = CombatView {
+            target_age_ticks: Some(0),
+            ..locked_on(0)
+        };
+        assert!(
+            !target_relation(&current, &tracks).contains("stale"),
+            "a replica that refreshed this tick is not stale"
+        );
+
+        // Every age a live replica can actually hold.
+        for age in 1..=120u64 {
+            let view = CombatView {
+                target_age_ticks: Some(age),
+                ..locked_on(0)
+            };
+            let line = target_relation(&view, &tracks);
+            assert!(
+                line.contains("stale"),
+                "age {age}: the readout stated a separation to a body that has \
+                 not reported in for {age} ticks, with no cue: {line}"
+            );
+            assert!(
+                line.contains('~'),
+                "age {age}: the metre count must stop claiming to be exact: {line}"
+            );
         }
     }
 
