@@ -727,12 +727,15 @@ fn episode_dedup_digest(ruleset: RulesetId, episode: &StrikeEpisodeRef) -> [u8; 
     *blake3::hash(&encoded).as_bytes()
 }
 
+#[cfg(feature = "fdb")]
+type RestoreHoldIndex = Arc<std::sync::RwLock<Option<(NodeId, Arc<crate::journal::Journal>)>>>;
+
 /// FoundationDB-backed executor-owned writer for D33's `ya` family.
 #[cfg(feature = "fdb")]
 #[derive(Clone)]
 pub struct FdbStrikeLedger {
     db: Arc<foundationdb::Database>,
-    restore_hold_index: Arc<std::sync::RwLock<Option<(NodeId, Arc<crate::journal::Journal>)>>>,
+    restore_hold_index: RestoreHoldIndex,
 }
 
 #[cfg(feature = "fdb")]
@@ -844,7 +847,6 @@ impl StrikeLedger for FdbStrikeLedger {
         futures::executor::block_on(async move {
             db.run(|trx, _| {
                 let row = row.clone();
-                let hold_location = hold_location;
                 async move {
                     let binding_key = crate::keyspace::binding_key(&target);
                     let Some(raw_binding) = trx.get(&binding_key, false).await? else {

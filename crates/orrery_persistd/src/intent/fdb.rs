@@ -1580,7 +1580,6 @@ impl ProvisionalStore for FdbIntentExecutor {
             .db
             .run(|trx, _maybe_committed| {
                 let hold = hold.clone();
-                let hold_location = hold_location;
                 async move {
                     let ikey = keyspace::intent_key(hold.intent_id);
                     let previous = trx.get(&ikey, false).await?;
