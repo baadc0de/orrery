@@ -62,6 +62,7 @@ their linked dependencies.
 | D47 | [ADR-47](adr/0047-rollback-unit.md) | Only prediction rewinds: canonical is correction-only, durable recovery-only, critical compensation-only; the unit is the per-entity predicted set with all-or-nothing restore |
 | D48 | [ADR-0048](adr/0048-canonical-witness-projection.md) | The canonical witness projection WP-1..WP-6; `projection_version` becomes a third orthogonal version axis, widening D38 clause (d)(3) |
 | D49 | [ADR-0049](adr/0049-compatibility-manifest.md) | The compatibility manifest: field set by verdict, `RulesetId.digest` gains a real scope, the seven-axis composition law, no rolling-upgrade story |
+| D51 | [ADR-0051](adr/0051-v1-terrain-is-not-durable-state.md) | v1 terrain is not durable state: the `TerrainDelta` / `chunk/` promises and the `k` family are withdrawn, recovering one clean prefix byte that this decision does not spend |
 
 ## Status and supersession
 
@@ -90,12 +91,13 @@ rules H1-H6. The owner signalled acceptance in principle on 2026-08-27 while
 explicitly reserving the right to change their mind; it is non-normative
 until the owner flips its status.
 
-D51 is **proposed, not accepted**:
-[ADR-0051](adr/0051-v1-terrain-is-not-durable-state.md) drafts the owner's
-2026-09-01 #830 decision to remove v1 durable terrain. It is deliberately
-absent from the index above until the owner accepts it; the draft names its
-supersession of D11's terrain allocation and D32/D35's reclaimed-byte
-arithmetic without changing those accepted records while Proposed.
+D51 was **accepted on 2026-09-02**:
+[ADR-0051](adr/0051-v1-terrain-is-not-durable-state.md) records the owner's
+2026-09-01 #830 decision to remove v1 durable terrain. Its supersession of
+D11's terrain allocation and its amendment of D32/D35's reclaimed-byte
+arithmetic are now in force, but those accepted records have **not yet been
+edited** — that follow-up is tracked separately so each amendment lands
+through its own record rather than by D51 rewriting them.
 
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
