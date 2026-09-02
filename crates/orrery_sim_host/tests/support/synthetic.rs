@@ -14,6 +14,21 @@
 //! neighbour read, no adapter delivery and no off-lattice quantization could
 //! pass a rewind test while leaving every interesting path unproven.
 //!
+//! # Why this is not `orrery_synthetic`
+//!
+//! #871 landed a crate by that name, and it is deliberately the *smaller* of
+//! the two: one `i64`, a no-op `quantize`, and uninhabited input and event
+//! types — the minimum a pose ring can be filled from.  This one cannot be
+//! replaced by it without silently weakening every proof in this crate.
+//! Adopting it would leave the ABI's command submit and event drain
+//! unreachable (both types are uninhabited), VC-7 unexercised (`quantize`
+//! does nothing), and — the sharp one — it would make the observation-stamp
+//! mutant in `tests/rewind.rs` **inert**, because a ruleset that reads no
+//! neighbour cannot notice a staleness bound.  The two coexist because they
+//! prove different things: `orrery_synthetic` is the smallest rules a hit
+//! claim can be adjudicated against, and this is the smallest rules that
+//! exercise every path the host seam has.
+//!
 //! The state is deliberately shaped like something a first-person game would
 //! carry (a position, a velocity, hit points, a target) so the flat encoding a
 //! C++ consumer mirrors is a realistic one, but every field is generic.
