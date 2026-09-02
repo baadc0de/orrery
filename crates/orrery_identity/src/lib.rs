@@ -72,6 +72,7 @@
 
 pub mod client;
 pub mod cooldown;
+pub mod filing;
 pub mod invalidation;
 pub mod invite;
 pub mod issuer;

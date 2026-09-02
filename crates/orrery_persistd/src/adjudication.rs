@@ -1338,6 +1338,21 @@ impl StrikeLedger for FdbStrikeLedger {
                         &encoded,
                         MutationType::SetVersionstampedKey,
                     );
+                    // D33 clause (e)'s "after every live filing" half. The
+                    // notice is written in the *same* transaction as the row,
+                    // so a strike that exists always has a pending evaluation
+                    // and a notice never names a filing that did not commit.
+                    //
+                    // Written for every filed row, shadow-stamped ones
+                    // included, because this ledger has no mode branch and
+                    // must not grow one: the mode lives in the row and the
+                    // scorer is what reads it. A shadow filing therefore
+                    // queues an evaluation that finds nothing, which is what
+                    // shadow means.
+                    trx.set(
+                        &crate::keyspace::filing_notice_key(account),
+                        &row.issued_at_ms.to_be_bytes(),
+                    );
                     if let Some(source_node) = hold_location {
                         trx.atomic_op(
                             &crate::keyspace::restore_hold_strike_versionstamped_key(

@@ -254,8 +254,13 @@ lane_clippy() {
     # compiles the crate with the feature off. Without this line that wiring is
     # not merely untested, it is never type-checked — the state #863's poller
     # work found it in.
+    #
+    # `standing-feed` was in a worse state still (#862 box 2): no build, no CI
+    # job and no lint compiled it, so D33 clause (e)'s consumer wiring was
+    # never type-checked by anything. It ships on the fdb-capable gate builds
+    # now; this line is what keeps it compiling on every commit.
     run cargo clippy -p orrery_coordinator --all-targets --no-deps \
-        --features fdb-state \
+        --features fdb-state,standing-feed \
         -- -D warnings
 
     # D19 keeps Fjall as a mutually exclusive fallback. The workspace command
@@ -746,6 +751,26 @@ self_test() {
         note "self-test: ci.yml delegates all ${#LANES[@]} per-commit jobs"
     else
         note 'self-test: no .github/workflows/ci.yml here; skipped the delegation clause'
+    fi
+
+    # #862 box 2: D33 clause (e)'s coordinator-side feed must stay reachable on
+    # a binary somebody actually builds. It spent its whole life behind a cargo
+    # feature that no build, no CI job and no lint enabled, which is strictly
+    # weaker than `--strikes off` — that is at least a runtime dial an operator
+    # can turn. Two clauses, because either alone can rot: something must
+    # *build* it, and this lane must keep *type-checking* it.
+    grep -Eq -- '^ *--features [a-z,-]*standing-feed' \
+        <(sed -n '/^lane_clippy() {/,/^}/p' "$0") \
+        || die 'self-test: the clippy lane no longer type-checks the standing-feed wiring'
+    # `--exclude` keeps this assertion from matching its own text: the earlier
+    # form searched all of scripts/, found this line, and passed with every
+    # real build site reverted.
+    if grep -rlE --exclude="$(basename "$0")" -- \
+        '^ *cargo build .*-p orrery_coordinator .*--features [a-z,-]*standing-feed' \
+        "$ROOT/scripts" "$ROOT/.github/workflows" >/dev/null 2>&1; then
+        note 'self-test: standing-feed is enabled by an in-repo coordinator build'
+    else
+        die 'self-test: no in-repo build enables orrery_coordinator/standing-feed (#862 box 2)'
     fi
 
     # D19 retains Fjall as a real fallback, not dead source. Both the clippy

@@ -13,12 +13,23 @@ license = "MIT OR Apache-2.0"
 # Not implemented in P1; the in-memory state is reconstructible from presence.
 fdb-state = ["dep:orrery_persistd", "orrery_persistd/fdb"]
 # D33 clause (e)'s standing-invalidation feed, read from identity's durable
-# `dc` family. Off by default: it pulls `orrery_identity` (and through it
-# `orrery_persistd` and the FoundationDB C client) into a service whose own
-# state is in-memory, and a coordinator with no identity store to read is the
-# shipped default. Enabling it only *offers* `--identity-cluster-file`; C5
-# still starts at D32's `off` posture and acts on nothing until an operator
-# raises `--strikes`.
+# `dc` family. Enabling it only *offers* `--identity-cluster-file`; C5 still
+# starts at D32's `off` posture and acts on nothing until an operator raises
+# `--strikes`, so the feature is packaging and the two runtime dials are the
+# gate.
+#
+# Not in a `default` set, and deliberately: it links `orrery_identity` and
+# through it the FoundationDB C client, which the P3 island leg does not have
+# and does not want (nightly.yml documents its FDB-free build as the honest
+# configuration for a volatile lease store). It is instead enabled by every
+# in-repo coordinator build that *does* run against a cluster — the p3-siblings
+# leg in `scripts/gate-status.sh` and `.github/workflows/nightly.yml` — and
+# type-checked on every commit by `scripts/check.sh`'s clippy lane.
+#
+# #862 box 2 found it in the state that made this necessary: no build, no CI
+# job and no lint compiled it at all, so an operator could not turn the feed on
+# without editing this manifest. A compile-time flag nobody sets is weaker than
+# `--strikes off`, which is at least a dial on a shipped binary.
 #
 # Independent of `fdb-state`, which reads D32's `ramp/` posture rows through
 # persistd's keyspace. Both may be on; cargo unifies the FoundationDB features

@@ -38,6 +38,7 @@
 //! wearing the signature of a hash probe. [`crate::MemAccountStore`] implements
 //! it because a lock-guarded map probe genuinely is tier 2.
 
+use crate::filing::FilingNotice;
 use crate::store::{AccountStore, BindOutcome, CooldownEntry, CooldownRecord, IdentityError};
 use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
@@ -682,6 +683,112 @@ impl AccountStore for FdbAccountStore {
     }
 }
 
+/// The durable half of D33 clause (e)'s filing queue: the executor's `yd`
+/// notices, as [`crate::filing`] drains them.
+///
+/// A separate type from [`FdbAccountStore`] on purpose. `yd` is written by the
+/// adjudication executor and belongs to the `y` family, not to identity's `d`
+/// family, so it is not a row [`AccountStore`] may grow a method for — identity
+/// only ever *consumes* it. Keeping the two adapters apart keeps "identity owns
+/// `d`, the executor owns `y`" true of the code and not just of the prose.
+#[derive(Clone)]
+pub struct FdbFilingNoticeQueue {
+    db: Arc<Database>,
+}
+
+impl std::fmt::Debug for FdbFilingNoticeQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FdbFilingNoticeQueue")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FdbFilingNoticeQueue {
+    /// Open a bounded queue handle against `cluster_file`.
+    ///
+    /// # Errors
+    ///
+    /// [`IdentityError::Store`] when the cluster file cannot be opened.
+    pub fn connect(cluster_file: &str) -> Result<Self, IdentityError> {
+        let context = orrery_persistd::fdb::FdbContext::connect(cluster_file)
+            .map_err(|error| IdentityError::Store(error.to_string()))?;
+        Ok(Self::from_database(context.database()))
+    }
+
+    /// Reuse a process-scoped, bounded database handle.
+    #[must_use]
+    pub fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl crate::filing::FilingNoticeQueue for FdbFilingNoticeQueue {
+    async fn pending(&self) -> Result<Vec<FilingNotice>, IdentityError> {
+        // Snapshot, for the reason `cooldown_entries` gives: this is a sweep,
+        // not an admission decision, and taking conflict ranges over the whole
+        // family would make every sweep conflict with every concurrent filing.
+        // A notice missed by one sweep is read by the next; the compare-and-
+        // clear below is what actually protects against a lost filing.
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                let start = keyspace::filing_notice_range_start();
+                let end = keyspace::filing_notice_range_end();
+                let mut stream = trx.get_ranges_keyvalues(
+                    foundationdb::RangeOption {
+                        begin: foundationdb::KeySelector::first_greater_or_equal(start.as_slice()),
+                        end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
+                        ..foundationdb::RangeOption::default()
+                    },
+                    true,
+                );
+                let mut notices = Vec::new();
+                while let Some(kv) = stream.try_next().await? {
+                    // A key this decoder does not recognise is skipped, not
+                    // fatal: one unreadable row must not stop every other
+                    // account's invalidation from being published.
+                    let Some(account) = keyspace::filing_notice_account(kv.key()) else {
+                        continue;
+                    };
+                    let value: [u8; 8] = kv.value().try_into().map_err(|_| {
+                        custom(IdentityError::Store(
+                            "filing notice decode: expected 8 bytes".into(),
+                        ))
+                    })?;
+                    notices.push(FilingNotice {
+                        account,
+                        filed_at_ms: u64::from_be_bytes(value),
+                    });
+                }
+                Ok(notices)
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+
+    async fn clear_if(&self, notice: FilingNotice) -> Result<bool, IdentityError> {
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                let key = keyspace::filing_notice_key(notice.account);
+                // A serializable read here, unlike the sweep above: this one
+                // *is* the decision, and a filing that commits between the read
+                // and the clear must make this transaction retry rather than
+                // have its notice erased by a sweep that never saw it.
+                let current = trx.get(&key, false).await?;
+                let still_ours = current.as_deref().is_some_and(|raw| {
+                    <[u8; 8]>::try_from(raw)
+                        .is_ok_and(|value| u64::from_be_bytes(value) == notice.filed_at_ms)
+                });
+                if still_ours {
+                    trx.clear(&key);
+                }
+                Ok(still_ours)
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! FDB-gated tests for the durable store.
@@ -1173,6 +1280,11 @@ mod tests {
                 let end = end.clone();
                 async move {
                     trx.clear_range(&start, &end);
+                    // The `yd` notice is written by the same filing
+                    // transaction, so it is this suite's row too: a leftover
+                    // would make the next run's sweep evaluate an account it
+                    // believes it just created clean.
+                    trx.clear(&keyspace::filing_notice_key(account));
                     Ok(())
                 }
             })
@@ -1312,6 +1424,259 @@ mod tests {
                     .expect("read entry")
                     .is_some(),
                 "the refused mint left the durable `dc` row the feed reads"
+            );
+
+            wipe_strikes(&store, account).await;
+            wipe(&store, account, &[node]).await;
+        }
+    );
+
+    // #862 acceptance box 2's producer half. The mint-driven publisher
+    // (#934) proves a *refused mint* leaves a `dc` row; this proves the half
+    // that had no mechanism at all — an account that crosses `C` and never
+    // comes back to identity. Nothing here calls `standing()`.
+    fdb_test!(
+        a_real_filing_publishes_an_invalidation_with_no_mint_at_all,
+        |store| async move {
+            use crate::filing::{FilingNoticeQueue, StandingFilingReactor};
+            use crate::invalidation::StandingInvalidationSource;
+            use crate::ComputedStanding;
+            use orrery_persistd::adjudication::StrikeMode;
+            use orrery_persistd::gateway::{StrikesEnforcement, StrikesPosture};
+
+            let account = account(0x8623);
+            let node = node(0x73);
+            wipe(&store, account, &[node]).await;
+            wipe_strikes(&store, account).await;
+
+            let at_ms = 1_000_000;
+            let source = file_through_the_real_ledger(
+                &store,
+                account,
+                &node,
+                at_ms,
+                &[
+                    major_row(at_ms + 1, 3, StrikeMode::Live),
+                    major_row(at_ms + 1, 4, StrikeMode::Live),
+                ],
+            )
+            .await;
+
+            let queue = FdbFilingNoticeQueue::from_database(Arc::clone(&store.db));
+            assert!(
+                queue
+                    .pending()
+                    .await
+                    .expect("read the filing queue")
+                    .iter()
+                    .any(|notice| notice.account == account),
+                "the executor's filing transaction left a `yd` notice identity can read"
+            );
+
+            let store = Arc::new(store);
+            // The reactor's clock is *after* the filing, as a deployed sweep's
+            // would be — a fixture that scored at the filing instant itself
+            // would exercise a coincidence production cannot produce.
+            let scorer = ComputedStanding::new(
+                source,
+                move || at_ms + 5_000,
+                crate::standing::DEFAULT_STANDING_THRESHOLDS,
+            )
+            .expect("the default policy package is coherent");
+            let reactor = StandingFilingReactor::new(
+                Arc::clone(&store),
+                FdbFilingNoticeQueue::from_database(Arc::clone(&store.db)),
+                scorer,
+                StrikesPosture::new(StrikesEnforcement::Live),
+            );
+            let sweep = reactor.sweep().await.expect("sweep the durable queue");
+            assert!(
+                sweep.published >= 1,
+                "the sweep recorded the crossing: {sweep:?}"
+            );
+
+            let published = StandingInvalidationSource::new(Arc::clone(&store))
+                .current()
+                .await
+                .expect("publish");
+            let mine = published
+                .iter()
+                .find(|invalidation| invalidation.account == account)
+                .expect(
+                    "a_real_filing_publishes_an_invalidation_with_no_mint_at_all: \
+                     the coordinator's feed sees the account",
+                );
+            assert_eq!(
+                mine.effective_from_ms.0,
+                at_ms + 5_000,
+                "the watermark is the sweep's read instant, which is when the refusal began"
+            );
+
+            // And the notice is drained, so the next sweep does no work twice.
+            assert!(
+                !FdbFilingNoticeQueue::from_database(Arc::clone(&store.db))
+                    .pending()
+                    .await
+                    .expect("re-read the queue")
+                    .iter()
+                    .any(|notice| notice.account == account),
+                "a `Live` sweep drains the notice it acted on"
+            );
+
+            wipe_strikes(&store, account).await;
+            wipe(&store, account, &[node]).await;
+        }
+    );
+
+    // The durable compare-and-clear, which is the only thing standing between
+    // a filing that lands mid-sweep and a strike nobody ever evaluates. The
+    // in-memory queue's test covers the trait's contract; this covers the
+    // implementation the deployed reactor actually calls.
+    fdb_test!(
+        a_notice_rewritten_by_a_later_filing_survives_the_clear,
+        |store| async move {
+            use crate::filing::{FilingNotice, FilingNoticeQueue};
+            use orrery_persistd::adjudication::StrikeMode;
+
+            let account = account(0x8625);
+            let node = node(0x75);
+            wipe(&store, account, &[node]).await;
+            wipe_strikes(&store, account).await;
+
+            let at_ms = 1_000_000;
+            file_through_the_real_ledger(
+                &store,
+                account,
+                &node,
+                at_ms,
+                &[major_row(at_ms + 1, 7, StrikeMode::Live)],
+            )
+            .await;
+
+            let queue = FdbFilingNoticeQueue::from_database(Arc::clone(&store.db));
+            let read = queue
+                .pending()
+                .await
+                .expect("read the queue")
+                .into_iter()
+                .find(|notice| notice.account == account)
+                .expect("the filing queued a notice");
+
+            // A second filing lands while the sweep is still evaluating the
+            // first. It overwrites the notice with its own, later, instant.
+            let ledger = orrery_persistd::adjudication::FdbStrikeLedger::from_database(Arc::clone(
+                &store.db,
+            ));
+            {
+                use orrery_persistd::adjudication::{OffenceTime, StrikeLedger};
+                ledger
+                    .file(
+                        node,
+                        OffenceTime::KnownMs(at_ms + 1),
+                        &major_row(at_ms + 9_000, 8, StrikeMode::Live),
+                        None,
+                    )
+                    .expect("the second filing");
+            }
+
+            assert!(
+                !queue
+                    .clear_if(read)
+                    .await
+                    .expect("compare-and-clear the stale notice"),
+                "a_notice_rewritten_by_a_later_filing_survives_the_clear"
+            );
+            let after = queue
+                .pending()
+                .await
+                .expect("re-read the queue")
+                .into_iter()
+                .find(|notice| notice.account == account)
+                .expect("the later filing's notice is still queued");
+            assert_eq!(
+                after,
+                FilingNotice {
+                    account,
+                    filed_at_ms: at_ms + 9_000,
+                },
+                "the surviving notice is the later filing's, not the one just evaluated"
+            );
+            // And the notice the sweep did read clears cleanly when nothing
+            // has raced it, so the ordinary path still drains.
+            assert!(
+                queue
+                    .clear_if(after)
+                    .await
+                    .expect("clear the current notice"),
+                "an unraced notice is drained"
+            );
+
+            wipe_strikes(&store, account).await;
+            wipe(&store, account, &[node]).await;
+        }
+    );
+
+    // Box 4 on the new path: a shadow filing really does queue a notice — the
+    // ledger has no mode branch — and evaluating it changes no standing,
+    // because the scorer is what ignores a shadow row.
+    fdb_test!(
+        a_shadow_filing_queues_a_notice_that_publishes_nothing,
+        |store| async move {
+            use crate::filing::{FilingNoticeQueue, StandingFilingReactor};
+            use crate::ComputedStanding;
+            use orrery_persistd::adjudication::StrikeMode;
+            use orrery_persistd::gateway::{StrikesEnforcement, StrikesPosture};
+
+            let account = account(0x8624);
+            let node = node(0x74);
+            wipe(&store, account, &[node]).await;
+            wipe_strikes(&store, account).await;
+
+            let at_ms = 1_000_000;
+            let source = file_through_the_real_ledger(
+                &store,
+                account,
+                &node,
+                at_ms,
+                &[
+                    major_row(at_ms + 1, 5, StrikeMode::Shadow),
+                    major_row(at_ms + 1, 6, StrikeMode::Shadow),
+                ],
+            )
+            .await;
+
+            assert!(
+                FdbFilingNoticeQueue::from_database(Arc::clone(&store.db))
+                    .pending()
+                    .await
+                    .expect("read the filing queue")
+                    .iter()
+                    .any(|notice| notice.account == account),
+                "a shadow filing still queues a notice; the scorer, not the ledger, decides"
+            );
+
+            let store = Arc::new(store);
+            let scorer = ComputedStanding::new(
+                source,
+                move || at_ms + 5_000,
+                crate::standing::DEFAULT_STANDING_THRESHOLDS,
+            )
+            .expect("the default policy package is coherent");
+            let reactor = StandingFilingReactor::new(
+                Arc::clone(&store),
+                FdbFilingNoticeQueue::from_database(Arc::clone(&store.db)),
+                scorer,
+                StrikesPosture::new(StrikesEnforcement::Live),
+            );
+            let sweep = reactor.sweep().await.expect("sweep");
+            assert_eq!(
+                sweep.published, 0,
+                "a_shadow_filing_queues_a_notice_that_publishes_nothing: {sweep:?}"
+            );
+            assert_eq!(
+                store.cooldown_entry(account).await.expect("read entry"),
+                None,
+                "no `dc` row exists, so the feed publishes nothing for this account"
             );
 
             wipe_strikes(&store, account).await;

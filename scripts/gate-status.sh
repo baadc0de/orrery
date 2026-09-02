@@ -383,7 +383,14 @@ gate_p3_siblings_run() {
   {
     cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_persistd --features fdb
     cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_seed --features orrery_seed/fdb
-    cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_coordinator
+    # `standing-feed` ships here and not on the island leg: this is the only
+    # in-repo coordinator build that runs against a FoundationDB cluster, and
+    # the feature links identity's durable reader. Enabling it arms nothing —
+    # the feed stays `None` until an operator passes `--identity-cluster-file`,
+    # and C5's posture still starts at `off`. It only makes D33 clause (e)'s
+    # consumer *reachable* on a built binary, which a cargo feature no build
+    # sets never is.
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_coordinator --features standing-feed
     (cd "$ROOT/gates/p3-siblings" && cargo build --release)
     PERSISTD_BIN="$ROOT/target/release/persistd" \
     COORDINATOR_BIN="$ROOT/target/release/orrery-coordinator" \
