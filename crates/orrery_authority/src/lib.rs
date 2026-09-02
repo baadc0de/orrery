@@ -34,7 +34,7 @@ pub use ephemeral::{
     IslandAuthoritative, IslandAuthorityEvent, IslandClaim, IslandClient, IslandInbox,
     IslandOutbox,
 };
-pub use hit::{HitRules, PoseHistory, PoseRing, PoseSample};
+pub use hit::{CanonicalPosePublications, HitRules, PoseHistory, PoseRing, PoseSample};
 
 /// Registrar TTL from D7/D16, in milliseconds.
 pub const LEASE_TTL_MS: u64 = 10_000;
@@ -957,6 +957,7 @@ impl Plugin for OrreryAuthorityPlugin {
             .init_resource::<ephemeral::EphemeralRegistry>()
             .init_resource::<ephemeral::IslandInbox>()
             .init_resource::<ephemeral::IslandOutbox>()
+            .init_resource::<hit::CanonicalPosePublications>()
             .add_message::<AuthorityEvent>()
             .add_message::<ephemeral::IslandAuthorityEvent>()
             .add_systems(
@@ -969,6 +970,9 @@ impl Plugin for OrreryAuthorityPlugin {
                     // be seen with its settled status before the propagator
                     // decides whether to claim it again.
                     process_lease_replies,
+                    // The settled live-fence set decides which game-published
+                    // canonical poses may enter the authority's hit rings.
+                    hit::record_published_held_poses,
                     ephemeral::process_island_claims,
                     // Verdicts reach the planner's back-off state *before* it
                     // plans, or a body refused this frame is re-claimed in the

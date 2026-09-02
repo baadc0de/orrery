@@ -22,7 +22,7 @@
 //! loses an entity calls [`PoseHistory::forget`], and a claim against it is
 //! refused as [`HitRefusal::NotMyEntity`] from then on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy_ecs::prelude::*;
 use orrery_protocol::{
@@ -43,6 +43,58 @@ pub struct PoseSample {
     pub position: LatticePoint,
     /// Hit radius, in lattice units (millimetres).
     pub hit_radius: u32,
+}
+
+/// Canonical end-of-tick poses published by the game for hit validation.
+///
+/// This is a host-supplied, post-canonical-step observation queue. After each
+/// canonical step, game code calls [`Self::publish`] once for every persistent
+/// entity this node held during that step. The authority plugin drains the
+/// queue in `Update`, records only entities for which it still holds a live
+/// fence, and discards publications for unheld entities by name.
+///
+/// The sample must come from the game's canonical simulation state. A Bevy
+/// `Transform`, rendered mirror, interpolated pose, or predicted pose is not a
+/// substitute: validating against one would make the authority judge a claim
+/// against state it did not compute. This type deliberately contains no Bevy
+/// transform conversion that could make that mistake look sanctioned.
+///
+/// Each publication carries its own [`Tick`] instead of borrowing
+/// [`crate::ContactTick::tick`]. `ContactTick` names the physics step that
+/// produced a contact report, while a game's canonical step need not be its
+/// physics step. Both ticks must come from the same universe-global tick source
+/// when they describe the same step; publishing different values is a host
+/// contract violation. Keeping the tick on the queued item also preserves
+/// every canonical tick when several fixed steps run before one `Update`.
+///
+/// A second publication for the same `(tick, entity)` replaces the pending
+/// sample. The consumer therefore calls [`PoseHistory::record`] exactly once
+/// per published tick per held entity.
+#[derive(Debug, Default, Resource)]
+pub struct CanonicalPosePublications {
+    pending: BTreeMap<(Tick, PersistId), PoseSample>,
+}
+
+impl CanonicalPosePublications {
+    /// Publish `entity`'s canonical pose at the end of `tick`.
+    ///
+    /// Call this from the game-owned system that has just completed the
+    /// canonical step, never from presentation extraction or interpolation.
+    pub fn publish(&mut self, entity: PersistId, tick: Tick, sample: PoseSample) {
+        self.pending.insert((tick, entity), sample);
+    }
+
+    /// Whether no canonical poses are waiting for the authority consumer.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// The number of distinct `(tick, entity)` publications waiting.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 /// The ruleset's static facts a hit validator needs.
@@ -318,6 +370,37 @@ impl PoseHistory {
             });
         }
         Ok(pose)
+    }
+}
+
+/// Drain game-published canonical poses into the rings of entities held here.
+///
+/// The live fence set is the filter, not an ECS marker or a status supplied by
+/// the game. Publications for any other [`PersistId`] are ignored and never
+/// open a ring. Conversely, every held entity gets an empty ring even when the
+/// host publishes nothing, so a claim against a held-but-unpublished entity is
+/// refused as [`HitRefusal::BasisNotRetained`] rather than mistaken for an
+/// entity held elsewhere. Rings are dropped as soon as their fence is lost.
+pub fn record_published_held_poses(
+    mut publications: ResMut<CanonicalPosePublications>,
+    state: Res<crate::AuthorityState>,
+    mut history: ResMut<PoseHistory>,
+) {
+    let held: BTreeSet<_> = state.held_leases().map(|(persist, _)| persist).collect();
+
+    history.rings.retain(|persist, _| held.contains(persist));
+    let depth = history.window.history_ticks;
+    for persist in &held {
+        history
+            .rings
+            .entry(*persist)
+            .or_insert_with(|| PoseRing::new(depth));
+    }
+
+    for ((tick, persist), sample) in std::mem::take(&mut publications.pending) {
+        if held.contains(&persist) {
+            history.record(persist, tick, sample);
+        }
     }
 }
 
