@@ -10,14 +10,27 @@ cargo run
 ## Where the client writes
 
 Everything this client writes -- the session telemetry stream, the join file a
-campaign join produces, and the upload-retry state -- lives in one per-user
-application data directory:
+campaign join produces, and the upload-retry state -- lives in one directory:
+**the directory containing the executable**, by owner decision (2026-09-02).
+The extracted release folder is where a volunteer is already looking, on every
+operating system, so that is where the files appear.
+
+The location has moved twice. It was first a per-user application data
+directory (#766), chosen by platform convention:
 
 | Platform | Location |
 |---|---|
 | Windows | `%LOCALAPPDATA%\Orrery\Regolith\` (`%APPDATA%` if unset) |
 | Linux | `$XDG_DATA_HOME/orrery/regolith/`, else `~/.local/share/orrery/regolith/` |
 | macOS | `~/Library/Application Support/Orrery/Regolith/` |
+
+That solved writability but hid the files, so an owner decision the same day
+moved the default to the working directory -- and that was the wrong mechanism
+for the right intent: after a macOS Finder double-click the working directory
+is the user's HOME, so a volunteer's `session.jsonl` landed in
+`/Users/<user>/` while he searched the extracted release folder for it
+(#942). The per-user conventions remain in the code (`paths::data_dir_from`)
+for any future opt-in, which is why the table stays here.
 
 Not `target/`: that is Cargo's build directory, which a downloaded client does
 not have, and resolving it against the working directory meant a volunteer who

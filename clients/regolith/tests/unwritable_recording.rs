@@ -2,7 +2,7 @@
 //!
 //! `RegolithSkinPlugin::build` used to `panic!` when the telemetry file could
 //! not be opened. That runs during plugin registration, before any UI exists,
-//! so a volunteer whose launch directory blocked the *create* — a ZIP preview
+//! so a volunteer whose artifact directory blocked the *create* — a ZIP preview
 //! path, an elevated install directory, a Controlled Folder Access denial —
 //! got a raw Rust panic and a dead process instead of the dialog #766
 //! produces. Same root cause, one step earlier, strictly worse (#772).

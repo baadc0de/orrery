@@ -1096,12 +1096,14 @@ fn spawn_button<M: Component>(
 
 /// Save the granted seat beside the telemetry stream, and report where.
 ///
-/// The directory is the telemetry path's, which since #766 resolves to the
-/// per-user application-data directory rather than to `target/` under whatever
-/// the volunteer's working directory happened to be. Deliberately without a
-/// fallback: this write failing is what stops a player at the door, so the one
-/// thing that keeps it working must be resolving a writable directory in the
-/// first place, and a rescue path here would hide that.
+/// The directory is the telemetry path's, which since the 2026-09-02 owner
+/// decision resolves to the directory holding the executable — the extracted
+/// release folder a volunteer is already looking in (#942) — rather than to
+/// `target/` under whatever her working directory happened to be, or to the
+/// per-user application-data directory #766 chose first. Deliberately without
+/// a fallback: this write failing is what stops a player at the door, so the
+/// one thing that keeps it working must be resolving a writable directory in
+/// the first place, and a rescue path here would hide that.
 pub fn write_join_artifact(telemetry_path: &Path, join: &JoinObject) -> std::io::Result<PathBuf> {
     let directory = telemetry_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(directory)?;

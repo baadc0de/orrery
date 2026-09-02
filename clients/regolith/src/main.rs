@@ -162,10 +162,12 @@ fn main() {
             return;
         }
     };
-    // Flag, then environment, then the platform's per-user data directory --
-    // never a path relative to wherever the volunteer launched the binary
-    // (#766). The join artifact and the upload-retry state are written beside
-    // whatever this resolves to.
+    // Flag, then environment, then the directory holding the executable --
+    // never the working directory, which a Finder double-click sets to the
+    // user's HOME while the volunteer looks in the extracted release folder
+    // (#942), and never a path relative to wherever she launched (#766). The
+    // join artifact and the upload-retry state are written beside whatever
+    // this resolves to.
     let telemetry_path = orrery_regolith_client::paths::resolve_telemetry_path(
         &args,
         std::env::var_os("ORRERY_TELEMETRY_JSONL"),

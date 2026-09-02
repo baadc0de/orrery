@@ -5,9 +5,9 @@ archive for your computer from the Orrery [Releases page](https://github.com/baa
 
 **Extract the archive before running it, and extract it somewhere you own** —
 your Desktop or a folder under your user account. The game writes its files
-next to where you launch it: the session log, the join file, and the retry
-state all appear in that folder, so you can find them and send them back
-without hunting through hidden system directories.
+into the folder the game itself is in: the session log, the join file, and
+the retry state all appear next to the executable, so you can find them and
+send them back without hunting through hidden system directories.
 
 That is also why the folder has to be writable. If you run the game from
 *inside* the ZIP (Windows opens it in a read-only temporary folder), or from

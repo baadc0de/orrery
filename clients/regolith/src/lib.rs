@@ -2813,11 +2813,12 @@ fn stream_metrics(
 ///
 /// Beside the telemetry stream, which is the single resolved location for
 /// everything this client writes (`paths`). It therefore inherits whatever
-/// `paths::data_dir` resolves to — since the 2026-09-02 owner decision that is
-/// the current working directory, not #766's per-user application-data
-/// directory, and this comment said otherwise until #942 — inherits
-/// `--telemetry-jsonl`, and shares one writability condition with the stream
-/// and the upload state
+/// `paths::data_dir` resolves to — since the 2026-09-02 owner decision that
+/// is the directory holding the executable, superseding the same-day
+/// decision that named the working directory, which had itself superseded
+/// #766's per-user application-data directory, and this comment has named
+/// each of its predecessors in turn — inherits `--telemetry-jsonl`, and
+/// shares one writability condition with the stream and the upload state
 /// — which is what lets the client warn about all three at startup instead of
 /// discovering the record failure at exit, with no UI left to say so (#773).
 #[must_use]
@@ -2880,9 +2881,11 @@ fn write_campaign_record_on_exit(
         let Some(record) = record else {
             return;
         };
-        // Beside the telemetry stream, which since #766 resolves to the
-        // per-user application-data directory rather than to `target/` under
-        // whatever the volunteer's working directory happened to be. One
+        // Beside the telemetry stream, which since the 2026-09-02 owner
+        // decision resolves to the directory holding the executable — the
+        // folder a volunteer who has just extracted the release is already
+        // looking in (#942), superseding the same-day cwd decision and,
+        // before that, #766's per-user application-data directory. One
         // directory for the stream, the banking record and the upload state
         // is what makes `--telemetry-jsonl` a complete override, and what
         // makes the startup writability check below cover all three (#773).
