@@ -44,24 +44,114 @@
         "accounts_would_act": 0,
         "by_cause": {}
       }
+    },
+    {
+      "control": "quarantine_validation",
+      "observed_from_ms": 0,
+      "observed_to_ms": 0,
+      "window_days": 0.0,
+      "qualifying": 0,
+      "observed": 0,
+      "unevaluated": 0,
+      "would_act": 0,
+      "accounts_qualifying": 0,
+      "accounts_observed": 0,
+      "accounts_would_act": 0,
+      "accounts_truncated": 0,
+      "unattributed": {
+        "qualifying": 0,
+        "observed": 0,
+        "would_act": 0
+      },
+      "by_verdict": {},
+      "by_cause": {},
+      "cohort": {
+        "armed": 40,
+        "natural": 80,
+        "size": 120,
+        "active": 0,
+        "qualifying": 0,
+        "observed": 0,
+        "unevaluated": 0,
+        "coverage": null,
+        "fp_count": 0,
+        "accounts_would_act": 0,
+        "by_cause": {}
+      }
+    },
+    {
+      "control": "authority_correction",
+      "observed_from_ms": 0,
+      "observed_to_ms": 0,
+      "window_days": 0.0,
+      "qualifying": 0,
+      "observed": 0,
+      "unevaluated": 0,
+      "would_act": 0,
+      "accounts_qualifying": 0,
+      "accounts_observed": 0,
+      "accounts_would_act": 0,
+      "accounts_truncated": 0,
+      "unattributed": {
+        "qualifying": 0,
+        "observed": 0,
+        "would_act": 0
+      },
+      "by_verdict": {},
+      "by_cause": {},
+      "cohort": {
+        "armed": 40,
+        "natural": 80,
+        "size": 120,
+        "active": 0,
+        "qualifying": 0,
+        "observed": 0,
+        "unevaluated": 0,
+        "coverage": null,
+        "fp_count": 0,
+        "accounts_would_act": 0,
+        "by_cause": {}
+      }
+    },
+    {
+      "control": "strikes",
+      "observed_from_ms": 0,
+      "observed_to_ms": 0,
+      "window_days": 0.0,
+      "qualifying": 0,
+      "observed": 0,
+      "unevaluated": 0,
+      "would_act": 0,
+      "accounts_qualifying": 0,
+      "accounts_observed": 0,
+      "accounts_would_act": 0,
+      "accounts_truncated": 0,
+      "unattributed": {
+        "qualifying": 0,
+        "observed": 0,
+        "would_act": 0
+      },
+      "by_verdict": {},
+      "by_cause": {},
+      "cohort": {
+        "armed": 40,
+        "natural": 80,
+        "size": 120,
+        "active": 0,
+        "qualifying": 0,
+        "observed": 0,
+        "unevaluated": 0,
+        "coverage": null,
+        "fp_count": 0,
+        "accounts_would_act": 0,
+        "by_cause": {}
+      }
     }
   ],
   "absent": [
     {
-      "control": "quarantine_validation",
-      "reason": "D32 clause (d): with C1 off no intent commits on an attestation shortcut, so \"denied the shortcut\" is vacuous and C2-shadow degrades to counting quarantined-session intents — a count this tree does not emit on any target."
-    },
-    {
       "control": "write_annulment",
-      "reason": "D32 clause (c): C3 does not exist yet (#220). Its flag is specified so the implementing issue lands against a named contract; until then the row gates nothing and there is nothing to observe."
-    },
-    {
-      "control": "authority_correction",
-      "reason": "D32 clause (c): C4 does not exist yet (#215)."
-    },
-    {
-      "control": "strikes",
-      "reason": "D32 clause (c): C5 does not exist yet (#219)."
+      "reason": "D32 clause (d): C3 has no write-refusal or compensating-write observation seam, so neither qualifying honest activity nor would-be annulments can be measured."
     }
   ]
 }

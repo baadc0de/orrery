@@ -69,6 +69,13 @@ pub use ramp::{
     SharedRampPostureReader, UnattributedTally, RAMP_ARTIFACT_SCHEMA,
 };
 
+pub mod cohort;
+#[cfg(feature = "fdb")]
+pub use cohort::{
+    CohortError, CohortHalf, CohortMemberRow, FdbHonestCohortStore, SampleRefusal,
+    DEFAULT_PROBATION_MS, MAX_COHORT_REASON_BYTES,
+};
+
 pub mod stages;
 pub use stages::{intent_stage_metrics, IntentStageMetrics, IntentStageSnapshot, IntentTrace};
 
@@ -1309,6 +1316,23 @@ impl BaselineIntentValidator {
             observer: Some(observer),
             ..Self::shadow(epochs, interest, bindings)
         }
+    }
+
+    /// Attach an observer to whatever posture this validator already tracks,
+    /// changing no mode.
+    ///
+    /// [`Self::shadow_observing`] pins the posture to [`AttestationEnforcement::Shadow`]
+    /// as it attaches, which is right for a validator built to observe and
+    /// wrong for a deployed one: the mode belongs to the runtime posture cell
+    /// a poller writes, and the meter belongs on the validator regardless of
+    /// which mode the cell currently holds. Shadow observations only occur
+    /// under `Shadow`, so attaching unconditionally is measurement-neutral
+    /// in every other mode — while `record_qualifying` is exactly the
+    /// denominator that must keep counting when the mode is not shadow.
+    #[must_use]
+    pub fn with_shadow_observer(mut self, observer: SharedShadowObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// This validator's enforcement mode, as of this instant.
@@ -4434,6 +4458,31 @@ mod tests {
     }
 
     // -- D32 clause (c) and (f): the runtime lever -------------------------
+
+    /// [`BaselineIntentValidator::with_shadow_observer`] attaches the
+    /// in-process meter without touching the tracked posture. The denominator
+    /// must count in every mode — that is what makes it a denominator — while
+    /// the observations only occur under `Shadow`; a builder that pinned the
+    /// mode would force the deployed wiring to choose between them.
+    #[test]
+    fn with_shadow_observer_attaches_without_changing_the_tracked_posture() {
+        let meter = Arc::new(ramp::RampMeter::new(ATTESTATION_QUORUM_CONTROL));
+        let validator = BaselineIntentValidator::permissive()
+            .with_shadow_observer(Arc::clone(&meter) as SharedShadowObserver);
+        assert_eq!(
+            validator.enforcement(),
+            AttestationEnforcement::Off,
+            "attaching a meter is not a posture change"
+        );
+
+        // And the meter really is on the path: an admission decision through
+        // an `Off` validator reaches it, the qualifying denominator of a
+        // control that never evaluated anything.
+        validator
+            .check_at(&attestable_intent(7), &cx(Some(9)), 1_000)
+            .expect("off admits");
+        assert_eq!(meter.snapshot(&ramp::HonestCohort::new()).qualifying, 1);
+    }
 
     /// The posture is settable while the validator runs, and setting it
     /// changes what the *next* intent gets — which is the whole point of

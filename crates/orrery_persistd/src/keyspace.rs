@@ -564,6 +564,42 @@ pub fn ramp_range_end() -> Vec<u8> {
     b"vs".to_vec()
 }
 
+/// Key for one D32 clause (e) cohort-membership row:
+/// `rampc/{account}` where `account` is a big-endian `u64`.
+///
+/// The known-honest cohort is clause (e)'s `H`, and a membership row records
+/// a human's sample decision — which half the account belongs to, when, and
+/// why — so `|H| ≥ 100` can be assembled across restarts instead of living
+/// only in one process's [`crate::intent::HonestCohort`].
+///
+/// The rows share the registered `v` family and occupy their own `b"vc"`
+/// sub-span, per D32 clause (c)'s allocation rule: a new key kind takes an
+/// ASCII sub-discriminator inside the family whose writer, retention and scan
+/// profile it matches. The profile match is exact — written rarely by the
+/// operator plane, read by measurement tooling, never on any hot path, and
+/// retained for incident history — which is the same profile the record gives
+/// as `v`'s. `b"vc"` sorts before the posture span, so the two sub-spans are
+/// disjoint by construction and no family byte is spent.
+#[must_use]
+pub fn cohort_key(account: AccountId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10);
+    key.extend_from_slice(b"vc");
+    key.extend_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// Inclusive start of the cohort-membership sub-span.
+#[must_use]
+pub fn cohort_range_start() -> Vec<u8> {
+    b"vc".to_vec()
+}
+
+/// Exclusive end of the cohort-membership sub-span.
+#[must_use]
+pub fn cohort_range_end() -> Vec<u8> {
+    b"vd".to_vec()
+}
+
 // ---------------------------------------------------------------------------
 // Intent idempotency family: `intent/{intent_id}`
 // ---------------------------------------------------------------------------
@@ -2939,6 +2975,31 @@ mod tests {
         assert!(ramp_range_start() <= key);
         assert!(key < ramp_range_end());
         assert!(ramp_range_end().as_slice() < [b'w'].as_slice());
+    }
+
+    #[test]
+    fn cohort_rows_are_a_distinct_v_family_subspan() {
+        // The extreme account id, because a maximal `u64` is the key a
+        // too-short bound would let escape its own sub-span.
+        let key = cohort_key(AccountId::new(u64::MAX));
+        assert_eq!(key.len(), 10, "`vc` discriminator plus a big-endian u64");
+        assert_eq!(&key[..2], b"vc");
+        assert!(content_version_key().as_slice() < cohort_range_start().as_slice());
+        assert!(cohort_range_start() <= key);
+        assert!(key < cohort_range_end());
+        assert!(cohort_range_end().as_slice() < [b'w'].as_slice());
+
+        // Disjoint from the posture span by construction, and ordered so a
+        // reader of one sub-span never observes the other's rows: the
+        // failure ADR-0032's amendment records for `y` is exactly a
+        // discriminator chosen without checking the accepted set.
+        assert!(
+            cohort_range_end() <= ramp_range_start(),
+            "cohort rows sort strictly before every `vr` posture row"
+        );
+        let posture = ramp_key("attestation_quorum");
+        assert!(posture >= ramp_range_start() && posture < ramp_range_end());
+        assert!(key < posture, "even the extreme cohort key stays below");
     }
 
     // -----------------------------------------------------------------------

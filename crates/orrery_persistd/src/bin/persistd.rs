@@ -75,11 +75,12 @@ use orrery_persistd::journal::{
 use orrery_persistd::AdjudicationExecutor;
 use orrery_persistd::{
     ActivationOutcome, AreaInterestScoping, AuthorityCorrectionEnforcement,
-    AuthorityCorrectionPosture, AuthorityMetrics, CellRuntime, CheckpointScheduler,
-    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceFreshnessMonitor,
-    FenceRow, FenceStore, GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
-    GatewayServerLatencySnapshot, GrpcChainTransport, IntentExecutor, JournalConfig,
-    MemCheckpointStore, RuntimeConfig, ShardActivation, SharedAdjudicator,
+    AuthorityCorrectionMetrics, AuthorityCorrectionPosture, AuthorityMetrics, CellRuntime,
+    CheckpointScheduler, CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig,
+    FenceFreshnessMonitor, FenceRow, FenceStore, GatewayConfig, GatewayMetrics, GatewayServer,
+    GatewayServerLatency, GatewayServerLatencySnapshot, GrpcChainTransport, IntentExecutor,
+    JournalConfig, MemCheckpointStore, RampMeters, RuntimeConfig, ShardActivation,
+    SharedAdjudicator,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
@@ -1441,6 +1442,7 @@ async fn main() -> anyhow::Result<()> {
     let adjudicator = configured_adjudicator(
         cli.universe_seed,
         cli.strikes,
+        gateway_config.ramp_meters.strikes.clone().into(),
         #[cfg(feature = "fdb")]
         fdb_context.as_ref(),
         #[cfg(feature = "fdb")]
@@ -2717,8 +2719,26 @@ where
             wiring.posture.clone(),
         ),
     };
-    let validator: Arc<dyn orrery_persistd::intent::IntentValidator> =
-        Arc::new(validator.with_quarantine_validation(cli.quarantine_validation));
+
+    // D32 clause (e)'s meters, one per measurable control, wired from the
+    // bundle the config hands back so an artifact producer snapshots exactly
+    // what this process counted. The seams landed cohort-aware
+    // (#883); nothing attached them in this binary, which left a deployed
+    // fleet producing a production artifact with empty C2–C5 rows no matter
+    // how real its traffic was. Attaching is unconditional in every posture:
+    // `qualify` is the coverage denominator and must count in `Off` and
+    // `Live` too, while the shadow observations only occur under `Shadow`.
+    let ramp_meters = RampMeters::new();
+    let validator: Arc<dyn orrery_persistd::intent::IntentValidator> = Arc::new(
+        validator
+            .with_shadow_observer(Arc::clone(&ramp_meters.attestation_quorum)
+                as orrery_persistd::intent::SharedShadowObserver)
+            .with_quarantine_validation_observing(
+                cli.quarantine_validation,
+                Arc::clone(&ramp_meters.quarantine_validation)
+                    as orrery_persistd::intent::SharedQuarantineValidationObserver,
+            ),
+    );
 
     Ok(GatewayConfig {
         witness_epochs: attestation
@@ -2742,6 +2762,10 @@ where
         validator,
         strikes_posture: StrikesPosture::new(cli.strikes),
         authority_correction_posture: AuthorityCorrectionPosture::new(cli.authority_correction),
+        authority_correction_metrics: Arc::new(AuthorityCorrectionMetrics::with_ramp_meter(
+            Arc::clone(&ramp_meters.authority_correction),
+        )),
+        ramp_meters,
         ..GatewayConfig::default()
     })
 }
@@ -2756,6 +2780,7 @@ where
 fn configured_adjudicator(
     universe_seed: Option<UniverseSeedSpec>,
     strikes: StrikesEnforcement,
+    strikes_meter: Option<Arc<orrery_persistd::intent::RampMeter>>,
     #[cfg(feature = "fdb")] fdb_context: Option<&FdbContext>,
     #[cfg(feature = "fdb")] restore_hold_source: Option<NodeId>,
 ) -> anyhow::Result<Option<SharedAdjudicator>> {
@@ -2788,6 +2813,12 @@ fn configured_adjudicator(
             );
         }
     }
+    if let Some(meter) = strikes_meter {
+        // D32 clause (e)'s C5 meter: the filing seam counts at both points
+        // once a meter is attached, so the cohort evidence for `strikes`
+        // comes from the same rows the ledger wrote.
+        executor = executor.with_strike_ramp_meter(meter);
+    }
     executor.register(|| orrery_conformance::Reference);
     Ok(Some(Arc::new(executor)))
 }
@@ -2813,10 +2844,11 @@ fn strike_filing_mode(strikes: StrikesEnforcement) -> Option<StrikeMode> {
 fn configured_adjudicator(
     universe_seed: Option<UniverseSeedSpec>,
     strikes: StrikesEnforcement,
+    strikes_meter: Option<Arc<orrery_persistd::intent::RampMeter>>,
     #[cfg(feature = "fdb")] fdb_context: Option<&FdbContext>,
     #[cfg(feature = "fdb")] restore_hold_source: Option<NodeId>,
 ) -> anyhow::Result<Option<SharedAdjudicator>> {
-    let _ = (universe_seed, strikes);
+    let _ = (universe_seed, strikes, strikes_meter);
     #[cfg(feature = "fdb")]
     let _ = (fdb_context, restore_hold_source);
     Ok(None)
@@ -4220,6 +4252,69 @@ mod tests {
             ),
             orrery_persistd::intent::IntentVerdict::Admit(_)
         ));
+    }
+
+    /// D32 clause (e)'s meters are attached by the deployed composition, or a
+    /// production artifact's rows are empty no matter how real the traffic
+    /// was. The seams are cohort-aware in the library; this pins that this
+    /// binary actually hands them the counts.
+    #[test]
+    fn gateway_config_wires_the_cohort_meters_into_the_validator() {
+        let config = gateway_config(&cli(None), None, |_cluster_file, _grid, _attestation| {
+            Ok(None)
+        })
+        .expect("gateway config");
+        let meters = &config.ramp_meters;
+
+        // One meter per control: a bundle that handed the same meter to two
+        // controls would merge their cohorts silently, and no artifact could
+        // tell which control had produced a count.
+        assert!(!std::sync::Arc::ptr_eq(
+            &meters.attestation_quorum,
+            &meters.quarantine_validation
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &meters.authority_correction,
+            &meters.strikes
+        ));
+
+        let cohort = orrery_persistd::intent::HonestCohort::new();
+        let context_for = |standing| {
+            let (intent, key) = unannounced_intent();
+            (
+                intent,
+                orrery_persistd::intent::IntentContext {
+                    issuer: key.public(),
+                    account: Some(orrery_protocol::AccountId::new(7)),
+                    standing,
+                    network: orrery_persistd::intent::NetworkQuality::Unknown,
+                },
+            )
+        };
+
+        // A good-standing admission decision reaches C1's meter — the
+        // coverage denominator, which must count in every posture.
+        let (intent, cx) = context_for(orrery_protocol::SessionStanding::Good);
+        let _ = config.validator.validate(&intent, &cx);
+        assert_eq!(
+            meters.attestation_quorum.snapshot(&cohort).qualifying,
+            1,
+            "C1's meter is on the validator and counted the admission decision"
+        );
+        assert_eq!(
+            meters.quarantine_validation.snapshot(&cohort).qualifying,
+            0,
+            "C2's denominator counts quarantined sessions, and this one was good"
+        );
+
+        // A quarantined session reaches C2's meter, on the same bundle.
+        let (intent, cx) = context_for(orrery_protocol::SessionStanding::Quarantined);
+        let _ = config.validator.validate(&intent, &cx);
+        assert_eq!(
+            meters.quarantine_validation.snapshot(&cohort).qualifying,
+            1,
+            "C2's meter is on the validator and counted the quarantined session"
+        );
     }
 
     /// The archive claim must remain absent until an operator opts in. The

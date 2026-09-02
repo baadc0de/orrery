@@ -3028,6 +3028,60 @@ impl AuthorityCorrectionMetrics {
     }
 }
 
+/// One cohort-aware [`RampMeter`] per D32 clause (c) control this process can
+/// measure: C1's admission evaluations, C2's quarantined-intent incidence, C4's
+/// correction evaluations and C5's strike filings.
+///
+/// The meters exist as library seams and are inert until something attaches
+/// them, which is a wiring decision and not a library one: a validator or a
+/// metrics struct built without an observer measures nothing, and a deployed
+/// binary that never attaches a meter produces a production artifact whose
+/// C2–C5 rows are empty no matter how real its traffic was. [`GatewayConfig`]
+/// is where a process's controls are composed, so the bundle lives here and
+/// `persistd` wires every meter from it — one place, four controls, and an
+/// artifact producer can hold the same `Arc`s to snapshot them.
+///
+/// Attaching is unconditional in every posture, and that is deliberate: the
+/// meters' `qualify` half is clause (e)'s coverage denominator, which counts
+/// admission decisions in `Off` and `Live` too — the shadow *observations*
+/// only occur under `Shadow`, so nothing else is measured in those modes.
+#[derive(Debug, Clone)]
+pub struct RampMeters {
+    /// C1 `attestation_quorum`: handed to the validator as its
+    /// [`crate::intent::ShadowObserver`].
+    pub attestation_quorum: Arc<RampMeter>,
+    /// C2 `quarantine_validation`: handed to the validator as its
+    /// [`crate::intent::QuarantineValidationObserver`].
+    pub quarantine_validation: Arc<RampMeter>,
+    /// C4 `authority_correction`: built into
+    /// [`AuthorityCorrectionMetrics::with_ramp_meter`].
+    pub authority_correction: Arc<RampMeter>,
+    /// C5 `strikes`: handed to the adjudicator via
+    /// [`crate::adjudication::AdjudicationExecutor::with_strike_ramp_meter`].
+    pub strikes: Arc<RampMeter>,
+}
+
+impl Default for RampMeters {
+    fn default() -> Self {
+        Self {
+            attestation_quorum: Arc::new(RampMeter::new(crate::intent::ATTESTATION_QUORUM_CONTROL)),
+            quarantine_validation: Arc::new(RampMeter::new(
+                crate::intent::QUARANTINE_VALIDATION_CONTROL,
+            )),
+            authority_correction: Arc::new(RampMeter::new(AUTHORITY_CORRECTION_CONTROL)),
+            strikes: Arc::new(RampMeter::new(STRIKES_CONTROL)),
+        }
+    }
+}
+
+impl RampMeters {
+    /// A fresh bundle, one meter per control.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// A point-in-time C4 counter snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuthorityCorrectionSnapshot {
@@ -3351,6 +3405,11 @@ pub struct GatewayConfig {
     pub authority_correction_posture: AuthorityCorrectionPosture,
     /// Always-on C4 evaluation/action telemetry.
     pub authority_correction_metrics: Arc<AuthorityCorrectionMetrics>,
+    /// The process's cohort-aware D32 clause (e) meters, one per measurable
+    /// control. Fresh by default; a composition that wants the validator, C4's
+    /// metrics and the adjudicator measuring from the *same* meters passes its
+    /// own bundle and wires each consumer from it — see [`RampMeters`].
+    pub ramp_meters: RampMeters,
     /// Always-on server-side telemetry: bulk stages, the intent and area
     /// server spans, and the report outcome split. Share the handle to read
     /// it; a fresh one is created when the caller does not, and collection is
@@ -3442,6 +3501,7 @@ impl Default for GatewayConfig {
             strikes_posture: StrikesPosture::default(),
             authority_correction_posture: AuthorityCorrectionPosture::default(),
             authority_correction_metrics: Arc::new(AuthorityCorrectionMetrics::default()),
+            ramp_meters: RampMeters::default(),
             metrics: Arc::new(GatewayMetrics::default()),
             peer_registry_capacity: MAX_PEER_REGISTRY_ENTRIES,
             peer_lease_capacity: MAX_PEER_LIVE_LEASES,
