@@ -55,7 +55,7 @@ defects came out of that one session, all fixed: the client wrote to a path a
 downloaded copy does not have (#766), the Windows zip shipped an extensionless
 binary inside a `stage/` folder (#768), the campaign/practice distinction was
 invisible on screen (#769), an unopenable telemetry stream killed the client
-during plugin registration (#772), and a session that banks nothing said so
+during plugin registration (#772), and a session that records nothing said so
 only in a log line after the fact (#773). See #775, #776 and #778 — the last of
 which is the CI check that now extracts and launches the *archive* on each
 platform, because every one of those defects was invisible to a build and
