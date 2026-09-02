@@ -34,7 +34,7 @@ different scopes and cost shapes.
 | Sweep | Default / enablement | What one pass reads and checks | Known cost |
 |---|---|---|---|
 | Hot-ledger incremental | 3,600,000 ms; starts with an FDB context unless zeroed (crates/orrery_persistd/src/bin/persistd.rs:325-335, :1330-1334) | All current ledger/bal and ledger/item rows; receipt rows strictly after the durable versionstamp cursor; every gap in the ledger family (crates/orrery_persistd/src/audit.rs:603-667, :689-873). It catches duplicate ownership, negative balance, unbacked receipt party, and malformed/stray row findings; it does **not** prove global sanctioned-versus-observed conservation (audit.rs:15-60, :102-132). | No production byte/CPU/I/O cost. The only timing artifact is a 12-sample harness: 73 balance rows, 186 item claims, 150 ms interval, pass max 2 ms and sum 15 ms (docs/data/hot-ledger-sweep-ttd-2026-08-23.json). The daemon logs counts and elapsed time (persistd.rs:2569-2613). |
-| Full conservation | 86,400,000 ms, only in explicit --receipt-archive role and unless zeroed (crates/orrery_persistd/src/audit/conservation.rs:30-35; persistd.rs:301-312, :1576-1592) | Captures every visible rarchive/*.parquet object, decodes every row, folds account/asset balance effects against sanctioned source/sink ops, then retains and re-sorts ownership transitions by (item, receipt key, ordinal) (conservation.rs:151-310, :313-345, :368-436). It catches global conservation, continuity, and effect-shape findings (audit.rs:121-132). | Shape-C layout fixture projects a 24-hour all-transfer workload: 45,792,000 receipts, 3.35577 GiB read and a 2.38824 GiB ownership re-sort allocation **per full pass** (docs/data/full-conservation-sweep-layout-2026-09-01.json). This is a byte/layout measurement, not a duration benchmark. |
+| Full conservation | 86,400,000 ms, only in explicit --receipt-archive role and unless zeroed (crates/orrery_persistd/src/audit/conservation.rs; persistd.rs:301-312, :1576-1592) | Captures every visible rarchive/*.parquet object, decodes every row, folds account/asset balance effects against sanctioned source/sink ops, then external-merges page-bounded ownership runs by (item, receipt key, ordinal). It catches the same global conservation, continuity, and effect-shape findings (audit.rs:121-132). | Shape-C layout fixture projects a 24-hour all-transfer workload: 45,792,000 receipts and 3.35577 GiB read; the ownership external-sort working set is 230,272 bytes (224.875 KiB) per full pass, independent of retained transitions (docs/data/full-conservation-sweep-layout-2026-09-01.json). This is a byte/layout measurement, not a duration benchmark. |
 
 The full-sweep input is real Shape C: ReceiptRow records account-scoped signed
 balance deltas and item before/after ownership transitions
@@ -99,26 +99,41 @@ period makes cost reciprocal but improves expected wait linearly. There is no
 measured physical knee yet; production duration/resource distributions must
 establish it.
 
+### #890 implementation decision: external merge sort
+
+The full sweep keeps its no-cursor, complete-visible-window meaning. #890
+therefore uses a bounded external merge sort over the existing receipt objects:
+one 4,096-event run is sorted and spilled at a time, and merge passes retain at
+most 16 run heads. This makes ownership-sort memory O(page), not O(transitions
+in retention), while preserving the same item history and findings in one pass.
+
+The other offered shapes lose here. A tailer-written item-clustered secondary
+Parquet object would add write-path work, a new `z` family sub-kind and an
+additional publication/consistency surface; the registered `z` sub-kinds are
+already `za` and `zr`, and `yb` is allocated. A carried per-item cursor would
+make a pass incremental rather than a full-window proof, weakening D32 clause
+(g)'s conclusion. Neither trade is necessary to bound this read-only sweep.
+
 Using the fixture one-day archive projection as a per-pass assumption:
 
-| Full period | Passes/day | Read volume/day | Ownership allocation churn/day | Expected scheduling wait |
+| Full period | Passes/day | Read volume/day | Ownership re-sort working set/pass | Expected scheduling wait |
 |---:|---:|---:|---:|---:|
-| 24 h | 1 | 3.356 GiB | 2.388 GiB | 12 h |
-| 1 h | 24 | 80.538 GiB | 57.318 GiB | 30 min |
-| 15 min | 96 | 322.154 GiB | 229.271 GiB | 7 min 30 s |
-| 5 min | 288 | 966.462 GiB | 687.813 GiB | 2 min 30 s |
+| 24 h | 1 | 3.356 GiB | 224.875 KiB | 12 h |
+| 1 h | 24 | 80.538 GiB | 224.875 KiB | 30 min |
+| 15 min | 96 | 322.154 GiB | 224.875 KiB | 7 min 30 s |
+| 5 min | 288 | 966.462 GiB | 224.875 KiB | 5 min |
 
-The operational bend is therefore **daily, not faster**, until the layout
-changes or is externally bounded. Hourly to 15-minute full scans multiply I/O
-and allocation churn by four to remove 22 min 30 s expected wait; 15 to five
-minutes multiplies cost by three to remove five minutes. The fixture already
-calls the 2.388 GiB one-day in-process allocation too large as a default.
+The operational bend remains **daily, not faster**. Hourly to 15-minute full
+scans multiply I/O by four to remove 22 min 30 s expected wait; 15 to five
+minutes multiplies it by three to remove five minutes. #890 removes the
+history-sized ownership allocation, not the retained-history read volume that
+keeps the daily cadence appropriate.
 
-Because the code reads retained history, 30-day full-fidelity retention projects
-100.673 GiB read and 71.647 GiB retained ownership-sort bound **per pass**
-(docs/data/full-conservation-sweep-layout-2026-09-01.json). At daily cadence
-that is the daily cost, not a one-time bootstrap. This is the concrete bend:
-shortening cadence would multiply an already-rejected shape.
+Because the code reads retained history, 30-day full-fidelity retention still
+projects 100.673 GiB read **per pass**
+(docs/data/full-conservation-sweep-layout-2026-09-01.json). Its ownership-sort
+working set stays 224.875 KiB. At daily cadence that read volume is the daily
+cost, not a one-time bootstrap; shortening cadence would multiply it.
 
 The hot sweep has a different steady-state model. If H is current
 balances/items/gaps read per pass, r receipt rate, and q receipt processing
@@ -132,10 +147,11 @@ so this spike does not invent its knee.
 
 * **Derived layout evidence, not production:** the test writes a real
   uncompressed 4,096-row Shape-C object, applies the prior 530 intents/s spike
-  rate for 86,400 s, and uses compiled OwnershipEvent size for the allocation
-  bound (crates/orrery_persistd/src/audit/conservation.rs:807-846). The
-  45,792,000 / 3.35577 GiB / 2.38824 GiB figures are arithmetic from that
-  fixture, recorded in the JSON.
+  rate for 86,400 s, and uses compiled OwnershipEvent size plus the fixed
+  4,096-event run and 16-way merge fan-in for the ownership bound. The
+  45,792,000 / 3.35577 GiB / 224.875 KiB figures are recorded in the JSON; a
+  separate 30-page synthetic pass exercises the multi-stage merge below its
+  stated 256 KiB ceiling.
 * **Harness TTD only:** 12 planted duplicate-owner cases at 150 ms over the
   small ledger above; neither production traffic nor a full-pass duration.
 * **Instrumentation but no series:** hot passes log elapsed and row counts;

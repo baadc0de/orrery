@@ -10,13 +10,18 @@
 //! effects already name [`AccountId`] and [`ItemUid`], and their FDB commit
 //! versionstamp is the history order. The price is the layout mismatch: objects
 //! are ordered by commit, while ownership continuity is grouped by item. The
-//! balance fold streams, but ownership transitions must be retained and
-//! re-sorted by `(ItemUid, receipt key, transition ordinal)`. Every report
-//! carries the exact bytes scanned and the sort vector's memory bound.
+//! balance fold streams, while ownership continuity is an external merge sort
+//! by `(ItemUid, receipt key, transition ordinal)`. The sorter writes bounded
+//! sorted runs to a private temporary directory and merges at most a fixed
+//! fan-in, so the ownership working set is independent of retained history.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use orrery_protocol::{AccountId, AssetId, ItemUid};
 use serde::{Deserialize, Serialize};
@@ -33,6 +38,27 @@ pub const FULL_SWEEP_REPORT_SCHEMA: &str = "orrery.audit.full-conservation/1";
 /// The clause-(g) starting cadence: one complete archive pass per day.
 pub const DEFAULT_FULL_SWEEP_INTERVAL_MS: u64 = 86_400_000;
 
+/// Ownership events retained in one sorted external-sort run.
+///
+/// This is deliberately one receipt-object page from the archive tailer. The
+/// page decoder is already that bound; allowing an ownership re-sort run to
+/// outgrow it would reintroduce a history-sized allocation through this path.
+const OWNERSHIP_RUN_EVENTS: usize = 4_096;
+
+/// Simultaneous sorted-run heads during the external merge.
+const OWNERSHIP_MERGE_FAN_IN: usize = 16;
+
+/// Fixed-size on-disk representation of one [`OwnershipEvent`] in a run.
+const OWNERSHIP_RUN_RECORD_BYTES: usize = 42;
+
+/// Maximum ownership-event working set for one full conservation pass.
+///
+/// It includes one page-sized sorted run and one head per merge input. Object
+/// decoding remains page-bounded too; this number specifically reports the
+/// ownership re-sort that used to scale with every transition in retention.
+pub const OWNERSHIP_RESORT_MEMORY_CEILING_BYTES: u64 =
+    ((OWNERSHIP_RUN_EVENTS + OWNERSHIP_MERGE_FAN_IN) * size_of::<OwnershipEvent>()) as u64;
+
 /// Exact population and I/O denominators for one full pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FullSweepPopulation {
@@ -46,18 +72,18 @@ pub struct FullSweepPopulation {
     pub legacy_receipts: u64,
     /// Signed balance effects folded.
     pub balance_deltas: u64,
-    /// Ownership transitions retained for the item re-sort.
+    /// Ownership transitions read for the item-history external merge.
     pub ownership_transitions: u64,
 }
 
 /// The measured layout cost of re-grouping commit-ordered ownership history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnershipResortCost {
-    /// Events sorted by item and commit order.
+    /// Events sorted by item and commit order across all external runs.
     pub entries: u64,
-    /// Inline bytes per retained event in this build.
+    /// Inline bytes per ownership-event working-set slot in this build.
     pub bytes_per_entry: u64,
-    /// Exact in-place sort-vector bound after `shrink_to_fit`.
+    /// Bounded ownership-sort working set: one run plus merge heads.
     pub memory_bytes_bound: u64,
 }
 
@@ -178,7 +204,7 @@ impl ReceiptArchiveSweeper {
         };
         let mut observed = BTreeMap::<AssetId, i128>::new();
         let mut receipted = BTreeMap::<AssetId, i128>::new();
-        let mut ownership = Vec::<OwnershipEvent>::new();
+        let mut ownership = OwnershipExternalSorter::create()?;
         let mut findings = Vec::new();
         let mut first_key = None;
         let mut previous_key = None;
@@ -274,24 +300,8 @@ impl ReceiptArchiveSweeper {
             }
         }
 
-        ownership.shrink_to_fit();
-        let ownership_resort = OwnershipResortCost {
-            entries: ownership.len() as u64,
-            bytes_per_entry: size_of::<OwnershipEvent>() as u64,
-            memory_bytes_bound: (ownership.capacity() as u64)
-                .checked_mul(size_of::<OwnershipEvent>() as u64)
-                .ok_or_else(|| {
-                    FullSweepError("ownership re-sort byte bound overflow".to_owned())
-                })?,
-        };
-        ownership.sort_unstable_by(|left, right| {
-            (left.item.0, left.receipt_key, left.ordinal).cmp(&(
-                right.item.0,
-                right.receipt_key,
-                right.ordinal,
-            ))
-        });
-        findings.extend(ownership_findings(&ownership));
+        let ownership_resort = ownership.cost(population.ownership_transitions)?;
+        findings.extend(ownership.finish()?);
 
         for finding in &findings {
             finding.emit();
@@ -354,6 +364,402 @@ struct OwnershipEvent {
     ordinal: u32,
 }
 
+/// Private scratch directory for one external ownership merge.
+///
+/// `tempfile` is intentionally only a test dependency in this crate. The
+/// daemon needs no new runtime dependency to obtain a best-effort-cleaned
+/// unique directory under the operating system temporary directory.
+#[derive(Debug)]
+struct SweepWorkDir(PathBuf);
+
+impl SweepWorkDir {
+    fn create() -> Result<Self, FullSweepError> {
+        static NEXT_WORK_DIR: AtomicU64 = AtomicU64::new(0);
+
+        let epoch_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        for attempt in 0..64_u64 {
+            let serial = NEXT_WORK_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "orrery-conservation-{}-{epoch_nanos}-{serial}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(FullSweepError(format!(
+                        "create ownership-sort work directory {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Err(FullSweepError(
+            "create unique ownership-sort work directory: exhausted 64 attempts".to_owned(),
+        ))
+    }
+
+    fn stage(&self, stage: u32) -> PathBuf {
+        self.0.join(format!("stage-{stage}"))
+    }
+}
+
+impl Drop for SweepWorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Page-bounded external sorter for commit-ordered ownership transitions.
+#[derive(Debug)]
+struct OwnershipExternalSorter {
+    work_dir: SweepWorkDir,
+    buffer: Vec<OwnershipEvent>,
+    runs: u64,
+}
+
+impl OwnershipExternalSorter {
+    fn create() -> Result<Self, FullSweepError> {
+        let work_dir = SweepWorkDir::create()?;
+        std::fs::create_dir(work_dir.stage(0)).map_err(|error| {
+            FullSweepError(format!(
+                "create ownership-sort initial run directory: {error}"
+            ))
+        })?;
+        Ok(Self {
+            work_dir,
+            buffer: Vec::with_capacity(OWNERSHIP_RUN_EVENTS),
+            runs: 0,
+        })
+    }
+
+    fn push(&mut self, event: OwnershipEvent) -> Result<(), FullSweepError> {
+        self.buffer.push(event);
+        if self.buffer.len() == OWNERSHIP_RUN_EVENTS {
+            self.flush_run()?;
+        }
+        Ok(())
+    }
+
+    fn cost(&self, entries: u64) -> Result<OwnershipResortCost, FullSweepError> {
+        let slots = self
+            .buffer
+            .capacity()
+            .checked_add(OWNERSHIP_MERGE_FAN_IN)
+            .ok_or_else(|| FullSweepError("ownership re-sort slot bound overflow".to_owned()))?;
+        let memory_bytes_bound = (slots as u64)
+            .checked_mul(size_of::<OwnershipEvent>() as u64)
+            .ok_or_else(|| FullSweepError("ownership re-sort byte bound overflow".to_owned()))?;
+        Ok(OwnershipResortCost {
+            entries,
+            bytes_per_entry: size_of::<OwnershipEvent>() as u64,
+            memory_bytes_bound,
+        })
+    }
+
+    fn flush_run(&mut self) -> Result<(), FullSweepError> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.buffer.sort_unstable_by(event_order);
+        let path = self
+            .work_dir
+            .stage(0)
+            .join(format!("{:020}.run", self.runs));
+        write_run(&path, &self.buffer)?;
+        self.buffer.clear();
+        self.runs = checked_u64_add(self.runs, 1, "ownership external-sort run count")?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<AuditFinding>, FullSweepError> {
+        self.flush_run()?;
+        if self.runs == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut stage = 0_u32;
+        while self.runs > OWNERSHIP_MERGE_FAN_IN as u64 {
+            self.runs = consolidate_stage(&self.work_dir, stage)?;
+            stage = stage.checked_add(1).ok_or_else(|| {
+                FullSweepError("ownership external-sort stage counter overflow".to_owned())
+            })?;
+        }
+        ownership_findings_from_stage(&self.work_dir.stage(stage))
+    }
+}
+
+fn event_order(left: &OwnershipEvent, right: &OwnershipEvent) -> std::cmp::Ordering {
+    (left.item.0, left.receipt_key, left.ordinal).cmp(&(
+        right.item.0,
+        right.receipt_key,
+        right.ordinal,
+    ))
+}
+
+fn write_run(path: &Path, events: &[OwnershipEvent]) -> Result<(), FullSweepError> {
+    let file = File::create(path).map_err(|error| {
+        FullSweepError(format!(
+            "create ownership-sort run {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut writer = BufWriter::with_capacity(OWNERSHIP_RUN_RECORD_BYTES, file);
+    for event in events {
+        write_event(&mut writer, event)?;
+    }
+    writer.flush().map_err(|error| {
+        FullSweepError(format!(
+            "flush ownership-sort run {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn write_event(writer: &mut impl Write, event: &OwnershipEvent) -> Result<(), FullSweepError> {
+    writer
+        .write_all(&event.item.0.to_le_bytes())
+        .and_then(|()| write_account(writer, event.before))
+        .and_then(|()| write_account(writer, event.after))
+        .and_then(|()| writer.write_all(&event.receipt_key))
+        .and_then(|()| writer.write_all(&event.ordinal.to_le_bytes()))
+        .map_err(|error| FullSweepError(format!("write ownership-sort event: {error}")))
+}
+
+fn write_account(writer: &mut impl Write, account: Option<AccountId>) -> std::io::Result<()> {
+    match account {
+        Some(account) => {
+            writer.write_all(&[1])?;
+            writer.write_all(&account.0.to_le_bytes())
+        }
+        None => {
+            writer.write_all(&[0])?;
+            writer.write_all(&0_u64.to_le_bytes())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunCursor {
+    reader: BufReader<File>,
+    current: Option<OwnershipEvent>,
+}
+
+impl RunCursor {
+    fn open(path: &Path) -> Result<Self, FullSweepError> {
+        let file = File::open(path).map_err(|error| {
+            FullSweepError(format!(
+                "open ownership-sort run {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut cursor = Self {
+            reader: BufReader::with_capacity(OWNERSHIP_RUN_RECORD_BYTES, file),
+            current: None,
+        };
+        cursor.advance()?;
+        Ok(cursor)
+    }
+
+    fn advance(&mut self) -> Result<(), FullSweepError> {
+        self.current = read_event(&mut self.reader)?;
+        Ok(())
+    }
+}
+
+fn read_event(reader: &mut impl Read) -> Result<Option<OwnershipEvent>, FullSweepError> {
+    let mut item = [0_u8; 8];
+    let read = reader
+        .read(&mut item)
+        .map_err(|error| FullSweepError(format!("read ownership-sort event: {error}")))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    reader
+        .read_exact(&mut item[read..])
+        .map_err(|error| FullSweepError(format!("truncated ownership-sort event item: {error}")))?;
+    let before = read_account(reader)?;
+    let after = read_account(reader)?;
+    let mut receipt_key = [0_u8; 12];
+    reader.read_exact(&mut receipt_key).map_err(|error| {
+        FullSweepError(format!("truncated ownership-sort receipt key: {error}"))
+    })?;
+    let mut ordinal = [0_u8; 4];
+    reader
+        .read_exact(&mut ordinal)
+        .map_err(|error| FullSweepError(format!("truncated ownership-sort ordinal: {error}")))?;
+    Ok(Some(OwnershipEvent {
+        item: ItemUid::new(u64::from_le_bytes(item)),
+        before,
+        after,
+        receipt_key,
+        ordinal: u32::from_le_bytes(ordinal),
+    }))
+}
+
+fn read_account(reader: &mut impl Read) -> Result<Option<AccountId>, FullSweepError> {
+    let mut present = [0_u8; 1];
+    reader.read_exact(&mut present).map_err(|error| {
+        FullSweepError(format!("truncated ownership-sort account tag: {error}"))
+    })?;
+    let mut account = [0_u8; 8];
+    reader
+        .read_exact(&mut account)
+        .map_err(|error| FullSweepError(format!("truncated ownership-sort account: {error}")))?;
+    match present[0] {
+        0 => Ok(None),
+        1 => Ok(Some(AccountId::new(u64::from_le_bytes(account)))),
+        tag => Err(FullSweepError(format!(
+            "invalid ownership-sort account presence tag {tag}"
+        ))),
+    }
+}
+
+/// Merge each bounded batch in one stage into the next, deleting inputs as
+/// they are consumed. A directory iterator and a batch of at most sixteen
+/// paths keep the run catalogue out of the process heap.
+fn consolidate_stage(work_dir: &SweepWorkDir, stage: u32) -> Result<u64, FullSweepError> {
+    let input = work_dir.stage(stage);
+    let output = work_dir.stage(
+        stage
+            .checked_add(1)
+            .ok_or_else(|| FullSweepError("ownership external-sort stage overflow".to_owned()))?,
+    );
+    std::fs::create_dir(&output).map_err(|error| {
+        FullSweepError(format!(
+            "create ownership-sort stage {}: {error}",
+            output.display()
+        ))
+    })?;
+    let mut entries = std::fs::read_dir(&input).map_err(|error| {
+        FullSweepError(format!(
+            "read ownership-sort stage {}: {error}",
+            input.display()
+        ))
+    })?;
+    let mut output_runs = 0_u64;
+    loop {
+        let mut batch = Vec::with_capacity(OWNERSHIP_MERGE_FAN_IN);
+        while batch.len() < OWNERSHIP_MERGE_FAN_IN {
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            let path = entry
+                .map_err(|error| {
+                    FullSweepError(format!("read ownership-sort stage entry: {error}"))
+                })?
+                .path();
+            if path.extension().is_some_and(|extension| extension == "run") {
+                batch.push(path);
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        batch.sort();
+        let output_path = output.join(format!("{:020}.run", output_runs));
+        merge_runs(&batch, &output_path)?;
+        for path in batch {
+            std::fs::remove_file(&path).map_err(|error| {
+                FullSweepError(format!(
+                    "remove consumed ownership-sort run {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+        output_runs = checked_u64_add(output_runs, 1, "ownership external-sort output run count")?;
+    }
+    std::fs::remove_dir(&input).map_err(|error| {
+        FullSweepError(format!(
+            "remove consumed ownership-sort stage {}: {error}",
+            input.display()
+        ))
+    })?;
+    Ok(output_runs)
+}
+
+fn merge_runs(paths: &[PathBuf], output: &Path) -> Result<(), FullSweepError> {
+    let mut cursors = paths
+        .iter()
+        .map(|path| RunCursor::open(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let file = File::create(output).map_err(|error| {
+        FullSweepError(format!(
+            "create merged ownership-sort run {}: {error}",
+            output.display()
+        ))
+    })?;
+    let mut writer = BufWriter::with_capacity(OWNERSHIP_RUN_RECORD_BYTES, file);
+    while let Some(index) = smallest_cursor(&cursors) {
+        let event = cursors[index]
+            .current
+            .expect("selected cursor always has a current ownership event");
+        write_event(&mut writer, &event)?;
+        cursors[index].advance()?;
+    }
+    writer.flush().map_err(|error| {
+        FullSweepError(format!(
+            "flush merged ownership-sort run {}: {error}",
+            output.display()
+        ))
+    })
+}
+
+fn smallest_cursor(cursors: &[RunCursor]) -> Option<usize> {
+    cursors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cursor)| cursor.current.map(|event| (index, event)))
+        .min_by(|(_, left), (_, right)| event_order(left, right))
+        .map(|(index, _)| index)
+}
+
+fn ownership_findings_from_stage(stage: &Path) -> Result<Vec<AuditFinding>, FullSweepError> {
+    let entries = std::fs::read_dir(stage).map_err(|error| {
+        FullSweepError(format!(
+            "read final ownership-sort stage {}: {error}",
+            stage.display()
+        ))
+    })?;
+    let mut paths = Vec::with_capacity(OWNERSHIP_MERGE_FAN_IN);
+    for entry in entries {
+        let path = entry
+            .map_err(|error| FullSweepError(format!("read final ownership-sort entry: {error}")))?
+            .path();
+        if path.extension().is_some_and(|extension| extension == "run") {
+            if paths.len() == OWNERSHIP_MERGE_FAN_IN {
+                return Err(FullSweepError(
+                    "final ownership-sort stage exceeds merge fan-in".to_owned(),
+                ));
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    let mut cursors = paths
+        .iter()
+        .map(|path| RunCursor::open(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut findings = Vec::new();
+    let mut previous: Option<(ItemUid, Option<AccountId>)> = None;
+    while let Some(index) = smallest_cursor(&cursors) {
+        let event = cursors[index]
+            .current
+            .expect("selected cursor always has a current ownership event");
+        match previous {
+            Some((item, current)) if item == event.item => {
+                append_ownership_finding(&mut findings, event.item, current, &event);
+                previous = Some((item, event.after));
+            }
+            _ => previous = Some((event.item, event.after)),
+        }
+        cursors[index].advance()?;
+    }
+    Ok(findings)
+}
+
 fn validate_prefix(prefix: &str) -> Result<(), FullSweepError> {
     for component in Path::new(prefix).components() {
         if !matches!(component, Component::Normal(_)) {
@@ -370,7 +776,7 @@ fn fold_receipt(
     receipt: &ReceiptRow,
     observed: &mut BTreeMap<AssetId, i128>,
     receipted: &mut BTreeMap<AssetId, i128>,
-    ownership: &mut Vec<OwnershipEvent>,
+    ownership: &mut OwnershipExternalSorter,
     findings: &mut Vec<AuditFinding>,
 ) -> Result<(), FullSweepError> {
     for delta in &receipt.balance_deltas {
@@ -431,7 +837,7 @@ fn fold_receipt(
             receipt_key: key,
             ordinal: u32::try_from(ordinal)
                 .map_err(|_| FullSweepError("receipt ownership ordinal exceeds u32".to_owned()))?,
-        });
+        })?;
     }
     Ok(())
 }
@@ -464,57 +870,46 @@ fn effect_shape_finding(key: [u8; 12], receipt: &ReceiptRow, reason: &str) -> Au
     }
 }
 
-fn ownership_findings(events: &[OwnershipEvent]) -> Vec<AuditFinding> {
-    let mut findings = Vec::new();
-    let mut index = 0;
-    while index < events.len() {
-        let item = events[index].item;
-        let mut end = index + 1;
-        while end < events.len() && events[end].item == item {
-            end += 1;
-        }
-        let history = &events[index..end];
-        let mut current = history[0].after;
-        for event in &history[1..] {
-            match (current, event.before) {
-                (Some(expected), Some(stated)) if expected == stated => {}
-                (None, None) => {}
-                (None, Some(stated)) => findings.push(AuditFinding {
-                    kind: FindingKind::UnreceiptedItemOwnership,
-                    item: Some(item),
-                    account: Some(stated),
-                    asset: None,
-                    receipt_intent_id: None,
-                    key_hex: hex(&event.receipt_key),
-                    detail: format!(
-                        "item {} was burned, then receipt {} claimed prior owner {} without an \
-                         intervening None -> Some mint",
-                        item.0,
-                        hex(&event.receipt_key),
-                        stated.0
-                    ),
-                }),
-                (Some(expected), stated) => findings.push(AuditFinding {
-                    kind: FindingKind::OverlappingItemOwnership,
-                    item: Some(item),
-                    account: Some(expected),
-                    asset: None,
-                    receipt_intent_id: None,
-                    key_hex: hex(&event.receipt_key),
-                    detail: format!(
-                        "item {} remained owned by account {}, but the next transition named \
-                         prior owner {}; the preceding ownership interval never closed",
-                        item.0,
-                        expected.0,
-                        stated.map_or_else(|| "None".to_owned(), |owner| owner.0.to_string())
-                    ),
-                }),
-            }
-            current = event.after;
-        }
-        index = end;
+fn append_ownership_finding(
+    findings: &mut Vec<AuditFinding>,
+    item: ItemUid,
+    current: Option<AccountId>,
+    event: &OwnershipEvent,
+) {
+    match (current, event.before) {
+        (Some(expected), Some(stated)) if expected == stated => {}
+        (None, None) => {}
+        (None, Some(stated)) => findings.push(AuditFinding {
+            kind: FindingKind::UnreceiptedItemOwnership,
+            item: Some(item),
+            account: Some(stated),
+            asset: None,
+            receipt_intent_id: None,
+            key_hex: hex(&event.receipt_key),
+            detail: format!(
+                "item {} was burned, then receipt {} claimed prior owner {} without an \
+                 intervening None -> Some mint",
+                item.0,
+                hex(&event.receipt_key),
+                stated.0
+            ),
+        }),
+        (Some(expected), stated) => findings.push(AuditFinding {
+            kind: FindingKind::OverlappingItemOwnership,
+            item: Some(item),
+            account: Some(expected),
+            asset: None,
+            receipt_intent_id: None,
+            key_hex: hex(&event.receipt_key),
+            detail: format!(
+                "item {} remained owned by account {}, but the next transition named \
+                 prior owner {}; the preceding ownership interval never closed",
+                item.0,
+                expected.0,
+                stated.map_or_else(|| "None".to_owned(), |owner| owner.0.to_string())
+            ),
+        }),
     }
-    findings
 }
 
 fn checked_u64_add(left: u64, right: u64, label: &str) -> Result<u64, FullSweepError> {
@@ -788,7 +1183,69 @@ mod tests {
         assert_eq!(report.ownership_resort.entries, 4);
         assert_eq!(
             report.ownership_resort.memory_bytes_bound,
-            4 * report.ownership_resort.bytes_per_entry
+            OWNERSHIP_RESORT_MEMORY_CEILING_BYTES
+        );
+    }
+
+    /// Thirty page-sized synthetic days force the multi-stage merge path: the
+    /// sweep reads 30 complete archive objects (not a delta) while its reported
+    /// ownership working set remains below the stated 256 KiB ceiling.
+    #[test]
+    fn thirty_day_synthetic_archive_stays_inside_ownership_memory_ceiling() {
+        const SYNTHETIC_DAYS: u64 = 30;
+        const PAGE_ROWS: u64 = OWNERSHIP_RUN_EVENTS as u64;
+        const MEMORY_CEILING_BYTES: u64 = 256 * 1024;
+
+        let directory = tempfile::tempdir().expect("archive directory");
+        let object_dir = directory.path().join("rarchive");
+        std::fs::create_dir_all(&object_dir).expect("receipt object directory");
+        for day in 0..SYNTHETIC_DAYS {
+            let first = day * PAGE_ROWS + 1;
+            let rows = (first..first + PAGE_ROWS)
+                .map(|key| {
+                    archived(
+                        key,
+                        u128::from(key),
+                        vec![LEDGER_ITEM_TRANSFER_OP],
+                        vec![delta(key, 7, -1), delta(key + 1, 7, 1)],
+                        vec![ReceiptOwnershipTransition {
+                            item: ItemUid::new(key),
+                            before: Some(AccountId::new(key)),
+                            after: Some(AccountId::new(key + 1)),
+                        }],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let bytes = encode_receipt_object(&rows).expect("encode synthetic receipt object");
+            let last = rows.last().expect("synthetic page is nonempty").key;
+            std::fs::write(
+                object_dir.join(format!("{}.parquet", hex(&last[2..]))),
+                bytes,
+            )
+            .expect("write synthetic receipt object");
+        }
+
+        let sweeper = ReceiptArchiveSweeper::open(directory.path(), "").expect("open sweeper");
+        let report = sweeper.run_pass(0, 1).expect("synthetic 30-day pass");
+        assert_eq!(report.population.objects, SYNTHETIC_DAYS);
+        assert_eq!(report.population.receipts, SYNTHETIC_DAYS * PAGE_ROWS);
+        assert_eq!(
+            report.population.ownership_transitions,
+            SYNTHETIC_DAYS * PAGE_ROWS
+        );
+        assert!(
+            report.findings.is_empty(),
+            "synthetic transfers are balanced"
+        );
+        assert_eq!(
+            report.ownership_resort.memory_bytes_bound,
+            OWNERSHIP_RESORT_MEMORY_CEILING_BYTES
+        );
+        assert!(
+            report.ownership_resort.memory_bytes_bound <= MEMORY_CEILING_BYTES,
+            "ownership external-sort working set {} exceeds stated {} byte ceiling",
+            report.ownership_resort.memory_bytes_bound,
+            MEMORY_CEILING_BYTES
         );
     }
 
@@ -804,9 +1261,9 @@ mod tests {
         assert!(error.0.contains("zero receipt archive objects"));
     }
 
-    /// Reproducible inputs for #615's layout-cost artifact. The source rate is
+    /// Reproducible inputs for #890's layout-cost artifact. The source rate is
     /// the P2-shaped 530 intents/s used by the Shape-C spike; the all-trade arm
-    /// is the ownership-heavy bound the secondary-clustering decision needs.
+    /// proves the external sort stays page-bounded at any retention horizon.
     #[test]
     fn realistic_window_cost_inputs_are_machine_derived() {
         const PAGE_ROWS: u64 = 4_096;
@@ -836,13 +1293,19 @@ mod tests {
         let receipts_per_day = INTENTS_PER_SECOND * SECONDS_PER_DAY;
         let objects_per_day = receipts_per_day.div_ceil(PAGE_ROWS);
         let scan_bytes_per_day_bound = report.population.object_bytes * objects_per_day;
-        let resort_bytes_per_day = receipts_per_day * report.ownership_resort.bytes_per_entry;
+        assert_eq!(
+            report.ownership_resort.memory_bytes_bound,
+            OWNERSHIP_RESORT_MEMORY_CEILING_BYTES,
+            "the reported ownership re-sort bound must be page/fan-in bounded, not transition bounded"
+        );
         eprintln!(
             "measurement page_rows={PAGE_ROWS} page_bytes={} ownership_event_bytes={} \
              receipts_per_day={receipts_per_day} objects_per_day={objects_per_day} \
              scan_bytes_per_day_bound={scan_bytes_per_day_bound} \
-             resort_bytes_per_day={resort_bytes_per_day}",
-            report.population.object_bytes, report.ownership_resort.bytes_per_entry,
+             ownership_resort_memory_bytes_bound={}",
+            report.population.object_bytes,
+            report.ownership_resort.bytes_per_entry,
+            report.ownership_resort.memory_bytes_bound,
         );
     }
 }
