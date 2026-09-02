@@ -495,12 +495,28 @@ impl SessionPresentation {
         }
     }
 
+    /// Which scope this row belongs to — not whether the link is up this
+    /// instant.
+    ///
+    /// [`Self::Disconnected`] used to answer `Local`, which made a row saying
+    /// `session_scope: "local"` and `banked_minutes: 12.93` at the same time
+    /// (#942): a campaign session that lost its host emitted seven rows
+    /// indistinguishable in scope from local practice, while carrying thirteen
+    /// banked minutes local practice can never have. A disconnected campaign
+    /// session is still a campaign session; its minutes were flown against a
+    /// host and are bankable, and the reason the link is gone is carried by
+    /// [`Self::local_reason`] and the banner, which read the presentation and
+    /// not this. `Dialing`, `Failed` and `Refused` stay `Local`: they reached
+    /// no joined tick, so they bank nothing and there is nothing to
+    /// contradict.
+    ///
+    /// The invariant this restores is the one [`LOCAL_PRACTICE_BANNER`] rests
+    /// on — `banked_minutes > 0` implies campaign scope, so a `local` row with
+    /// minutes on it is impossible rather than merely unusual.
     const fn session_scope(self) -> SessionScope {
         match self {
-            Self::Live => SessionScope::Campaign,
-            Self::Local | Self::Dialing | Self::Failed | Self::Refused | Self::Disconnected => {
-                SessionScope::Local
-            }
+            Self::Live | Self::Disconnected => SessionScope::Campaign,
+            Self::Local | Self::Dialing | Self::Failed | Self::Refused => SessionScope::Local,
         }
     }
 
@@ -524,10 +540,19 @@ impl SessionPresentation {
 ///
 /// A volunteer flew this client for 2¼ minutes believing she was in the
 /// playtest (#769). Every one of her 255 overlay rows said `session_scope:
-/// "local"`, `island_id: null`, `banked_minutes: 0.0` — the client knew. So
-/// the banner says the two things she would have needed: that this is not a
-/// campaign, and that nothing is being banked, which is the consequence she
-/// actually cared about.
+/// "local"` and `banked_minutes: 0.0` — the client knew. So the banner says
+/// the two things she would have needed: that this is not a campaign, and that
+/// nothing is being banked, which is the consequence she actually cared about.
+///
+/// That reasoning was cited with a third signal, `island_id: null`, which
+/// proved nothing: the field was never assigned anywhere in the client and
+/// read `null` in a campaign exactly as it did in local practice (#942). It is
+/// gone, replaced by the host's `attempt_id`, which is `null` in local
+/// practice because there is no attempt and populated in a campaign because
+/// the host named one. The two remaining signals now hold as stated — the
+/// scope of a session that banked minutes is `campaign` even after its link
+/// drops, so `banked_minutes > 0` with `session_scope: "local"` is a
+/// contradiction the client cannot emit.
 const LOCAL_PRACTICE_BANNER: &str =
     "LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN - NOTHING IS BEING BANKED";
 
@@ -581,14 +606,22 @@ fn session_banner_text(
     campaign: Option<&str>,
     notices: &[String],
 ) -> String {
-    let scope = match presentation.session_scope() {
-        SessionScope::Campaign => match campaign {
+    // Keyed on the presentation, not on `session_scope`. The two answer
+    // different questions and part company at `Disconnected` (#942): the row's
+    // scope says whose evidence this session is, and stays `campaign` after
+    // the link dies so banked minutes are never filed as local practice, while
+    // this banner says whether the player is in a live campaign *now* — and a
+    // player whose host has gone is not. Reading the scope here would have put
+    // "CAMPAIGN LIVE" on a dead link, which is the #769 failure with the sign
+    // flipped.
+    let scope = match presentation {
+        SessionPresentation::Live => match campaign {
             Some(identity) => format!("CAMPAIGN LIVE - {identity}"),
             // The runtime always has one; this is the honest reading if it
             // ever does not, and it still never says "local".
             None => "CAMPAIGN LIVE".to_owned(),
         },
-        SessionScope::Local => match presentation.local_reason() {
+        _ => match presentation.local_reason() {
             Some(reason) => format!("{LOCAL_PRACTICE_BANNER} ({reason})"),
             None => LOCAL_PRACTICE_BANNER.to_owned(),
         },
@@ -849,9 +882,23 @@ fn install_campaign_finalization(app: &mut App) {
     // scheduler order. Last still belongs to the same frame, after every
     // Update exit producer and before the runner decides to tear the app
     // down.
+    //
+    // But the exit a *player* produces is not an Update system: closing the
+    // window makes `bevy_window::exit_on_all_closed` write `AppExit`, and that
+    // system lives in `Last` too, in `ExitSystems` (#942). Unordered against
+    // it, this writer ran first in the only frame there was — the runner tears
+    // the app down at the end of the frame the exit was written in, so there
+    // is no next frame to read the message in. That is how two witnessed
+    // 900-second human sessions were measured, displayed, and then dropped
+    // without a line of output. Ordering after `ExitSystems` is the whole
+    // difference between the record existing and not; `.after` on a set no
+    // plugin installed (the headless `MinimalPlugins` composition has no
+    // `WindowPlugin`) is a no-op, so the preflight path is unaffected.
     app.add_systems(
         Last,
-        write_campaign_record_on_exit.in_set(CampaignFinalization),
+        write_campaign_record_on_exit
+            .in_set(CampaignFinalization)
+            .after(bevy::window::ExitSystems),
     );
 }
 
@@ -2674,12 +2721,12 @@ fn refresh_f3_pane(
             Display::None
         };
         **text = format!(
-            "adjudications {} | latency p50/p99 {}/{} ms\nprediction set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nisland {:?} | cell {:?}\nbuild {}\nsession {}\nbanked {:.1} min | idle {:.1} min",
+            "adjudications {} | latency p50/p99 {}/{} ms\nprediction set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nattempt {:?} | cell {:?}\nbuild {}\nsession {}\nbanked {:.1} min | idle {:.1} min",
             metrics.adjudications_completed, metrics.adjudication_latency_p50_ms,
             metrics.adjudication_latency_p99_ms, metrics.prediction_set_size,
             metrics.observed_loss_pct, metrics.configured_loss_pct,
             metrics.observed_jitter_p50_ms, metrics.observed_jitter_p99_ms,
-            metrics.configured_jitter_ms, metrics.island_id, metrics.cell_id, BUILD_REV,
+            metrics.configured_jitter_ms, metrics.attempt_id, metrics.cell_id, BUILD_REV,
             metrics.session_record_path.display(), metrics.banked_minutes, metrics.idle_minutes,
         );
         text.push('\n');
@@ -2743,6 +2790,12 @@ fn stream_metrics(
             metrics.observed_jitter_p50_ms = runtime.observed_jitter_p50_ms();
             metrics.observed_jitter_p99_ms = runtime.observed_jitter_p99_ms();
             metrics.cell_id = runtime.latest_cell().map(CellId::to_bits);
+            // The host's own name for this attempt, adopted from its `StartV1`
+            // manifest. Until one is adopted there is no attempt to name, and
+            // the field says so rather than guessing (#942).
+            metrics.attempt_id = runtime
+                .accepted_start()
+                .map(|start| start.attempt_id.clone());
             let progress = runtime.accumulator().progress();
             metrics.banked_minutes = progress.banked_minutes;
             metrics.idle_minutes = progress.idle_minutes;
@@ -2759,9 +2812,12 @@ fn stream_metrics(
 /// Where a finished attempt's banking record is appended.
 ///
 /// Beside the telemetry stream, which is the single resolved location for
-/// everything this client writes (`paths`). It therefore inherits #766's move
-/// to the per-user application-data directory, inherits `--telemetry-jsonl`,
-/// and shares one writability condition with the stream and the upload state
+/// everything this client writes (`paths`). It therefore inherits whatever
+/// `paths::data_dir` resolves to — since the 2026-09-02 owner decision that is
+/// the current working directory, not #766's per-user application-data
+/// directory, and this comment said otherwise until #942 — inherits
+/// `--telemetry-jsonl`, and shares one writability condition with the stream
+/// and the upload state
 /// — which is what lets the client warn about all three at startup instead of
 /// discovering the record failure at exit, with no UI left to say so (#773).
 #[must_use]
@@ -2772,10 +2828,28 @@ fn campaign_record_path(session_record_path: &Path) -> PathBuf {
         .join("campaign-records.jsonl")
 }
 
-/// Writes the finished banking row once, on app exit.
+/// Writes the finished banking row once, when the session is over.
 ///
 /// The row is produced by the joined-session accumulator only; an offline
 /// [`ActiveSession::Local`] writes nothing because it measured nothing.
+///
+/// Two moments end a session, and banking must survive both (#942):
+///
+/// * **App exit.** The player quits. The link is still up, so the session is
+///   closed politely — goodbye marker, grace period — and then recorded.
+/// * **The link ending first.** The host dropped, or said goodbye, and the
+///   join state left [`JoinState::Joined`]. Everything this session will ever
+///   measure has been measured: [`CampaignRuntime::advance`] banks no further
+///   tick once the state leaves `Joined`. Waiting for the exit to write it
+///   down stakes minutes a human actually flew on the process surviving long
+///   enough to be asked — which the macOS seat of the 2026-09-02 attempt did
+///   not, losing 12.93 measured minutes seven seconds after its host link
+///   closed. So the row is written the moment the session ends, and the exit
+///   path finds it already written.
+///
+/// [`CampaignRuntime::finish_record`] is idempotent and still refuses a
+/// session that reached no joined tick, so neither trigger can produce a
+/// second row or a zero-minute placeholder.
 fn write_campaign_record_on_exit(
     mut exited: MessageReader<AppExit>,
     mut session: ResMut<ActiveSession>,
@@ -2783,11 +2857,27 @@ fn write_campaign_record_on_exit(
     sink: Res<JsonlTelemetry>,
     upload: Option<Res<admission::UploadManager>>,
 ) {
-    for exit in exited.read() {
+    let exiting = exited.read().count() > 0;
+    {
         let ActiveSession::Campaign(runtime) = &mut *session else {
             return;
         };
-        let Some(record) = runtime.shutdown() else {
+        // A dial still in flight has not ended; a joined session has not
+        // ended until the app does. Anything else is over.
+        let link_ended = !matches!(runtime.state(), JoinState::Dialing | JoinState::Joined);
+        if !exiting && !link_ended {
+            return;
+        }
+        // On exit the link may still be up and is owed the goodbye marker.
+        // A session whose link already ended has nothing left to say to a
+        // host that is no longer there, and must not spend `close`'s grace
+        // period sleeping the render loop mid-frame.
+        let record = if exiting {
+            runtime.shutdown()
+        } else {
+            runtime.finish_record()
+        };
+        let Some(record) = record else {
             return;
         };
         // Beside the telemetry stream, which since #766 resolves to the
@@ -2838,9 +2928,10 @@ fn write_campaign_record_on_exit(
             // about; a record that exists in one place only, and that place
             // the server, is not the volunteer's evidence.
             //
-            // What was wrong was never the skip but the silence: this fires at
-            // `AppExit`, when no UI is left to say anything, so an `error!`
-            // here is by construction a message the player cannot act on. The
+            // What was wrong was never the skip but the silence: this fires
+            // when the session ends, which at app exit is a moment with no UI
+            // left to say anything, so an `error!` here is by construction a
+            // message the player may not be able to act on. The
             // condition that produces it — a directory the client cannot write
             // — is now detected at plugin build and carried on the scope
             // banner for the whole session (`RECORDING_UNAVAILABLE_NOTICE`),
@@ -2860,7 +2951,6 @@ fn write_campaign_record_on_exit(
                 );
             }
         }
-        let _ = exit;
     }
 }
 
@@ -2875,6 +2965,261 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
     use std::time::Duration;
+
+    /// The composition and the campaign session a #942 regression drives.
+    ///
+    /// Deliberately the *real* `RegolithSkinPlugin`, not a hand-assembled
+    /// schedule: the defect was that the plugin's own `Last` ordering lost the
+    /// exit, and a test that installs the finalization system itself asserts
+    /// on a schedule it built rather than the one a player runs.
+    fn banking_app(telemetry_path: &Path) -> App {
+        let mut app = App::new();
+        app.add_plugins(bevy::MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .add_plugins(bevy::state::app::StatesPlugin)
+            .add_plugins(bevy::input::InputPlugin)
+            .add_plugins(bevy::window::WindowPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .add_plugins(RegolithSkinPlugin::new(telemetry_path.to_path_buf()));
+        app.finish();
+        app
+    }
+
+    fn banking_campaign_config(session_id: &str) -> campaign::CampaignConfig {
+        campaign::CampaignConfig {
+            host_node_hex: String::new(),
+            host_direct: None,
+            slot: 0,
+            own_label: Some("seat".to_owned()),
+            session_id: session_id.to_owned(),
+            session_token_hex: None,
+            wall_start_utc: "2026-09-02T17:24:00Z".to_owned(),
+            configured: ConfiguredImpairment {
+                loss_pct: 3.0,
+                jitter_p50_ms: 100,
+                jitter_p99_ms: 100,
+            },
+            transport_secret: iroh_base::SecretKey::generate(),
+            island_seats: Some(8),
+            roster_url: None,
+        }
+    }
+
+    /// Closes every window, the way a player quits, and runs the single frame
+    /// the runner grants after that.
+    ///
+    /// Exactly one `update`. The winit runner checks `AppExit` at the end of
+    /// each frame and tears the app down in the frame the message was written
+    /// in; a test that runs a second frame gives the writer a chance no player
+    /// ever gives it, and passes over the defect.
+    fn close_the_window(app: &mut App) {
+        app.update();
+        let windows: Vec<_> = app
+            .world_mut()
+            .query_filtered::<Entity, With<bevy::window::Window>>()
+            .iter(app.world())
+            .collect();
+        assert!(!windows.is_empty(), "the composition opened a window");
+        for window in windows {
+            app.world_mut().entity_mut(window).despawn();
+        }
+        app.update();
+    }
+
+    /// #942, seat 5 (Linux): the owner flew a full witnessed 900-second
+    /// attempt, the host counted 54,000 connected ticks and zero downlink
+    /// drops, the HUD showed 15.39 banked minutes to the last frame — and
+    /// closing the window produced no `campaign-records.jsonl` and not one
+    /// line of output saying why.
+    ///
+    /// The cause was scheduler order inside one schedule. `AppExit` for a
+    /// closed window is written by `bevy_window::exit_on_all_closed`, which
+    /// lives in `Last`; so does this client's record writer, and nothing
+    /// ordered them. The writer ran first, read no exit, and the runner tore
+    /// the app down at the end of that same frame. Every test before this one
+    /// wrote `AppExit` from an `Update` system, which cannot reproduce it:
+    /// there the message is always already there by `Last`.
+    #[test]
+    fn closing_the_window_banks_the_session_in_the_frame_the_runner_grants() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let telemetry_path = temporary.path().join("session.jsonl");
+        let session_id = "01a06327-329f-7443-a211-11f3dee18418".to_owned();
+        let runtime = campaign::CampaignRuntime::finished_for_test(
+            banking_campaign_config(&session_id),
+            SEED,
+        );
+        let mut app = banking_app(&telemetry_path);
+        app.insert_resource(ActiveSession::Campaign(Box::new(runtime)));
+
+        close_the_window(&mut app);
+
+        let record_path = temporary.path().join("campaign-records.jsonl");
+        let rows = std::fs::read_to_string(&record_path).unwrap_or_else(|error| {
+            panic!(
+                "a session the host witnessed for 900 seconds banked nothing: \
+                 no {} ({error})",
+                record_path.display()
+            )
+        });
+        let row: serde_json::Value =
+            serde_json::from_str(rows.trim()).expect("one signed banking row");
+        assert_eq!(row["session_id"], session_id);
+    }
+
+    /// #942, seat 6 (macOS): the host link ended seven seconds before the
+    /// player quit. His last seven overlay rows carry `banked_minutes: 12.93`
+    /// and his client wrote no row at all.
+    ///
+    /// A session that has left `Joined` has measured everything it will ever
+    /// measure — `advance` banks no further tick — so the row must not wait
+    /// for an exit that may never be observed. No `AppExit` is written here at
+    /// all: the frames below are ordinary play after the link died, and the
+    /// row has to be on disk by the end of them.
+    #[test]
+    fn a_session_whose_link_ends_banks_without_waiting_for_the_exit() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let telemetry_path = temporary.path().join("session.jsonl");
+        let session_id = "01a06327-329f-7443-a211-11f3dee18419".to_owned();
+        let mut runtime = campaign::CampaignRuntime::finished_for_test(
+            banking_campaign_config(&session_id),
+            SEED,
+        );
+        runtime.close_for_test();
+        let mut app = banking_app(&telemetry_path);
+        app.insert_resource(ActiveSession::Campaign(Box::new(runtime)));
+
+        app.update();
+
+        let record_path = temporary.path().join("campaign-records.jsonl");
+        let rows = std::fs::read_to_string(&record_path).unwrap_or_else(|error| {
+            panic!(
+                "a campaign session that measured minutes discarded them when \
+                 its link ended: no {} ({error})",
+                record_path.display()
+            )
+        });
+        let row: serde_json::Value =
+            serde_json::from_str(rows.trim()).expect("one signed banking row");
+        assert_eq!(row["session_id"], session_id);
+
+        // And exactly one row: the exit path must find it already written
+        // rather than append a second.
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        let rows = std::fs::read_to_string(&record_path).expect("read banking rows");
+        assert_eq!(
+            rows.lines().count(),
+            1,
+            "one session banks one row, whichever end of it fires first"
+        );
+    }
+
+    /// #942: a session that never reached a joined tick still banks nothing.
+    ///
+    /// The guard the two fixes above must not have loosened. `finish_record`
+    /// calls it out itself: "a zero-minute placeholder would be
+    /// indistinguishable from evidence downstream". A refused dial is a
+    /// session that measured nothing, and no exit path may invent a row for
+    /// it.
+    #[test]
+    fn a_session_that_measured_nothing_banks_nothing() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let telemetry_path = temporary.path().join("session.jsonl");
+        let mut runtime = campaign::CampaignRuntime::launch(
+            banking_campaign_config("01a06327-329f-7443-a211-11f3dee1841a"),
+            SEED,
+        );
+        runtime.refuse_for_test("the campaign is full");
+        let mut app = banking_app(&telemetry_path);
+        app.insert_resource(ActiveSession::Campaign(Box::new(runtime)));
+
+        close_the_window(&mut app);
+
+        assert!(
+            !temporary.path().join("campaign-records.jsonl").exists(),
+            "a refused dial measured nothing and must bank nothing"
+        );
+    }
+
+    /// #942: the row must carry the host's name for the attempt it belongs
+    /// to — assigned, not merely declared.
+    ///
+    /// `island_id` sat in this struct being serialized onto every row and
+    /// printed on the HUD while nothing in the client ever wrote to it, so it
+    /// read `null` in a campaign exactly as in local practice, and the two
+    /// captures from 2026-09-02 had to be matched to the host's attempt report
+    /// by hand. This drives the real emitter, so a field that stops being
+    /// assigned fails here rather than going quietly null again.
+    #[test]
+    fn an_overlay_row_carries_the_attempt_the_host_named() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let telemetry_path = temporary.path().join("session.jsonl");
+        let attempt_id = "attempt-1788343657521929051-3".to_owned();
+        let mut runtime = campaign::CampaignRuntime::finished_for_test(
+            banking_campaign_config("01a06327-329f-7443-a211-11f3dee1841b"),
+            SEED,
+        );
+        runtime.adopt_start_for_test(crate::lobby::AcceptedStart {
+            attempt_id: attempt_id.clone(),
+            island_seats: 8,
+            tick: 0,
+            active_slots: vec![0],
+            witness_recipients: Vec::new(),
+            duration_ticks: 54_000,
+        });
+
+        let mut app = App::new();
+        app.insert_resource(OverlayMetrics::new(telemetry_path.clone()))
+            .insert_resource(MetricWindow::default())
+            .insert_resource(JsonlTelemetry::open(&telemetry_path).expect("open telemetry"))
+            .insert_resource(ActiveSession::Campaign(Box::new(runtime)))
+            .add_systems(Update, stream_metrics);
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<OverlayMetrics>().attempt_id,
+            Some(attempt_id.clone()),
+            "an overlay row cannot name the attempt it belongs to"
+        );
+        let line = std::fs::read_to_string(&telemetry_path).expect("read telemetry");
+        let row: serde_json::Value = serde_json::from_str(line.trim()).expect("one overlay row");
+        assert_eq!(row["values"]["attempt_id"], attempt_id);
+    }
+
+    /// #942: `banked_minutes > 0` and `session_scope: "local"` on one row is a
+    /// contradiction, and seat 6 emitted seven of them.
+    ///
+    /// `LOCAL_PRACTICE_BANNER`'s reasoning rests on a local row meaning
+    /// "nothing is being banked". A campaign session that lost its host is not
+    /// local practice; it is a campaign session with a dead link, and its
+    /// minutes are bankable.
+    #[test]
+    fn a_disconnected_campaign_row_is_not_local_practice() {
+        assert_eq!(
+            SessionPresentation::Disconnected.session_scope(),
+            SessionScope::Campaign,
+            "a campaign session that banked minutes cannot report the scope of \
+             a session that banks nothing"
+        );
+        assert_eq!(
+            SessionPresentation::Disconnected.local_reason(),
+            Some("disconnected"),
+            "and the player is still told the link is gone"
+        );
+        for practice in [
+            SessionPresentation::Local,
+            SessionPresentation::Dialing,
+            SessionPresentation::Failed,
+            SessionPresentation::Refused,
+        ] {
+            assert_eq!(
+                practice.session_scope(),
+                SessionScope::Local,
+                "{practice:?} reached no joined tick and banks nothing"
+            );
+        }
+    }
 
     /// `Tab` walks the ring and wraps, rather than stopping at the end.
     #[test]
@@ -3918,9 +4263,11 @@ mod tests {
         assert_eq!(BUILD_REV, expected, "the binary stamp must be this commit");
     }
 
-    /// A row is campaign evidence only while the transport state machine says
-    /// it is joined. In particular, failed dials must remain visibly and
+    /// A row is campaign evidence only if the transport state machine reached
+    /// a join. In particular, failed dials must remain visibly and
     /// mechanically local even though they still occupy the campaign runtime.
+    /// (A session that joined and *then* lost its host keeps campaign scope —
+    /// see `a_disconnected_campaign_row_is_not_local_practice`.)
     #[test]
     fn local_fallbacks_cannot_present_or_serialize_as_live_campaigns() {
         let local = SessionPresentation::from_join_state(None);
@@ -3963,11 +4310,21 @@ mod tests {
             // was told about but never entered must not be presented as one
             // it is in.
             let banner = session_banner_text(presentation, Some("orrery-live-3"), &[]);
-            assert_eq!(
-                presentation.session_scope(),
-                SessionScope::Local,
-                "{presentation:?} banks nothing and its rows say local"
-            );
+            // The banner speaks about *now* — this player is not in a live
+            // campaign, whichever way she got here. The row's scope speaks
+            // about the session, and the two part company at `Disconnected`
+            // alone: a session that lost its host after banking minutes is a
+            // campaign session with a dead link, and calling its rows local
+            // put 12.93 banked minutes on a row that claimed to bank nothing
+            // (#942). Every other state here reached no joined tick, so it
+            // banks nothing and there is nothing to contradict.
+            if !matches!(presentation, SessionPresentation::Disconnected) {
+                assert_eq!(
+                    presentation.session_scope(),
+                    SessionScope::Local,
+                    "{presentation:?} banks nothing and its rows say local"
+                );
+            }
             assert!(
                 banner.starts_with("LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN"),
                 "{presentation:?} shows {banner:?}, which does not tell a player she is out"
