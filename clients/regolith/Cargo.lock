@@ -123,6 +123,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeronet_iroh"
+version = "0.21.0"
+dependencies = [
+ "aeronet_io",
+ "aeronet_tokio_runtime",
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_platform",
+ "bytes",
+ "derive_more",
+ "futures",
+ "iroh",
+ "tracing",
+]
+
+[[package]]
 name = "aeronet_steam"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -140,6 +156,16 @@ dependencies = [
  "steamworks",
  "sync_wrapper",
  "tracing",
+]
+
+[[package]]
+name = "aeronet_tokio_runtime"
+version = "0.21.0"
+dependencies = [
+ "bevy_ecs",
+ "gloo-timers",
+ "tokio",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -7058,6 +7084,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_net"
+version = "0.1.0"
+dependencies = [
+ "aeronet_io",
+ "aeronet_iroh",
+ "aeronet_tokio_runtime",
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_platform",
+ "bevy_reflect",
+ "bevy_time",
+ "bytes",
+ "iroh",
+ "orrery_protocol",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "orrery_predict"
 version = "0.1.0"
 dependencies = [
@@ -7065,7 +7110,10 @@ dependencies = [
  "bevy_ecs",
  "bevy_platform",
  "bevy_time",
+ "bytes",
  "lightyear",
+ "lightyear_replication",
+ "orrery_net",
  "orrery_protocol",
  "tracing",
 ]
