@@ -53,6 +53,10 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(all(feature = "fdb", feature = "reference-ruleset"))]
+use orrery_persistd::adjudication::FdbStrikeLedger;
+#[cfg(feature = "reference-ruleset")]
+use orrery_persistd::adjudication::StrikeMode;
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 use orrery_persistd::gateway::{SessionTokenV1Authorizer, StrikesEnforcement, StrikesPosture};
 #[cfg(feature = "fdb")]
@@ -1325,6 +1329,16 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid --secret-key (expected hex iroh key): {e}"))
         })
         .transpose()?;
+    // An archive-enabled process keys restore products by the same stable
+    // gateway identity its tailer uses. Capture that identity before the key
+    // moves into `GatewayConfig`, so verdict strikes can join #903's restore
+    // hold index as well as append their `ya` fact.
+    #[cfg(feature = "fdb")]
+    let strike_restore_hold_source = cli
+        .archive_dir
+        .as_ref()
+        .and(secret_key.as_ref())
+        .map(iroh::SecretKey::public);
 
     // The durable ownership this process activated, as the intent executor's
     // fence. Uniform across the shard set: `activate_topology` refuses a mixed
@@ -1407,7 +1421,14 @@ async fn main() -> anyhow::Result<()> {
     // binary compiled with a registration feature supplies its concrete build
     // here. Keep this after the generic gateway construction so a game-owned
     // binary can use the same hand-off without changing the harness default.
-    let adjudicator = configured_adjudicator(cli.universe_seed)?;
+    let adjudicator = configured_adjudicator(
+        cli.universe_seed,
+        cli.strikes,
+        #[cfg(feature = "fdb")]
+        fdb_context.as_ref(),
+        #[cfg(feature = "fdb")]
+        strike_restore_hold_source,
+    )?;
     let adjudicator_rulesets: Vec<_> = adjudicator
         .as_ref()
         .map(|executor| executor.retained().collect())
@@ -2680,6 +2701,9 @@ where
 #[cfg(feature = "reference-ruleset")]
 fn configured_adjudicator(
     universe_seed: Option<UniverseSeedSpec>,
+    strikes: StrikesEnforcement,
+    #[cfg(feature = "fdb")] fdb_context: Option<&FdbContext>,
+    #[cfg(feature = "fdb")] restore_hold_source: Option<NodeId>,
 ) -> anyhow::Result<Option<SharedAdjudicator>> {
     let seed = universe_seed.ok_or_else(|| {
         anyhow::anyhow!(
@@ -2688,8 +2712,44 @@ fn configured_adjudicator(
         )
     })?;
     let mut executor = AdjudicationExecutor::new(seed.0);
+    if let Some(mode) = strike_filing_mode(strikes) {
+        #[cfg(feature = "fdb")]
+        {
+            let context = fdb_context.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--strikes {strikes:?} requires --fdb-cluster-file when an adjudicator is linked"
+                )
+            })?;
+            let ledger = FdbStrikeLedger::from_database(context.database());
+            if let Some(source) = restore_hold_source {
+                ledger.configure_restore_hold_index(source);
+            }
+            executor = executor.with_strike_ledger(Arc::new(ledger), mode);
+        }
+        #[cfg(not(feature = "fdb"))]
+        {
+            let _ = mode;
+            anyhow::bail!(
+                "--strikes {strikes:?} requires persistd to be compiled with the `fdb` feature when an adjudicator is linked"
+            );
+        }
+    }
     executor.register(|| orrery_conformance::Reference);
     Ok(Some(Arc::new(executor)))
+}
+
+/// Map C5's one startup policy to its two distinct enforcement points.
+///
+/// `StrikeMode` stamps facts at the adjudicator; `StrikesEnforcement` governs
+/// how the gateway consumes later standing invalidations. They deliberately
+/// remain different types even though D32 gives the operator one C5 control.
+#[cfg(feature = "reference-ruleset")]
+fn strike_filing_mode(strikes: StrikesEnforcement) -> Option<StrikeMode> {
+    match strikes {
+        StrikesEnforcement::Off => None,
+        StrikesEnforcement::Shadow => Some(StrikeMode::Shadow),
+        StrikesEnforcement::Live => Some(StrikeMode::Live),
+    }
 }
 
 /// The library harness's shipped default: no linked Ruleset means no
@@ -2698,8 +2758,13 @@ fn configured_adjudicator(
 #[cfg(not(feature = "reference-ruleset"))]
 fn configured_adjudicator(
     universe_seed: Option<UniverseSeedSpec>,
+    strikes: StrikesEnforcement,
+    #[cfg(feature = "fdb")] fdb_context: Option<&FdbContext>,
+    #[cfg(feature = "fdb")] restore_hold_source: Option<NodeId>,
 ) -> anyhow::Result<Option<SharedAdjudicator>> {
-    let _ = universe_seed;
+    let _ = (universe_seed, strikes);
+    #[cfg(feature = "fdb")]
+    let _ = (fdb_context, restore_hold_source);
     Ok(None)
 }
 
