@@ -484,3 +484,49 @@ mod mutants {
         mutation_moves_the_replay(seed, &bytes, mutant, "its observation stamps");
     }
 }
+
+/// What a restore does *not* put back, pinned deliberately.
+///
+/// A snapshot is a rewind point for canonical state, not for the consumer's
+/// undrained output.  `SimulationHost::snapshot` documents that undrained
+/// events stay in the drain buffer across a restore, while `abi::restore`
+/// clears the hashes accumulated in the handle, on the reasoning that they
+/// "would be attributed to ticks the restored host is about to execute
+/// again".
+///
+/// That reasoning reads across to events word for word, so the asymmetry is
+/// pinned here rather than left to be discovered: a consumer that drains
+/// every frame — the normal pattern — never sees it, but one that snapshots,
+/// steps and restores without draining will see the abandoned timeline's
+/// events once and the replayed timeline's events again.  If that is ever
+/// judged wrong, this test is the thing to change, and it names the ABI half
+/// that already decided the other way.
+#[test]
+fn a_restore_rewinds_canonical_state_and_not_the_undrained_event_buffer() {
+    let mut host = executor_host(0);
+    host.install_state(WATCHER, watcher());
+    host.install_state(WATCHED, watched());
+    host.step(TickCount::new(2));
+    let snapshot = host.snapshot();
+    let at_snapshot = host.peek_event_bytes().expect("events fit").into_bytes();
+    assert!(
+        !at_snapshot.is_empty(),
+        "the scenario emitted events, or this pins nothing"
+    );
+
+    host.step(TickCount::new(2));
+    let after_more_ticks = host.peek_event_bytes().expect("events fit").into_bytes();
+    assert!(
+        after_more_ticks.len() > at_snapshot.len(),
+        "the extra ticks emitted more events"
+    );
+
+    host.restore(&snapshot).expect("snapshot restores");
+    assert_eq!(
+        host.peek_event_bytes().expect("events fit").into_bytes(),
+        after_more_ticks,
+        "the undrained event buffer is the consumer's output and survives a \
+         restore untouched; canonical state is what rewinds"
+    );
+    assert_eq!(host.next_tick(), snapshot.next_tick());
+}
