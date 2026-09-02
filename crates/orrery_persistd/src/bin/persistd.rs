@@ -34,6 +34,10 @@
 //! `kill -9` the process, restart from the same FDB cluster and secret key, and
 //! the world resumes (RPO 0 intents, bulk bounded by the journal window).
 
+#[cfg(any(feature = "fdb", test))]
+#[path = "persistd/restore_control.rs"]
+mod restore_control;
+
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::net::SocketAddr;
@@ -78,6 +82,7 @@ use orrery_protocol::metrics::{
 use orrery_protocol::{CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId};
 
 type SharedExecutor = Arc<dyn IntentExecutor>;
+type OperatorControl = (oneshot::Sender<()>, JoinHandle<()>);
 
 /// Command-line configuration for the `persistd` binary.
 #[derive(Debug, Parser)]
@@ -254,6 +259,20 @@ struct Cli {
     /// then issues be *redirects* — see `DenyReason::WrongOwner`.
     #[arg(long, value_name = "PATH")]
     handover_request: Option<PathBuf>,
+
+    /// Path to a JSON file this node watches for a two-phase restore request.
+    ///
+    /// A `plan` request names the archive selection and operator. It writes an
+    /// inspectable entity-by-entity plan and appends nothing. A later `apply`
+    /// request names only that prior `plan_id`; it applies the retained plan
+    /// forward and writes the `RestoreApplyReport`. In both phases the request
+    /// is renamed aside before work starts and the outcome is written to
+    /// `<path>.result`, following `--handover-request`.
+    ///
+    /// This is a mechanism, not an authorization policy. Who may place the
+    /// file is unresolved and explicitly reserved to the deployment owner.
+    #[arg(long, value_name = "PATH")]
+    restore_request: Option<PathBuf>,
 
     /// Retain every journal segment: never release the ones the checkpoints
     /// have made redundant (D20).
@@ -948,6 +967,12 @@ async fn main() -> anyhow::Result<()> {
     if cli.receipt_archive && cli.archive_dir.is_none() {
         anyhow::bail!("--receipt-archive requires --archive-dir");
     }
+    if cli.restore_request.is_some() && cli.archive_dir.is_none() {
+        anyhow::bail!("--restore-request requires --archive-dir");
+    }
+    if cli.restore_request.is_some() && cli.fdb_cluster_file.is_none() {
+        anyhow::bail!("--restore-request requires --fdb-cluster-file");
+    }
     if cli.receipt_archive && cli.fdb_cluster_file.is_none() {
         anyhow::bail!("--receipt-archive requires --fdb-cluster-file");
     }
@@ -1505,59 +1530,77 @@ async fn main() -> anyhow::Result<()> {
     // the object key and the `jarchive/{node_id}` range the watermark is
     // recovered from. `--secret-key` is what makes that identity survive a
     // restart, which is why it is required rather than merely recommended.
-    let archive_tailer: Option<orrery_persistd::archive::ArchiveTailerHandle> =
-        match cli.archive_dir.clone() {
-            None => None,
-            Some(dir) => {
-                if cli.secret_key.is_none() {
-                    anyhow::bail!(
-                        "--archive-dir requires --secret-key: the archive is keyed by this node's \
+    let (archive_tailer, restore_control): (
+        Option<orrery_persistd::archive::ArchiveTailerHandle>,
+        Option<OperatorControl>,
+    ) = match cli.archive_dir.clone() {
+        None => (None, None),
+        Some(dir) => {
+            if cli.secret_key.is_none() {
+                anyhow::bail!(
+                    "--archive-dir requires --secret-key: the archive is keyed by this node's \
                      NodeId, and an ephemeral identity would archive into a fresh namespace on \
                      every start"
-                    );
-                }
-                // The `jarchive/` rows belong in the same durable tier as the
-                // checkpoints that bound the other half of the release
-                // precondition. Without FDB there is nowhere durable to put them,
-                // and an in-memory index would make every restart re-archive from
-                // the floor — so this is refused rather than silently downgraded.
-                #[cfg(not(feature = "fdb"))]
-                {
-                    let _ = dir;
-                    anyhow::bail!(
+                );
+            }
+            // The `jarchive/` rows belong in the same durable tier as the
+            // checkpoints that bound the other half of the release
+            // precondition. Without FDB there is nowhere durable to put them,
+            // and an in-memory index would make every restart re-archive from
+            // the floor — so this is refused rather than silently downgraded.
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = dir;
+                anyhow::bail!(
                     "--archive-dir requires the `fdb` feature: the jarchive/ metadata rows have \
                      no durable home without it"
                 );
-                }
-                #[cfg(feature = "fdb")]
-                {
-                    let context = fdb_context.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
+            }
+            #[cfg(feature = "fdb")]
+            {
+                let context = fdb_context.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
                         "--archive-dir requires --fdb-cluster-file: the jarchive/ metadata rows \
                          are the durable record a restart recovers its archive watermark from"
                     )
-                    })?;
-                    let tailer = orrery_persistd::archive::ArchiveTailer::open(
-                        Arc::clone(runtime_for_shutdown.journal()),
-                        Arc::new(orrery_persistd::archive::FsArchiveStore::open(&dir)?),
-                        Arc::new(orrery_persistd::archive::FdbJarchiveIndex::new(
-                            context.database(),
-                        )),
-                        gateway.id(),
-                        cli.archive_prefix.clone(),
-                        orrery_persistd::archive::ArchiveTailerConfig::default(),
+                })?;
+                let store = Arc::new(orrery_persistd::archive::FsArchiveStore::open(&dir)?);
+                let index = Arc::new(orrery_persistd::archive::FdbJarchiveIndex::new(
+                    context.database(),
+                ));
+                let tailer = orrery_persistd::archive::ArchiveTailer::open(
+                    Arc::clone(runtime_for_shutdown.journal()),
+                    store.clone(),
+                    index.clone(),
+                    gateway.id(),
+                    cli.archive_prefix.clone(),
+                    orrery_persistd::archive::ArchiveTailerConfig::default(),
+                )
+                .await?;
+                tracing::info!(
+                    dir = %dir.display(),
+                    prefix = %cli.archive_prefix,
+                    status = ?tailer.status(),
+                    "archive tailer started"
+                );
+                let restore_control = cli.restore_request.clone().map(|path| {
+                    let planner = orrery_persistd::archive::RestorePlanner::new(store, index);
+                    restore_control::spawn_restore_control(
+                        restore_control::RestoreControlContext::new(
+                            planner,
+                            Arc::clone(&runtime_for_shutdown),
+                            gateway.id(),
+                        ),
+                        path,
                     )
-                    .await?;
-                    tracing::info!(
-                        dir = %dir.display(),
-                        prefix = %cli.archive_prefix,
-                        status = ?tailer.status(),
-                        "archive tailer started"
-                    );
-                    Some(orrery_persistd::archive::spawn_archive_tailer(tailer))
-                }
+                });
+                (
+                    Some(orrery_persistd::archive::spawn_archive_tailer(tailer)),
+                    restore_control,
+                )
             }
-        };
+        }
+    };
 
     // The economic receipt archive is global rather than node-local. It is an
     // explicit role (`--receipt-archive`) so a deployment starts one scanner,
@@ -1629,6 +1672,7 @@ async fn main() -> anyhow::Result<()> {
         shards = topology.shards.len(),
         role = topology.role.name(),
         archive_tailer = archive_tailer.is_some(),
+        restore_control = restore_control.is_some(),
         receipt_archive_tailer = receipt_archive_tailer.is_some(),
         full_conservation_sweeper = full_conservation_sweeper.is_some(),
         startup_elapsed_ms = startup_started.elapsed().as_millis(),
@@ -1649,8 +1693,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Graceful shutdown in reverse order: gateway - schedulers - cluster.
-    // The handover orchestrator goes first and is *awaited*, because it holds
-    // an `Arc<CellRuntime>` and the journal close below needs the last one.
+    // Operator controls go first and are *awaited*, because each holds an
+    // `Arc<CellRuntime>` and the journal close below needs the last one.
+    if let Some((shutdown, task)) = restore_control {
+        let _ = shutdown.send(());
+        let _ = task.await;
+    }
     if let Some((shutdown, task)) = handover_control {
         let _ = shutdown.send(());
         let _ = task.await;
@@ -2174,6 +2222,11 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
         anyhow::bail!(
             "--archive-dir is not valid for a chain follower; a follower originates no records \
              and its mirror is bounded by the primary's own retention floor (D23)"
+        );
+    }
+    if cli.restore_request.is_some() {
+        anyhow::bail!(
+            "--restore-request is not valid for a chain follower; a follower has no active cell runtime"
         );
     }
 
@@ -3214,7 +3267,8 @@ mod tests {
     ///   epoch; the epoch flag exists so a chain "never silently resumes under a
     ///   different ownership epoch", which a stale exported value would cause.
     /// - `--no-journal-retention` is a forensics switch, not a knob.
-    /// - `--handover-request` drives a single-writer transition.
+    /// - `--handover-request` and `--restore-request` drive single-writer
+    ///   transitions.
     #[test]
     fn identity_role_and_mode_flags_do_not_read_the_environment() {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3233,6 +3287,7 @@ mod tests {
             ("ORRERY_CHAIN_EPOCH", "7"),
             ("ORRERY_NO_JOURNAL_RETENTION", "true"),
             ("ORRERY_HANDOVER_REQUEST", "/tmp/handover"),
+            ("ORRERY_RESTORE_REQUEST", "/tmp/restore"),
         ] {
             let previous = std::env::var_os(name);
             std::env::set_var(name, value);
@@ -3259,8 +3314,8 @@ mod tests {
                 "{name} reached --no-journal-retention; a forensics switch is not a knob"
             );
             assert!(
-                parsed.handover_request.is_none(),
-                "{name} reached --handover-request; the transition has one writer"
+                parsed.handover_request.is_none() && parsed.restore_request.is_none(),
+                "{name} reached an operator request path; the transition has one writer"
             );
             assert_eq!(
                 parsed.attestation_enforcement,
@@ -3395,6 +3450,7 @@ mod tests {
             shard: Vec::new(),
             standby_shard: Vec::new(),
             handover_request: None,
+            restore_request: None,
             metrics_jsonl: None,
         }
     }
