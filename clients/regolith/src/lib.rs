@@ -795,7 +795,7 @@ impl Plugin for RegolithSkinPlugin {
                         .before(sync_rendered_state),
                     recompose_craft_bodies.after(sync_rendered_state),
                     ensure_local_body.after(sync_rendered_state),
-                    ensure_focus_body.after(recompose_craft_bodies),
+                    ensure_remote_craft_bodies.after(recompose_craft_bodies),
                     ensure_rock_bodies.after(sync_rendered_state),
                     // After every body-spawning system, so a craft that
                     // appears this frame is faded on the frame it appears
@@ -804,7 +804,7 @@ impl Plugin for RegolithSkinPlugin {
                     aoi::sync_aoi_fade
                         .after(aoi::read_aoi_boundary)
                         .after(ensure_rock_bodies)
-                        .after(ensure_focus_body)
+                        .after(ensure_remote_craft_bodies)
                         .after(ensure_local_body),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
@@ -2174,32 +2174,80 @@ fn ensure_local_body(
     );
 }
 
-fn ensure_focus_body(
+/// Spawns a body for **every** remote craft this session holds state for.
+///
+/// This used to spawn exactly one: `session.focus_entity()`, the "duel view"
+/// craft, which `CampaignRuntime` latches to the first remote entity whose
+/// replication arrives and never re-points while that replica stays fresh
+/// (`campaign.rs`, `self.focus.is_none()`). That was correct for the
+/// two-seat sandbox it was written for and silently wrong for every campaign
+/// since: the 2026-09-02 witnessed attempt ran **six active seats**, so five
+/// peers were decoded, installed into the executor by the downlink ingest,
+/// counted by the F3 pane and the telemetry — and four of them had no
+/// geometry of any kind. Not a mesh, not a ship label (which projects from a
+/// body's `GlobalTransform`), and not even a contact arrow, since
+/// `contact_arrows` only draws hearsay for a seat and hearsay is strictly
+/// weaker than the replicated state already sitting in the executor.
+///
+/// Which one survived was decided by arrival order, so the single craft a
+/// player could see was whichever peer's keyframe landed first — a headless
+/// bot, in a crowd that is mostly bots. The other human was not drawable at
+/// all until that latch was released by replica expiry. "No other craft
+/// visible for a long stretch, then contact eventually made" is that latch
+/// being held and then dropped, not a distance effect.
+///
+/// **This asserts nothing new** (#519). Every craft drawn here is one whose
+/// authoritative `RegolithState::Craft` the host already replicated to this
+/// client and which `sync_rendered_state` is already driving the transform
+/// of; the fix is that a body now exists for it to drive. Retirement is
+/// unchanged and still belongs to `ensure_local_body`, which despawns any
+/// body whose entity the executor no longer knows — so a peer that leaves
+/// the interest set still disappears on exactly the schedule `#505`'s
+/// `REPLICA_TTL_TICKS` sets.
+///
+/// `focus_entity` is left alone: it is still the default lock target
+/// (`select_clicked_body`'s neighbourhood) and still what `setup_scene`
+/// pre-spawns. It is no longer what decides who is visible.
+fn ensure_remote_craft_bodies(
     session: Res<ActiveSession>,
     asset_server: Res<AssetServer>,
     paths: Res<VisualAssetPaths>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    bodies: Query<(Entity, &CoreEntity)>,
+    bodies: Query<&CoreEntity, With<CraftBodyComposition>>,
     mut commands: Commands,
 ) {
-    let Some(focus) = session.focus_entity() else {
-        return;
-    };
-    if bodies.iter().any(|(_, core)| core.0 == focus) {
-        return;
+    let local = session.local_entity();
+    let drawn = bodies.iter().map(|core| core.0).collect::<BTreeSet<_>>();
+    // Sorted, so which craft is spawned on which frame is a property of the
+    // executor's own ordering rather than of ECS iteration order.
+    for entity in session
+        .executor()
+        .entities()
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        if entity == local || drawn.contains(&entity) {
+            continue;
+        }
+        if !matches!(
+            session.executor().state(entity),
+            Some(RegolithState::Craft(_))
+        ) {
+            continue;
+        }
+        spawn_craft_body(
+            &mut commands,
+            &asset_server,
+            &paths,
+            session.executor(),
+            entity,
+            craft::Seat::Bot,
+            Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
+            &mut meshes,
+            &mut materials,
+        );
     }
-    spawn_craft_body(
-        &mut commands,
-        &asset_server,
-        &paths,
-        session.executor(),
-        focus,
-        craft::Seat::Bot,
-        Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
-        &mut meshes,
-        &mut materials,
-    );
 }
 
 /// Rebuilds a speculative craft body once replicated state names a different
@@ -3559,6 +3607,87 @@ mod tests {
             origin,
             Some("https://campaigns.distopik.com".to_owned()),
             "a headless session must derive its upload origin from the roster URL it joined through"
+        );
+    }
+
+    /// Every peer the host replicated gets a body, not just the first one.
+    ///
+    /// This is the initial half of #940. The 2026-09-02 witnessed attempt ran
+    /// eight seats with six active, so a joined client decoded and installed
+    /// five peers into its executor — and drew exactly one of them, because
+    /// `ensure_remote_craft_bodies` was `ensure_focus_body` and
+    /// `CampaignRuntime::focus` latches first-write-wins on whichever
+    /// replication arrived first. In a crowd that is mostly headless bots
+    /// that latch almost never lands on the other human, and nothing releases
+    /// it while the latched replica keeps refreshing. "No other craft visible
+    /// for a long stretch, then contact eventually made" is that latch, not a
+    /// distance effect: #951's pitch walk is gradual and predicts the
+    /// opposite order.
+    ///
+    /// The peers here are installed through `install_replica_for_test`, which
+    /// runs the same two lines the downlink keyframe arm runs, so `focus` is
+    /// latched by arrival order exactly as production latches it rather than
+    /// being posed by the test.
+    #[test]
+    fn every_replicated_peer_is_drawn_not_only_the_first_to_arrive() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let config = campaign::CampaignConfig {
+            host_node_hex: String::new(),
+            host_direct: None,
+            slot: 0,
+            own_label: Some("ada".to_owned()),
+            session_id: "01917f0e-2b9a-7c4d-8f21-6a0b3c9d1e2f".to_owned(),
+            session_token_hex: None,
+            wall_start_utc: "2026-08-30T12:00:00Z".to_owned(),
+            configured: ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+            transport_secret: iroh_base::SecretKey::generate(),
+            island_seats: Some(6),
+            roster_url: None,
+        };
+        let mut runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
+        runtime.set_record_path(temporary.path().join("record.jsonl"));
+        runtime.join_for_test();
+        let local = runtime.entity();
+        // Five peers, in the order their keyframes landed. The first is a
+        // headless bot; the other human is somewhere behind it, which is the
+        // ordinary case for a six-active island.
+        let game = Regolith::honest();
+        let peers: Vec<PersistId> = (2..=6).map(PersistId::new).collect();
+        for peer in &peers {
+            runtime.install_replica_for_test(*peer, game.spawn(*peer, 0));
+        }
+        assert_eq!(
+            runtime.focus(),
+            Some(peers[0]),
+            "the duel latch still takes the first arrival; this test is about \
+             what is drawn, not about removing the latch"
+        );
+
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_resource::<VisualAssetPaths>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .insert_resource(ActiveSession::Campaign(Box::new(runtime)))
+            .add_systems(Update, (ensure_local_body, ensure_remote_craft_bodies));
+        app.update();
+
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&CoreEntity, With<CraftBodyComposition>>();
+        let drawn: BTreeSet<PersistId> = query.iter(app.world()).map(|core| core.0).collect();
+        let mut expected: BTreeSet<PersistId> = peers.iter().copied().collect();
+        expected.insert(local);
+        assert_eq!(
+            drawn,
+            expected,
+            "a joined client must draw every craft the host replicated to it; \
+             missing {:?}",
+            expected.difference(&drawn).collect::<Vec<_>>()
         );
     }
 

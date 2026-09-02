@@ -1857,7 +1857,17 @@ impl Bot {
     }
 
     /// Attach a session for `peer`, so the send path has somewhere to write.
+    ///
+    /// Idempotent. `form_island` links the seats present when the run starts
+    /// and `refresh_rosters` links every seat that binds afterwards, so both
+    /// call this for peers already linked; spawning a second `Peer` for one
+    /// node would give `send_peer_packets` two sessions to choose between.
+    /// The check is a query of the world this spawns into rather than a
+    /// second set kept alongside it, so it cannot disagree with reality.
     pub fn link(&mut self, peer: NodeId, mtu: usize) {
+        if self.is_linked_to(peer) {
+            return;
+        }
         self.app.world_mut().spawn((
             Peer {
                 id: peer,
@@ -1868,6 +1878,33 @@ impl Bot {
             // without this has nowhere to put a gap repair at all.
             aeronet_iroh::stream::IrohStreamIo::detached(),
         ));
+    }
+
+    /// Whether this bot holds a transport session for `peer`.
+    ///
+    /// `send_peer_packets` finds its session by exactly this predicate
+    /// (`crates/orrery_net/src/peer_link.rs`), and a packet addressed to a
+    /// node with no match is dropped against `no_session`, which nothing in
+    /// the swarm report surfaces. So this is the difference between "the
+    /// roster names the seat" and "the seat can be sent to".
+    #[must_use]
+    pub fn is_linked_to(&mut self, peer: NodeId) -> bool {
+        self.sessions_to(peer) > 0
+    }
+
+    /// How many transport sessions this bot holds for `peer`.
+    ///
+    /// More than one is a defect, not a redundancy: `send_peer_packets` takes
+    /// the `find` first match, so a duplicate silently halves nothing and
+    /// hides which session a packet went down.
+    #[must_use]
+    pub fn sessions_to(&mut self, peer: NodeId) -> usize {
+        self.app
+            .world_mut()
+            .query::<&Peer>()
+            .iter(self.app.world())
+            .filter(|existing| existing.id == peer)
+            .count()
     }
 
     /// Drops everything this bot has queued to send, on both lanes.
