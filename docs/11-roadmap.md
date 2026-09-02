@@ -887,11 +887,10 @@ platforms the criterion names.
 
 **Goal.** The population-adaptive topology completed (D6), the full R7 persistence surface, and production ops posture.
 
-**Crates.** `orrery_field_host` (promoted-cell authority, parked-cell catch-up execution), `orrery_coordinator` (promotion at > 32 sustained with hysteresis, elastic scheduling), `orrery_persistd` (hotspot cell splitting, terrain chunk compaction, journal→archive tailer, griefing rollback), `orrery_net` (multi-region relay/gateway routing), ops (≥3 relay regions, fdb-kubernetes-operator or systemd deployment, dashboards, runbooks).
+**Crates.** `orrery_field_host` (promoted-cell authority, parked-cell catch-up execution), `orrery_coordinator` (promotion at > 32 sustained with hysteresis, elastic scheduling), `orrery_persistd` (hotspot cell splitting, journal→archive tailer, griefing rollback), `orrery_net` (multi-region relay/gateway routing), ops (≥3 relay regions, fdb-kubernetes-operator or systemd deployment, dashboards, runbooks).
 
 **Deliverables.**
 - Field-host promotion/demotion: coordinator spins up a headless Bevy instance that assumes cell-entity authority; peers keep authority over their own players; clients experience it as just another authority peer (the Destiny 2 lesson — [move the host into the datacenter, never onto a player](https://edgegap.com/blog/multiplayer-game-hosting-deep-dive-exploring-how-destiny-2-uses-both-peer-to-peer-authoritative-servers)).
-- Terrain pipeline: cell-aligned chunk deltas in the journal, compacted to ≤ 100 KB snapshot shards.
 - Event archive (Parquet on object storage) with retention config; griefing rollback via inverse-op replay by cell/actor/time-range. **The tailer is now load-bearing rather than additive**: [D20](adr/0020-journal-retention.md) made the journal bounded, so from here on a released record's history exists only where the tailer has put it. When it lands it contributes one more watermark to the same release floor — no second mechanism.
 - Chaos suite: netsplit (cluster unreachable → intents queue, sim continues), relay-region loss, FDB node loss, coordinator restart.
 - **The enforcement ramp's last control lands here, not in P5.** This follows

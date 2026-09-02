@@ -1,4 +1,4 @@
-# ADR-0042: Canonical state stays in the engine-neutral executor, the composition root and host seam land now, and a dedicated ECS world is trigger-gated
+# ADR-0042: Canonical state stays in the engine-neutral executor, the composition root and host seam land now, and a dedicated ECS world is admitted on a fired trigger or by recorded owner decision
 
 **Status:** Accepted · **Date:** 2026-08-25 · **Decision:** D42
 
@@ -451,10 +451,13 @@ clause (d) stay binding on the hybrid's ECS-hosted tier regardless.
   every forward path the brief contemplates — plus the reversal condition of
   clause (e), which names the experiment that would kill the composition
   claim rather than leaving it unfalsifiable.
-- Until an R1 trigger fires, proposals to put `bevy_ecs` in a gated crate
-  are refused by this record, not argued case-by-case; and the trigger list
-  means such a proposal now has a legitimate path — produce the T1/T2
-  measurement and the T3 gate bundle — instead of a standing argument.
+- Absent a fired R1 trigger or a recorded owner decision, proposals to put
+  `bevy_ecs` in a gated crate are refused by this record, not argued
+  case-by-case; and clause (d)'s two paths mean such a proposal now has a
+  legitimate route — produce the T1/T2 measurement and the T3 gate bundle, or
+  obtain a recorded owner admission — instead of a standing argument.
+  (Restated 2026-09-02 with clause (d)'s amendment; the original read "Until an
+  R1 trigger fires".)
   (2026-08-31: `orrery_games` has left that set by the clause (a) and
   clause (d) amendments above. `orrery_core` and `orrery_conformance` have
   not, and the sentence is about them.)
