@@ -31,7 +31,8 @@ pub use client::{ClientError, CoordinatorClient};
 pub use interest::{InterestCrossingError, InterestIssuer, IssuedInterestCrossing};
 pub use registry::{CoordinatorConfig, IslandDrain, IslandRegistry, MembershipChange};
 pub use server::{
-    CoordinatorServer, CoordinatorStats, FeedFailure, ServerConfig, ServerError,
-    SharedStandingInvalidationFeed, StandingInvalidationFeed, StrikesMode, StrikesPosture,
+    spawn_strikes_posture_poller, CoordinatorServer, CoordinatorStats, FeedFailure, ServerConfig,
+    ServerError, SharedStandingInvalidationFeed, SharedStrikesPostureReader,
+    StandingInvalidationFeed, StrikesMode, StrikesPosture, StrikesPostureReader,
 };
 pub use witness::{SeedOutcome, SeededEpoch, WitnessEpochIssuer, WitnessSeedConfig, WitnessSeeder};

@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 [features]
 # Durable witness-seed epochs / island generation counters via FoundationDB.
 # Not implemented in P1; the in-memory state is reconstructible from presence.
-fdb-state = []
+fdb-state = ["dep:orrery_persistd", "orrery_persistd/fdb"]
 
 [[bin]]
 name = "orrery-coordinator"
@@ -19,6 +19,11 @@ path = "src/bin/orrery-coordinator.rs"
 
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
+# D32's posture row vocabulary and read-only adapter are owned by persistd's
+# durable keyspace. The raw journal feature only satisfies persistd's
+# exactly-one-backend crate invariant; the coordinator uses no journal API and
+# does not pull the chain transport.
+orrery_persistd = { path = "../orrery_persistd", default-features = false, features = ["journal-raw"], optional = true }
 # The standing-invalidation feed (D33 clause (e)) is an async trait, the same
 # shape persistd's gateway-side seam uses.
 async-trait = "0.1"
@@ -46,7 +51,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 glam = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 bytes = { workspace = true }
 # The mint-refusal proof (`tests/standing_mint_refusal.rs`) drives
 # `orrery_identity::IdentityService` over `ComputedStanding` from outside the

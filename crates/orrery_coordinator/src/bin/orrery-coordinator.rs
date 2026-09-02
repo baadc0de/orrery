@@ -20,6 +20,27 @@ use orrery_coordinator::server::{
 use orrery_coordinator::{CoordinatorServer, InterestIssuer, WitnessEpochIssuer};
 use orrery_protocol::{GridId, IssuerKey, IssuerKeyId, NodeId};
 
+#[cfg(feature = "fdb-state")]
+struct FdbStrikesPostureReader(orrery_persistd::intent::FdbRampPostureStore);
+
+#[cfg(feature = "fdb-state")]
+#[async_trait::async_trait]
+impl orrery_coordinator::StrikesPostureReader for FdbStrikesPostureReader {
+    async fn read_strikes(&self) -> Result<Option<StrikesMode>, String> {
+        self.0
+            .read(orrery_persistd::gateway::STRIKES_CONTROL)
+            .await
+            .map(|row| {
+                row.map(|row| match row.mode {
+                    orrery_persistd::intent::RampMode::Off => StrikesMode::Off,
+                    orrery_persistd::intent::RampMode::Shadow => StrikesMode::Shadow,
+                    orrery_persistd::intent::RampMode::Live => StrikesMode::Live,
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "orrery-coordinator",
@@ -134,6 +155,14 @@ fn main() -> anyhow::Result<()> {
         })
         .transpose()?;
 
+    #[cfg(feature = "fdb-state")]
+    let strikes_posture_reader = {
+        let context = orrery_persistd::FdbContext::connect_default()?;
+        Some(Arc::new(FdbStrikesPostureReader(
+            orrery_persistd::intent::FdbRampPostureStore::from_context(&context),
+        )) as orrery_coordinator::SharedStrikesPostureReader)
+    };
+
     let config = ServerConfig {
         bind: cli.bind.parse::<SocketAddr>()?,
         secret_key,
@@ -142,6 +171,8 @@ fn main() -> anyhow::Result<()> {
         token_clock: Arc::new(SystemUnixClock),
         presence_clock: Arc::new(SystemPresenceClock::default()),
         strikes_posture: strikes_posture(&cli),
+        #[cfg(feature = "fdb-state")]
+        strikes_posture_reader,
         ..ServerConfig::new(cli.issuer_key.iter().map(|key| key.0.clone()), issuer)
     };
 

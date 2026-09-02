@@ -1428,13 +1428,45 @@ mod tests {
 
     /// Everything `AuditFinding::emit` wrote on `orrery_audit` while `run`
     /// executed, as the rendered log text.
+    ///
+    /// # Why the subscriber is global and only the buffer is per-thread
+    ///
+    /// The obvious shape — build a capturing subscriber and hand it to
+    /// `tracing::subscriber::with_default` — is what this helper used to do,
+    /// and it lost a race about one run in four. `with_default` is
+    /// thread-local, but `tracing`'s *callsite interest* cache is global and
+    /// sticky: `AuditFinding::emit` is a single callsite, and a sibling test
+    /// reaching it on another thread while no subscriber was installed
+    /// registered it as `Interest::never()` for the rest of the process. Every
+    /// later capture then read an empty log — indistinguishable from "the
+    /// finding was never emitted", which is exactly the assertion these tests
+    /// make. Rebuilding the interest cache does not close it either; the
+    /// sibling simply re-poisons it on its next pass.
+    ///
+    /// So the subscriber is installed once, globally, and interest is computed
+    /// against a subscriber that is always there. What varies per thread is
+    /// only *where the bytes go*: a thread with no capture in progress writes
+    /// into no buffer and produces no output, so a global INFO subscriber
+    /// costs the rest of the suite nothing.
     fn captured_audit_log<T>(run: impl FnOnce() -> T) -> (T, String) {
-        #[derive(Clone, Default)]
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        type Buffer = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
 
-        impl std::io::Write for Captured {
+        thread_local! {
+            /// The capture in progress on this thread, if any.
+            static SINK: std::cell::RefCell<Option<Buffer>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        #[derive(Clone, Copy, Default)]
+        struct ThreadSink;
+
+        impl std::io::Write for ThreadSink {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                SINK.with(|sink| {
+                    if let Some(buffer) = sink.borrow().as_ref() {
+                        buffer.lock().expect("log buffer").extend_from_slice(bytes);
+                    }
+                });
                 Ok(bytes.len())
             }
 
@@ -1443,22 +1475,33 @@ mod tests {
             }
         }
 
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadSink {
             type Writer = Self;
 
             fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
+                *self
             }
         }
 
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, run);
-        let text = String::from_utf8(captured.0.lock().expect("log buffer").clone())
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ThreadSink)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            // Deliberately not `expect`: if some other harness in this binary
+            // already owns the global, failing here would turn a capture that
+            // still works into a panic.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+
+        let buffer: Buffer = Buffer::default();
+        SINK.with(|sink| *sink.borrow_mut() = Some(std::sync::Arc::clone(&buffer)));
+        let result = run();
+        SINK.with(|sink| *sink.borrow_mut() = None);
+
+        let text = String::from_utf8(buffer.lock().expect("log buffer").clone())
             .expect("log text is UTF-8");
         (result, text)
     }

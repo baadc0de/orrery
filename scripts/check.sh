@@ -249,6 +249,15 @@ lane_clippy() {
         --features orrery_persistd/fdb,orrery_seed/fdb \
         -- -D warnings
 
+    # The coordinator's `fdb-state` arm is the only place its C5 durable
+    # posture reader is wired to FoundationDB, and the workspace command above
+    # compiles the crate with the feature off. Without this line that wiring is
+    # not merely untested, it is never type-checked — the state #863's poller
+    # work found it in.
+    run cargo clippy -p orrery_coordinator --all-targets --no-deps \
+        --features fdb-state \
+        -- -D warnings
+
     # D19 keeps Fjall as a mutually exclusive fallback. The workspace command
     # exercises the default raw backend; this invocation prevents the fallback
     # from becoming compile-only archaeology behind an unvisited feature.

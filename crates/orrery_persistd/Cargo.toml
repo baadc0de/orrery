@@ -101,3 +101,4 @@ harness = false
 tempfile = "3"
 proptest = { workspace = true }
 iroh-base = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
