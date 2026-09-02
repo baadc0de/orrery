@@ -205,10 +205,11 @@ make_read_only() { # directory
                 # spelling `(WD,AD)` is documented but the runner rejected it
                 # with "Invalid parameter", and a deny that will not parse is
                 # a deny that does not exist.
-                deny_err="$(icacls "$win_path" /deny "$account:(OI)(CI)(W)" 2>&1)" \
+                deny_err="$(MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 icacls "$win_path" /deny "$account:(OI)(CI)(W)" 2>&1)" \
                     && read_only_method="icacls deny (OI)(CI)(W) for $account" \
                     || read_only_why="icacls could not deny writes to $account: ${deny_err//$'\n'/ }"
-                icacls "$win_path" /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1 \
+                MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+                    icacls "$win_path" /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1 \
                     || read_only_why="${read_only_why:-icacls could not reset inheritance}"
             fi
         fi
@@ -223,8 +224,10 @@ make_read_only() { # directory
 
 make_writable() { # directory
     if [[ $(host_platform) == windows ]] && command -v icacls >/dev/null 2>&1; then
-        icacls "$(cygpath -w "$1")" /remove:d "$(whoami)" >/dev/null 2>&1
-        icacls "$(cygpath -w "$1")" /inheritance:e \
+        MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+            icacls "$(cygpath -w "$1")" /remove:d "$(whoami | tr -d '\r\n')" >/dev/null 2>&1
+        MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+            icacls "$(cygpath -w "$1")" /inheritance:e \
             /grant '*S-1-1-0:(OI)(CI)(F)' >/dev/null 2>&1
     else
         chmod -R u+w "$1" 2>/dev/null
