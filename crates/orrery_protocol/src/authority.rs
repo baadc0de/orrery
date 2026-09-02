@@ -484,9 +484,11 @@ mod tests {
         // Version 10 (#861) added the identity wire family, also a different
         // enum set; `DenyReason` still did not move, and the byte still says
         // so.
+        // Version 11 (#923) added a state sub-tag family instead; this enum
+        // did not move either.
         assert_eq!(
             crate::PROTOCOL_VERSION,
-            10,
+            11,
             "this test pins the wire under a specific version; re-check it when the version moves"
         );
 

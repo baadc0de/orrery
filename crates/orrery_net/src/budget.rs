@@ -847,6 +847,27 @@ mod tests {
     }
 
     #[test]
+    fn re_homing_a_state_family_onto_the_stream_cannot_buy_it_a_shed() {
+        // The families whose home channel is the state datagram keep it in
+        // `WireFamily::from_frame`; a pairing the table does not name is not a
+        // family, and falls back to the transport's default lane. On the
+        // stream that fallback is `Lane::Control` — unsheddable — so moving a
+        // hit, a witness anchor, or replication itself onto the stream can
+        // only cost its sender accounting, never survival. This is the claim
+        // `from_frame`'s doc makes, and it is what lets the delivered input be
+        // the one family matched on both channels: every other state family
+        // lands here if its channel moves.
+        use crate::channels::{tag, TAG_HIT, TAG_REPLICATION, TAG_WITNESS_KEYFRAME};
+        for family_tag in [TAG_HIT, TAG_REPLICATION, TAG_WITNESS_KEYFRAME] {
+            assert_eq!(
+                lane_of(Channel::Control, &tag(Channel::Control, &[family_tag, 0])),
+                Lane::Control,
+                "sub-tag {family_tag:#04x} on the stream must not fall into a sheddable lane"
+            );
+        }
+    }
+
+    #[test]
     fn a_delta_datagram_is_charged_to_the_replication_lane() {
         use orrery_protocol::channels::{
             encode_delta_patch, encode_replication_delta, ReplicationDelta, TAG_REPLICATION_DELTA,
