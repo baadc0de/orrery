@@ -1419,10 +1419,78 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.sync_all()?;
     }
     std::fs::rename(&temporary, path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    sync_parent_directory(path);
     Ok(())
+}
+
+/// Flush the directory entry, on the platforms where that is a thing.
+///
+/// A rename is only durable once the *directory* is synced, so POSIX wants an
+/// `fsync` on the parent. Windows has no equivalent: `File::open` on a
+/// directory fails with `ERROR_ACCESS_DENIED` — os error 5 — unless the handle
+/// is opened with `FILE_FLAG_BACKUP_SEMANTICS`, which `std` does not expose.
+///
+/// This used to be `File::open(parent)?.sync_all()?` on every platform. The
+/// join file was written, synced and renamed successfully, and then that line
+/// failed and took the whole write with it, so a Windows volunteer was stopped
+/// at the door with **"Could not save the join file: Access is denied (os
+/// error 5)"** — the same sentence #766 fixed, from a different cause, with
+/// the artifact already on disk.
+///
+/// Best-effort by design: on POSIX a failure here means the rename may not
+/// survive a power cut, which is worth a log line and is not worth failing a
+/// join over. On Windows there is nothing to call.
+fn sync_parent_directory(path: &Path) {
+    #[cfg(not(windows))]
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+            debug!(
+                "could not flush the directory entry for {}: {error}; the write itself succeeded",
+                parent.display()
+            );
+        }
+    }
+    #[cfg(windows)]
+    let _ = path;
+}
+
+#[cfg(test)]
+mod durable_write_tests {
+    use super::*;
+
+    /// A join artifact survives a write, and the write does not depend on
+    /// being able to open its parent directory as a file.
+    ///
+    /// The bug this pins: `durable_write` ended with
+    /// `File::open(parent)?.sync_all()?`, which on Windows fails with
+    /// `ERROR_ACCESS_DENIED` (os error 5) because a directory cannot be opened
+    /// that way. The bytes were already on disk; the `?` discarded that and
+    /// returned the error, so a volunteer saw "Could not save the join file:
+    /// Access is denied" with the file sitting beside them.
+    ///
+    /// A Linux-only assertion cannot reproduce the Windows failure, so this
+    /// asserts the property that makes the platform difference irrelevant:
+    /// the write reports success and the bytes are readable afterwards.
+    #[test]
+    fn a_durable_write_succeeds_and_leaves_the_bytes_readable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nested").join("artifact.json");
+        durable_write(&path, b"{\"ok\":true}").expect("durable_write reports success");
+        assert_eq!(
+            std::fs::read(&path).expect("the artifact is readable"),
+            b"{\"ok\":true}",
+            "the bytes durable_write claimed to write must be on disk"
+        );
+    }
+
+    /// The directory flush is advisory: it must not be able to fail a write.
+    ///
+    /// Calling it on a path whose parent does not exist exercises the error
+    /// arm directly. Before the fix that arm was a `?`.
+    #[test]
+    fn the_directory_flush_cannot_fail_a_write() {
+        sync_parent_directory(Path::new("/definitely/not/here/artifact.json"));
+    }
 }
 
 #[cfg(test)]

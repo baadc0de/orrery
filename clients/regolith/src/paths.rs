@@ -136,15 +136,25 @@ pub fn data_dir_from(environment: &DataDirEnv, platform: Platform) -> Option<Pat
 
 /// The directory this launch writes its artifacts into.
 ///
-/// The platform's per-user application data directory, and — when the
-/// environment names none — the temporary directory rather than anything
-/// derived from the current working directory. The last resort is chosen for
-/// the one property that matters here: a process that cannot write cannot
-/// join.
+/// **The current working directory**, by owner decision (2026-09-02): a
+/// volunteer trusts files that appear where they launched the game, and can
+/// find them to send back. A per-user application-data path is invisible to
+/// most people and turns "send me the log" into a support conversation.
+///
+/// The trade is documented rather than engineered around. If the client is
+/// launched from a place the process may not write — from inside the ZIP via
+/// Explorer's read-only temp, or extracted into `Program Files` — the join
+/// artifact cannot be saved and the volunteer is stopped at the door. The
+/// answer is `PLAYTEST.md`'s instruction to extract first, plus
+/// `--telemetry-jsonl` (or `ORRERY_TELEMETRY_JSONL`) to point everything
+/// somewhere writable.
+///
+/// [`data_dir_from`] still resolves the platform conventions; it is kept
+/// because `--telemetry-jsonl` users and any future opt-in need it, and
+/// because a Windows answer must stay testable from a Linux host.
 #[must_use]
 pub fn data_dir() -> PathBuf {
-    data_dir_from(&DataDirEnv::from_process(), Platform::host())
-        .unwrap_or_else(|| std::env::temp_dir().join("orrery").join("regolith"))
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// The default telemetry stream, which the join artifact and the upload-retry

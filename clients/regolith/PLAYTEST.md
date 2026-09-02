@@ -3,6 +3,20 @@
 This folder is a complete, code-only Regolith client release. Download the
 archive for your computer from the Orrery [Releases page](https://github.com/baadc0de/orrery/releases), then extract it before opening the game.
 
+**Extract the archive before running it, and extract it somewhere you own** —
+your Desktop or a folder under your user account. The game writes its files
+next to where you launch it: the session log, the join file, and the retry
+state all appear in that folder, so you can find them and send them back
+without hunting through hidden system directories.
+
+That is also why the folder has to be writable. If you run the game from
+*inside* the ZIP (Windows opens it in a read-only temporary folder), or from
+`Program Files`, or from a folder Windows' Controlled Folder Access is
+guarding, the game will tell you **"Could not save the join file: Access is
+denied"** and stop before you join. Extracting to your Desktop avoids all
+three. If you would rather keep the game where it is, start it with
+`--telemetry-jsonl <a writable path>` and every file follows that location.
+
 - **Windows PC:** download `orrery-regolith-x86_64-windows.zip`, right-click it
   and choose **Extract All**, then open `orrery-regolith-x86_64-windows.exe`.
   Windows may show *Windows protected your PC*. Choose **More info**, then
