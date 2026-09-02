@@ -48,9 +48,9 @@ cargo run -- --telemetry-jsonl /tmp/regolith/session.jsonl
 A banner across the top of the screen says so for the whole session, drawn
 above the join gate so it is never the thing that is covered:
 
-- `CAMPAIGN LIVE - <campaign>` -- joined, banking, and named, so campaign scope
+- `CAMPAIGN LIVE - <campaign>` -- joined, recording, and named, so campaign scope
   is recognised positively rather than by the absence of a warning.
-- `LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN - NOTHING IS BEING BANKED` --
+- `LOCAL PRACTICE - NOT CONNECTED TO A CAMPAIGN - NOTHING IS BEING RECORDED` --
   every other state, with the reason in parentheses when there is one
   (`connecting`, `dial failed`, `join refused`, `disconnected`).
 
@@ -60,17 +60,17 @@ from the same value, so the screen and the record cannot disagree (#769).
 The banner also carries any condition that changes what the session is worth.
 The one that exists today:
 
-    SESSION NOT BEING RECORDED - NOTHING YOU FLY NOW WILL BE SAVED OR BANKED
+    SESSION NOT BEING RECORDED - NOTHING YOU FLY NOW WILL BE SAVED
 
 which appears when the telemetry stream cannot be opened. That is a degradable
 condition -- a game that cannot record can still be played, and the client no
 longer dies during plugin registration when it happens (#772) -- but it is not
-a silent one: the stream, the campaign banking record and the upload state
+a silent one: the stream, the campaign session record and the upload state
 share one directory, so a directory the client cannot write is a session that
-banks nothing, and the volunteer is told that before she flies rather than by
+records nothing, and the volunteer is told that before she flies rather than by
 an `error!` after she has quit (#773).
 
-When a banking record cannot be written at exit the upload is still not
+When a session record cannot be written at exit the upload is still not
 attempted, deliberately: the service would otherwise hold evidence its author
 cannot corroborate. What changed is that the condition which causes it is now
 visible for the whole session instead of only in the log.
@@ -79,7 +79,7 @@ Campaign entry is explicit. `--campaign` prints the recording notice and exits
 without joining until `--campaign-consent` is supplied. Campaign coordinators
 provide the human session UUIDv7 and P4 pipeline digest with the session's
 witness report; `scripts/p4-ledger.sh append` then validates and stores the
-completed `session` row on its normal banking path.
+completed `session` row on its normal recording path.
 
 ## Joining with one file
 
