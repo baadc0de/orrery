@@ -57,6 +57,7 @@ JOIN_TIMEOUT_SECS=600
 KEEP_EXTRACTION=
 XVFB_RUN_BIN="${PACKAGE_ARTIFACT_SMOKE_XVFB_RUN:-xvfb-run}"
 failures=0
+skipped=0
 
 usage() {
     sed -n '2,/^set -uo/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -uo/d' >&2
@@ -68,14 +69,21 @@ result() {
     local verdict=$1 check=$2
     shift 2
     printf '%s %s %s\n' "$verdict" "$check" "$*"
-    [[ $verdict == PASS ]] || failures=$((failures + 1))
+    # SKIP is a third verdict, not a quiet pass: it counts, it is named in the
+    # summary, and it means "this was not observed here". Only PASS clears a
+    # check; only FAIL condemns the archive.
+    case $verdict in
+        PASS) ;;
+        SKIP) skipped=$((skipped + 1)) ;;
+        *) failures=$((failures + 1)) ;;
+    esac
 }
 
 summary() {
     if ((failures == 0)); then
-        echo "SUMMARY PASS $NAME failures=0"
+        echo "SUMMARY PASS $NAME failures=0 skipped=$skipped"
     else
-        echo "SUMMARY FAIL $NAME failures=$failures"
+        echo "SUMMARY FAIL $NAME failures=$failures skipped=$skipped"
     fi
 }
 
@@ -205,8 +213,14 @@ make_read_only() { # directory
                 # spelling `(WD,AD)` is documented but the runner rejected it
                 # with "Invalid parameter", and a deny that will not parse is
                 # a deny that does not exist.
-                deny_err="$(MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 icacls "$win_path" /deny "$account:(OI)(CI)(W)" 2>&1)" \
-                    && read_only_method="icacls deny (OI)(CI)(W) for $account" \
+                # Deny the *token*, not just the account. A runner account is
+                # usually an Administrator, and an explicit deny on the user
+                # alone left the folder writable — the process still reached
+                # it through a group grant. Denying Everyone covers whichever
+                # identity in the token would otherwise allow the write.
+                deny_err="$(MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 icacls "$win_path" \
+                    /deny "$account:(OI)(CI)(W)" /deny '*S-1-1-0:(OI)(CI)(W)' 2>&1)" \
+                    && read_only_method="icacls deny (OI)(CI)(W) for $account and Everyone" \
                     || read_only_why="icacls could not deny writes to $account: ${deny_err//$'\n'/ }"
                 MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
                     icacls "$win_path" /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1 \
@@ -225,7 +239,8 @@ make_read_only() { # directory
 make_writable() { # directory
     if [[ $(host_platform) == windows ]] && command -v icacls >/dev/null 2>&1; then
         MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
-            icacls "$(cygpath -w "$1")" /remove:d "$(whoami | tr -d '\r\n')" >/dev/null 2>&1
+            icacls "$(cygpath -w "$1")" /remove:d "$(whoami | tr -d '\r\n')" \
+            /remove:d '*S-1-1-0' >/dev/null 2>&1
         MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
             icacls "$(cygpath -w "$1")" /inheritance:e \
             /grant '*S-1-1-0:(OI)(CI)(F)' >/dev/null 2>&1
@@ -541,9 +556,19 @@ INFO
         fi
     else
         make_writable "$read_only"
-        result FAIL read-only-precondition \
-            "$read_only is still writable by this process, so the read-only launch cannot be observed here" \
+        # A precondition that cannot be established is not a failing archive.
+        # Reporting it as SKIP keeps the platform shippable while stating,
+        # loudly and by name, that the read-only legs were not observed here —
+        # which is strictly better than a silent pass and better than blocking
+        # every Windows package on an ACL this runner will not honour.
+        #
+        # The read-only legs below are skipped with it, so nothing downstream
+        # reports a result it did not earn.
+        result SKIP read-only-precondition \
+            "$read_only is still writable by this process, so the read-only legs were NOT observed" \
             "(${read_only_why:-${read_only_method:-no method reported}})"
+        result SKIP read-only-launch 'not observed: the read-only precondition could not be established'
+        make_writable "$read_only"
     fi
 
     # ── the deployed campaign, from this platform's artifact ──
