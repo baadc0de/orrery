@@ -506,11 +506,25 @@ INFO
         result FAIL launch-writes-beside-the-binary \
             "nothing was written into the launch folder $extraction"
     fi
-    if [[ ! -d $data_dir ]]; then
-        result PASS launch-writes-nowhere-hidden "no per-user data directory was created"
+    # The volunteer's *artifacts* live where she launched the game. Her
+    # transport identity key does not, and deliberately so: it is a signing
+    # secret, not a log, and a launch folder is exactly what someone zips up
+    # and passes to a friend. `identity::default_identity_path` resolves it to
+    # the per-user profile independently of `paths::data_dir`.
+    #
+    # So the check is not "nothing hidden exists" — that would forbid the key —
+    # it is that no *artifact* was diverted there.
+    local hidden_artifacts
+    hidden_artifacts="$(
+        [[ -d $data_dir ]] && (cd "$data_dir" && find . -mindepth 1 -type f \
+            ! -name 'transport-identity.key' | sed 's|^\./||' | LC_ALL=C sort)
+    )"
+    if [[ -z $hidden_artifacts ]]; then
+        result PASS launch-writes-nowhere-hidden \
+            'no artifact was diverted to the per-user directory'
     else
         result FAIL launch-writes-nowhere-hidden \
-            "the client wrote to the hidden per-user directory $data_dir instead of its launch folder"
+            "the client diverted artifacts to $data_dir: [$(echo $hidden_artifacts)]"
     fi
     local stray
     # Both sides stay newline-separated and sorted, the shape `$expected` was
@@ -568,12 +582,17 @@ INFO
         # folder, so a read-only launch must NOT have quietly diverted them to
         # a hidden per-user directory. If it had, the volunteer would be
         # banking hours into a location nobody told her about.
-        if [[ ! -d $ro_data_dir ]]; then
+        local ro_hidden
+        ro_hidden="$(
+            [[ -d $ro_data_dir ]] && (cd "$ro_data_dir" && find . -mindepth 1 -type f \
+                ! -name 'transport-identity.key' | sed 's|^\./||' | LC_ALL=C sort)
+        )"
+        if [[ -z $ro_hidden ]]; then
             result PASS read-only-writes-nowhere-hidden \
-                'a read-only launch diverted nothing to a hidden directory'
+                'a read-only launch diverted no artifact to a hidden directory'
         else
             result FAIL read-only-writes-nowhere-hidden \
-                "a read-only launch wrote to the hidden directory $ro_data_dir instead of refusing visibly"
+                "a read-only launch diverted artifacts to $ro_data_dir: [$(echo $ro_hidden)]"
         fi
         make_writable "$read_only"
         local ro_entries
@@ -661,6 +680,19 @@ if [[ ${1:-} == --build-info ]]; then
 fi
 # Artifacts live beside the binary, where the volunteer launched it.
 data_dir=.
+# ...but the transport identity key does not, and the stand-in must model that
+# or the smoke passes against a client simpler than the one it ships. The real
+# `identity::default_identity_path` resolves to the per-user profile,
+# independently of the artifact location.
+case "$label" in
+    x86_64-windows) identity_dir="${APPDATA:-}/Orrery/Regolith" ;;
+    aarch64-macos) identity_dir="${HOME:-}/Library/Application Support/Orrery/Regolith" ;;
+    *) identity_dir="${XDG_DATA_HOME:-}/orrery/regolith" ;;
+esac
+if [[ -n ${identity_dir#/} ]]; then
+    mkdir -p "$identity_dir" 2>/dev/null \
+        && : >>"$identity_dir/transport-identity.key" 2>/dev/null || true
+fi
 file=session.jsonl
 for arg in "$@"; do
     [[ $arg == --smoke-test ]] && file=smoke.jsonl
