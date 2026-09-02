@@ -934,7 +934,9 @@ impl StrikeLedger for FdbStrikeLedger {
 mod tests {
     use super::*;
     use orrery_core::{CodecError, CoreCodec, OrderedInputs, Quantized, StateView, StepOutput};
-    use orrery_protocol::{ChainHash, EvidenceBundle, PersistId, StateClaim, Tick};
+    use orrery_protocol::{
+        ChainHash, EntitySlice, EvidenceBundle, LogFrame, PersistId, StateClaim, Tick,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Empty;
@@ -984,6 +986,31 @@ mod tests {
         iroh_base::SecretKey::from_bytes(&[seed; 32])
     }
 
+    /// One signed, record-free frame spanning the fixture's whole window.
+    fn covering_frame(subject: &iroh_base::SecretKey, ruleset: RulesetId) -> LogFrame {
+        let entity = PersistId::new(1);
+        let slice = EntitySlice {
+            entity,
+            chain_epoch: 0,
+            prev_head: ChainHash::EMPTY.rolling(),
+            records: Vec::new(),
+            head: ChainHash::EMPTY.rolling(),
+        };
+        let transitions = vec![orrery_core::log::HeadTransition {
+            entity,
+            prev_head: ChainHash::EMPTY,
+            head: ChainHash::EMPTY,
+        }];
+        let preimage = orrery_core::log::frame_preimage(ruleset, Tick::new(0), 1, &transitions);
+        LogFrame {
+            ruleset,
+            first_tick: Tick::new(0),
+            tick_count: 1,
+            entities: vec![slice],
+            sig: subject.sign(&preimage),
+        }
+    }
+
     fn bundle(ruleset: RulesetId) -> EvidenceBundle {
         let subject = key(1);
         let mut claim = StateClaim {
@@ -1004,8 +1031,14 @@ mod tests {
             window_end: Tick::new(1),
             t0_claim: claim,
             t0_snapshot: bytes::Bytes::new(),
-            frames: Vec::new(),
-            sibling_heads: Vec::new(),
+            // A real signed frame covering [0, 1). An empty `frames` is not a
+            // bundle any honest witness can build — `AuthorityLog::assemble_bundle`
+            // refuses it with `BundleError::IncompleteFrames` — and the
+            // adjudicator now agrees, because frames withheld wholesale are the
+            // #874 omission attack at its limit: every tick would replay with no
+            // inputs and diverge from what the authority signed.
+            frames: vec![covering_frame(&subject, ruleset)],
+            sibling_heads: vec![Vec::new()],
             disputed_claims: Vec::new(),
             claimed_hashes: vec![[0; 32]],
             computed_hashes: vec![[0; 32]],
