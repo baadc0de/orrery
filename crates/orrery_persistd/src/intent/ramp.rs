@@ -189,6 +189,91 @@ impl RampPosture {
             PostureSource::Default | PostureSource::Operator => true,
         }
     }
+
+    /// [`Self::admissible`], plus the part that needs to know what the control
+    /// is doing right now.
+    ///
+    /// An automation row must *strictly lower the acting rank*: it may only
+    /// take a control that is acting and stop it. [`Self::admissible`] cannot
+    /// see the current mode, so it enforces the half that is a property of the
+    /// row alone; this adds the half that is a property of the transition.
+    ///
+    /// The two are both required and neither implies the other, which is the
+    /// reason they are written as a conjunction rather than folded into one
+    /// rank comparison:
+    ///
+    /// - A rank comparison alone admits `AutoSuspend` → `Off` from `Live`,
+    ///   because `off` does rank below `live`. Clause (f) forbids exactly that
+    ///   — *"Fallback is shadow, never off"* — because blinding the cluster
+    ///   during the incident that tripped the breaker is a denial-of-service
+    ///   lever against enforcement, not an abundance of caution.
+    /// - [`Self::admissible`] alone admits `AutoSuspend` → `Shadow` from
+    ///   `Off`, which raises the rank: automation starting an evaluation an
+    ///   operator switched off.
+    ///
+    /// Only the conjunction is clause (f).
+    #[must_use]
+    pub const fn admissible_from(&self, current: RampMode) -> bool {
+        if !self.admissible() {
+            return false;
+        }
+        match self.source {
+            PostureSource::AutoSuspend => self.mode.rank() < current.rank(),
+            PostureSource::Default | PostureSource::Operator => true,
+        }
+    }
+}
+
+impl RampMode {
+    /// Hardening rank: how much the control acts. Higher acts more.
+    ///
+    /// This is emphatically **not** "safer" — D32's default table makes C2 ship
+    /// `live`, so lowering C2's rank de-hardens the fleet while lowering C1's
+    /// merely stops an experiment. Rank orders *action*, and the safety
+    /// question is answered per control against that table, not by this
+    /// function.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Shadow => 1,
+            Self::Live => 2,
+        }
+    }
+}
+
+/// The row a poller may act on, or `None` for one no writer was permitted to
+/// produce.
+///
+/// **Every posture poller reads through this.** It is the single seam where
+/// [`RampPosture::admissible`] is applied, so a new constraint on who may write
+/// what — [#932]'s accepted operator-signature check among them — reaches C1,
+/// C4 and C5 by being added to `admissible`, not by editing three pollers and
+/// hoping the fourth remembers.
+///
+/// An inadmissible row is treated exactly as an **absent** one: the control
+/// falls back to its startup default. That is the conservative direction in
+/// both senses — a forged promotion is refused rather than obeyed, and the
+/// fallback is a value an operator chose at launch rather than one a writer
+/// asserted. The refusal is logged loudly, because a row that reached the
+/// store while being unwritable is either a bug in a writer or someone with
+/// cluster access, and both deserve an operator's attention.
+///
+/// [#932]: https://github.com/baadc0de/orrery/pull/932
+#[must_use]
+pub fn admitted<'row>(row: Option<&'row RampPosture>, control: &str) -> Option<&'row RampPosture> {
+    let row = row?;
+    if row.admissible() {
+        return Some(row);
+    }
+    tracing::error!(
+        control,
+        mode = ?row.mode,
+        source = ?row.source,
+        set_at_ms = row.set_at_ms,
+        "refusing a durable ramp posture its claimed writer was not permitted          to write; falling back to this control's startup default"
+    );
+    None
 }
 
 /// Failure reading a durable ramp posture.

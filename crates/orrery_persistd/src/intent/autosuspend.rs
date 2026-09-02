@@ -1077,6 +1077,56 @@ mod tests {
         }
     }
 
+    /// The transition rule, and why rank alone is not clause (f).
+    ///
+    /// The accepted D32 open-question-1 spike states the automation arm as a
+    /// rank comparison (`rank(row.mode) < rank(current)`). That is necessary
+    /// and **not sufficient**: `off` ranks below `live`, so a rank-only rule
+    /// admits the one fallback clause (f) forbids in as many words. The row's
+    /// own constraint and the transition's constraint are both required, and
+    /// this pins the two cases that separate them.
+    #[test]
+    fn the_transition_rule_is_a_conjunction_and_not_a_rank_comparison() {
+        let auto = |mode| RampPosture {
+            mode,
+            source: PostureSource::AutoSuspend,
+            set_at_ms: 1,
+            reason: String::new(),
+            incident_id: None,
+        };
+
+        // The one permitted move.
+        assert!(auto(RampMode::Shadow).admissible_from(RampMode::Live));
+
+        // Ranks below `live`, and is still refused: shadow keeps observing,
+        // and falling to `off` is the censorship lever.
+        assert!(!auto(RampMode::Off).admissible_from(RampMode::Live));
+
+        // Passes the row-local check and still refused: it raises the rank.
+        assert!(!auto(RampMode::Shadow).admissible_from(RampMode::Off));
+
+        // Idempotence: re-applying a demotion to an already-shadow control is
+        // not a transition, so it does not strictly lower anything.
+        assert!(!auto(RampMode::Shadow).admissible_from(RampMode::Shadow));
+
+        // A promotion fails both halves.
+        assert!(!auto(RampMode::Live).admissible_from(RampMode::Shadow));
+
+        // The operator's lever is unconstrained in both predicates.
+        for mode in [RampMode::Off, RampMode::Shadow, RampMode::Live] {
+            for current in [RampMode::Off, RampMode::Shadow, RampMode::Live] {
+                let operator = RampPosture {
+                    mode,
+                    source: PostureSource::Operator,
+                    set_at_ms: 1,
+                    reason: String::new(),
+                    incident_id: None,
+                };
+                assert!(operator.admissible_from(current));
+            }
+        }
+    }
+
     /// The monitor never yields a demotion without a breach, in either
     /// direction.
     #[test]

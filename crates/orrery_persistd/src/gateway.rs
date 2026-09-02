@@ -442,7 +442,8 @@ pub fn spawn_strikes_posture_poller(
             interval.tick().await;
             match reader.read(STRIKES_CONTROL).await {
                 Ok(row) => {
-                    let mode = row.as_ref().map_or(startup_default, |row| match row.mode {
+                    let admitted = crate::intent::ramp::admitted(row.as_ref(), STRIKES_CONTROL);
+                    let mode = admitted.map_or(startup_default, |row| match row.mode {
                         RampMode::Off => StrikesEnforcement::Off,
                         RampMode::Shadow => StrikesEnforcement::Shadow,
                         RampMode::Live => StrikesEnforcement::Live,
