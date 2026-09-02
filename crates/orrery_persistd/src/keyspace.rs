@@ -2313,7 +2313,7 @@ pub fn strike_account_range_end(account: AccountId) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Restore-hold index: `yc/{source node}/{entity}/{filing LSN}/{product}`
+// Restore-hold index: `yc/{source node}/{entity}/{product}`
 // ---------------------------------------------------------------------------
 
 /// The `y`-family discriminator for the restore-hold join.
@@ -2323,7 +2323,7 @@ pub fn strike_account_range_end(account: AccountId) -> Vec<u8> {
 /// those products, not another representation of either product.
 pub const RESTORE_HOLD_DISCRIMINATOR: u8 = b'c';
 
-const RESTORE_HOLD_PREFIX_LEN: usize = 2 + 32 + 8 + 16;
+const RESTORE_HOLD_PREFIX_LEN: usize = 2 + 32 + 8;
 const RESTORE_HOLD_STRIKE_KIND: u8 = b'a';
 const RESTORE_HOLD_ANNULMENT_KIND: u8 = b'b';
 
@@ -2368,15 +2368,19 @@ fn versionstamp_hex(versionstamp: &[u8; 10]) -> String {
     text
 }
 
-/// `yc || source_node || entity || filing_lsn`, the common ordered prefix.
-fn restore_hold_prefix(source_node: &NodeId, entity: PersistId, filing_lsn: Lsn) -> Vec<u8> {
+/// `yc || source_node || entity`, the common entity-scoped prefix.
+///
+/// The durable products name evidence windows in client-supplied ticks, while
+/// restore selects server-assigned journal LSNs. Neither product carries a
+/// server LSN for its evidence window, so filing order cannot safely join
+/// them. An entity-scoped projection is deliberately conservative: any
+/// retained adjudication product for the entity holds its restore.
+fn restore_hold_prefix(source_node: &NodeId, entity: PersistId) -> Vec<u8> {
     let mut key = vec![0; RESTORE_HOLD_PREFIX_LEN];
     key[0] = b'y';
     key[1] = b'c';
     key[2..34].copy_from_slice(source_node.as_bytes());
     key[34..42].copy_from_slice(&entity.0.to_be_bytes());
-    key[42..50].copy_from_slice(&filing_lsn.segment.to_be_bytes());
-    key[50..58].copy_from_slice(&filing_lsn.offset.to_be_bytes());
     key
 }
 
@@ -2388,10 +2392,9 @@ fn restore_hold_prefix(source_node: &NodeId, entity: PersistId, filing_lsn: Lsn)
 pub fn restore_hold_strike_versionstamped_key(
     source_node: &NodeId,
     entity: PersistId,
-    filing_lsn: Lsn,
     account: AccountId,
 ) -> Vec<u8> {
-    let mut key = restore_hold_prefix(source_node, entity, filing_lsn);
+    let mut key = restore_hold_prefix(source_node, entity);
     key.push(RESTORE_HOLD_STRIKE_KIND);
     key.extend_from_slice(&account.0.to_be_bytes());
     let versionstamp_offset = u32::try_from(key.len()).expect("restore hold key fits u32");
@@ -2405,38 +2408,24 @@ pub fn restore_hold_strike_versionstamped_key(
 pub fn restore_hold_annulment_key(
     source_node: &NodeId,
     entity: PersistId,
-    filing_lsn: Lsn,
     intent_id: u128,
 ) -> Vec<u8> {
-    let mut key = restore_hold_prefix(source_node, entity, filing_lsn);
+    let mut key = restore_hold_prefix(source_node, entity);
     key.push(RESTORE_HOLD_ANNULMENT_KIND);
     key.extend_from_slice(&intent_id.to_be_bytes());
     key
 }
 
-/// The inclusive-start range key for a source/entity LSN selection.
+/// The inclusive-start key for all held products of one source/entity.
 #[must_use]
-pub fn restore_hold_range_start(source_node: &NodeId, entity: PersistId, lsn: Lsn) -> Vec<u8> {
-    restore_hold_prefix(source_node, entity, lsn)
+pub fn restore_hold_range_start(source_node: &NodeId, entity: PersistId) -> Vec<u8> {
+    restore_hold_prefix(source_node, entity)
 }
 
-/// Exclusive end for a source/entity LSN selection.
-///
-/// At the representable LSN maximum, this becomes the next entity prefix;
-/// that is the only key after every possible LSN under the selected entity.
+/// Exclusive end for all held products of one source/entity.
 #[must_use]
-pub fn restore_hold_range_end(source_node: &NodeId, entity: PersistId, lsn: Lsn) -> Vec<u8> {
-    if lsn.offset < u64::MAX {
-        return restore_hold_prefix(source_node, entity, Lsn::new(lsn.segment, lsn.offset + 1));
-    }
-    if lsn.segment < u64::MAX {
-        return restore_hold_prefix(source_node, entity, Lsn::new(lsn.segment + 1, 0));
-    }
-    let mut prefix = Vec::with_capacity(2 + 32 + 8);
-    prefix.push(b'y');
-    prefix.push(b'c');
-    prefix.extend_from_slice(source_node.as_bytes());
-    prefix.extend_from_slice(&entity.0.to_be_bytes());
+pub fn restore_hold_range_end(source_node: &NodeId, entity: PersistId) -> Vec<u8> {
+    let mut prefix = restore_hold_prefix(source_node, entity);
     for byte in prefix.iter_mut().rev() {
         let (next, carry) = byte.overflowing_add(1);
         *byte = next;
@@ -2447,9 +2436,9 @@ pub fn restore_hold_range_end(source_node: &NodeId, entity: PersistId, lsn: Lsn)
     vec![b'z']
 }
 
-/// Decode an index key into its source, entity, LSN and durable product.
+/// Decode an index key into its source, entity and durable product.
 #[must_use]
-pub fn decode_restore_hold_key(key: &[u8]) -> Option<(NodeId, PersistId, Lsn, RestoreHoldProduct)> {
+pub fn decode_restore_hold_key(key: &[u8]) -> Option<(NodeId, PersistId, RestoreHoldProduct)> {
     if key.len() < RESTORE_HOLD_PREFIX_LEN + 1
         || key[0] != b'y'
         || key[1] != RESTORE_HOLD_DISCRIMINATOR
@@ -2458,21 +2447,17 @@ pub fn decode_restore_hold_key(key: &[u8]) -> Option<(NodeId, PersistId, Lsn, Re
     }
     let source_node = NodeId::from_bytes(key[2..34].try_into().ok()?).ok()?;
     let entity = PersistId::new(u64::from_be_bytes(key[34..42].try_into().ok()?));
-    let lsn = Lsn::new(
-        u64::from_be_bytes(key[42..50].try_into().ok()?),
-        u64::from_be_bytes(key[50..58].try_into().ok()?),
-    );
-    let product = match key[58] {
-        RESTORE_HOLD_STRIKE_KIND if key.len() == 77 => RestoreHoldProduct::Strike {
-            account: AccountId::new(u64::from_be_bytes(key[59..67].try_into().ok()?)),
-            versionstamp: key[67..77].try_into().ok()?,
+    let product = match key[42] {
+        RESTORE_HOLD_STRIKE_KIND if key.len() == 61 => RestoreHoldProduct::Strike {
+            account: AccountId::new(u64::from_be_bytes(key[43..51].try_into().ok()?)),
+            versionstamp: key[51..61].try_into().ok()?,
         },
-        RESTORE_HOLD_ANNULMENT_KIND if key.len() == 75 => RestoreHoldProduct::Annulment {
-            intent_id: u128::from_be_bytes(key[59..75].try_into().ok()?),
+        RESTORE_HOLD_ANNULMENT_KIND if key.len() == 59 => RestoreHoldProduct::Annulment {
+            intent_id: u128::from_be_bytes(key[43..59].try_into().ok()?),
         },
         _ => return None,
     };
-    Some((source_node, entity, lsn, product))
+    Some((source_node, entity, product))
 }
 
 #[cfg(test)]
@@ -4019,12 +4004,7 @@ mod tests {
                         SubKind {
                             discriminator: b'c',
                             name: "strike/yc restore holds",
-                            sample: restore_hold_annulment_key(
-                                &node(1),
-                                PersistId::new(1),
-                                Lsn::new(0, 0),
-                                1,
-                            ),
+                            sample: restore_hold_annulment_key(&node(1), PersistId::new(1), 1),
                         },
                     ],
                 },

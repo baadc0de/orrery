@@ -124,12 +124,12 @@ pub struct FdbIntentExecutor {
     /// [`FdbIntentExecutor::refence`].
     fence: std::sync::RwLock<Option<IntentFence>>,
     allocator: Arc<tokio::sync::Mutex<PersistIdAllocator>>,
-    /// The local archive coordinate recorded beside an annulled product.
+    /// The archive source whose restores annulled products hold.
     ///
     /// It is installed only by a node that exposes archive restore. Keeping
     /// it separate from the intent transaction's business inputs means the
     /// usual executor remains usable by harnesses that have no journal.
-    restore_hold_index: std::sync::RwLock<Option<(NodeId, Arc<crate::journal::Journal>)>>,
+    restore_hold_index: std::sync::RwLock<Option<NodeId>>,
     /// The epoch cache this executor records against, when the gateway
     /// enforces K-of-N.
     ///
@@ -407,17 +407,12 @@ impl FdbIntentExecutor {
         &self.db
     }
 
-    /// Attach the source-node journal used to index an annulment for archive
-    /// restore selection.
-    pub fn configure_restore_hold_index(
-        &self,
-        source_node: NodeId,
-        journal: Arc<crate::journal::Journal>,
-    ) {
+    /// Attach the archive source whose restores annulled products hold.
+    pub fn configure_restore_hold_index(&self, source_node: NodeId) {
         *self
             .restore_hold_index
             .write()
-            .expect("restore-hold index lock poisoned") = Some((source_node, journal));
+            .expect("restore-hold index lock poisoned") = Some(source_node);
     }
 
     /// Allocate ids before entering the intent transaction.
@@ -1570,12 +1565,12 @@ impl ProvisionalStore for FdbIntentExecutor {
 
     async fn annul(&self, hold: &keyspace::ProvisionalHold) -> Result<(), IntentError> {
         let hold = hold.clone();
-        let hold_location = self
+        let hold_source = self
             .restore_hold_index
             .read()
             .expect("restore-hold index lock poisoned")
             .as_ref()
-            .map(|(source_node, journal)| (*source_node, journal.committed()));
+            .copied();
         let result: Result<(), FdbBindingError> = self
             .db
             .run(|trx, _maybe_committed| {
@@ -1631,12 +1626,11 @@ impl ProvisionalStore for FdbIntentExecutor {
                     let encoded =
                         postcard::to_stdvec(&row).map_err(store_err("intent row encode"))?;
                     trx.set(&ikey, &encoded);
-                    if let Some((source_node, filing_lsn)) = hold_location {
+                    if let Some(source_node) = hold_source {
                         trx.set(
                             &keyspace::restore_hold_annulment_key(
                                 &source_node,
                                 hold.commitment.entity,
-                                filing_lsn,
                                 hold.intent_id,
                             ),
                             b"",
@@ -2167,7 +2161,7 @@ mod tests {
             .expect("journal opens"),
         );
         let source_node = iroh_base::SecretKey::from_bytes(&[7; 32]).public();
-        exec.configure_restore_hold_index(source_node, Arc::clone(&journal));
+        exec.configure_restore_hold_index(source_node);
         reset(&db, CAROL, &[0xd29_0004]).await;
 
         exec.execute_provisional(&credit(CAROL, 0xd29_0004, 100), AccountId::new(CAROL))
@@ -2179,7 +2173,6 @@ mod tests {
         let hold_key = keyspace::restore_hold_annulment_key(
             &source_node,
             hold.commitment.entity,
-            orrery_protocol::Lsn::new(0, 0),
             hold.intent_id,
         );
         let indexed = db

@@ -135,10 +135,10 @@ impl RestoreHoldDetector for NoRestoreHolds {
 
 /// FoundationDB-backed join over the `yc` restore-hold index.
 ///
-/// The index is ordered by `(source node, entity, filing LSN)`, so this reader
-/// has the same server-assigned LSN axis as [`RestoreSelection`].  It reads
-/// only products filed within the operator's selected range and returns the
-/// stable FDB key of the first one.
+/// The index is ordered by `(source node, entity, product)`. Evidence products
+/// carry client ticks rather than a server LSN, so the reader conservatively
+/// reads the entity's retained products instead of comparing incomparable
+/// evidence and restore axes.
 #[cfg(feature = "fdb")]
 #[derive(Clone)]
 pub struct FdbRestoreHoldDetector {
@@ -164,16 +164,8 @@ impl RestoreHoldDetector for FdbRestoreHoldDetector {
     ) -> Result<Option<String>, RestoreError> {
         use futures::TryStreamExt as _;
 
-        let start = crate::keyspace::restore_hold_range_start(
-            &selection.source_node,
-            entity,
-            selection.start_lsn,
-        );
-        let end = crate::keyspace::restore_hold_range_end(
-            &selection.source_node,
-            entity,
-            selection.end_lsn,
-        );
+        let start = crate::keyspace::restore_hold_range_start(&selection.source_node, entity);
+        let end = crate::keyspace::restore_hold_range_end(&selection.source_node, entity);
         self.db
             .run(|trx, _| {
                 let start = start.clone();
@@ -193,27 +185,23 @@ impl RestoreHoldDetector for FdbRestoreHoldDetector {
                     let Some(row) = rows.try_next().await? else {
                         return Ok(None);
                     };
-                    let Some((source, indexed_entity, lsn, product)) =
+                    let Some((source, indexed_entity, product)) =
                         crate::keyspace::decode_restore_hold_key(row.key())
                     else {
                         return Err(foundationdb::FdbBindingError::new_custom_error(Box::new(
                             RestoreError::Index("malformed restore-hold index key".into()),
                         )));
                     };
-                    if source != selection.source_node
-                        || indexed_entity != entity
-                        || lsn < selection.start_lsn
-                        || lsn > selection.end_lsn
-                    {
+                    if source != selection.source_node || indexed_entity != entity {
                         return Err(foundationdb::FdbBindingError::new_custom_error(Box::new(
-                            RestoreError::Index("restore-hold index escaped its range".into()),
+                            RestoreError::Index("restore-hold index escaped entity range".into()),
                         )));
                     }
                     Ok(Some(product.stable_key()))
                 }
             })
             .await
-            .map_err(|error| RestoreError::Index(format!("restore-hold range read: {error}")))
+            .map_err(|error| RestoreError::Index(format!("restore-hold entity read: {error}")))
     }
 }
 
