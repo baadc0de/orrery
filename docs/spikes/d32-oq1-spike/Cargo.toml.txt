@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "d32-oq1-spike"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+foundationdb = { version = "0.11", features = ["fdb-7_3"] }
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+blake3 = "1"
