@@ -1426,86 +1426,6 @@ mod tests {
         );
     }
 
-    /// Everything `AuditFinding::emit` wrote on `orrery_audit` while `run`
-    /// executed, as the rendered log text.
-    ///
-    /// # Why the subscriber is global and only the buffer is per-thread
-    ///
-    /// The obvious shape — build a capturing subscriber and hand it to
-    /// `tracing::subscriber::with_default` — is what this helper used to do,
-    /// and it lost a race about one run in four. `with_default` is
-    /// thread-local, but `tracing`'s *callsite interest* cache is global and
-    /// sticky: `AuditFinding::emit` is a single callsite, and a sibling test
-    /// reaching it on another thread while no subscriber was installed
-    /// registered it as `Interest::never()` for the rest of the process. Every
-    /// later capture then read an empty log — indistinguishable from "the
-    /// finding was never emitted", which is exactly the assertion these tests
-    /// make. Rebuilding the interest cache does not close it either; the
-    /// sibling simply re-poisons it on its next pass.
-    ///
-    /// So the subscriber is installed once, globally, and interest is computed
-    /// against a subscriber that is always there. What varies per thread is
-    /// only *where the bytes go*: a thread with no capture in progress writes
-    /// into no buffer and produces no output, so a global INFO subscriber
-    /// costs the rest of the suite nothing.
-    fn captured_audit_log<T>(run: impl FnOnce() -> T) -> (T, String) {
-        type Buffer = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
-
-        thread_local! {
-            /// The capture in progress on this thread, if any.
-            static SINK: std::cell::RefCell<Option<Buffer>> =
-                const { std::cell::RefCell::new(None) };
-        }
-
-        #[derive(Clone, Copy, Default)]
-        struct ThreadSink;
-
-        impl std::io::Write for ThreadSink {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                SINK.with(|sink| {
-                    if let Some(buffer) = sink.borrow().as_ref() {
-                        buffer.lock().expect("log buffer").extend_from_slice(bytes);
-                    }
-                });
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadSink {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                *self
-            }
-        }
-
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(ThreadSink)
-                .with_ansi(false)
-                .with_max_level(tracing::Level::INFO)
-                .finish();
-            // Deliberately not `expect`: if some other harness in this binary
-            // already owns the global, failing here would turn a capture that
-            // still works into a panic.
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        });
-
-        let buffer: Buffer = Buffer::default();
-        SINK.with(|sink| *sink.borrow_mut() = Some(std::sync::Arc::clone(&buffer)));
-        let result = run();
-        SINK.with(|sink| *sink.borrow_mut() = None);
-
-        let text = String::from_utf8(buffer.lock().expect("log buffer").clone())
-            .expect("log text is UTF-8");
-        (result, text)
-    }
-
     /// The slow-leak window from the guarded test above, unchanged.
     fn leaking_window_rows() -> Vec<ReceiptArchiveRow> {
         let item = ItemUid::new(55);
@@ -1552,8 +1472,9 @@ mod tests {
         let (_directory, sweeper) = write_window_pages(&rows, 1);
         let sweeper = sweeper.with_spill_fault("No space left on device (os error 28)");
 
-        let (result, audit_log) = captured_audit_log(|| sweeper.run_pass(10, 11));
-        let failure = result.expect_err("the injected spill failure must surface");
+        let failure = sweeper
+            .run_pass(10, 11)
+            .expect_err("the injected spill failure must surface");
 
         // The louder condition is reported, with the spill path it hit.
         assert!(
@@ -1567,31 +1488,36 @@ mod tests {
             failure.error
         );
 
-        // The more serious condition was emitted before the failure, on the
-        // shared audit target, in the same shape a clean pass emits it.
-        assert!(
-            audit_log.contains(r#"kind="global_conservation_break""#),
-            "the computed break must be on the audit log before the spill failed:\n{audit_log}"
-        );
-        assert!(
-            audit_log.contains("unexplained delta -1"),
-            "the emitted break carries its magnitude:\n{audit_log}"
-        );
-        assert!(
-            !audit_log.contains("overlapping_item_ownership")
-                && !audit_log.contains("unreceipted_item_ownership"),
-            "ownership continuity was never established and must not be emitted:\n{audit_log}"
-        );
-
-        // And the failure carries what it had already told the operator, so
-        // the daemon's failure line can count it.
+        // The more serious condition was emitted before the failure, in the
+        // same shape a clean pass emits it. `emitted_findings` is the record
+        // of exactly that emission, not a parallel one: `run_pass` emits the
+        // whole-window verdict the moment the fold is final, and a spill
+        // failure returns precisely the findings it had already emitted.
+        // Asserting on the returned value pins the ordering without
+        // depending on process-global tracing state (#936).
         assert_eq!(failure.conservation_breaks(), 1);
         let carried = failure
             .emitted_findings
             .iter()
             .find(|finding| finding.kind == FindingKind::GlobalConservationBreak)
-            .expect("the failure carries the emitted break");
+            .expect("the computed break must be carried as emitted before the spill failed");
         assert_eq!(carried.asset, Some(AssetId::new(7)));
+        assert!(
+            carried.detail.contains("unexplained delta -1"),
+            "the emitted break carries its magnitude: {}",
+            carried.detail
+        );
+        assert!(
+            !failure.emitted_findings.iter().any(|finding| matches!(
+                finding.kind,
+                FindingKind::OverlappingItemOwnership | FindingKind::UnreceiptedItemOwnership
+            )),
+            "ownership continuity was never established and must not be emitted: {:?}",
+            failure.emitted_findings
+        );
+
+        // And the failure states what it had already told the operator, so
+        // the daemon's failure line can count it.
         let rendered = failure.to_string();
         assert!(
             rendered.contains("1 of them global_conservation_break")
@@ -1627,12 +1553,13 @@ mod tests {
         ];
         let (_directory, sweeper) = write_window(&rows);
         let sweeper = sweeper.with_spill_fault("No space left on device (os error 28)");
-        let (result, audit_log) = captured_audit_log(|| sweeper.run_pass(10, 11));
-        let failure = result.expect_err("the spill failure must surface");
-        assert!(failure.emitted_findings.is_empty());
+        let failure = sweeper
+            .run_pass(10, 11)
+            .expect_err("the spill failure must surface");
         assert!(
-            !audit_log.contains("ledger sweep finding"),
-            "nothing was found, so nothing is emitted:\n{audit_log}"
+            failure.emitted_findings.is_empty(),
+            "nothing was found, so nothing was emitted: {:?}",
+            failure.emitted_findings
         );
         assert!(!failure.to_string().contains("emitted before the failure"));
     }
