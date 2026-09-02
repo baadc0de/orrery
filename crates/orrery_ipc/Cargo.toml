@@ -1,0 +1,15 @@
+[package]
+name = "orrery_ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-neutral IPC schema for an Orrery prediction sidecar"
+license = "MIT OR Apache-2.0"
+
+# The sidecar/engine boundary is deliberately narrower than either endpoint;
+# the schema's fixed-width codec is implemented locally so this manifest has
+# exactly one dependency.
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+
+[lints]
+workspace = true
