@@ -21,7 +21,7 @@ use aeronet_iroh::stream::IrohStreamIo;
 use orrery_net::budget::{
     stream_wire_bytes, Bandwidth, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES,
 };
-use orrery_net::channels::{untag, Channel};
+use orrery_net::channels::{tag, untag, Channel};
 use orrery_net::peer_link::{forget_departed_links, send_peer_packets, PeerLinkCounters};
 use orrery_net::plugin::Peer;
 use orrery_net::{SendPacket, StreamMode};
@@ -356,10 +356,14 @@ fn hit_claims_survive_upload_pressure_ahead_of_replication() {
 
 #[test]
 fn delivered_inputs_survive_upload_pressure_on_a_datagram() {
-    // `Game::deliver` currently uses a reliable stream, but its delivery
-    // guarantee belongs to the tagged class. This deliberately sends the real
-    // delivered-input frame as a datagram: changing transports cannot turn a
-    // damage, pickup, or door-open input into replication that the meter sheds.
+    // `Game::deliver` rides a reliable stream today, but its delivery
+    // guarantee belongs to the tagged class, not to the channel it happens to
+    // ride. This sends the real delivered-input frame as a datagram twice:
+    // once exactly as the encoder produces it today, and once as re-homing
+    // the family onto the state channel would — the same move that made hits
+    // sheddable. Neither the transport nor the channel byte may turn a
+    // damage, pickup, or door-open input into replication that the meter
+    // sheds.
     let peer = secret(1).public();
     let mut app = app(&[peer]);
     queue(&mut app, peer, Channel::State, allowance() + 200);
@@ -368,9 +372,9 @@ fn delivered_inputs_survive_upload_pressure_on_a_datagram() {
     app.world_mut()
         .resource_mut::<Messages<SendPacket>>()
         .write(SendPacket::state(peer, bytes::Bytes::from(vec![0u8; 397])));
-    app.world_mut()
-        .resource_mut::<Messages<SendPacket>>()
-        .write(SendPacket::state(
+    {
+        let mut messages = app.world_mut().resource_mut::<Messages<SendPacket>>();
+        messages.write(SendPacket::state(
             peer,
             bytes::Bytes::from(encode_delivered_input(
                 PersistId::new(1),
@@ -378,9 +382,16 @@ fn delivered_inputs_survive_upload_pressure_on_a_datagram() {
                 b"damage",
             )),
         ));
+        messages.write(SendPacket::state(
+            peer,
+            bytes::Bytes::from(tag(Channel::State, &[TAG_DELIVERED_INPUT, 9, 9])),
+        ));
+    }
     app.update();
 
-    let delivered = app
+    let mut on_control_channel = false;
+    let mut on_state_channel = false;
+    for packet in app
         .world_mut()
         .query::<&aeronet_io::Session>()
         .iter(app.world())
@@ -388,14 +399,25 @@ fn delivered_inputs_survive_upload_pressure_on_a_datagram() {
         .expect("test session")
         .send
         .iter()
-        .any(|packet| {
-            let (_, logical) = untag(packet).expect("outer transport tag");
-            let (channel, body) = untag(logical).expect("inner protocol tag");
-            channel == Channel::Control && body.first() == Some(&TAG_DELIVERED_INPUT)
-        });
+    {
+        let (_, logical) = untag(packet).expect("outer transport tag");
+        let (channel, body) = untag(logical).expect("inner protocol tag");
+        if body.first() != Some(&TAG_DELIVERED_INPUT) {
+            continue;
+        }
+        match channel {
+            Channel::Control => on_control_channel = true,
+            Channel::State => on_state_channel = true,
+        }
+    }
     assert!(
-        delivered,
-        "the delivered input must be admitted before replication is shed"
+        on_control_channel,
+        "the delivered input as encoded today must be admitted before replication is shed"
+    );
+    assert!(
+        on_state_channel,
+        "a delivered input re-homed onto the state channel must still be admitted: \
+         the class, not the channel, decides"
     );
     assert!(
         app.world().resource::<UploadMeter>().shed > 0,
