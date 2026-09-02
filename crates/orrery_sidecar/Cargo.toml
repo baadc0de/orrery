@@ -1,0 +1,37 @@
+[package]
+name = "orrery_sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "The synthetic-rules prediction sidecar: the shipped binary that runs canonical rules inside Lightyear's tick and registers hits"
+license = "MIT OR Apache-2.0"
+
+# A game-owned composition, not another facade plugin (#898 step 1). The facade
+# cannot infer a game's predicted component, turn that component into
+# `CoreState`, choose a hit radius, or say how far a weapon reaches — so the
+# smallest honest game that does all four lives here, and ships as a binary
+# rather than an example, because a seam reachable only from `cargo test` is
+# the defect #871 was filed about.
+
+[[bin]]
+name = "orrery-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+orrery = { path = "../orrery" }
+orrery_authority = { path = "../orrery_authority" }
+orrery_core = { path = "../orrery_core" }
+orrery_net = { path = "../orrery_net" }
+orrery_predict = { path = "../orrery_predict" }
+orrery_protocol = { path = "../orrery_protocol" }
+orrery_synthetic = { path = "../orrery_synthetic" }
+bevy = { workspace = true }
+# lightyear's replication backend calls `init_state`, which needs the
+# `StateTransition` schedule `StatesPlugin` installs; `MinimalPlugins` has no
+# states. A game on `DefaultPlugins` gets it for free.
+bevy_state = { workspace = true }
+iroh = { workspace = true }
+lightyear = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }

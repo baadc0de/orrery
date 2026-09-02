@@ -25,6 +25,14 @@
 //! value between two resources and decides nothing beyond *whether* the move
 //! applies.
 //!
+//! [`hit`] adds the fourth and fifth, and they are here under the same rule
+//! rather than a relaxed one (#871). `orrery_authority` owns the pose ring and
+//! may not name `orrery_net`'s peer link; `orrery_net` must not learn what a
+//! pose is; and a game crate is Bevy-free and sits below both. So the wire
+//! that carries a game's canonical pose into the ring, and the wire that
+//! carries a claim off a link to the ring and the verdict back, can only be
+//! written where every one of those crates is already a dependency.
+//!
 //! ```no_run
 //! use bevy::prelude::*;
 //! use orrery::prelude::*;
@@ -63,6 +71,7 @@ use orrery_protocol::SeqPair;
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
 use orrery_witness::{ReportFiled, WitnessPlugin};
 
+pub mod hit;
 pub mod prelude;
 
 /// The aggregate client configuration: one struct carrying every member
@@ -442,7 +451,7 @@ impl Plugin for OrreryIslandBindingPlugin {
 /// |---|---|---|
 /// | [`ContactObservations`](orrery_authority::ContactObservations) | the physics step's contact report | contact-island weak claims: the planner sees an empty graph and proposes nothing (D7 §5) |
 /// | [`ContactTick::tick`](orrery_authority::ContactTick) | the universe tick that step ran on | every weak claim carries `ClaimBasis::Contact{tick: 0}` as its evidence, which the registrar's plausibility gate reads |
-/// | [`CanonicalPosePublications`](orrery_authority::CanonicalPosePublications) | each held entity's canonical end-of-step pose and that step's universe tick | no hit claim can be validated: every [`HitClaim`](orrery_protocol::HitClaim) returns `BasisNotRetained`, so hit registration silently does nothing |
+/// | [`CanonicalPosePublications`](orrery_authority::CanonicalPosePublications) | each held entity's canonical end-of-step pose and that step's universe tick — write [`CanonicalPose`](hit::CanonicalPose) and add [`OrreryHitRegistrationPlugin`](hit::OrreryHitRegistrationPlugin) | no hit claim can be validated: every [`HitClaim`](orrery_protocol::HitClaim) returns `BasisNotRetained`, so hit registration silently does nothing |
 /// | [`WitnessClock`](orrery_witness::plugin::WitnessClock) | the same universe tick | the repair-timeout sweep, which is the only check a subject that goes *silent* can trip (D10) |
 ///
 /// One more resource is host-supplied and is *configuration* rather than
@@ -453,6 +462,14 @@ impl Plugin for OrreryIslandBindingPlugin {
 /// ([`WitnessConfig::shadow_mode`](orrery_witness::WitnessConfig::shadow_mode))
 /// is on by default besides. No plugin here can invent it: `NetConfig`'s
 /// secret key is consumed into the iroh endpoint and never handed back.
+///
+/// [`OrreryHitRegistrationPlugin`](hit::OrreryHitRegistrationPlugin) narrows the
+/// pose row without removing it, and it is deliberately *not* a member of this
+/// group: it is generic over the game's [`HitRules`](orrery_authority::HitRules)
+/// table, which a [`Ruleset`] does not imply and this group cannot invent. A
+/// game that adds it still writes [`CanonicalPose`](hit::CanonicalPose) itself
+/// — the pose and its tick remain the game's — but no longer has to know that
+/// `CanonicalPosePublications` exists.
 ///
 /// The game also registers its replicated component schemas and their
 /// interpolation/correction policy, then attaches replication and prediction

@@ -1,16 +1,28 @@
-//! Synthetic rules used by facade integration tests.
+//! The synthetic ruleset (#871): the smallest canonical rules a hit claim can
+//! be adjudicated against.
 //!
-//! This follows `orrery_sim_host`'s `OffLatticeRuleset` precedent: the fixture
-//! is deliberately smaller than a game and implements only the canonical
-//! contract the facade's generic witness plugin requires.
+//! Hit registration is platform code, and #871 says so explicitly: build it
+//! against a synthetic two-entity ruleset, not against Regolith and not
+//! against the eventual FPS. Following `orrery_sim_host`'s `OffLatticeRuleset`
+//! precedent, this is deliberately smaller than a game and implements only the
+//! canonical contract — one integer of state, advanced by one per tick, which
+//! is enough for a pose ring to be filled, looked up, and disagreed with.
+//!
+//! It is Bevy-free by construction and by gate: `orrery_sidecar` is what turns
+//! these rules into a running app.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use orrery_core::{
     CodecError, CoreCodec, OrderedInputs, Quantized, Ruleset, StateView, StepOutput, TickRng,
 };
 use orrery_protocol::RulesetId;
 
+/// The canonical state: one position on one axis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntheticState {
+    /// Position along x, in lattice units.
     pub position_mm: i64,
 }
 
@@ -33,6 +45,7 @@ impl CoreCodec for SyntheticState {
     }
 }
 
+/// The uninhabited input and event type: this ruleset takes neither.
 #[derive(Clone)]
 pub enum SyntheticNever {}
 
@@ -46,6 +59,7 @@ impl CoreCodec for SyntheticNever {
     }
 }
 
+/// The sidecar's ruleset: the entity advances one millimetre per tick.
 pub struct Synthetic;
 
 impl Ruleset for Synthetic {

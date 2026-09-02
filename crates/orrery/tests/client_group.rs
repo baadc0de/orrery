@@ -337,7 +337,10 @@ fn host_driver_resources_either_advance_or_are_a_declared_host_contract() {
     );
     assert!(
         world.resource::<CanonicalPosePublications>().is_empty(),
-        "canonical poses come from the game's post-step publication"
+        "canonical poses come from the game's post-step publication; the group \
+         alone must not fill this queue, and `OrreryHitRegistrationPlugin` — \
+         which does, from the game's `CanonicalPose` — is deliberately not a \
+         member (#871)"
     );
     assert_eq!(
         world.resource::<WitnessClock>().0,

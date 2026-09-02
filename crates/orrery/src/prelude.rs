@@ -5,12 +5,13 @@
 //! crates, which the facade re-exports as modules of itself; a prelude that
 //! pulled in every subsystem's vocabulary would collide with the game's own.
 
+pub use crate::hit::{CanonicalPose, OrreryHitRegistrationPlugin};
 pub use crate::{
     bind_island_membership, queue_authority_corrections, OrreryClientPlugins, OrreryConfig,
     OrreryIslandBindingPlugin,
 };
 
-pub use orrery_authority::{IslandBinding, OrreryAuthorityPlugin};
+pub use orrery_authority::{HitRules, IslandBinding, OrreryAuthorityPlugin, PoseSample};
 pub use orrery_core::Ruleset;
 pub use orrery_net::plugin::NetConfig;
 pub use orrery_net::{CoordinatorConfig, IslandMembership, OrreryNetPlugin};

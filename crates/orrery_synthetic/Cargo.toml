@@ -1,0 +1,17 @@
+[package]
+name = "orrery_synthetic"
+version = "0.1.0"
+edition = "2021"
+description = "The synthetic two-entity ruleset: the smallest canonical rules that hit registration can be built and gated against"
+license = "MIT OR Apache-2.0"
+
+# Bevy-free, and a separate crate for that reason. `orrery_sidecar` composes
+# these rules into a Bevy app, and D42 (a) / D43 (e)(1) keep a `Ruleset` out of
+# any crate with Bevy in its graph — `scripts/core-gates.sh` discovers this
+# crate by its `impl Ruleset for` and scans it. Folding the rules into the
+# sidecar would have made a Bevy binary a rules crate, which is the inversion
+# the gate exists to refuse.
+
+[dependencies]
+orrery_core = { path = "../orrery_core" }
+orrery_protocol = { path = "../orrery_protocol" }
