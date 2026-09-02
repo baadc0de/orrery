@@ -1,7 +1,7 @@
 {
-  "schema": "orrery.measurement.full-conservation-layout/1",
-  "date": "2026-09-01",
-  "issue": 615,
+  "schema": "orrery.measurement.full-conservation-layout/2",
+  "date": "2026-09-02",
+  "issue": 890,
   "producer_pr": 841,
   "method": {
     "check": "audit::conservation::tests::realistic_window_cost_inputs_are_machine_derived",
@@ -9,11 +9,16 @@
     "archive_page_bytes_measured": 322293,
     "archive_bytes_per_receipt_measured": 78.6848,
     "ownership_event_bytes_measured": 56,
+    "ownership_external_sort_run_events": 4096,
+    "ownership_external_sort_merge_fan_in": 16,
+    "ownership_external_sort_memory_bytes_bound": 230272,
+    "ownership_external_sort_memory_ceiling_bytes": 262144,
     "object_compression": "none",
     "notes": [
       "The fixture uses one Shape-C item transfer, two balance deltas, and one ownership transition per receipt.",
       "The Parquet byte count is measured from encode_receipt_object; the ownership entry size is size_of::<OwnershipEvent>() in this build.",
-      "The re-sort vector is shrink_to_fit before an in-place unstable sort, so entries * 56 is the sort-stage heap bound."
+      "The external merge sort retains one 4,096-event run plus 16 run heads, so its ownership-event working set is 4,112 * 56 = 230,272 bytes, independent of transitions retained.",
+      "audit::conservation::tests::thirty_day_synthetic_archive_stays_inside_ownership_memory_ceiling exercises 30 page-sized archive objects through the multi-stage merge and asserts the stated 256 KiB ceiling."
     ]
   },
   "realistic_window": {
@@ -25,15 +30,15 @@
     "parquet_objects_bound": 11180,
     "scan_bytes_bound": 3603235740,
     "scan_gib_bound": 3.35577,
-    "ownership_resort_bytes": 2564352000,
-    "ownership_resort_gib": 2.38824
+    "ownership_resort_memory_bytes_bound": 230272,
+    "ownership_resort_memory_gib_bound": 0.000214458
   },
   "full_fidelity_retention_projection": {
     "days": 30,
     "scan_bytes_bound": 108097072200,
     "scan_gib_bound": 100.673,
-    "ownership_resort_bytes": 76930560000,
-    "ownership_resort_gib": 71.6472
+    "ownership_resort_memory_bytes_bound": 230272,
+    "ownership_resort_memory_gib_bound": 0.000214458
   },
   "identity": {
     "effect_identity": "AccountId",
@@ -41,8 +46,8 @@
     "reason": "ReceiptBalanceDelta and ReceiptOwnershipTransition carry AccountId directly."
   },
   "layout_verdict": {
-    "daily_24h_window": "scan volume is plausible but a 2.39 GiB ownership sort allocation is too large for an in-process auditor default",
-    "full_30d_retention": "unacceptable: about 100.67 GiB scanned and 71.65 GiB retained for the ownership re-sort in the ownership-heavy arm",
-    "secondary_clustering": "evidence supports adding an item-clustered/indexed archive view in a separate schema decision; this change does not add one"
+    "daily_24h_window": "the ownership re-sort is bounded at 224.875 KiB (230,272 bytes), below the 256 KiB stated ceiling; scan volume remains a separate capacity concern",
+    "full_30d_retention": "the sweep still reads about 100.67 GiB per full pass, but the ownership re-sort remains 224.875 KiB rather than growing to 71.65 GiB",
+    "chosen_shape": "#890 uses a bounded external merge sort over the captured receipt objects. It preserves full-window findings without a new tailer-side archive object or a carried item cursor."
   }
 }
