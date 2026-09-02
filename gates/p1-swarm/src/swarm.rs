@@ -1890,6 +1890,18 @@ impl Swarm {
                     cells: cells.clone(),
                 })
                 .collect();
+            // Link before publishing the membership, exactly as `form_island`
+            // does. Without this a seat that binds after `run()` has started
+            // is entered into every bot's `IslandMembership`, is diffed into
+            // every sender's audience, and has a keyframe built for it that
+            // `send_peer_packets` then discards for want of a session --
+            // counting `no_session`, which nothing reports. The joiner
+            // receives no replication at all, for the whole attempt, with
+            // every host-side signal clean. `link` is idempotent, so the
+            // seats already linked are unaffected.
+            for entry in &others {
+                bot.link(entry.node, 1_200);
+            }
             bot.set_island(others);
         }
         self.replace_shot_interest_scope(&roster);
@@ -3767,6 +3779,93 @@ mod tests {
             vec![0, 1, 2, 3],
             "the joiner's post-link membership must name every already bound seat"
         );
+    }
+
+    /// A seat that binds after the run started must be **linked**, not merely
+    /// rostered.
+    ///
+    /// `form_island` runs exactly once, at the top of `run`, and it is the
+    /// only place that used to call `Bot::link`. `refresh_rosters` published
+    /// the new seat into every bot's `IslandMembership` — so every sender
+    /// diffed it into its audience and built it a keyframe
+    /// (`bot.rs`, the `added` arm) — and `send_peer_packets` then dropped
+    /// every one of those packets for want of a session, counting
+    /// `no_session`, which no report prints. A late-joining human therefore
+    /// received no replication at all for the whole attempt while every
+    /// host-side signal stayed clean: connected, witness-anchored,
+    /// `downlink_dropped: 0`. That is the "absent from the start" half of
+    /// #940, and it is invisible to the client, which has nothing to count.
+    ///
+    /// The sibling test above pins that the joiner is *told* about every
+    /// bound seat. This pins that the bound seats can actually reach it.
+    #[test]
+    fn a_peer_that_joins_a_running_attempt_is_linked_by_every_bot() {
+        let (existing_host, _existing_remote) = crate::exterior::link_pair();
+        let (joined_host, _joined_remote) = crate::exterior::link_pair();
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let membership = Arc::new(Mutex::new(LiveMembership {
+            attempt_id: "attempt-live".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeSet::new(),
+            tick: 0,
+            running: true,
+            path: None,
+        }));
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: 2,
+                ..SwarmConfig::default()
+            },
+            4,
+        )
+        .with_external_session_at(
+            2,
+            4,
+            crate::bot::bot_key(2).public(),
+            "session-two".to_owned(),
+            None,
+            existing_host,
+        )
+        .with_live_joins(joined_rx, membership, 4);
+
+        // The run's one and only island formation, before the late seat exists.
+        swarm.form_island();
+        let joiner = crate::bot::bot_key(3).public();
+        let lobby_seat = crate::bot::bot_key(2).public();
+        for bot in &mut swarm.bots {
+            assert!(
+                bot.is_linked_to(lobby_seat),
+                "a seat bound in the lobby is linked by `form_island`"
+            );
+            assert!(!bot.is_linked_to(joiner), "the late seat has not bound yet");
+        }
+
+        joined_tx
+            .send(JoinedExternal {
+                slot: 3,
+                node: joiner,
+                session_id: "session-three".to_owned(),
+                anchor: None,
+                link: joined_host,
+            })
+            .expect("join reaches the standing swarm");
+        swarm.process_live_membership(120);
+        swarm.refresh_rosters(121);
+
+        for bot in &mut swarm.bots {
+            assert!(
+                bot.is_linked_to(joiner),
+                "every bot must hold a session for the late seat, or every \
+                 keyframe built for it is dropped against `no_session`"
+            );
+            assert_eq!(
+                bot.sessions_to(lobby_seat),
+                1,
+                "relinking is idempotent: a seat already bound keeps exactly \
+                 one session, or `send_peer_packets` picks between duplicates"
+            );
+        }
     }
 
     #[test]

@@ -1779,6 +1779,21 @@ impl CampaignRuntime {
         self.state = JoinState::Joined;
     }
 
+    /// Install one replicated peer exactly as the downlink keyframe arm does.
+    ///
+    /// The two lines that matter are copied from `advance`'s `Lane::Datagram`
+    /// keyframe branch and must stay copied: the executor insert, and the
+    /// first-write-wins `focus` latch. A test that seeded `focus` by hand
+    /// could not tell the difference between "the client draws every peer"
+    /// and "the client draws the peer the test happened to point at".
+    #[cfg(test)]
+    pub(crate) fn install_replica_for_test(&mut self, entity: PersistId, state: RegolithState) {
+        self.executor.insert(entity, state);
+        if entity != self.entity && self.focus.is_none() {
+            self.focus = Some(entity);
+        }
+    }
+
     /// A dial the host turned away: no joined tick, nothing measured (#942).
     #[cfg(test)]
     pub(crate) fn refuse_for_test(&mut self, why: &str) {
