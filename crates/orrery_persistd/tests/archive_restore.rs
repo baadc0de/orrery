@@ -11,8 +11,8 @@ use orrery_persistd::archive::{
 use orrery_persistd::journal::{JournalConfig, StoredRecord};
 use orrery_persistd::keyspace::{JarchiveCellRange, JarchiveLsnSpan, JarchiveMetadata};
 use orrery_persistd::{
-    payload_crc, CellRuntime, CheckpointStore, FenceRow, FenceStatus, FenceStore,
-    MemCheckpointStore, MemFenceStore, RuntimeConfig,
+    payload_crc, CellRuntime, CheckpointData, CheckpointStore, EntityRecord, FenceRow, FenceStatus,
+    FenceStore, MemCheckpointStore, MemFenceStore, RuntimeConfig,
 };
 use orrery_protocol::{
     CellId, Epoch, GridId, JournalRecord, Lsn, NodeId, PersistId, RecordKind, RestoreRecord,
@@ -63,6 +63,12 @@ struct Fixture {
 
 impl Fixture {
     async fn open() -> Self {
+        Self::open_with_seeded_entity(None).await
+    }
+
+    /// Seed a durable `world/` row without appending a journal record, as the
+    /// offline seeder does in production.
+    async fn open_with_seeded_entity(seeded_entity: Option<PersistId>) -> Self {
         let journal_dir = tempfile::tempdir().expect("journal tempdir");
         let archive_dir = tempfile::tempdir().expect("archive tempdir");
         let checkpoints = Arc::new(MemCheckpointStore::new());
@@ -76,6 +82,34 @@ impl Fixture {
             .fence(GridId::ROOT, CellId::ROOT, None, &row)
             .await
             .expect("fence write");
+        if let Some(entity) = seeded_entity {
+            let mut entities = std::collections::HashMap::new();
+            let mut by_cell = std::collections::HashMap::new();
+            entities.insert(
+                entity,
+                EntityRecord {
+                    schema_floor: 0,
+                    components: Bytes::from_static(b"designed-content"),
+                    dirty: false,
+                },
+            );
+            by_cell.insert(entity, CellId::ROOT);
+            checkpoints
+                .checkpoint(&CheckpointData {
+                    shard: CellId::ROOT,
+                    grid: GridId::ROOT,
+                    node_id: 7,
+                    epoch: Epoch::new(3),
+                    watermark: Lsn::new(0, 0),
+                    entities,
+                    by_cell,
+                    tombstones: std::collections::HashMap::new(),
+                    superseded: std::collections::HashSet::new(),
+                    taken_at_ms: 0,
+                })
+                .await
+                .expect("seeded world row");
+        }
         let config = RuntimeConfig {
             shards: vec![CellId::ROOT],
             grid: GridId::ROOT,
@@ -114,6 +148,10 @@ impl Fixture {
     }
 
     async fn publish_archive(&self) {
+        self.publish_archive_as(0).await;
+    }
+
+    async fn publish_archive_as(&self, segment_seq: u64) {
         let mut records = self.journal_records();
         sort_for_archive(&mut records);
         let bytes = encode_object(&records).expect("archive object encodes");
@@ -141,7 +179,7 @@ impl Fixture {
             checksum: *blake3::hash(&bytes).as_bytes(),
         };
         self.archive_index
-            .put_row(&self.source_node, 0, &metadata)
+            .put_row(&self.source_node, segment_seq, &metadata)
             .await
             .expect("metadata put");
     }
@@ -478,6 +516,177 @@ async fn a_partial_apply_can_be_rerun_without_duplicate_entity_records() {
             "rerun does not duplicate entity {entity:?}"
         );
     }
+    fixture.runtime.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn seeded_world_row_with_genesis_archive_refuses_invented_absence() {
+    let seeded = PersistId::new(30);
+    let fixture = Fixture::open_with_seeded_entity(Some(seeded)).await;
+    fixture
+        .runtime
+        .apply(record(999, 1, node(1), RecordKind::Spawn, b"unrelated"))
+        .await
+        .expect("unrelated genesis record");
+    let grief_lsn = fixture
+        .runtime
+        .apply(record(
+            seeded.0,
+            2,
+            node(2),
+            RecordKind::ComponentDiff,
+            b"grief",
+        ))
+        .await
+        .expect("grief append");
+    fixture.publish_archive().await;
+
+    let plan = fixture
+        .planner()
+        .plan(fixture.request("restore-seeded", grief_lsn, grief_lsn))
+        .await
+        .expect("plan");
+    assert!(matches!(
+        plan.entities.as_slice(),
+        [orrery_persistd::archive::RestorePlanEntity {
+            entity,
+            disposition: RestoreDisposition::Refused(
+                orrery_persistd::archive::RestoreRefusal::PreimageUnavailable
+            ),
+        }] if *entity == seeded
+    ));
+
+    let applied = RestoreApplier::new(&fixture.runtime, node(9))
+        .apply(&plan, Tick::new(900))
+        .await
+        .expect("refused plan applies without a write");
+    assert!(matches!(
+        applied.entities[0].disposition,
+        RestoreApplyDisposition::Refused(
+            orrery_persistd::archive::RestoreRefusal::PreimageUnavailable
+        )
+    ));
+    assert!(
+        fixture
+            .runtime
+            .read(GridId::ROOT, CellId::ROOT)
+            .await
+            .expect("live read")
+            .entities
+            .contains_key(&seeded),
+        "a refused restore must not despawn designed content"
+    );
+    fixture.runtime.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn missing_genesis_archive_refuses_invented_absence() {
+    let fixture = Fixture::open().await;
+    fixture
+        .runtime
+        .apply(record(998, 1, node(1), RecordKind::Spawn, b"unrelated"))
+        .await
+        .expect("unrelated genesis record");
+    let grief_lsn = fixture
+        .runtime
+        .apply(record(31, 2, node(2), RecordKind::ComponentDiff, b"grief"))
+        .await
+        .expect("grief append");
+    fixture.publish_archive_as(1).await;
+
+    let plan = fixture
+        .planner()
+        .plan(fixture.request("restore-no-genesis", grief_lsn, grief_lsn))
+        .await
+        .expect("plan");
+    assert!(matches!(
+        plan.entities[0].disposition,
+        RestoreDisposition::Refused(orrery_persistd::archive::RestoreRefusal::PreimageUnavailable)
+    ));
+    fixture.runtime.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn archived_despawn_proves_a_genuine_absence_is_restorable() {
+    let fixture = Fixture::open().await;
+    fixture
+        .runtime
+        .apply(record(32, 1, node(1), RecordKind::Spawn, b"temporary"))
+        .await
+        .expect("spawn append");
+    fixture
+        .runtime
+        .apply(record(32, 2, node(1), RecordKind::Despawn, b""))
+        .await
+        .expect("despawn append");
+    let grief_lsn = fixture
+        .runtime
+        .apply(record(32, 3, node(2), RecordKind::ComponentDiff, b"grief"))
+        .await
+        .expect("grief append");
+    fixture.publish_archive().await;
+
+    let plan = fixture
+        .planner()
+        .plan(fixture.request("restore-despawn", grief_lsn, grief_lsn))
+        .await
+        .expect("plan");
+    assert!(matches!(
+        plan.entities[0].disposition,
+        RestoreDisposition::Restorable {
+            target: RestoreTarget::Absent,
+            ..
+        }
+    ));
+    RestoreApplier::new(&fixture.runtime, node(9))
+        .apply(&plan, Tick::new(901))
+        .await
+        .expect("apply");
+    assert!(
+        !fixture
+            .runtime
+            .read(GridId::ROOT, CellId::ROOT)
+            .await
+            .expect("live read")
+            .entities
+            .contains_key(&PersistId::new(32)),
+        "the archived despawn is a positive absence preimage"
+    );
+    fixture.runtime.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn selected_spawn_proves_prior_absence_is_restorable() {
+    let fixture = Fixture::open().await;
+    fixture
+        .runtime
+        .apply(record(997, 1, node(1), RecordKind::Spawn, b"unrelated"))
+        .await
+        .expect("unrelated record");
+    let spawn_lsn = fixture
+        .runtime
+        .apply(record(33, 2, node(1), RecordKind::Spawn, b"other spawn"))
+        .await
+        .expect("other-author spawn");
+    let grief_lsn = fixture
+        .runtime
+        .apply(record(33, 3, node(2), RecordKind::ComponentDiff, b"grief"))
+        .await
+        .expect("grief append");
+    fixture.publish_archive().await;
+
+    let plan = fixture
+        .planner()
+        .plan(fixture.request("restore-spawn", spawn_lsn, grief_lsn))
+        .await
+        .expect("plan");
+    assert!(matches!(
+        plan.entities[0].disposition,
+        RestoreDisposition::Restorable {
+            target: RestoreTarget::Absent,
+            ..
+        }
+    ));
     fixture.runtime.close().await.expect("close");
 }
 
