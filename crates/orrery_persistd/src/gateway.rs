@@ -3180,8 +3180,18 @@ pub struct GatewayConfig {
     /// **The default is `None` and stays `None`.** Adjudication re-runs a
     /// concrete `Ruleset`, and docs/09-services-and-ops.md §1 is normative that
     /// "the game team links its `Ruleset` and builds the deployed binary" —
-    /// so this crate ships the registration seam and registers nothing. A
-    /// cluster with an adjudicator is one somebody built one into.
+    /// so this *library* registers nothing, and a cluster with an adjudicator
+    /// is one somebody built one into.
+    ///
+    /// The binary side of that hand-off is `configured_adjudicator` in
+    /// `src/bin/persistd.rs`, which is compiled two ways: the stock build
+    /// returns `None` and readiness reports `"adjudicator": false`, while a
+    /// build with a registration feature constructs an
+    /// [`AdjudicationExecutor`](crate::AdjudicationExecutor), registers the
+    /// `Ruleset` it linked, and installs it here. `reference-ruleset` is that
+    /// seam's proof — it registers `orrery_conformance::Reference` rather than
+    /// a game's rules, so the composition is exercised without prejudging
+    /// where D21 puts the deployed artifact (#880).
     pub adjudicator: Option<SharedAdjudicator>,
     /// The intent admission validator (D11 §2.2, first stage). Defaults to
     /// the permissive stub so the harness runs unconfigured; a linked
