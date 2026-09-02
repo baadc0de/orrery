@@ -21,9 +21,14 @@
 //! And a third, [`divest_on_drain`]: a coordinator drain order lands on
 //! `orrery_net`'s session and the leases it releases are `orrery_authority`'s,
 //! which is the same crossing as the first system and in the same direction.
-//! The exception is meant to stay this narrow — every one of the three moves a
-//! value between two resources and decides nothing beyond *whether* the move
-//! applies.
+//!
+//! And a fourth, [`track_predicted_authority`], which is the only one that
+//! writes a *component* rather than moving a value between two resources:
+//! `orrery_authority` settles who holds an entity and `orrery_predict` owns the
+//! [`PredictedBy`] type that records it, authority is the lower layer of the
+//! two, and neither may name the other. The exception is meant to stay this
+//! narrow — every one of the four moves a settled value across one seam and
+//! decides nothing beyond *whether* the move applies.
 //!
 //! ```no_run
 //! use bevy::prelude::*;
@@ -43,9 +48,11 @@
 
 use bevy_app::{App, Plugin, PluginGroup, PluginGroupBuilder};
 use bevy_ecs::prelude::*;
+use bevy_ecs::schedule::ApplyDeferred;
 
 use orrery_authority::{
-    track_island_binding, Authority, IslandBinding, LeaseClient, LeaseDivest, OrreryAuthorityPlugin,
+    process_lease_replies, track_island_binding, Authority, IslandBinding, LeaseClient,
+    LeaseDivest, OrreryAuthorityPlugin, PersistIdentity,
 };
 use orrery_core::Ruleset;
 use orrery_net::plugin::NetConfig;
@@ -57,7 +64,7 @@ use orrery_persist_client::{
 };
 use orrery_predict::{
     AuthorityCorrectionInbox, ConfigDefect, OrreryPredictPlugin, OrreryReplicationBridgePlugin,
-    PredictConfig, HIGH_RATE_SET,
+    PredictConfig, PredictedBy, HIGH_RATE_SET,
 };
 use orrery_protocol::SeqPair;
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
@@ -345,6 +352,128 @@ pub fn queue_authority_corrections(
     }
 }
 
+/// Stamps [`PredictedBy`] from the authority state that settled this frame.
+///
+/// The facade's **fourth** cross-crate system (#910), and the same rule puts it
+/// here as the other three. `orrery_authority` owns the claim state machine and
+/// writes [`Authority`]; [`PredictedBy`] is a type in `orrery_predict`, which
+/// sits *above* authority on the dependency spine (D15). `orrery_authority`
+/// cannot insert it without depending upward and inverting that spine, and
+/// `orrery_predict` cannot derive it, because the holder is a fact the lease
+/// protocol settles. Only this crate depends on both — so the write crosses
+/// here, and, like the other three, it moves a value and decides nothing.
+///
+/// It is not smuggled through
+/// [`CanonicalPosePublications`](orrery_authority::CanonicalPosePublications)
+/// either: that resource is game-owned post-step data, and this is
+/// authority-to-prediction state.
+///
+/// # What it writes
+///
+/// [`PredictedBy::authority`] is *the holder*, not "some other peer". That is
+/// the reading the F-7 handoff fixture already depends on
+/// (`crates/orrery_predict/tests/handoff_window.rs`: "the peer whose live
+/// `PredictedBy` component names it as holder of entity P is the peer feeding
+/// the entity's authoritative state"), and it is what makes the component a
+/// single-writer witness across a handoff — the successor's copy names the
+/// successor from the re-anchor tick on. A `holder: None`
+/// ([`ExpireDisposition::Parked`] or `Free`) is not an authority to attribute a
+/// residual to, so the component is removed rather than left naming a peer that
+/// no longer writes the entity.
+///
+/// [`ExpireDisposition::Parked`]: orrery_protocol::ExpireDisposition::Parked
+///
+/// # Why every authority-bearing entity and not only the predicted ones
+///
+/// Gating on lightyear's `Predicted` marker would put a lightyear type in this
+/// crate's dependency list, and confining lightyear to `orrery_predict`'s
+/// internals is the plan-B seam docs/11 §P1 calls load-bearing — lightyear
+/// 0.29's per-entity authority does not work, so that layering is what keeps a
+/// replicon-direct prediction layer a rewrite of one crate's internals. The
+/// superset costs nothing: `feed_residuals` reads `PredictedBy` only alongside
+/// an `Added<VisualCorrection<D>>`, which lightyear writes on mispredicted
+/// entities and nowhere else. An entity that is never predicted never produces
+/// a residual, so its marker is never consulted.
+///
+/// # Ordering
+///
+/// `Changed<Authority>` rather than an unconditional restamp: `Authority` is
+/// written by [`process_lease_replies`] on grant, inheritance, expiry,
+/// disposition and renewal, and on nothing else, so the change flag is exactly
+/// the settled-transition edge the acceptance criterion asks the write to be
+/// pinned against. The equality check on top of it is not redundant — a lease
+/// *renewal* re-inserts `Authority` every heartbeat with the same holder, and
+/// re-inserting `PredictedBy` there would dirty a marker that never moved.
+///
+/// The plugin puts an explicit [`ApplyDeferred`] between the two.
+/// `process_lease_replies` inserts `Authority` through `Commands`, and Bevy
+/// 0.19 adds no sync point for a bare `.after(…)` edge — `chain()` adds them on
+/// its own edges and nothing else does. In practice a barrier is already there:
+/// `OrreryAuthorityPlugin` chains its `Update` systems, so an `ApplyDeferred`
+/// follows `process_lease_replies` inside that chain, and removing the explicit
+/// one here still passes `tests/predicted_by_attribution.rs` today. That is
+/// precisely why the explicit one stays. `.after(process_lease_replies)` leaves
+/// this system free to be scheduled either side of a barrier belonging to
+/// another crate's plugin, so the alternative is not "no barrier" but "a
+/// barrier this crate neither owns nor is ordered against" — and the failure it
+/// would eventually produce is a marker lagging authority by a frame, which
+/// misattributes the residuals of the frame a handoff lands in and shows up as
+/// a flaky witness signal rather than a red test.
+///
+/// `feed_residuals` runs in `PostUpdate`, so the stamp lands before the first
+/// residual that could reference it either way.
+pub fn track_predicted_authority(
+    mut commands: Commands,
+    settled: Query<
+        (Entity, &PersistIdentity, &Authority, Option<&PredictedBy>),
+        Changed<Authority>,
+    >,
+) {
+    for (entity, persist, authority, current) in &settled {
+        match authority.holder {
+            Some(holder) => {
+                let next = PredictedBy {
+                    authority: holder,
+                    persist_id: persist.0,
+                };
+                if current != Some(&next) {
+                    commands.entity(entity).insert(next);
+                }
+            }
+            None => {
+                if current.is_some() {
+                    commands.entity(entity).remove::<PredictedBy>();
+                }
+            }
+        }
+    }
+}
+
+/// Installs [`track_predicted_authority`] behind its sync point.
+///
+/// A member of [`OrreryClientPlugins`] rather than something a game adds, for
+/// the reason [`OrreryEscalationPlugin`] is: a client with both the authority
+/// and the predict plugin and not this wire is a client whose reconciliation
+/// residuals have no authority to attribute themselves to, so
+/// [`ReconciliationMonitor`](orrery_predict::ReconciliationMonitor) observes
+/// nothing and the witness path (D10) is fed by hand insertion or not at all.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OrreryAuthorityAttributionPlugin;
+
+impl Plugin for OrreryAuthorityAttributionPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            bevy_app::Update,
+            // The barrier is the point: see `track_predicted_authority`'s
+            // ordering section. `.after` on the pair puts `ApplyDeferred` after
+            // the authority writer and the stamp after the flush.
+            (ApplyDeferred, track_predicted_authority)
+                .chain()
+                .after(process_lease_replies),
+        );
+    }
+}
+
 /// Installs [`queue_filed_reports`].
 ///
 /// A `PluginGroup` can only add plugins, so this carries the wire the same way
@@ -421,13 +550,15 @@ impl Plugin for OrreryIslandBindingPlugin {
 ///    [`PredictConfig::hit_window`].
 /// 4. [`OrreryIslandBindingPlugin`] — this crate's own wires, between the two
 ///    above: the membership binding, and the drain divestiture.
-/// 5. [`OrreryPredictPlugin`] — lightyear's client stack, per D8/D16.
-/// 6. [`OrreryReplicationBridgePlugin`] — established Orrery sessions become
+/// 5. [`OrreryAuthorityAttributionPlugin`] — this crate's wire from the
+///    settled authority holder to `orrery_predict`'s `PredictedBy`.
+/// 6. [`OrreryPredictPlugin`] — lightyear's client stack, per D8/D16.
+/// 7. [`OrreryReplicationBridgePlugin`] — established Orrery sessions become
 ///    P2P replication links with a Replicon-backed sender and receiver.
-/// 7. [`WitnessPlugin<R>`] — the log stream and the discrepancy path.
-/// 8. [`OrreryPersistClientPlugin`] — the gateway session, uplink, area loader.
-/// 9. [`OrreryEscalationPlugin`] — this crate's other wire, from the witness's
-///    filed reports to the gateway's report queue.
+/// 8. [`WitnessPlugin<R>`] — the log stream and the discrepancy path.
+/// 9. [`OrreryPersistClientPlugin`] — the gateway session, uplink, area loader.
+/// 10. [`OrreryEscalationPlugin`] — this crate's other wire, from the witness's
+///     filed reports to the gateway's report queue.
 ///
 /// # What the host must drive
 ///
@@ -540,6 +671,11 @@ where
             // numbers cross here.
             .add(OrreryAuthorityPlugin::default().with_hit_window(config.predict.hit_window()))
             .add(OrreryIslandBindingPlugin)
+            // After the authority plugin, whose `process_lease_replies` it
+            // orders against, and before the predict plugin only by reading
+            // order — the stamp is a component write, not a resource the
+            // predict plugin has to have initialised.
+            .add(OrreryAuthorityAttributionPlugin)
             .add(OrreryPredictPlugin {
                 config: config.predict,
             })

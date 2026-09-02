@@ -446,8 +446,10 @@ impl RollbackBudget {
     pub fn plan(&mut self, pending_ticks: u16, predicted_len: u16) -> ResimPlan;
 }
 
-/// Attribution for a predicted entity, populated by `orrery_authority`. A
-/// residual with no authority attached is discarded, never guessed at.
+/// Attribution for a predicted entity. A residual with no authority attached
+/// is discarded, never guessed at. Written at the composition root by
+/// `orrery::track_predicted_authority` (#910), not by `orrery_authority`, which
+/// settles the holder but sits below this crate on the spine.
 #[derive(Component)]
 pub struct PredictedBy { pub authority: NodeId, pub persist_id: PersistId }
 
