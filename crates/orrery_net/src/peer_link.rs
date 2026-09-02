@@ -221,7 +221,6 @@ pub fn send_peer_packets(
     // unsheddable traffic, then absolute replication anchors, then deltas.
     batch.sort_by_key(|packet| batch_priority(packet.channel, &packet.payload));
 
-    let mut over = false;
     for packet in batch {
         let Some((_, mut session, streams)) =
             sessions.iter_mut().find(|(peer, ..)| peer.id == packet.to)
@@ -253,7 +252,6 @@ pub fn send_peer_packets(
         };
 
         if meter.would_exceed_wire(*budget, now, wire) {
-            over = true;
             if is_sheddable(lane) {
                 meter.shed += 1;
                 // Wire bytes, matching what the meter charges — otherwise
@@ -296,7 +294,6 @@ pub fn send_peer_packets(
             }
         }
     }
-    meter.oversubscribed = over;
 }
 
 /// Drops per-link meters for peers that no longer have a session.
