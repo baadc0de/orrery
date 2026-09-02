@@ -101,4 +101,15 @@
 /// equality on its own `IdentityMsg::Hello` bootstrap, so a version-9 client
 /// is refused there by name with the accepted version in the reply, not left
 /// to discover the gap at first decode.
-pub const PROTOCOL_VERSION: u16 = 10;
+///
+/// Version 11 adds the witness-set keyframe datagram family
+/// ([`TAG_WITNESS_KEYFRAME`](crate::channels::TAG_WITNESS_KEYFRAME), #923):
+/// an absolute replication anchor sent to a witness-set link, unsheddable by
+/// class because A20 §4 measured 89 false positives when such an anchor could
+/// be shed. As with version 8, no existing byte moves — the family is a new
+/// sub-tag — but a version-10 peer *silently drops* it:
+/// `decode_replication` returns `None` for a tag it does not know, so the
+/// anchor never arrives and the deltas that reference it are garbage.
+/// Exact-version admission turns that into one handshake refusal with a
+/// version in it.
+pub const PROTOCOL_VERSION: u16 = 11;

@@ -51,7 +51,12 @@ pub const REFERENCE_RULESET: RulesetId = RulesetId {
     // Version 6: the hit-claim admission cap and `HitRefusal::OverClaimRate`
     // (#923) landed in `orrery_protocol`, by the same rule as version 5. The
     // rules and every canonical chain are untouched; identity-only again.
-    version: 6,
+    //
+    // Version 7: the lane classification (#923) landed in `orrery_protocol`'s
+    // channel module — the `WireFamily` table and the witness-set keyframe
+    // sub-tag — by the same rule as versions 5 and 6. The rules and every
+    // canonical chain are untouched; identity-only again.
+    version: 7,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 

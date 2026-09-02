@@ -18,15 +18,18 @@ use bevy_ecs::message::Messages;
 use bevy_platform::time::Instant;
 
 use aeronet_iroh::stream::IrohStreamIo;
-use orrery_net::budget::{stream_wire_bytes, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES};
-use orrery_net::channels::{untag, Channel};
+use orrery_net::budget::{
+    stream_wire_bytes, Bandwidth, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES,
+};
+use orrery_net::channels::{tag, untag, Channel};
 use orrery_net::peer_link::{forget_departed_links, send_peer_packets, PeerLinkCounters};
 use orrery_net::plugin::Peer;
 use orrery_net::{SendPacket, StreamMode};
 use orrery_protocol::{
     channels::{
-        encode_delta_patch, encode_hit, encode_replication, encode_replication_delta,
-        ReplicationDelta, TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_DELTA,
+        encode_delivered_input, encode_delta_patch, encode_hit, encode_replication,
+        encode_replication_delta, encode_witness_keyframe, ReplicationDelta, TAG_DELIVERED_INPUT,
+        TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_DELTA, TAG_WITNESS_KEYFRAME,
     },
     HitClaim, HitMsg, HitSurface, InterpBasis, LatticePoint, NodeId, PersistId, QuantizedDir,
     QuantizedRay, Tick, WeaponRef,
@@ -98,10 +101,11 @@ fn queued_for_io(app: &mut App) -> usize {
 
 /// Packets the budget allows in one window, at this test's packet size.
 fn allowance() -> usize {
-    (UploadBudget::default()
-        .sustained
-        .bytes_over(Duration::from_secs(1))
-        / WIRE) as usize
+    allowance_for(UploadBudget::default())
+}
+
+fn allowance_for(budget: UploadBudget) -> usize {
+    (budget.sustained.bytes_over(budget.window) / WIRE) as usize
 }
 
 fn state_subtag(payload: &[u8]) -> Option<u8> {
@@ -139,7 +143,6 @@ fn everything_flows_while_there_is_budget() {
 
     assert_eq!(queued_for_io(&mut app), 10);
     assert_eq!(app.world().resource::<UploadMeter>().shed, 0);
-    assert!(!app.world().resource::<UploadMeter>().oversubscribed);
 }
 
 #[test]
@@ -159,7 +162,6 @@ fn state_is_shed_once_the_window_is_spent() {
         "sent {sent} packets against an allowance of {cap}"
     );
     assert_eq!(sent + meter.shed as usize, cap + 200, "nothing vanishes");
-    assert!(meter.oversubscribed);
     assert!(meter.shed_bytes >= meter.shed * WIRE);
 }
 
@@ -233,6 +235,56 @@ fn a_keyframe_is_shed_only_after_every_delta() {
 }
 
 #[test]
+fn a_witness_link_keyframe_survives_a_500_kbps_squeeze() {
+    // A20 §4 observed 89 false positives at 500 kbps when a witness lost the
+    // keyframe its deltas depend on. The distinct wire family, not a caller
+    // priority field, places this anchor on the unsheddable side of the meter.
+    let peer = secret(1).public();
+    let mut app = app(&[peer]);
+    let budget = UploadBudget {
+        sustained: Bandwidth::from_kbps(500),
+        ..UploadBudget::default()
+    };
+    *app.world_mut().resource_mut::<UploadBudget>() = budget;
+    queue(&mut app, peer, Channel::State, allowance_for(budget) + 200);
+    app.world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .write(SendPacket::state(
+            peer,
+            bytes::Bytes::from(encode_witness_keyframe(&vec![7u8; PAYLOAD])),
+        ));
+
+    app.update();
+
+    let sent = app
+        .world_mut()
+        .query::<&aeronet_io::Session>()
+        .iter(app.world())
+        .next()
+        .expect("test session")
+        .send
+        .iter()
+        .filter_map(|packet| replication_subtag(packet))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sent.iter()
+            .filter(|&&tag| tag == TAG_WITNESS_KEYFRAME)
+            .count(),
+        1,
+        "the witness-link keyframe must survive the squeeze"
+    );
+    let meter = app.world().resource::<UploadMeter>();
+    assert!(
+        meter.shed > 0,
+        "the replication flood must actually be shed"
+    );
+    assert!(
+        meter.lanes.witness_keyframe_bytes > 0,
+        "the preserved anchor gets its own audited lane"
+    );
+}
+
+#[test]
 fn control_still_goes_out_when_state_is_being_shed() {
     // Shedding a gap repair or a lease operation turns one dropped datagram
     // into a permanent hole — a repair that never arrives is indistinguishable
@@ -247,7 +299,7 @@ fn control_still_goes_out_when_state_is_being_shed() {
 
     let (shed, control) = {
         let meter = app.world().resource::<UploadMeter>();
-        (meter.shed, meter.control_over_budget)
+        (meter.shed, meter.unsheddable_over_budget)
     };
     assert!(shed > 0, "the state flood must actually be shed");
     assert_eq!(
@@ -303,20 +355,77 @@ fn hit_claims_survive_upload_pressure_ahead_of_replication() {
 }
 
 #[test]
-fn an_overrun_is_reported_rather_than_only_absorbed() {
-    // docs/03-replication.md §9.3: sustained oversubscription across an
-    // island's links is a promotion signal alongside raw population, so it has
-    // to be visible and not merely handled.
+fn delivered_inputs_survive_upload_pressure_on_a_datagram() {
+    // `Game::deliver` rides a reliable stream today, but its delivery
+    // guarantee belongs to the tagged class, not to the channel it happens to
+    // ride. This sends the real delivered-input frame as a datagram twice:
+    // once exactly as the encoder produces it today, and once as re-homing
+    // the family onto the state channel would — the same move that made hits
+    // sheddable. Neither the transport nor the channel byte may turn a
+    // damage, pickup, or door-open input into replication that the meter
+    // sheds.
     let peer = secret(1).public();
     let mut app = app(&[peer]);
-    queue(&mut app, peer, Channel::State, allowance() + 50);
+    queue(&mut app, peer, Channel::State, allowance() + 200);
+    {
+        // Both frames are the flood's own size. A short frame would prove
+        // nothing: the window's fractional remainder is always smaller than one
+        // flood packet, so a *misclassified* short input would slip through on
+        // leftover budget and the test would pass with the classification
+        // broken. At `PAYLOAD` bytes there is no remainder that fits it, so
+        // being admitted is evidence of the lane and nothing else.
+        let mut messages = app.world_mut().resource_mut::<Messages<SendPacket>>();
+        messages.write(SendPacket::state(
+            peer,
+            bytes::Bytes::from(encode_delivered_input(
+                PersistId::new(1),
+                PersistId::new(2),
+                &vec![9u8; PAYLOAD],
+            )),
+        ));
+        let mut rehomed = vec![TAG_DELIVERED_INPUT];
+        rehomed.extend_from_slice(&vec![9u8; PAYLOAD]);
+        messages.write(SendPacket::state(
+            peer,
+            bytes::Bytes::from(tag(Channel::State, &rehomed)),
+        ));
+    }
     app.update();
-    assert!(app.world().resource::<UploadMeter>().oversubscribed);
 
-    // A quiet frame clears the flag — the signal is "right now", and the
-    // coordinator's promotion decision is over sustained overruns, not one.
-    app.update();
-    assert!(!app.world().resource::<UploadMeter>().oversubscribed);
+    let mut on_control_channel = false;
+    let mut on_state_channel = false;
+    for packet in app
+        .world_mut()
+        .query::<&aeronet_io::Session>()
+        .iter(app.world())
+        .next()
+        .expect("test session")
+        .send
+        .iter()
+    {
+        let (_, logical) = untag(packet).expect("outer transport tag");
+        let (channel, body) = untag(logical).expect("inner protocol tag");
+        if body.first() != Some(&TAG_DELIVERED_INPUT) {
+            continue;
+        }
+        match channel {
+            Channel::Control => on_control_channel = true,
+            Channel::State => on_state_channel = true,
+        }
+    }
+    assert!(
+        on_control_channel,
+        "the delivered input as encoded today must be admitted before replication is shed"
+    );
+    assert!(
+        on_state_channel,
+        "a delivered input re-homed onto the state channel must still be admitted: \
+         the class, not the channel, decides"
+    );
+    assert!(
+        app.world().resource::<UploadMeter>().shed > 0,
+        "the replication flood must actually be shed"
+    );
 }
 
 #[test]

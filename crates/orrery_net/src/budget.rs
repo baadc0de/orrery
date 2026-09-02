@@ -39,8 +39,8 @@ use core::time::Duration;
 
 use bevy_ecs::prelude::*;
 
-use crate::channels::{untag, Channel, TAG_HIT, TAG_WITNESS, TAG_WITNESS_COMPRESSED};
-use orrery_protocol::{channels::TAG_REPLICATION_DELTA, NodeId};
+use crate::channels::{untag, Channel, TAG_REPLICATION_DELTA};
+use orrery_protocol::{channels::WireFamily, NodeId};
 
 /// Per-datagram wire overhead: IP+UDP 28 B, QUIC short header + AEAD ≈ 32 B.
 ///
@@ -297,19 +297,19 @@ pub struct UploadMeter {
     pub shed: u64,
     /// Bytes shed for want of budget.
     pub shed_bytes: u64,
-    /// Unsheddable packets sent while over budget — control and witness alike
-    /// (see [`is_sheddable`]) — never shed, always counted.
+    /// Unsheddable packets sent while over budget (see [`is_sheddable`]) —
+    /// never shed, always counted.
     ///
     /// A non-zero value here with `shed` climbing is the honest picture of an
     /// oversubscribed peer: the lanes that cannot be shed are still being paid
     /// for, so the overrun is real rather than an artefact of the backstop.
-    pub control_over_budget: u64,
-    /// Whether the last send pass was over budget.
     ///
-    /// docs/03-replication.md §9.3: sustained oversubscription across an
-    /// island's links is a promotion signal alongside raw population, so this is
-    /// reported rather than merely acted on.
-    pub oversubscribed: bool,
+    /// This deliberately replaces the old `oversubscribed` last-send-pass
+    /// boolean. It had no reader, and a single quiet pass cleared the only
+    /// signal that could establish the sustained condition docs/03 §9.3 needs.
+    /// Consumers instead sample [`Self::rate`] over their own promotion window
+    /// and use this counter to identify an overrun the backstop could not shed.
+    pub unsheddable_over_budget: u64,
     /// What each lane spent, cumulatively over the session.
     ///
     /// Cumulative rather than windowed because the question it answers is a
@@ -441,13 +441,14 @@ pub const fn is_sheddable(lane: Lane) -> bool {
 
 /// The order in which one send tick admits packets to the upload meter.
 ///
-/// The backstop cannot drop control, witness, or hit traffic. Within
-/// replication, an absolute keyframe is an anchor for subsequent deltas, so it
-/// is admitted before deltas. The delta distinction is read from the packet's
-/// wire sub-tag, not supplied by the caller as a second piece of metadata.
+/// The backstop cannot drop control, witness, hit, or witness-keyframe
+/// traffic. Within replication, an absolute keyframe is an anchor for
+/// subsequent deltas, so it is admitted before deltas. The delta distinction
+/// is read from the packet's wire sub-tag, not supplied by the caller as a
+/// second piece of metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BatchPriority {
-    /// Control, witness, and hit packets, which are never shed.
+    /// Control, witness, hit, and witness-keyframe packets, never shed.
     Unsheddable,
     /// Absolute replication state, including keyframes.
     Keyframe,
@@ -459,8 +460,8 @@ pub(crate) enum BatchPriority {
 ///
 /// A state payload with no valid replication-delta wire sub-tag remains an
 /// absolute replication packet. In particular, omitting a sub-tag cannot
-/// reclassify state traffic as control, witness, or hit, and a caller has no
-/// caller-provided priority to lie about.
+/// reclassify state traffic as control, witness, hit, or witness-keyframe, and
+/// a caller has no caller-provided priority to lie about.
 #[must_use]
 pub(crate) fn batch_priority(channel: Channel, payload: &[u8]) -> BatchPriority {
     if !is_sheddable(lane_of(channel, payload)) {
@@ -478,11 +479,11 @@ pub(crate) fn batch_priority(channel: Channel, payload: &[u8]) -> BatchPriority 
 /// Which kind of traffic a packet carries, for accounting and shedding order.
 ///
 /// Read *off the wire* rather than declared by the sender. `Channel::State`
-/// already carries a sub-tag — [`crate::channels::TAG_REPLICATION`],
-/// [`TAG_WITNESS`], or [`TAG_HIT`] — so a receiver can route a datagram without
-/// parsing it, and the meter reads the same byte the receiver routes on. A
-/// field on the packet would be a second source of truth for one fact, and it
-/// would drift from the wire the first time a caller left it at its default.
+/// already carries a sub-tag — [`WireFamily`] — so a receiver can route a
+/// datagram without parsing it, and the meter reads the same byte the receiver
+/// routes on. A field on the packet would be a second source of truth for one
+/// fact, and it would drift from the wire the first time a caller left it at
+/// its default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lane {
     /// Replicated entity state — the interactive lane, and the only sheddable
@@ -490,6 +491,8 @@ pub enum Lane {
     Replication,
     /// Verifiable-core log frames and state claims (docs/03-replication.md §5.3a).
     Witness,
+    /// An absolute replication anchor sent to a witness-set link (A20 §4).
+    WitnessKeyframe,
     /// Hit claims and verdicts: latency-critical state traffic retried until a
     /// verdict, not a snapshot superseded by the next replication send.
     Hit,
@@ -497,29 +500,73 @@ pub enum Lane {
     Control,
 }
 
-/// Which lane a packet belongs to, from its channel and its wire bytes.
+/// Read the inner, protocol-owned channel tag and sub-tag from a send payload.
 ///
-/// Anything on `Channel::State` that is not positively sub-tagged as witness
-/// or hit traffic counts as replication. That default is deliberate: an
-/// untagged or hand-rolled state payload is charged to the lane the budget is
-/// *for*, so a caller can never make its traffic cheaper by leaving the tag
-/// off.
+/// `SendPacket` adds its transport tag later, so its payload is the complete
+/// logical frame produced by the protocol encoder. Deliberately consult that
+/// inner frame first: a delivered input remains a delivered input if a future
+/// transport change moves it from a stream to a datagram.
+fn wire_family(payload: &[u8]) -> Option<WireFamily> {
+    let (channel, body) = untag(payload)?;
+    WireFamily::from_frame(channel, body.first().copied()?)
+}
+
+/// The delivery classification for a declared [`WireFamily`].
+///
+/// There is intentionally no wildcard arm. Adding a protocol sub-tag means
+/// adding a [`WireFamily`] variant, which makes this match fail to compile
+/// until its delivery class is decided.
+const fn lane_for_family(transport: Channel, family: WireFamily) -> Lane {
+    match family {
+        WireFamily::Replication
+        | WireFamily::ReplicationCompressed
+        | WireFamily::ReplicationDelta => Lane::Replication,
+        WireFamily::WitnessKeyframe => Lane::WitnessKeyframe,
+        // Range repairs share the witness envelope but ride the control
+        // transport. They remain the separately named, uncapped control family
+        // in #925's source-cap audit; the ordinary witness log stays witness.
+        WireFamily::Witness | WireFamily::WitnessCompressed => {
+            if transport.is_stream() {
+                Lane::Control
+            } else {
+                Lane::Witness
+            }
+        }
+        // This arm intentionally ignores `transport`: a delivered input stays
+        // unsheddable if a future transport moves it to a datagram.
+        WireFamily::DeliveredInput => Lane::Control,
+        WireFamily::Hit => Lane::Hit,
+    }
+}
+
+/// Which lane a packet belongs to, from its protocol-owned wire class.
+///
+/// Declared families are read from their protocol bytes. The one exception is
+/// the witness envelope's control transport, which distinguishes range repair
+/// from normal witness log traffic without a second caller-provided field.
+/// Opaque bytes retain the conservative transport fallback: raw state is
+/// charged to replication, and raw stream bytes to control.
 #[must_use]
 pub fn lane_of(channel: Channel, payload: &[u8]) -> Lane {
-    if channel.is_stream() {
+    let lane = match wire_family(payload) {
+        Some(family) => lane_for_family(channel, family),
+        None if channel.is_datagram() => Lane::Replication,
+        None => Lane::Control,
+    };
+    // Shedding is a *datagram* backstop. A stream is reliable and ordered, so
+    // skipping one of its messages is not a dropped snapshot the next send
+    // supersedes — it is a hole in a byte sequence the receiver will wait on.
+    // A sheddable classification is therefore unrepresentable on that
+    // transport, and this clamp says so once, here, rather than leaving the
+    // send loop to shed a stream message. It is not the channel deciding the
+    // class: the family below still names the lane, and this can only move a
+    // packet onto the *more* expensive, unsheddable side — never the cheaper
+    // one. Without it, re-homing a state family onto the stream (the move that
+    // made hits sheddable) would let the backstop punch that hole.
+    if channel.is_stream() && is_sheddable(lane) {
         return Lane::Control;
     }
-    match untag(payload) {
-        Some((Channel::State, body))
-            if body
-                .first()
-                .is_some_and(|tag| *tag == TAG_WITNESS || *tag == TAG_WITNESS_COMPRESSED) =>
-        {
-            Lane::Witness
-        }
-        Some((Channel::State, body)) if body.first() == Some(&TAG_HIT) => Lane::Hit,
-        _ => Lane::Replication,
-    }
+    lane
 }
 
 /// Wire bytes and packet counts, split by [`Lane`].
@@ -535,6 +582,8 @@ pub struct LaneTally {
     pub replication_bytes: u64,
     /// Wire bytes charged to the witness lane.
     pub witness_bytes: u64,
+    /// Wire bytes charged to witness-link replication keyframes.
+    pub witness_keyframe_bytes: u64,
     /// Wire bytes charged to the hit-registration lane.
     pub hit_bytes: u64,
     /// Wire bytes charged to the control lane.
@@ -547,7 +596,11 @@ impl LaneTally {
     /// Every wire byte this peer has offered the link, across all lanes.
     #[must_use]
     pub const fn total_bytes(&self) -> u64 {
-        self.replication_bytes + self.witness_bytes + self.hit_bytes + self.control_bytes
+        self.replication_bytes
+            + self.witness_bytes
+            + self.witness_keyframe_bytes
+            + self.hit_bytes
+            + self.control_bytes
     }
 
     /// The witness lane's share of everything sent, in \[0, 1\].
@@ -567,6 +620,7 @@ impl LaneTally {
         match lane {
             Lane::Replication => self.replication_bytes += wire,
             Lane::Witness => self.witness_bytes += wire,
+            Lane::WitnessKeyframe => self.witness_keyframe_bytes += wire,
             Lane::Hit => self.hit_bytes += wire,
             Lane::Control => self.control_bytes += wire,
         }
@@ -695,6 +749,7 @@ mod tests {
         // the next send 50 ms later.
         assert!(is_sheddable(Lane::Replication));
         assert!(!is_sheddable(Lane::Control));
+        assert!(!is_sheddable(Lane::WitnessKeyframe));
         assert!(!is_sheddable(Lane::Hit));
     }
 
@@ -713,7 +768,8 @@ mod tests {
     #[test]
     fn the_lane_is_read_off_the_wire_rather_than_taken_on_trust() {
         use crate::channels::{
-            encode_replication, encode_witness, encode_witness_compressed, tag, TAG_HIT,
+            encode_replication, encode_witness, encode_witness_compressed, encode_witness_keyframe,
+            tag, TAG_HIT,
         };
 
         // The sub-tag a receiver routes on is the same byte the meter reads, so
@@ -737,9 +793,12 @@ mod tests {
             lane_of(Channel::State, &tag(Channel::State, &[TAG_HIT, 0])),
             Lane::Hit
         );
-        // Control is control regardless of what it carries: the witness crate
-        // encodes its repair traffic with `encode_witness` and sends it on the
-        // reliable lane, and that is a control cost, not a lane cost.
+        assert_eq!(
+            lane_of(Channel::State, &encode_witness_keyframe(&[1u8, 2, 3])),
+            Lane::WitnessKeyframe
+        );
+        // Witness range repair shares the envelope but is control traffic when
+        // sent over a stream; #925 names its missing cap separately.
         assert_eq!(
             lane_of(Channel::Control, &encode_witness(&[1u8, 2, 3])),
             Lane::Control
@@ -753,6 +812,90 @@ mod tests {
         // cheaper by moving it onto an unsheddable lane.
         assert_eq!(lane_of(Channel::State, &[]), Lane::Replication);
         assert_eq!(lane_of(Channel::State, &[0, 99, 1]), Lane::Replication);
+    }
+
+    #[test]
+    fn a_delivered_input_is_its_class_not_its_channel() {
+        // The delivered-input sub-tag names the class; the channel byte is
+        // framing. Today the frame rides the control channel; the move that
+        // made hits sheddable — re-homing the family onto the state channel —
+        // must leave the classification where the class put it. Both readings
+        // land on the same unsheddable lane.
+        use crate::channels::{tag, TAG_DELIVERED_INPUT};
+        let body = &[TAG_DELIVERED_INPUT, 1, 2, 3];
+        assert_eq!(
+            lane_of(Channel::Control, &tag(Channel::Control, body)),
+            Lane::Control
+        );
+        assert_eq!(
+            lane_of(Channel::State, &tag(Channel::State, body)),
+            Lane::Control
+        );
+    }
+
+    #[test]
+    fn the_witness_envelope_names_one_family_on_either_channel() {
+        // The log rides state and the meter reads it as witness; range repair
+        // shares the envelope on the control transport, where the transport —
+        // not a second caller field — puts it in the control lane.
+        use crate::channels::{encode_witness, encode_witness_compressed};
+        assert_eq!(
+            lane_of(Channel::State, &encode_witness(&[1u8, 2, 3])),
+            Lane::Witness
+        );
+        assert_eq!(
+            lane_of(
+                Channel::State,
+                &encode_witness_compressed(&vec![0u8; 4_096])
+            ),
+            Lane::Witness
+        );
+        assert_eq!(
+            lane_of(Channel::Control, &encode_witness(&[1u8, 2, 3])),
+            Lane::Control
+        );
+        assert_eq!(
+            lane_of(Channel::Control, &encode_witness_compressed(&[1u8, 2, 3])),
+            Lane::Control
+        );
+    }
+
+    #[test]
+    fn re_homing_a_state_family_onto_the_stream_cannot_buy_it_a_shed() {
+        // Two readings of the same move, both of which must land unsheddable.
+        //
+        // A frame the protocol encoders produce carries its *own* channel byte
+        // inside the payload, so genuinely re-homing a state family onto the
+        // stream keeps that `Channel::State` byte and `from_frame` still names
+        // the family. Replication then classifies as `Lane::Replication` —
+        // sheddable — and the send loop tests `is_sheddable` *before* it
+        // dispatches on the channel, so it would skip a message on a reliable,
+        // ordered stream: not a superseded snapshot but a hole the receiver
+        // waits on. `lane_of` clamps that, so the re-homed frame is control.
+        //
+        // Re-tagged onto the control channel the pairing is not in the table at
+        // all, and the opaque fallback on a stream is control as well.
+        use crate::channels::{tag, TAG_HIT, TAG_REPLICATION, TAG_WITNESS_KEYFRAME};
+        for family_tag in [TAG_HIT, TAG_REPLICATION, TAG_WITNESS_KEYFRAME] {
+            assert!(
+                !is_sheddable(lane_of(
+                    Channel::Control,
+                    &tag(Channel::State, &[family_tag, 0])
+                )),
+                "re-homed sub-tag {family_tag:#04x} must not be sheddable on a stream"
+            );
+            assert_eq!(
+                lane_of(Channel::Control, &tag(Channel::Control, &[family_tag, 0])),
+                Lane::Control,
+                "sub-tag {family_tag:#04x} on the stream must not fall into a sheddable lane"
+            );
+        }
+        // The clamp only ever moves a packet to the dearer side: a datagram
+        // reading of the same bytes is untouched.
+        assert_eq!(
+            lane_of(Channel::State, &tag(Channel::State, &[TAG_REPLICATION, 0])),
+            Lane::Replication
+        );
     }
 
     #[test]

@@ -1058,7 +1058,9 @@ mod tests {
         // changed shape, but the doctrine is one version number for the tree
         // (see `PROTOCOL_VERSION`'s own doc for why a family that never
         // crosses a gateway session still bumps it).
-        assert_eq!(crate::PROTOCOL_VERSION, 10);
+        // 11 is #923's witness-set keyframe sub-tag family, by the same
+        // doctrine.
+        assert_eq!(crate::PROTOCOL_VERSION, 11);
     }
 
     #[test]
