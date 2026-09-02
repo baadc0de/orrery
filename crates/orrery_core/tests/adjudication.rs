@@ -920,3 +920,43 @@ fn a_multi_entity_frame_needs_its_sibling_heads_to_verify() {
         Verdict::Confirms { .. }
     ));
 }
+
+#[test]
+fn omitting_a_trailing_input_frame_cannot_convict() {
+    // The claim chain is complete and every signature is genuine; what the
+    // reporter withheld is the *input* frame covering the last three ticks.
+    // Replaying those ticks with no inputs diverges from what the subject
+    // signed, so an adjudicator that does not require the frames to cover the
+    // window convicts an honest authority with its own signatures.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Exonerates,
+        "the untouched bundle must exonerate, or the probe proves nothing"
+    );
+
+    bundle.frames.pop().expect("frames present");
+    bundle.sibling_heads.pop().expect("heads present");
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain)
+    );
+}
+
+#[test]
+fn omitting_a_leading_input_frame_cannot_convict() {
+    // The same withholding at the other end of the window.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    bundle.frames.remove(0);
+    bundle.sibling_heads.remove(0);
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain)
+    );
+}

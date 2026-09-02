@@ -299,6 +299,21 @@ impl<R: Ruleset, B: TickBackend<R>> ReplayHarness<R, B> {
             }
         }
 
+        // The frames must actually cover the window. Contiguity between
+        // frames is not enough: with only the pairwise check, a reporter
+        // holding a genuine bundle can drop the frames at either end and the
+        // withheld ticks replay as ticks with no inputs, diverging from what
+        // the authority signed. That is the #874 omission attack wearing a
+        // different coat — incomplete evidence, never proof of deviation — so
+        // it is an error here rather than a verdict there.
+        let covered = frames
+            .first()
+            .zip(previous_end)
+            .is_some_and(|(first, last_end)| first.first_tick.0 <= start.0 && last_end >= end.0);
+        if !covered {
+            return Err(ReplayError::NonContiguousFrames);
+        }
+
         let mut trace = ReplayTrace::default();
         for tick in start.0..end.0 {
             let inputs = per_tick.remove(&tick).unwrap_or_default();
