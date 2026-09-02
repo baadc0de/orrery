@@ -146,7 +146,7 @@ pub struct StrikeRow {
 // lived here.
 pub use crate::keyspace::{
     strike_account_range_end, strike_account_range_start, strike_episode_key, strike_key,
-    strike_versionstamped_key, STRIKE_VERSIONSTAMP_OFFSET,
+    strike_range_end, strike_range_start, strike_versionstamped_key, STRIKE_VERSIONSTAMP_OFFSET,
 };
 
 /// Result of attempting to append one verdict-derived fact.
@@ -180,13 +180,21 @@ impl std::error::Error for StrikeLedgerError {}
 
 /// The adjudication executor's append seam.
 pub trait StrikeLedger: Send + Sync {
-    /// Resolve `target` through D31's current binding and append `row` once.
+    /// Resolve `target` through its D31 binding at `offence` and append
+    /// `row` once.
+    ///
+    /// `offence` is an [`OffenceTime`], not a bare millisecond, because a
+    /// [`Tick`] is not a Unix millisecond: comparing the two would silently
+    /// turn a rebinding into a misattribution. A caller with no authenticated
+    /// instant passes [`OffenceTime::Unknown`] and is refused rather than
+    /// misattributed.
     ///
     /// `episode` is written to a separate durable dedup index, leaving
     /// immutable D33 row bytes backward-readable.
     fn file(
         &self,
         target: NodeId,
+        offence: OffenceTime,
         row: &StrikeRow,
         episode: Option<&StrikeEpisodeRef>,
     ) -> Result<StrikeFileOutcome, StrikeLedgerError>;
@@ -200,7 +208,8 @@ pub struct MemStrikeLedger {
 
 #[derive(Debug, Default)]
 struct MemStrikeState {
-    bindings: HashMap<NodeId, AccountId>,
+    bindings: HashMap<NodeId, crate::keyspace::BindingRow>,
+    history: HashMap<NodeId, Vec<crate::keyspace::BindingHistoryRow>>,
     rows: HashMap<AccountId, Vec<StrikeRow>>,
     episodes: HashMap<AccountId, HashMap<[u8; 32], u64>>,
 }
@@ -214,7 +223,43 @@ impl MemStrikeLedger {
 
     /// Install one current D31 binding for a harness.
     pub fn bind(&self, node: NodeId, account: AccountId) {
-        Self::lock(&self.state).bindings.insert(node, account);
+        self.bind_at(node, account, 0);
+    }
+
+    /// Append a binding event at a known wall-clock instant for a harness.
+    pub fn bind_at(&self, node: NodeId, account: AccountId, at_ms: u64) {
+        let mut state = Self::lock(&self.state);
+        state.bindings.insert(
+            node,
+            crate::keyspace::BindingRow {
+                account,
+                bound_at_ms: at_ms,
+            },
+        );
+        state
+            .history
+            .entry(node)
+            .or_default()
+            .push(crate::keyspace::BindingHistoryRow {
+                account,
+                kind: crate::keyspace::BindKind::Bind,
+                at_ms,
+            });
+    }
+
+    /// Append an unbinding event for a harness.
+    pub fn unbind_at(&self, node: NodeId, account: AccountId, at_ms: u64) {
+        let mut state = Self::lock(&self.state);
+        state.bindings.remove(&node);
+        state
+            .history
+            .entry(node)
+            .or_default()
+            .push(crate::keyspace::BindingHistoryRow {
+                account,
+                kind: crate::keyspace::BindKind::Unbind,
+                at_ms,
+            });
     }
 
     /// Read one account's filed facts in append order.
@@ -227,6 +272,18 @@ impl MemStrikeLedger {
             .unwrap_or_default()
     }
 
+    /// Hard-delete retained facts whose carried deadline has passed.
+    pub fn sweep_expired(&self, now_ms: u64) -> usize {
+        let mut state = Self::lock(&self.state);
+        let mut removed = 0;
+        for rows in state.rows.values_mut() {
+            let before = rows.len();
+            rows.retain(|row| row.expires_at_ms > now_ms);
+            removed += before - rows.len();
+        }
+        removed
+    }
+
     fn lock(state: &Mutex<MemStrikeState>) -> MutexGuard<'_, MemStrikeState> {
         state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -236,11 +293,21 @@ impl StrikeLedger for MemStrikeLedger {
     fn file(
         &self,
         target: NodeId,
+        offence: OffenceTime,
         row: &StrikeRow,
         episode: Option<&StrikeEpisodeRef>,
     ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
         let mut state = Self::lock(&self.state);
-        let Some(account) = state.bindings.get(&target).copied() else {
+        let account = binding_account_at(
+            state.bindings.get(&target),
+            state
+                .history
+                .get(&target)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            offence,
+        );
+        let Some(account) = account else {
             return Ok(StrikeFileOutcome::UnresolvedBinding);
         };
         if episode.is_none()
@@ -267,6 +334,80 @@ impl StrikeLedger for MemStrikeLedger {
         state.rows.entry(account).or_default().push(row.clone());
         Ok(StrikeFileOutcome::Filed { account })
     }
+}
+
+/// When an offence happened, on identity's Unix-millisecond binding clock.
+///
+/// D31 binding events are wall-clock addressed, while signed evidence is
+/// tick-addressed: an [`EvidenceBundle`] carries `window_start`, `window_end`
+/// and a `chain_epoch`, and no field of it — nor any durable row in this
+/// crate — maps a chain epoch onto a wall clock. There is therefore no
+/// authenticated offence instant to be had from evidence alone, and this
+/// enum makes that absence explicit instead of letting a fabricated
+/// projection masquerade as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffenceTime {
+    /// An instant a caller can actually authenticate for this evidence.
+    KnownMs(u64),
+    /// No authenticated instant exists for this evidence.
+    ///
+    /// Attribution then refuses to guess: it demands that the node have had
+    /// exactly one owner across its whole recorded binding history. Any
+    /// rebinding makes the offender unknowable, and the strike is refused
+    /// rather than landed on whoever happens to hold the binding now.
+    Unknown,
+}
+
+/// Resolve D31's append-only binding facts to the account that earned a
+/// strike, never merely the account that holds the node today.
+///
+/// Binding history is the authority whenever present. The current `db` row is
+/// only a migration fallback for a legacy node with no `dh` events yet, and
+/// under [`OffenceTime::KnownMs`] its `bound_at_ms` still prevents assigning
+/// an earlier offence to a later owner. Equal timestamps retain commit order
+/// from the history scan.
+fn binding_account_at(
+    current: Option<&crate::keyspace::BindingRow>,
+    history: &[crate::keyspace::BindingHistoryRow],
+    offence: OffenceTime,
+) -> Option<AccountId> {
+    let offence_at_ms = match offence {
+        OffenceTime::KnownMs(at_ms) => at_ms,
+        // Without an instant, one continuously-owned node is the only case
+        // where the offender is knowable. Two distinct owners in the history
+        // means the strike could belong to either, so it belongs to neither.
+        OffenceTime::Unknown => {
+            let current = current?;
+            let mut sole_owner = Some(current.account);
+            for event in history {
+                if event.account != current.account {
+                    sole_owner = None;
+                    break;
+                }
+            }
+            return sole_owner;
+        }
+    };
+
+    if history.is_empty() {
+        return current
+            .and_then(|binding| (binding.bound_at_ms <= offence_at_ms).then_some(binding.account));
+    }
+
+    let mut account = None;
+    for event in history {
+        if event.at_ms > offence_at_ms {
+            continue;
+        }
+        match event.kind {
+            crate::keyspace::BindKind::Bind => account = Some(event.account),
+            crate::keyspace::BindKind::Unbind if account == Some(event.account) => {
+                account = None;
+            }
+            crate::keyspace::BindKind::Unbind => {}
+        }
+    }
+    account
 }
 
 /// Strike-filing counters, separate from verdict delivery counters.
@@ -444,13 +585,36 @@ impl AdjudicationExecutor {
         self.adjudicate_outcome(report).verdict
     }
 
+    /// Adjudicate one report whose evidence window has been projected onto
+    /// identity's Unix-millisecond clock.
+    ///
+    /// Callers that configure a strike ledger must use this form: the signed
+    /// evidence is tick-addressed, while D31 binding events are wall-clock
+    /// addressed. The projection belongs at the coordinator-epoch boundary,
+    /// not inside the ledger where a tick would otherwise masquerade as ms.
+    #[must_use]
+    pub fn adjudicate_at(&self, report: &DiscrepancyReport, offence: OffenceTime) -> Verdict {
+        self.adjudicate_outcome_at(report, offence).verdict
+    }
+
     /// Adjudicate and retain the replayed state a guilty response needs.
     ///
-    /// Strike filing is identical to [`Self::adjudicate`] and happens exactly
-    /// once; callers choose this form only when they also consume C4.
+    /// If C5 is configured, filing uses its required evidence-time projection
+    /// and happens exactly once. [`Self::adjudicate_outcome_at`] is available
+    /// to a caller that has already computed the projection for this report.
     #[must_use]
     pub fn adjudicate_outcome(&self, report: &DiscrepancyReport) -> AdjudicationOutcome {
-        let outcome = if orrery_witness::verify_report(report).is_err() {
+        let outcome = self.evaluate_outcome(report);
+        // Signed evidence carries no authenticated wall clock, so the default
+        // adjudication path cannot name the offence instant. It says so,
+        // rather than substituting "now" — which is precisely the current-
+        // binding misattribution this seam exists to prevent.
+        self.file_report_verdict_at(report, outcome.verdict, OffenceTime::Unknown);
+        outcome
+    }
+
+    fn evaluate_outcome(&self, report: &DiscrepancyReport) -> AdjudicationOutcome {
+        if orrery_witness::verify_report(report).is_err() {
             // Unsigned or tampered-in-transit. Not `EvidenceForged`: that
             // verdict strikes the named reporter, and an unverifiable
             // signature is exactly the case where the name means nothing.
@@ -469,12 +633,33 @@ impl AdjudicationExecutor {
                 verdict: Verdict::Unadjudicable(UnadjudicableReason::UnknownRuleset),
                 corrected: None,
             }
-        };
-        self.file_report_verdict(report, outcome.verdict);
+        }
+    }
+
+    /// Adjudicate and file against the account bound when the evidence window
+    /// occurred, rather than the account bound when replay completed.
+    #[must_use]
+    pub fn adjudicate_outcome_at(
+        &self,
+        report: &DiscrepancyReport,
+        offence: OffenceTime,
+    ) -> AdjudicationOutcome {
+        let outcome = self.evaluate_outcome(report);
+        self.file_report_verdict_at(report, outcome.verdict, offence);
         outcome
     }
 
+    #[cfg(test)]
     fn file_report_verdict(&self, report: &DiscrepancyReport, verdict: Verdict) {
+        self.file_report_verdict_at(report, verdict, OffenceTime::Unknown);
+    }
+
+    fn file_report_verdict_at(
+        &self,
+        report: &DiscrepancyReport,
+        verdict: Verdict,
+        offence: OffenceTime,
+    ) {
         let (target, kind, filed_counter, episode) = match verdict {
             Verdict::Confirms { at, .. } => (
                 report.subject,
@@ -515,7 +700,7 @@ impl AdjudicationExecutor {
             mode: filer.mode,
             expires_at_ms: issued_at_ms.saturating_add(STRIKE_RETENTION_MS),
         };
-        match filer.ledger.file(target, &row, episode.as_ref()) {
+        match filer.ledger.file(target, offence, &row, episode.as_ref()) {
             Ok(StrikeFileOutcome::Filed { account }) => {
                 filed_counter.fetch_add(1, Ordering::Relaxed);
                 self.record_strike_ramp(
@@ -584,6 +769,99 @@ impl AdjudicationExecutor {
         };
         meter.qualify(None);
         meter.observe_unevaluated(None, reason, observed_at_ms);
+    }
+
+    /// Append D33's executor-authorized compensating fact for an upheld
+    /// appeal. The original fact remains immutable; this new `Appeal` row
+    /// references its evidence and negates exactly its original weight.
+    ///
+    /// `offence` must be the same [`OffenceTime`] used when the original was
+    /// filed, so a later NodeId rebind cannot redirect the reversal to a new
+    /// account owner. Passing the original's own resolution is what makes the
+    /// compensating fact land on the account that carries the conviction.
+    pub fn uphold_appeal(
+        &self,
+        target: NodeId,
+        offence: OffenceTime,
+        appealed: &StrikeRow,
+    ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
+        if appealed.kind == StrikeKind::Appeal || appealed.weight_milli <= 0 {
+            return Err(StrikeLedgerError(
+                "an appeal must compensate one positive, non-appeal strike".into(),
+            ));
+        }
+        let Some(filer) = &self.strike_filer else {
+            return Err(StrikeLedgerError(
+                "cannot uphold an appeal while strike filing is off".into(),
+            ));
+        };
+        let issued_at_ms = (filer.clock)();
+        let row = StrikeRow {
+            issued_at_ms,
+            weight_milli: -appealed.weight_milli,
+            kind: StrikeKind::Appeal,
+            evidence_ref: appealed.evidence_ref.clone(),
+            ruleset: appealed.ruleset,
+            mode: appealed.mode,
+            expires_at_ms: issued_at_ms.saturating_add(STRIKE_RETENTION_MS),
+        };
+        // No episode key: an appeal is deduplicated by (evidence digest,
+        // `Appeal`) instead, so upholding the same appeal twice cannot credit
+        // the appellant twice.
+        filer.ledger.file(target, offence, &row, None)
+    }
+
+    /// File the D33 clause (a) non-cooperation tier after the executor has
+    /// established the existing proof threshold. This is a separate producer
+    /// because a replay `Verdict` does not represent a log-gap finding.
+    pub fn file_non_cooperation(
+        &self,
+        target: NodeId,
+        offence: OffenceTime,
+        evidence_ref: StrikeEvidenceRef,
+        ruleset: RulesetId,
+    ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
+        self.file_executor_finding(
+            target,
+            offence,
+            StrikeKind::NonCooperation,
+            NON_COOPERATION_WEIGHT_MILLI,
+            evidence_ref,
+            ruleset,
+        )
+    }
+
+    fn file_executor_finding(
+        &self,
+        target: NodeId,
+        offence: OffenceTime,
+        kind: StrikeKind,
+        weight_milli: i32,
+        evidence_ref: StrikeEvidenceRef,
+        ruleset: RulesetId,
+    ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
+        let Some(filer) = &self.strike_filer else {
+            return Err(StrikeLedgerError(
+                "cannot file an executor finding while strike filing is off".into(),
+            ));
+        };
+        let issued_at_ms = (filer.clock)();
+        filer.ledger.file(
+            target,
+            offence,
+            &StrikeRow {
+                issued_at_ms,
+                weight_milli,
+                kind,
+                evidence_ref,
+                ruleset,
+                mode: filer.mode,
+                expires_at_ms: issued_at_ms.saturating_add(STRIKE_RETENTION_MS),
+            },
+            // An executor finding is not a replay divergence episode; its
+            // dedup identity is (evidence digest, kind).
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -768,6 +1046,123 @@ impl FdbStrikeLedger {
     pub async fn rows(&self, account: AccountId) -> Result<Vec<StrikeRow>, StrikeLedgerError> {
         read_strike_rows(Arc::clone(&self.db), account).await
     }
+
+    /// Delete every expired D33 product found in one off-path maintenance
+    /// pass, and return how many keys were cleared.
+    ///
+    /// The scorer already excludes an expired row before this task reaches
+    /// it, but that is not retention: this pass is what makes expiry a hard
+    /// delete rather than unbounded dead data.
+    ///
+    /// All three families a filing writes are swept together, because two of
+    /// them are indexes *into* the `ya` row and outliving it would be worse
+    /// than never having been written. A `yc` restore hold in particular
+    /// holds an entity's restore for as long as an adjudication product is
+    /// retained, so an orphaned hold would block restore forever on the
+    /// strength of a strike retention has already erased.
+    ///
+    /// The scan is in key order; production cadence and paging belong to the
+    /// maintenance runner.
+    pub async fn sweep_expired(&self, now_ms: u64) -> Result<usize, StrikeLedgerError> {
+        use futures::TryStreamExt;
+
+        async fn scan(
+            trx: &foundationdb::RetryableTransaction,
+            start: &[u8],
+            end: &[u8],
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, foundationdb::FdbBindingError> {
+            let mut stream = trx.get_ranges_keyvalues(
+                foundationdb::RangeOption {
+                    begin: foundationdb::KeySelector::first_greater_or_equal(start),
+                    end: foundationdb::KeySelector::first_greater_or_equal(end),
+                    ..foundationdb::RangeOption::default()
+                },
+                false,
+            );
+            let mut found = Vec::new();
+            while let Some(kv) = stream.try_next().await? {
+                found.push((kv.key().to_vec(), kv.value().to_vec()));
+            }
+            Ok(found)
+        }
+
+        self.db
+            .run(|trx, _| async move {
+                let mut doomed: Vec<Vec<u8>> = Vec::new();
+                // `ya`: the strike rows themselves, and the identity of each
+                // erased row, so its indexes can be found below.
+                let mut erased = std::collections::HashSet::new();
+                for (key, value) in scan(&trx, &strike_range_start(), &strike_range_end()).await? {
+                    let row: StrikeRow = postcard::from_bytes(&value).map_err(|error| {
+                        foundationdb::FdbBindingError::new_custom_error(Box::new(
+                            StrikeLedgerError(format!("strike row decode: {error}")),
+                        ))
+                    })?;
+                    if row.expires_at_ms <= now_ms {
+                        if key.len() == 20 {
+                            erased.insert((
+                                AccountId::new(u64::from_be_bytes(
+                                    key[2..10].try_into().expect("8 bytes"),
+                                )),
+                                <[u8; 10]>::try_from(&key[10..20]).expect("10 bytes"),
+                            ));
+                        }
+                        doomed.push(key);
+                    }
+                }
+                // `yb`: the episode-dedup marker, whose value is its own
+                // expiry.
+                for (key, value) in scan(
+                    &trx,
+                    &crate::keyspace::strike_episode_range_start(),
+                    &crate::keyspace::strike_episode_range_end(),
+                )
+                .await?
+                {
+                    let expires_at_ms =
+                        u64::from_be_bytes(value.as_slice().try_into().map_err(|_| {
+                            foundationdb::FdbBindingError::new_custom_error(Box::new(
+                                StrikeLedgerError(
+                                    "strike episode index expiry has invalid width".into(),
+                                ),
+                            ))
+                        })?);
+                    if expires_at_ms <= now_ms {
+                        doomed.push(key);
+                    }
+                }
+                // `yc`: restore holds naming a strike this pass erased.
+                if !erased.is_empty() {
+                    for (key, _) in scan(
+                        &trx,
+                        &crate::keyspace::restore_hold_family_range_start(),
+                        &crate::keyspace::restore_hold_family_range_end(),
+                    )
+                    .await?
+                    {
+                        if let Some((
+                            _,
+                            _,
+                            crate::keyspace::RestoreHoldProduct::Strike {
+                                account,
+                                versionstamp,
+                            },
+                        )) = crate::keyspace::decode_restore_hold_key(&key)
+                        {
+                            if erased.contains(&(account, versionstamp)) {
+                                doomed.push(key);
+                            }
+                        }
+                    }
+                }
+                for key in &doomed {
+                    trx.clear(key);
+                }
+                Ok(doomed.len())
+            })
+            .await
+            .map_err(strike_fdb_error)
+    }
 }
 
 #[cfg(feature = "fdb")]
@@ -820,6 +1215,7 @@ impl StrikeLedger for FdbStrikeLedger {
     fn file(
         &self,
         target: NodeId,
+        offence: OffenceTime,
         row: &StrikeRow,
         episode: Option<&StrikeEpisodeRef>,
     ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
@@ -840,16 +1236,48 @@ impl StrikeLedger for FdbStrikeLedger {
                 let row = row.clone();
                 async move {
                     let binding_key = crate::keyspace::binding_key(&target);
-                    let Some(raw_binding) = trx.get(&binding_key, false).await? else {
+                    let current = trx
+                        .get(&binding_key, false)
+                        .await?
+                        .map(|raw| {
+                            postcard::from_bytes::<crate::keyspace::BindingRow>(&raw).map_err(
+                                |error| {
+                                    foundationdb::FdbBindingError::new_custom_error(Box::new(
+                                        StrikeLedgerError(format!("binding row decode: {error}")),
+                                    ))
+                                },
+                            )
+                        })
+                        .transpose()?;
+                    let history_start = crate::keyspace::binding_history_node_range_start(&target);
+                    let history_end = crate::keyspace::binding_history_node_range_end(&target);
+                    let mut history_stream = trx.get_ranges_keyvalues(
+                        foundationdb::RangeOption {
+                            begin: foundationdb::KeySelector::first_greater_or_equal(
+                                history_start.as_slice(),
+                            ),
+                            end: foundationdb::KeySelector::first_greater_or_equal(
+                                history_end.as_slice(),
+                            ),
+                            ..foundationdb::RangeOption::default()
+                        },
+                        false,
+                    );
+                    let mut history = Vec::new();
+                    while let Some(kv) = history_stream.try_next().await? {
+                        history.push(postcard::from_bytes(kv.value()).map_err(|error| {
+                            foundationdb::FdbBindingError::new_custom_error(Box::new(
+                                StrikeLedgerError(format!("binding history row decode: {error}")),
+                            ))
+                        })?);
+                    }
+                    drop(history_stream);
+                    let Some(account) = binding_account_at(current.as_ref(), &history, offence)
+                    else {
                         return Ok(StrikeFileOutcome::UnresolvedBinding);
                     };
-                    let binding: crate::keyspace::BindingRow = postcard::from_bytes(&raw_binding)
-                        .map_err(|error| {
-                        foundationdb::FdbBindingError::new_custom_error(Box::new(
-                            StrikeLedgerError(format!("binding row decode: {error}")),
-                        ))
-                    })?;
-                    let account = binding.account;
+                    // The selected account is historical, never merely the
+                    // owner observed while this adjudication transaction ran.
                     if let Some(episode) = episode {
                         let episode_key = strike_episode_key(account, &episode);
                         if let Some(existing_expiry) = trx.get(&episode_key, false).await? {
@@ -1391,6 +1819,203 @@ mod tests {
     }
 
     #[test]
+    fn binding_time_attribution_keeps_a_rebound_node_from_punishing_its_new_owner() {
+        let report = report();
+        let original_owner = AccountId(72);
+        let new_owner = AccountId(73);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind_at(report.subject, original_owner, 100);
+        ledger.unbind_at(report.subject, original_owner, 200);
+        ledger.bind_at(report.subject, new_owner, 300);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+
+        executor.file_report_verdict_at(
+            &report,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+            OffenceTime::KnownMs(150),
+        );
+
+        assert_eq!(ledger.rows(original_owner).len(), 1);
+        assert!(
+            ledger.rows(new_owner).is_empty(),
+            "the account bound only after the offence inherits no conviction"
+        );
+    }
+
+    #[test]
+    fn upheld_appeal_appends_a_negative_fact_without_rewriting_the_strike() {
+        let report = report();
+        let account = AccountId(74);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind_at(report.subject, account, 100);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+        executor.file_report_verdict_at(
+            &report,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+            OffenceTime::KnownMs(150),
+        );
+        let original = ledger.rows(account).pop().expect("original strike");
+
+        assert_eq!(
+            executor
+                .uphold_appeal(report.subject, OffenceTime::KnownMs(150), &original)
+                .expect("executor-authorized appeal"),
+            StrikeFileOutcome::Filed { account }
+        );
+
+        let rows = ledger.rows(account);
+        assert_eq!(rows.len(), 2, "appeal is an additional immutable fact");
+        assert_eq!(rows[0], original, "the conviction was not rewritten");
+        assert_eq!(rows[1].kind, StrikeKind::Appeal);
+        assert_eq!(rows[1].weight_milli, -original.weight_milli);
+        assert_eq!(rows[1].evidence_ref, original.evidence_ref);
+    }
+
+    #[test]
+    fn upholding_the_same_appeal_twice_credits_the_appellant_once() {
+        let report = report();
+        let account = AccountId(77);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind_at(report.subject, account, 100);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+        executor.file_report_verdict_at(
+            &report,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+            OffenceTime::KnownMs(150),
+        );
+        let original = ledger.rows(account).pop().expect("original strike");
+        let offence = OffenceTime::KnownMs(150);
+
+        assert_eq!(
+            executor.uphold_appeal(report.subject, offence, &original),
+            Ok(StrikeFileOutcome::Filed { account })
+        );
+        assert_eq!(
+            executor.uphold_appeal(report.subject, offence, &original),
+            Ok(StrikeFileOutcome::Duplicate { account }),
+            "an appeal is deduplicated by (evidence digest, Appeal)"
+        );
+
+        let rows = ledger.rows(account);
+        assert_eq!(rows.len(), 2, "the reversal was credited exactly once");
+        assert_eq!(
+            rows.iter()
+                .map(|row| i64::from(row.weight_milli))
+                .sum::<i64>(),
+            0,
+            "the conviction is exactly cancelled, never over-credited"
+        );
+    }
+
+    #[test]
+    fn an_unknown_offence_instant_is_refused_rather_than_landed_on_the_new_owner() {
+        // The default adjudication path has no authenticated wall clock. A
+        // node that changed hands could have earned the strike under either
+        // owner, so it is filed against neither.
+        let report = report();
+        let original_owner = AccountId(78);
+        let new_owner = AccountId(79);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind_at(report.subject, original_owner, 100);
+        ledger.unbind_at(report.subject, original_owner, 200);
+        ledger.bind_at(report.subject, new_owner, 300);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+
+        executor.file_report_verdict_at(
+            &report,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+            OffenceTime::Unknown,
+        );
+
+        assert!(
+            ledger.rows(new_owner).is_empty(),
+            "the current holder does not inherit an unattributable conviction"
+        );
+        assert!(ledger.rows(original_owner).is_empty());
+        assert_eq!(executor.strike_metrics().suppressed_unresolved, 1);
+    }
+
+    #[test]
+    fn an_unknown_offence_instant_still_files_against_a_sole_owner() {
+        // Failing closed on ambiguity must not silently disable C5 for the
+        // ordinary case of a node that never changed hands.
+        let report = report();
+        let account = AccountId(80);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind_at(report.subject, account, 100);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+
+        executor.file_report_verdict_at(
+            &report,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+            OffenceTime::Unknown,
+        );
+
+        assert_eq!(ledger.rows(account).len(), 1);
+    }
+
+    #[test]
+    fn expired_rows_are_hard_deleted_by_the_retention_sweep() {
+        let report = report();
+        let account = AccountId(75);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind(report.subject, account);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+        executor.file_report_verdict(
+            &report,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+        );
+        let expires_at_ms = ledger.rows(account)[0].expires_at_ms;
+
+        assert_eq!(ledger.sweep_expired(expires_at_ms - 1), 0);
+        assert_eq!(ledger.rows(account).len(), 1, "unexpired row remains");
+        assert_eq!(ledger.sweep_expired(expires_at_ms), 1);
+        assert!(ledger.rows(account).is_empty(), "expired row was deleted");
+    }
+
+    #[test]
+    fn non_cooperation_uses_d33s_reachable_low_weight_tier() {
+        let report = report();
+        let account = AccountId(76);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind(report.subject, account);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+
+        executor
+            .file_non_cooperation(
+                report.subject,
+                OffenceTime::Unknown,
+                evidence_ref(&report),
+                report.bundle.ruleset,
+            )
+            .expect("proved log gap files a strike");
+
+        let rows = ledger.rows(account);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, StrikeKind::NonCooperation);
+        assert_eq!(rows[0].weight_milli, NON_COOPERATION_WEIGHT_MILLI);
+        assert_ne!(rows[0].weight_milli, MAJOR_STRIKE_WEIGHT_MILLI);
+    }
+
+    #[test]
     fn unresolved_subject_binding_suppresses_instead_of_redirecting_to_reporter() {
         let report = report();
         let reporter_account = AccountId(82);
@@ -1436,6 +2061,7 @@ mod tests {
             fn file(
                 &self,
                 _target: NodeId,
+                _offence: OffenceTime,
                 _row: &StrikeRow,
                 _episode: Option<&StrikeEpisodeRef>,
             ) -> Result<StrikeFileOutcome, StrikeLedgerError> {

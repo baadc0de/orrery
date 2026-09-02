@@ -2460,6 +2460,49 @@ pub fn decode_restore_hold_key(key: &[u8]) -> Option<(NodeId, PersistId, Restore
     Some((source_node, entity, product))
 }
 
+/// First key in the complete executor-owned D33 `ya` strike ledger.
+///
+/// Retention maintenance walks this span in account order. It is deliberately
+/// separate from the hot identity read, which stays on one account's bounded
+/// contiguous subrange.
+#[must_use]
+pub fn strike_range_start() -> Vec<u8> {
+    vec![b'y', b'a']
+}
+
+/// Exclusive end of the complete executor-owned D33 `ya` strike ledger.
+#[must_use]
+pub fn strike_range_end() -> Vec<u8> {
+    vec![b'y', b'b']
+}
+
+/// First key in the `yb` episode-dedup family.
+#[must_use]
+pub fn strike_episode_range_start() -> Vec<u8> {
+    vec![b'y', b'b']
+}
+
+/// Exclusive end of the `yb` episode-dedup family.
+#[must_use]
+pub fn strike_episode_range_end() -> Vec<u8> {
+    vec![b'y', b'c']
+}
+
+/// First key in the whole `yc` restore-hold family, across every source.
+///
+/// Retention maintenance needs the family span; the hot restore check stays
+/// on one source-and-entity subrange via [`restore_hold_range_start`].
+#[must_use]
+pub fn restore_hold_family_range_start() -> Vec<u8> {
+    vec![b'y', RESTORE_HOLD_DISCRIMINATOR]
+}
+
+/// Exclusive end of the whole `yc` restore-hold family.
+#[must_use]
+pub fn restore_hold_family_range_end() -> Vec<u8> {
+    vec![b'y', RESTORE_HOLD_DISCRIMINATOR + 1]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
