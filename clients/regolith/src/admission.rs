@@ -520,8 +520,12 @@ fn poll_worker(
                 roster_url: campaign_id
                     .map(|id| format!("{}/v1/campaigns/{}/roster", settings.origin, id)),
             };
-            *session =
-                ActiveSession::Campaign(Box::new(CampaignRuntime::launch(config, crate::SEED)));
+            let mut runtime = CampaignRuntime::launch(config, crate::SEED);
+            // See the plugin-build site: the finished row is written by the
+            // call that mints it, so this session needs its path up front
+            // (#947).
+            runtime.set_record_path(crate::campaign_record_path(&settings.telemetry_path));
+            *session = ActiveSession::Campaign(Box::new(runtime));
             commands.insert_resource(UploadManager {
                 origin: settings.origin.clone(),
                 state_path: upload_state_path(&settings.telemetry_path),

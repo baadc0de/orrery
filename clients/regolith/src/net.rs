@@ -662,7 +662,14 @@ impl CampaignLink {
             lane: Lane::Meta,
             payload: Bytes::from([0xFFu8].to_vec()),
         };
-        let _ = self.try_uplink(goodbye);
+        if let Err(error) = self.try_uplink(goodbye) {
+            // Discarded silently, this left the host recording a timeout for
+            // a session the player ended cleanly (#947).
+            bevy::log::warn!(
+                "regolith: could not queue the goodbye marker ({error}); \
+                 the host will record this session as a timeout, not a clean end"
+            );
+        }
         // The writer pump flushes each frame as it writes; this mirrors the
         // runner's grace period before dropping its runtime.
         std::thread::sleep(Duration::from_millis(200));
@@ -809,10 +816,16 @@ where
     spawn_reader(
         connection.clone(),
         Arc::clone(&closed_by_host),
+        Arc::clone(&connected),
         downlink_recv,
         inbound_tx,
     );
-    spawn_writer(connection.clone(), uplink_send, outbound_rx);
+    spawn_writer(
+        connection.clone(),
+        Arc::clone(&connected),
+        uplink_send,
+        outbound_rx,
+    );
     spawn_connection_watcher(connection.clone(), Arc::clone(&connected));
 
     // A freshly spawned task has not necessarily reached its first await; let
@@ -922,6 +935,7 @@ async fn write_stream_frame(
 fn spawn_reader(
     connection: iroh::endpoint::Connection,
     closed_by_host: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     mut recv: iroh::endpoint::RecvStream,
     inbound_tx: tokio::sync::mpsc::Sender<Frame>,
 ) {
@@ -930,7 +944,21 @@ fn spawn_reader(
         // `Connection` handle drops, the transport closes and every later
         // write succeeds into the void while reads starve (#385).
         let _keep_alive = connection;
-        while let Ok(Some(frame)) = read_stream_frame(&mut recv).await {
+        loop {
+            let frame = match read_stream_frame(&mut recv).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    bevy::log::info!("regolith downlink stream ended");
+                    break;
+                }
+                Err(error) => {
+                    // Silent `break` here had the same consequence as the
+                    // writer's: a dead downlink that still read as connected
+                    // (#947).
+                    bevy::log::error!("regolith downlink reader stopped: {error}");
+                    break;
+                }
+            };
             // The runner's clean end-of-run marker, seen from the far side:
             // one meta frame whose whole payload is a single 0xFF byte.
             if frame.lane == Lane::Meta && frame.payload.as_ref() == [0xFFu8] {
@@ -942,21 +970,39 @@ fn spawn_reader(
             // pauses the socket read; it never silently discards.
             let _ = inbound_tx.send(frame).await;
         }
+        connected.store(false, Ordering::Relaxed);
     });
 }
 
 fn spawn_writer(
     connection: iroh::endpoint::Connection,
+    connected: Arc<AtomicBool>,
     mut shared_send: iroh::endpoint::SendStream,
     mut outbound_rx: tokio::sync::mpsc::Receiver<Frame>,
 ) {
     tokio::spawn(async move {
         let _keep_alive = connection;
         while let Some(frame) = outbound_rx.recv().await {
-            if write_stream_frame(&mut shared_send, &frame).await.is_err() {
-                break;
+            if let Err(error) = write_stream_frame(&mut shared_send, &frame).await {
+                // This used to `break` with no log and without clearing
+                // `connected`, which only the full-connection-close watcher
+                // ever cleared. A stream-level failure — peer reset, host
+                // restart — therefore left `is_connected()` true: the session
+                // never reached `JoinState::Closed`, `observe_tick` kept
+                // banking, and every later frame vanished into an undrained
+                // channel. The client then signed a clean-looking record for
+                // minutes the host never received (#947).
+                bevy::log::error!(
+                    "regolith uplink writer stopped: {error}; \
+                     this session is no longer reaching the host"
+                );
+                connected.store(false, Ordering::Relaxed);
+                return;
             }
         }
+        // The queue closed: the runtime that owned the sender is gone, so
+        // there is no uplink left either way.
+        connected.store(false, Ordering::Relaxed);
     });
 }
 

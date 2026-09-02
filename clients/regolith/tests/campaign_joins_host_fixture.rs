@@ -208,6 +208,14 @@ enum Mode {
     /// different entity in it. Everything else about the join is correct, so
     /// only the manifest check can stop the session.
     MismatchedManifest,
+    /// Join normally, then send STOP_SENDING on the client's uplink stream
+    /// while leaving the QUIC connection wide open.
+    ///
+    /// This is #947 defect 3 in its exact shape, and the shape matters: a
+    /// full connection close is already noticed by `spawn_connection_watcher`,
+    /// so only a *stream-level* failure reproduces the defect. A peer reset or
+    /// a host restart produces this.
+    StopUplink,
 }
 
 /// The fixture's pump: accept → verify identity → handshake → data path.
@@ -344,6 +352,16 @@ async fn pump(
     };
     write_frame(&mut downlink_send, &announce).await?;
     let mut uplink_recv = connection.accept_uni().await.map_err(|e| e.to_string())?;
+
+    if matches!(mode, Mode::StopUplink) {
+        // Kill the stream, keep the connection. The client's writer will fail
+        // its next write; nothing will close the connection underneath it.
+        let _ = uplink_recv.stop(0u32.into());
+        // Hold the connection open so the watcher stays silent and the client
+        // is left with exactly the evidence the defect gave it.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        return Ok(());
+    }
 
     let (feed_tx, mut feed_rx) = tokio::sync::mpsc::unbounded_channel::<FeedItem>();
     let writer_truth = Arc::clone(&truth);
@@ -1216,6 +1234,47 @@ fn a_client_joins_measures_and_applies_replicated_state() {
 
     drive_until_joined(&mut runtime, &mut sink, 150);
 
+    // #947: idling must be measured on the path that banks.
+    //
+    // `drive_until_joined` flew with `thrust: true`, so the accumulator is
+    // active here. The campaign tick used to feed `observe_tick` the number of
+    // authored orders, and `pilot::honest_orders` pushes Thrust/Lock/Fire on
+    // every tick regardless of input — the skin's idle gate only zeroes the
+    // acceleration and yaw inside `Thrust`. That made every tick look active
+    // forever: `idle_ticks` stayed 0, `banked_ticks` always equalled
+    // `connected_ticks`, and `afk_capped` could not fire. A tester who idled
+    // for twenty minutes banked all twenty and the row asserted
+    // `afk_seconds: 0`.
+    //
+    // This drives the real `advance` against the live fixture with the
+    // controls a resting player produces, which is the exact production input
+    // the defect mismeasured.
+    assert_eq!(
+        runtime.accumulator().progress().idle_minutes,
+        0.0,
+        "flying with thrust held is not idling"
+    );
+    for _ in 0..120 {
+        let _ = runtime.advance(Controls::default(), &mut sink);
+    }
+    assert!(
+        runtime.accumulator().progress().idle_minutes > 0.0,
+        "120 ticks with no control held must accrue idle time, not bank as play"
+    );
+    // And input resumes accrual, so idling is a measurement and not a latch.
+    let _ = runtime.advance(
+        Controls {
+            thrust: true,
+            ..Controls::default()
+        },
+        &mut sink,
+    );
+    assert_eq!(
+        runtime.accumulator().progress().idle_minutes,
+        0.0,
+        "a keypress ends the idle run"
+    );
+
     // Let every outstanding datagram reach its settled decision.
     let deadline = Instant::now() + Duration::from_secs(10);
     while runtime.uplink_acks().0 < runtime.uplink_sent() && Instant::now() < deadline {
@@ -1332,6 +1391,57 @@ fn a_client_joins_measures_and_applies_replicated_state() {
     );
 
     drop(sink);
+}
+
+/// #947 defect 3: a client must not bank time the host never received.
+///
+/// The uplink writer pump broke out of its loop on the first write error,
+/// logged nothing, and never cleared `connected`. That flag was only ever
+/// cleared by the connection watcher, which fires on a *full* connection
+/// close — so a stream-level failure (peer reset, host restart) left
+/// `is_connected()` true. The session never reached `JoinState::Closed`,
+/// `observe_tick` kept banking, and up to 4096 frames vanished into an
+/// undrained channel. The client then signed a clean-looking record for
+/// minutes the host never saw.
+///
+/// The fixture here holds the QUIC connection open on purpose: if it simply
+/// hung up, the watcher would clear the flag and this test would pass without
+/// the fix.
+#[test]
+fn a_dead_uplink_ends_the_session_instead_of_banking_into_the_void() {
+    let fixture = HostFixture::spawn(Mode::StopUplink);
+    let mut sink = sink_for("regolith-campaign-stop-uplink");
+    let mut runtime = CampaignRuntime::launch(fixture.config("stop-uplink"), crate_seed());
+
+    drive_until_joined(&mut runtime, &mut sink, 1);
+
+    let flying = Controls {
+        thrust: true,
+        ..Controls::default()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while matches!(runtime.state(), JoinState::Joined) && Instant::now() < deadline {
+        let _ = runtime.advance(flying, &mut sink);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        !matches!(runtime.state(), JoinState::Joined),
+        "a link that cannot send is not a recorded session, but the client is \
+         still Joined: {:?}",
+        runtime.state()
+    );
+
+    // And having left Joined, it banks nothing further: the minutes it keeps
+    // are the ones it actually delivered.
+    let banked = runtime.accumulator().progress().banked_minutes;
+    for _ in 0..120 {
+        let _ = runtime.advance(flying, &mut sink);
+    }
+    assert_eq!(
+        runtime.accumulator().progress().banked_minutes,
+        banked,
+        "a closed session must not keep accruing bankable time"
+    );
 }
 
 #[test]
