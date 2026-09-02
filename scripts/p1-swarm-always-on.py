@@ -162,6 +162,7 @@ class Supervisor:
 
     def run(self) -> int:
         c = campaign(self.args.control, self.args.campaign)
+        control_mtime = self.args.control.stat().st_mtime_ns
         initial_delay = lobby_seconds(c)
         self.args.state.mkdir(parents=True, exist_ok=True)
         signal.signal(signal.SIGTERM, self.stop)
@@ -187,6 +188,30 @@ class Supervisor:
             self.child = subprocess.Popen(self.command(attempt, c))
             running = False
             while self.child.poll() is None and not self.stopping:
+                try:
+                    changed_mtime = self.args.control.stat().st_mtime_ns
+                except OSError:
+                    self.child.terminate()
+                    self.child.wait()
+                    self.child = None
+                    raise
+                if changed_mtime != control_mtime:
+                    try:
+                        new_campaign = campaign(self.args.control, self.args.campaign)
+                    except (OSError, ValueError):
+                        # Never keep serving with the old pin after an operator
+                        # edit that cannot be read or validated.
+                        self.child.terminate()
+                        self.child.wait()
+                        self.child = None
+                        raise
+                    c = new_campaign
+                    control_mtime = changed_mtime
+                    initial_delay = lobby_seconds(c)
+                    # The pin is a child argument, so a new generation is the
+                    # atomic boundary at which the changed campaign takes effect.
+                    self.child.terminate()
+                    continue
                 now = int(time.time())
                 host_running = self.host_running(attempt.name)
                 if host_running is True and not running:
@@ -345,6 +370,39 @@ class Tests(unittest.TestCase):
             record = json.loads((state / "attempt.json").read_text())
             self.assertEqual(record["attempt_id"], attempts[-1].name)
             self.assertEqual(record["expires_at"] - record["started"], LOBBY_SECONDS + 900)
+
+    def test_changed_campaign_pin_restarts_running_child_with_new_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            control, issuer, state = root / "campaigns.conf", root / "issuer.pub", root / "state"
+            template = ("[test]\nhost = 203.0.113.7\nexternal_port = 41641\npeers = 8\n"
+                        "seconds = 900\nloss_pct = 3\njitter_ms = 100\nalways_on = yes\n"
+                        "client_rev = {rev}\n")
+            control.write_text(template.format(rev="old-pin"))
+            issuer.write_text("41:" + "a" * 64)
+            observations = root / "pins"
+            wrapper = root / "wrapper.py"
+            wrapper.write_text(
+                "import pathlib, sys, time\n"
+                "pins, rev, control = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])\n"
+                "with pins.open('a') as output: output.write(rev)\n"
+                "if not pins.read_text().count('new-pin'):\n"
+                "    control.write_text(control.read_text().replace('old-pin', 'new-pin'))\n"
+                "time.sleep(2)\n"
+            )
+            args = argparse.Namespace(control=control, campaign="test", swarm=str(wrapper),
+                                      issuer_key=issuer, state=state,
+                                      reservation_journal=root / "slots.json",
+                                      restart_delay=0, max_runs=2)
+            original_command = Supervisor.command
+            Supervisor.command = lambda self, attempt, c: [
+                sys.executable, str(wrapper), str(observations), c["client_rev"], str(control),
+            ]
+            try:
+                self.assertEqual(Supervisor(args).run(), 0)
+            finally:
+                Supervisor.command = original_command
+            self.assertEqual(observations.read_text(), "old-pinnew-pin")
 
     def test_idle_child_renews_attempt_lease_without_restarting(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
