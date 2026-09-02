@@ -12,6 +12,18 @@ license = "MIT OR Apache-2.0"
 # Durable witness-seed epochs / island generation counters via FoundationDB.
 # Not implemented in P1; the in-memory state is reconstructible from presence.
 fdb-state = ["dep:orrery_persistd", "orrery_persistd/fdb"]
+# D33 clause (e)'s standing-invalidation feed, read from identity's durable
+# `dc` family. Off by default: it pulls `orrery_identity` (and through it
+# `orrery_persistd` and the FoundationDB C client) into a service whose own
+# state is in-memory, and a coordinator with no identity store to read is the
+# shipped default. Enabling it only *offers* `--identity-cluster-file`; C5
+# still starts at D32's `off` posture and acts on nothing until an operator
+# raises `--strikes`.
+#
+# Independent of `fdb-state`, which reads D32's `ramp/` posture rows through
+# persistd's keyspace. Both may be on; cargo unifies the FoundationDB features
+# they each imply.
+standing-feed = ["dep:orrery_identity", "orrery_identity/fdb"]
 
 [[bin]]
 name = "orrery-coordinator"
@@ -24,6 +36,12 @@ orrery_protocol = { path = "../orrery_protocol" }
 # exactly-one-backend crate invariant; the coordinator uses no journal API and
 # does not pull the chain transport.
 orrery_persistd = { path = "../orrery_persistd", default-features = false, features = ["journal-raw"], optional = true }
+# Optional, behind `standing-feed`: the publisher half of D33 clause (e).
+# Identity owns the `d` family, so the producer lives there and this crate
+# only adapts it to the local `StandingInvalidationFeed` trait. The edge runs
+# coordinator → identity → persistd and never back, which is why the adapter
+# is here rather than the trait impl being over there.
+orrery_identity = { path = "../orrery_identity", optional = true }
 # The standing-invalidation feed (D33 clause (e)) is an async trait, the same
 # shape persistd's gateway-side seam uses.
 async-trait = "0.1"

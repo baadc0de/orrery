@@ -55,6 +55,19 @@ pub struct CooldownEntry {
     pub entered_at_ms: u64,
 }
 
+/// One account's cooldown entry, as returned by a sweep of the whole family.
+///
+/// A named pair rather than a bare tuple: this crosses a public trait
+/// boundary and feeds D33 clause (e)'s invalidation publisher, where
+/// "which of these two `u64`s is the account" must not be positional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CooldownRecord {
+    /// The account holding the entry.
+    pub account: AccountId,
+    /// That account's current cooldown interval.
+    pub entry: CooldownEntry,
+}
+
 /// A typed failure from the identity store or the service above it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -290,6 +303,21 @@ pub trait AccountStore: Send + Sync {
         account: AccountId,
         expected: CooldownEntry,
     ) -> Result<bool, IdentityError>;
+
+    /// Every account currently holding a cooldown entry.
+    ///
+    /// This is the read D33 clause (e)'s invalidation publisher is built on:
+    /// the `dc` family is exactly the set of accounts identity has refused
+    /// and not yet released, and each row's `entered_at_ms` is the refusal
+    /// instant an [`orrery_protocol::AccountInvalidation`] needs. See
+    /// [`crate::invalidation`] for what that mapping does and does not claim.
+    ///
+    /// Unbounded by design at this seam — the family is bounded by the number
+    /// of simultaneously-cooled accounts, which
+    /// `MAX_STANDING_INVALIDATION_ENTRIES` already caps consumer-side at
+    /// 65 536. A deployment that outgrows one range read has outgrown the
+    /// single-poll feed contract, not just this method.
+    async fn cooldown_entries(&self) -> Result<Vec<CooldownRecord>, IdentityError>;
 }
 
 /// Forward through a shared handle, so one store can back several services.
@@ -366,5 +394,9 @@ impl<T: AccountStore + ?Sized> AccountStore for std::sync::Arc<T> {
         account: AccountId,
     ) -> Result<Option<CooldownEntry>, IdentityError> {
         (**self).cooldown_entry(account).await
+    }
+
+    async fn cooldown_entries(&self) -> Result<Vec<CooldownRecord>, IdentityError> {
+        (**self).cooldown_entries().await
     }
 }

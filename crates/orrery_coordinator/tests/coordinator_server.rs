@@ -1278,3 +1278,61 @@ async fn in_shadow_the_invalidated_account_is_still_admitted_and_counted() {
     assert_eq!(stats.connected_peers, 1);
     server.shutdown().await;
 }
+
+/// The termination half of the same requirement, and the one the sibling
+/// above cannot reach: it publishes before connecting, so it only ever
+/// exercises the `Hello` path.
+///
+/// This one connects first and publishes into an *open* session, which is the
+/// only way to reach the invalidation-watch arm. That arm consulted the
+/// watermark and broke unconditionally, with no posture check at all — so a
+/// coordinator at `--strikes shadow` really cut live sessions while its
+/// `Hello` path only pretended to refuse. `shadow_sessions_would_terminate`
+/// was declared, exported on the stats snapshot and incremented by nothing.
+///
+/// Mutation check: reverting the arm to `if invalidates(..) { .. break }`
+/// fails this on `connected_peers` (1 → 0) and on the counter (1 → 0).
+#[tokio::test]
+async fn in_shadow_an_open_session_is_kept_and_only_counted() {
+    let issuer = secret(210);
+    let interest = secret(211);
+    let feed = MutableStandingFeed::serving(vec![]);
+    let (server, _clock, _identity_up) =
+        coordinator_with_standing(&issuer, &interest, Arc::clone(&feed), StrikesMode::Shadow).await;
+
+    let peer = CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(1), 60_000),
+        PATIENCE,
+    )
+    .await
+    .expect("peer admitted before any invalidation exists");
+    peer.report_presence(vec![cell(0)]).expect("presence");
+    peer.next_grant(PATIENCE).await.expect("grant");
+
+    // Same watermark the live test uses, so the two differ only in posture.
+    feed.publish(invalidated(AccountId::new(7), NOW_MS)).await;
+    let polled = feed.polls.load(Ordering::SeqCst);
+    feed.wait_for_poll(polled + 1).await;
+
+    let stats = server.stats().await;
+    assert_eq!(
+        stats.shadow_sessions_would_terminate, 1,
+        "shadow must record the termination it declined to perform"
+    );
+    assert_eq!(
+        stats.standing_sessions_terminated, 0,
+        "shadow must not terminate"
+    );
+    assert_eq!(
+        stats.connected_peers, 1,
+        "the session stays connected: D32 clause (b)'s shadow arm observes and does not act"
+    );
+
+    // And it is still a working session, not a husk kept only in the counter.
+    peer.report_presence(vec![cell(0)])
+        .expect("the session still functions");
+    assert!(peer.next_grant(PATIENCE).await.is_ok());
+    server.shutdown().await;
+}
