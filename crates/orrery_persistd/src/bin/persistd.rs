@@ -337,6 +337,21 @@ struct Cli {
     )]
     archive_prefix: String,
 
+    /// Where the daily full conservation sweep spills its ownership external
+    /// sort (#912).
+    ///
+    /// The sweep writes 42 bytes per ownership transition in the captured
+    /// archive window and holds them until the pass ends: about 1.79 GiB for
+    /// one day at the Shape-C spike rate, and thirty times that over a
+    /// thirty-day retention. Unset, it spills under the OS temporary
+    /// directory (`TMPDIR`, else `/tmp`), which on a systemd host is
+    /// RAM-backed tmpfs — the reported 224.875 KiB re-sort bound is the heap
+    /// alone and does not include this. Point it at a disk with room for
+    /// twice the report's `ownership_resort.spill_bytes`; each pass creates
+    /// and removes a private subdirectory beneath it.
+    #[arg(long, value_name = "DIR", env = "ORRERY_AUDIT_WORK_DIR")]
+    audit_work_dir: Option<std::path::PathBuf>,
+
     /// Archive the global FDB `ledger/receipt/` stream into receipt Parquet
     /// objects under `--archive-dir` (#832).
     ///
@@ -1689,12 +1704,20 @@ async fn main() -> anyhow::Result<()> {
 
     let full_conservation_sweeper =
         if cli.receipt_archive && cli.full_conservation_sweep_interval_ms != 0 {
-            let sweeper = orrery_persistd::audit::conservation::ReceiptArchiveSweeper::open(
+            let mut sweeper = orrery_persistd::audit::conservation::ReceiptArchiveSweeper::open(
                 cli.archive_dir.as_ref().expect("validated archive dir"),
                 cli.archive_prefix.clone(),
             )?;
+            if let Some(work_dir) = cli.audit_work_dir.clone() {
+                sweeper = sweeper.with_work_dir(work_dir);
+            }
             tracing::info!(
                 interval_ms = cli.full_conservation_sweep_interval_ms,
+                work_dir = %sweeper
+                    .work_dir()
+                    .map_or_else(std::env::temp_dir, std::path::Path::to_path_buf)
+                    .display(),
+                work_dir_configured = sweeper.work_dir().is_some(),
                 "daily full conservation sweeper started"
             );
             Some(spawn_full_conservation_sweeper(
@@ -2796,7 +2819,7 @@ fn spawn_full_conservation_sweeper(
                 report.finished_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(started_at_ms, |since_epoch| since_epoch.as_millis() as u64);
-                Ok::<_, orrery_persistd::audit::conservation::FullSweepError>(report)
+                Ok::<_, orrery_persistd::audit::conservation::FullSweepFailure>(report)
             })
             .await;
             match result {
@@ -2809,15 +2832,22 @@ fn spawn_full_conservation_sweeper(
                     balance_deltas = report.population.balance_deltas,
                     ownership_transitions = report.population.ownership_transitions,
                     ownership_resort_bytes_bound = report.ownership_resort.memory_bytes_bound,
+                    ownership_spill_bytes = report.ownership_resort.spill_bytes,
                     findings = report.findings.len(),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     first_receipt_key = %report.first_receipt_key,
                     last_receipt_key = %report.last_receipt_key,
                     "full conservation sweep pass complete"
                 ),
-                Ok(Err(error)) => tracing::warn!(
+                // A pass can fail after its whole-window verdict was already
+                // emitted. Count what stands, so a full spill disk never reads
+                // as "nothing found" (#912).
+                Ok(Err(failure)) => tracing::warn!(
                     target: "orrery_audit",
-                    %error,
+                    error = %failure.error,
+                    findings_emitted = failure.emitted_findings.len(),
+                    conservation_breaks_emitted = failure.conservation_breaks(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
                     "full conservation sweep pass failed"
                 ),
                 Err(error) => tracing::warn!(
@@ -3558,6 +3588,7 @@ mod tests {
             archive_retention: false,
             archive_dir: None,
             archive_prefix: String::new(),
+            audit_work_dir: None,
             receipt_archive: false,
             receipt_archive_page_rows: orrery_persistd::archive::DEFAULT_RECEIPT_ARCHIVE_PAGE_ROWS,
             full_conservation_sweep_interval_ms:
