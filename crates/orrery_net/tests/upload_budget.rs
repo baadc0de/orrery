@@ -25,8 +25,9 @@ use orrery_net::plugin::Peer;
 use orrery_net::{SendPacket, StreamMode};
 use orrery_protocol::{
     channels::{
-        encode_delta_patch, encode_hit, encode_replication, encode_replication_delta,
-        ReplicationDelta, TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_DELTA,
+        encode_delivered_input, encode_delta_patch, encode_hit, encode_replication,
+        encode_replication_delta, ReplicationDelta, TAG_DELIVERED_INPUT, TAG_HIT, TAG_REPLICATION,
+        TAG_REPLICATION_DELTA,
     },
     HitClaim, HitMsg, HitSurface, InterpBasis, LatticePoint, NodeId, PersistId, QuantizedDir,
     QuantizedRay, Tick, WeaponRef,
@@ -139,7 +140,6 @@ fn everything_flows_while_there_is_budget() {
 
     assert_eq!(queued_for_io(&mut app), 10);
     assert_eq!(app.world().resource::<UploadMeter>().shed, 0);
-    assert!(!app.world().resource::<UploadMeter>().oversubscribed);
 }
 
 #[test]
@@ -159,7 +159,6 @@ fn state_is_shed_once_the_window_is_spent() {
         "sent {sent} packets against an allowance of {cap}"
     );
     assert_eq!(sent + meter.shed as usize, cap + 200, "nothing vanishes");
-    assert!(meter.oversubscribed);
     assert!(meter.shed_bytes >= meter.shed * WIRE);
 }
 
@@ -303,20 +302,52 @@ fn hit_claims_survive_upload_pressure_ahead_of_replication() {
 }
 
 #[test]
-fn an_overrun_is_reported_rather_than_only_absorbed() {
-    // docs/03-replication.md §9.3: sustained oversubscription across an
-    // island's links is a promotion signal alongside raw population, so it has
-    // to be visible and not merely handled.
+fn delivered_inputs_survive_upload_pressure_on_a_datagram() {
+    // `Game::deliver` currently uses a reliable stream, but its delivery
+    // guarantee belongs to the tagged class. This deliberately sends the real
+    // delivered-input frame as a datagram: changing transports cannot turn a
+    // damage, pickup, or door-open input into replication that the meter sheds.
     let peer = secret(1).public();
     let mut app = app(&[peer]);
-    queue(&mut app, peer, Channel::State, allowance() + 50);
+    queue(&mut app, peer, Channel::State, allowance() + 200);
+    // Fill the fractional remainder that `allowance()` leaves after 500-byte
+    // packets, so a misclassified input has no accidental room to slip through.
+    app.world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .write(SendPacket::state(peer, bytes::Bytes::from(vec![0u8; 397])));
+    app.world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .write(SendPacket::state(
+            peer,
+            bytes::Bytes::from(encode_delivered_input(
+                PersistId::new(1),
+                PersistId::new(2),
+                b"damage",
+            )),
+        ));
     app.update();
-    assert!(app.world().resource::<UploadMeter>().oversubscribed);
 
-    // A quiet frame clears the flag — the signal is "right now", and the
-    // coordinator's promotion decision is over sustained overruns, not one.
-    app.update();
-    assert!(!app.world().resource::<UploadMeter>().oversubscribed);
+    let delivered = app
+        .world_mut()
+        .query::<&aeronet_io::Session>()
+        .iter(app.world())
+        .next()
+        .expect("test session")
+        .send
+        .iter()
+        .any(|packet| {
+            let (_, logical) = untag(packet).expect("outer transport tag");
+            let (channel, body) = untag(logical).expect("inner protocol tag");
+            channel == Channel::Control && body.first() == Some(&TAG_DELIVERED_INPUT)
+        });
+    assert!(
+        delivered,
+        "the delivered input must be admitted before replication is shed"
+    );
+    assert!(
+        app.world().resource::<UploadMeter>().shed > 0,
+        "the replication flood must actually be shed"
+    );
 }
 
 #[test]

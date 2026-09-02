@@ -39,8 +39,11 @@ use core::time::Duration;
 
 use bevy_ecs::prelude::*;
 
-use crate::channels::{untag, Channel, TAG_HIT, TAG_WITNESS, TAG_WITNESS_COMPRESSED};
-use orrery_protocol::{channels::TAG_REPLICATION_DELTA, NodeId};
+use crate::channels::{
+    untag, Channel, TAG_DELIVERED_INPUT, TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED,
+    TAG_REPLICATION_DELTA, TAG_WITNESS, TAG_WITNESS_COMPRESSED,
+};
+use orrery_protocol::NodeId;
 
 /// Per-datagram wire overhead: IP+UDP 28 B, QUIC short header + AEAD ≈ 32 B.
 ///
@@ -304,12 +307,6 @@ pub struct UploadMeter {
     /// oversubscribed peer: the lanes that cannot be shed are still being paid
     /// for, so the overrun is real rather than an artefact of the backstop.
     pub control_over_budget: u64,
-    /// Whether the last send pass was over budget.
-    ///
-    /// docs/03-replication.md §9.3: sustained oversubscription across an
-    /// island's links is a promotion signal alongside raw population, so this is
-    /// reported rather than merely acted on.
-    pub oversubscribed: bool,
     /// What each lane spent, cumulatively over the session.
     ///
     /// Cumulative rather than windowed because the question it answers is a
@@ -497,28 +494,102 @@ pub enum Lane {
     Control,
 }
 
-/// Which lane a packet belongs to, from its channel and its wire bytes.
+/// A known wire family, read from the sub-tag the receiver routes on.
 ///
-/// Anything on `Channel::State` that is not positively sub-tagged as witness
-/// or hit traffic counts as replication. That default is deliberate: an
-/// untagged or hand-rolled state payload is charged to the lane the budget is
-/// *for*, so a caller can never make its traffic cheaper by leaving the tag
-/// off.
+/// Keep this enum exhaustive. A new family must add a variant here, and the
+/// exhaustive match in [`lane_for_family`] then makes the compiler require its
+/// delivery classification. Opaque bytes are deliberately not a family: they
+/// remain subject to the conservative transport fallback below until their
+/// owner gives them a protocol sub-tag and a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireFamily {
+    Replication,
+    ReplicationCompressed,
+    ReplicationDelta,
+    Witness,
+    WitnessCompressed,
+    DeliveredInput,
+    Hit,
+}
+
+/// Bytes that do not declare one of [`WireFamily`]'s protocol sub-tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpaqueWire {
+    State,
+    Control,
+}
+
+/// The wire classification from which a budget lane is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireClass {
+    Family(WireFamily),
+    Opaque(OpaqueWire),
+}
+
+/// Read the inner, protocol-owned channel tag and sub-tag from a send payload.
+///
+/// `SendPacket` adds its transport tag later, so its payload is the complete
+/// logical frame produced by the protocol encoder. Deliberately consult that
+/// inner frame first: a delivered input remains a delivered input if a future
+/// transport change moves it from a stream to a datagram.
+fn wire_class(transport: Channel, payload: &[u8]) -> WireClass {
+    let Some((channel, body)) = untag(payload) else {
+        return WireClass::Opaque(match transport {
+            Channel::State => OpaqueWire::State,
+            Channel::Control => OpaqueWire::Control,
+        });
+    };
+
+    match (channel, body.first().copied()) {
+        (Channel::State, Some(TAG_REPLICATION)) => WireClass::Family(WireFamily::Replication),
+        (Channel::State, Some(TAG_REPLICATION_COMPRESSED)) => {
+            WireClass::Family(WireFamily::ReplicationCompressed)
+        }
+        (Channel::State, Some(TAG_REPLICATION_DELTA)) => {
+            WireClass::Family(WireFamily::ReplicationDelta)
+        }
+        (Channel::State, Some(TAG_WITNESS)) => WireClass::Family(WireFamily::Witness),
+        (Channel::State, Some(TAG_WITNESS_COMPRESSED)) => {
+            WireClass::Family(WireFamily::WitnessCompressed)
+        }
+        (Channel::Control, Some(TAG_DELIVERED_INPUT)) => {
+            WireClass::Family(WireFamily::DeliveredInput)
+        }
+        (Channel::State, Some(TAG_HIT)) => WireClass::Family(WireFamily::Hit),
+        (Channel::State, _) => WireClass::Opaque(OpaqueWire::State),
+        (Channel::Control, _) => WireClass::Opaque(OpaqueWire::Control),
+    }
+}
+
+/// The delivery classification for a declared [`WireFamily`].
+///
+/// There is intentionally no wildcard arm. Adding a protocol family without
+/// deciding its lane fails here at compile time rather than inheriting a lane
+/// from its transport channel.
+const fn lane_for_family(family: WireFamily) -> Lane {
+    match family {
+        WireFamily::Replication
+        | WireFamily::ReplicationCompressed
+        | WireFamily::ReplicationDelta => Lane::Replication,
+        WireFamily::Witness | WireFamily::WitnessCompressed => Lane::Witness,
+        WireFamily::DeliveredInput => Lane::Control,
+        WireFamily::Hit => Lane::Hit,
+    }
+}
+
+/// Which lane a packet belongs to, from its protocol-owned wire class.
+///
+/// A declared family is never classified by its transport channel. Opaque
+/// bytes retain the old conservative fallback: raw state is charged to
+/// replication, and raw stream bytes to control. This preserves budget
+/// coverage for hand-rolled payloads without granting them a named delivery
+/// guarantee.
 #[must_use]
 pub fn lane_of(channel: Channel, payload: &[u8]) -> Lane {
-    if channel.is_stream() {
-        return Lane::Control;
-    }
-    match untag(payload) {
-        Some((Channel::State, body))
-            if body
-                .first()
-                .is_some_and(|tag| *tag == TAG_WITNESS || *tag == TAG_WITNESS_COMPRESSED) =>
-        {
-            Lane::Witness
-        }
-        Some((Channel::State, body)) if body.first() == Some(&TAG_HIT) => Lane::Hit,
-        _ => Lane::Replication,
+    match wire_class(channel, payload) {
+        WireClass::Family(family) => lane_for_family(family),
+        WireClass::Opaque(OpaqueWire::State) => Lane::Replication,
+        WireClass::Opaque(OpaqueWire::Control) => Lane::Control,
     }
 }
 
@@ -737,12 +808,12 @@ mod tests {
             lane_of(Channel::State, &tag(Channel::State, &[TAG_HIT, 0])),
             Lane::Hit
         );
-        // Control is control regardless of what it carries: the witness crate
-        // encodes its repair traffic with `encode_witness` and sends it on the
-        // reliable lane, and that is a control cost, not a lane cost.
+        // A named family retains its classification when its transport changes.
+        // Witness repair traffic is carried on the reliable stream, but it is
+        // still witness traffic for accounting and survival purposes.
         assert_eq!(
             lane_of(Channel::Control, &encode_witness(&[1u8, 2, 3])),
-            Lane::Control
+            Lane::Witness
         );
     }
 
