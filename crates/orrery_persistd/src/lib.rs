@@ -77,10 +77,10 @@ pub use gateway::{
     GatewayBulkSample, GatewayBulkSnapshot, GatewayConfig, GatewayError, GatewayIntentMetrics,
     GatewayIntentSnapshot, GatewayMetrics, GatewayReportMetrics, GatewayReportSnapshot,
     GatewayServer, GatewayServerLatency, GatewayServerLatencySnapshot,
-    NearestInterestSuccessorPolicy, ParkOnLossPolicy, RegistrarSweepClock, ShardDrainHandle,
-    SharedAdjudicator, SharedBulkAckAdmission, SharedSuccessorPolicy, SuccessorCandidate,
-    SuccessorPolicy, SuccessorRequest, AUTHORITY_CORRECTION_CONTROL, GATEWAY_ALPN,
-    MAX_INTEREST_PEERS,
+    NearestInterestSuccessorPolicy, ParkOnLossPolicy, RampMeters, RegistrarSweepClock,
+    ShardDrainHandle, SharedAdjudicator, SharedBulkAckAdmission, SharedSuccessorPolicy,
+    SuccessorCandidate, SuccessorPolicy, SuccessorRequest, AUTHORITY_CORRECTION_CONTROL,
+    GATEWAY_ALPN, MAX_INTEREST_PEERS,
 };
 pub use intent::{
     item_transfer_verdict, IntentError, IntentExecutor, IntentPrecheck, IntentValidator,

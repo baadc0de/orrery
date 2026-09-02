@@ -51,12 +51,38 @@
 //! # Read what the fleet would see, verified as a poller verifies it.
 //! orrery-ramp show --control strikes --operator-key 1@<public-key>
 //! ```
+//!
+//! # The cohort subcommand: D32 clause (e)'s sampling path
+//!
+//! ```sh
+//! # Sample a natural-honest member. The store verifies the durable facts —
+//! # the account row exists, probation is past, and the strike-ledger span is
+//! # empty — in the same transaction that records the decision, and refuses
+//! # with the reason when one fails.
+//! orrery-ramp cohort sample --account 4242 --half natural \
+//!     --reason "owner-sampled 2026-09-02" --fdb-cluster-file /etc/orrery/fdb.cluster
+//!
+//! # Record an armed-honest (operator harness) account. The decision is the
+//! # fact: no cluster-side check can re-derive "this account is harness-driven".
+//! orrery-ramp cohort sample --account 4243 --half armed \
+//!     --reason "p1 swarm operator #3" --fdb-cluster-file /etc/orrery/fdb.cluster
+//!
+//! # Inspect the cohort a promotion review would be handed.
+//! orrery-ramp cohort show --fdb-cluster-file /etc/orrery/fdb.cluster
+//! ```
+//!
+//! Cohort rows carry no signature, unlike the posture rows above, and the
+//! asymmetry is deliberate: a posture row commands enforcement, a cohort row
+//! names a member of a measurement population. A forged membership row cannot
+//! manufacture a clean `fp_count` or promote anything — see
+//! `orrery_persistd::intent::cohort`'s module docs for the full argument.
 
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use orrery_persistd::intent::cohort::{CohortHalf, CohortMemberRow, FdbHonestCohortStore};
 use orrery_persistd::intent::posture::{self, SignedRampPosture};
 use orrery_persistd::intent::{FdbRampPostureStore, PostureSource, RampMode, RampPosture};
 
@@ -131,6 +157,56 @@ enum Command {
         #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
         operator_key: Vec<String>,
     },
+    /// Record, remove and inspect D32 clause (e)'s known-honest cohort.
+    #[command(subcommand)]
+    Cohort(CohortCommand),
+}
+
+/// The cohort subcommand's three verbs.
+#[derive(Subcommand)]
+enum CohortCommand {
+    /// Record one sample decision. For a `natural` member the store verifies
+    /// the durable facts — account row present, probation past, strike-ledger
+    /// span empty — in the transaction that writes the row, and refuses with
+    /// the failing fact when one does not hold.
+    Sample {
+        /// The account being sampled.
+        #[arg(long, value_name = "ID")]
+        account: u64,
+        /// Which of clause (e)'s two halves this decision names.
+        #[arg(long, value_enum)]
+        half: HalfArg,
+        /// Why. Recorded in the row, bounded at 256 bytes.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+    },
+    /// Remove one account's membership row, the explicit correction path.
+    Remove {
+        /// The account to remove.
+        #[arg(long, value_name = "ID")]
+        account: u64,
+    },
+    /// List every recorded decision and the cohort totals a promotion
+    /// reviewer reads.
+    Show,
+}
+
+/// The two halves, on the command line.
+#[derive(Clone, Copy, ValueEnum)]
+enum HalfArg {
+    /// Operator-controlled accounts acting honestly under automation.
+    Armed,
+    /// Real players past probation with a clean archive, sampled in by hand.
+    Natural,
+}
+
+impl From<HalfArg> for CohortHalf {
+    fn from(value: HalfArg) -> Self {
+        match value {
+            HalfArg::Armed => Self::Armed,
+            HalfArg::Natural => Self::Natural,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -317,6 +393,85 @@ async fn main() -> anyhow::Result<()> {
                 ),
             }
         }
+        Command::Cohort(cohort) => run_cohort(cohort, &context).await?,
+    }
+    Ok(())
+}
+
+/// The summary line `cohort show` leads with.
+fn cohort_summary(total: usize, armed: usize, natural: usize) -> String {
+    format!("cohort: |H| = {total} ({armed} armed, {natural} natural)")
+}
+
+/// One member line of `cohort show`.
+fn cohort_member_line(account: u64, row: &CohortMemberRow) -> String {
+    format!(
+        "  {} {} decided_at_ms={} reason={:?}",
+        account,
+        row.half.as_str(),
+        row.decided_at_ms,
+        row.reason
+    )
+}
+
+/// Run one `cohort` verb against the durable cohort store.
+///
+/// Refusals are the tool working, not it failing: a sample that fails a
+/// durable fact is the store saying *why this account cannot be natural
+/// honest*, which is exactly what the operator at the terminal needs to see.
+/// They still exit non-zero, so a scripted sampling run stops on the first
+/// refusal rather than assembling a cohort someone later assumes was checked.
+async fn run_cohort(
+    command: CohortCommand,
+    context: &orrery_persistd::FdbContext,
+) -> anyhow::Result<()> {
+    let store = FdbHonestCohortStore::from_context(context);
+    match command {
+        CohortCommand::Sample {
+            account,
+            half,
+            reason,
+        } => {
+            let half = CohortHalf::from(half);
+            store
+                .sample(
+                    orrery_protocol::AccountId::new(account),
+                    half,
+                    &reason,
+                    now_ms(),
+                    now_ms(),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!(
+                "cohort: sampled account {account} as {}; the decision is durable and verified",
+                half.as_str()
+            );
+        }
+        CohortCommand::Remove { account } => {
+            store
+                .remove(orrery_protocol::AccountId::new(account))
+                .await?;
+            println!(
+                "cohort: removed account {account}; the CLI startup default of nothing applies"
+            );
+        }
+        CohortCommand::Show => {
+            let members = store.members().await?;
+            let armed = members
+                .iter()
+                .filter(|(_, row)| matches!(row.half, CohortHalf::Armed))
+                .count();
+            let natural = members.len() - armed;
+            println!("{}", cohort_summary(members.len(), armed, natural));
+            for (account, row) in members {
+                println!("{}", cohort_member_line(account.0, &row));
+            }
+            println!(
+                "clause (e)'s floor is |H| ≥ 100 with the split reported separately; \
+                 an artifact's `active` count is the one that makes the size mean something"
+            );
+        }
     }
     Ok(())
 }
@@ -415,5 +570,67 @@ mod tests {
         )
         .expect_err("RampPosture::reason documents a 256-byte writer bound");
         assert!(format!("{error}").contains("256"));
+    }
+
+    /// The cohort subcommand parses, and its half argument maps onto D32
+    /// clause (e)'s two halves in the order the record names them.
+    #[test]
+    fn the_cohort_subcommand_parses_with_both_halves() {
+        let parsed = Cli::try_parse_from([
+            "orrery-ramp",
+            "--fdb-cluster-file",
+            "/tmp/fdb.cluster",
+            "cohort",
+            "sample",
+            "--account",
+            "4242",
+            "--half",
+            "natural",
+            "--reason",
+            "owner-sampled",
+        ])
+        .expect("cohort sample parses");
+        let Command::Cohort(CohortCommand::Sample { account, half, .. }) = parsed.command else {
+            panic!("expected the cohort sample subcommand");
+        };
+        assert_eq!(account, 4242);
+        assert!(matches!(CohortHalf::from(half), CohortHalf::Natural));
+
+        let parsed = Cli::try_parse_from([
+            "orrery-ramp",
+            "--fdb-cluster-file",
+            "/tmp/fdb.cluster",
+            "cohort",
+            "sample",
+            "--account",
+            "7",
+            "--half",
+            "armed",
+            "--reason",
+            "harness",
+        ])
+        .expect("armed sample parses");
+        let Command::Cohort(CohortCommand::Sample { half, .. }) = parsed.command else {
+            panic!("expected the cohort sample subcommand");
+        };
+        assert!(matches!(CohortHalf::from(half), CohortHalf::Armed));
+    }
+
+    /// `cohort show` renders the split a promotion reviewer reads: the
+    /// halves separately, never folded into one number.
+    #[test]
+    fn the_cohort_summary_reports_the_halves_separately() {
+        assert_eq!(
+            cohort_summary(120, 40, 80),
+            "cohort: |H| = 120 (40 armed, 80 natural)"
+        );
+        let row = CohortMemberRow {
+            half: CohortHalf::Natural,
+            decided_at_ms: 2_000,
+            reason: "handed a day pass by the owner".to_owned(),
+        };
+        let line = cohort_member_line(4242, &row);
+        assert!(line.contains("4242 natural"), "{line}");
+        assert!(line.contains("decided_at_ms=2000"), "{line}");
     }
 }
