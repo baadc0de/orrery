@@ -23,3 +23,11 @@ iroh-base = { workspace = true }
 # resimulation" is asserted on a step counter the executor actually drives.
 orrery_core = { path = "../orrery_core" }
 orrery_sim_host = { path = "../orrery_sim_host" }
+# Test-only: the source-cap audit (#923, `tests/source_caps.rs`) sums every
+# unsheddable family's declared cap against the peer upload budget. The
+# figures are read from where they are defined — the budget and wire costs in
+# `orrery_net`, the witness lane's share in `orrery_witness`, the hit window in
+# `orrery_predict` — so the audit cannot drift from a copied number.
+orrery_net = { path = "../orrery_net" }
+orrery_predict = { path = "../orrery_predict" }
+orrery_witness = { path = "../orrery_witness" }

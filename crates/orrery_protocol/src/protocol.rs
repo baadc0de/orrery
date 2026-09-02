@@ -80,4 +80,12 @@
 /// until the shooter gives up, with no refusal anywhere. Exact-version
 /// admission turns that into one handshake refusal with a version in it,
 /// which is the same reason every bump above was taken.
-pub const PROTOCOL_VERSION: u16 = 8;
+///
+/// Version 9 appends [`HitRefusal::OverClaimRate`](crate::HitRefusal::OverClaimRate),
+/// the refusal a target's authority sends when a source exceeds its hit-claim
+/// admission cap (#923). `HitRefusal` is a positional postcard enum inside
+/// [`HitVerdict`](crate::HitVerdict), so a version-8 shooter handed the new
+/// arm fails to decode the verdict — and a verdict it cannot decode is
+/// exactly the silent non-answer the refusal exists to replace. Exact-version
+/// admission keeps that failure at the handshake.
+pub const PROTOCOL_VERSION: u16 = 9;

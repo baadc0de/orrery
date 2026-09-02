@@ -34,7 +34,10 @@ pub use ephemeral::{
     IslandAuthoritative, IslandAuthorityEvent, IslandClaim, IslandClient, IslandInbox,
     IslandOutbox,
 };
-pub use hit::{CanonicalPosePublications, HitRules, PoseHistory, PoseRing, PoseSample};
+pub use hit::{
+    CanonicalPosePublications, ClaimAnswer, HitRules, PoseHistory, PoseRing, PoseSample,
+    MAX_CLAIM_SOURCES,
+};
 
 /// Registrar TTL from D7/D16, in milliseconds.
 pub const LEASE_TTL_MS: u64 = 10_000;
