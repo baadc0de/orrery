@@ -39,11 +39,8 @@ use core::time::Duration;
 
 use bevy_ecs::prelude::*;
 
-use crate::channels::{
-    untag, Channel, TAG_DELIVERED_INPUT, TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_COMPRESSED,
-    TAG_REPLICATION_DELTA, TAG_WITNESS, TAG_WITNESS_COMPRESSED,
-};
-use orrery_protocol::NodeId;
+use crate::channels::{untag, Channel, TAG_REPLICATION_DELTA};
+use orrery_protocol::{channels::WireFamily, NodeId};
 
 /// Per-datagram wire overhead: IP+UDP 28 B, QUIC short header + AEAD ≈ 32 B.
 ///
@@ -300,13 +297,19 @@ pub struct UploadMeter {
     pub shed: u64,
     /// Bytes shed for want of budget.
     pub shed_bytes: u64,
-    /// Unsheddable packets sent while over budget — control and witness alike
-    /// (see [`is_sheddable`]) — never shed, always counted.
+    /// Unsheddable packets sent while over budget (see [`is_sheddable`]) —
+    /// never shed, always counted.
     ///
     /// A non-zero value here with `shed` climbing is the honest picture of an
     /// oversubscribed peer: the lanes that cannot be shed are still being paid
     /// for, so the overrun is real rather than an artefact of the backstop.
-    pub control_over_budget: u64,
+    ///
+    /// This deliberately replaces the old `oversubscribed` last-send-pass
+    /// boolean. It had no reader, and a single quiet pass cleared the only
+    /// signal that could establish the sustained condition docs/03 §9.3 needs.
+    /// Consumers instead sample [`Self::rate`] over their own promotion window
+    /// and use this counter to identify an overrun the backstop could not shed.
+    pub unsheddable_over_budget: u64,
     /// What each lane spent, cumulatively over the session.
     ///
     /// Cumulative rather than windowed because the question it answers is a
@@ -438,13 +441,14 @@ pub const fn is_sheddable(lane: Lane) -> bool {
 
 /// The order in which one send tick admits packets to the upload meter.
 ///
-/// The backstop cannot drop control, witness, or hit traffic. Within
-/// replication, an absolute keyframe is an anchor for subsequent deltas, so it
-/// is admitted before deltas. The delta distinction is read from the packet's
-/// wire sub-tag, not supplied by the caller as a second piece of metadata.
+/// The backstop cannot drop control, witness, hit, or witness-keyframe
+/// traffic. Within replication, an absolute keyframe is an anchor for
+/// subsequent deltas, so it is admitted before deltas. The delta distinction
+/// is read from the packet's wire sub-tag, not supplied by the caller as a
+/// second piece of metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BatchPriority {
-    /// Control, witness, and hit packets, which are never shed.
+    /// Control, witness, hit, and witness-keyframe packets, never shed.
     Unsheddable,
     /// Absolute replication state, including keyframes.
     Keyframe,
@@ -456,8 +460,8 @@ pub(crate) enum BatchPriority {
 ///
 /// A state payload with no valid replication-delta wire sub-tag remains an
 /// absolute replication packet. In particular, omitting a sub-tag cannot
-/// reclassify state traffic as control, witness, or hit, and a caller has no
-/// caller-provided priority to lie about.
+/// reclassify state traffic as control, witness, hit, or witness-keyframe, and
+/// a caller has no caller-provided priority to lie about.
 #[must_use]
 pub(crate) fn batch_priority(channel: Channel, payload: &[u8]) -> BatchPriority {
     if !is_sheddable(lane_of(channel, payload)) {
@@ -475,11 +479,11 @@ pub(crate) fn batch_priority(channel: Channel, payload: &[u8]) -> BatchPriority 
 /// Which kind of traffic a packet carries, for accounting and shedding order.
 ///
 /// Read *off the wire* rather than declared by the sender. `Channel::State`
-/// already carries a sub-tag — [`crate::channels::TAG_REPLICATION`],
-/// [`TAG_WITNESS`], or [`TAG_HIT`] — so a receiver can route a datagram without
-/// parsing it, and the meter reads the same byte the receiver routes on. A
-/// field on the packet would be a second source of truth for one fact, and it
-/// would drift from the wire the first time a caller left it at its default.
+/// already carries a sub-tag — [`WireFamily`] — so a receiver can route a
+/// datagram without parsing it, and the meter reads the same byte the receiver
+/// routes on. A field on the packet would be a second source of truth for one
+/// fact, and it would drift from the wire the first time a caller left it at
+/// its default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lane {
     /// Replicated entity state — the interactive lane, and the only sheddable
@@ -487,43 +491,13 @@ pub enum Lane {
     Replication,
     /// Verifiable-core log frames and state claims (docs/03-replication.md §5.3a).
     Witness,
+    /// An absolute replication anchor sent to a witness-set link (A20 §4).
+    WitnessKeyframe,
     /// Hit claims and verdicts: latency-critical state traffic retried until a
     /// verdict, not a snapshot superseded by the next replication send.
     Hit,
     /// The reliable lane: gap repairs, leases, handshakes.
     Control,
-}
-
-/// A known wire family, read from the sub-tag the receiver routes on.
-///
-/// Keep this enum exhaustive. A new family must add a variant here, and the
-/// exhaustive match in [`lane_for_family`] then makes the compiler require its
-/// delivery classification. Opaque bytes are deliberately not a family: they
-/// remain subject to the conservative transport fallback below until their
-/// owner gives them a protocol sub-tag and a variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WireFamily {
-    Replication,
-    ReplicationCompressed,
-    ReplicationDelta,
-    Witness,
-    WitnessCompressed,
-    DeliveredInput,
-    Hit,
-}
-
-/// Bytes that do not declare one of [`WireFamily`]'s protocol sub-tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpaqueWire {
-    State,
-    Control,
-}
-
-/// The wire classification from which a budget lane is derived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WireClass {
-    Family(WireFamily),
-    Opaque(OpaqueWire),
 }
 
 /// Read the inner, protocol-owned channel tag and sub-tag from a send payload.
@@ -532,46 +506,34 @@ enum WireClass {
 /// logical frame produced by the protocol encoder. Deliberately consult that
 /// inner frame first: a delivered input remains a delivered input if a future
 /// transport change moves it from a stream to a datagram.
-fn wire_class(transport: Channel, payload: &[u8]) -> WireClass {
-    let Some((channel, body)) = untag(payload) else {
-        return WireClass::Opaque(match transport {
-            Channel::State => OpaqueWire::State,
-            Channel::Control => OpaqueWire::Control,
-        });
-    };
-
-    match (channel, body.first().copied()) {
-        (Channel::State, Some(TAG_REPLICATION)) => WireClass::Family(WireFamily::Replication),
-        (Channel::State, Some(TAG_REPLICATION_COMPRESSED)) => {
-            WireClass::Family(WireFamily::ReplicationCompressed)
-        }
-        (Channel::State, Some(TAG_REPLICATION_DELTA)) => {
-            WireClass::Family(WireFamily::ReplicationDelta)
-        }
-        (Channel::State, Some(TAG_WITNESS)) => WireClass::Family(WireFamily::Witness),
-        (Channel::State, Some(TAG_WITNESS_COMPRESSED)) => {
-            WireClass::Family(WireFamily::WitnessCompressed)
-        }
-        (Channel::Control, Some(TAG_DELIVERED_INPUT)) => {
-            WireClass::Family(WireFamily::DeliveredInput)
-        }
-        (Channel::State, Some(TAG_HIT)) => WireClass::Family(WireFamily::Hit),
-        (Channel::State, _) => WireClass::Opaque(OpaqueWire::State),
-        (Channel::Control, _) => WireClass::Opaque(OpaqueWire::Control),
-    }
+fn wire_family(payload: &[u8]) -> Option<WireFamily> {
+    let (channel, body) = untag(payload)?;
+    WireFamily::from_frame(channel, body.first().copied()?)
 }
 
 /// The delivery classification for a declared [`WireFamily`].
 ///
-/// There is intentionally no wildcard arm. Adding a protocol family without
-/// deciding its lane fails here at compile time rather than inheriting a lane
-/// from its transport channel.
-const fn lane_for_family(family: WireFamily) -> Lane {
+/// There is intentionally no wildcard arm. Adding a protocol sub-tag means
+/// adding a [`WireFamily`] variant, which makes this match fail to compile
+/// until its delivery class is decided.
+const fn lane_for_family(transport: Channel, family: WireFamily) -> Lane {
     match family {
         WireFamily::Replication
         | WireFamily::ReplicationCompressed
         | WireFamily::ReplicationDelta => Lane::Replication,
-        WireFamily::Witness | WireFamily::WitnessCompressed => Lane::Witness,
+        WireFamily::WitnessKeyframe => Lane::WitnessKeyframe,
+        // Range repairs share the witness envelope but ride the control
+        // transport. They remain the separately named, uncapped control family
+        // in #925's source-cap audit; the ordinary witness log stays witness.
+        WireFamily::Witness | WireFamily::WitnessCompressed => {
+            if transport.is_stream() {
+                Lane::Control
+            } else {
+                Lane::Witness
+            }
+        }
+        // This arm intentionally ignores `transport`: a delivered input stays
+        // unsheddable if a future transport moves it to a datagram.
         WireFamily::DeliveredInput => Lane::Control,
         WireFamily::Hit => Lane::Hit,
     }
@@ -579,17 +541,17 @@ const fn lane_for_family(family: WireFamily) -> Lane {
 
 /// Which lane a packet belongs to, from its protocol-owned wire class.
 ///
-/// A declared family is never classified by its transport channel. Opaque
-/// bytes retain the old conservative fallback: raw state is charged to
-/// replication, and raw stream bytes to control. This preserves budget
-/// coverage for hand-rolled payloads without granting them a named delivery
-/// guarantee.
+/// Declared families are read from their protocol bytes. The one exception is
+/// the witness envelope's control transport, which distinguishes range repair
+/// from normal witness log traffic without a second caller-provided field.
+/// Opaque bytes retain the conservative transport fallback: raw state is
+/// charged to replication, and raw stream bytes to control.
 #[must_use]
 pub fn lane_of(channel: Channel, payload: &[u8]) -> Lane {
-    match wire_class(channel, payload) {
-        WireClass::Family(family) => lane_for_family(family),
-        WireClass::Opaque(OpaqueWire::State) => Lane::Replication,
-        WireClass::Opaque(OpaqueWire::Control) => Lane::Control,
+    match wire_family(payload) {
+        Some(family) => lane_for_family(channel, family),
+        None if channel.is_datagram() => Lane::Replication,
+        None => Lane::Control,
     }
 }
 
@@ -606,6 +568,8 @@ pub struct LaneTally {
     pub replication_bytes: u64,
     /// Wire bytes charged to the witness lane.
     pub witness_bytes: u64,
+    /// Wire bytes charged to witness-link replication keyframes.
+    pub witness_keyframe_bytes: u64,
     /// Wire bytes charged to the hit-registration lane.
     pub hit_bytes: u64,
     /// Wire bytes charged to the control lane.
@@ -618,7 +582,11 @@ impl LaneTally {
     /// Every wire byte this peer has offered the link, across all lanes.
     #[must_use]
     pub const fn total_bytes(&self) -> u64 {
-        self.replication_bytes + self.witness_bytes + self.hit_bytes + self.control_bytes
+        self.replication_bytes
+            + self.witness_bytes
+            + self.witness_keyframe_bytes
+            + self.hit_bytes
+            + self.control_bytes
     }
 
     /// The witness lane's share of everything sent, in \[0, 1\].
@@ -638,6 +606,7 @@ impl LaneTally {
         match lane {
             Lane::Replication => self.replication_bytes += wire,
             Lane::Witness => self.witness_bytes += wire,
+            Lane::WitnessKeyframe => self.witness_keyframe_bytes += wire,
             Lane::Hit => self.hit_bytes += wire,
             Lane::Control => self.control_bytes += wire,
         }
@@ -766,6 +735,7 @@ mod tests {
         // the next send 50 ms later.
         assert!(is_sheddable(Lane::Replication));
         assert!(!is_sheddable(Lane::Control));
+        assert!(!is_sheddable(Lane::WitnessKeyframe));
         assert!(!is_sheddable(Lane::Hit));
     }
 
@@ -784,7 +754,8 @@ mod tests {
     #[test]
     fn the_lane_is_read_off_the_wire_rather_than_taken_on_trust() {
         use crate::channels::{
-            encode_replication, encode_witness, encode_witness_compressed, tag, TAG_HIT,
+            encode_replication, encode_witness, encode_witness_compressed, encode_witness_keyframe,
+            tag, TAG_HIT,
         };
 
         // The sub-tag a receiver routes on is the same byte the meter reads, so
@@ -808,12 +779,15 @@ mod tests {
             lane_of(Channel::State, &tag(Channel::State, &[TAG_HIT, 0])),
             Lane::Hit
         );
-        // A named family retains its classification when its transport changes.
-        // Witness repair traffic is carried on the reliable stream, but it is
-        // still witness traffic for accounting and survival purposes.
+        assert_eq!(
+            lane_of(Channel::State, &encode_witness_keyframe(&[1u8, 2, 3])),
+            Lane::WitnessKeyframe
+        );
+        // Witness range repair shares the envelope but is control traffic when
+        // sent over a stream; #925 names its missing cap separately.
         assert_eq!(
             lane_of(Channel::Control, &encode_witness(&[1u8, 2, 3])),
-            Lane::Witness
+            Lane::Control
         );
     }
 
