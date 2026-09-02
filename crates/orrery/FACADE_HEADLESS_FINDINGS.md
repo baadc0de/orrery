@@ -89,10 +89,16 @@ would reject Lightyear's intended interpolation, not catch a rollback fault.
 
 ## Platform gaps and game-owned work exposed
 
-- `orrery_authority` does **not** populate `PredictedBy`; its only first-party
-  writers are fixtures. The prediction docs' statement that authority
-  populates it is aspirational. A game adapter still has to join the spawned
-  predicted entity to its authority and `PersistId`.
+- ~~`orrery_authority` does **not** populate `PredictedBy`; its only
+  first-party writers are fixtures.~~ **Closed by #910.** The gap was real —
+  and so was the reason for it: `orrery_authority` sits *below* `orrery_predict`
+  on the spine and cannot name the component without inverting it. The writer
+  therefore landed at the composition root, as
+  `orrery::track_predicted_authority` in `OrreryAuthorityAttributionPlugin`,
+  stamping the settled `Authority.holder` onto every entity carrying a
+  `PersistIdentity`. A game adapter no longer joins predicted entities to their
+  authority by hand; it still owns the `CoreState` ↔ predicted-component
+  adapter below.
 - `orrery_authority` does expose both `PoseSample` and
   `PoseHistory::record`; no frozen-crate reach-through is needed. There is no
   production writer, though. Step 1 projects the latest pose; step 4 must add

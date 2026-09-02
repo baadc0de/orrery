@@ -92,10 +92,18 @@ use crate::tick::TickBridge;
 /// Ties a locally predicted entity to the authority whose claims it is
 /// reconciled against.
 ///
-/// `orrery_authority` owns the claim state machine and populates this;
-/// `orrery_predict` only reads it, because a residual with no authority
-/// attached is a number with nobody to attribute it to — and attribution is the
+/// `orrery_authority` owns the claim state machine that settles the holder,
+/// and `orrery_predict` only reads the result — a residual with no authority
+/// attached is a number with nobody to attribute it to, and attribution is the
 /// entire point of the monitor (D10).
+///
+/// Neither crate writes it. `orrery_authority` is the lower layer of the two
+/// and cannot name a type from this crate without inverting the dependency
+/// spine (D15), so the write lives at the composition root:
+/// `orrery::track_predicted_authority`, in `OrreryAuthorityAttributionPlugin`
+/// (#910). That is also what keeps this crate's public surface free of
+/// lightyear — the writer needs the holder and the `PersistId` and nothing
+/// else, so no lightyear type crosses the seam to reach it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Component)]
 pub struct PredictedBy {
     /// The peer holding authority over this entity.
