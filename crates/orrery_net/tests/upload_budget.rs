@@ -367,24 +367,27 @@ fn delivered_inputs_survive_upload_pressure_on_a_datagram() {
     let peer = secret(1).public();
     let mut app = app(&[peer]);
     queue(&mut app, peer, Channel::State, allowance() + 200);
-    // Fill the fractional remainder that `allowance()` leaves after 500-byte
-    // packets, so a misclassified input has no accidental room to slip through.
-    app.world_mut()
-        .resource_mut::<Messages<SendPacket>>()
-        .write(SendPacket::state(peer, bytes::Bytes::from(vec![0u8; 397])));
     {
+        // Both frames are the flood's own size. A short frame would prove
+        // nothing: the window's fractional remainder is always smaller than one
+        // flood packet, so a *misclassified* short input would slip through on
+        // leftover budget and the test would pass with the classification
+        // broken. At `PAYLOAD` bytes there is no remainder that fits it, so
+        // being admitted is evidence of the lane and nothing else.
         let mut messages = app.world_mut().resource_mut::<Messages<SendPacket>>();
         messages.write(SendPacket::state(
             peer,
             bytes::Bytes::from(encode_delivered_input(
                 PersistId::new(1),
                 PersistId::new(2),
-                b"damage",
+                &vec![9u8; PAYLOAD],
             )),
         ));
+        let mut rehomed = vec![TAG_DELIVERED_INPUT];
+        rehomed.extend_from_slice(&vec![9u8; PAYLOAD]);
         messages.write(SendPacket::state(
             peer,
-            bytes::Bytes::from(tag(Channel::State, &[TAG_DELIVERED_INPUT, 9, 9])),
+            bytes::Bytes::from(tag(Channel::State, &rehomed)),
         ));
     }
     app.update();

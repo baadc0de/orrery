@@ -548,11 +548,25 @@ const fn lane_for_family(transport: Channel, family: WireFamily) -> Lane {
 /// charged to replication, and raw stream bytes to control.
 #[must_use]
 pub fn lane_of(channel: Channel, payload: &[u8]) -> Lane {
-    match wire_family(payload) {
+    let lane = match wire_family(payload) {
         Some(family) => lane_for_family(channel, family),
         None if channel.is_datagram() => Lane::Replication,
         None => Lane::Control,
+    };
+    // Shedding is a *datagram* backstop. A stream is reliable and ordered, so
+    // skipping one of its messages is not a dropped snapshot the next send
+    // supersedes — it is a hole in a byte sequence the receiver will wait on.
+    // A sheddable classification is therefore unrepresentable on that
+    // transport, and this clamp says so once, here, rather than leaving the
+    // send loop to shed a stream message. It is not the channel deciding the
+    // class: the family below still names the lane, and this can only move a
+    // packet onto the *more* expensive, unsheddable side — never the cheaper
+    // one. Without it, re-homing a state family onto the stream (the move that
+    // made hits sheddable) would let the backstop punch that hole.
+    if channel.is_stream() && is_sheddable(lane) {
+        return Lane::Control;
     }
+    lane
 }
 
 /// Wire bytes and packet counts, split by [`Lane`].
@@ -848,23 +862,40 @@ mod tests {
 
     #[test]
     fn re_homing_a_state_family_onto_the_stream_cannot_buy_it_a_shed() {
-        // The families whose home channel is the state datagram keep it in
-        // `WireFamily::from_frame`; a pairing the table does not name is not a
-        // family, and falls back to the transport's default lane. On the
-        // stream that fallback is `Lane::Control` — unsheddable — so moving a
-        // hit, a witness anchor, or replication itself onto the stream can
-        // only cost its sender accounting, never survival. This is the claim
-        // `from_frame`'s doc makes, and it is what lets the delivered input be
-        // the one family matched on both channels: every other state family
-        // lands here if its channel moves.
+        // Two readings of the same move, both of which must land unsheddable.
+        //
+        // A frame the protocol encoders produce carries its *own* channel byte
+        // inside the payload, so genuinely re-homing a state family onto the
+        // stream keeps that `Channel::State` byte and `from_frame` still names
+        // the family. Replication then classifies as `Lane::Replication` —
+        // sheddable — and the send loop tests `is_sheddable` *before* it
+        // dispatches on the channel, so it would skip a message on a reliable,
+        // ordered stream: not a superseded snapshot but a hole the receiver
+        // waits on. `lane_of` clamps that, so the re-homed frame is control.
+        //
+        // Re-tagged onto the control channel the pairing is not in the table at
+        // all, and the opaque fallback on a stream is control as well.
         use crate::channels::{tag, TAG_HIT, TAG_REPLICATION, TAG_WITNESS_KEYFRAME};
         for family_tag in [TAG_HIT, TAG_REPLICATION, TAG_WITNESS_KEYFRAME] {
+            assert!(
+                !is_sheddable(lane_of(
+                    Channel::Control,
+                    &tag(Channel::State, &[family_tag, 0])
+                )),
+                "re-homed sub-tag {family_tag:#04x} must not be sheddable on a stream"
+            );
             assert_eq!(
                 lane_of(Channel::Control, &tag(Channel::Control, &[family_tag, 0])),
                 Lane::Control,
                 "sub-tag {family_tag:#04x} on the stream must not fall into a sheddable lane"
             );
         }
+        // The clamp only ever moves a packet to the dearer side: a datagram
+        // reading of the same bytes is untouched.
+        assert_eq!(
+            lane_of(Channel::State, &tag(Channel::State, &[TAG_REPLICATION, 0])),
+            Lane::Replication
+        );
     }
 
     #[test]
