@@ -91,6 +91,22 @@ impl StrikeKind {
     }
 }
 
+/// The adjudicator-derived identity of one confirmed divergence episode.
+///
+/// The reporter chooses evidence-window bounds, but not any of these values:
+/// the subject signs the chain epoch, the ruleset is pinned in the evidence,
+/// and replay finds the first divergence. Together they make a confirmed
+/// episode one durable strike fact even when several valid windows cover it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrikeEpisodeRef {
+    /// The authority whose signed chain replay convicted this episode.
+    pub subject: NodeId,
+    /// The signed chain epoch containing the divergence.
+    pub chain_epoch: u32,
+    /// The first tick replay found to diverge from the signed claim chain.
+    pub first_diverging_tick: Tick,
+}
+
 /// Stable coordinates plus a digest for the evidence behind one strike.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrikeEvidenceRef {
@@ -129,8 +145,8 @@ pub struct StrikeRow {
 // guard cannot see written — which is exactly what it reported when these
 // lived here.
 pub use crate::keyspace::{
-    strike_account_range_end, strike_account_range_start, strike_key, strike_versionstamped_key,
-    STRIKE_VERSIONSTAMP_OFFSET,
+    strike_account_range_end, strike_account_range_start, strike_episode_key, strike_key,
+    strike_versionstamped_key, STRIKE_VERSIONSTAMP_OFFSET,
 };
 
 /// Result of attempting to append one verdict-derived fact.
@@ -165,8 +181,15 @@ impl std::error::Error for StrikeLedgerError {}
 /// The adjudication executor's append seam.
 pub trait StrikeLedger: Send + Sync {
     /// Resolve `target` through D31's current binding and append `row` once.
-    fn file(&self, target: NodeId, row: &StrikeRow)
-        -> Result<StrikeFileOutcome, StrikeLedgerError>;
+    ///
+    /// `episode` is written to a separate durable dedup index, leaving
+    /// immutable D33 row bytes backward-readable.
+    fn file(
+        &self,
+        target: NodeId,
+        row: &StrikeRow,
+        episode: Option<&StrikeEpisodeRef>,
+    ) -> Result<StrikeFileOutcome, StrikeLedgerError>;
 }
 
 /// In-memory strike ledger for tests and harnesses.
@@ -179,6 +202,7 @@ pub struct MemStrikeLedger {
 struct MemStrikeState {
     bindings: HashMap<NodeId, AccountId>,
     rows: HashMap<AccountId, Vec<StrikeRow>>,
+    episodes: HashMap<AccountId, HashMap<[u8; 32], u64>>,
 }
 
 impl MemStrikeLedger {
@@ -213,18 +237,34 @@ impl StrikeLedger for MemStrikeLedger {
         &self,
         target: NodeId,
         row: &StrikeRow,
+        episode: Option<&StrikeEpisodeRef>,
     ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
         let mut state = Self::lock(&self.state);
         let Some(account) = state.bindings.get(&target).copied() else {
             return Ok(StrikeFileOutcome::UnresolvedBinding);
         };
-        let rows = state.rows.entry(account).or_default();
-        if rows.iter().any(|existing| {
-            existing.evidence_ref.digest == row.evidence_ref.digest && existing.kind == row.kind
-        }) {
+        if episode.is_none()
+            && state.rows.get(&account).is_some_and(|rows| {
+                rows.iter().any(|existing| {
+                    existing.evidence_ref.digest == row.evidence_ref.digest
+                        && existing.kind == row.kind
+                })
+            })
+        {
             return Ok(StrikeFileOutcome::Duplicate { account });
         }
-        rows.push(row.clone());
+        if let Some(episode) = episode {
+            let key = episode_dedup_digest(row.ruleset, episode);
+            let episodes = state.episodes.entry(account).or_default();
+            if episodes
+                .get(&key)
+                .is_some_and(|expires_at_ms| *expires_at_ms > row.issued_at_ms)
+            {
+                return Ok(StrikeFileOutcome::Duplicate { account });
+            }
+            episodes.insert(key, row.expires_at_ms);
+        }
+        state.rows.entry(account).or_default().push(row.clone());
         Ok(StrikeFileOutcome::Filed { account })
     }
 }
@@ -435,16 +475,22 @@ impl AdjudicationExecutor {
     }
 
     fn file_report_verdict(&self, report: &DiscrepancyReport, verdict: Verdict) {
-        let (target, kind, filed_counter) = match verdict {
-            Verdict::Confirms { .. } => (
+        let (target, kind, filed_counter, episode) = match verdict {
+            Verdict::Confirms { at, .. } => (
                 report.subject,
                 StrikeKind::Deviation,
                 &self.strike_metrics.filed_subject,
+                Some(StrikeEpisodeRef {
+                    subject: report.subject,
+                    chain_epoch: report.bundle.t0_claim.chain_epoch,
+                    first_diverging_tick: at,
+                }),
             ),
             Verdict::EvidenceForged(_) => (
                 report.reporter,
                 StrikeKind::EvidenceForged,
                 &self.strike_metrics.filed_reporter,
+                None,
             ),
             Verdict::Exonerates | Verdict::Unadjudicable(_) => {
                 self.strike_metrics
@@ -469,7 +515,7 @@ impl AdjudicationExecutor {
             mode: filer.mode,
             expires_at_ms: issued_at_ms.saturating_add(STRIKE_RETENTION_MS),
         };
-        match filer.ledger.file(target, &row) {
+        match filer.ledger.file(target, &row, episode.as_ref()) {
             Ok(StrikeFileOutcome::Filed { account }) => {
                 filed_counter.fetch_add(1, Ordering::Relaxed);
                 self.record_strike_ramp(
@@ -676,11 +722,20 @@ fn evidence_ref(report: &DiscrepancyReport) -> StrikeEvidenceRef {
     }
 }
 
+fn episode_dedup_digest(ruleset: RulesetId, episode: &StrikeEpisodeRef) -> [u8; 32] {
+    let encoded = postcard::to_stdvec(&(ruleset, episode)).expect("episode identity encodes");
+    *blake3::hash(&encoded).as_bytes()
+}
+
+#[cfg(feature = "fdb")]
+type RestoreHoldIndex = Arc<std::sync::RwLock<Option<(NodeId, Arc<crate::journal::Journal>)>>>;
+
 /// FoundationDB-backed executor-owned writer for D33's `ya` family.
 #[cfg(feature = "fdb")]
 #[derive(Clone)]
 pub struct FdbStrikeLedger {
     db: Arc<foundationdb::Database>,
+    restore_hold_index: RestoreHoldIndex,
 }
 
 #[cfg(feature = "fdb")]
@@ -695,7 +750,27 @@ impl FdbStrikeLedger {
     /// Reuse a process-scoped, bounded database handle.
     #[must_use]
     pub fn from_database(db: Arc<foundationdb::Database>) -> Self {
-        Self { db }
+        Self {
+            db,
+            restore_hold_index: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Attach the local journal coordinate used by the restore-hold index.
+    ///
+    /// The position is sampled immediately before the filing transaction and
+    /// written in that same transaction as the `ya` product.  A deployment
+    /// that does not install this seam has no archive restore surface and
+    /// therefore deliberately emits no incomplete index rows.
+    pub fn configure_restore_hold_index(
+        &self,
+        source_node: NodeId,
+        journal: Arc<crate::journal::Journal>,
+    ) {
+        *self
+            .restore_hold_index
+            .write()
+            .expect("restore-hold index lock poisoned") = Some((source_node, journal));
     }
 
     /// Read one account's ledger rows in commit order.
@@ -755,12 +830,20 @@ impl StrikeLedger for FdbStrikeLedger {
         &self,
         target: NodeId,
         row: &StrikeRow,
+        episode: Option<&StrikeEpisodeRef>,
     ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
         use foundationdb::options::MutationType;
         use futures::TryStreamExt;
 
         let db = Arc::clone(&self.db);
         let row = row.clone();
+        let hold_location = self
+            .restore_hold_index
+            .read()
+            .expect("restore-hold index lock poisoned")
+            .as_ref()
+            .map(|(source_node, journal)| (*source_node, journal.committed()));
+        let episode = episode.map(|episode| episode_dedup_digest(row.ruleset, episode));
         futures::executor::block_on(async move {
             db.run(|trx, _| {
                 let row = row.clone();
@@ -776,6 +859,23 @@ impl StrikeLedger for FdbStrikeLedger {
                         ))
                     })?;
                     let account = binding.account;
+                    if let Some(episode) = episode {
+                        let episode_key = strike_episode_key(account, &episode);
+                        if let Some(existing_expiry) = trx.get(&episode_key, false).await? {
+                            let expires_at_ms = u64::from_be_bytes(
+                                existing_expiry.as_ref().try_into().map_err(|_| {
+                                    foundationdb::FdbBindingError::new_custom_error(Box::new(
+                                        StrikeLedgerError(
+                                            "strike episode index expiry has invalid width".into(),
+                                        ),
+                                    ))
+                                })?,
+                            );
+                            if expires_at_ms > row.issued_at_ms {
+                                return Ok(StrikeFileOutcome::Duplicate { account });
+                            }
+                        }
+                    }
                     let start = strike_account_range_start(account);
                     let end = strike_account_range_end(account);
                     let mut stream = trx.get_ranges_keyvalues(
@@ -795,7 +895,8 @@ impl StrikeLedger for FdbStrikeLedger {
                                     StrikeLedgerError(format!("strike row decode: {error}")),
                                 ))
                             })?;
-                        if existing.evidence_ref.digest == row.evidence_ref.digest
+                        if episode.is_none()
+                            && existing.evidence_ref.digest == row.evidence_ref.digest
                             && existing.kind == row.kind
                         {
                             return Ok(StrikeFileOutcome::Duplicate { account });
@@ -807,11 +908,29 @@ impl StrikeLedger for FdbStrikeLedger {
                             StrikeLedgerError(format!("strike row encode: {error}")),
                         ))
                     })?;
+                    if let Some(episode) = episode {
+                        trx.set(
+                            &strike_episode_key(account, &episode),
+                            &row.expires_at_ms.to_be_bytes(),
+                        );
+                    }
                     trx.atomic_op(
                         &strike_versionstamped_key(account),
                         &encoded,
                         MutationType::SetVersionstampedKey,
                     );
+                    if let Some((source_node, filing_lsn)) = hold_location {
+                        trx.atomic_op(
+                            &crate::keyspace::restore_hold_strike_versionstamped_key(
+                                &source_node,
+                                row.evidence_ref.entity,
+                                filing_lsn,
+                                account,
+                            ),
+                            b"",
+                            MutationType::SetVersionstampedKey,
+                        );
+                    }
                     Ok(StrikeFileOutcome::Filed { account })
                 }
             })
@@ -1143,6 +1262,112 @@ mod tests {
     }
 
     #[test]
+    fn reslicing_one_divergence_files_one_strike() {
+        // The reports have different reporter-selected bounds and therefore
+        // different whole-report digests, but adjudication found the same
+        // first divergence in the same signed chain epoch.
+        let whole = report();
+        let mut tail_bundle = whole.bundle.clone();
+        tail_bundle.window_start = Tick::new(1);
+        tail_bundle.window_end = Tick::new(2);
+        let tail = orrery_witness::sign_report(&key(2), key(1).public(), tail_bundle);
+        let first_divergence = Tick::new(7);
+        assert_ne!(
+            evidence_ref(&whole).digest,
+            evidence_ref(&tail).digest,
+            "the reporter-chosen slices still have distinct report digests"
+        );
+
+        let account = AccountId(72);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind(whole.subject, account);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+        let verdict = Verdict::Confirms {
+            at: first_divergence,
+            kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+        };
+
+        executor.file_report_verdict(&whole, verdict);
+        executor.file_report_verdict(&tail, verdict);
+
+        assert_eq!(ledger.rows(account).len(), 1, "one episode files one fact");
+        assert_eq!(executor.strike_metrics().filed_subject, 1);
+        assert_eq!(executor.strike_metrics().duplicate, 1);
+    }
+
+    #[test]
+    fn distinct_divergence_episodes_file_distinct_strikes() {
+        // Same subject, ruleset and signed chain epoch, but replay identified
+        // different first-divergence ticks: these are two independent facts.
+        let report = report();
+        let account = AccountId(73);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind(report.subject, account);
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Live);
+
+        for at in [Tick::new(7), Tick::new(19)] {
+            executor.file_report_verdict(
+                &report,
+                Verdict::Confirms {
+                    at,
+                    kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+                },
+            );
+        }
+
+        assert_eq!(
+            ledger.rows(account).len(),
+            2,
+            "distinct episodes remain visible"
+        );
+        assert_eq!(executor.strike_metrics().filed_subject, 2);
+        assert_eq!(executor.strike_metrics().duplicate, 0);
+    }
+
+    #[test]
+    fn legacy_strike_rows_stay_readable() {
+        // Episode identity lives in a separate index, so the immutable D33
+        // strike-row encoding remains exactly readable.
+        #[derive(serde::Serialize)]
+        struct LegacyEvidenceRef {
+            entity: PersistId,
+            window_start: Tick,
+            window_end: Tick,
+            digest: [u8; 32],
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacyStrikeRow {
+            issued_at_ms: u64,
+            weight_milli: i32,
+            kind: StrikeKind,
+            evidence_ref: LegacyEvidenceRef,
+            ruleset: RulesetId,
+            mode: StrikeMode,
+            expires_at_ms: u64,
+        }
+
+        let legacy = LegacyStrikeRow {
+            issued_at_ms: 1,
+            weight_milli: MAJOR_STRIKE_WEIGHT_MILLI,
+            kind: StrikeKind::Deviation,
+            evidence_ref: LegacyEvidenceRef {
+                entity: PersistId::new(1),
+                window_start: Tick::new(0),
+                window_end: Tick::new(1),
+                digest: [3; 32],
+            },
+            ruleset: V1.id(),
+            mode: StrikeMode::Shadow,
+            expires_at_ms: 2,
+        };
+
+        let encoded = postcard::to_stdvec(&legacy).expect("legacy row encodes");
+        let decoded: StrikeRow = postcard::from_bytes(&encoded).expect("legacy row stays readable");
+        assert_eq!(decoded.evidence_ref.digest, [3; 32]);
+    }
+
+    #[test]
     fn unresolved_subject_binding_suppresses_instead_of_redirecting_to_reporter() {
         let report = report();
         let reporter_account = AccountId(82);
@@ -1174,6 +1399,11 @@ mod tests {
         assert_eq!(&parameter[20..], &10_u32.to_le_bytes());
         assert!(strike_account_range_start(account) < key.to_vec());
         assert!(key.to_vec() < strike_account_range_end(account));
+
+        let episode = strike_episode_key(account, &[0xAB; 32]);
+        assert_eq!(&episode[..2], b"yb");
+        assert_eq!(&episode[2..10], &account.0.to_be_bytes());
+        assert_eq!(&episode[10..], &[0xAB; 32]);
     }
 
     #[test]
@@ -1184,6 +1414,7 @@ mod tests {
                 &self,
                 _target: NodeId,
                 _row: &StrikeRow,
+                _episode: Option<&StrikeEpisodeRef>,
             ) -> Result<StrikeFileOutcome, StrikeLedgerError> {
                 Err(StrikeLedgerError("injected write failure".into()))
             }
@@ -1212,6 +1443,16 @@ mod tests {
         };
         let ledger = Arc::new(FdbStrikeLedger::connect(&cluster).expect("connect strike ledger"));
         let report = report();
+        let journal_dir = tempfile::tempdir().expect("journal tempdir");
+        let journal = Arc::new(
+            crate::journal::Journal::open(&crate::journal::JournalConfig {
+                dir: journal_dir.path().to_path_buf(),
+                ..crate::journal::JournalConfig::default()
+            })
+            .expect("journal opens"),
+        );
+        let source_node = key(7).public();
+        ledger.configure_restore_hold_index(source_node, Arc::clone(&journal));
         let subject_account = AccountId(0x0215_0000_0000_0001);
         let reporter_account = AccountId(0x0215_0000_0000_0002);
         let subject_key = crate::keyspace::binding_key(&report.subject);
@@ -1221,14 +1462,27 @@ mod tests {
         let reporter_start = strike_account_range_start(reporter_account);
         let reporter_end = strike_account_range_end(reporter_account);
         let db = Arc::clone(&ledger.db);
+        let hold_start = crate::keyspace::restore_hold_range_start(
+            &source_node,
+            report.bundle.entity,
+            orrery_protocol::Lsn::new(0, 0),
+        );
+        let hold_end = crate::keyspace::restore_hold_range_end(
+            &source_node,
+            report.bundle.entity,
+            orrery_protocol::Lsn::new(0, 0),
+        );
         db.run(|trx, _| {
             let subject_start = subject_start.clone();
             let subject_end = subject_end.clone();
             let reporter_start = reporter_start.clone();
             let reporter_end = reporter_end.clone();
+            let hold_start = hold_start.clone();
+            let hold_end = hold_end.clone();
             async move {
                 trx.clear_range(&subject_start, &subject_end);
                 trx.clear_range(&reporter_start, &reporter_end);
+                trx.clear_range(&hold_start, &hold_end);
                 trx.set(
                     &subject_key,
                     &postcard::to_stdvec(&crate::keyspace::BindingRow {
@@ -1276,6 +1530,41 @@ mod tests {
                 .is_empty(),
             "the durable writer preserves the reporter/subject split"
         );
+        let hold_start = hold_start.clone();
+        let hold_end = hold_end.clone();
+        let indexed = db
+            .run(|trx, _| {
+                let hold_start = hold_start.clone();
+                let hold_end = hold_end.clone();
+                async move {
+                    use futures::TryStreamExt as _;
+
+                    let mut rows = trx.get_ranges_keyvalues(
+                        foundationdb::RangeOption {
+                            begin: foundationdb::KeySelector::first_greater_or_equal(
+                                hold_start.as_slice(),
+                            ),
+                            end: foundationdb::KeySelector::first_greater_or_equal(
+                                hold_end.as_slice(),
+                            ),
+                            ..foundationdb::RangeOption::default()
+                        },
+                        false,
+                    );
+                    Ok(rows.try_next().await?)
+                }
+            })
+            .await
+            .expect("restore-hold index read")
+            .expect("strike transaction wrote restore-hold index");
+        assert!(matches!(
+            crate::keyspace::decode_restore_hold_key(indexed.key()),
+            Some((source, entity, lsn, crate::keyspace::RestoreHoldProduct::Strike { account, .. }))
+                if source == source_node
+                    && entity == report.bundle.entity
+                    && lsn == orrery_protocol::Lsn::new(0, 0)
+                    && account == subject_account
+        ));
 
         let subject_start = strike_account_range_start(subject_account);
         let subject_end = strike_account_range_end(subject_account);
@@ -1286,15 +1575,19 @@ mod tests {
             let subject_end = subject_end.clone();
             let reporter_start = reporter_start.clone();
             let reporter_end = reporter_end.clone();
+            let hold_start = hold_start.clone();
+            let hold_end = hold_end.clone();
             async move {
                 trx.clear(&subject_key);
                 trx.clear(&reporter_key);
                 trx.clear_range(&subject_start, &subject_end);
                 trx.clear_range(&reporter_start, &reporter_end);
+                trx.clear_range(&hold_start, &hold_end);
                 Ok(())
             }
         })
         .await
         .expect("wipe strike test rows");
+        journal.close().await.expect("journal closes");
     }
 }

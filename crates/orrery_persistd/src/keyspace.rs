@@ -2269,6 +2269,20 @@ pub fn strike_key(account: AccountId) -> [u8; 20] {
     key
 }
 
+/// `yb || account:u64-be || blake3(ruleset, episode):[u8;32]`.
+///
+/// The marker makes a confirmed divergence episode idempotent without
+/// changing D33's immutable `ya` strike-row value format.
+#[must_use]
+pub fn strike_episode_key(account: AccountId, episode_digest: &[u8; 32]) -> [u8; 42] {
+    let mut key = [0; 42];
+    key[0] = b'y';
+    key[1] = b'b';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key[10..].copy_from_slice(episode_digest);
+    key
+}
+
 /// [`strike_key`] in `SetVersionstampedKey` parameter form.
 #[must_use]
 pub fn strike_versionstamped_key(account: AccountId) -> [u8; 24] {
@@ -2296,6 +2310,169 @@ pub fn strike_account_range_end(account: AccountId) -> Vec<u8> {
         }
     }
     vec![b'y', b'b']
+}
+
+// ---------------------------------------------------------------------------
+// Restore-hold index: `yc/{source node}/{entity}/{filing LSN}/{product}`
+// ---------------------------------------------------------------------------
+
+/// The `y`-family discriminator for the restore-hold join.
+///
+/// `ya` is the strike ledger and `yb` is the episode-dedup row.  This index is
+/// deliberately a third, independent subspace: its rows are projections of
+/// those products, not another representation of either product.
+pub const RESTORE_HOLD_DISCRIMINATOR: u8 = b'c';
+
+const RESTORE_HOLD_PREFIX_LEN: usize = 2 + 32 + 8 + 16;
+const RESTORE_HOLD_STRIKE_KIND: u8 = b'a';
+const RESTORE_HOLD_ANNULMENT_KIND: u8 = b'b';
+
+/// One durable product named by a restore-hold index key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreHoldProduct {
+    /// A `ya` strike row, named by its account and committed versionstamp.
+    Strike {
+        /// The account prefix of the strike product.
+        account: AccountId,
+        /// The FDB versionstamp suffix of the strike key.
+        versionstamp: [u8; 10],
+    },
+    /// An `intent/` row whose finality became `Annulled`.
+    Annulment {
+        /// The durable intent key's id component.
+        intent_id: u128,
+    },
+}
+
+impl RestoreHoldProduct {
+    /// A stable, operator-facing spelling of the product's actual FDB key.
+    #[must_use]
+    pub fn stable_key(self) -> String {
+        match self {
+            Self::Strike {
+                account,
+                versionstamp,
+            } => format!("ya/{:016x}/{}", account.0, versionstamp_hex(&versionstamp)),
+            Self::Annulment { intent_id } => format!("i/{intent_id:032x}"),
+        }
+    }
+}
+
+fn versionstamp_hex(versionstamp: &[u8; 10]) -> String {
+    use core::fmt::Write as _;
+
+    let mut text = String::with_capacity(20);
+    for byte in versionstamp {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// `yc || source_node || entity || filing_lsn`, the common ordered prefix.
+fn restore_hold_prefix(source_node: &NodeId, entity: PersistId, filing_lsn: Lsn) -> Vec<u8> {
+    let mut key = vec![0; RESTORE_HOLD_PREFIX_LEN];
+    key[0] = b'y';
+    key[1] = b'c';
+    key[2..34].copy_from_slice(source_node.as_bytes());
+    key[34..42].copy_from_slice(&entity.0.to_be_bytes());
+    key[42..50].copy_from_slice(&filing_lsn.segment.to_be_bytes());
+    key[50..58].copy_from_slice(&filing_lsn.offset.to_be_bytes());
+    key
+}
+
+/// A `SetVersionstampedKey` parameter for the index of one `ya` strike.
+///
+/// The versionstamp is substituted in the same FDB transaction as the strike
+/// key, so the product name returned to an operator names the exact `ya` row.
+#[must_use]
+pub fn restore_hold_strike_versionstamped_key(
+    source_node: &NodeId,
+    entity: PersistId,
+    filing_lsn: Lsn,
+    account: AccountId,
+) -> Vec<u8> {
+    let mut key = restore_hold_prefix(source_node, entity, filing_lsn);
+    key.push(RESTORE_HOLD_STRIKE_KIND);
+    key.extend_from_slice(&account.0.to_be_bytes());
+    let versionstamp_offset = u32::try_from(key.len()).expect("restore hold key fits u32");
+    key.extend_from_slice(&[0; 10]);
+    key.extend_from_slice(&versionstamp_offset.to_le_bytes());
+    key
+}
+
+/// The ordinary index key for one annulled `intent/` product.
+#[must_use]
+pub fn restore_hold_annulment_key(
+    source_node: &NodeId,
+    entity: PersistId,
+    filing_lsn: Lsn,
+    intent_id: u128,
+) -> Vec<u8> {
+    let mut key = restore_hold_prefix(source_node, entity, filing_lsn);
+    key.push(RESTORE_HOLD_ANNULMENT_KIND);
+    key.extend_from_slice(&intent_id.to_be_bytes());
+    key
+}
+
+/// The inclusive-start range key for a source/entity LSN selection.
+#[must_use]
+pub fn restore_hold_range_start(source_node: &NodeId, entity: PersistId, lsn: Lsn) -> Vec<u8> {
+    restore_hold_prefix(source_node, entity, lsn)
+}
+
+/// Exclusive end for a source/entity LSN selection.
+///
+/// At the representable LSN maximum, this becomes the next entity prefix;
+/// that is the only key after every possible LSN under the selected entity.
+#[must_use]
+pub fn restore_hold_range_end(source_node: &NodeId, entity: PersistId, lsn: Lsn) -> Vec<u8> {
+    if lsn.offset < u64::MAX {
+        return restore_hold_prefix(source_node, entity, Lsn::new(lsn.segment, lsn.offset + 1));
+    }
+    if lsn.segment < u64::MAX {
+        return restore_hold_prefix(source_node, entity, Lsn::new(lsn.segment + 1, 0));
+    }
+    let mut prefix = Vec::with_capacity(2 + 32 + 8);
+    prefix.push(b'y');
+    prefix.push(b'c');
+    prefix.extend_from_slice(source_node.as_bytes());
+    prefix.extend_from_slice(&entity.0.to_be_bytes());
+    for byte in prefix.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            return prefix;
+        }
+    }
+    vec![b'z']
+}
+
+/// Decode an index key into its source, entity, LSN and durable product.
+#[must_use]
+pub fn decode_restore_hold_key(key: &[u8]) -> Option<(NodeId, PersistId, Lsn, RestoreHoldProduct)> {
+    if key.len() < RESTORE_HOLD_PREFIX_LEN + 1
+        || key[0] != b'y'
+        || key[1] != RESTORE_HOLD_DISCRIMINATOR
+    {
+        return None;
+    }
+    let source_node = NodeId::from_bytes(key[2..34].try_into().ok()?).ok()?;
+    let entity = PersistId::new(u64::from_be_bytes(key[34..42].try_into().ok()?));
+    let lsn = Lsn::new(
+        u64::from_be_bytes(key[42..50].try_into().ok()?),
+        u64::from_be_bytes(key[50..58].try_into().ok()?),
+    );
+    let product = match key[58] {
+        RESTORE_HOLD_STRIKE_KIND if key.len() == 77 => RestoreHoldProduct::Strike {
+            account: AccountId::new(u64::from_be_bytes(key[59..67].try_into().ok()?)),
+            versionstamp: key[67..77].try_into().ok()?,
+        },
+        RESTORE_HOLD_ANNULMENT_KIND if key.len() == 75 => RestoreHoldProduct::Annulment {
+            intent_id: u128::from_be_bytes(key[59..75].try_into().ok()?),
+        },
+        _ => return None,
+    };
+    Some((source_node, entity, lsn, product))
 }
 
 #[cfg(test)]
@@ -3828,11 +4005,28 @@ mod tests {
                 prefix: b'y',
                 name: "strike",
                 kinds: Kinds::SubKinds {
-                    table: vec![SubKind {
-                        discriminator: b'a',
-                        name: "strike/ya account facts",
-                        sample: strike_key(AccountId::new(1)).to_vec(),
-                    }],
+                    table: vec![
+                        SubKind {
+                            discriminator: b'a',
+                            name: "strike/ya account facts",
+                            sample: strike_key(AccountId::new(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'b',
+                            name: "strike/yb episode dedup",
+                            sample: strike_episode_key(AccountId::new(1), &[0; 32]).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'c',
+                            name: "strike/yc restore holds",
+                            sample: restore_hold_annulment_key(
+                                &node(1),
+                                PersistId::new(1),
+                                Lsn::new(0, 0),
+                                1,
+                            ),
+                        },
+                    ],
                 },
             },
             Family {

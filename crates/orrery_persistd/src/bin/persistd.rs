@@ -1577,6 +1577,16 @@ async fn main() -> anyhow::Result<()> {
                     orrery_persistd::archive::ArchiveTailerConfig::default(),
                 )
                 .await?;
+                if let Some(executor) = intent_executor
+                    .lock()
+                    .expect("intent executor capture lock poisoned")
+                    .as_ref()
+                {
+                    executor.configure_restore_hold_index(
+                        gateway.id(),
+                        Arc::clone(runtime_for_shutdown.journal()),
+                    );
+                }
                 tracing::info!(
                     dir = %dir.display(),
                     prefix = %cli.archive_prefix,
@@ -1584,7 +1594,13 @@ async fn main() -> anyhow::Result<()> {
                     "archive tailer started"
                 );
                 let restore_control = cli.restore_request.clone().map(|path| {
-                    let planner = orrery_persistd::archive::RestorePlanner::new(store, index);
+                    let holds: Arc<dyn orrery_persistd::archive::RestoreHoldDetector> = Arc::new(
+                        orrery_persistd::archive::FdbRestoreHoldDetector::from_database(
+                            context.database(),
+                        ),
+                    );
+                    let planner = orrery_persistd::archive::RestorePlanner::new(store, index)
+                        .with_hold_detector(holds);
                     restore_control::spawn_restore_control(
                         restore_control::RestoreControlContext::new(
                             planner,
