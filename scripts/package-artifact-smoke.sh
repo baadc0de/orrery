@@ -494,19 +494,36 @@ INFO
         result FAIL extracted-launch \
             "the extracted $asset exited $launch_status when launched from its own folder (log: $work/launch.log)"
     fi
-    if [[ -f $data_dir/smoke.jsonl ]]; then
-        result PASS launch-writes-to-data-dir "$data_dir/smoke.jsonl"
+    # Owner decision, 2026-09-02: artifacts land in the launch folder, because
+    # a volunteer trusts files that appear where she started the game and can
+    # find them to send back. So the check is no longer "the folder is
+    # untouched" — it is "the folder gains the client's own artifacts and
+    # nothing else". A stray `target/` is still the bug this leg was written
+    # for; it is just no longer the only thing that would be written.
+    if [[ -f $extraction/smoke.jsonl ]]; then
+        result PASS launch-writes-beside-the-binary "$extraction/smoke.jsonl"
     else
-        result FAIL launch-writes-to-data-dir \
-            "nothing was written under the per-user application data directory $data_dir"
+        result FAIL launch-writes-beside-the-binary \
+            "nothing was written into the launch folder $extraction"
+    fi
+    if [[ ! -d $data_dir ]]; then
+        result PASS launch-writes-nowhere-hidden "no per-user data directory was created"
+    else
+        result FAIL launch-writes-nowhere-hidden \
+            "the client wrote to the hidden per-user directory $data_dir instead of its launch folder"
     fi
     local stray
-    stray="$(list_entries "$extraction")"
+    # Both sides stay newline-separated and sorted, the shape `$expected` was
+    # built in; the client's own artifacts are filtered out so what remains is
+    # only what the archive shipped.
+    stray="$(list_entries "$extraction" \
+        | grep -vE '^(smoke|session)\.jsonl$|\.join\.json$|^uploads?$')"
     if [[ $stray == "$expected" ]]; then
-        result PASS launch-leaves-folder-alone 'the extraction folder is unchanged'
+        result PASS launch-writes-only-its-own-artifacts \
+            'the launch folder gained only the client artifacts'
     else
-        result FAIL launch-leaves-folder-alone \
-            "launching wrote into the volunteer's folder; it now holds [$(echo $stray)]"
+        result FAIL launch-writes-only-its-own-artifacts \
+            "launching left something that is not a client artifact; the folder holds [$(echo $stray)]"
     fi
 
     # ── and again from a folder she cannot write ──
@@ -530,20 +547,33 @@ INFO
             result FAIL read-only-launch \
                 "the extracted $asset exited $ro_status from a read-only folder (log: $work/read-only.log)"
         fi
-        # #772's message. A client that degrades here is a client whose
-        # artifacts still resolve against the launch directory: the session
-        # plays and banks nothing, which is what #773 cost a volunteer.
+        # Owner decision, 2026-09-02: artifacts resolve against the launch
+        # directory, so a folder the volunteer cannot write is a folder the
+        # session cannot record in. That is the documented cost, and
+        # PLAYTEST.md tells her to extract somewhere she owns.
+        #
+        # What must stay true is that the cost is *legible*. A silent
+        # degradation is what #773 cost a volunteer: a session that plays and
+        # banks nothing. So the client must SAY it cannot record, and this leg
+        # now fails when it stays quiet — the inverse of what it asserted while
+        # artifacts lived in a per-user directory.
         if grep -qF 'cannot open telemetry' "$work/read-only.log"; then
-            result FAIL read-only-recording-available \
-                "the client reported its recording unavailable, so this session would bank nothing (log: $work/read-only.log)"
+            result PASS read-only-refusal-is-legible \
+                'the client said it cannot record, so the volunteer can act on it'
         else
-            result PASS read-only-recording-available 'the session records'
+            result FAIL read-only-refusal-is-legible \
+                "the client said nothing about being unable to record, so this session would bank nothing silently (log: $work/read-only.log)"
         fi
-        if [[ -f $ro_data_dir/session.jsonl ]]; then
-            result PASS read-only-writes-to-data-dir "$ro_data_dir/session.jsonl"
+        # The counterpart of the leg above: artifacts follow the launch
+        # folder, so a read-only launch must NOT have quietly diverted them to
+        # a hidden per-user directory. If it had, the volunteer would be
+        # banking hours into a location nobody told her about.
+        if [[ ! -d $ro_data_dir ]]; then
+            result PASS read-only-writes-nowhere-hidden \
+                'a read-only launch diverted nothing to a hidden directory'
         else
-            result FAIL read-only-writes-to-data-dir \
-                "a read-only launch wrote nothing under $ro_data_dir, so its artifacts still resolve against the launch folder"
+            result FAIL read-only-writes-nowhere-hidden \
+                "a read-only launch wrote to the hidden directory $ro_data_dir instead of refusing visibly"
         fi
         make_writable "$read_only"
         local ro_entries
@@ -615,8 +645,9 @@ INFO
 st_dir=
 
 # A stand-in for the shipped binary: same command surface, same write
-# behaviour, and -- in the `cwd-relative` arm -- the pre-#775 habit of
-# resolving its artifacts against the current working directory.
+# behaviour, and -- in the `hidden-data-dir` arm -- the habit the owner
+# reverted on 2026-09-02: resolving artifacts against a per-user application
+# data directory the volunteer cannot find.
 write_fixture_client() { # path, label, behaviour
     cat >"$1" <<SH
 #!/usr/bin/env bash
@@ -628,11 +659,8 @@ if [[ ${1:-} == --build-info ]]; then
     echo '{"client_rev":"fixture","ruleset_version":19,"admission_url":"https://fixture.invalid"}'
     exit 0
 fi
-case "$label" in
-    x86_64-windows) data_dir="${LOCALAPPDATA:-}/Orrery/Regolith" ;;
-    aarch64-macos) data_dir="${HOME:-}/Library/Application Support/Orrery/Regolith" ;;
-    *) data_dir="${XDG_DATA_HOME:-}/orrery/regolith" ;;
-esac
+# Artifacts live beside the binary, where the volunteer launched it.
+data_dir=.
 file=session.jsonl
 for arg in "$@"; do
     [[ $arg == --smoke-test ]] && file=smoke.jsonl
@@ -647,10 +675,14 @@ if [[ $behaviour == read-only-crash ]]; then
         exit 101
     fi
 fi
-if [[ $behaviour == cwd-relative ]]; then
-    # #766 exactly: Cargo's build directory, relative to wherever the
-    # volunteer happened to launch from.
-    data_dir='target/regolith-client'
+if [[ $behaviour == hidden-data-dir ]]; then
+    # The behaviour reverted on 2026-09-02: artifacts diverted to a per-user
+    # directory, invisible to the volunteer and to anyone asking her for a log.
+    case "$label" in
+        x86_64-windows) data_dir="${LOCALAPPDATA:-}/Orrery/Regolith" ;;
+        aarch64-macos) data_dir="${HOME:-}/Library/Application Support/Orrery/Regolith" ;;
+        *) data_dir="${XDG_DATA_HOME:-}/orrery/regolith" ;;
+    esac
 fi
 if mkdir -p "$data_dir" 2>/dev/null && : >>"$data_dir/$file" 2>/dev/null; then
     :
@@ -828,8 +860,8 @@ $output"
         grep -Fq "SUMMARY PASS $NAME failures=0" <<<"$output" \
             || die "self-test: $label baseline emitted no passing summary"
         counts="$(st_counts "$output")"
-        [[ $counts == '18 0' ]] \
-            || die "self-test: $label baseline counted $counts pass/fail, expected 18 0"
+        [[ $counts == '19 0' ]] \
+            || die "self-test: $label baseline counted $counts pass/fail, expected 19 0"
         passing=$((passing + 1))
     done
 
@@ -838,8 +870,8 @@ $output"
     ((status == 0)) || die "self-test: join baseline failed
 $output"
     counts="$(st_counts "$output")"
-    [[ $counts == '23 0' ]] \
-        || die "self-test: join baseline counted $counts pass/fail, expected 23 0"
+    [[ $counts == '24 0' ]] \
+        || die "self-test: join baseline counted $counts pass/fail, expected 24 0"
     grep -Fq 'PASS artifact-join-seated ' <<<"$output" \
         || die 'self-test: join baseline did not observe the seating marker'
     passing=$((passing + 1))
@@ -889,24 +921,24 @@ $output"
     # The client still exits 0 -- #775 made an unwritable recording degradable
     # rather than fatal -- so an exit-status check would pass this. What fails
     # is where the writes went.
-    status=0; output="$(st_run x86_64-linux cwd-relative ordinary)" || status=$?
+    status=0; output="$(st_run x86_64-linux hidden-data-dir ordinary)" || status=$?
     ((status != 0)) || die "self-test: a CWD-relative artifact path passed
 $output"
     grep -Fq 'PASS extracted-launch ' <<<"$output" \
-        || die 'self-test: the cwd-relative mutation should still exit 0 from a writable folder'
-    grep -Fq 'FAIL launch-writes-to-data-dir ' <<<"$output" \
-        || die 'self-test: the cwd-relative mutation did not fail named check launch-writes-to-data-dir'
-    grep -Fq 'FAIL launch-leaves-folder-alone ' <<<"$output" \
-        || die 'self-test: the cwd-relative mutation did not fail named check launch-leaves-folder-alone'
-    grep -Fq 'FAIL read-only-recording-available ' <<<"$output" \
-        || die 'self-test: the cwd-relative mutation did not fail named check read-only-recording-available'
-    grep -Fq 'FAIL read-only-writes-to-data-dir ' <<<"$output" \
-        || die 'self-test: the cwd-relative mutation did not fail named check read-only-writes-to-data-dir'
+        || die 'self-test: the hidden-data-dir mutation should still exit 0 from a writable folder'
+    grep -Fq 'FAIL launch-writes-beside-the-binary ' <<<"$output" \
+        || die 'self-test: the hidden-data-dir mutation did not fail named check launch-writes-beside-the-binary'
+    grep -Fq 'FAIL launch-writes-nowhere-hidden ' <<<"$output" \
+        || die 'self-test: the hidden-data-dir mutation did not fail named check launch-writes-nowhere-hidden'
+    grep -Fq 'FAIL read-only-refusal-is-legible ' <<<"$output" \
+        || die 'self-test: the hidden-data-dir mutation did not fail named check read-only-refusal-is-legible'
+    grep -Fq 'FAIL read-only-writes-nowhere-hidden ' <<<"$output" \
+        || die 'self-test: the hidden-data-dir mutation did not fail named check read-only-writes-nowhere-hidden'
     grep -Fq 'PASS read-only-precondition ' <<<"$output" \
         || die 'self-test: the read-only stage could not be observed, so its failures mean nothing'
     counts="$(st_counts "$output")"
-    [[ $counts == '14 4' ]] \
-        || die "self-test: the cwd-relative mutation counted $counts pass/fail, expected 14 4"
+    [[ $counts == '15 4' ]] \
+        || die "self-test: the hidden-data-dir mutation counted $counts pass/fail, expected 15 4"
     mutations=$((mutations + 1))
 
     # ── #772 in its original form: dying instead of degrading ──
@@ -919,7 +951,7 @@ $output"
         || die 'self-test: the read-only-crash mutation should still launch from a writable folder'
     mutations=$((mutations + 1))
 
-    echo "$NAME: self-test passed ($passing baselines: three platform archives at 18 pass / 0 fail each, plus a campaign join at 23 / 0; $mutations mutations: stage-prefix and dropped-extension each fail manifest + shipped-name, readme-disagrees fails readme-names-binary with the manifest intact, bad-checksum fails checksum, cwd-relative fails launch-writes-to-data-dir + launch-leaves-folder-alone + read-only-recording-available + read-only-writes-to-data-dir at 14 pass / 4 fail while still exiting 0, read-only-crash fails read-only-launch)"
+    echo "$NAME: self-test passed ($passing baselines: three platform archives at 19 pass / 0 fail each, plus a campaign join at 24 / 0; $mutations mutations: stage-prefix and dropped-extension each fail manifest + shipped-name, readme-disagrees fails readme-names-binary with the manifest intact, bad-checksum fails checksum, hidden-data-dir fails launch-writes-beside-the-binary + launch-writes-nowhere-hidden + read-only-refusal-is-legible + read-only-writes-nowhere-hidden at 15 pass / 4 fail while still exiting 0, read-only-crash fails read-only-launch)"
 }
 
 while (($#)); do
