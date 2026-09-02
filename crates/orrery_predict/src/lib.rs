@@ -53,4 +53,7 @@ pub use monitor::{
 };
 pub use plugin::OrreryPredictPlugin;
 pub use tick::TickBridge;
-pub use wiring::{AppReconciliationExt, PredictSystems, PredictedBy, ReconciliationResidual};
+pub use wiring::{
+    AppInterpolationBasisExt, AppReconciliationExt, InterpolateWithBasis, PredictSystems,
+    PredictedBy, ReconciliationResidual, RenderedInterpBasis,
+};
