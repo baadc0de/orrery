@@ -394,6 +394,39 @@ pub struct PeerReport {
     pub deltas_with_superseded_keyframe: u64,
     /// Of those, deltas whose keyframe age underflowed their tick.
     pub deltas_with_invalid_reference: u64,
+    /// Sends this sender dropped for want of a session for the addressed peer.
+    ///
+    /// **Must be zero.** A peer that is rostered but never linked is built the
+    /// keyframe a new subscriber is owed, and every packet for it is dropped
+    /// against `no_session` (`crates/orrery_net/src/peer_link.rs`) with every
+    /// other host-side signal clean — connected, witness-anchored,
+    /// `downlink_dropped: 0`. That is the whole-attempt replication failure
+    /// #953 fixed, found by reading `send_peer_packets` rather than by
+    /// observing it; this row is what makes the next one observable (#954).
+    pub no_session_sends: u64,
+    /// Sends refused for exceeding the lane's size limit.
+    ///
+    /// **Must be zero.** A caller exceeding a budget it was sized against is
+    /// a defect at the call site, not a network condition.
+    pub oversized_sends: u64,
+    /// Inbound packets with no channel tag, or an unknown one.
+    ///
+    /// **Must be zero.** The tag is redundant with the lane the packet arrived
+    /// on, so a packet without one means the *sender's* framing has drifted
+    /// from this crate's.
+    pub untagged_inbound: u64,
+    /// State packets whose envelope decoded but whose body did not.
+    ///
+    /// **Must be zero.** Unlike `undecodable`, this is canonical state the
+    /// receiver's own codec refused — a rules mismatch between sender and
+    /// receiver, not noise on the wire.
+    pub bad_body: u64,
+    /// Unsheddable packets — control, witness, hit — sent while over budget.
+    ///
+    /// The lanes that cannot be shed are still being paid for, so a non-zero
+    /// value is a real overrun of the ceiling rather than an artefact of the
+    /// backstop (docs/03-replication.md §9.3).
+    pub unsheddable_over_budget: u64,
     /// Keyframes this sender built, charged, then discarded during a hitch.
     pub keyframes_discarded_while_stalled: u64,
     /// Deltas this sender built, charged, then discarded during a hitch.
@@ -618,6 +651,21 @@ pub struct SwarmReport {
     pub deltas_with_superseded_keyframe: u64,
     /// Unanchored deltas carrying an impossible keyframe reference.
     pub deltas_with_invalid_reference: u64,
+    /// Sends dropped swarm-wide for want of a session for the addressed peer.
+    /// See [`PeerReport::no_session_sends`]; **must be zero** (#954).
+    pub total_no_session_sends: u64,
+    /// Sends refused swarm-wide over a lane's size limit. See
+    /// [`PeerReport::oversized_sends`]; **must be zero**.
+    pub total_oversized_sends: u64,
+    /// Inbound packets swarm-wide with no channel tag. See
+    /// [`PeerReport::untagged_inbound`]; **must be zero**.
+    pub total_untagged_inbound: u64,
+    /// State packets swarm-wide whose body did not decode. See
+    /// [`PeerReport::bad_body`]; **must be zero**.
+    pub total_bad_body: u64,
+    /// Unsheddable packets swarm-wide sent while over budget. See
+    /// [`PeerReport::unsheddable_over_budget`].
+    pub total_unsheddable_over_budget: u64,
     /// Keyframes built and charged, then discarded during simulated hitches.
     pub keyframes_discarded_while_stalled: u64,
     /// Deltas built and charged, then discarded during simulated hitches.
@@ -751,6 +799,15 @@ pub struct LinkReport {
     pub delayed: u64,
     /// Wire bytes carried.
     pub bytes: u64,
+    /// Packets addressed to a peer the router does not know.
+    ///
+    /// **Must be zero on a settled run.** A sender addressing a peer the swarm
+    /// cannot seat means a roster names a node the transport never admitted.
+    /// The one benign window is the tick a released seat's roster entry
+    /// outlives the swarm's knowledge of it, which is why this is reported
+    /// rather than failed: the row is read at report time, after the window
+    /// has closed.
+    pub misaddressed: u64,
 }
 
 impl From<RouterCounters> for LinkReport {
@@ -760,6 +817,7 @@ impl From<RouterCounters> for LinkReport {
             dropped: counters.dropped,
             delayed: counters.delayed,
             bytes: counters.bytes,
+            misaddressed: counters.misaddressed,
         }
     }
 }
@@ -2907,6 +2965,7 @@ impl Swarm {
                 let replication_wire = bot.replication_wire_counters();
                 let witness = bot.witness_counters();
                 let links = bot.link_counters();
+                let peer_link = bot.peer_link_counters();
                 let convicted_at_tick = docket.first_conviction(bot.node);
                 PeerReport {
                     index,
@@ -2962,6 +3021,11 @@ impl Swarm {
                     deltas_missing_newer_keyframe: replica.deltas_missing_newer_keyframe,
                     deltas_with_superseded_keyframe: replica.deltas_with_superseded_keyframe,
                     deltas_with_invalid_reference: replica.deltas_with_invalid_reference,
+                    no_session_sends: peer_link.no_session,
+                    oversized_sends: peer_link.oversized,
+                    untagged_inbound: peer_link.untagged,
+                    bad_body: replica.bad_body,
+                    unsheddable_over_budget: bot.unsheddable_over_budget(),
                     keyframes_discarded_while_stalled: replication_wire
                         .keyframes_discarded_while_stalled,
                     deltas_discarded_while_stalled: replication_wire.deltas_discarded_while_stalled,
@@ -3138,6 +3202,11 @@ impl Swarm {
                 .iter()
                 .map(|p| p.deltas_with_invalid_reference)
                 .sum(),
+            total_no_session_sends: per_peer.iter().map(|p| p.no_session_sends).sum(),
+            total_oversized_sends: per_peer.iter().map(|p| p.oversized_sends).sum(),
+            total_untagged_inbound: per_peer.iter().map(|p| p.untagged_inbound).sum(),
+            total_bad_body: per_peer.iter().map(|p| p.bad_body).sum(),
+            total_unsheddable_over_budget: per_peer.iter().map(|p| p.unsheddable_over_budget).sum(),
             keyframes_discarded_while_stalled: replication_wire.keyframes_discarded_while_stalled,
             deltas_discarded_while_stalled: replication_wire.deltas_discarded_while_stalled,
             total_replicas: per_peer.iter().map(|p| p.replicas).sum(),
@@ -4487,6 +4556,11 @@ mod tests {
             deltas_missing_newer_keyframe: 0,
             deltas_with_superseded_keyframe: 0,
             deltas_with_invalid_reference: 0,
+            total_no_session_sends: 0,
+            total_oversized_sends: 0,
+            total_untagged_inbound: 0,
+            total_bad_body: 0,
+            total_unsheddable_over_budget: 0,
             keyframes_discarded_while_stalled: 0,
             deltas_discarded_while_stalled: 0,
             total_replicas: 992,
@@ -4536,6 +4610,7 @@ mod tests {
                 dropped: 66_520,
                 delayed: 0,
                 bytes: 0,
+                misaddressed: 0,
             },
             late_join: Some(LateJoinReport {
                 neighbourhood: 27,
@@ -5532,6 +5607,215 @@ mod tests {
         assert!(
             saw_confirmation,
             "the host target's authoritative step must route its reply to the exterior entity"
+        );
+    }
+
+    // ── Fault counters surfaced in the report (#954) ──────────────────────
+    //
+    // #953's whole-attempt replication failure was invisible because its
+    // counter had no reader. Each test below trips one fault path and asserts
+    // the report row an operator reads carries it.
+
+    /// Two bots, island formed, so replication runs and the fault counters
+    /// start from a healthy, exchanging pair.
+    fn formed_pair() -> Swarm {
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 2,
+            ..SwarmConfig::default()
+        });
+        swarm.form_island();
+        swarm
+    }
+
+    fn ticks(swarm: &mut Swarm, count: u64) -> u64 {
+        let mut phase = [0u128; 6];
+        let send_every = (TICK_HZ / 20).max(1);
+        for tick in 0..count {
+            swarm.tick_once(tick, send_every, &mut phase);
+        }
+        count
+    }
+
+    /// The #953 signature, made observable: a rostered peer with no session.
+    ///
+    /// `refresh_rosters` now links before publishing, so this shape can no
+    /// longer arise from a late join — but any future wiring that seats a
+    /// peer into a roster without a session produces it again, and the
+    /// report row is where an operator sees it instead of an evening spent
+    /// reading `send_peer_packets`.
+    #[test]
+    fn a_rostered_peer_with_no_session_is_named_in_the_report() {
+        let mut swarm = formed_pair();
+        let target = swarm.bots[1].node;
+
+        // Sever bot 0's session for bot 1. The roster still names the seat,
+        // so every sender keeps building packets for it — the #953 shape.
+        let mut sessions = swarm.bots[0]
+            .app
+            .world_mut()
+            .query::<(bevy_ecs::prelude::Entity, &orrery_net::plugin::Peer)>();
+        let severed: Vec<_> = sessions
+            .iter(swarm.bots[0].app.world())
+            .filter(|(_, peer)| peer.id == target)
+            .map(|(entity, _)| entity)
+            .collect();
+        assert_eq!(severed.len(), 1, "the session under test exists");
+        for entity in severed {
+            swarm.bots[0].app.world_mut().despawn(entity);
+        }
+        assert!(
+            !swarm.bots[0].is_linked_to(target),
+            "the session is really gone"
+        );
+
+        ticks(&mut swarm, 60);
+        let report = swarm.report(60, None);
+        assert!(
+            report.per_peer[0].no_session_sends >= 1,
+            "sends dropped for want of a session must be visible in the report row, got {}",
+            report.per_peer[0].no_session_sends
+        );
+        assert!(report.total_no_session_sends >= 1);
+        assert_eq!(
+            report.per_peer[1].no_session_sends, 0,
+            "only the sender whose session was severed drops sends"
+        );
+    }
+
+    #[test]
+    fn an_oversized_send_is_named_in_the_report() {
+        let mut swarm = formed_pair();
+        let peer = swarm.bots[1].node;
+        // One byte over the framed MTU: payload + channel tag.
+        swarm.bots[0]
+            .app
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<orrery_net::SendPacket>>()
+            .write(orrery_net::SendPacket::state(
+                peer,
+                Bytes::from(vec![0u8; 1_300]),
+            ));
+        swarm.tick_once(0, 3, &mut [0u128; 6]);
+
+        let report = swarm.report(1, None);
+        assert_eq!(
+            report.per_peer[0].oversized_sends, 1,
+            "a send refused over the lane's size limit must be visible in the report row"
+        );
+        assert_eq!(report.total_oversized_sends, 1);
+    }
+
+    #[test]
+    fn an_untagged_inbound_packet_is_named_in_the_report() {
+        let mut swarm = formed_pair();
+        // A raw datagram with no channel tag, pushed the way the IO layer
+        // pushes what arrives on the wire.
+        swarm.bots[0]
+            .app
+            .world_mut()
+            .query::<&mut aeronet_io::Session>()
+            .iter_mut(swarm.bots[0].app.world_mut())
+            .next()
+            .expect("a formed island holds a session")
+            .recv
+            .push(aeronet_io::packet::RecvPacket {
+                recv_at: bevy_platform::time::Instant::now(),
+                payload: Bytes::from_static(&[0xFF]),
+            });
+        swarm.tick_once(0, 3, &mut [0u128; 6]);
+
+        let report = swarm.report(1, None);
+        assert_eq!(
+            report.per_peer[0].untagged_inbound, 1,
+            "inbound framing that carries no channel tag must be visible in the report row"
+        );
+        assert_eq!(report.total_untagged_inbound, 1);
+    }
+
+    #[test]
+    fn a_state_packet_whose_body_does_not_decode_is_named_in_the_report() {
+        let mut swarm = formed_pair();
+        let sender = swarm.bots[1].node;
+        // A well-formed replication envelope carrying canonical bytes no
+        // codec accepts as `RegolithState`: an envelope failure is
+        // `undecodable`, a body failure is `bad_body`, and the report keeps
+        // the two apart.
+        let cell = orrery_protocol::CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL)
+            .expect("origin cell");
+        let inner = orrery_protocol::channels::encode_replication(&(
+            b"not a craft".to_vec(),
+            cell,
+            orrery_protocol::PersistId(0),
+            0_u64,
+        ));
+        swarm.bots[0]
+            .app
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<orrery_net::PeerPacket>>()
+            .write(orrery_net::PeerPacket {
+                from: sender,
+                channel: orrery_net::channels::Channel::State,
+                // `encode_replication` emits the full channel-tagged frame the
+                // receive lane hands a replica reader.
+                payload: Bytes::from(inner),
+            });
+        swarm.tick_once(0, 3, &mut [0u128; 6]);
+
+        let report = swarm.report(1, None);
+        assert_eq!(
+            report.per_peer[0].bad_body, 1,
+            "a body the receiver's own codec refuses must be visible in the report row"
+        );
+        assert_eq!(report.total_bad_body, 1);
+        assert_eq!(
+            report.per_peer[0].undecodable, 0,
+            "the envelope decoded; this is a body failure, not an envelope failure"
+        );
+    }
+
+    #[test]
+    fn a_control_lane_overrun_is_named_in_the_report() {
+        let mut swarm = formed_pair();
+        let peer = swarm.bots[1].node;
+        // Control is unsheddable: once the window is spent the sends still go
+        // out, and the overrun is counted rather than shed away
+        // (docs/03-replication.md §9.3).
+        {
+            let mut messages = swarm.bots[0]
+                .app
+                .world_mut()
+                .resource_mut::<bevy_ecs::message::Messages<orrery_net::SendPacket>>();
+            for _ in 0..64 {
+                messages.write(orrery_net::SendPacket::control(
+                    peer,
+                    Bytes::from(vec![0u8; 64_000]),
+                ));
+            }
+        }
+        swarm.tick_once(0, 3, &mut [0u128; 6]);
+
+        let report = swarm.report(1, None);
+        assert!(
+            report.per_peer[0].unsheddable_over_budget >= 1,
+            "an overrun the backstop could not shed must be visible in the report row, got {}",
+            report.per_peer[0].unsheddable_over_budget
+        );
+        assert!(report.total_unsheddable_over_budget >= 1);
+    }
+
+    #[test]
+    fn a_misaddressed_send_is_named_in_the_report() {
+        let mut swarm = formed_pair();
+        // The swarm forgets the seat while its roster entry survives: the
+        // release window a sender can address into.
+        swarm.index_of.remove(&swarm.bots[1].node);
+        ticks(&mut swarm, 30);
+
+        let report = swarm.report(30, None);
+        assert!(
+            report.link.misaddressed >= 1,
+            "packets addressed to a peer the swarm cannot seat must be visible in the report, got {}",
+            report.link.misaddressed
         );
     }
 }

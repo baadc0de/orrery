@@ -1336,6 +1336,71 @@ fn main() -> Result<()> {
         report.link.delivered,
         report.link.dropped,
     );
+    // The fault counters, printed even at zero. A counter that is incremented
+    // but never surfaced is worse than no counter, because it creates the
+    // impression the condition is monitored — which is how `no_session` hid a
+    // whole-attempt replication failure behind a clean report (#954). One line
+    // per run is the whole cost of the zeros; the non-zero lines below name
+    // what each counter exists to catch.
+    eprintln!(
+        "gates/p1-swarm: fault counters — no_session {}, oversized {}, untagged {}, bad_body {}, unsheddable_over_budget {}, misaddressed {}",
+        report.total_no_session_sends,
+        report.total_oversized_sends,
+        report.total_untagged_inbound,
+        report.total_bad_body,
+        report.total_unsheddable_over_budget,
+        report.link.misaddressed,
+    );
+    if report.total_no_session_sends > 0 {
+        let seats = report
+            .per_peer
+            .iter()
+            .filter(|peer| peer.no_session_sends > 0)
+            .map(|peer| format!("{}:{}", peer.index, peer.no_session_sends))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "gates/p1-swarm: no_session > 0 — {} send(s) dropped because the addressed peer had no \
+             session (seat:count {seats}); a rostered peer without a link loses every packet built \
+             for it, keyframes included, while every host-side signal stays clean (#953, #954)",
+            report.total_no_session_sends,
+        );
+    }
+    if report.total_oversized_sends > 0 {
+        eprintln!(
+            "gates/p1-swarm: oversized > 0 — {} send(s) refused over a lane's size limit; a caller \
+             exceeded a budget it was sized against, which is a defect at the call site (#954)",
+            report.total_oversized_sends,
+        );
+    }
+    if report.total_untagged_inbound > 0 {
+        eprintln!(
+            "gates/p1-swarm: untagged > 0 — {} inbound packet(s) carried no channel tag; a sender's \
+             framing has drifted from this crate's (#954)",
+            report.total_untagged_inbound,
+        );
+    }
+    if report.total_bad_body > 0 {
+        eprintln!(
+            "gates/p1-swarm: bad_body > 0 — {} state packet(s) decoded at the envelope but not as \
+             state; the sender and this receiver disagree about the rules (#954)",
+            report.total_bad_body,
+        );
+    }
+    if report.total_unsheddable_over_budget > 0 {
+        eprintln!(
+            "gates/p1-swarm: unsheddable_over_budget > 0 — {} control/witness/hit packet(s) sent \
+             while over budget; the overrun was real, not an artefact of shedding (docs/03 §9.3, #954)",
+            report.total_unsheddable_over_budget,
+        );
+    }
+    if report.link.misaddressed > 0 {
+        eprintln!(
+            "gates/p1-swarm: misaddressed > 0 — {} packet(s) addressed to a peer the router does not \
+             know; a roster names a seat the transport never admitted (#954)",
+            report.link.misaddressed,
+        );
+    }
     if let Some(margin) = &report.interest_margin {
         eprintln!(
             "gates/p1-swarm: swept interest margin installed {:.2} cells mean ({} min, {} max) across {} peer-refresh samples",
