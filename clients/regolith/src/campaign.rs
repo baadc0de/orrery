@@ -1604,6 +1604,27 @@ impl CampaignRuntime {
         runtime
     }
 
+    /// A session that drove joined ticks and then lost its host, which is what
+    /// seat 6 of the 2026-09-02 attempt was for its last seven seconds (#942).
+    #[cfg(test)]
+    pub(crate) fn close_for_test(&mut self) {
+        self.state = JoinState::Closed {
+            host_said_goodbye: false,
+        };
+    }
+
+    /// A session that adopted the host's `StartV1` manifest (#942).
+    #[cfg(test)]
+    pub(crate) fn adopt_start_for_test(&mut self, start: crate::lobby::AcceptedStart) {
+        self.start = Some(start);
+    }
+
+    /// A dial the host turned away: no joined tick, nothing measured (#942).
+    #[cfg(test)]
+    pub(crate) fn refuse_for_test(&mut self, why: &str) {
+        self.state = JoinState::Refused(why.to_owned());
+    }
+
     /// Diagnostics for the F3 pane's session line.
     #[must_use]
     pub fn summary_line(&self) -> String {

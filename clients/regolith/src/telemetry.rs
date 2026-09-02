@@ -14,9 +14,14 @@ use orrery_protocol::PersistId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionScope {
-    /// No live campaign link backed this row.
+    /// Local practice: this row belongs to a session that banks nothing.
     Local,
-    /// A joined campaign link backed this row.
+    /// This row belongs to a campaign session, and its minutes are bankable.
+    ///
+    /// The scope of the *session*, not of the instant: a campaign session
+    /// whose host link has dropped keeps this scope, because the minutes it
+    /// already flew were flown against a host. Reporting `Local` there put
+    /// `banked_minutes: 12.93` on a row claiming to be local practice (#942).
     Campaign,
 }
 
@@ -49,8 +54,18 @@ pub struct OverlayMetrics {
     pub observed_jitter_p99_ms: u64,
     /// Configured jitter.
     pub configured_jitter_ms: u64,
-    /// Current island identifier, if joined.
-    pub island_id: Option<u64>,
+    /// The host's attempt generation, once a `StartV1` manifest has been
+    /// adopted.
+    ///
+    /// This replaces `island_id` (#942), which was declared, defaulted to
+    /// `None`, emitted on every row and printed on the HUD without ever being
+    /// assigned anywhere in the client — a field that is always null while
+    /// being presented as state is worse than absent, and it read identically
+    /// in a campaign and in local practice. The attempt id is the join between
+    /// a client's rows and the host's attempt report, which is exactly what
+    /// had to be reconstructed by hand when the 2026-09-02 sessions were
+    /// triaged.
+    pub attempt_id: Option<String>,
     /// Current cell identifier, if known.
     pub cell_id: Option<u64>,
     /// Session record path displayed to the operator.
@@ -79,7 +94,7 @@ impl OverlayMetrics {
             observed_jitter_p50_ms: 0,
             observed_jitter_p99_ms: 0,
             configured_jitter_ms: 0,
-            island_id: None,
+            attempt_id: None,
             cell_id: None,
             session_record_path,
             banked_minutes: 0.0,
@@ -286,7 +301,7 @@ mod tests {
             "observed_jitter_p50_ms",
             "observed_jitter_p99_ms",
             "configured_jitter_ms",
-            "island_id",
+            "attempt_id",
             "cell_id",
             "session_record_path",
             "banked_minutes",
