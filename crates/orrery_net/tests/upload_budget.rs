@@ -25,10 +25,11 @@ use orrery_net::plugin::Peer;
 use orrery_net::{SendPacket, StreamMode};
 use orrery_protocol::{
     channels::{
-        encode_delta_patch, encode_replication, encode_replication_delta, ReplicationDelta,
-        TAG_REPLICATION, TAG_REPLICATION_DELTA,
+        encode_delta_patch, encode_hit, encode_replication, encode_replication_delta,
+        ReplicationDelta, TAG_HIT, TAG_REPLICATION, TAG_REPLICATION_DELTA,
     },
-    NodeId, PersistId,
+    HitClaim, HitMsg, HitSurface, InterpBasis, LatticePoint, NodeId, PersistId, QuantizedDir,
+    QuantizedRay, Tick, WeaponRef,
 };
 
 const MTU: usize = 1_200;
@@ -111,6 +112,22 @@ fn state_subtag(payload: &[u8]) -> Option<u8> {
 fn replication_subtag(packet: &[u8]) -> Option<u8> {
     let (_, payload) = untag(packet)?;
     state_subtag(payload)
+}
+
+fn hit_claim() -> HitMsg {
+    HitMsg::Claim(HitClaim {
+        shooter: PersistId::new(1),
+        target: PersistId::new(2),
+        weapon: WeaponRef(1),
+        fire_tick: Tick::new(100),
+        basis: InterpBasis::exact(Tick::new(95)),
+        ray: QuantizedRay {
+            origin: LatticePoint::new(0, 0, 0),
+            direction: QuantizedDir::new(1, 0, 0),
+        },
+        claimed: HitSurface(0),
+        input_seq: 1,
+    })
 }
 
 #[test]
@@ -240,6 +257,49 @@ fn control_still_goes_out_when_state_is_being_shed() {
     // Sent = whatever state fit, plus all five control packets.
     let sent = queued_for_io(&mut app);
     assert_eq!(sent + shed as usize, cap + 205);
+}
+
+#[test]
+fn hit_claims_survive_upload_pressure_ahead_of_replication() {
+    // A hit claim is small, latency-critical input retried until its verdict.
+    // Flooding the State lane with bulk snapshots must not discard it before
+    // the next replication update, which will supersede the one we shed.
+    let peer = secret(1).public();
+    let mut app = app(&[peer]);
+    queue(&mut app, peer, Channel::State, allowance() + 200);
+    app.world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .write(SendPacket::state(
+            peer,
+            bytes::Bytes::from(encode_hit(&hit_claim())),
+        ));
+
+    app.update();
+
+    let sent = app
+        .world_mut()
+        .query::<&aeronet_io::Session>()
+        .iter(app.world())
+        .next()
+        .expect("test session")
+        .send
+        .iter()
+        .filter_map(|packet| replication_subtag(packet))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sent.iter().filter(|&&subtag| subtag == TAG_HIT).count(),
+        1,
+        "the hit claim must be admitted before replication is shed"
+    );
+    let meter = app.world().resource::<UploadMeter>();
+    assert!(
+        meter.shed > 0,
+        "the replication flood must actually be shed"
+    );
+    assert!(
+        meter.lanes.hit_bytes > 0,
+        "hit traffic gets its own accounting lane"
+    );
 }
 
 #[test]
