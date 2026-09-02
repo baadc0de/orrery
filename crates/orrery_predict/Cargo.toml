@@ -15,12 +15,17 @@ license = "MIT OR Apache-2.0"
 avian = []
 
 [dependencies]
+orrery_net = { path = "../orrery_net" }
 orrery_protocol = { path = "../orrery_protocol" }
 bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_platform = { workspace = true }
 bevy_time = { workspace = true }
+bytes = { workspace = true }
 lightyear = { workspace = true }
+# Internal to the lightyear-facing seam: the combined P2P role must normalize
+# 0.29's channel map to the pinned Replicon backend's directional namespaces.
+lightyear_replication = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

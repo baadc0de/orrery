@@ -1,11 +1,8 @@
 //! The first running consumer of `OrreryClientPlugins` (#873).
 //!
-//! The first test is the positive proof the current facade can make: two full
-//! `MinimalPlugins` apps start without panicking, open real iroh endpoints,
-//! connect, and discover the other peer. The second is a characterization of
-//! the rot that stops the requested proof there. It attempts to replicate one
-//! registered payload, then names the missing bridge instead of replacing it
-//! with a test-only transport and claiming convergence.
+//! Two full `MinimalPlugins` apps start, open real iroh endpoints, connect,
+//! discover the other peer, and carry one registered entity through the
+//! facade's production P2P replication bridge.
 
 mod support;
 
@@ -17,14 +14,54 @@ use bevy::ecs::system::EntityCommand;
 use bevy::prelude::*;
 use bevy::MinimalPlugins;
 use bevy_state::app::StatesPlugin;
-use lightyear::prelude::{NetworkTarget, Replicate};
+use lightyear::prelude::{
+    AppComponentExt, Diffable, InterpolationRegistrationExt, NetworkTarget, Predicted,
+    PredictionBuilderExt, PredictionTarget, Replicate,
+};
 use orrery::{OrreryClientPlugins, OrreryConfig};
 use orrery_net::plugin::{NetConfig, PeerRegistry, ALPN};
+use orrery_predict::{
+    AppReconciliationExt, PredictedBy, ReconciliationMonitor, ReconciliationResidual, TrackKey,
+};
+use orrery_protocol::PersistId;
 use orrery_replicon::{OrreryRepliconAppExt, ReplicatedPayload};
+use serde::{Deserialize, Serialize};
 
 use support::Synthetic;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Component)]
+struct PredictedPosition(i64);
+
+impl Diffable for PredictedPosition {
+    fn base_value() -> Self {
+        Self::default()
+    }
+
+    fn diff(&self, new: &Self) -> Self {
+        Self(new.0 - self.0)
+    }
+
+    fn apply_diff(&mut self, delta: &Self) {
+        self.0 += delta.0;
+    }
+}
+
+impl ReconciliationResidual for PredictedPosition {
+    fn pos_error_mm(&self) -> i64 {
+        self.0.abs()
+    }
+}
+
+fn interpolate_position(
+    start: PredictedPosition,
+    end: PredictedPosition,
+    t: f32,
+) -> PredictedPosition {
+    let delta = (end.0 - start.0) as f32;
+    PredictedPosition(start.0 + (delta * t).round() as i64)
+}
 
 fn secret(seed: u8) -> iroh::SecretKey {
     let mut bytes = [0_u8; 32];
@@ -45,6 +82,12 @@ fn client(seed: u8) -> App {
         }),
     ));
     app.replicate::<ReplicatedPayload<i64>>();
+    app.component::<PredictedPosition>()
+        .replicate()
+        .add_interpolation_with(interpolate_position)
+        .predict()
+        .add_correction_fn::<PredictedPosition>(interpolate_position);
+    app.track_reconciliation::<PredictedPosition>();
     app.finish();
     app
 }
@@ -122,46 +165,79 @@ fn two_facades_start_and_discover_over_real_iroh_endpoints() {
     let right_peer = right.world().resource::<PeerRegistry>().peers[0].1.id;
     assert_eq!(left_peer, secret(2).public());
     assert_eq!(right_peer, secret(1).public());
-}
 
-#[test]
-fn connected_iroh_sessions_do_not_become_replication_capable_lightyear_links() {
-    let mut left = client(3);
-    let mut right = client(4);
-    connect_pair(&mut left, &mut right);
+    let authoritative = left
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+            ReplicatedPayload(41_i64),
+            PredictedPosition(41),
+        ))
+        .id();
 
-    let left_session = left.world().resource::<PeerRegistry>().peers[0].0;
-    let right_session = right.world().resource::<PeerRegistry>().peers[0].0;
-    assert!(
-        left.world()
-            .get::<lightyear::prelude::Link>(left_session)
-            .is_none()
-            && right
-                .world()
-                .get::<lightyear::prelude::Link>(right_session)
-                .is_none(),
-        "orrery_net sessions unexpectedly became lightyear links; update the #873 finding and turn this into a convergence test"
+    wait_until(
+        &mut left,
+        &mut right,
+        "for the registered entity state to converge through the facade bridge",
+        |_, right| {
+            right
+                .query::<&ReplicatedPayload<i64>>()
+                .iter(right)
+                .any(|payload| payload.0 == 41)
+        },
     );
 
-    left.world_mut().spawn((
-        Replicate::to_clients(NetworkTarget::All),
-        ReplicatedPayload(41_i64),
-    ));
-
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        left.update();
-        right.update();
-        thread::sleep(Duration::from_millis(5));
-    }
-
-    let received = right
+    let predicted = right
         .world_mut()
-        .query::<&ReplicatedPayload<i64>>()
+        .query_filtered::<Entity, (With<PredictedPosition>, With<Predicted>)>()
         .iter(right.world())
-        .any(|payload| payload.0 == 41);
-    assert!(
-        !received,
-        "the known missing transport bridge unexpectedly replicated; replace this characterization with state convergence and a genuine rollback"
+        .next()
+        .expect("the prediction target should produce a predicted receiver entity");
+    let persist_id = PersistId(889);
+    right.world_mut().entity_mut(predicted).insert(PredictedBy {
+        authority: secret(1).public(),
+        persist_id,
+    });
+
+    // Record a deliberately wrong local prediction in Lightyear's history.
+    right
+        .world_mut()
+        .entity_mut(predicted)
+        .insert(PredictedPosition(9_000));
+    thread::sleep(Duration::from_millis(25));
+    left.update();
+    right.update();
+
+    // The next authoritative update must force Lightyear's rollback path. A
+    // manually inserted VisualCorrection would only test the monitor wiring;
+    // this value travels over the real iroh session and causes the correction.
+    left.world_mut()
+        .entity_mut(authoritative)
+        .insert((ReplicatedPayload(77_i64), PredictedPosition(77)));
+
+    let key = TrackKey {
+        authority: secret(1).public(),
+        entity: persist_id,
+    };
+    wait_until(
+        &mut left,
+        &mut right,
+        "for authoritative reconciliation to produce an observed residual",
+        |_, right| {
+            let state_converged = right
+                .query::<&ReplicatedPayload<i64>>()
+                .iter(right)
+                .any(|payload| payload.0 == 77);
+            state_converged
+                && right
+                    .resource::<lightyear::prelude::PredictionMetrics>()
+                    .rollbacks
+                    > 0
+                && right
+                    .resource::<ReconciliationMonitor>()
+                    .track(&key)
+                    .is_some_and(|track| track.rollbacks > 0 && track.pos_ewma_mm > 0)
+        },
     );
 }

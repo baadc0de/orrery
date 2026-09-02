@@ -94,6 +94,7 @@ graph BT
     spatial --> net
     spatial --> replicon
     authority --> protocol
+    predict --> net
     predict --> protocol
     witness --> net
     witness --> core
@@ -116,7 +117,7 @@ graph BT
     identity --> persistd
     fhost --> facade
     fhost --> core
-    game --> facade
+    game -- "component schemas, registration, prediction policy + entity targets" --> facade
     game --> core
     game --> persistd
     games -.-> ruleset_digest
@@ -395,7 +396,7 @@ pub enum AuthorityEvent {
 
 ### 7. `orrery_predict` — prediction and rollback
 
-The lightyear 0.29 configuration layer for per-entity authority (D8): fixed 60 Hz tick, 20 Hz send (≤ 30), 9-tick rollback window, 100 ms interpolation buffer, 200 ms hit-rewind cap, delta compression against acked baselines, priority accumulation within the `orrery_net` upload budget. Also home to the reconciliation-error monitor (the witness signal, D10) and the rollback budget guard (resim amortized over ≤ 2 render frames). **The only crate whose internals name lightyear types** — the plan-B seam.
+The lightyear 0.29 configuration layer for per-entity authority (D8): fixed 60 Hz tick, 20 Hz send (≤ 30), 9-tick rollback window, 100 ms interpolation buffer, 200 ms hit-rewind cap, delta compression against acked baselines, priority accumulation within the `orrery_net` upload budget. It also owns the session bridge: each authenticated `orrery_net` peer session becomes a P2P Lightyear link, and Lightyear's Replicon sender/receiver packets cross the transport through Orrery's state channel and upload-budget path. Replicon is therefore the sender backend specified by D4, not a parallel replication route. Also home to the reconciliation-error monitor (the witness signal, D10) and the rollback budget guard (resim amortized over ≤ 2 render frames). **The only first-party crate whose internals name lightyear types** — the plan-B seam.
 
 **Features:** `avian` (default; avian3d 0.7 integration per D13).
 
@@ -510,7 +511,7 @@ impl AreaLoader<'_, '_> {
 
 ### 10. `orrery` — client facade
 
-Landed. Defines `OrreryClientPlugins<R: Ruleset>` — a Bevy `PluginGroup` in dependency order: net → spatial → authority → *island binding* → predict → witness → persist_client — and `OrreryConfig` aggregating the per-plugin configs. There is no separate transport plugin: `OrreryNetPlugin` adds aeronet's `IrohPlugin` itself. The island-binding member is the facade's own one system, mirroring `orrery_net::IslandMembership` into `orrery_authority::IslandBinding` — the wire crosses two crates neither of which may depend on the other. `AoiVisibilityPlugin` is deliberately **not** a member: it is built out of replicon's registries and panics unless `RepliconPlugins` was added first, so a game adds it after its own replication setup. Games depend on this one crate for the client side; individual plugins remain overridable through the standard `PluginGroupBuilder` (`.set(…)`, `.disable::<…>()`).
+Landed. Defines `OrreryClientPlugins<R: Ruleset>` — a Bevy `PluginGroup` in dependency order: net → spatial → authority → *island binding* → predict → *replication bridge* → witness → persist_client — and `OrreryConfig` aggregating the per-plugin configs. There is no separate transport plugin: `OrreryNetPlugin` adds aeronet's `IrohPlugin` itself, and the bridge converts its established sessions into P2P Lightyear links backed by Replicon's sender and receiver. The island-binding member mirrors `orrery_net::IslandMembership` into `orrery_authority::IslandBinding` — the wire crosses two crates neither of which may depend on the other. `AoiVisibilityPlugin` is deliberately **not** a member: it is built out of replicon's registries and panics unless `RepliconPlugins` was added first, so a game adds it after its own replication setup. Games depend on this one crate for the client stack, but the labelled `game → facade` edge still carries game-specific work the facade cannot infer: registering component schemas and their interpolation/correction policy, and attaching replication and prediction targets to entities. Individual plugins remain overridable through the standard `PluginGroupBuilder` (`.set(…)`, `.disable::<…>()`).
 
 ### 11. `orrery_persistd` — persistence cluster harness
 

@@ -143,6 +143,13 @@ pub struct Peer {
     pub incoming: bool,
 }
 
+/// Largest application payload the underlying peer session can carry.
+///
+/// Kept separate from [`Peer`] so adding transport tuning does not widen the
+/// identity component every test harness and consumer constructs.
+#[derive(Debug, Clone, Copy, Component)]
+pub struct PeerMtu(pub usize);
+
 /// Registry of connected peers, keyed by session entity.
 #[derive(Debug, Default, Resource)]
 pub struct PeerRegistry {
@@ -178,13 +185,19 @@ fn track_peers(
     >,
     mut disconnected: RemovedComponents<aeronet_io::Session>,
 ) {
-    for (entity, _session, iroh) in &sessions {
+    for (entity, session, iroh) in &sessions {
         let peer = Peer {
             id: iroh.peer_id(),
             incoming: iroh.side() == aeronet_iroh::session::SessionSide::Incoming,
         };
         registry.peers.retain(|(e, _)| *e != entity);
-        registry.peers.push((entity, peer));
+        registry.peers.push((entity, peer.clone()));
+        // The registry is the discovery/index view. The packet lane queries
+        // the same identity on the session itself so it can drain and route
+        // that session's buffers.
+        commands
+            .entity(entity)
+            .insert((peer, PeerMtu(session.mtu())));
     }
     for entity in disconnected.read() {
         registry.peers.retain(|(e, _)| *e != entity);

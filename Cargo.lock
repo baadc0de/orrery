@@ -7923,6 +7923,7 @@ dependencies = [
  "orrery_replicon",
  "orrery_spatial",
  "orrery_witness",
+ "serde",
 ]
 
 [[package]]
@@ -8143,7 +8144,10 @@ dependencies = [
  "bevy_platform",
  "bevy_state",
  "bevy_time",
+ "bytes",
  "lightyear",
+ "lightyear_replication",
+ "orrery_net",
  "orrery_protocol",
  "tracing",
 ]

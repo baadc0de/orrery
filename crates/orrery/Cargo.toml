@@ -8,10 +8,9 @@ license = "MIT OR Apache-2.0"
 # Purely compositional (D15, docs/10-crates.md §10). It contains no subsystem
 # logic: a `PluginGroup` has to live in a crate that depends on every member
 # plugin, and none of the functional crates can do that without inverting the
-# dependency spine. The one system it owns is there for the same reason — the
-# `IslandMembership` -> `IslandBinding` wire crosses `orrery_net` and
-# `orrery_authority`, and authority is the lower layer, so neither end may
-# reach for the other.
+# dependency spine. Its crossing plugins exist for the same reason: they wire
+# subsystem seams at the composition root without making either lower crate
+# invert the dependency spine.
 
 [dependencies]
 orrery_authority = { path = "../orrery_authority" }
@@ -39,8 +38,9 @@ bevy = { workspace = true }
 bevy_state = { workspace = true }
 lightyear = { workspace = true }
 # The headless facade fixture registers one engine-handle-free payload through
-# the guarded registration surface before proving that no transport bridge
-# carries it between the two real iroh sessions.
+# the guarded registration surface and proves it crosses two real iroh
+# sessions through the production bridge.
 orrery_replicon = { path = "../orrery_replicon" }
 # The test `Ruleset`: real, Bevy-free, and already in the workspace.
 orrery_games = { path = "../orrery_games" }
+serde = { workspace = true }
