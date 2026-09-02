@@ -54,6 +54,12 @@ pub use autosuspend::{
     WindowStats, BASELINE_HOURS, MEDIAN_MULTIPLE, RATE_FLOOR_PER_HOUR, SPREAD_THRESHOLD, WINDOW_MS,
 };
 
+pub mod posture;
+pub use posture::{
+    admit, d32_default, is_de_hardening, posture_preimage, rank, sign_posture, PostureRefusal,
+    PostureVerdict, SignedRampPosture, RAMP_POSTURE_SCHEMA, RAMP_POSTURE_V1_DOMAIN,
+};
+
 pub mod ramp;
 #[cfg(feature = "fdb")]
 pub use ramp::FdbRampPostureStore;
