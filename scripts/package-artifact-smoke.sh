@@ -201,8 +201,12 @@ make_read_only() { # directory
                 # Resetting inheritance first strips those, and the deny that
                 # followed reported "could not deny writes" — which is what
                 # the runner said after the previous attempt.
-                deny_err="$(icacls "$win_path" /deny "$account:(OI)(CI)(WD,AD)" 2>&1)" \
-                    && read_only_method="icacls deny for $account" \
+                # `(W)` is icacls' simple write right. The specific-rights
+                # spelling `(WD,AD)` is documented but the runner rejected it
+                # with "Invalid parameter", and a deny that will not parse is
+                # a deny that does not exist.
+                deny_err="$(icacls "$win_path" /deny "$account:(OI)(CI)(W)" 2>&1)" \
+                    && read_only_method="icacls deny (OI)(CI)(W) for $account" \
                     || read_only_why="icacls could not deny writes to $account: ${deny_err//$'\n'/ }"
                 icacls "$win_path" /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)(RX)' >/dev/null 2>&1 \
                     || read_only_why="${read_only_why:-icacls could not reset inheritance}"
