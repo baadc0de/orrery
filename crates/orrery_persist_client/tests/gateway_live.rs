@@ -64,7 +64,7 @@ fn client_app(gateway: &orrery_persistd::GatewayServer, client_key: &iroh_base::
             coordinator: CoordinatorConfig::default(),
         },
     ));
-    app.add_plugins(OrreryAuthorityPlugin);
+    app.add_plugins(OrreryAuthorityPlugin::default());
     app.add_plugins(OrreryPersistClientPlugin::default());
     app.insert_resource(GatewayConfig::new(gateway.addr(), gateway.id()));
     app.insert_resource(GatewaySession::new(support::valid_session_token(

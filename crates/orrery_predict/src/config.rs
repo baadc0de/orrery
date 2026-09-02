@@ -18,6 +18,7 @@
 use std::time::Duration;
 
 use bevy_ecs::prelude::*;
+use orrery_protocol::HitWindow;
 
 /// The bounded high-rate interest set (D16: 24 entities).
 ///
@@ -155,7 +156,7 @@ impl PredictConfig {
     }
 
     /// The hit-rewind cap expressed in ticks — the unit the target's authority
-    /// checks a [`HitClaim`](orrery_protocol) basis against.
+    /// checks a [`HitClaim`](orrery_protocol::HitClaim) basis against.
     #[must_use]
     pub fn hit_rewind_ticks(&self) -> u16 {
         let ticks = self.hit_rewind_cap.as_secs_f64() * f64::from(self.tick_hz);
@@ -191,6 +192,17 @@ impl PredictConfig {
     #[must_use]
     pub fn pose_history_ticks(&self) -> u16 {
         (self.hit_rewind_ticks() + self.interp_ticks() + self.rollback_ticks).next_power_of_two()
+    }
+
+    /// The two figures a hit validator is configured by, as the wire crate's
+    /// [`HitWindow`]: the rewind cap and the retained ring depth.
+    ///
+    /// This is how the numbers reach `orrery_authority`'s pose ring without
+    /// either crate depending on the other — the facade reads it here and
+    /// hands it to the authority plugin.
+    #[must_use]
+    pub fn hit_window(&self) -> HitWindow {
+        HitWindow::new(self.hit_rewind_ticks(), self.pose_history_ticks())
     }
 
     /// Check docs/05 §12's coupling invariants.
@@ -399,5 +411,6 @@ mod tests {
         assert_eq!(cfg.history_ticks(), 16, "docs/05 §1");
         assert_eq!(cfg.hit_rewind_ticks(), 12, "200 ms at 60 Hz");
         assert_eq!(cfg.pose_history_ticks(), 32, "docs/05 §7");
+        assert_eq!(cfg.hit_window(), HitWindow::new(12, 32));
     }
 }

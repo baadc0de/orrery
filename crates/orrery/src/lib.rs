@@ -415,7 +415,9 @@ impl Plugin for OrreryIslandBindingPlugin {
 ///    island membership. It adds aeronet's `IrohPlugin` itself; there is no
 ///    separate transport plugin.
 /// 2. [`OrrerySpatialPlugin`] — cell commitment, AOI, interest set.
-/// 3. [`OrreryAuthorityPlugin`] — claims, leases, the ephemeral namespace.
+/// 3. [`OrreryAuthorityPlugin`] — claims, leases, the ephemeral namespace,
+///    and the pose ring hit claims are validated against, sized from
+///    [`PredictConfig::hit_window`].
 /// 4. [`OrreryIslandBindingPlugin`] — this crate's own wires, between the two
 ///    above: the membership binding, and the drain divestiture.
 /// 5. [`OrreryPredictPlugin`] — lightyear's client stack, per D8/D16.
@@ -519,7 +521,11 @@ where
             .add(OrrerySpatialPlugin {
                 config: config.spatial,
             })
-            .add(OrreryAuthorityPlugin)
+            // The pose ring's depth and the rewind cap are `orrery_predict`'s
+            // derivations (docs/05 §7: 12 + 6 + 9 → 32) and the ring is
+            // `orrery_authority`'s; neither may depend on the other, so the
+            // numbers cross here.
+            .add(OrreryAuthorityPlugin::default().with_hit_window(config.predict.hit_window()))
             .add(OrreryIslandBindingPlugin)
             .add(OrreryPredictPlugin {
                 config: config.predict,

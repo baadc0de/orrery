@@ -21,6 +21,7 @@ use orrery::{OrreryClientPlugins, OrreryConfig, OrreryIslandBindingPlugin};
 use orrery_authority::ephemeral::EphemeralRegistry;
 use orrery_authority::{
     AuthorityState, ContactObservations, ContactTick, IslandBinding, OrreryAuthorityPlugin,
+    PoseHistory,
 };
 use orrery_games::Skirmish;
 use orrery_net::island::IslandMembership;
@@ -145,6 +146,18 @@ fn group_registers_every_member_plugins_resources() {
     assert!(world.get_resource::<AuthorityState>().is_some());
     assert!(world.get_resource::<IslandBinding>().is_some());
     assert!(world.get_resource::<EphemeralRegistry>().is_some());
+    // The pose ring is sized from the predict config, not from a default:
+    // docs/05 §7's 32-tick ring and D8's 12-tick cap, derived in one place.
+    let history = world
+        .get_resource::<PoseHistory>()
+        .expect("the authority plugin owns the pose ring");
+    assert_eq!(
+        history.window(),
+        PredictConfig::default().hit_window(),
+        "the facade must hand the authority the derived window"
+    );
+    assert_eq!(history.window().history_ticks, 32, "docs/05 §7");
+    assert_eq!(history.window().rewind_ticks, 12, "D8: 200 ms at 60 Hz");
 
     // orrery_predict
     assert!(world.get_resource::<PredictConfig>().is_some());

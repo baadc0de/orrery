@@ -32,7 +32,7 @@ use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::{CellId, PersistId};
+use crate::{CellId, HitMsg, PersistId};
 
 /// The two logical channels the design defines (docs/02-networking.md §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,6 +544,32 @@ pub fn decode_witness<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
     decode_sub_tagged(payload, TAG_WITNESS, TAG_WITNESS_COMPRESSED)
 }
 
+/// Sub-tag marking hit-registration traffic (docs/05 §7): a [`HitMsg`]
+/// claim from a shooter, or the verdict back. Rides the unreliable state
+/// channel; the shooter resends a claim until a verdict names its key.
+pub const TAG_HIT: u8 = 0xEC;
+
+/// Encode one hit claim or verdict as a state datagram:
+/// `[TAG_STATE][TAG_HIT][postcard]`.
+#[must_use]
+pub fn encode_hit(msg: &HitMsg) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64);
+    payload.push(TAG_HIT);
+    payload.extend_from_slice(&postcard::to_stdvec(msg).expect("wire message is serializable"));
+    tag(Channel::State, &payload)
+}
+
+/// Decode one hit claim or verdict, refusing every other state-channel member
+/// before handing bytes to postcard.
+#[must_use]
+pub fn decode_hit(payload: &[u8]) -> Option<HitMsg> {
+    let (channel, rest) = untag(payload)?;
+    if channel != Channel::State || rest.first() != Some(&TAG_HIT) {
+        return None;
+    }
+    postcard::from_bytes(&rest[1..]).ok()
+}
+
 /// Encode a message as a **state** datagram: `[TAG_STATE][postcard]`.
 ///
 /// Used for bulk diffs and their acks (D11 §2.1). Both directions share this
@@ -788,5 +814,37 @@ mod tests {
         truncated.extend_from_slice(&128u32.to_le_bytes());
         truncated.extend_from_slice(&[0x03, 0x00]);
         assert!(decode_replication::<Vec<u8>>(&tag(Channel::State, &truncated)).is_none());
+    }
+
+    #[test]
+    fn hit_frame_roundtrips_and_refuses_other_sub_tags() {
+        use crate::{
+            HitClaim, HitSurface, InterpBasis, LatticePoint, QuantizedDir, QuantizedRay, Tick,
+            WeaponRef,
+        };
+        let msg = HitMsg::Claim(HitClaim {
+            shooter: PersistId::new(1),
+            target: PersistId::new(2),
+            weapon: WeaponRef(1),
+            fire_tick: Tick::new(100),
+            basis: InterpBasis::exact(Tick::new(95)),
+            ray: QuantizedRay {
+                origin: LatticePoint::new(0, 0, 0),
+                direction: QuantizedDir::new(1, 0, 0),
+            },
+            claimed: HitSurface(0),
+            input_seq: 1,
+        });
+        let bytes = encode_hit(&msg);
+        assert_eq!(bytes[0], TAG_STATE);
+        assert_eq!(bytes[1], TAG_HIT);
+        assert_eq!(decode_hit(&bytes), Some(msg));
+
+        // The same postcard body under the witness sub-tag is not a hit.
+        let mut witness = vec![TAG_WITNESS];
+        witness.extend_from_slice(&bytes[2..]);
+        assert_eq!(decode_hit(&tag(Channel::State, &witness)), None);
+        // And a control frame is never one either.
+        assert_eq!(decode_hit(&tag(Channel::Control, &bytes[1..])), None);
     }
 }

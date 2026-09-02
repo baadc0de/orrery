@@ -35,7 +35,7 @@ fn node_id(seed: u8) -> NodeId {
 /// A peer whose identity and island assignment have already propagated.
 fn peer(seed: u8) -> App {
     let mut app = App::new();
-    app.add_plugins(OrreryAuthorityPlugin);
+    app.add_plugins(OrreryAuthorityPlugin::default());
     app.world_mut().resource_mut::<AuthorityState>().node = node_id(seed);
     *app.world_mut().resource_mut::<IslandBinding>() = IslandBinding {
         island: Some(IslandId::new(3)),

@@ -18,3 +18,8 @@ blake3 = "1.8"
 [dev-dependencies]
 # Test-only: minting valid ed25519 NodeIds for successor/handoff assertions.
 iroh-base = { workspace = true }
+# Test-only: the synthetic ruleset the hit validator is proven against runs
+# on the real `Ruleset` contract and the real fixed-step host, so "no
+# resimulation" is asserted on a step counter the executor actually drives.
+orrery_core = { path = "../orrery_core" }
+orrery_sim_host = { path = "../orrery_sim_host" }
