@@ -7936,8 +7936,11 @@ dependencies = [
  "blake3",
  "iroh-base",
  "orrery_core",
+ "orrery_net",
+ "orrery_predict",
  "orrery_protocol",
  "orrery_sim_host",
+ "orrery_witness",
  "serde",
 ]
 

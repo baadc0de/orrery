@@ -47,7 +47,11 @@ pub const REFERENCE_RULESET: RulesetId = RulesetId {
     // `orrery_protocol`, which is in this crate's source closure. The rules
     // and every canonical chain are untouched; only the build identity moved,
     // and the golden was regenerated identity-only.
-    version: 5,
+    //
+    // Version 6: the hit-claim admission cap and `HitRefusal::OverClaimRate`
+    // (#923) landed in `orrery_protocol`, by the same rule as version 5. The
+    // rules and every canonical chain are untouched; identity-only again.
+    version: 6,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 

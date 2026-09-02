@@ -68,8 +68,9 @@ pub use gateway::{
 };
 pub use grid::GridId;
 pub use hit::{
-    HitClaim, HitClaimKey, HitMsg, HitOutcome, HitRefusal, HitSurface, HitVerdict, HitWindow,
-    InterpBasis, LatticePoint, QuantizedDir, QuantizedRay, UNorm16, WeaponRef,
+    Admission, HitClaim, HitClaimCap, HitClaimGate, HitClaimKey, HitMsg, HitOutcome, HitRefusal,
+    HitSurface, HitVerdict, HitWindow, InterpBasis, LatticePoint, QuantizedDir, QuantizedRay,
+    UNorm16, WeaponRef,
 };
 pub use identity::{
     AccountInvalidation, FixedTokenClock, IssuerKey, IssuerKeyId, NodeId, SessionStanding,

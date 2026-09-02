@@ -19,6 +19,8 @@
 //! The validation lives in `orrery_authority`; this module is the shape of the
 //! wire and the vocabulary of the verdict.
 
+use std::collections::{BTreeSet, VecDeque};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{PersistId, Tick};
@@ -328,6 +330,17 @@ pub enum HitRefusal {
         /// The radius (plus tolerance) that would have counted, in lattice units.
         allowed: u32,
     },
+    /// The source has put more *new* claims on the wire than its admission
+    /// cap allows ([`HitClaimCap`], #923). Named so the shooter stops
+    /// resending this key: a resend cannot earn a token, and the claim will
+    /// be refused the same way until the bucket refills. Not a verdict on
+    /// the shot — the pose was never looked up.
+    OverClaimRate {
+        /// New claims the bucket holds when full.
+        burst: u16,
+        /// Ticks per token refilled.
+        refill_ticks: u16,
+    },
 }
 
 /// The authority's answer to a [`HitClaim`].
@@ -408,6 +421,251 @@ impl HitWindow {
     }
 }
 
+/// The admission cap on hit claims one source may put on the wire (#923).
+///
+/// Hit traffic is unsheddable (`orrery_net::budget::is_sheddable`): the
+/// backstop cannot drop a claim without losing a shot the player has already
+/// taken. The rule that makes an unsheddable lane coherent is the one the
+/// witness lane already follows — *bounded at the source*, so the lane cannot
+/// be the thing that exhausts the budget. This is the hit lane's bound, and
+/// the same figures are enforced twice: by the shooter's peer over the claims
+/// it emits, and by the target's authority over the claims it answers, keyed
+/// by the peer the transport vouches for. A source that skips its own gate
+/// meets the same numbers on the other side, and gets the refusal by name.
+///
+/// # Derivation
+///
+/// Both figures come from things already in the tree, so that a change to
+/// either is a change to a stated reason and not to a number.
+///
+/// - **Refill: one token per tick.** docs/05 §7 assigns the fire-rate
+///   invariant to the witness validators (D10), and every shipped validator
+///   checks `fired ≤ elapsed / cooldown + 1` with `cooldown.max(1)` — one
+///   shot per tick is the invariant's own floor, because a fire input is
+///   sampled once per tick. The platform cannot know a game's real cooldown
+///   (Regolith's fastest is 20 ticks), so it caps at the floor and leaves the
+///   tighter per-weapon rate where docs/05 §7 puts it. At D16's 60 Hz that is
+///   60 new claims per second per source. The cap counts *claims* and the
+///   invariant counts *shots*; a shot that hits several targets is several
+///   claims, so the two coincide at the floor only for single-target hits.
+///   At any real cooldown the spread has `cooldown` tokens of headroom per
+///   shot — Regolith's fastest weapon could hit twenty targets a shot,
+///   sustained, before the cap noticed.
+/// - **Burst: the pose ring's depth** (`HitWindow::history_ticks`, 32 on
+///   D16's defaults). A claim's basis older than the ring is refused as
+///   [`HitRefusal::BasisNotRetained`] whatever else is true of it, so a burst
+///   deeper than the ring cannot all be valid. A shooter that emits 33 new
+///   claims in one tick has, by construction, emitted at least one the ring
+///   cannot answer.
+///
+/// # What is metered
+///
+/// A token is spent per *new* claim key — `(shooter, input_seq)`. A resend
+/// of a key this gate has already admitted is free while the key is among the
+/// last `burst` admissions, because docs/05 §7 has the shooter resend until a
+/// verdict names the key, and charging the resend would turn verdict loss
+/// into a refusal of a legitimate shot. Duplicate copies of one key inside one
+/// tick are coalesced rather than answered twice: the answer to the first copy
+/// has not had time to arrive, so a second answer carries nothing.
+///
+/// Stated worst case for a source that replays admitted keys deliberately:
+/// `burst + 1` answers per tick. The gate bounds a malicious source, but not
+/// as tightly as it bounds an honest one; the honest bound is the one the
+/// budget arithmetic in `orrery_authority`'s source-cap check counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HitClaimCap {
+    /// New claims the bucket holds when full.
+    pub burst: u16,
+    /// Ticks per token refilled. Zero is treated as one.
+    pub refill_ticks: u16,
+}
+
+impl HitClaimCap {
+    /// Admits nothing: the cap of a closed [`HitWindow`].
+    pub const CLOSED: Self = Self {
+        burst: 0,
+        refill_ticks: 1,
+    };
+
+    /// The cap docs/05 §7's figures imply for `window`: burst = the ring's
+    /// depth, refill = one per tick (the fire-rate invariant's floor).
+    #[must_use]
+    pub const fn for_window(window: HitWindow) -> Self {
+        Self {
+            burst: window.history_ticks,
+            refill_ticks: 1,
+        }
+    }
+
+    /// The sustained rate this cap admits, in new claims per second at
+    /// `tick_hz`. This is the figure the sum-of-caps check charges the hit
+    /// lane with; the burst is transient and refills from the same rate.
+    #[must_use]
+    pub const fn sustained_claims_per_second(&self, tick_hz: u32) -> u64 {
+        let refill = if self.refill_ticks == 0 {
+            1
+        } else {
+            self.refill_ticks as u64
+        };
+        tick_hz as u64 / refill
+    }
+}
+
+impl Default for HitClaimCap {
+    fn default() -> Self {
+        Self::CLOSED
+    }
+}
+
+/// How a [`HitClaimGate`] answered one claim datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Validate and answer it.
+    Admit,
+    /// Answer it with this refusal — by name, so the producer stops.
+    Refuse(HitRefusal),
+    /// This key, or this source's over-cap refusal, was already answered at
+    /// `at` (the current tick). The earlier answer is in flight and a second
+    /// one carries nothing; the copy is coalesced, not dropped, and the count
+    /// is kept in [`HitClaimGate::coalesced`].
+    AlreadyAnswered {
+        /// The tick the standing answer was given at.
+        at: Tick,
+    },
+}
+
+/// The per-source admission gate for [`HitClaim`]s: a token bucket over new
+/// claim keys, with resends free and same-tick duplicates coalesced. See
+/// [`HitClaimCap`] for the figures and their derivation.
+///
+/// Engine-free and clock-free: the caller passes its own tick, so the same
+/// type serves the shooter's peer (its simulation tick) and the target's
+/// authority (its pose ring's newest tick).
+#[derive(Debug, Clone)]
+pub struct HitClaimGate {
+    cap: HitClaimCap,
+    tokens: u16,
+    /// The tick the bucket was last brought up to date at.
+    refilled_at: Option<Tick>,
+    /// The last `burst` keys admitted, oldest first; a resend of one is free.
+    admitted: VecDeque<HitClaimKey>,
+    /// Keys answered at `answered_at`, so a same-tick copy is coalesced.
+    answered_at: Option<Tick>,
+    answered: BTreeSet<HitClaimKey>,
+    /// The tick this source was last refused for rate, so a flood is told
+    /// once per tick rather than once per datagram.
+    refused_at: Option<Tick>,
+    coalesced: u64,
+    refused: u64,
+}
+
+impl HitClaimGate {
+    /// A full bucket under `cap`.
+    #[must_use]
+    pub fn new(cap: HitClaimCap) -> Self {
+        Self {
+            cap,
+            tokens: cap.burst,
+            refilled_at: None,
+            admitted: VecDeque::with_capacity(usize::from(cap.burst)),
+            answered_at: None,
+            answered: BTreeSet::new(),
+            refused_at: None,
+            coalesced: 0,
+            refused: 0,
+        }
+    }
+
+    /// The cap this gate enforces.
+    #[must_use]
+    pub const fn cap(&self) -> HitClaimCap {
+        self.cap
+    }
+
+    /// New claims this gate would admit right now, before any refill.
+    #[must_use]
+    pub const fn tokens(&self) -> u16 {
+        self.tokens
+    }
+
+    /// The tick this gate last saw a claim at.
+    #[must_use]
+    pub const fn last_seen(&self) -> Option<Tick> {
+        self.refilled_at
+    }
+
+    /// Same-tick duplicate copies coalesced so far.
+    #[must_use]
+    pub const fn coalesced(&self) -> u64 {
+        self.coalesced
+    }
+
+    /// Over-cap refusals issued so far (one per tick at most).
+    #[must_use]
+    pub const fn refused(&self) -> u64 {
+        self.refused
+    }
+
+    /// Decide one claim datagram carrying `key`, at the caller's tick `now`.
+    pub fn admit(&mut self, key: HitClaimKey, now: Tick) -> Admission {
+        self.refill(now);
+        if self.answered_at != Some(now) {
+            self.answered_at = Some(now);
+            self.answered.clear();
+        }
+
+        if self.answered.contains(&key) {
+            self.coalesced = self.coalesced.saturating_add(1);
+            return Admission::AlreadyAnswered { at: now };
+        }
+        if self.admitted.contains(&key) {
+            self.answered.insert(key);
+            return Admission::Admit;
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            if self.admitted.len() >= usize::from(self.cap.burst) {
+                self.admitted.pop_front();
+            }
+            if self.cap.burst > 0 {
+                self.admitted.push_back(key);
+            }
+            self.answered.insert(key);
+            return Admission::Admit;
+        }
+        if self.refused_at == Some(now) {
+            self.coalesced = self.coalesced.saturating_add(1);
+            return Admission::AlreadyAnswered { at: now };
+        }
+        self.refused_at = Some(now);
+        self.refused = self.refused.saturating_add(1);
+        Admission::Refuse(HitRefusal::OverClaimRate {
+            burst: self.cap.burst,
+            refill_ticks: self.cap.refill_ticks,
+        })
+    }
+
+    /// Bring the bucket up to `now`. A tick behind the last one refills
+    /// nothing and moves nothing: the bucket never runs backwards.
+    fn refill(&mut self, now: Tick) {
+        let Some(last) = self.refilled_at else {
+            self.refilled_at = Some(now);
+            return;
+        };
+        if now <= last {
+            return;
+        }
+        let refill = u64::from(self.cap.refill_ticks.max(1));
+        let elapsed = now.0 - last.0;
+        let earned = elapsed / refill;
+        self.tokens = u16::try_from(u64::from(self.tokens) + earned)
+            .unwrap_or(u16::MAX)
+            .min(self.cap.burst);
+        // Keep the fractional progress towards the next token.
+        self.refilled_at = Some(Tick::new(last.0 + earned * refill));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +737,10 @@ mod tests {
                 miss_distance: 900,
                 allowed: 500,
             }),
+            HitOutcome::Rejected(HitRefusal::OverClaimRate {
+                burst: 32,
+                refill_ticks: 1,
+            }),
         ];
         for outcome in outcomes {
             let verdict = HitVerdict {
@@ -524,5 +786,131 @@ mod tests {
     fn the_closed_window_is_the_default() {
         assert_eq!(HitWindow::default(), HitWindow::CLOSED);
         assert_eq!(HitWindow::CLOSED.history_ticks, 0);
+    }
+
+    fn key(seq: u16) -> HitClaimKey {
+        HitClaimKey {
+            shooter: PersistId::new(7),
+            input_seq: seq,
+        }
+    }
+
+    #[test]
+    fn the_cap_is_derived_from_the_window_not_written_down() {
+        let cap = HitClaimCap::for_window(HitWindow::new(12, 32));
+        assert_eq!(cap.burst, 32, "burst is the ring's depth");
+        assert_eq!(cap.refill_ticks, 1, "the fire-rate invariant's floor");
+        assert_eq!(cap.sustained_claims_per_second(60), 60);
+        assert_eq!(
+            HitClaimCap::for_window(HitWindow::CLOSED),
+            HitClaimCap::CLOSED
+        );
+        assert_eq!(HitClaimCap::default(), HitClaimCap::CLOSED);
+    }
+
+    #[test]
+    fn an_over_cap_claim_is_refused_by_name_once_per_tick() {
+        let mut gate = HitClaimGate::new(HitClaimCap::for_window(HitWindow::new(12, 32)));
+        let now = Tick::new(100);
+        for seq in 0..32 {
+            assert_eq!(gate.admit(key(seq), now), Admission::Admit, "seq {seq}");
+        }
+        assert_eq!(
+            gate.admit(key(32), now),
+            Admission::Refuse(HitRefusal::OverClaimRate {
+                burst: 32,
+                refill_ticks: 1,
+            })
+        );
+        // The flood is told once this tick; further copies are coalesced.
+        assert_eq!(
+            gate.admit(key(33), now),
+            Admission::AlreadyAnswered { at: now }
+        );
+        assert_eq!(gate.refused(), 1);
+        assert_eq!(gate.coalesced(), 1);
+        // One tick later one token has refilled, and the refusal is fresh.
+        let next = Tick::new(101);
+        assert_eq!(gate.admit(key(32), next), Admission::Admit);
+        assert_eq!(
+            gate.admit(key(33), next),
+            Admission::Refuse(HitRefusal::OverClaimRate {
+                burst: 32,
+                refill_ticks: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_resend_of_an_admitted_key_is_free_and_a_same_tick_copy_is_coalesced() {
+        let mut gate = HitClaimGate::new(HitClaimCap::for_window(HitWindow::new(12, 32)));
+        assert_eq!(gate.admit(key(1), Tick::new(10)), Admission::Admit);
+        assert_eq!(gate.tokens(), 31);
+        assert_eq!(
+            gate.admit(key(1), Tick::new(10)),
+            Admission::AlreadyAnswered { at: Tick::new(10) }
+        );
+        // Resent six ticks later, the verdict having been lost: free.
+        assert_eq!(gate.admit(key(1), Tick::new(16)), Admission::Admit);
+        assert_eq!(
+            gate.tokens(),
+            32,
+            "the resend spent nothing and six ticks refilled"
+        );
+    }
+
+    #[test]
+    fn the_bucket_refills_at_the_stated_rate_and_never_runs_backwards() {
+        let mut gate = HitClaimGate::new(HitClaimCap {
+            burst: 4,
+            refill_ticks: 3,
+        });
+        let t = Tick::new(30);
+        for seq in 0..4 {
+            assert_eq!(gate.admit(key(seq), t), Admission::Admit);
+        }
+        assert!(matches!(gate.admit(key(4), t), Admission::Refuse(_)));
+        // Two ticks is not a token; three is.
+        assert!(matches!(
+            gate.admit(key(4), Tick::new(32)),
+            Admission::Refuse(_)
+        ));
+        assert_eq!(gate.admit(key(4), Tick::new(33)), Admission::Admit);
+        // A tick behind the last one refills nothing.
+        assert!(matches!(
+            gate.admit(key(5), Tick::new(20)),
+            Admission::Refuse(_)
+        ));
+        assert_eq!(gate.last_seen(), Some(Tick::new(33)));
+    }
+
+    /// The refusal was appended, never inserted: every arm before it keeps
+    /// the positional byte a version-8 build wrote (see `PROTOCOL_VERSION`).
+    #[test]
+    fn over_claim_rate_is_appended_after_every_older_refusal() {
+        let bytes = postcard::to_stdvec(&HitRefusal::OverClaimRate {
+            burst: 32,
+            refill_ticks: 1,
+        })
+        .unwrap();
+        assert_eq!(bytes[0], 8, "OverClaimRate is the ninth arm, after Miss");
+        let miss = postcard::to_stdvec(&HitRefusal::Miss {
+            miss_distance: 1,
+            allowed: 1,
+        })
+        .unwrap();
+        assert_eq!(miss[0], 7, "Miss stays where a version-8 build put it");
+    }
+
+    #[test]
+    fn a_closed_cap_refuses_every_new_claim_by_name() {
+        let mut gate = HitClaimGate::new(HitClaimCap::CLOSED);
+        assert_eq!(
+            gate.admit(key(0), Tick::new(0)),
+            Admission::Refuse(HitRefusal::OverClaimRate {
+                burst: 0,
+                refill_ticks: 1,
+            })
+        );
     }
 }

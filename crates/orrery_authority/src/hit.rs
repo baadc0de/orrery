@@ -26,9 +26,38 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bevy_ecs::prelude::*;
 use orrery_protocol::{
-    HitClaim, HitOutcome, HitRefusal, HitVerdict, HitWindow, LatticePoint, PersistId, Tick,
-    WeaponRef,
+    Admission, HitClaim, HitClaimCap, HitClaimGate, HitClaimKey, HitOutcome, HitRefusal,
+    HitVerdict, HitWindow, LatticePoint, NodeId, PersistId, Tick, WeaponRef,
 };
+
+/// How many source peers [`PoseHistory`] keeps an admission gate for.
+///
+/// D6's per-cell player ceiling, the same figure D25 caps the `Expire`
+/// fan-out at: no honest authority is shot at by more peers than share its
+/// cell. Past it the least-recently-seen gate is evicted, which only ever
+/// makes an evicted source *more* admissible (it returns to a full bucket),
+/// so a flood of fresh node ids cannot lock an honest shooter out.
+pub const MAX_CLAIM_SOURCES: usize = 128;
+
+/// What [`PoseHistory::answer`] did with one claim datagram.
+///
+/// Every arm is named because a claim the authority does not answer is
+/// indistinguishable, to the shooter, from a lost datagram (docs/05 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimAnswer {
+    /// Send this verdict back to the source. Accepted, or refused by name —
+    /// including [`HitRefusal::OverClaimRate`] when the source is over its
+    /// [`HitClaimCap`].
+    Verdict(HitVerdict),
+    /// A copy of a claim (or of an over-cap flood) this authority answered
+    /// earlier in the same tick; that answer is in flight. Nothing to send.
+    AlreadyAnswered {
+        /// The key of the coalesced copy.
+        key: HitClaimKey,
+        /// The tick the standing answer was given at.
+        at: Tick,
+    },
+}
 
 /// One retained pose: where the entity was at the end of a tick, and how big
 /// it is for the purpose of being hit.
@@ -192,10 +221,19 @@ impl PoseRing {
 /// the default is [`HitWindow::CLOSED`], which refuses every claim, so a
 /// plugin that was never told its window fails closed rather than with a
 /// figure copied from a document.
+///
+/// Also owns one [`HitClaimGate`] per source peer, keyed by the [`NodeId`] the
+/// transport vouches for rather than the `shooter` a claim names — a peer
+/// can mint shooter ids, not node ids — so [`PoseHistory::answer`] refuses an
+/// over-cap source by name before any pose is looked up (#923). The cap is
+/// derived from the window ([`HitClaimCap::for_window`]): the closed default
+/// admits nothing, by the same fail-closed rule.
 #[derive(Debug, Resource)]
 pub struct PoseHistory {
     window: HitWindow,
+    cap: HitClaimCap,
     rings: BTreeMap<PersistId, PoseRing>,
+    gates: BTreeMap<NodeId, HitClaimGate>,
     now: Option<Tick>,
 }
 
@@ -211,7 +249,9 @@ impl PoseHistory {
     pub fn new(window: HitWindow) -> Self {
         Self {
             window,
+            cap: HitClaimCap::for_window(window),
             rings: BTreeMap::new(),
+            gates: BTreeMap::new(),
             now: None,
         }
     }
@@ -220,6 +260,18 @@ impl PoseHistory {
     #[must_use]
     pub fn window(&self) -> HitWindow {
         self.window
+    }
+
+    /// The per-source admission cap claims are gated by.
+    #[must_use]
+    pub fn claim_cap(&self) -> HitClaimCap {
+        self.cap
+    }
+
+    /// The admission gate for `source`, if it has sent a claim.
+    #[must_use]
+    pub fn claim_gate(&self, source: NodeId) -> Option<&HitClaimGate> {
+        self.gates.get(&source)
     }
 
     /// The newest tick any ring has recorded — the authority's present, as
@@ -266,10 +318,63 @@ impl PoseHistory {
         self.rings.remove(&entity);
     }
 
+    /// Answer one claim datagram from `source`: admit it through the source's
+    /// [`HitClaimGate`], then [`validate`](Self::validate) it.
+    ///
+    /// This is the entry point for a claim that arrived on the wire.
+    /// [`validate`](Self::validate) alone is the pure lookup and spends
+    /// nothing; calling it directly for wire traffic would leave the hit lane
+    /// uncapped on this side. The gate runs *first* — before the ring is
+    /// consulted, before `NotMyEntity` — because what it bounds is the
+    /// verdicts this authority uploads, and every arm of the verdict costs
+    /// the same bytes.
+    ///
+    /// `now` is the ring's newest recorded tick, which is the only clock a
+    /// pose history has; an authority that has recorded nothing gates at
+    /// tick zero, and its closed window refuses everything anyway.
+    pub fn answer(
+        &mut self,
+        source: NodeId,
+        claim: &HitClaim,
+        rules: &impl HitRules,
+    ) -> ClaimAnswer {
+        let now = self.now.unwrap_or(Tick::new(0));
+        let key = claim.key();
+        let admission = self.gate_for(source).admit(key, now);
+        match admission {
+            Admission::Admit => ClaimAnswer::Verdict(self.validate(claim, rules)),
+            Admission::Refuse(refusal) => ClaimAnswer::Verdict(HitVerdict {
+                claim: key,
+                target: claim.target,
+                claimed: claim.claimed,
+                outcome: HitOutcome::Rejected(refusal),
+            }),
+            Admission::AlreadyAnswered { at } => ClaimAnswer::AlreadyAnswered { key, at },
+        }
+    }
+
+    fn gate_for(&mut self, source: NodeId) -> &mut HitClaimGate {
+        if !self.gates.contains_key(&source) && self.gates.len() >= MAX_CLAIM_SOURCES {
+            let stalest = self
+                .gates
+                .iter()
+                .min_by_key(|(_, gate)| gate.last_seen())
+                .map(|(node, _)| *node)
+                .expect("the gate table is non-empty when full");
+            self.gates.remove(&stalest);
+        }
+        let cap = self.cap;
+        self.gates
+            .entry(source)
+            .or_insert_with(|| HitClaimGate::new(cap))
+    }
+
     /// Validate `claim` against retained history: a lookup, never a
     /// resimulation.
     ///
-    /// The checks, in the order a refusal names them:
+    /// Pure: spends no admission token. Wire traffic goes through
+    /// [`answer`](Self::answer), which gates first. The checks, in the order
+    /// a refusal names them:
     ///
     /// 1. the target is an entity this authority holds a ring for;
     /// 2. the ray has a direction;
@@ -983,5 +1088,268 @@ mod tests {
             None,
             "slot 1 holds tick 5, and the stamp says so"
         );
+    }
+
+    fn source(seed: u8) -> NodeId {
+        iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn claim_seq(peer: &AuthorityPeer, seq: u16) -> HitClaim {
+        let now = peer.now();
+        let basis = Tick::new(now.0 - 6);
+        HitClaim {
+            input_seq: seq,
+            ..claim(
+                now,
+                InterpBasis::exact(basis),
+                ray_through_pose_at(peer, basis),
+            )
+        }
+    }
+
+    fn refusal(answer: ClaimAnswer) -> Option<HitRefusal> {
+        match answer {
+            ClaimAnswer::Verdict(HitVerdict {
+                outcome: HitOutcome::Rejected(refusal),
+                ..
+            }) => Some(refusal),
+            _ => None,
+        }
+    }
+
+    /// #923: the hit lane is unsheddable, so it is capped at admission, and
+    /// an over-cap claim is refused **by name** in a verdict that echoes the
+    /// claim's key — the shooter learns which claim to stop resending. A
+    /// second over-cap copy in the same tick is coalesced, never silently
+    /// dropped: the return value says so.
+    #[test]
+    fn an_over_cap_claim_is_refused_by_name_and_the_refusal_names_the_claim() {
+        let mut peer = AuthorityPeer::new();
+        peer.run(40);
+        let rules = peer.rules();
+        let shooter_peer = source(1);
+        let cap = peer.history.claim_cap();
+        assert_eq!(cap, HitClaimCap::for_window(WINDOW));
+        assert_eq!(cap.burst, 32, "the burst is the ring's depth");
+
+        for seq in 0..cap.burst {
+            let claim = claim_seq(&peer, seq);
+            let answer = peer.history.answer(shooter_peer, &claim, &rules);
+            assert!(
+                matches!(
+                    answer,
+                    ClaimAnswer::Verdict(HitVerdict {
+                        outcome: HitOutcome::Accepted { .. },
+                        ..
+                    })
+                ),
+                "claim {seq} inside the burst validates normally: {answer:?}"
+            );
+        }
+
+        let over = claim_seq(&peer, cap.burst);
+        let answer = peer.history.answer(shooter_peer, &over, &rules);
+        let ClaimAnswer::Verdict(verdict) = answer else {
+            panic!("the over-cap claim must be *answered*, got {answer:?}");
+        };
+        assert_eq!(verdict.claim, over.key(), "the refusal names the claim");
+        assert_eq!(
+            verdict.outcome,
+            HitOutcome::Rejected(HitRefusal::OverClaimRate {
+                burst: 32,
+                refill_ticks: 1,
+            })
+        );
+
+        let copy = claim_seq(&peer, cap.burst + 1);
+        assert_eq!(
+            peer.history.answer(shooter_peer, &copy, &rules),
+            ClaimAnswer::AlreadyAnswered {
+                key: copy.key(),
+                at: peer.now(),
+            },
+            "a same-tick flood is told once, and the coalescing is named"
+        );
+        let gate = peer.history.claim_gate(shooter_peer).expect("gate opened");
+        assert_eq!((gate.refused(), gate.coalesced()), (1, 1));
+
+        // One tick on, one token has refilled: the next new claim goes through.
+        peer.run(1);
+        let fresh = claim_seq(&peer, cap.burst + 2);
+        assert_eq!(
+            refusal(peer.history.answer(shooter_peer, &fresh, &rules)),
+            None
+        );
+    }
+
+    /// The leg that matters as much as the refusal: a cap that refuses
+    /// legitimate play is worse than no cap. Regolith's fastest weapon has a
+    /// 20-tick cooldown (`crates/orrery_games/src/regolith/weapon.rs`), and
+    /// docs/05 §7 has the shooter resend until a verdict names the key. So:
+    /// a shot every 20 ticks for a minute, each shot a spread that hits
+    /// *eight* targets, each claim resent twice as if the verdict were lost —
+    /// and, separately, the fire-rate invariant's own floor of one shot per
+    /// tick, single-target, with the same resends. Neither ever meets
+    /// `OverClaimRate`.
+    ///
+    /// The floor leg is single-target on purpose. The cap is in claims and
+    /// the invariant is in shots; they coincide at the floor only for one
+    /// claim per shot, and a weapon that hits two targets every tick for half
+    /// a second is not a designed rate any validator in the tree admits. At
+    /// any shipped cooldown the spread has `cooldown` tokens of headroom per
+    /// shot, which the eight-target leg demonstrates.
+    #[test]
+    fn an_honest_weapon_at_its_designed_rate_is_never_refused() {
+        const REGOLITH_FASTEST_COOLDOWN_TICKS: u64 = 20;
+        const RESEND_AFTER_TICKS: [u64; 2] = [6, 12];
+
+        for (cooldown, targets_per_shot) in [(REGOLITH_FASTEST_COOLDOWN_TICKS, 8), (1, 1)] {
+            let mut peer = AuthorityPeer::new();
+            peer.run(40);
+            let rules = peer.rules();
+            let shooter_peer = source(2);
+            let mut pending: Vec<(Tick, HitClaim)> = Vec::new();
+            let mut seq: u16 = 0;
+            let mut accepted = 0u32;
+
+            for _ in 0..3_600u64 {
+                peer.run(1);
+                let now = peer.now();
+                if now.0.is_multiple_of(cooldown) {
+                    // One shot; every target it hits is a claim in this tick.
+                    for _ in 0..targets_per_shot {
+                        let claim = claim_seq(&peer, seq);
+                        seq = seq.wrapping_add(1);
+                        let answer = peer.history.answer(shooter_peer, &claim, &rules);
+                        assert_eq!(refusal(answer), None, "cooldown {cooldown}: {answer:?}");
+                        if matches!(
+                            answer,
+                            ClaimAnswer::Verdict(HitVerdict {
+                                outcome: HitOutcome::Accepted { .. },
+                                ..
+                            })
+                        ) {
+                            accepted += 1;
+                        }
+                        for after in RESEND_AFTER_TICKS {
+                            pending.push((Tick::new(now.0 + after), claim));
+                        }
+                    }
+                }
+                for (_, claim) in pending.iter().filter(|(due, _)| *due == now) {
+                    let answer = peer.history.answer(shooter_peer, claim, &rules);
+                    assert_eq!(
+                        refusal(answer),
+                        None,
+                        "cooldown {cooldown}: a resend is never over cap: {answer:?}"
+                    );
+                }
+                pending.retain(|(due, _)| *due > now);
+            }
+            assert!(
+                accepted > 0,
+                "the honest claims were real: some validated against the ring"
+            );
+            let gate = peer.history.claim_gate(shooter_peer).expect("gate opened");
+            assert_eq!(gate.refused(), 0, "cooldown {cooldown}");
+            assert_eq!(gate.coalesced(), 0, "cooldown {cooldown}");
+        }
+    }
+
+    /// The gate is keyed by the peer the transport vouches for. A source
+    /// cannot buy a second bucket by naming a second shooter, and one source
+    /// running dry does not touch another's bucket.
+    #[test]
+    fn the_cap_is_per_source_peer_not_per_named_shooter() {
+        let mut peer = AuthorityPeer::new();
+        peer.run(40);
+        let rules = peer.rules();
+        let flooder = source(3);
+        let honest = source(4);
+
+        for seq in 0..32u16 {
+            let claim = HitClaim {
+                // A fresh shooter id per claim buys nothing.
+                shooter: PersistId::new(1_000 + u64::from(seq)),
+                ..claim_seq(&peer, seq)
+            };
+            assert_eq!(refusal(peer.history.answer(flooder, &claim, &rules)), None);
+        }
+        let over = HitClaim {
+            shooter: PersistId::new(2_000),
+            ..claim_seq(&peer, 99)
+        };
+        assert!(matches!(
+            refusal(peer.history.answer(flooder, &over, &rules)),
+            Some(HitRefusal::OverClaimRate { .. })
+        ));
+
+        let theirs = claim_seq(&peer, 0);
+        assert_eq!(
+            refusal(peer.history.answer(honest, &theirs, &rules)),
+            None,
+            "another peer's bucket is its own"
+        );
+    }
+
+    /// The gate table is bounded at D6's per-cell ceiling and evicts the
+    /// stalest source, which can only make that source *more* admissible.
+    #[test]
+    fn the_gate_table_is_bounded_and_evicts_the_stalest_source() {
+        let mut peer = AuthorityPeer::new();
+        peer.run(40);
+        let rules = peer.rules();
+
+        let first = source(0);
+        let claim = claim_seq(&peer, 0);
+        peer.history.answer(first, &claim, &rules);
+        peer.run(1);
+        for seed in 1..=MAX_CLAIM_SOURCES {
+            let claim = claim_seq(&peer, 0);
+            peer.history.answer(
+                iroh_base::SecretKey::from_bytes(&[
+                    seed as u8,
+                    (seed >> 8) as u8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                ])
+                .public(),
+                &claim,
+                &rules,
+            );
+        }
+        assert!(
+            peer.history.claim_gate(first).is_none(),
+            "the stalest source was evicted"
+        );
+        assert!(peer.history.gates.len() <= MAX_CLAIM_SOURCES);
     }
 }
