@@ -54,7 +54,7 @@ their linked dependencies.
 | D37 | [ADR-0037](adr/0037-unavailable-witness-epoch.md) | Unavailable witness epochs refuse with a bounded cure; corrects D27/D28 |
 | D38 | [ADR-0038](adr/0038-at-rest-schema-versioning.md) | At-rest schema versioning as three work items: formats before machinery, migrations fit D21's freeze additively |
 | D41 | [ADR-0041](adr/0041-offline-identity-issuer-custody-and-lifecycle.md) | Offline invites are single-use capabilities, account allocation is singular, issuer keys are portable escrowed secrets |
-| D42 | [ADR-0042](adr/0042-canonical-simulation-architecture.md) | Canonical state stays in the engine-neutral executor; composition root and `SimulationHost` seam land now; shared app world rejected; dedicated ECS world trigger-gated; clauses (a) and (b)(2) amended 2026-08-31 — a dedicated `bevy_ecs::World` is reachable from the rules and the seam gained a per-section read surface, with (c) untouched |
+| D42 | [ADR-0042](adr/0042-canonical-simulation-architecture.md) | Canonical state stays in the engine-neutral executor; composition root and `SimulationHost` seam land now; shared app world rejected; dedicated ECS world trigger-gated; clauses (a) and (b)(2) amended 2026-08-31 — a dedicated `bevy_ecs::World` is reachable from the rules and the seam gained a per-section read surface, with (c) untouched; clause (d) restated 2026-09-02 — a dedicated world enters automatically on a fired trigger or by recorded owner decision, the trigger list standing |
 | D43 | [ADR-0043](adr/0043-determinism-envelope-and-gate-replacement.md) | The three-ring determinism envelope, canonical stages S0–S7, and role-discovery replacing the typed gate list; overflow flags inside witnessed state; clause (d)'s neighbour ban narrowed 2026-08-25 to declared audited predicates; clause (e)(1) amended 2026-08-31 to admit `orrery_games` as an ECS host, with (e)(5) unamended but enforced by gate rather than by type; clause (f)(3) amended 2026-08-31 to make overflow-canonicity a required per-ruleset declaration rather than a blanket requirement |
 | D44 | [ADR-44](adr/0044-identity-classes-and-allocation.md) | Three closed identity classes; granted-range derivation; no provisional durable identity; id reuse stays legal and durable readers must be lifetime-aware |
 | D45 | [ADR-0045](adr/0045-per-component-capability-policy.md) | Five independent capability dimensions with fail-closed zeros and eight invalid combinations; `classify_component` replaced; IV-7's engine-handle rule accepted, its enforcement mechanism open |
@@ -93,11 +93,14 @@ until the owner flips its status.
 
 D51 was **accepted on 2026-09-02**:
 [ADR-0051](adr/0051-v1-terrain-is-not-durable-state.md) records the owner's
-2026-09-01 #830 decision to remove v1 durable terrain. Its supersession of
-D11's terrain allocation and its amendment of D32/D35's reclaimed-byte
-arithmetic are now in force, but those accepted records have **not yet been
-edited** — that follow-up is tracked separately so each amendment lands
-through its own record rather than by D51 rewriting them.
+2026-09-01 #830 decision to remove v1 durable terrain. Its consequential
+amendments landed in the affected records on 2026-09-02, each recorded
+against the record it touches rather than by D51 rewriting them: D11's
+terrain allocation is withdrawn (status line and a dated note against the
+terrain bullets); D35 §4's recount drops `k` — seventeen registered
+families, one clean prefix byte; D32 clause (c)'s arithmetic and allocation
+rule carry the same correction. The recovered byte is **not pre-spent** by
+any of them (D51 §(c)).
 
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no

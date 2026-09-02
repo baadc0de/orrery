@@ -259,6 +259,20 @@ already name the fork for the next family — "adopt sub-discrimination as
 this one does or open the question of a two-byte family space" — and this
 record takes the first tine.
 
+> **Amended 2026-09-02 (owner-authorised), on the acceptance of [ADR-0051].**
+> The arithmetic above counted `k` (`chunk/`) among the eighteen registered
+> families; D51 withdraws that family as v1 terrain that was never durable
+> state, so the seventeen-family line is `a c d e f g i l m n o p r s u v w`
+> and the clean-byte budget is **one**, not zero — the recount is [ADR-0035]
+> §4, amended the same day. (`y` and `z` have since landed as registered
+> families too, `strike/` and `jarchive/`; they were already counted on the
+> accepted-allocation line and are not counted twice.) Nothing this clause decided moves: `ramp/` stays the `b"vr"` sub-span
+> of `v`, because the sub-span was the right shape for five singleton rows
+> whether or not a byte remained, as the sentence above already says. The
+> recovered byte is **not pre-spent** ([ADR-0051] §(c)); it is not `ramp/`'s,
+> not terrain's, and not anyone's until a normal allocation decision under
+> the rule below spends it.
+
 `v` is the right host, not merely an available one. Its one landed key kind,
 `content/version`, is a deployment-plane singleton: written by the world
 seeder at seed time (`docs/12-world-seeding.md` §9.3), read by `persistd`,
@@ -290,6 +304,15 @@ against "the fourteen in `keyspace.rs`"; it happened to be right). The rule:
 > a dedicated ADR that amends [ADR-0031]'s budget arithmetic and defines a
 > multi-byte family scheme. It is never grounds for taking `y`, `z`, or a
 > range-end byte in passing.**
+
+> **Amended 2026-09-02 (owner-authorised).** "That list is now empty" read
+> true when written and is corrected by [ADR-0051]: the list holds exactly
+> one byte, the `k` it recovered. The rule stands unchanged in every other
+> word, and the recovered byte is read *through* it, not around it — a new
+> kind still takes a sub-discriminator inside a matching family, and the one
+> free byte is spent only by a dedicated allocation decision that names this
+> rule, never taken in passing, exactly as `y`, `z` and the range ends are
+> never taken in passing.
 
 The value:
 
@@ -718,7 +741,10 @@ either an attack or a ruleset bug, and both page somebody.
   describes from the other direction.
 - **Take `z` instead.** The same mistake one byte later: [ADR-0031]'s
   accepted arithmetic closes only because `z` goes to `jarchive/`. Spending
-  it here re-opens an accepted record's budget to shelve five rows.
+  it here re-opens an accepted record's budget to shelve five rows. (As of
+  [ADR-0051], 2026-09-02, the budget no longer closes at zero — `k` is
+  recovered and unspent — but the rejection holds as written: `z` is still
+  `jarchive/`'s, and the recovered byte is no more `ramp/`'s than `z` was.)
 - **Open the two-byte family space now.** The structural fix, and costed
   rather than dismissed: it touches every key builder in `keyspace.rs`, the
   disjointness guard's one-byte model, and — for any family it re-homes —
@@ -816,3 +842,5 @@ either an attack or a ruleset bug, and both page somebody.
 [#226]: https://github.com/baadc0de/orrery/issues/226
 [#248]: https://github.com/baadc0de/orrery/issues/248
 [ADR-0031]: 0031-id-account-subspace.md
+[ADR-0035]: 0035-lease-key-discriminator.md
+[ADR-0051]: 0051-v1-terrain-is-not-durable-state.md

@@ -2,8 +2,9 @@
 
 **Status:** Accepted; local journal-engine choice superseded by
 [ADR-0019](0019-indexed-waldb-journal.md); shard placement qualified by
-[ADR-0026](0026-sibling-gateways.md) · **Date:** 2026-08-11 ·
-**Decision:** D11
+[ADR-0026](0026-sibling-gateways.md); terrain allocation withdrawn by
+[ADR-0051](0051-v1-terrain-is-not-durable-state.md) (2026-09-02) ·
+**Date:** 2026-08-11 · **Decision:** D11
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
 
@@ -18,6 +19,25 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 - **Durability windows:** intents: **RPO 0** (synchronous FDB). Bulk: journal on local NVMe → RPO ≈ 0 if disk survives, ≤ checkpoint cadence if node is lost; optional **chain-replicated journal** (1 async follower) → RPO ≤ ~100 ms. Default deployment: chain replication on.
 - **Event history (R7):** the journal *is* the event source — a tailer compacts it to an archive (object storage, Parquet) with configurable retention; supports griefing rollback (inverse-op replay by cell/actor/time-range), offline-progress computation, desync forensics, analytics.
 - **Terrain/bulk edits:** chunk-oriented, cell-aligned; deltas-vs-base in the journal, periodically compacted into chunk snapshot rows (≤100 KB shards, Minecraft sparse-elision precedent). Every `TerrainDelta` is **attributed to and fenced by the editing player's lease** and invariant-checked at the cell actor (reach/rate/tool); destructive or high-value edits route through intents. Live edits replicate P2P on the reliable per-cell stream, ordered by `(cell, tick)`.
+
+> **Withdrawn 2026-09-02 (owner-authorised), by
+> [ADR-0051](0051-v1-terrain-is-not-durable-state.md).** v1 has no durable
+> terrain state. The terrain allocation this record made — the *bulk state*
+> bullet's "terrain deltas", the `chunk/{cell_id}/{n}` checkpoint family in
+> the *Checkpointing* bullet, the whole of the *Terrain/bulk edits* bullet
+> above (`TerrainDelta`, chunk deltas-vs-base, compacted chunk snapshot rows),
+> the "oversized blobs (terrain chunks)" example under the durable tier, and
+> the seeder's `chunk/` rows in *World seeding & IDs* below — is superseded:
+> no `RecordKind::TerrainDelta`, no `chunk/` key family, no terrain checkpoint,
+> recovery, area-load, archive, replication or seed-write contract exists, and
+> `scripts/terrain-substrate-gate.sh` refuses their reintroduction by name. A
+> future terrain design needs a new owner decision with its own payload,
+> replay, checkpoint, admission, archive and key-allocation terms (D51 §(a));
+> it does not revive these bullets. The text is kept so the original record
+> stays readable, as with the journal-engine supersession in the status line.
+> Everything else in this record — the two write classes, the cell actor and
+> journal, the FoundationDB checkpoint families other than `chunk/`, leases,
+> intents and the ledger — stands.
 - **At-rest schema versioning:** component bags carry a per-component schema version; `Ruleset`-registered migrations run lazily on checkpoint-load/area-read plus an optional background sweep; journal and archive records carry their encoding version so replay, catch-up, and griefing rollback can decode history. Migrations must span ≥2 adjacent versions.
 - **World seeding & IDs:** an offline import tool (built on the persistd harness) bulk-writes designed content into `world/`/`chunk/` rows, mints `PersistId`s, and records a content-version row for later diff/patch deploys. Live minting: intent commit receipts carry cluster-minted `PersistId`s; peers also hold **journaled block grants** (contiguous id ranges leased per session, usable offline). `universe_seed` is generated once per universe and held in the secret store (it is security-relevant per [D9](0009-verifiable-core.md)).
 - **Bulk-path validation:** cell actors run the stateless `Ruleset` invariant validators on inbound bulk diffs — mandatory for entities in cells with fewer than N witness candidates (the solo-cell exposure), sampled elsewhere — rejecting or flagging violations. CRDTs deliberately absent from the hot path (single writer per cell); noted as a future option for offline build modes only.

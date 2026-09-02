@@ -1,4 +1,4 @@
-# ADR-0042: Canonical state stays in the engine-neutral executor, the composition root and host seam land now, and a dedicated ECS world is trigger-gated
+# ADR-0042: Canonical state stays in the engine-neutral executor, the composition root and host seam land now, and a dedicated ECS world is admitted on a fired trigger or by recorded owner decision
 
 **Status:** Accepted · **Date:** 2026-08-25 · **Decision:** D42
 
@@ -335,53 +335,25 @@ Rejected outright means: no trigger, no pilot, and no reversal condition in
 this record reopens it. Clause (e)'s reversal path explicitly does not lead
 here.
 
-### (d) A dedicated `bevy_ecs::World` is admitted only behind the host seam, on pre-registered triggers
+### (d) A dedicated `bevy_ecs::World` behind the seam: automatic on a fired trigger, otherwise by recorded owner decision
 
-> **Amended 2026-08-31 (owner-authorised). The host is admitted, and no
-> trigger fired.** On 2026-08-30 the owner sanctioned `bevy_ecs` adoption
-> directly; on 2026-08-31 it landed as `orrery_sim_host`'s `EcsBackend`
-> (#757), at four-class F-4 parity, with `scripts/core-gates.sh` at exit 0.
-> This clause prescribed its own amendment mechanism — *"amendment is an owner
-> decision recorded against this clause, not a silent edit"* — and this is that
-> record.
->
-> **What the admission did not do.** It did not fire T1, T2 or T3, and it did
-> not discharge the precondition package below. Read the trigger list as the
-> conditions under which adoption would have been *automatic*; the owner
-> retains the separate power to admit a host directly, which is what happened.
->
-> **The package ledger, as of this amendment:**
->
-> | Item | State |
-> |---|---|
-> | the differential parity harness beyond goldens | **met** — all four A10 §4.1 classes, generalised across substrates |
-> | A5's component-policy registry | **partial** — declaration data plane live and now the single source (`classify_component` retired, #761); IV-7's engine-handle refusal and the persistd linkage remain open |
-> | A4's Tier-H gate bundle (T3) | **not met** — see the open question below |
-> | capacity-scale mirror-cost numbers | **not met, and partly overtaken** — the admitted backend does not mirror into an application world, so A3's two-world-hop question is not the one now in front of us |
->
-> **T3's status is narrowed, not retired.** It no longer gates admission,
-> because admission has happened. It remains binding on *canonical bytes
-> moving*: no golden may be regenerated on the ECS path, and no second host may
-> be admitted, until [D43] clause (e)'s battery is enforced.
->
-> > **Discharged 2026-08-31 (owner-authorised).** [D43] clause (e)'s battery is
-> > now enforced and demonstrated mutation-style in full — all five clauses, each
-> > with a named killing mutation — and that record's confinement is lifted
-> > accordingly. T3 is satisfied for this host. It stays binding on any *further*
-> > adoption: a second host still enters through clause (e)(1)'s review-required
-> > allowlist and inherits the whole battery, which is the mechanism rather than
-> > a formality.
-> >
-> > The package's other two open items are unchanged by this and are **not**
-> > discharged: A5's component-policy registry is nearer (the declaration data
-> > plane is now the single source, `classify_component` retired) but IV-7's
-> > engine-handle refusal and the persistd linkage remain open; the
-> > capacity-scale mirror-cost numbers remain unmet.
+> **Amended 2026-09-02 (owner-authorised), on the acceptance recorded in
+> [#853].** The owner accepted the drafted restatement
+> ([d42-d-amendment-draft.md]) as written, with its dependency audit as the
+> basis. This clause is restated so its operative text states the mechanism
+> the tree ran, instead of stating a rule its own amendment notes override.
+> Both admissions below were already recorded against this clause (#759,
+> #805); what the restatement changes is where the rule lives — in the body,
+> single-sourced — not what is licensed. Nothing new is admitted here,
+> nothing is foreclosed that was open, and the trigger list stands.
 
 A dedicated canonical `bevy_ecs::World` — same per-entity topology, different
-substrate behind the seam — is neither adopted nor foreclosed. It becomes a
-legal *future* host implementation, adoptable only when a pre-registered
-trigger fires:
+substrate behind the seam — is a legal host implementation. It enters the
+tree one of two ways, and no third:
+
+**1. A pre-registered trigger fires, and adoption is automatic.** The
+triggers are measurements, not judgements; the owner may amend their
+*definitions* (second opinion §3 V5 marks them "owner may amend"):
 
 - **T1:** a shipped module genuinely needs per-component canonical storage
   with independent per-component policies — i.e. `CoreState`-as-one-enum
@@ -393,36 +365,62 @@ trigger fires:
   programme's standing bar ("a weaker gate that passes is worse") and must
   not ship.
 
-T3 is a necessary precondition for any canonical byte to move regardless of
-T1/T2, per the pilot precondition list both lanes carry (A3 §7.4): the gate
-bundle, the differential parity harness beyond goldens, capacity-scale
-mirror-cost numbers replacing the indicative P4/P-1 bounds, and A5's
-component-policy registry. The trigger *definitions* may be amended by the
-owner (second opinion §3 V5 marks them "owner may amend"); amendment is an
-owner decision recorded against this clause, not a silent edit.
+**2. The owner admits directly, by a decision recorded against this clause.**
+The trigger list is the automatic path, not the exclusive one — it never
+bound the owner's power over this record, and an exercise of that power is an
+amendment recorded here, never a silent edit. Both paths have been walked,
+and both walks are part of this clause's rule:
 
-**Until a trigger fires, the gated crates stay Bevy-free and
-`scripts/core-gates.sh` clause 1 stays exactly as it is** — the Bevy-free
-scan over `GATED_CRATES=(orrery_core orrery_games orrery_conformance)`
-(`scripts/core-gates.sh:37,66-77`). Nothing replaces the gate because
-nothing weakens it. (R2's Tier V discovery clause *strengthens* membership
-detection and is compatible with this sentence; the conditional Tier H
-battery arms only with a trigger here.)
+- **2026-08-30, the host (sanction in [#745]):** *"`bevy_ecs` is approved and
+  S7 may start. No D42 (d) trigger fired; the owner sanctioned entry
+  directly."* It landed 2026-08-31 as `orrery_sim_host`'s `EcsBackend`
+  (#757) — the host behind the seam — at four-class F-4 parity, with
+  `scripts/core-gates.sh` at exit 0.
+- **2026-08-31, the rules (acceptance in [#793], "OWNER ACCEPTANCE,
+  2026-08-31"):** *"I accept the amendments. Bevy ECS in `orrery_games` as
+  first class dependency. ECS as idiomatic storage for entities and ruleset
+  logic. Systems registration and tick driving works over `World`."* What
+  that acceptance changed is recorded in clause (a) — reach, not location —
+  and what it changed *here* is the Bevy-free floor below.
 
-> **Amended 2026-08-31 (owner-authorised): the paragraph above no longer names
-> the tree.** The owner's acceptance in [#793] removes `orrery_games` from the
-> Bevy-free scan — see the second 2026-08-31 amendment to clause (a) for the
-> decision and the manifest evidence, and `scripts/core-gates.sh` clause 1 for
-> the corrected reasoning. **The set the sentence protects is now
-> `orrery_core` and `orrery_conformance`, and for those two it stands
-> unweakened.** No trigger fired; this is the same owner power clause (d)
-> already reserved and already exercised once for #757, recorded against the
-> clause rather than edited in silently.
->
-> Everything else in the paragraph holds: the declared floor
-> (`DECLARED_GATED_CRATES`) still carries `orrery_games`, so role discovery,
-> VC-4, VC-6, VC-8, the async-runtime ban and the neighbour-read scan all
-> still bind it. The only clause that stops binding it is the Bevy one.
+**The precondition package rides the admission, not the trigger.** The
+package both A3 lanes carry (A3 §7.4) binds whatever substrate is admitted,
+however it was admitted. Its ledger, as recorded against this clause and
+current at this amendment:
+
+| Item | State |
+|---|---|
+| the differential parity harness beyond goldens | **met** — all four A10 §4.1 classes, generalised across substrates |
+| A5's component-policy registry | **partial** — declaration data plane live and now the single source (`classify_component` retired, #761); IV-7's engine-handle refusal and the persistd linkage remain open ([D45]) |
+| the Tier-H gate bundle (T3) | **met for the admitted host** — [D43] clause (e)'s battery is enforced and demonstrated mutation-style in full, five clauses each with a named killing mutation; discharged there on 2026-08-31 |
+| capacity-scale mirror-cost numbers | **not met as written, and partly overtaken** — the admitted backend does not mirror into an application world, so A3's two-world-hop question is not the one now in front of us; the source half now has capacity-scale numbers and a recorded "partly discharged" judgement ([docs/14 §12.6]), and the consumer half does not exist |
+
+T3 keeps a second force the table does not retire: **no canonical byte moves
+without it.** Its admission-gating function lapsed when admission happened by
+sanction; its enforcement function is what a *further* adoption passes
+through — a second host enters through [D43] (e)(1)'s review-required
+allowlist and inherits the whole battery, which is the mechanism rather than
+a formality.
+
+**The Bevy-free floor, narrowed as recorded.** `orrery_core` and
+`orrery_conformance` stay Bevy-free and `scripts/core-gates.sh` clause 1
+stays exactly as it is for them; proposals to put `bevy_ecs` in either are
+refused by this record, not argued case-by-case. `orrery_games` is the one
+recorded exception, and the exception is permission, not dependency: the
+gate carries it in `BEVY_PERMITTED_CRATES` (`scripts/core-gates.sh:259`)
+while the crate's manifest declares none. Everything else about it binds in
+full — it stays in `DECLARED_GATED_CRATES` and `DECLARED_RULES_CRATES`, so
+role discovery, VC-4, VC-6, VC-8, the async-runtime ban and clause 5's
+neighbour-read scan all still apply — and if it ever hosts canonical state
+in a `bevy_ecs::World`, section 6's escape check fails it by name until it
+joins `DECLARED_HOST_CRATES` and takes the whole Tier-H battery
+([D43] (e)(1): eligible, not admitted). (R2's Tier V discovery clause
+*strengthens* membership detection and is compatible with this paragraph.)
+
+Nothing here touches clause (c): the shared application world stays rejected
+outright, with no trigger, pilot, or reversal path leading to it — a
+dedicated world shares nothing with presentation, and that distinction is
+the entire reason this clause could be restated without reopening (c).
 
 ### (e) The pre-registered reversal condition
 
@@ -453,10 +451,13 @@ clause (d) stay binding on the hybrid's ECS-hosted tier regardless.
   every forward path the brief contemplates — plus the reversal condition of
   clause (e), which names the experiment that would kill the composition
   claim rather than leaving it unfalsifiable.
-- Until an R1 trigger fires, proposals to put `bevy_ecs` in a gated crate
-  are refused by this record, not argued case-by-case; and the trigger list
-  means such a proposal now has a legitimate path — produce the T1/T2
-  measurement and the T3 gate bundle — instead of a standing argument.
+- Absent a fired R1 trigger or a recorded owner decision, proposals to put
+  `bevy_ecs` in a gated crate are refused by this record, not argued
+  case-by-case; and clause (d)'s two paths mean such a proposal now has a
+  legitimate route — produce the T1/T2 measurement and the T3 gate bundle, or
+  obtain a recorded owner admission — instead of a standing argument.
+  (Restated 2026-09-02 with clause (d)'s amendment; the original read "Until an
+  R1 trigger fires".)
   (2026-08-31: `orrery_games` has left that set by the clause (a) and
   clause (d) amendments above. `orrery_core` and `orrery_conformance` have
   not, and the sentence is about them.)
@@ -507,9 +508,14 @@ clause (d) stay binding on the hybrid's ECS-hosted tier regardless.
 [D15]: 0015-crate-set.md
 [D21]: 0021-ruleset-distribution.md
 [D43]: 0043-determinism-envelope-and-gate-replacement.md
+[D45]: 0045-per-component-capability-policy.md
 [docs/10 §2]: ../10-crates.md
+[docs/14 §12.6]: ../14-capacity.md
+[d42-d-amendment-draft.md]: ../spikes/d42-d-amendment-draft.md
 [#407]: https://github.com/baadc0de/orrery/issues/407
+[#745]: https://github.com/baadc0de/orrery/issues/745
 [#793]: https://github.com/baadc0de/orrery/issues/793
 [#796]: https://github.com/baadc0de/orrery/pull/796
 [#798]: https://github.com/baadc0de/orrery/pull/798
 [#802]: https://github.com/baadc0de/orrery/pull/802
+[#853]: https://github.com/baadc0de/orrery/issues/853
