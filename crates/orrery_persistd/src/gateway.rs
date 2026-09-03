@@ -6242,7 +6242,7 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
 async fn standing_sweep(
     feed: &dyn StandingInvalidationFeed,
     invalidations: &AccountInvalidations,
-    mode: StrikesEnforcement,
+    posture: &StrikesPosture,
     peers: &PeerRegistry,
     metrics: &GatewayStandingMetrics,
     router: &Arc<dyn Router>,
@@ -6253,7 +6253,7 @@ async fn standing_sweep(
     // a control that does not exist neither acts nor calibrates, and a flip
     // to `Shadow` or `Live` converges on its first evaluated sweep because
     // the feed answers with the full set every time.
-    if let StrikesEnforcement::Off = mode {
+    if let StrikesEnforcement::Off = posture.get() {
         return;
     }
     let fetched = match feed.invalidations().await {
@@ -6272,11 +6272,21 @@ async fn standing_sweep(
     }
     let entries = invalidations.snapshot().await;
     for session in peers.invalidated_sessions(&entries).await {
-        match mode {
-            // Re-read per session so a mid-sweep demotion cannot act after it
-            // has been asked for; a demotion taking effect one session late is
-            // the same one-poll-late observation [`StrikesPosture`] documents.
-            StrikesEnforcement::Off | StrikesEnforcement::Shadow => {
+        // Re-read per session so a mid-sweep demotion cannot act after it has
+        // been asked for — the posture is read once above to gate the poll and
+        // again here, per account, exactly as `orrery_identity`'s filing
+        // reactor does (`filing.rs:218-234`). Reading it once and matching a
+        // captured copy is what left the coordinator's session-termination arm
+        // acting under a posture it no longer held (#934); a demotion landing
+        // one session late is the same one-poll-late observation
+        // [`StrikesPosture`] documents, and a whole sweep late is not.
+        match posture.get() {
+            // A demotion all the way to `Off` stops the walk rather than
+            // shadow-logging the rest: D32 clause (b)'s "Off observes nothing"
+            // is the same sentence whether the posture was `Off` when the poll
+            // began or arrived there halfway through it.
+            StrikesEnforcement::Off => return,
+            StrikesEnforcement::Shadow => {
                 metrics.record_shadow_session_would_terminate();
                 tracing::info!(
                     target: STRIKES_SHADOW_TARGET,
@@ -6418,7 +6428,7 @@ async fn accept_loop(
                     standing_sweep(
                         feed,
                         invalidations,
-                        admission.strikes_posture.get(),
+                        &admission.strikes_posture,
                         &admission.peers,
                         &admission.standing_metrics,
                         &router,
@@ -9721,6 +9731,11 @@ mod tests {
         entries: Mutex<Vec<AccountInvalidation>>,
         polls: AtomicU64,
         fail: std::sync::atomic::AtomicBool,
+        /// A posture demoted at poll time, standing in for C5's auto-suspend
+        /// firing between the sweep's top and the sessions it would kill.
+        /// There is no other way to hit that window deterministically: the
+        /// real demotion comes from a poller task on its own clock.
+        demote_on_poll: Mutex<Option<StrikesPosture>>,
     }
 
     impl StaticStandingFeed {
@@ -9729,11 +9744,17 @@ mod tests {
                 entries: Mutex::new(entries),
                 polls: AtomicU64::new(0),
                 fail: std::sync::atomic::AtomicBool::new(false),
+                demote_on_poll: Mutex::new(None),
             })
         }
 
         fn publish(&self, entry: AccountInvalidation) {
             self.entries.lock().expect("static feed lock").push(entry);
+        }
+
+        /// Auto-suspend `posture` the next time this feed is polled.
+        fn demoting(&self, posture: StrikesPosture) {
+            *self.demote_on_poll.lock().expect("static feed lock") = Some(posture);
         }
     }
 
@@ -9743,6 +9764,14 @@ mod tests {
             self.polls.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err(FeedFailure("injected feed failure".to_string()));
+            }
+            if let Some(posture) = self
+                .demote_on_poll
+                .lock()
+                .expect("static feed lock")
+                .as_ref()
+            {
+                posture.auto_suspend();
             }
             Ok(self.entries.lock().expect("static feed lock").clone())
         }
@@ -9780,6 +9809,12 @@ mod tests {
 
         /// One maintenance sweep against this rig's own feed and consumer.
         async fn sweep(&self, mode: StrikesEnforcement) {
+            self.sweep_under(&StrikesPosture::new(mode)).await;
+        }
+
+        /// One maintenance sweep under a posture cell the caller still holds,
+        /// so a test can move it while the sweep runs.
+        async fn sweep_under(&self, posture: &StrikesPosture) {
             let redistributor = Redistributor {
                 peers: Arc::clone(&self.registry),
                 interest: Arc::new(DenyAllInterestAuthority),
@@ -9793,7 +9828,7 @@ mod tests {
             standing_sweep(
                 self.feed.as_ref(),
                 &self.consumer,
-                mode,
+                posture,
                 &self.registry,
                 &self.metrics,
                 &router,
@@ -10174,6 +10209,60 @@ mod tests {
             .await
             .is_none());
         assert_eq!(fixture.metrics.snapshot().sessions_terminated, 1);
+    }
+
+    /// A demotion landing *inside* a sweep stops it, rather than being
+    /// noticed on the next one.
+    ///
+    /// The posture is read at the top of the sweep to gate the poll and again
+    /// per session before any action, the shape `orrery_identity`'s filing
+    /// reactor uses (`filing.rs:218-234`). Reading it once and matching a
+    /// captured copy is what #934 found in the coordinator's
+    /// session-termination arm: an arm that keeps acting under a posture the
+    /// process no longer holds. Here the demotion is `Live -> Shadow`, which
+    /// is the only move [`StrikesPosture::auto_suspend`] makes and the one a
+    /// failed posture read performs — so this is the trip that must not
+    /// arrive one whole sweep late, with the sessions already gone.
+    #[tokio::test]
+    async fn a_demotion_during_a_sweep_stops_it_terminating_the_rest() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Live,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        established_session(&fixture, account).await;
+        feed.publish(invalidated(account, 500));
+
+        // Live at the top — the poll happens and the entries are applied —
+        // and Shadow by the time the first session is considered.
+        let posture = StrikesPosture::new(StrikesEnforcement::Live);
+        feed.demoting(posture.clone());
+        fixture.sweep_under(&posture).await;
+
+        assert_eq!(
+            posture.get(),
+            StrikesEnforcement::Shadow,
+            "the fixture's demotion never fired, so this proves nothing"
+        );
+        assert_eq!(feed.polls.load(Ordering::SeqCst), 1, "the sweep polled");
+        assert!(
+            fixture
+                .registry
+                .current_session(fixture.peer)
+                .await
+                .is_some(),
+            "the sweep terminated a session under a posture that had already \
+             been suspended to Shadow"
+        );
+        let snapshot = fixture.metrics.snapshot();
+        assert_eq!(snapshot.sessions_terminated, 0);
+        assert_eq!(
+            snapshot.shadow_sessions_would_terminate, 1,
+            "a demoted sweep still records what Live would have done"
+        );
     }
 
     /// Off consults nothing: not the predicate, not even the feed — D32

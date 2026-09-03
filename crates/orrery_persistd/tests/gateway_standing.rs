@@ -433,3 +433,268 @@ async fn in_shadow_the_invalidated_account_is_still_admitted_and_counted() {
     assert_eq!(snapshot.shadow_hello_would_refuse, 1);
     assert_eq!(snapshot.hello_refused_standing, 0);
 }
+
+/// The deployed feed, against the real `dc` family (#862).
+///
+/// Everything above injects [`MutableFeed`], which proves the gateway's half of
+/// D33 clause (e) and nothing about where the entries come from. These run
+/// [`orrery_persistd::standing_feed::DcCooldownFeed`] — the type the `persistd`
+/// binary now installs — over a live FoundationDB cluster, against the same
+/// accept loop, sweep and raw-iroh client as the rest of the suite.
+///
+/// # Why the row is written as raw bytes and not through `orrery_identity`
+///
+/// It cannot be: `orrery_identity` depends on `orrery_persistd`, so no target
+/// in this crate — test targets included — may name it
+/// (`docs/spikes/862-gateway-consumer-dependency-cycle.md` carries the cargo
+/// error). What keeps this honest is that the writer below builds its key with
+/// [`orrery_persistd::keyspace::cooldown_entry_key`], which since #862 is also
+/// the function `orrery_identity::fdb`'s real `observe_cooldown` calls. There is
+/// one definition of these bytes, so a test writing them writes identity's
+/// layout by construction rather than by a comment promising it does.
+#[cfg(feature = "fdb")]
+mod dc_feed {
+    use super::{
+        connect, hello, node, spawn_gateway, AtomicClock, HealthSwitch, HELLO_LIVENESS_TIMEOUT,
+        INVALIDATED_AT_MS,
+    };
+    use orrery_persistd::gateway::{
+        FeedFailure, SharedStandingInvalidationFeed, StandingInvalidationFeed, StrikesEnforcement,
+        StrikesPosture,
+    };
+    use orrery_persistd::keyspace;
+    use orrery_persistd::standing_feed::DcCooldownFeed;
+    use orrery_persistd::{GatewayConfig, GatewayServer};
+    use orrery_protocol::{AccountId, AccountInvalidation, CellId, GatewayReply, GridId};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The gateway's maintenance arm ticks once a second; two ticks is the
+    /// window in which a poll must have happened, and the window in which an
+    /// `Off` gateway must still not have polled.
+    const TWO_SWEEPS: Duration = Duration::from_millis(2_500);
+
+    /// An account id no other lane uses.
+    ///
+    /// The dev cluster at 127.0.0.1:4500 is shared, and the `dc` family is
+    /// process-global: a fixed id would let this suite and a sibling's identity
+    /// suite write each other's rows. `0x0862_0005` is this issue's band, and
+    /// the low half is the pid and a counter so two runs of this binary — or
+    /// two arms of it in parallel — never meet either.
+    fn unique_account() -> AccountId {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        AccountId::new(
+            0x0862_0005_0000_0000
+                | (u64::from(std::process::id()) << 16)
+                | NEXT.fetch_add(1, Ordering::Relaxed),
+        )
+    }
+
+    /// The real feed, plus a poll counter.
+    ///
+    /// The counter is the only thing this adds: every `invalidations` call is
+    /// delegated to [`DcCooldownFeed`], so what the gateway reads is what the
+    /// binary reads. It exists because "`Off` reads nothing" is a claim about
+    /// the *absence* of a read, which no metric on the gateway can witness —
+    /// D32 clause (b) says an `Off` control does not even poll, and only the
+    /// feed itself can say whether it was asked.
+    struct CountingDcFeed {
+        inner: DcCooldownFeed,
+        polls: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl StandingInvalidationFeed for CountingDcFeed {
+        async fn invalidations(&self) -> Result<Vec<AccountInvalidation>, FeedFailure> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.inner.invalidations().await
+        }
+    }
+
+    impl CountingDcFeed {
+        fn polls(&self) -> u64 {
+            self.polls.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for_poll(&self, minimum: u64) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while self.polls() < minimum {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the maintenance sweep never polled the dc feed"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    /// A cluster handle, or `None` when this box has no dev cluster — the same
+    /// self-skip every other FDB-gated suite here uses.
+    fn context() -> Option<orrery_persistd::FdbContext> {
+        let cluster_file = super::support::fdb_cluster_file()?;
+        Some(orrery_persistd::FdbContext::connect(&cluster_file).expect("connect to dev cluster"))
+    }
+
+    /// Write one `dc` row exactly as identity's `observe_cooldown` does:
+    /// `keyspace::cooldown_entry_key(account)` -> `entered_at_ms:u64-be`.
+    async fn write_cooldown_entry(
+        db: &foundationdb::Database,
+        account: AccountId,
+        entered_at_ms: u64,
+    ) {
+        db.run(|trx, _| async move {
+            trx.set(
+                &keyspace::cooldown_entry_key(account),
+                &entered_at_ms.to_be_bytes(),
+            );
+            Ok(())
+        })
+        .await
+        .expect("write the dc cooldown entry");
+    }
+
+    /// Leave the shared cluster as it was found.
+    async fn clear_cooldown_entry(db: &foundationdb::Database, account: AccountId) {
+        db.run(|trx, _| async move {
+            trx.clear(&keyspace::cooldown_entry_key(account));
+            Ok(())
+        })
+        .await
+        .expect("clear the dc cooldown entry");
+    }
+
+    /// A gateway whose standing feed is the deployed one, at `posture`.
+    fn config(
+        issuer: &iroh_base::SecretKey,
+        feed: Arc<CountingDcFeed>,
+        posture: StrikesEnforcement,
+    ) -> GatewayConfig {
+        GatewayConfig {
+            authorizer: super::support::authorizer(issuer),
+            identity_clock: Arc::new(AtomicClock(AtomicU64::new(super::support::TOKEN_NOW_MS))),
+            identity_health: Arc::new(HealthSwitch(AtomicBool::new(true))),
+            standing_feed: Some(feed as SharedStandingInvalidationFeed),
+            strikes_posture: StrikesPosture::new(posture),
+            ..super::support::authority_config(node(1), GridId::ROOT, vec![CellId::ROOT])
+        }
+    }
+
+    /// One arm: write the row, run a gateway at `posture`, dial and `Hello`.
+    async fn run_arm(
+        posture: StrikesEnforcement,
+        seed_byte: u8,
+    ) -> Option<(Arc<CountingDcFeed>, GatewayServer, Option<GatewayReply>)> {
+        let context = context()?;
+        let db = context.database();
+        let account = unique_account();
+        write_cooldown_entry(&db, account, INVALIDATED_AT_MS).await;
+
+        let issuer = super::support::issuer();
+        let feed = Arc::new(CountingDcFeed {
+            inner: DcCooldownFeed::from_context(&context),
+            polls: AtomicU64::new(0),
+        });
+        let server = spawn_gateway(config(&issuer, Arc::clone(&feed), posture)).await;
+        let client = connect(&server, seed_byte).await;
+
+        match posture {
+            // `Off` must be given at least as long as an acting posture to do
+            // the thing it must not do; waiting for a poll that must never
+            // arrive is the one wait this suite cannot express as a condition.
+            StrikesEnforcement::Off => tokio::time::sleep(TWO_SWEEPS).await,
+            _ => feed.wait_for_poll(1).await,
+        }
+
+        let reply = hello(
+            &client,
+            super::support::session_token_for_account(
+                &issuer,
+                account,
+                client.node,
+                super::support::TOKEN_ISSUED_AT_MS,
+                super::support::TOKEN_TTL_MS,
+            ),
+        )
+        .await;
+        clear_cooldown_entry(&db, account).await;
+        Some((feed, server, reply))
+    }
+
+    fn admitted(reply: Option<GatewayReply>, posture: &str) {
+        match reply {
+            Some(GatewayReply::HelloAck { .. }) => {}
+            Some(other) => panic!("{posture} did not admit the invalidated account: {other:?}"),
+            None => panic!(
+                "timed out after {} s with no reply to the hello at all. A refusal \
+                 would have arrived as a HelloRefused, so this is silence rather \
+                 than evidence that {posture} refused the account",
+                HELLO_LIVENESS_TIMEOUT.as_secs(),
+            ),
+        }
+    }
+
+    /// D32 clause (b): "Off observes nothing." Not even the poll.
+    #[tokio::test]
+    async fn at_off_the_dc_family_is_never_read_and_the_account_is_admitted() {
+        let Some((feed, server, reply)) = run_arm(StrikesEnforcement::Off, 60).await else {
+            eprintln!("skipped: no FoundationDB dev cluster is configured");
+            return;
+        };
+        assert_eq!(
+            feed.polls(),
+            0,
+            "an Off gateway read identity's dc family; D32 clause (b) says an \
+             Off control does not even poll"
+        );
+        admitted(reply, "off");
+        assert_eq!(
+            server.standing_metrics().snapshot(),
+            orrery_persistd::gateway::GatewayStandingSnapshot::default(),
+            "an Off gateway recorded a standing observation"
+        );
+    }
+
+    /// Shadow runs the whole predicate over the real rows and acts on none of
+    /// it — the half #934's bug did not have.
+    #[tokio::test]
+    async fn at_shadow_the_real_dc_row_is_evaluated_and_the_account_still_admitted() {
+        let Some((feed, server, reply)) = run_arm(StrikesEnforcement::Shadow, 61).await else {
+            eprintln!("skipped: no FoundationDB dev cluster is configured");
+            return;
+        };
+        assert!(feed.polls() > 0, "a Shadow gateway never polled the feed");
+        admitted(reply, "shadow");
+        let snapshot = server.standing_metrics().snapshot();
+        assert_eq!(
+            snapshot.shadow_hello_would_refuse, 1,
+            "the shadow arm did not evaluate the dc row it read"
+        );
+        assert_eq!(
+            snapshot.hello_refused_standing, 0,
+            "a shadow posture refused a Hello"
+        );
+    }
+
+    /// Only `Live` acts.
+    #[tokio::test]
+    async fn at_live_the_real_dc_row_refuses_the_hello() {
+        let Some((_feed, server, reply)) = run_arm(StrikesEnforcement::Live, 62).await else {
+            eprintln!("skipped: no FoundationDB dev cluster is configured");
+            return;
+        };
+        match reply {
+            Some(GatewayReply::HelloRefused { reason, .. })
+                if reason == GatewayReply::HELLO_REFUSED_STANDING => {}
+            other => panic!(
+                "a live gateway did not refuse a Hello for an account identity \
+                 had cooled down; the dc row was written and read but nothing \
+                 acted on it: {other:?}"
+            ),
+        }
+        assert_eq!(
+            server.standing_metrics().snapshot().hello_refused_standing,
+            1
+        );
+    }
+}
