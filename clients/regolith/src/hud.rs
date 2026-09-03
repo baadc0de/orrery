@@ -413,6 +413,10 @@ pub enum Readout {
     /// The nearest live pickup's separation against the ruleset's reach, or
     /// the statement of how pickups are collected when none is in view.
     PickupReach,
+    /// Whether the island tether is acting on this craft, and how hard (#955).
+    TetherState,
+    /// The announced bloom site: the campaign's own reason to stay (#955).
+    BloomBeacon,
 }
 
 fn label(text: &str) -> impl Bundle {
@@ -521,6 +525,11 @@ pub fn spawn_hud(commands: &mut Commands) {
                     gauge_row("SHIELD", Gauge::OwnShield, Readout::OwnShield),
                     value(Readout::OwnVitals, 11.0, DIM),
                     value(Readout::PickupReach, 11.0, MUTED),
+                    // #955's two anchor lines sit on the *own* panel, beside
+                    // speed and score, because both are facts about this
+                    // pilot's own position rather than about a target.
+                    value(Readout::TetherState, 11.0, MUTED),
+                    value(Readout::BloomBeacon, 11.0, MINING_AMBER),
                 ]
             ),
         ],
@@ -1083,6 +1092,7 @@ pub fn refresh_combat_hud(
     tracks: Res<ProjectileTracks>,
     broken: Res<LockBreak>,
     feedback: Res<ShotFeedback>,
+    anchor: Res<crate::anchor::AnchorView>,
     mut lines: Query<(&Readout, &mut Text, &mut TextColor)>,
 ) {
     let phase = view.lock.phase();
@@ -1169,6 +1179,26 @@ pub fn refresh_combat_hud(
             Readout::PickupReach => (
                 crate::grab::caption(&reach),
                 if reach.nearest().is_some_and(|pickup| pickup.claimable) {
+                    MINING_AMBER
+                } else {
+                    DIM
+                },
+            ),
+            // Both #955 lines are pure functions of `AnchorView`, which is a
+            // copy of published ruleset state. The tint is the only judgement
+            // the skin makes, and it is about legibility, not about the rule:
+            // a tether that is acting is worth reading, so it brightens.
+            Readout::TetherState => (
+                crate::anchor::tether_line(&anchor),
+                if anchor.outside_m > 0.0 {
+                    IMPACT_ORANGE
+                } else {
+                    DIM
+                },
+            ),
+            Readout::BloomBeacon => (
+                crate::anchor::bloom_line(&anchor),
+                if anchor.bloom.is_some() {
                     MINING_AMBER
                 } else {
                     DIM
@@ -1411,6 +1441,7 @@ mod tests {
             .init_resource::<LockBreak>()
             .init_resource::<crate::CameraZoom>()
             .init_resource::<ShotFeedback>()
+            .init_resource::<crate::anchor::AnchorView>()
             .insert_resource(crate::ActiveSession::Local(Box::default()));
         let world = app.world_mut();
         world.spawn((LockReticle, Transform::default(), Visibility::Hidden));
@@ -2487,6 +2518,7 @@ mod band_line {
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
             .init_resource::<ShotFeedback>()
+            .init_resource::<crate::anchor::AnchorView>()
             .add_systems(Update, refresh_combat_hud);
         let line = app
             .world_mut()
@@ -2512,6 +2544,7 @@ mod band_line {
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
             .init_resource::<ShotFeedback>()
+            .init_resource::<crate::anchor::AnchorView>()
             .add_systems(Update, refresh_combat_hud);
         let line = app
             .world_mut()
@@ -2521,5 +2554,56 @@ mod band_line {
         let text = app.world().get::<Text>(line).expect("the line exists");
         assert_eq!(**text, hit_band_line(&locked_on(60_000)));
         assert!(**text != *"-", "the band line was never written");
+    }
+
+    /// #955's two anchor lines reach the screen, and say the tether's own
+    /// numbers rather than a placeholder.
+    ///
+    /// The failure this guards is not a wrong string — `crate::anchor` tests
+    /// the strings — but a line that is spawned and never refreshed, which is
+    /// invisible to every test that calls the builder directly.
+    #[test]
+    fn the_refresh_system_writes_both_anchor_lines() {
+        use crate::anchor::{AnchorView, BloomBeacon};
+
+        let outside_m = orrery_games::regolith::TETHER_BAND_MM as f32 / 1_000.0 * 2.0;
+        let mut app = App::new();
+        app.insert_resource(locked_on(60_000))
+            .init_resource::<crate::grab::ReachView>()
+            .init_resource::<ProjectileTracks>()
+            .init_resource::<LockBreak>()
+            .init_resource::<ShotFeedback>()
+            .insert_resource(AnchorView {
+                outside_m,
+                tether_ramp: 1.0,
+                bloom: Some(BloomBeacon {
+                    range_m: 640.0,
+                    seconds_left: 12,
+                    rocks_alive: 7,
+                }),
+            })
+            .add_systems(Update, refresh_combat_hud);
+        let tether = app
+            .world_mut()
+            .spawn((Readout::TetherState, Text::new("-"), TextColor(MUTED)))
+            .id();
+        let bloom = app
+            .world_mut()
+            .spawn((Readout::BloomBeacon, Text::new("-"), TextColor(MUTED)))
+            .id();
+        app.update();
+
+        let tether_text = app.world().get::<Text>(tether).expect("the line exists");
+        assert!(
+            tether_text.contains("OUTSIDE ISLAND") && tether_text.contains("TETHER FULL"),
+            "the tether line was never written: {}",
+            **tether_text
+        );
+        let bloom_text = app.world().get::<Text>(bloom).expect("the line exists");
+        assert!(
+            bloom_text.contains("BLOOM") && bloom_text.contains("7 ROCKS"),
+            "the bloom beacon was never written: {}",
+            **bloom_text
+        );
     }
 }

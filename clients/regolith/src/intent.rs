@@ -594,10 +594,22 @@ mod attempt_length_flight {
         let (drift_pitch, drift_y_mm, _) = fly(true);
         assert_ne!(drift_pitch, 0);
         let drift_cells = (drift_y_mm.abs() / 1_000) as f64 / CAMPAIGN_CELL_EDGE_M;
+        // The control is the interest block, not a round number. Two seats
+        // more than `AOI_CELL_SPAN` cells apart are not in each other's
+        // interest set at all, which is the symptom the attempt reported.
+        //
+        // This threshold was 10 cells until v25. The island tether (#955) now
+        // damps the y axis like any other — the island is a box — so the
+        // un-gated drift is bounded at about 4.6 cells instead of the tens of
+        // kilometres it used to reach. The hazard is unchanged in kind and
+        // still well past the block; only its ceiling moved, and pinning the
+        // old number would have made this test fail for the wrong reason.
+        let block_cells = f64::from(crate::aoi::AOI_CELL_SPAN);
         assert!(
-            drift_cells > 10.0,
+            drift_cells > block_cells,
             "this test is inert: the un-gated flight drifted only {drift_cells:.1} \
-             interest cells, so it would not have hidden anything"
+             interest cells, inside the {block_cells:.0}-cell block, so it would \
+             not have hidden anything"
         );
     }
 }
