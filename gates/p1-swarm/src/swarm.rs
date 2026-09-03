@@ -95,6 +95,39 @@ impl LiveMembership {
         }
         Ok(())
     }
+
+    /// Give one seat back: unbind it, forget any reservation still in flight
+    /// for it, and spend its session so admission stops honouring the row.
+    ///
+    /// This is the *only* seat-release path. It serves both callers: a live
+    /// exterior whose transport vanished mid-run
+    /// ([`Swarm::process_live_membership`]), and a lobby peer that could not
+    /// complete its start handshake (#994). The latter never reached `active`,
+    /// so the removal is optional and the returned binding says whether one was
+    /// there — the run-time caller asserts it, because for that path a missing
+    /// binding is a bookkeeping bug.
+    ///
+    /// Publication is not optional: a seat that has been released and a feed
+    /// that still names it is exactly the roster-lies-about-the-transport shape
+    /// #954 was.
+    pub(crate) fn release_seat(
+        &mut self,
+        slot: usize,
+        session_id: &str,
+    ) -> std::io::Result<Option<LiveSeatBinding>> {
+        let released = self.active.remove(&slot);
+        if let Some(binding) = &released {
+            assert_eq!(
+                binding.session_id.as_str(),
+                session_id,
+                "release session must match the active membership binding"
+            );
+        }
+        self.pending.remove(&slot);
+        self.released_sessions.insert(session_id.to_owned());
+        self.publish()?;
+        Ok(released)
+    }
 }
 
 struct LiveJoins {
@@ -2758,18 +2791,12 @@ impl Swarm {
             if let (Some(live), Some(session)) = (&self.live_joins, exterior.session_id.as_ref()) {
                 let mut membership = live.membership.lock().expect("membership lock");
                 let binding = membership
-                    .active
-                    .remove(&slot)
-                    .expect("release names an active membership binding");
-                assert_eq!(
-                    binding.session_id.as_str(),
-                    session.as_str(),
-                    "release session must match the active membership binding"
-                );
-                membership.released_sessions.insert(session.clone());
-                membership
-                    .publish()
+                    .release_seat(slot, session.as_str())
                     .expect("republish active seats after unbind");
+                assert!(
+                    binding.is_some(),
+                    "release names an active membership binding"
+                );
             }
             self.departed_exteriors.push(exterior.report());
             changed = true;
