@@ -206,7 +206,7 @@ use orrery_games::game::Tamper;
 use orrery_games::regolith::state::RegolithState;
 use orrery_protocol::NodeId;
 use router::Impairment;
-use swarm::{CheatSpec, Criterion, Swarm, SwarmConfig};
+use swarm::{CheatSpec, Criterion, SeatReclaim, Swarm, SwarmConfig};
 
 /// The D6/D16 peer upload budget.
 const BUDGET_BITS: u64 = 1_000_000;
@@ -688,6 +688,15 @@ fn build_start_manifests(
         .collect()
 }
 
+/// The wall clock in whole seconds, which is admission's clock too: both sides
+/// of the reservation contract — `slots.json` and `active-seats.json` — are
+/// stamped in Unix seconds by co-located processes on one box.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 fn decode_join_anchor(
     anchor: Option<exterior::AnchorFrame>,
 ) -> Result<Option<(orrery_protocol::StateClaim, RegolithState)>> {
@@ -722,6 +731,13 @@ fn reserve_live_join(
     ))
 }
 
+/// Bind one seat, and stop calling its session released if it was.
+///
+/// The second half is what makes a reissued reservation (#1001) safe: while a
+/// session is named released, admission counts its seat free and will offer it
+/// to the next volunteer. A peer that redialled inside its grace and bound the
+/// seat again is *in* it, so the feed must stop saying otherwise in the same
+/// publication that names the binding.
 fn record_live_binding(
     live: &mut swarm::LiveMembership,
     slot: usize,
@@ -729,10 +745,19 @@ fn record_live_binding(
     session_id: String,
 ) -> Result<()> {
     live.pending.remove(&slot);
-    live.active
-        .insert(slot, swarm::LiveSeatBinding { node, session_id });
+    let reclaimed = live.rebind_released(&session_id);
+    live.active.insert(
+        slot,
+        swarm::LiveSeatBinding {
+            node,
+            session_id: session_id.clone(),
+        },
+    );
     if let Err(error) = live.publish() {
         live.active.remove(&slot);
+        if let Some(reclaim) = reclaimed {
+            live.released_sessions.insert(session_id, reclaim);
+        }
         return Err(error).context("republish active seats after bind");
     }
     Ok(())
@@ -797,8 +822,15 @@ impl StartJoin for bridge::PendingJoin {
 /// It has to answer one question — retry, or not? — for somebody who is not
 /// reading a stack trace, and it has to be short: the wire carries this reason
 /// behind a `u8` length.
+///
+/// Since #1001's reissue window the answer is "retry, right now, from this
+/// machine": admission hands the same reservation back to the same transport
+/// identity for its grace, so rejoining is a click and not a new invite. The
+/// install is named because the identity *is* the client's durable transport
+/// key — the same install is the same volunteer, and a fresh one is a stranger.
 const LOBBY_LOST_CONTACT: &str = "the host lost contact while the run was filling; \
-     your seat was given back, so ask for a new invite and rejoin";
+     your seat is held for you for a short while — rejoin this campaign now, from \
+     this same install, and you get it back";
 
 /// The lobby-sweep shape needed from one peer that is still waiting.
 ///
@@ -858,11 +890,18 @@ impl LobbyPeer for bridge::PendingJoin {
 /// heartbeat grace is what makes the outcome intelligible when the notice
 /// cannot land.
 ///
+/// A seat lost here is released as [`SeatReclaim::LostAt`] `now_s`: the seat
+/// frees, and admission may hand the same reservation back to the same
+/// transport identity until its own grace runs out (#1001). `now_s` is the
+/// wall-clock second of this sweep, injected for the same reason the trait
+/// above is — a test must be able to name the instant without waiting one out.
+///
 /// Returns how many seats were given back.
 async fn sweep_lobby<P: LobbyPeer>(
     pending: &mut Vec<P>,
     wanted: usize,
     membership: Option<&Arc<Mutex<swarm::LiveMembership>>>,
+    now_s: u64,
 ) -> Result<usize> {
     let seated = u16::try_from(pending.len()).unwrap_or(u16::MAX);
     let needed = u16::try_from(wanted).unwrap_or(u16::MAX);
@@ -884,8 +923,14 @@ async fn sweep_lobby<P: LobbyPeer>(
         let session_id = peer.session_id().map(ToOwned::to_owned);
         if let (Some(live), Some(session_id)) = (membership, &session_id) {
             let mut live = live.lock().expect("membership lock");
-            live.release_seat(slot, session_id)
-                .context("republish active seats after a lobby eviction")?;
+            live.release_seat(
+                slot,
+                session_id,
+                SeatReclaim::LostAt {
+                    released_at_s: now_s,
+                },
+            )
+            .context("republish active seats after a lobby eviction")?;
         }
         peer.evict(LOBBY_LOST_CONTACT).await;
     }
@@ -959,6 +1004,7 @@ async fn finish_start_joins<J: StartJoin>(
     pending: Vec<J>,
     roster: &StartRoster<'_>,
     membership: Option<&Arc<Mutex<swarm::LiveMembership>>>,
+    now_s: u64,
 ) -> Result<Vec<(JoinedSeat, Option<String>)>> {
     let prepared_seats = pending.len();
     let mut connected = pending
@@ -988,8 +1034,14 @@ async fn finish_start_joins<J: StartJoin>(
                 manifests = roster.manifests(&connected)?;
                 if let (Some(live), Some(session_id)) = (membership, &session_id) {
                     let mut live = live.lock().expect("membership lock");
-                    live.release_seat(slot, session_id)
-                        .context("republish active seats after a start-path drop")?;
+                    live.release_seat(
+                        slot,
+                        session_id,
+                        SeatReclaim::LostAt {
+                            released_at_s: now_s,
+                        },
+                    )
+                    .context("republish active seats after a start-path drop")?;
                 }
                 continue;
             }
@@ -1376,7 +1428,7 @@ fn main() -> Result<()> {
                     attempt_id: attempt_id.clone(),
                     active: BTreeMap::new(),
                     pending: BTreeSet::new(),
-                    released_sessions: BTreeSet::new(),
+                    released_sessions: BTreeMap::new(),
                     tick: 0,
                     running: false,
                     path: args.active_seats_file.clone(),
@@ -1456,7 +1508,13 @@ fn main() -> Result<()> {
                     break;
                 }
                 let Some(result) = arrived else {
-                    sweep_lobby(&mut pending, args.external_slots, membership.as_ref()).await?;
+                    sweep_lobby(
+                        &mut pending,
+                        args.external_slots,
+                        membership.as_ref(),
+                        unix_seconds(),
+                    )
+                    .await?;
                     continue;
                 };
                 accept = Box::pin(bridge::host_prepare(
@@ -1527,6 +1585,7 @@ fn main() -> Result<()> {
                     witnessing: config.witnessing,
                 },
                 membership.as_ref(),
+                unix_seconds(),
             )
             .await?;
             let live_joins = if let Some(membership) = membership {
@@ -2113,7 +2172,7 @@ mod session_geometry_tests {
             attempt_id: "attempt-live".to_owned(),
             active: BTreeMap::new(),
             pending: BTreeSet::new(),
-            released_sessions: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
             tick: 240,
             running: true,
             path: None,
@@ -2137,6 +2196,52 @@ mod session_geometry_tests {
             membership.active[&5].session_id, "session-five",
             "the active binding retains the release key for the live seat"
         );
+    }
+
+    #[test]
+    fn a_reclaimed_seat_stops_being_named_released_the_moment_it_binds() {
+        // The other half of #1001's reissue window. Admission counts a
+        // released session's seat as free once the window passes, and hands it
+        // to the next volunteer; a peer that redialled inside its window and
+        // bound the seat again would then be flying a seat admission was still
+        // offering. The feed has to stop saying released in the very
+        // publication that names the binding.
+        let mut membership = swarm::LiveMembership {
+            attempt_id: "attempt-live".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
+            tick: 240,
+            running: true,
+            path: None,
+        };
+        membership
+            .release_seat(
+                5,
+                "session-five",
+                swarm::SeatReclaim::LostAt {
+                    released_at_s: 1_756_900_000,
+                },
+            )
+            .expect("a seat with no feed path releases in memory");
+        assert!(
+            membership.released_sessions.contains_key("session-five"),
+            "the lapse is published so admission can hold the reservation"
+        );
+
+        record_live_binding(
+            &mut membership,
+            5,
+            bot::bot_key(5).public(),
+            "session-five".to_owned(),
+        )
+        .expect("the redial binds the same seat");
+
+        assert!(
+            membership.released_sessions.is_empty(),
+            "a seat the transport is holding must never read as released"
+        );
+        assert_eq!(membership.active[&5].session_id, "session-five");
     }
 }
 
@@ -2238,6 +2343,10 @@ mod start_join_tests {
         }
     }
 
+    /// The wall-clock second the lobby tests release seats at. Fixed, so the
+    /// published reissue deadline is an equality and not a window (#1001).
+    const SWEPT_AT: u64 = 1_756_900_000;
+
     struct StartHarness {
         accepted: Arc<Mutex<Vec<(usize, Option<exterior::StartManifest>)>>>,
         remotes: Arc<Mutex<Vec<(usize, exterior::RemoteLink)>>>,
@@ -2257,7 +2366,7 @@ mod start_join_tests {
                     attempt_id: "attempt-994".to_owned(),
                     active: BTreeMap::new(),
                     pending: BTreeSet::new(),
-                    released_sessions: BTreeSet::new(),
+                    released_sessions: BTreeMap::new(),
                     tick: 0,
                     running: false,
                     // No feed file: `publish` is a no-op and the assertions
@@ -2361,7 +2470,7 @@ mod start_join_tests {
         let mut pending = vec![harness.peer(5, None), harness.peer(6, None)];
 
         for _ in 0..A_THREE_MINUTE_LOBBY {
-            let lost = sweep_lobby(&mut pending, 3, Some(&harness.membership))
+            let lost = sweep_lobby(&mut pending, 3, Some(&harness.membership), SWEPT_AT)
                 .await
                 .expect("a reachable lobby releases no seat");
             assert_eq!(lost, 0);
@@ -2379,7 +2488,7 @@ mod start_join_tests {
         );
 
         // And it still starts: the wait cost it nothing.
-        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership), SWEPT_AT)
             .await
             .expect("both peers survived the lobby");
         assert_eq!(
@@ -2400,7 +2509,7 @@ mod start_join_tests {
 
         let mut lost = 0;
         for _ in 0..4 {
-            lost += sweep_lobby(&mut pending, 3, Some(&harness.membership))
+            lost += sweep_lobby(&mut pending, 3, Some(&harness.membership), SWEPT_AT)
                 .await
                 .expect("losing one seat is survivable");
         }
@@ -2417,8 +2526,14 @@ mod start_join_tests {
             "the peer is told why, in words that say whether to retry"
         );
         assert!(
-            LOBBY_LOST_CONTACT.contains("ask for a new invite"),
-            "and the words have to be actionable by somebody who is not reading a log"
+            LOBBY_LOST_CONTACT.contains("rejoin this campaign now"),
+            "and the words have to be actionable by somebody who is not reading a log: \
+             since #1001 the action is rejoining, not asking for a new invite"
+        );
+        assert!(
+            !LOBBY_LOST_CONTACT.contains("new invite"),
+            "telling a volunteer to get a new invite when their reservation is being \
+             held for them sends them the long way round"
         );
         assert!(
             LOBBY_LOST_CONTACT.len() <= usize::from(u8::MAX),
@@ -2427,9 +2542,17 @@ mod start_join_tests {
 
         let live = harness.membership.lock().expect("membership lock");
         assert_eq!(
-            live.released_sessions.iter().cloned().collect::<Vec<_>>(),
+            live.released_sessions.keys().cloned().collect::<Vec<_>>(),
             vec!["session-6".to_owned()],
             "the seat goes back through the one release path, so admission reopens it (#954)"
+        );
+        assert_eq!(
+            live.released_sessions.get("session-6").copied(),
+            Some(swarm::SeatReclaim::LostAt {
+                released_at_s: SWEPT_AT
+            }),
+            "a lobby lapse is lost, not spent: admission is told when, so it can hand the \
+             same reservation back to the same transport identity (#1001)"
         );
         assert!(
             live.active.is_empty() && live.pending.is_empty(),
@@ -2447,7 +2570,7 @@ mod start_join_tests {
         let mut pending = vec![stale];
 
         assert_eq!(
-            sweep_lobby(&mut pending, 2, Some(&harness.membership))
+            sweep_lobby(&mut pending, 2, Some(&harness.membership), SWEPT_AT)
                 .await
                 .expect("a session-less peer is evicted the same way"),
             1
@@ -2476,7 +2599,7 @@ mod start_join_tests {
             harness.peer(7, None),
         ];
 
-        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership), SWEPT_AT)
             .await
             .expect("one stale peer must not take the attempt down");
 
@@ -2500,9 +2623,17 @@ mod start_join_tests {
             "the dropped seat must not be left reserved"
         );
         assert_eq!(
-            live.released_sessions.iter().cloned().collect::<Vec<_>>(),
+            live.released_sessions.keys().cloned().collect::<Vec<_>>(),
             vec!["session-6".to_owned()],
-            "the dropped seat's session is spent, so admission reopens the seat"
+            "the dropped seat's session is released, so admission reopens the seat"
+        );
+        assert_eq!(
+            live.released_sessions.get("session-6").copied(),
+            Some(swarm::SeatReclaim::LostAt {
+                released_at_s: SWEPT_AT
+            }),
+            "a peer that could not finish its start handshake lapsed the same way a \
+             swept lobby peer did, and gets the same reissue window"
         );
         drop(live);
 
@@ -2533,7 +2664,7 @@ mod start_join_tests {
         let harness = StartHarness::new();
         let pending = vec![harness.peer(5, None), harness.peer(6, None)];
 
-        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership), SWEPT_AT)
             .await
             .expect("a clean lobby starts");
 
@@ -2558,7 +2689,7 @@ mod start_join_tests {
             harness.peer(6, Some("timed out")),
         ];
 
-        let error = finish_start_joins(pending, &roster(), Some(&harness.membership))
+        let error = finish_start_joins(pending, &roster(), Some(&harness.membership), SWEPT_AT)
             .await
             .expect_err("an attempt with no bound seat is not viable");
         assert!(
@@ -2572,7 +2703,7 @@ mod start_join_tests {
             "no seat may be left named by the feed"
         );
         assert_eq!(
-            live.released_sessions.iter().cloned().collect::<Vec<_>>(),
+            live.released_sessions.keys().cloned().collect::<Vec<_>>(),
             vec!["session-5".to_owned(), "session-6".to_owned()],
             "both seats are released for the next lobby"
         );
@@ -2587,7 +2718,7 @@ mod start_join_tests {
         stale.session_id = None;
         let pending = vec![harness.peer(5, None), stale];
 
-        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership), SWEPT_AT)
             .await
             .expect("a session-less peer dropping must not take the attempt down");
 

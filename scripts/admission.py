@@ -39,6 +39,23 @@ SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0
 DISPLAY_LABEL_MAX_CHARS = 32
 LOBBY_SECONDS = 180
 ARRIVAL_LEASE_SECONDS = 45
+# How long after the host loses a lobby peer its reservation stays reclaimable
+# by the *same* transport identity (#1001).  It is the arrival lease, and
+# deliberately the same number: both answer one question -- how long may a seat
+# be held for somebody who is not sitting in it? -- and a volunteer whose
+# connection lapsed is arriving, not playing.
+#
+# It has to be longer than the client can take to find out.  The host beats the
+# lobby every 2 s, the client waits 8 s of silence before it says the lobby is
+# lost, and QUIC's own `EXTERIOR_MAX_IDLE_TIMEOUT` kills the connection at 10 s,
+# so the volunteer learns between 8 and 10 seconds after the lapse.  Anything
+# under about 15 s would expire while they are still reading the notice.
+#
+# And it has to be shorter than the lobby it holds a seat inside: the lobby runs
+# `lobby_seconds` (180 s by default), so 45 s spends at most a quarter of one
+# window holding a seat against everyone else -- and only a seat somebody
+# demonstrably held a moment ago.
+RECLAIM_GRACE_SECONDS = ARRIVAL_LEASE_SECONDS
 RESTART_DELAY_SECONDS = 5
 UPLOAD_PROBE_SESSION = "00000000-0000-7000-8000-000000000002"
 UPLOAD_PROBE_OTHER_SESSION = "00000000-0000-7000-8000-000000000003"
@@ -206,6 +223,28 @@ class StandingHostMembership:
     active_slots: frozenset[int]
     released_sessions: frozenset[str]
     running: bool
+    # session -> the second the host lost the binding, for the releases it says
+    # a redial may still reclaim.  The host contributes only the instant, which
+    # is the one fact it alone observed; how long that instant is worth is this
+    # service's policy, because this service owns the reservation.  A release
+    # with no entry here -- an explicit goodbye, a run-time departure, or any
+    # host too old to publish `released_at` -- is spent on sight, exactly as
+    # every release was before #1001.
+    released_at: dict[str, int]
+
+    def reclaimable(self, session_id: Any, now: int) -> bool:
+        """True while only the identity that held this seat may have it back."""
+        lost_at = self.released_at.get(session_id) if isinstance(session_id, str) else None
+        return lost_at is not None and now < lost_at + RECLAIM_GRACE_SECONDS
+
+    def reclaim_closes(self, session_id: Any) -> int | None:
+        """The second this reservation stops being reissuable, if it still is."""
+        lost_at = self.released_at.get(session_id) if isinstance(session_id, str) else None
+        return None if lost_at is None else lost_at + RECLAIM_GRACE_SECONDS
+
+    def spent(self, session_id: Any, now: int) -> bool:
+        """True once a released reservation is worth nothing to anybody."""
+        return session_id in self.released_sessions and not self.reclaimable(session_id, now)
 
 
 class Admission:
@@ -348,6 +387,7 @@ class Admission:
             value = json.loads(path.read_text(encoding="utf-8"))
             slots = value["active_slots"]
             released = value.get("released_sessions", [])
+            released_at = value.get("released_at", {})
             running = value["running"]
             attempt_id = value.get("attempt_id")
         except FileNotFoundError:
@@ -360,11 +400,22 @@ class Admission:
                 or any(not isinstance(session, str) or not SESSION.fullmatch(session)
                        for session in released)):
             return None
+        # A reissue window is only as trustworthy as the timestamp under it, so
+        # nothing malformed buys one: an unparseable feed fails the whole read
+        # closed, exactly as a malformed slot list does.  A session named here
+        # but not released is a contradiction, and the safe reading of a
+        # contradiction is that no seat is held.
+        if (not isinstance(released_at, dict)
+                or any(not isinstance(session, str) or session not in set(released)
+                       or not isinstance(when, int) or isinstance(when, bool) or when < 0
+                       for session, when in released_at.items())):
+            return None
         if (any(not isinstance(slot, int) or isinstance(slot, bool)
                 or not campaign.peers <= slot < campaign.peers + campaign.humans for slot in slots)
                 or len(set(slots)) != len(slots)):
             return None
-        return StandingHostMembership(attempt_id, frozenset(slots), frozenset(released), running)
+        return StandingHostMembership(attempt_id, frozenset(slots), frozenset(released), running,
+                                      dict(released_at))
 
     def _standing_host_membership(self, campaign: Campaign, attempt: dict[str, Any]
                                   ) -> StandingHostMembership | None:
@@ -372,14 +423,20 @@ class Admission:
         try:
             membership = self._published_standing_host_membership(campaign)
         except FileNotFoundError:
-            return StandingHostMembership(attempt["attempt_id"], frozenset(), frozenset(), False)
+            return StandingHostMembership(attempt["attempt_id"], frozenset(), frozenset(), False, {})
         if membership is None or membership.attempt_id != attempt["attempt_id"]:
             return None
         return membership
 
     def _current_slots(self, campaign: Campaign, attempt: dict[str, Any], *, persist: bool
-                       ) -> tuple[list[dict[str, Any]], set[int]] | None:
-        """Return active or unexpired reservations for one host generation."""
+                       ) -> tuple[list[dict[str, Any]], StandingHostMembership] | None:
+        """Return active, unexpired or still-reclaimable reservations for one host generation.
+
+        A row the host has released survives its arrival lease for as long as
+        the identity that held it may still redial (#1001), and not one second
+        longer: `spent` is what drops it, and once it drops the seat is free for
+        whoever asks next.
+        """
         membership = self._standing_host_membership(campaign, attempt)
         if membership is None:
             return None
@@ -387,13 +444,14 @@ class Admission:
         generation = [row for row in self._read_slots(campaign)
                       if row.get("attempt_id") == attempt["attempt_id"]]
         current = [row for row in generation
-                   if row.get("session_id") not in membership.released_sessions
+                   if not membership.spent(row.get("session_id"), now)
                    and (row.get("slot") in membership.active_slots
+                        or membership.reclaimable(row.get("session_id"), now)
                         or (isinstance(row.get("expires_at"), int)
                             and row["expires_at"] > now))]
         if persist and current != generation:
             self._write_slots(campaign, current)
-        return current, set(membership.active_slots)
+        return current, membership
 
     def _campaign_phase(self, campaign: Campaign, attempt: dict[str, Any] | None) -> tuple[str, int]:
         if not campaign.open:
@@ -448,15 +506,23 @@ class Admission:
                         and row.get("slot") in bound.active_slots
                         and row.get("session_id") not in bound.released_sessions):
                     occupied[row["slot"]] = SeatOccupancy(row=row, bound=True)
-        released = (bound.released_sessions if bound is not None and attempt is not None
-                    and bound.attempt_id == attempt["attempt_id"] else frozenset())
+        generation = (bound if bound is not None and attempt is not None
+                      and bound.attempt_id == attempt["attempt_id"] else None)
+        released = generation.released_sessions if generation is not None else frozenset()
         now = int(time.time())
         if attempt is not None:
             for row in rows:
-                if (row.get("slot") not in occupied
-                        and row.get("attempt_id") == attempt["attempt_id"]
-                        and row.get("session_id") not in released
-                        and isinstance(row.get("expires_at"), int) and row["expires_at"] > now):
+                if row.get("slot") in occupied or row.get("attempt_id") != attempt["attempt_id"]:
+                    continue
+                # A seat inside its reissue window is taken by the volunteer who
+                # just lost it, whatever their arrival lease says: their lease
+                # ran out while they were flying, and the window is what is
+                # holding the seat now (#1001).  It draws `reserved`, not
+                # `active`, because nothing is bound to the transport.
+                held = (isinstance(row.get("expires_at"), int) and row["expires_at"] > now
+                        and row.get("session_id") not in released)
+                if held or (generation is not None
+                            and generation.reclaimable(row.get("session_id"), now)):
                     occupied[row["slot"]] = SeatOccupancy(row=row, bound=False)
         return occupied
 
@@ -535,7 +601,13 @@ class Admission:
                 current_slots = self._current_slots(c, attempt, persist=True)
                 if current_slots is None:
                     raise Refusal(503, "host_failed", "The always-on host membership is invalid — try again shortly.")
-                slots, _active_slots = current_slots
+                slots, membership = current_slots
+                # The reservation is found by the transport identity that holds
+                # it, which is what makes the reissue safe: knowing a session id
+                # buys nothing, because no row is ever looked up by one.  The
+                # token minted below is signed for the node presented here, and
+                # the host checks both — the QUIC-authenticated dialler against
+                # the token, and the token's node against this row (#583).
                 existing = next((row for row in slots if row.get("node") == node), None)
                 slot = existing.get("slot") if existing else None
                 granted_nickname = existing.get("nickname") if existing else None
@@ -543,8 +615,7 @@ class Admission:
                     occupied = {row.get("slot") for row in slots}
                     free_slots = [candidate for candidate in range(c.peers, c.peers + c.humans) if candidate not in occupied]
                     if not free_slots:
-                        raise Refusal(409, "campaign_full", f"All {c.humans} player seats are currently occupied.",
-                                      retry_after_s=ARRIVAL_LEASE_SECONDS)
+                        raise self._full_refusal(c, slots, membership)
                     slot = free_slots[0]
                     try:
                         minted = self.output([self.invite, "mint", "--ledger", str(directory / "ledger.tsv"), "--label", nickname])
@@ -569,6 +640,23 @@ class Admission:
                         raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
                 else:
                     account, sid = existing["account"], existing["session_id"]
+                    if membership.reclaimable(sid, int(time.time())):
+                        # The redial of a volunteer whose lobby connection
+                        # lapsed. Nothing is minted: the same session, the same
+                        # account and the same seat come back, and the only new
+                        # thing is a freshly signed token for the same node.
+                        # The row does get a fresh arrival lease, because the
+                        # host's journal refuses an expired one and this
+                        # volunteer is arriving exactly as a first-time joiner
+                        # is.
+                        existing["expires_at"] = int(time.time()) + ARRIVAL_LEASE_SECONDS
+                        self._write_slots(c, slots)
+                        self.append_join(c, {"when": int(time.time()), "campaign": ident,
+                                             "nickname": nickname, "account": int(account),
+                                             "session_id": sid, "node": node, "slot": slot,
+                                             "attempt_id": attempt["attempt_id"], "reissued": True})
+                        logging.info("campaign %s: reissued seat %s to the transport identity that "
+                                     "lost it (session %s)", ident, slot, sid)
                 try:
                     signed = self.output([self.invite, "session-token", "--issuer-credential", str(self.issuer),
                                           "--account", str(account), "--node", node])
@@ -622,6 +710,31 @@ class Admission:
             if ident not in self.children:
                 self.locks.pop(ident, None)
                 lock.close()
+
+    @staticmethod
+    def _full_refusal(campaign: Campaign, slots: list[dict[str, Any]],
+                      membership: StandingHostMembership) -> Refusal:
+        """Say which kind of full this is, because the two need different actions.
+
+        A seat inside its reissue window is not occupied by a player, and
+        "occupied" is the wrong thing to tell somebody who could have it in
+        under a minute by waiting.  The seconds are named so waiting is a
+        decision rather than a guess, and they go in the sentence rather than in
+        `retry_after_s`: shipped clients append "Next lobby in ..." to that
+        field, and this is not the next lobby, it is this one.
+        """
+        now = int(time.time())
+        closes = [when for when in (membership.reclaim_closes(row.get("session_id"))
+                                    for row in slots) if when is not None and when > now]
+        if closes:
+            wait = min(closes) - now
+            return Refusal(409, "seat_held_for_reconnect",
+                           f"Every other seat is taken, and the last one is being held for about "
+                           f"{wait} more second{'' if wait == 1 else 's'} for a player whose "
+                           "connection just dropped. Nothing you did was wrong — try again in a "
+                           "moment.")
+        return Refusal(409, "campaign_full", f"All {campaign.humans} player seats are currently occupied.",
+                       retry_after_s=ARRIVAL_LEASE_SECONDS)
 
     def roster(self, ident: str) -> dict[str, Any]:
         """Slot -> display label for every craft in this live campaign.
@@ -822,6 +935,19 @@ class AdmissionTests(unittest.TestCase):
         (host / "attempt.json").write_text(json.dumps(attempt))
         (host / "listening.txt").write_text("f2a1 0.0.0.0:52011\n")
         return attempt
+    def publish_seats(self, attempt: dict[str, Any], *, active: tuple[int, ...] = (),
+                      released: tuple[str, ...] = (), released_at: dict[str, int] | None = None,
+                      running: bool = True) -> None:
+        """Write one host membership publication, exactly as the harness does."""
+        (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": list(active),
+            "released_sessions": list(released), "released_at": released_at or {},
+            "running": running}))
+
+    def one_seat(self) -> None:
+        """Narrow the campaign to a single human seat, so `full` is one drop away."""
+        self.control.write_text(self.control.read_text().replace("humans = 4", "humans = 1"))
+
     def recorded_harness_command(self) -> str:
         args = self.ssh.parent / "ssh.args"
         deadline = time.monotonic() + 1
@@ -1123,6 +1249,10 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(rows), 1, "the expired no-show row must be removed")
 
     def test_host_release_makes_the_departed_slot_immediately_reservable(self) -> None:
+        # A release the host published no `released_at` for — an explicit
+        # goodbye, a run-time departure, or a host too old to say — is spent on
+        # sight. #1001's reissue window is opt-in per release, and this is the
+        # path everything that is not a lobby lapse still takes.
         attempt = self.enable_always_on()
         first = self.service.join("test", self.request())
         active = self.standing_host_state / "test" / "active-seats.json"
@@ -1137,6 +1267,141 @@ class AdmissionTests(unittest.TestCase):
         second = self.service.join("test", second_request)
         self.assertEqual(second["join"]["slot"], 4,
                          "the host's unbind publication must release the real allocator row")
+
+    def test_a_lapsed_lobby_peer_redials_into_the_reservation_it_already_had(self) -> None:
+        # #1001's decision. A volunteer whose connection lapsed for eight
+        # seconds gets their own seat back by redialling, and spends no invite
+        # doing it: the same session, the same account, the same slot.
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        session = first["join"]["session_id"]
+        self.publish_seats(attempt, active=(4,))
+        # Long enough in the lobby that the arrival lease is gone: the window,
+        # not the lease, is what holds this seat now.
+        self.publish_seats(attempt, released=(session,),
+                           released_at={session: int(time.time()) - RECLAIM_GRACE_SECONDS + 5})
+        rows = json.loads((self.state / "test" / "slots.json").read_text())
+        for row in rows:
+            row["expires_at"] = int(time.time()) - 1
+        (self.state / "test" / "slots.json").write_text(json.dumps(rows))
+
+        ledger = self.state / "test" / "ledger.tsv"
+        minted = ledger.read_text()
+
+        again = self.service.join("test", self.request())
+        self.assertEqual(again["join"]["session_id"], session,
+                         "the redial must reissue the reservation, not mint another")
+        self.assertEqual(again["join"]["slot"], first["join"]["slot"])
+        self.assertEqual(again["account"], first["account"])
+        self.assertGreater(len(again["join"]["session_token"]), 100,
+                           "and it must carry a freshly signed token for the same node")
+
+        rows = json.loads((self.state / "test" / "slots.json").read_text())
+        self.assertEqual([row["session_id"] for row in rows], [session],
+                         "exactly one reservation, the one that was already there")
+        self.assertGreater(rows[0]["expires_at"], int(time.time()),
+                           "the host's journal refuses an expired row, so an arriving "
+                           "volunteer needs their arrival lease back")
+        banked = [json.loads(line) for line in
+                  (self.state / "test" / "joins.jsonl").read_text().splitlines()]
+        self.assertEqual([row.get("reissued") for row in banked], [None, True],
+                         "the reissue is filed, so an operator can see the window firing")
+        self.assertEqual(ledger.read_text(), minted,
+                         "reissuing must not mint a second invite")
+
+    def test_the_reissue_window_closes_on_the_second_it_says(self) -> None:
+        # The boundary, from both sides, with no clock to wait out. One second
+        # inside the window the seat is the lapsed volunteer's; on the second it
+        # closes it belongs to whoever asks.
+        attempt = self.enable_always_on()
+        self.one_seat()
+        first = self.service.join("test", self.request())
+        session = first["join"]["session_id"]
+        stranger = self.request(); stranger.update({"nickname": "lin", "node": "b" * 64})
+
+        self.publish_seats(attempt, active=(4,))
+        self.publish_seats(attempt, released=(session,),
+                           released_at={session: int(time.time()) - RECLAIM_GRACE_SECONDS + 1})
+        with self.assertRaises(Refusal) as caught:
+            self.service.join("test", stranger)
+        self.assertEqual((caught.exception.status, caught.exception.error),
+                         (409, "seat_held_for_reconnect"),
+                         "a different transport identity is refused inside the window")
+        self.assertIn("try again in a moment", caught.exception.detail.lower(),
+                      "and told what to do about it")
+        self.assertNotIn("retry_after_s", caught.exception.extra,
+                         "shipped clients render that as `Next lobby in ...`, and this is "
+                         "the same lobby")
+        self.assertEqual([row["session_id"] for row in
+                          json.loads((self.state / "test" / "slots.json").read_text())],
+                         [session], "and the held reservation is untouched by the attempt")
+
+        self.publish_seats(attempt, released=(session,),
+                           released_at={session: int(time.time()) - RECLAIM_GRACE_SECONDS})
+        taken = self.service.join("test", stranger)
+        self.assertEqual(taken["join"]["slot"], 4,
+                         "once the window closes the seat genuinely frees for somebody else")
+        self.assertNotEqual(taken["join"]["session_id"], session,
+                            "and it is their own session, never the one that was held")
+
+    def test_an_expired_window_does_not_reissue_to_the_identity_that_held_it(self) -> None:
+        # The other half of the boundary: the volunteer who lapsed comes back
+        # too late. Their old session is spent — they are a new joiner now, and
+        # get a seat only if one is free.
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        session = first["join"]["session_id"]
+        self.publish_seats(attempt, active=(4,))
+        self.publish_seats(attempt, released=(session,),
+                           released_at={session: int(time.time()) - RECLAIM_GRACE_SECONDS})
+
+        again = self.service.join("test", self.request())
+        self.assertNotEqual(again["join"]["session_id"], session,
+                            "a redial after the window cannot resume the spent reservation")
+        rows = json.loads((self.state / "test" / "slots.json").read_text())
+        self.assertEqual([row["session_id"] for row in rows], [again["join"]["session_id"]],
+                         "and the expired row is gone rather than lingering beside its successor")
+
+    def test_a_held_seat_is_drawn_reserved_and_counted_taken(self) -> None:
+        # #713's invariant across the new state: the count and the roster
+        # answer from one definition, so a held seat can never be `full` in the
+        # listing and an empty chair in the lobby.
+        attempt = self.enable_always_on()
+        joined = self.service.join("test", self.request())
+        session = joined["join"]["session_id"]
+        self.publish_seats(attempt, active=(4,))
+        self.publish_seats(attempt, released=(session,),
+                           released_at={session: int(time.time())})
+
+        seat = self.service.roster("test")["roster"][joined["join"]["slot"]]
+        self.assertEqual((seat["state"], seat["nickname"]), ("reserved", "ada"),
+                         "the seat is held for a volunteer who is not in it: reserved, "
+                         "not active and not empty")
+        self.assertEqual(self.service.listing()["campaigns"][0]["slots_free"], 3,
+                         "and the listing counts it taken, exactly as the roster draws it")
+
+    def test_an_unstamped_or_malformed_release_never_holds_a_seat(self) -> None:
+        # A reissue window is only worth the timestamp under it. Anything the
+        # host could not say cleanly frees the seat, which is the safe
+        # direction: the pre-#1001 behaviour.
+        attempt = self.enable_always_on()
+        joined = self.service.join("test", self.request())
+        session = joined["join"]["session_id"]
+        self.publish_seats(attempt, active=(4,))
+
+        active = self.standing_host_state / "test" / "active-seats.json"
+        for broken in ({session: "soon"}, {session: True}, {session: -1},
+                       {"018f8f4e-5c90-7abc-8123-0000000000ab": int(time.time())}):
+            active.write_text(json.dumps({
+                "attempt_id": attempt["attempt_id"], "active_slots": [],
+                "released_sessions": [session], "released_at": broken, "running": True}))
+            listing = self.service.listing()["campaigns"][0]
+            self.assertEqual((listing["state"], listing["slots_free"]), ("restarting", 0),
+                             f"a feed this service cannot read must fail closed: {broken}")
+
+        self.publish_seats(attempt, released=(session,))
+        self.assertEqual(self.service.listing()["campaigns"][0]["slots_free"], 4,
+                         "and a release with no window at all frees the seat at once")
 
     def test_malformed_host_membership_fails_capacity_closed(self) -> None:
         self.enable_always_on()

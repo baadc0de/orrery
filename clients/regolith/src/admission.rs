@@ -1040,7 +1040,16 @@ pub fn admit_headless(
             Err(refusal)
                 if matches!(
                     refusal.code.as_deref(),
-                    Some("host_failed" | "session_started" | "campaign_full")
+                    // `seat_held_for_reconnect` is as transient as a full
+                    // campaign and shorter-lived: admission is holding the
+                    // last seat for a volunteer whose lobby connection lapsed,
+                    // and frees it when their reissue window closes (#1001).
+                    Some(
+                        "host_failed"
+                            | "session_started"
+                            | "campaign_full"
+                            | "seat_held_for_reconnect"
+                    )
                 ) && Instant::now() < deadline =>
             {
                 eprintln!(
