@@ -79,11 +79,51 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 - **Insurance is a delivery pipeline, so it can be griefed.** Intercepted delivery runs and camped corpses are legitimate PvP but the insurance contract must specify the outcome (pay out, retry, or fail) deterministically. This is the same low-population adjudication problem as offline cargo interception (ADR-0029).
 - **Full loot bounds per-avatar inventory to what can be lost.** The avatar's carried state is small and volatile; durable wealth lives in stockpiles (mothership, structures). This is a useful split for replication: carried inventory is hot state on the avatar entity, stockpiles are grid-owned and rarely replicated to non-owners.
 
+## G4 — Territory: mothership, ships, planets
+
+| # | Requirement | Source |
+|---|---|---|
+| G4 | **The mothership is a huge hub.** It contains **player-owned structures (apartments)** and **shared infrastructure**: NPCs, shops, transit, observation decks, hangars and the like. | owner mandate |
+| G4.1 | **Seamless.** Minimal or no loading screens anywhere: within the mothership, mothership to ship, ship to space, space to surface. | owner mandate |
+| G4.2 | **Ship ownership.** A ship belongs either to a **player** or to the **mothership**. | owner mandate |
+| G4.3 | **Command is gated.** Owning and commanding a ship is locked behind both a **resource** progression and a **renown** progression (a title or certificate). | owner mandate |
+| G4.4 | **Ships are the way into space.** A ship undocks from the mothership and takes its occupants to a mission, whatever it may be. | owner mandate |
+| G4.5 | **Most ships cannot land.** Surface insertion uses **landing craft** and **drop pods** for mechs. | owner mandate |
+| G4.6 | **Dismount.** An avatar may leave its mech, and must in order to traverse buildings and natural structures such as caves. | owner mandate |
+| G4.7 | **No foothold at season start.** When a season opens, the mothership's forces hold nothing on any body. They build structures and set up resource extraction while **staving off or displacing existing occupants and fauna**. | owner mandate |
+| G4.8 | **Planetary territory is temporary by construction.** Everything built on a body is left behind at the season jump (G2.1d). | derived from G2.1d, G4.7 |
+
+### Engineering consequences of G4
+
+- **The mothership is one grid at the population of the whole server**, not the 32–128 of a typical area (R6). It is the interest-management and replication stress case, and its shared infrastructure (transit, shops) is NPC-driven state that every player observes. It needs either sub-grids (decks, hangars) with seamless transitions, or an interest model that scales past R6 for a single grid. This decision belongs in ADR-0005/0006 and should be made early.
+- **Seamlessness is a grid-transition requirement.** Every boundary the player crosses (apartment door, hangar, airlock, undock, orbit, atmosphere, drop pod, cave mouth) is an authority or grid handoff that must complete within the player's movement, with prediction (ADR-0008) covering the gap. The number of distinct transition kinds is now large: enumerate them and make each a tested case.
+- **Ownership is a first-class attribute** on ships, structures and apartments, with the mothership as a legal owner alongside players. Mothership-owned ships are the on-ramp (G4.3) and are shared, so their use must be scheduled or contested by rule.
+- **Renown is a durable, non-transferable progression track** distinct from resources; it crosses seasons (G2.1d) and gates authority over shared assets. It is a reputation ledger and must be attested like any value-bearing write.
+- **Nesting depth is now known:** avatar → mech → drop pod → ship → mothership, five levels. The authority chain and the interest radius per level must be designed for that depth, not two.
+- **Surface structures are the territory game and are disposable.** They need build, upkeep, damage and destruction rules but no cross-season persistence. Their journals are retained only for the season (ADR-0020).
+- **Existing occupants and fauna are the PvE baseline** (G8). "Displacing" them means NPC territory is a real quantity that shrinks as players build. NPC presence must therefore be durable state for the season, not respawned decoration.
+
+### G4 — open decisions
+
+Numbered so they can be answered one at a time.
+
+1. **PvP scope on the mothership.** Is the mothership a safe zone (no weapons, no theft), partially safe (duels, sanctioned arenas), or fully open? This is the single biggest driver of the trust model at high population.
+2. **One mothership or several.** If every player shares one mothership, PvP is intra-faction rivalry on the surface and in space. If there are several (rival factions, or one per shard), PvP is inter-faction and each mothership is its own root grid. This also fixes what G7 grouping means.
+3. **Who may build on the surface.** Individuals, groups (G7), or only the mothership's collective effort? And who owns the resulting structure and its extracted resources?
+4. **Structure conflict rules.** Can players destroy or capture each other's structures? Offline raiding allowed, or only within a declared window (siege timers)? What is salvaged from a destroyed structure?
+5. **Exclusion or claim mechanics.** Does a structure claim a radius that blocks others from building, or is territory purely what you can physically hold?
+6. **Apartment scarcity and tenure.** Fixed number of apartments? Rent or upkeep? Reassignment on inactivity? Are they tradeable?
+7. **Hangar and docking capacity.** Is docking space finite and contested, and what happens to a ship whose owner cannot dock?
+8. **Landing craft and drop pod ownership.** Player, ship, or mothership assets? Are they lost on a bad insertion?
+9. **NPC counter-pressure.** Do displaced occupants retake territory, escalate, or stay displaced? Does fauna repopulate?
+10. **Upkeep and decay of surface structures.** Do abandoned structures decay within a season, and can others take them over?
+11. **Corpse and loot location on the mothership.** If G3 death can happen aboard, where does the loot go and who can take it (ties to 1).
+12. **Transit as fast travel.** Mothership transit implies teleport-like movement within one grid; is that also allowed ship-to-ship or only within the hub?
+
 ## Open — to be settled by the owner
 
 Sections reserved; each becomes a `G<n>` block when decided.
 
-- G4 — Ownership and territory (structures, bases, claims)
 - G5 — Economy rules (currency, NPC sinks/faucets, player-only trade)
 - G6 — Progression (skills, blueprints, ship/mech tiers)
 - G7 — Population and grouping (factions, crews, guilds)
