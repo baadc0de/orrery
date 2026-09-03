@@ -15,6 +15,8 @@ import configparser
 import json
 import os
 import signal
+import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -22,12 +24,58 @@ import time
 import unittest
 from pathlib import Path
 
+# The shape every consumer of an attempt id gates on: `p4-attempt-accounting.py`
+# refuses to derive without it, `p4-ledger.sh` refuses to bank without it, and
+# `p4-campaign-session.sh` refuses to assemble a seat pinned to anything else.
+# Restated here rather than imported because this supervisor is the only
+# production minter, and a minter that does not know the shape it must produce
+# is how `attempt-<time_ns>-<n>` reached production and made every human hour
+# unbankable (#960).
+UUID_V7_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+# The glob that finds attempt directories now that they are named by their id.
+# UUIDv7 is time-ordered by construction, so `sorted()` over these is still
+# generation order — which is the property the old `attempt-<time_ns>-` prefix
+# was carrying, and the reason renaming costs nothing.
+ATTEMPT_DIR_GLOB = "????????-????-7???-????-????????????"
+
 LOBBY_SECONDS = 180
 CHILD_EXIT_GRACE_SECONDS = 30
 # `CAMPAIGN_LOBBY_HOLD` in clients/regolith/src/lib.rs: the longest lobby a
 # shipped client will sit through. The host answers a join only when the lobby
 # closes, so a longer lobby is a campaign nobody can join.
 CLIENT_LOBBY_HOLD_SECONDS = 180
+
+
+def mint_attempt_id(now_ms: int | None = None) -> str:
+    """A UUIDv7, per RFC 9562 §5.7.
+
+    48 bits of Unix milliseconds, then version 7, then the variant bits, then
+    74 bits of randomness. The timestamp prefix is what makes two attempts
+    orderable without consulting their contents; the randomness is what keeps
+    two attempts minted inside one millisecond distinct.
+
+    Written out rather than taken from a dependency because this script is
+    stdlib-only by construction — it runs on the campaign host — and
+    `uuid.uuid7` is not in the interpreter this box ships.
+    """
+    stamp = int(time.time() * 1000) if now_ms is None else now_ms
+    if not 0 <= stamp < (1 << 48):
+        raise ValueError(f"timestamp {stamp} does not fit UUIDv7's 48 bits")
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+    value = (
+        (stamp << 80)
+        | (0x7 << 76)
+        | (rand_a << 64)
+        | (0b10 << 62)
+        | rand_b
+    )
+    digits = f"{value:032x}"
+    return (
+        f"{digits[0:8]}-{digits[8:12]}-{digits[12:16]}-{digits[16:20]}-{digits[20:32]}"
+    )
 
 
 def lobby_seconds(campaign_config: dict[str, str]) -> int:
@@ -170,7 +218,14 @@ class Supervisor:
         attempts = 0
         while not self.stopping:
             attempts += 1
-            attempt = self.args.state / f"attempt-{time.time_ns()}-{attempts}"
+            # The directory *is* the attempt id: the child is handed
+            # `--attempt-id <dir name>`, the active-seats file and the
+            # reservation journal match on that same string, and the host now
+            # serialises it into the report the ledger binds rows to. Minting a
+            # UUIDv7 here is therefore the whole change — every existing
+            # consumer matches the id by equality, so none of them notices, and
+            # the accounting contract stops refusing the result.
+            attempt = self.args.state / mint_attempt_id()
             attempt.mkdir(mode=0o750)
             started = int(time.time())
             # Never publish a new generation beside the previous child's
@@ -267,6 +322,26 @@ def parse_args() -> argparse.Namespace:
 
 
 class Tests(unittest.TestCase):
+    def test_minted_attempt_ids_are_uuidv7_and_ordered_by_mint_time(self) -> None:
+        """The shape three P4 consumers gate on, from the only production minter.
+
+        `attempt-<time_ns>-<n>` satisfied nothing downstream: it is not a
+        UUIDv7, so `p4-attempt-accounting.py derive` and `p4-ledger.sh append`
+        both refused every attempt this supervisor ever started, and no human
+        hour could bank (#960). The ordering half is asserted too, because that
+        is the property the discarded `time_ns` prefix was carrying.
+        """
+        minted = [mint_attempt_id() for _ in range(64)]
+        for attempt_id in minted:
+            self.assertRegex(attempt_id, UUID_V7_RE,
+                             "every consumer of an attempt id gates on UUIDv7")
+        self.assertEqual(len(set(minted)), len(minted),
+                         "two attempts minted in one millisecond must stay distinct")
+        earlier = mint_attempt_id(now_ms=1_700_000_000_000)
+        later = mint_attempt_id(now_ms=1_700_000_001_000)
+        self.assertLess(earlier, later,
+                        "attempt directories are still sorted into generation order")
+
     def test_a_lobby_longer_than_the_client_can_outwait_is_refused(self) -> None:
         budget = CLIENT_LOBBY_HOLD_SECONDS
         # The shipped default must be joinable, or the standing campaign is
@@ -365,7 +440,7 @@ class Tests(unittest.TestCase):
             finally:
                 Supervisor.command = original
             self.assertEqual(count.read_text(), "2", "failure must start a second child")
-            attempts = sorted(state.glob("attempt-*"))
+            attempts = sorted(state.glob(ATTEMPT_DIR_GLOB))
             self.assertEqual(len(attempts), 2, "each child needs an isolated report directory")
             record = json.loads((state / "attempt.json").read_text())
             self.assertEqual(record["attempt_id"], attempts[-1].name)
@@ -425,7 +500,7 @@ class Tests(unittest.TestCase):
             finally:
                 globals()["LOBBY_SECONDS"] = original_lobby
                 Supervisor.command = original_command
-            attempts = list(state.glob("attempt-*"))
+            attempts = list(state.glob(ATTEMPT_DIR_GLOB))
             self.assertEqual(len(attempts), 1, "an idle lobby must not respawn the child")
             record = json.loads((state / "attempt.json").read_text())
             self.assertGreater(record["started"], int(time.time()) - 2,

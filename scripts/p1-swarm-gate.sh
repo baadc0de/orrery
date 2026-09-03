@@ -224,23 +224,50 @@ note 'control run: the same island, witnesses armed, nobody modified — must fi
   --json "$OUT/control.json" \
   || die 'an entirely honest island filed a report with enforcement on'
 
-date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/PASSED"
-note "every clause held on all five legs, the witnessed and conviction ones included; reports in $OUT"
-
-# The exterior leg (#961). Every leg above is a pure-bot island in one process:
-# `--external-peer` is the only mode that binds a real iroh endpoint, and — via
-# `main.rs`'s `campaign: args.external_peer` — the only one that seeds campaign
-# rocks, so it is the only leg that puts a body other than a `Craft` on the
-# wire. Nothing in this file passed it until now, which is how a receiver that
-# discarded every rock and charged it to `bad_body` survived: the counter ran at
-# 151 on an 8-second run and no nightly ever took one.
+# ── The multi-process legs, and the accounting seam ────────────────────────
 #
-# Driven through the test rather than through "$BIN" because the proof needs two
-# processes at wall clock — a host and a dialling peer — and that orchestration
-# already exists, asserted, in `tests/external_join.rs`. It is `#[ignore]`d there
-# precisely so it runs here and not in every `cargo test`.
+# Everything above is a pure-bot island in one process. These are `#[ignore]`d
+# because they run several processes at wall clock, and until #961 landed
+# nothing dispatched any of them — `tests/external_join.rs` said this script ran
+# them and this script did not. That gap is the shape of both defects: a test
+# that exists, is described in the record, and never runs.
+#
+# The exterior leg (#961). `--external-peer` is the only mode that binds a real
+# iroh endpoint, and — via `main.rs`'s `campaign: args.external_peer` — the only
+# one that seeds campaign rocks, so it is the only leg that puts a body other
+# than a `Craft` on the wire. That is how a receiver which discarded every rock
+# and charged it to `bad_body` survived: the counter ran at 151 on an 8-second
+# run and no nightly ever took one. Kept as its own invocation, with its own
+# words, so a regression in the receive path is named as one rather than
+# reported as "a multi-process leg failed".
 note 'exterior leg: a real dialled peer against a campaign island, rocks on the wire'
 cargo test --release -q --manifest-path "$ROOT/gates/p1-swarm/Cargo.toml" \
   --test external_join -- --ignored --exact \
   an_external_peer_joins_witnesses_and_moves_frames \
   || die 'the exterior join did not hold: see bad_body / total_replicas in its output (#961)'
+
+# The accounting seam (#960). This is the one P4 exit waits on: it runs the
+# binary above as a reservation-backed host, seats two real remote processes,
+# and puts the report the host actually wrote through
+# `p4-campaign-session.sh assemble` and `p4-ledger.sh append` unedited. Both
+# sides of that join were already tested against fixtures of the shape each
+# expected, which is precisely why the suite was green while no human hour could
+# bank.
+note 'seam leg: a real host report through the real assembler into the real ledger'
+cargo test --release -q --manifest-path "$ROOT/gates/p1-swarm/Cargo.toml" \
+  --test attempt_report_seam -- --ignored --test-threads 1 \
+  || die 'the attempt-report seam failed; no human hour can bank (#960)'
+
+# The remaining wall-clock joins: reserved seating order, late join and rejoin,
+# and observed seat release. `--skip` rather than a second `--exact` list so a
+# leg added to that file is dispatched by default instead of silently joining
+# the set nothing runs, which is what this block exists to end.
+note 'lobby legs: reserved seating order, late join, rejoin and observed release'
+cargo test --release -q --manifest-path "$ROOT/gates/p1-swarm/Cargo.toml" \
+  --test external_join -- --ignored --test-threads 1 \
+  --skip an_external_peer_joins_witnesses_and_moves_frames \
+  || die 'a multi-process lobby leg failed'
+
+# Last, and only now: every leg above must hold before this file claims it did.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/PASSED"
+note "every clause held on all five legs plus the exterior, seam and lobby legs; reports in $OUT"

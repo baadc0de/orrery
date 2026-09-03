@@ -567,6 +567,40 @@ pub struct ExteriorReport {
     /// for a rendered client (#387): its slot is seated unwitnessed, and the
     /// witnessed clauses of this report cover the bot cohort only.
     pub witness_anchored: bool,
+    /// The coordinator-issued invite id seated here, when the host was given
+    /// one. `null` on a seat bound without admission (`--external-peer`), which
+    /// is the case #572 §2 calls the node-bound binding.
+    pub session_id: Option<String>,
+    /// How this seat's leg ended, in #572 §2's vocabulary.
+    ///
+    /// The host is the only party that knows this, and the accounting contract
+    /// refuses to bank two of the five: a `queue_overflow` leg's observed link
+    /// is the downlink pump's backlog rather than the declared impairment
+    /// profile, and a `never_connected` seat played nothing. Derived here
+    /// rather than left for a consumer to infer from `said_goodbye` and
+    /// `connected`, because neither of those can say that frames were dropped
+    /// on the way down.
+    pub close: &'static str,
+}
+
+/// What one directed link carried, for #572 §6.1's per-leg impairment band.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkImpairmentReport {
+    /// Swarm slot the traffic came from.
+    pub from_slot: usize,
+    /// Swarm slot it was addressed to.
+    pub to_slot: usize,
+    /// Which lane it took. Always `"datagram"`; see
+    /// [`SwarmReport::per_link_impairment`].
+    pub lane: &'static str,
+    /// Packets carried end to end.
+    pub delivered: u64,
+    /// Datagrams the loss model discarded.
+    pub dropped: u64,
+    /// Packets the jitter model held back.
+    pub delayed: u64,
+    /// Wire bytes offered, including per-datagram overhead.
+    pub bytes: u64,
 }
 
 /// The whole run.
@@ -677,7 +711,43 @@ pub struct SwarmReport {
     /// What each external peer did, ordered by swarm slot (#385, #571).
     pub external: Vec<ExteriorReport>,
     /// Player-hours accumulated: peers times simulated seconds.
+    ///
+    /// **Not the figure the campaign ledger banks.** It is one number for the
+    /// whole cohort, and #576 replaced it for accounting purposes with one
+    /// ledger input per actor contribution — see
+    /// `docs/plans/multi-human-attempt-accounting.md` §3. Retained because
+    /// every non-campaign P1 leg still reads it.
     pub player_hours: f64,
+    /// The attempt this report accounts for, when the host was given one
+    /// (`--attempt-id`). A UUIDv7, and the field every derived ledger row binds
+    /// to; without it `scripts/p4-attempt-accounting.py` refuses to derive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// Bot seats, i.e. slots `[0, bots)`. The exterior seats are the rest.
+    ///
+    /// The bot contribution is `bots * valid_attempt_seconds / 3600`, and a
+    /// human row bound to a slot below this is refused.
+    pub bots: usize,
+    /// Seconds the attempt actually ran, from the ticks it actually stepped.
+    ///
+    /// Read from the run's own tick count rather than copied from the
+    /// configured `seconds`, so a report that exists for a short run says so
+    /// instead of claiming the budget it was asked for.
+    pub valid_attempt_seconds: u64,
+    /// Whether the run reached its full tick budget. A partial attempt keeps
+    /// its rows for diagnosis and banks none of them.
+    pub completed: bool,
+    /// Per-directed-link impairment evidence, one entry per link the run
+    /// carried datagrams over.
+    ///
+    /// Only the **datagram** lane appears. The loss draw is made in
+    /// `Router::schedule`, which the reliable lane never reaches: a stream
+    /// message is retransmitted rather than dropped, so a stream entry carries
+    /// `dropped == 0` by construction. Folding it into #572 §6.1's binomial
+    /// band would measure the mix of lanes on a leg rather than the loss
+    /// injected into it, and would report a leg as clean for carrying reliable
+    /// traffic.
+    pub per_link_impairment: Vec<LinkImpairmentReport>,
     /// Chain gaps detected across the swarm — expected under loss.
     pub total_gaps: u64,
     /// Signals raised against honest peers. **Every one is a false positive.**
@@ -1195,6 +1265,13 @@ pub struct Swarm {
     exteriors: BTreeMap<usize, ExteriorSlot>,
     /// Completed participants retained after their seat was released.
     departed_exteriors: Vec<ExteriorReport>,
+    /// The attempt this run accounts for, when the operator named one.
+    ///
+    /// Held here rather than in [`SwarmConfig`], which is `Copy` and describes
+    /// what the swarm *simulates*. This names the accounting generation the
+    /// run belongs to and changes nothing the swarm executes, so a run is still
+    /// a function of its seed with or without it.
+    attempt_id: Option<String>,
     /// Continuous admission for a reservation-backed standing campaign.
     live_joins: Option<LiveJoins>,
     /// New links get a second manifest after their downlink writer is live.
@@ -1416,21 +1493,65 @@ fn public_hearsay_record(snapshot: &HearsaySnapshot) -> HearsayContacts {
 
 impl ExteriorSlot {
     fn report(&self) -> ExteriorReport {
+        let connected = self
+            .link
+            .connected
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let said_goodbye = self.goodbye.load(std::sync::atomic::Ordering::Relaxed);
         ExteriorReport {
             index: self.index,
             node: self.node,
-            connected: self
-                .link
-                .connected
-                .load(std::sync::atomic::Ordering::Relaxed),
+            connected,
             connected_ticks: self.connected_ticks,
             uplink_frames: self.uplink_frames,
             uplink_delivered: self.uplink_delivered,
             uplink_dropped: self.uplink_dropped,
             downlink_frames: self.downlink_frames,
             downlink_dropped: self.downlink_dropped,
-            said_goodbye: self.goodbye.load(std::sync::atomic::Ordering::Relaxed),
+            said_goodbye,
             witness_anchored: self.witness_anchored,
+            session_id: self.session_id.clone(),
+            close: Self::close_reason(
+                self.connected_ticks,
+                self.downlink_dropped,
+                said_goodbye,
+                connected,
+            ),
+        }
+    }
+
+    /// How a seat's leg ended, in #572 §2's vocabulary.
+    ///
+    /// The order is the precedence, and each step is a refusal the accounting
+    /// contract makes on this seat alone:
+    ///
+    /// 1. a seat the bridge never reported connected played nothing, whatever
+    ///    else its flags say;
+    /// 2. a seat the downlink pump dropped frames for observed the backlog
+    ///    rather than the configured profile, so it outranks a clean goodbye —
+    ///    a leg can say goodbye politely and still have been fed a lossy
+    ///    downlink the impairment profile did not cause;
+    /// 3. the runner's end-of-run marker is a clean end;
+    /// 4. a seat still connected when the clock stopped closed *with* the
+    ///    attempt, which is bankable and not a disconnect;
+    /// 5. anything left dropped out mid-attempt, which banks its own interval
+    ///    and costs the cohort nothing.
+    fn close_reason(
+        connected_ticks: u64,
+        downlink_dropped: u64,
+        said_goodbye: bool,
+        connected: bool,
+    ) -> &'static str {
+        if connected_ticks == 0 {
+            "never_connected"
+        } else if downlink_dropped > 0 {
+            "queue_overflow"
+        } else if said_goodbye {
+            "goodbye"
+        } else if connected {
+            "attempt_end"
+        } else {
+            "disconnected"
         }
     }
 
@@ -1716,12 +1837,25 @@ impl Swarm {
             admitted_deltas: 0,
             exteriors: BTreeMap::new(),
             departed_exteriors: Vec::new(),
+            attempt_id: None,
             live_joins: None,
             deferred_live_manifests: BTreeMap::new(),
             armed_external_watches: BTreeSet::new(),
             hearsay_buffers: HearsayBuffers::default(),
             hearsay_fold_enabled: true,
         }
+    }
+
+    /// Name the accounting attempt this run belongs to.
+    ///
+    /// The id is carried verbatim into the report as `attempt_id`; it is not
+    /// validated here, because the host is not the party that mints it. The
+    /// gate that matters is the accounting contract's, which refuses anything
+    /// that is not a UUIDv7 rather than binding rows to an id it cannot order.
+    #[must_use]
+    pub fn with_attempt_id(mut self, attempt_id: Option<String>) -> Self {
+        self.attempt_id = attempt_id;
+        self
     }
 
     /// Attaches an external peer to this swarm, occupying the next slot.
@@ -2950,6 +3084,49 @@ impl Swarm {
 
     fn report(mut self, ticks: u64, late_join: Option<LateJoinReport>) -> SwarmReport {
         let docket = core::mem::take(&mut self.docket);
+        // Every slot's transport identity, so the router's `NodeId`-keyed links
+        // can be stated in the seat namespace the accounting binds to. A
+        // departed exterior is no longer in `index_of`, and its links are still
+        // part of the attempt's evidence, so its own report supplies the pair.
+        let slot_of: BTreeMap<NodeId, usize> = self
+            .index_of
+            .iter()
+            .map(|(node, index)| (*node, *index))
+            .chain(
+                self.departed_exteriors
+                    .iter()
+                    .map(|seat| (seat.node, seat.index)),
+            )
+            .collect();
+        // The datagram lane only; see `SwarmReport::per_link_impairment` for
+        // why a reliable link is not evidence about injected loss.
+        let per_link_impairment: Vec<LinkImpairmentReport> = self
+            .router
+            .per_link()
+            .filter(|(_, _, lane, _)| *lane == crate::router::FateLane::Datagram)
+            .filter_map(|(from, to, lane, counters)| {
+                Some(LinkImpairmentReport {
+                    from_slot: *slot_of.get(&from)?,
+                    to_slot: to,
+                    lane: lane.name(),
+                    delivered: counters.delivered,
+                    dropped: counters.dropped,
+                    delayed: counters.delayed,
+                    bytes: counters.bytes,
+                })
+            })
+            .collect();
+        // The attempt's own clock, not the one it was asked for: `ticks` is
+        // what the run actually stepped, and a report that exists for fewer
+        // than the budget describes a short attempt rather than claiming the
+        // budget. `completed` is the same fact stated as the contract's
+        // refusal, and the two are read together — banking uses the seconds,
+        // and refuses the whole attempt when they are not the full span.
+        let budget_ticks = self.config.seconds * TICK_HZ;
+        let valid_attempt_seconds = ticks / TICK_HZ;
+        let completed = ticks == budget_ticks;
+        let attempt_id = self.attempt_id.clone();
+        let bots = self.bots.len();
         let per_peer: Vec<PeerReport> = (0..self.bots.len())
             .map(|index| {
                 let mut samples = self.samples[index].clone();
@@ -3222,6 +3399,11 @@ impl Swarm {
                 external
             },
             player_hours: self.total_peers() as f64 * self.config.seconds as f64 / 3_600.0,
+            attempt_id,
+            bots,
+            valid_attempt_seconds,
+            completed,
+            per_link_impairment,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
             total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
             conviction: self.config.cheats.map(|cheats| ConvictionReport {
@@ -4582,6 +4764,16 @@ mod tests {
             witnessing: true,
             external: Vec::new(),
             player_hours: 32.0,
+            // The accounting identity a campaign attempt carries. This baseline
+            // is a pure-bot criterion report, so it seats nobody and names no
+            // attempt: the clauses under test here are P1's, and #572's
+            // accounting clauses are exercised against real reports by
+            // `tests/attempt_report_seam.rs`.
+            attempt_id: None,
+            bots: 32,
+            valid_attempt_seconds: 3_600,
+            completed: true,
+            per_link_impairment: Vec::new(),
             total_gaps: 13_009,
             total_false_positives: 0,
             conviction: None,

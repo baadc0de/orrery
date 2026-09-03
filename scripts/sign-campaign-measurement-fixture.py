@@ -25,16 +25,36 @@ def main() -> None:
     # right one". `--secret-byte` gives each fixture seat its own key; the
     # default is the byte every existing fixture already signs with, so the
     # rows in `p4-ledger.sh` and `p4-campaign-session.sh` are unchanged.
+    #
+    # `--secret-hex` exists for the seam test (#960), which does not get to
+    # choose its key: the row must be signed by the seat key the *host*
+    # QUIC-admitted, and `gates/p1-swarm`'s slot keys are not 32 repeated
+    # bytes. A row signed by any other key is refused by the derivation and by
+    # the ledger, which is the whole point — so a seam test that could not
+    # reach the admitted key could not produce a bankable row at all.
     secret_byte = TEST_SECRET_BYTE
+    secret: bytes | None = None
     argv = sys.argv[1:]
     if argv[:1] == ["--secret-byte"]:
         secret_byte = int(argv[1], 0)
         if not 0 <= secret_byte <= 0xFF:
             raise SystemExit("--secret-byte must be one byte")
         argv = argv[2:]
+    elif argv[:1] == ["--secret-hex"]:
+        try:
+            secret = binascii.unhexlify(argv[1])
+        except (binascii.Error, IndexError) as error:
+            raise SystemExit(f"--secret-hex must be hex: {error}") from error
+        if len(secret) != 32:
+            raise SystemExit("--secret-hex must be 32 bytes of Ed25519 seed")
+        argv = argv[2:]
     if argv:
-        raise SystemExit("usage: sign-campaign-measurement-fixture.py [--secret-byte N]")
-    secret = bytes([secret_byte]) * 32
+        raise SystemExit(
+            "usage: sign-campaign-measurement-fixture.py "
+            "[--secret-byte N | --secret-hex <64 hex>]"
+        )
+    if secret is None:
+        secret = bytes([secret_byte]) * 32
     row = json.load(sys.stdin)
     if not isinstance(row, dict):
         raise SystemExit("fixture row must be an object")

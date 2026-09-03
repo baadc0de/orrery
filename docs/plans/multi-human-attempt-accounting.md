@@ -73,17 +73,54 @@ since #571 landed as #579 and made `SwarmReport.external` a
 derives. A report carrying both field names must name the same slots in both, or
 it is two accounts of one attempt and is refused.
 
-**What the host records, and what it does not.** `ExteriorReport` after #579
-carries `index`, `node`, `connected_ticks`, the frame counters, `said_goodbye`,
-`connected` and `witness_anchored` — and **no `session_id`**. So `exteriors`'s
-`session_id` is this contract's field and not yet a host-emitted one, and the
-seat identity a real report supplies is the QUIC-authenticated `node`, which the
-client signs into its own row and which #579 also made unique per seat. The
-binding is therefore by seated invite id when a report carries one and by
-admitted node when it does not; when a seat carries an id, the row that lands on
-it by node must name that same id, or the host's copy and the client's copy
-disagree and the row is refused. `connected_ticks` is likewise real per seat
-now, so §4's non-constant denominator is bounded by a number the host measured.
+**What the host records — updated by #960.** This section previously read "what
+the host records, and what it does not", and the *does not* was the whole of
+#960: `SwarmReport` carried none of `attempt_id`, `bots`,
+`valid_attempt_seconds`, `completed` or `per_link_impairment`, and
+`ExteriorReport` carried no `session_id` and no `close`. Nothing converted a
+`SwarmReport` into an `AttemptReport`, so a complete signed human row was refused
+with `the attempt report carries no UUIDv7 attempt_id to bind rows to` and no
+human hour could bank. The host now emits all of them:
+
+* `attempt_id` — the `--attempt-id` the operator names the generation by, which
+  previously reached only the start manifest, the active-seats file and the
+  reservation journal. `scripts/p1-swarm-always-on.py`, the only production
+  minter, now mints a **UUIDv7** rather than `attempt-<time_ns>-<n>`; the
+  directory *is* the id, and every other consumer matches it by equality.
+* `bots`, `valid_attempt_seconds`, `completed` — the last two read from the run's
+  own tick count against its budget, so a short attempt says so.
+* `per_link_impairment` — per directed link, from counters the router now keeps
+  beside its swarm-wide ones. **Datagram lane only**: the loss draw is made in
+  `Router::schedule`, which the reliable lane never reaches, so a stream entry
+  would carry `dropped == 0` by construction and folding it into §6.1's binomial
+  band would report a leg as clean for carrying reliable traffic.
+* `ExteriorReport.session_id` — the coordinator-issued invite id seated at that
+  seat, so the preferred binding of §4.1 is now available on a real report and
+  not only the node-bound fallback. `null` on a seat bound without admission.
+* `ExteriorReport.close` — in this section's vocabulary, decided by the host
+  because it is the only party that knows: a seat the bridge never reported
+  connected is `never_connected`; a seat the downlink pump dropped frames for is
+  `queue_overflow` and outranks a clean goodbye, because a leg can say goodbye
+  politely and still have been fed a backlog the impairment profile did not
+  cause; then `goodbye`, then `attempt_end` for a seat still connected when the
+  clock stopped, then `disconnected`.
+
+The node-bound path is retained unchanged, because a seat bound outside
+admission still carries no invite id: the binding is by seated invite id when a
+report carries one and by admitted node when it does not, and when a seat carries
+an id the row that lands on it by node must name that same id or the host's copy
+and the client's copy disagree and the row is refused. `connected_ticks` is real
+per seat, so §4's non-constant denominator is bounded by a number the host
+measured.
+
+**The seam itself is now tested.** `gates/p1-swarm/tests/attempt_report_seam.rs`
+runs the real binary as a reservation-backed host, seats two real remote
+processes over QUIC, and puts the report the host actually wrote through
+`scripts/p4-campaign-session.sh assemble` and `scripts/p4-ledger.sh append`
+unedited. The fixtures in §7 remain a check on *this* contract; that test is the
+check that the host's output is a thing this contract can read at all, which is
+the one nothing covered and the reason the suite stayed green with an empty
+ledger.
 
 ## 3. The contribution arithmetic
 

@@ -974,7 +974,12 @@ fn main() -> Result<()> {
         Swarm::new_for_island(config, configured_island_seats)
     } else {
         Swarm::new(config)
-    };
+    }
+    // The id the operator named this generation by, carried into the report so
+    // a derived ledger row has an attempt to bind to. Before this it reached
+    // the start manifest, the active-seats file and the reservation journal and
+    // stopped there, which is why no human hour could ever be assembled (#960).
+    .with_attempt_id(args.attempt_id.clone());
     let _endpoint_guard;
     let _runtime_guard;
     if args.external_peer {
