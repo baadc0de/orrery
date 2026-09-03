@@ -62,12 +62,47 @@ pub(crate) struct LiveSeatBinding {
     pub(crate) session_id: String,
 }
 
+/// What a released seat's admission reservation is still worth (#1001).
+///
+/// The host does not time the reissue window and holds no opinion about how
+/// long it is; that is admission's policy, and admission owns the reservation.
+/// All the host can contribute is the fact only it observed — *when* the
+/// binding went away, and whether the departure was the kind a volunteer can
+/// come back from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeatReclaim {
+    /// The seat was lost, not given up: the peer's transport lapsed while the
+    /// run was still filling. Admission may reissue this reservation to the
+    /// same transport identity until its own grace, measured from this
+    /// wall-clock second, runs out.
+    LostAt { released_at_s: u64 },
+    /// The reservation is spent the moment it is published: an explicit
+    /// goodbye, or a departure from a run already under way. The seat frees
+    /// for anyone immediately, exactly as it did before #1001.
+    Spent,
+}
+
+impl SeatReclaim {
+    /// The second the seat was lost, for the seats admission may reissue.
+    const fn lost_at(self) -> Option<u64> {
+        match self {
+            Self::LostAt { released_at_s } => Some(released_at_s),
+            Self::Spent => None,
+        }
+    }
+}
+
 /// Host-authored membership shared with admission and the live accept loop.
 pub(crate) struct LiveMembership {
     pub(crate) attempt_id: String,
     pub(crate) active: BTreeMap<usize, LiveSeatBinding>,
     pub(crate) pending: BTreeSet<usize>,
-    pub(crate) released_sessions: BTreeSet<String>,
+    /// Sessions whose binding is gone *and has not come back*, each with what
+    /// admission may still do with its reservation. A session re-bound by
+    /// [`Self::rebind_released`] leaves this map: a seat the transport is
+    /// holding must never read as released, or admission counts it free and
+    /// double-books it.
+    pub(crate) released_sessions: BTreeMap<String, SeatReclaim>,
     pub(crate) tick: u64,
     pub(crate) running: bool,
     pub(crate) path: Option<PathBuf>,
@@ -75,6 +110,12 @@ pub(crate) struct LiveMembership {
 
 impl LiveMembership {
     /// Atomically republish the generation-bound binding feed.
+    ///
+    /// `released_sessions` keeps the shape it has always had — the list of
+    /// sessions whose binding is gone — and `released_at` annotates the subset
+    /// admission may still reissue with the second each was lost. An admission
+    /// that does not read `released_at` sees exactly the pre-#1001 feed and
+    /// frees every released seat at once, which is the safe direction.
     pub(crate) fn publish(&self) -> std::io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -82,7 +123,12 @@ impl LiveMembership {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "attempt_id": self.attempt_id,
             "active_slots": self.active.keys().copied().collect::<Vec<_>>(),
-            "released_sessions": self.released_sessions,
+            "released_sessions": self.released_sessions.keys().collect::<Vec<_>>(),
+            "released_at": self
+                .released_sessions
+                .iter()
+                .filter_map(|(session, reclaim)| Some((session.clone(), reclaim.lost_at()?)))
+                .collect::<BTreeMap<_, _>>(),
             "running": self.running,
         }))?;
         let temporary = path.with_extension("tmp");
@@ -110,10 +156,16 @@ impl LiveMembership {
     /// Publication is not optional: a seat that has been released and a feed
     /// that still names it is exactly the roster-lies-about-the-transport shape
     /// #954 was.
+    ///
+    /// `reclaim` says which kind of departure this was. A lobby lapse is
+    /// [`SeatReclaim::LostAt`], so admission can hand the same reservation back
+    /// to the same transport identity for its grace; every other departure is
+    /// [`SeatReclaim::Spent`] and frees the seat outright.
     pub(crate) fn release_seat(
         &mut self,
         slot: usize,
         session_id: &str,
+        reclaim: SeatReclaim,
     ) -> std::io::Result<Option<LiveSeatBinding>> {
         let released = self.active.remove(&slot);
         if let Some(binding) = &released {
@@ -124,9 +176,21 @@ impl LiveMembership {
             );
         }
         self.pending.remove(&slot);
-        self.released_sessions.insert(session_id.to_owned());
+        self.released_sessions
+            .insert(session_id.to_owned(), reclaim);
         self.publish()?;
         Ok(released)
+    }
+
+    /// Forget a release because the seat is bound again.
+    ///
+    /// Returns whatever the session was released as, so a caller that fails to
+    /// publish can put it back. A reissued reservation only works if this
+    /// happens: admission treats a released session's seat as free, so a
+    /// volunteer who redialled inside the grace would otherwise be flying a
+    /// seat admission was still offering to somebody else.
+    pub(crate) fn rebind_released(&mut self, session_id: &str) -> Option<SeatReclaim> {
+        self.released_sessions.remove(session_id)
     }
 }
 
@@ -2814,8 +2878,11 @@ impl Swarm {
             eprintln!("gates/p1-swarm: live seat {slot} released at tick {tick} ({release_cause})");
             if let (Some(live), Some(session)) = (&self.live_joins, exterior.session_id.as_ref()) {
                 let mut membership = live.membership.lock().expect("membership lock");
+                // A run-time departure is spent on publication: the run has
+                // moved on, the report is banked, and #1001's reissue window
+                // is scoped to the lobby the owner named.
                 let binding = membership
-                    .release_seat(slot, session.as_str())
+                    .release_seat(slot, session.as_str(), SeatReclaim::Spent)
                     .expect("republish active seats after unbind");
                 assert!(
                     binding.is_some(),
@@ -4199,6 +4266,87 @@ mod tests {
     }
 
     #[test]
+    fn the_published_feed_names_a_lost_seats_second_and_a_spent_ones_not_at_all() {
+        // The whole contract between this host and `scripts/admission.py`, in
+        // one file. `released_sessions` keeps the shape every earlier admission
+        // parses, so a host publishing this to one that has never heard of
+        // #1001 frees both seats at once; `released_at` is the annotation that
+        // buys the lost seat its reissue window, and a spent seat must not
+        // appear in it at all or a goodbye would hold a seat nobody is coming
+        // back to.
+        let directory = std::env::temp_dir().join(format!(
+            "p1-live-feed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("active-seats.json");
+        let mut membership = LiveMembership {
+            attempt_id: "attempt-1001".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
+            tick: 0,
+            running: true,
+            path: Some(path.clone()),
+        };
+        membership
+            .release_seat(
+                4,
+                "018f8f4e-5c90-7abc-8123-000000000004",
+                SeatReclaim::LostAt {
+                    released_at_s: 1_756_900_000,
+                },
+            )
+            .expect("publishing a lost seat");
+        membership
+            .release_seat(
+                5,
+                "018f8f4e-5c90-7abc-8123-000000000005",
+                SeatReclaim::Spent,
+            )
+            .expect("publishing a spent seat");
+
+        let published: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("feed written"))
+                .expect("feed parses");
+        assert_eq!(
+            published["released_sessions"],
+            serde_json::json!([
+                "018f8f4e-5c90-7abc-8123-000000000004",
+                "018f8f4e-5c90-7abc-8123-000000000005"
+            ]),
+            "both seats are released, whatever admission may still do with them"
+        );
+        assert_eq!(
+            published["released_at"],
+            serde_json::json!({ "018f8f4e-5c90-7abc-8123-000000000004": 1_756_900_000u64 }),
+            "and only the lost one carries the second admission times its window from"
+        );
+
+        membership
+            .release_seat(
+                4,
+                "018f8f4e-5c90-7abc-8123-000000000004",
+                SeatReclaim::Spent,
+            )
+            .expect("republishing the same seat as spent");
+        let published: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("feed rewritten"))
+                .expect("feed parses");
+        assert_eq!(
+            published["released_at"],
+            serde_json::json!({}),
+            "a seat republished as spent loses its window rather than keeping a stale one"
+        );
+
+        std::fs::remove_dir_all(&directory).expect("temp dir cleanup");
+    }
+
+    #[test]
     fn a_peer_that_joins_a_running_attempt_is_given_every_seat_already_bound() {
         let (existing_host, _existing_remote) = crate::exterior::link_pair();
         let (joined_host, joined_remote) = crate::exterior::link_pair();
@@ -4207,7 +4355,7 @@ mod tests {
             attempt_id: "attempt-live".to_owned(),
             active: BTreeMap::new(),
             pending: BTreeSet::new(),
-            released_sessions: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
             tick: 0,
             running: true,
             path: None,
@@ -4280,7 +4428,7 @@ mod tests {
             attempt_id: "attempt-live".to_owned(),
             active: BTreeMap::new(),
             pending: BTreeSet::new(),
-            released_sessions: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
             tick: 0,
             running: true,
             path: None,
@@ -4368,7 +4516,7 @@ mod tests {
             attempt_id: "attempt-live".to_owned(),
             active: BTreeMap::new(),
             pending: BTreeSet::new(),
-            released_sessions: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
             tick: 0,
             running: true,
             path: None,
@@ -4505,7 +4653,7 @@ mod tests {
                 })
                 .collect(),
             pending: BTreeSet::new(),
-            released_sessions: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
             tick: 0,
             running: true,
             path: None,

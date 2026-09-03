@@ -740,8 +740,16 @@ pub const LOBBY_EVICTION_PREFIX: &str = "the host gave your seat back: ";
 /// `read join reply: handshake closed mid-length`: it names where the join
 /// was (waiting for the run to fill), what happened to the seat, and what to
 /// do next.
+///
+/// What to do next changed with #1001's reissue window: admission holds the
+/// reservation for this client's own transport identity for a short while, so
+/// the remedy is to rejoin now rather than to go and get another invite. This
+/// is the wording used when the host's own notice never arrived, so it must be
+/// true whether or not the host said anything — and it is: the window is a
+/// property of the reservation, not of the notice.
 pub const LOBBY_LOST_CONTACT: &str = "lost contact with the host while waiting for the run to \
-     fill; the seat has been given up, so ask for a new invite and try again";
+     fill; the seat is held for this install for a short while, so rejoin the same campaign \
+     now to get it back";
 
 /// The handshake replies a joining client reads while the lobby fills.
 ///
@@ -1347,8 +1355,14 @@ mod tests {
             "the wire's vocabulary is not the volunteer's: {reason}"
         );
         assert!(
-            reason.contains("try again"),
+            reason.contains("rejoin the same campaign now"),
             "and it has to answer 'do I retry?': {reason}"
+        );
+        assert!(
+            !reason.contains("invite"),
+            "since #1001 the answer is 'yes, now, from here' — the reservation is held \
+             for this install's transport identity, so sending the volunteer off for a \
+             new invite is the long way round: {reason}"
         );
     }
 
