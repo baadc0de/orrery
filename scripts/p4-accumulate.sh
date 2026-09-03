@@ -29,41 +29,62 @@
 # is a band in name — so the hours are spread across it by construction rather
 # than by anybody remembering to.
 #
-# ── The shed allowance, measured — and what the measurement found ───────────
+# ── The shed band, and §9.3's own signal ───────────────────────────────────
 #
-# `--max-shed` on the gate's witnessed leg is a ratchet pinned to one measured
-# number, 162, and a run that moves it has found something. That works because
-# the gate's leg is one fixed seed at one fixed loss. This leg is neither, so
-# the allowance was measured across the sweep before it was chosen: 72 (seed,
-# loss) cells, 32 peers, witnessed, seeds 20670–20741 against all three band
-# points.
+# This leg and the gate's witnessed leg now pass the *same* two numbers, and
+# `scripts/p1-swarm-gate.sh` carries the derivation in full. The short version,
+# because the numbers here have been wrong twice for the same reason:
 #
-#   all 72 cells    min 149   median 169   p90 175   max 183   mean 168.3
-#   at 3% loss      min 155   max 177   mean 168.5   (24 cells)
-#   at 4% loss      min 149   max 182   mean 168.7   (24 cells)
-#   at 5% loss      min 154   max 183   mean 167.6   (24 cells)
+# The gate's leg used to pass `--max-shed` as an exact per-seed ratchet on the
+# premise that at a fixed seed and a fixed loss point the shed count is a single
+# number. This leg's own header used to say that too, and used to say the
+# ratchet stood at 162 — #788 moved it to 278 on 2026-08-31 and never came back
+# here, so that sentence described a world a fortnight gone. Both statements
+# were wrong in the same way, and #974 measured why.
 #
-# **The shed count is a function of the seed, not of the loss point.** The three
-# band points agree on their means to within 1.1 packets while the seeds spread
-# 149–183 at every one of them. docs/11-roadmap.md records 162 at 3% and 172 at
-# 5% as though the band moved it; both figures are seed 1, and 162 → 172 is
-# inside the noise a seed change produces at a *fixed* loss (seed 20677 sheds
-# 159 at 4%, seed 20689 sheds 182 at the same 4%).
+# The impairment model hashes the *payload bytes* into packet identity
+# (`gates/p1-swarm/src/router.rs`, `PacketFate::of`) and draws loss and jitter
+# from `(seed, packet, draw)`. That is deliberate — it buys order-independence,
+# so an A/B comparison is not corrupted by send order — but it means any change
+# to any byte on the wire re-rolls the entire loss realisation. Holding the
+# simulation completely fixed and re-rolling only that realisation 24 times,
+# `total_shed` ranged **32 to 420**. The seed carries almost no information
+# about this count; the impairment realisation carries nearly all of it. A
+# number pinned at an observation was never measuring health.
 #
-# So a per-seed ratchet is the wrong instrument here: pinned at the observed
-# maximum it would fail roughly one night in twenty-four for no reason but the
-# seed, and a failed leg banks nothing. The allowance is **200** — a bound on
-# an island-formation transient measured at 149–183, about 9% above the
-# observed maximum — and the exact ratchet stays where it means something, on
-# the gate's fixed seed, where a regression shows as a step change. Every banked
-# line carries its own `shed`, so the distribution above stays auditable and a
-# shift in it is visible without re-running anything.
+# So both legs pass a band derived from one healthy reference population of 228
+# runs at HEAD (180 (seed, loss) cells over the criterion's 3–5% band, plus 48
+# impairment realisations at two fixed configurations):
 #
-# The transient settles early: seed 1 at 3% sheds 162 at 30 simulated seconds,
-# at five simulated minutes and at the hour; seed 20682 at 3% sheds 177 at 30 s
-# and at 5 min; seed 5 at 4% sheds 180 at 30 s, at 5 min and at the full hour.
-# That is what makes a 30-second cell a valid sample of an hour's shed, and it
-# is why the table above was affordable to measure.
+#   total_shed                min 32   p50 238   p95 345   max 420   mean 233.1   sd 66.1
+#   unsheddable_over_budget   min  1   p50  16   p95  29   max  42   mean  16.1   sd  7.7
+#
+# at `mean + 4·sd`, which is about one false failure per decade across the
+# nightly's ~3300 judgements a year:
+#
+#   MAX_SHED                  233.1 + 4 × 66.1 = 497.6  →  500
+#   MAX_UNSHEDDABLE_OVER_BUDGET 16.1 + 4 × 7.7 =  47.1  →   48
+#
+# Both still fail a genuine overrun by two orders of magnitude: starving the
+# send path to 850 kbps while judging against the 1 Mbps criterion reads 2528
+# shed and 285 unsheddable, and 700 kbps reads 21185 and 1495.
+#
+# `MAX_UNSHEDDABLE_OVER_BUDGET` is the half that follows from the record.
+# docs/03-replication.md §9.3 names exactly two overrun signals —
+# `UploadMeter::unsheddable_over_budget` and the windowed rate — and explicitly
+# refuses a "did we shed" boolean. A shed count is neither of them, so no number
+# for `--max-shed` follows from §9.3 at all; it is a harness-local convention.
+# This counter is the document's own signal, and until #974 it was measured,
+# printed on every run and judged by nothing. Every banked line carries its own
+# `shed`, so both distributions stay auditable and a shift is visible without
+# re-running anything.
+#
+# The transient settles early, which is what makes a 30-second cell a valid
+# sample of an hour and is why the population above was affordable to measure:
+# seed 1 at 3% sheds 345 with 20 unsheddable at 30 simulated seconds and at five
+# minutes; seed 7 at 4% sheds 270 with 12 unsheddable at 30 s, 5 min and 15 min.
+# A starved run is flat too (850 kbps: 2528/285 at both 30 s and 5 min), so
+# flatness says *formation transient*, and magnitude is what says overrun.
 #
 # Nothing else is relaxed. `--min-cells` and `--max-pops` carry the same values
 # the gate's witnessed leg gives them and for the same reasons: the witness leg
@@ -150,6 +171,12 @@ self_test() {
     || die 'self-test: the leg banks nothing; the hours would die with the runner'
   on_leg '--max-shed' \
     || die 'self-test: the shed allowance is gone; the budget backstop would go unjudged'
+  # §9.3's own overrun signal. The shed band above is wide by construction —
+  # the quantity it bounds moves 32–420 for reasons unrelated to health — and
+  # this is the bound that carries the document's meaning. Without it the leg
+  # banks hours judged only against a harness-local convention.
+  on_leg '--max-unsheddable-over-budget' \
+    || die 'self-test: the leg no longer judges unsheddable_over_budget; §9.3 overrun signal unenforced'
   has 'BAND=' \
     || die 'self-test: the loss band is gone'
   # Off-Linux, both of these: cargo emits `p1-swarm.exe` on a Windows runner,
@@ -219,10 +246,13 @@ readonly OUT="${P4_ACCUM_OUT:-$ROOT/target/p4-accumulate}"
 # The criterion's band, sampled at its ends and its middle. Sweeping in this
 # order means any three consecutive nights cover all three.
 readonly BAND=(0.03 0.04 0.05)
-# A bound on the island-formation transient, measured across 72 cells at
-# 149–183; see the header for why this is a bound rather than the gate's
-# per-seed ratchet. A night above it fails the leg and banks nothing.
-readonly MAX_SHED=200
+# The band's upper edge and §9.3's own overrun bound, both derived in the header
+# from 228 healthy runs at `mean + 4·sd`. The gate's witnessed leg passes the
+# same two numbers: #974 established that the shed count is a function of the
+# impairment realisation rather than of the seed, so there is nothing for a
+# per-leg number to say. A night above either fails the leg and banks nothing.
+readonly MAX_SHED=500
+readonly MAX_UNSHEDDABLE_OVER_BUDGET=48
 
 # index → "seed loss". The seed is the index itself: the default index is days
 # since the epoch, which is monotone, needs no stored state, and is the same on
@@ -292,7 +322,9 @@ run_probe() {
   # report that is a function of its parameters and of nothing else, so that a
   # diff against another platform's means what it looks like it means.
   "$bin" --peers 32 --seconds "$PROBE_SECONDS" --min-cells 1 --max-pops 0 \
-    --max-shed "$MAX_SHED" --late-join-at "$(( PROBE_SECONDS / 2 ))" \
+    --max-shed "$MAX_SHED" \
+    --max-unsheddable-over-budget "$MAX_UNSHEDDABLE_OVER_BUDGET" \
+    --late-join-at "$(( PROBE_SECONDS / 2 ))" \
     --impaired --loss "$PROBE_LOSS" --seed "$PROBE_SEED" --witness \
     --json "$staged" \
     || die 'the comparability probe did not hold'
@@ -353,7 +385,9 @@ main() {
   # three unrelated ones, because a divergence between them is then visible in
   # the reports themselves.
   if ! "$bin" --peers 32 --seconds "$seconds" --min-cells 1 --max-pops 0 \
-      --max-shed "$MAX_SHED" --late-join-at "$(( seconds / 2 ))" \
+      --max-shed "$MAX_SHED" \
+      --max-unsheddable-over-budget "$MAX_UNSHEDDABLE_OVER_BUDGET" \
+      --late-join-at "$(( seconds / 2 ))" \
       --impaired --loss "$loss" --seed "$seed" --witness --stamp-wall-clock \
       --json "$report"
   then

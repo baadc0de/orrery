@@ -281,21 +281,28 @@ struct Args {
     /// it. What says that is a transient and not an overrun is that the count
     /// is the same at five simulated minutes as at one hour.
     ///
-    /// The gate's witnessed leg has passed 206, then 230, then 162, and now
-    /// **278** — the measured number exactly, each time (docs/11-roadmap.md
-    /// §P4). 206 → 230 when watches stopped dying on their first lost frame,
-    /// which is more repair traffic and so more of the cheap lane shed to pay
-    /// for it. 230 → 162 when the bots moved from `orrery_conformance`'s corpus
-    /// kernel to `orrery_games`' Regolith: drag and a per-archetype speed clamp
-    /// move every trajectory in the swarm, and with it the crowd density that
-    /// decides how much any peer has to send. 172 at the 5% end of the band.
-    /// 162 → 278 with #788's crowd-density fix: narrowing the campaign's radial
-    /// spread keeps its initially compact crowd on one integer turn rate
-    /// instead of shearing it apart, so more peers remain in range and send
-    /// replication. 94 at the 5% end of the band. Both new figures are
-    /// identical at five simulated minutes and at one hour.
+    /// The gate's witnessed leg passed this as an exact per-seed ratchet — 206,
+    /// then 230, then 162, then 278, the measured number each time — on the
+    /// premise that at a fixed seed and loss point the count is a single number,
+    /// so a run that moved it had found something. #974 measured the premise and
+    /// it is false: holding the simulation entirely fixed and re-rolling only
+    /// the impairment realisation, the count ranges 32–420. The legs now pass a
+    /// **band**, derived in `scripts/p1-swarm-gate.sh`; see
+    /// `swarm::Criterion::max_shed` for why, and
+    /// `--max-unsheddable-over-budget` for the bound §9.3 actually names.
     #[arg(long, default_value_t = 0)]
     max_shed: u64,
+
+    /// Unsheddable sends charged while over budget before the clause fails.
+    ///
+    /// docs/03-replication.md §9.3's own overrun signal, judged from #974 —
+    /// before it, `unsheddable_over_budget` was measured, printed on every run,
+    /// and looked at by nothing. Zero is the criterion and zero is what every
+    /// leg but the 32-peer witnessed ones measures; those pass a derived
+    /// formation allowance, because the counter reads 1–42 on healthy runs
+    /// there and never 0.
+    #[arg(long, default_value_t = 0)]
+    max_unsheddable_over_budget: u64,
 
     /// Seed for impairment and the universe.
     #[arg(long, default_value_t = 1)]
@@ -1579,6 +1586,7 @@ fn main() -> Result<()> {
         min_cells: args.min_cells,
         max_pops: args.max_pops,
         max_shed: args.max_shed,
+        max_unsheddable_over_budget: args.max_unsheddable_over_budget,
         ..Criterion::default()
     });
     if failures.is_empty() {
@@ -1612,6 +1620,11 @@ fn self_test() -> Result<()> {
     for clause in [
         "sustained upload ≤ 1 Mbps",
         "no load shed to stay within budget",
+        // §9.3's normative overrun signal. It was measured and printed for
+        // four issues before #974 wired it to a failure; the clause above,
+        // which is a harness-local convention rather than a restatement of the
+        // document, was doing the whole job alone.
+        "no unsheddable overrun beyond island formation",
         "the harness observes what it sends",
         "no false-positive discrepancy signal against an honest peer",
         "the witness sees the stream it is judging",

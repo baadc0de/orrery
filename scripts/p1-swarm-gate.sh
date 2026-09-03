@@ -80,6 +80,12 @@ if [[ ${1:-} == --self-test ]]; then
     || die 'self-test: the witnessed hour runs a clean link; P4 measures the witness under impairment'
   grep -Fq -- '--max-shed' <<<"$witnessed" \
     || die 'self-test: the witnessed leg has lost its own shed allowance'
+  # §9.3's own overrun signal, and the reason the shed band above can afford to
+  # be wide: without this flag the leg judges only a harness-local convention
+  # and the document's normative counter goes back to being printed and ignored,
+  # which is the state #974 found it in.
+  grep -Fq -- '--max-unsheddable-over-budget' <<<"$witnessed" \
+    || die 'self-test: the witnessed leg no longer judges unsheddable_over_budget; §9.3 overrun signal unenforced'
   # The conviction leg, by the flag that arms it. `--cheat` is what fields a
   # modified client, takes every witness out of shadow mode and turns the filed
   # reports over to an adjudicator; without it the six clauses of P4's demo
@@ -156,28 +162,91 @@ note 'witnessed run: the same impaired hour, every peer re-executing its witness
 # when it is a parameterization mistake. The interest clauses are measured on the
 # cruise-only runs above; this leg is about the witness.
 #
+# ── The shed band, and §9.3's own signal ──────────────────────────────────────
+#
 # The shed allowance is the same kind of thing. The witness lane makes a
 # transient real that the cruise-only runs do not have: at island formation a
 # peer recovering from a hitch serves its witnesses' repair burst on the
 # unsheddable control lane and sheds the cheap lane to afford it
 # (docs/03-replication.md §5.3a). What says transient rather than overrun is that
-# the count is *identical* at five simulated minutes and at one hour. So the
-# allowance is the measured number exactly, and not a round one: it is a ratchet,
-# and a run that moves it has found something.
+# the count is *identical* at 30 simulated seconds, at five minutes and at one
+# hour — measured again for #974 and still true, of the healthy run and of a
+# deliberately starved one alike.
 #
-# It has moved three times. 206 → 230 when watches stopped dying on their first
-# lost frame, which is more repair traffic on the unsheddable control lane and
-# so more of the cheap lane shed to afford it (docs/11-roadmap.md §P4). 230 →
-# 162 when the bots stopped playing `orrery_conformance`'s corpus kernel and
-# started playing `orrery_games`' Skirmish: those rules apply drag and a
-# per-archetype speed clamp, so every trajectory in the swarm moved and with it
-# the crowd density that decides how much any peer has to send. #788 moved 162
-# → 278 by narrowing the campaign's radial spread: the initially compact crowd
-# stays on one integer turn rate instead of shearing apart, so more peers remain
-# in range and send replication. Re-measured rather than adjusted — 278 at 3%
-# loss, and *identical* at five simulated minutes and at one hour, which is what
-# still says transient rather than overrun. 94 at the 5% end.
-"$BIN" --peers 32 --seconds 3600 --min-cells 1 --max-pops 0 --max-shed 278 \
+# It used to be a ratchet: the measured number exactly, 206 → 230 → 162 → 278,
+# on the contract "a run that moves it has found something". **#974 measured the
+# premise underneath that contract and it is false.** The premise was that at a
+# fixed seed and a fixed loss point the shed count is a single number. It is
+# not, and the reason is in the harness rather than in the sender:
+# `gates/p1-swarm/src/router.rs` hashes the *payload bytes* into packet identity
+# (`PacketFate::of`) and draws loss and jitter from `(seed, packet, draw)`
+# (`draws`). That is deliberate and worth keeping — it buys order-independence,
+# so an A/B comparison is not silently corrupted by send order — but it means
+# any change to any byte on the wire re-rolls the whole loss realisation, and a
+# different realisation drops different packets, provokes different repair
+# bursts and sheds a different number.
+#
+# Holding the simulation *completely* fixed — seed 1, 3% loss, 32 peers,
+# witnessed, one hour's worth of formation — and re-rolling only that
+# realisation 24 times, `total_shed` ranged **32 to 420**, sd 81. The entire
+# 180-cell seed × loss sweep over the criterion's band ranged 58–399, sd 64. The
+# two distributions are the same one: the seed carries almost no information
+# about this count and the impairment realisation carries nearly all of it. So
+# #816's ruleset-digest change (real blake3 build hashes replacing
+# compressible placeholder fill — legitimate traffic, and `replication_bytes`
+# actually *fell*) did not break a bound. It collected on one that was asserting
+# a precision the harness never had, and cost two investigations to unwind.
+#
+# ── Deriving the band ────────────────────────────────────────────────────────
+#
+# Healthy reference population, all at HEAD, 32 peers, witnessed, impaired, on
+# the 1 Mbps budget, at a point of the criterion's 3–5% loss band: 180
+# (seed, loss) cells plus 48 impairment realisations at two fixed
+# configurations = **228 runs**.
+#
+#   total_shed                min 32   p50 238   p95 345   max 420   mean 233.1   sd 66.1
+#   unsheddable_over_budget   min  1   p50  16   p95  29   max  42   mean  16.1   sd  7.7
+#
+# The nightly judges these two clauses on three legs across three platforms —
+# about 3300 judgements a year — so a bound wants a per-run false-failure rate
+# well under 1/3300. `mean + 4·sd` gives a one-sided normal tail of 3.2e-5, or
+# roughly one false failure per decade, and that is the rule used here:
+#
+#   shed ceiling         233.1 + 4 × 66.1 = 497.6  →  500
+#   unsheddable ceiling   16.1 + 4 × 7.7  =  47.1  →   48
+#
+# Both sit above the observed healthy maximum with room (500 vs 420, 48 vs 42),
+# and the *lower* edge of the same construction lands below zero for both
+# (-31.4 and -14.8), which is why the band is stated as a ceiling: on a quantity
+# this dispersed there is no floor to assert, and asserting one would be the
+# ratchet's mistake again in the other direction.
+#
+# ── What the band still catches ──────────────────────────────────────────────
+#
+# Sensitivity, measured by starving the send path with `--budget-kbps` while
+# judging against the same 1 Mbps criterion (seed 1, 3% loss, 30 s):
+#
+#   budget   1000    990    975    950    925    900    875    850    700
+#   shed      345    412    494    650    790   1031   1453   2528  21185
+#   unshed     20     28     42     75     87     97    159    285   1495
+#
+# Both clauses cross between a 2.5% and a 5% budget shortfall, and both are two
+# orders of magnitude clear of a real one. A bound that fires on a 5% shortfall
+# and never on 228 healthy runs is a gate; 278 was a tripwire on a coin flip.
+#
+# `--max-unsheddable-over-budget` is the substantive half. §9.3 names exactly
+# two overrun signals — `UploadMeter::unsheddable_over_budget` and the windowed
+# rate — and explicitly refuses a "did we shed" boolean, because a quiet frame
+# would clear it. A shed *count* is neither: it says the backstop worked. This
+# counter says the lanes that could not be shed were sent and charged anyway,
+# so the overrun is real rather than an artefact of shedding. It was measured,
+# surfaced in `SwarmReport`, printed on every run with its own explanatory line
+# — and judged by nothing until #974. Zero is the criterion and zero is what
+# every other leg in this file measures, cruise and conviction alike; only the
+# 32-peer witnessed legs need the formation allowance, and they cannot assert
+# zero because they read 1–42 on healthy runs and never 0.
+"$BIN" --peers 32 --seconds 3600 --min-cells 1 --max-pops 0 --max-shed 500 \
+  --max-unsheddable-over-budget 48 \
   --late-join-at 1800 --impaired --witness --stamp-wall-clock \
   --json "$OUT/witnessed.json" \
   || die 'the P4 witnessing clauses did not hold over the impaired hour'
