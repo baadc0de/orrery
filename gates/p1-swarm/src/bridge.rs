@@ -58,17 +58,44 @@ use crate::exterior::{
 
 /// The connection's application protocol. A grammar change bumps this as well
 /// as `JoinRequest::VERSION`; both sides must refuse what they do not speak.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/4";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/5";
 
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connection-wide QUIC inactivity allowed before a vanished exterior closes.
 ///
-/// iroh's five-second keep-alive stays enabled, so a reachable idle player is
-/// retained. Ten seconds spans two keep-alive intervals while bounding a
-/// dead path's seat release to this timeout plus the host's two-second grace.
+/// iroh's five-second keep-alive stays enabled — `QuicTransportConfig::builder`
+/// installs `keep_alive_interval` and `default_path_keep_alive_interval` at its
+/// `HEARTBEAT_INTERVAL`, and setting `max_idle_timeout` here does not clear
+/// them — so ten seconds spans two keep-alive intervals while bounding a dead
+/// path's seat release to this timeout plus the host's two-second grace.
+///
+/// What that sentence does *not* buy, and #994 read it as if it did: a PING
+/// keeps a *working* path from going idle, it does not conjure a path that has
+/// stopped working. Relays are disabled (#375), so there is exactly one path,
+/// and a NAT binding that lapses over a multi-minute lobby wait ends the
+/// connection at this timeout with nobody watching — the host found out at
+/// `StartV1` and the client found out when its dial deadline expired. The
+/// lobby heartbeat below is the fix: real traffic while the lobby fills, and
+/// an observer on both ends of it. The timeout itself is unchanged, and must
+/// stay so — widening it would trade a bounded seat release for a cosmetic
+/// win.
 pub const EXTERIOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the host tells a waiting lobby peer that it is still seated.
+///
+/// Well inside [`EXTERIOR_MAX_IDLE_TIMEOUT`], so a healthy lobby connection is
+/// never idle for a whole timeout window, and small enough that the client's
+/// grace can miss three in a row and still decide before QUIC does.
+pub const LOBBY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// QUIC application close code the host uses when it evicts a lobby peer.
+///
+/// The `Evicted` message may not survive a path that is already failing; a
+/// CONNECTION_CLOSE carrying the same reason has a second chance at it, and
+/// gives the client something better than a truncated read to report.
+pub const LOBBY_EVICTION_CLOSE_CODE: u32 = 0x9_94;
 
 fn exterior_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
@@ -303,6 +330,53 @@ impl PendingJoin {
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Tell this waiting seat the lobby is still filling, and that it is
+    /// still in it.
+    ///
+    /// The write is the liveness probe as much as the news: once the peer's
+    /// connection has gone, this fails, which is how the host learns during
+    /// the lobby instead of at `StartV1` (#994).
+    ///
+    /// # Errors
+    /// The connection can no longer carry the handshake stream.
+    pub async fn lobby_heartbeat(&mut self, seated: u16, needed: u16) -> Result<()> {
+        if let Some(error) = self.connection.close_reason() {
+            bail!("{}", classify_close(&error));
+        }
+        write_message(
+            &mut self.send,
+            &JoinReply::LobbyWait { seated, needed }.encode(),
+        )
+        .await
+        .context("lobby heartbeat write failed")
+    }
+
+    /// Give this seat back, telling the peer why on the way out.
+    ///
+    /// Best effort twice over: the `Evicted` message goes on the handshake
+    /// stream, and the same sentence rides the CONNECTION_CLOSE, so a path
+    /// that is degraded rather than gone still delivers one of them. A path
+    /// that is gone delivers neither, which is why the client runs its own
+    /// lobby-heartbeat grace rather than trusting this to arrive.
+    pub async fn evict(mut self, reason: &str) {
+        let _ = write_message(
+            &mut self.send,
+            &JoinReply::Evicted {
+                reason: reason.to_owned(),
+            }
+            .encode(),
+        )
+        .await;
+        let _ = self.send.finish();
+        // Same 200ms as `refuse`: `close` stops sending, so the message needs
+        // its moment on the wire before the CONNECTION_CLOSE overtakes it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.connection.close(
+            iroh::endpoint::VarInt::from_u32(LOBBY_EVICTION_CLOSE_CODE),
+            reason.as_bytes(),
+        );
     }
 
     /// Send a named lobby refusal before dropping the pending connection.
@@ -570,17 +644,28 @@ pub async fn remote_join(
         .await
         .context("open handshake stream")?;
     write_message(&mut send, &request.encode()).await?;
-    let reply_bytes = read_message(&mut recv).await?;
-    match JoinReply::decode(&reply_bytes).map_err(|reason| anyhow::anyhow!("{reason}"))? {
-        JoinReply::Accept {
-            index: assigned,
-            manifest: _,
-        } => {
-            if assigned != index {
-                bail!("the host assigned slot {assigned}; this peer derived {index}");
+    // The host holds its verdict until the lobby freezes, beating
+    // `LobbyWait` at it meanwhile (#994). Each beat resets the per-message
+    // read timeout, so waiting out a lobby is bounded by silence rather than
+    // by how long the lobby takes.
+    loop {
+        let reply_bytes = read_message(&mut recv).await?;
+        match JoinReply::decode(&reply_bytes).map_err(|reason| anyhow::anyhow!("{reason}"))? {
+            JoinReply::Accept {
+                index: assigned,
+                manifest: _,
+            } => {
+                if assigned != index {
+                    bail!("the host assigned slot {assigned}; this peer derived {index}");
+                }
+                break;
             }
+            JoinReply::Reject { reason } => bail!("the host refused the join: {reason}"),
+            JoinReply::Evicted { reason } => {
+                bail!("the host gave this seat back while it waited in the lobby: {reason}")
+            }
+            JoinReply::LobbyWait { .. } => {}
         }
-        JoinReply::Reject { reason } => bail!("the host refused the join: {reason}"),
     }
     // Two length-prefixed messages, mirroring the host's reads: claim first,
     // then the state it commits to. An absent log is the explicit empty pair,

@@ -791,6 +791,107 @@ impl StartJoin for bridge::PendingJoin {
     }
 }
 
+/// What a seat is told when the host gives it back mid-lobby, in the words the
+/// volunteer reads off their own screen.
+///
+/// It has to answer one question — retry, or not? — for somebody who is not
+/// reading a stack trace, and it has to be short: the wire carries this reason
+/// behind a `u8` length.
+const LOBBY_LOST_CONTACT: &str = "the host lost contact while the run was filling; \
+     your seat was given back, so ask for a new invite and rejoin";
+
+/// The lobby-sweep shape needed from one peer that is still waiting.
+///
+/// [`bridge::PendingJoin`] is the production implementor. As with
+/// [`StartJoin`], the trait exists so the tests can inject a peer whose
+/// heartbeat fails: the live failure is a connection that lapsed minutes
+/// before anyone looked at it (#994), and waiting one out would buy a slow
+/// flaky test rather than coverage.
+trait LobbyPeer: Sized {
+    /// Admission-authoritative seat this peer holds.
+    fn index(&self) -> usize;
+    /// Admission session whose reservation authorized the connection.
+    fn session_id(&self) -> Option<&str>;
+    /// Tell the peer the lobby is still filling and it is still in it.
+    fn lobby_heartbeat(
+        &mut self,
+        seated: u16,
+        needed: u16,
+    ) -> impl std::future::Future<Output = Result<()>>;
+    /// Give the seat back, naming the reason to the peer on the way out.
+    fn evict(self, reason: &str) -> impl std::future::Future<Output = ()>;
+}
+
+impl LobbyPeer for bridge::PendingJoin {
+    fn index(&self) -> usize {
+        Self::index(self)
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        Self::session_id(self)
+    }
+
+    async fn lobby_heartbeat(&mut self, seated: u16, needed: u16) -> Result<()> {
+        Self::lobby_heartbeat(self, seated, needed).await
+    }
+
+    async fn evict(self, reason: &str) {
+        Self::evict(self, reason).await;
+    }
+}
+
+/// Beat once on every seat still waiting for the lobby to fill, and give back
+/// the ones that no longer answer (#994).
+///
+/// The heartbeat is the news and the probe at once. A peer that hears it knows
+/// it is queued; a peer that stops hearing it knows it is not. And the write
+/// itself is what tells the *host* that a connection has lapsed — before this,
+/// nothing looked at a lobby connection between the handshake and `StartV1`,
+/// so a peer that died at 12:54 was discovered at 12:57, when discovering it
+/// was most expensive.
+///
+/// A lost seat is released through the one release path
+/// ([`swarm::LiveMembership::release_seat`]) so admission reopens it, exactly
+/// as a start-path drop is. Then, and only then, the peer is told: the notice
+/// is best effort by construction, because the usual reason a heartbeat failed
+/// is that nothing can be written to that peer any more. The client's own
+/// heartbeat grace is what makes the outcome intelligible when the notice
+/// cannot land.
+///
+/// Returns how many seats were given back.
+async fn sweep_lobby<P: LobbyPeer>(
+    pending: &mut Vec<P>,
+    wanted: usize,
+    membership: Option<&Arc<Mutex<swarm::LiveMembership>>>,
+) -> Result<usize> {
+    let seated = u16::try_from(pending.len()).unwrap_or(u16::MAX);
+    let needed = u16::try_from(wanted).unwrap_or(u16::MAX);
+    let mut lost = Vec::new();
+    for (position, peer) in pending.iter_mut().enumerate() {
+        if let Err(error) = peer.lobby_heartbeat(seated, needed).await {
+            eprintln!(
+                "gates/p1-swarm: seat {} lost in the lobby: {error:#}",
+                peer.index()
+            );
+            lost.push(position);
+        }
+    }
+    // Back to front: removing a low position first would shift every higher
+    // one out from under the index that named it.
+    for position in lost.iter().rev().copied() {
+        let peer = pending.remove(position);
+        let slot = peer.index();
+        let session_id = peer.session_id().map(ToOwned::to_owned);
+        if let (Some(live), Some(session_id)) = (membership, &session_id) {
+            let mut live = live.lock().expect("membership lock");
+            live.release_seat(slot, session_id)
+                .context("republish active seats after a lobby eviction")?;
+        }
+        peer.evict(LOBBY_LOST_CONTACT).await;
+    }
+    Ok(lost.len())
+}
+
 /// Everything the start path needs to author a `StartV1` for a given roster.
 struct StartRoster<'a> {
     attempt_id: Option<&'a str>,
@@ -1267,6 +1368,20 @@ fn main() -> Result<()> {
                 );
                 std::fs::write(path, line).context("cannot write the exterior listening file")?;
             }
+            // Hoisted above the lobby so a seat lost while the lobby is still
+            // filling can be released through the one release path (#994).
+            // Constructing it publishes nothing; only a release or a bind does.
+            let membership = args.attempt_id.as_ref().map(|attempt_id| {
+                Arc::new(Mutex::new(swarm::LiveMembership {
+                    attempt_id: attempt_id.clone(),
+                    active: BTreeMap::new(),
+                    pending: BTreeSet::new(),
+                    released_sessions: BTreeSet::new(),
+                    tick: 0,
+                    running: false,
+                    path: args.active_seats_file.clone(),
+                }))
+            });
             let mut pending = Vec::new();
             let fixed_legacy_seat =
                 (!standing).then(|| (config.peers, bot::bot_key(config.peers).public()));
@@ -1315,23 +1430,46 @@ fn main() -> Result<()> {
             }
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(args.lobby_seconds);
+            // The seats already in `pending` wait here for as long as the
+            // lobby takes to fill — minutes, live — so this loop is also the
+            // only place that can keep them alive and watched (#994). The
+            // accept future is held across ticks rather than recreated: a
+            // `select!` that dropped it every two seconds would abandon
+            // whichever handshake happened to be in flight.
+            let mut heartbeat = tokio::time::interval(bridge::LOBBY_HEARTBEAT_INTERVAL);
+            heartbeat.tick().await;
+            let mut accept = Box::pin(bridge::host_prepare(
+                &endpoint,
+                fixed_legacy_seat,
+                &admission,
+            ));
             while pending.len() < args.external_slots {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
+                let mut arrived = None;
+                let mut lobby_closed = false;
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(deadline) => lobby_closed = true,
+                    _ = heartbeat.tick() => {}
+                    result = accept.as_mut() => arrived = Some(result),
+                }
+                if lobby_closed {
                     break;
                 }
-                let prepared = match tokio::time::timeout(
-                    remaining,
-                    bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission),
-                )
-                .await
-                {
-                    Ok(Ok(prepared)) => prepared,
-                    Ok(Err(error)) => {
+                let Some(result) = arrived else {
+                    sweep_lobby(&mut pending, args.external_slots, membership.as_ref()).await?;
+                    continue;
+                };
+                accept = Box::pin(bridge::host_prepare(
+                    &endpoint,
+                    fixed_legacy_seat,
+                    &admission,
+                ));
+                let prepared = match result {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
                         eprintln!("gates/p1-swarm: refused pending join: {error:#}");
                         continue;
                     }
-                    Err(_) => break,
                 };
                 if prepared.index() < config.peers || prepared.index() >= island_seats {
                     let reason = format!(
@@ -1362,23 +1500,22 @@ fn main() -> Result<()> {
                 pending.push(prepared);
             }
 
+            // The unfinished accept borrows the endpoint the run is about to
+            // take ownership of; the lobby is closed, so let it go.
+            drop(accept);
+
+            if pending.is_empty() {
+                bail!(
+                    "every seat that reached this lobby was lost before StartV1; there is no \
+                     human left to measure, so the supervisor opens a fresh lobby"
+                );
+            }
             eprintln!(
                 "gates/p1-swarm: StartV1 begins with {} active humans across {} seats",
                 pending.len(),
                 island_seats
             );
 
-            let membership = args.attempt_id.as_ref().map(|attempt_id| {
-                Arc::new(Mutex::new(swarm::LiveMembership {
-                    attempt_id: attempt_id.clone(),
-                    active: BTreeMap::new(),
-                    pending: BTreeSet::new(),
-                    released_sessions: BTreeSet::new(),
-                    tick: 0,
-                    running: false,
-                    path: args.active_seats_file.clone(),
-                }))
-            });
             let finished = finish_start_joins(
                 pending,
                 &StartRoster {
@@ -2018,6 +2155,14 @@ mod start_join_tests {
         session_id: Option<String>,
         /// `Some` if this peer cannot finish, carrying the transport reason.
         failure: Option<&'static str>,
+        /// Lobby beats this peer still answers before its connection is gone.
+        /// `None` is a reachable peer, which answers for as long as it is
+        /// asked — the case that must survive an arbitrarily long lobby.
+        beats_left: Option<usize>,
+        /// Every beat any peer answered: slot, and the lobby it was told about.
+        beats: Arc<Mutex<Vec<(usize, u16, u16)>>>,
+        /// Every eviction notice sent, in the words the peer would read.
+        evictions: Arc<Mutex<Vec<(usize, String)>>>,
         /// The `StartV1` each peer was handed at `Accept`, in bind order.
         accepted: Arc<Mutex<Vec<(usize, Option<exterior::StartManifest>)>>>,
         /// Remote ends of the bound links, kept alive so the corrected roster
@@ -2060,9 +2205,44 @@ mod start_join_tests {
         }
     }
 
+    impl LobbyPeer for FakeJoin {
+        fn index(&self) -> usize {
+            self.slot
+        }
+
+        fn session_id(&self) -> Option<&str> {
+            self.session_id.as_deref()
+        }
+
+        async fn lobby_heartbeat(&mut self, seated: u16, needed: u16) -> Result<()> {
+            if let Some(left) = self.beats_left.as_mut() {
+                if *left == 0 {
+                    // What the live write returns once the connection has
+                    // lapsed: the classified QUIC close, not a stream error.
+                    bail!("idle timeout");
+                }
+                *left -= 1;
+            }
+            self.beats
+                .lock()
+                .expect("beats lock")
+                .push((self.slot, seated, needed));
+            Ok(())
+        }
+
+        async fn evict(self, reason: &str) {
+            self.evictions
+                .lock()
+                .expect("evictions lock")
+                .push((self.slot, reason.to_owned()));
+        }
+    }
+
     struct StartHarness {
         accepted: Arc<Mutex<Vec<(usize, Option<exterior::StartManifest>)>>>,
         remotes: Arc<Mutex<Vec<(usize, exterior::RemoteLink)>>>,
+        beats: Arc<Mutex<Vec<(usize, u16, u16)>>>,
+        evictions: Arc<Mutex<Vec<(usize, String)>>>,
         membership: Arc<Mutex<swarm::LiveMembership>>,
     }
 
@@ -2071,6 +2251,8 @@ mod start_join_tests {
             Self {
                 accepted: Arc::new(Mutex::new(Vec::new())),
                 remotes: Arc::new(Mutex::new(Vec::new())),
+                beats: Arc::new(Mutex::new(Vec::new())),
+                evictions: Arc::new(Mutex::new(Vec::new())),
                 membership: Arc::new(Mutex::new(swarm::LiveMembership {
                     attempt_id: "attempt-994".to_owned(),
                     active: BTreeMap::new(),
@@ -2090,9 +2272,30 @@ mod start_join_tests {
                 slot,
                 session_id: Some(format!("session-{slot}")),
                 failure,
+                beats_left: None,
                 accepted: Arc::clone(&self.accepted),
                 remotes: Arc::clone(&self.remotes),
+                beats: Arc::clone(&self.beats),
+                evictions: Arc::clone(&self.evictions),
             }
+        }
+
+        /// A peer whose connection lapses after `beats_left` more heartbeats.
+        fn fading_peer(&self, slot: usize, beats_left: usize) -> FakeJoin {
+            FakeJoin {
+                beats_left: Some(beats_left),
+                ..self.peer(slot, None)
+            }
+        }
+
+        /// How many beats a given seat was sent.
+        fn beats_for(&self, slot: usize) -> usize {
+            self.beats
+                .lock()
+                .expect("beats lock")
+                .iter()
+                .filter(|(seat, _, _)| *seat == slot)
+                .count()
         }
 
         /// Slots the given peer's `Accept` manifest named as active.
@@ -2139,6 +2342,126 @@ mod start_join_tests {
             island_seats: 8,
             witnessing: false,
         }
+    }
+
+    /// How many sweeps stand in for a lobby wait far past the idle timeout.
+    ///
+    /// The host beats every `bridge::LOBBY_HEARTBEAT_INTERVAL`, so ninety of
+    /// them is three minutes — the wait #994's tester actually sat through,
+    /// and eighteen `EXTERIOR_MAX_IDLE_TIMEOUT` windows. It costs microseconds
+    /// here because the seam is the beat, not the clock.
+    const A_THREE_MINUTE_LOBBY: usize = 90;
+
+    #[tokio::test]
+    async fn a_reachable_peer_waits_out_a_long_lobby_and_still_starts() {
+        // The defect's healthy half: nothing exercised a peer that waits
+        // longer than `EXTERIOR_MAX_IDLE_TIMEOUT`, because before the lobby
+        // heartbeat nothing happened on that connection at all.
+        let harness = StartHarness::new();
+        let mut pending = vec![harness.peer(5, None), harness.peer(6, None)];
+
+        for _ in 0..A_THREE_MINUTE_LOBBY {
+            let lost = sweep_lobby(&mut pending, 3, Some(&harness.membership))
+                .await
+                .expect("a reachable lobby releases no seat");
+            assert_eq!(lost, 0);
+        }
+
+        assert_eq!(harness.beats_for(5), A_THREE_MINUTE_LOBBY);
+        assert_eq!(
+            harness.beats.lock().expect("beats lock")[0],
+            (5, 2, 3),
+            "each beat carries the lobby's progress, which is what the client shows"
+        );
+        assert!(
+            harness.evictions.lock().expect("evictions lock").is_empty(),
+            "a reachable player is never evicted for waiting"
+        );
+
+        // And it still starts: the wait cost it nothing.
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+            .await
+            .expect("both peers survived the lobby");
+        assert_eq!(
+            finished
+                .iter()
+                .map(|((_, _, _, slot), _)| *slot)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_lobby_peer_is_evicted_told_why_and_gives_its_seat_back() {
+        // Seat 6's connection lapses after two beats; seat 5's does not. The
+        // host must learn during the lobby, not at `StartV1` minutes later.
+        let harness = StartHarness::new();
+        let mut pending = vec![harness.peer(5, None), harness.fading_peer(6, 2)];
+
+        let mut lost = 0;
+        for _ in 0..4 {
+            lost += sweep_lobby(&mut pending, 3, Some(&harness.membership))
+                .await
+                .expect("losing one seat is survivable");
+        }
+
+        assert_eq!(lost, 1);
+        assert_eq!(
+            pending.iter().map(LobbyPeer::index).collect::<Vec<_>>(),
+            vec![5],
+            "only the lost seat leaves the lobby"
+        );
+        assert_eq!(
+            *harness.evictions.lock().expect("evictions lock"),
+            vec![(6, LOBBY_LOST_CONTACT.to_owned())],
+            "the peer is told why, in words that say whether to retry"
+        );
+        assert!(
+            LOBBY_LOST_CONTACT.contains("ask for a new invite"),
+            "and the words have to be actionable by somebody who is not reading a log"
+        );
+        assert!(
+            LOBBY_LOST_CONTACT.len() <= usize::from(u8::MAX),
+            "the reject reason is u8-length-prefixed on the wire"
+        );
+
+        let live = harness.membership.lock().expect("membership lock");
+        assert_eq!(
+            live.released_sessions.iter().cloned().collect::<Vec<_>>(),
+            vec!["session-6".to_owned()],
+            "the seat goes back through the one release path, so admission reopens it (#954)"
+        );
+        assert!(
+            live.active.is_empty() && live.pending.is_empty(),
+            "and nothing the transport did not admit is left named"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lobby_peer_without_a_session_is_still_evicted() {
+        // The legacy single-peer path presents no invite session, so there is
+        // no reservation to spend. The eviction must still happen.
+        let harness = StartHarness::new();
+        let mut stale = harness.fading_peer(6, 0);
+        stale.session_id = None;
+        let mut pending = vec![stale];
+
+        assert_eq!(
+            sweep_lobby(&mut pending, 2, Some(&harness.membership))
+                .await
+                .expect("a session-less peer is evicted the same way"),
+            1
+        );
+        assert!(pending.is_empty());
+        assert!(
+            harness
+                .membership
+                .lock()
+                .expect("membership lock")
+                .released_sessions
+                .is_empty(),
+            "there was no reservation to spend"
+        );
     }
 
     #[tokio::test]
