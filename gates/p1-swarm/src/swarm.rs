@@ -3495,6 +3495,21 @@ impl SwarmReport {
                 ),
             });
         }
+        // `bad_body` carries a "**must be zero**" contract in its own doc
+        // comment and nothing enforced it, which is how #961 ran at 151 on
+        // every campaign run while the report printed a clean verdict. A body
+        // that decoded at the envelope and not as state is a peer sending
+        // bytes this receiver cannot read; the harness is then not observing
+        // what it sends, which is this clause exactly.
+        if self.total_bad_body > 0 {
+            failures.push(CriterionFailure {
+                clause: "the harness observes what it sends",
+                detail: format!(
+                    "{} inbound state packets decoded at the envelope but not as state",
+                    self.total_bad_body
+                ),
+            });
+        }
         if self.total_replicas == 0 {
             failures.push(CriterionFailure {
                 clause: "the harness observes what it sends",
@@ -5770,6 +5785,57 @@ mod tests {
         assert_eq!(
             report.per_peer[0].undecodable, 0,
             "the envelope decoded; this is a body failure, not an envelope failure"
+        );
+    }
+
+    #[test]
+    fn a_replicated_rock_becomes_a_replica_rather_than_a_fault() {
+        // #961: campaign rocks are hosted by ordinary bots (`Bot::host_entity`,
+        // the D2 multi-authority shape) and sent to every peer whose AOI covers
+        // them. A receiver that accepted only `Craft` charged each one to
+        // `bad_body` — a counter documented as bytes its own codec refuses —
+        // and dropped the body, so the interest selector ranked a world smaller
+        // than the one the sender had actually sent it.
+        let mut swarm = formed_pair();
+        let sender = swarm.bots[1].node;
+        let before = swarm.bots[0].replicas();
+        let cell = orrery_protocol::CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL)
+            .expect("origin cell");
+        // A real campaign rock, not a hand-rolled body: the value the gate
+        // actually puts on the wire under `--external-peer`.
+        let seeded = campaign_rock_seeds(UniverseSeed([0x11; 32]), 2)[0].clone();
+        let mut canonical = Vec::new();
+        <RegolithState as orrery_core::CoreCodec>::encode(
+            &RegolithState::Rock(seeded.rock),
+            &mut canonical,
+        );
+        let inner =
+            orrery_protocol::channels::encode_replication(&(canonical, cell, seeded.entity, 0_u64));
+        swarm.bots[0]
+            .app
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<orrery_net::PeerPacket>>()
+            .write(orrery_net::PeerPacket {
+                from: sender,
+                channel: orrery_net::channels::Channel::State,
+                payload: Bytes::from(inner),
+            });
+        swarm.tick_once(0, 3, &mut [0u128; 6]);
+
+        let report = swarm.report(1, None);
+        assert_eq!(
+            report.per_peer[0].bad_body, 0,
+            "a well-formed `Rock` is canonical state this receiver read successfully; \
+             charging it to `bad_body` claims the sender and receiver disagree about \
+             rules they agree about"
+        );
+        assert_eq!(report.total_bad_body, 0);
+        assert!(
+            report.per_peer[0].replicas > before,
+            "the rock must land as a replica the interest selector can rank; a body \
+             that is received and discarded shrinks the world every interest clause \
+             below is measured over (held {} replicas, was {before})",
+            report.per_peer[0].replicas
         );
     }
 
