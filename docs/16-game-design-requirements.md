@@ -34,7 +34,11 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 | # | Requirement | Source |
 |---|---|---|
 | G2 | **One solar system at a time.** The live universe is a single solar system of **dozens of bodies** (star, planets, moons; asteroids/stations as bodies or as content on them). | owner mandate |
-| G2.1 | **Seasonal.** The universe changes on a seasonal cadence. *Assumed reading:* a season is a bounded period during which one solar system is live; a new season opens a new (or regenerated) system. *Alternative reading:* planets have in-world seasons that change conditions over time. **Owner to confirm which, or both.** | owner mandate, reading unconfirmed |
+| G2.1 | **Seasonal.** A season is a bounded period during which one solar system is live. At the end of a season the **mothership jumps to a new system**; the old system is discarded. | owner mandate (confirmed 2026-09-03) |
+| G2.1a | **Season quests.** At season start players receive **season-length quests**: acquire resources, research technology, stockpile goods, craft. | owner mandate |
+| G2.1b | **Two end conditions.** The season ends when the quests are **completed** or when **time runs out**, whichever comes first. | owner mandate |
+| G2.1c | **Mothership.** A persistent, jump-capable hull that carries the players (and whatever they have stockpiled aboard it) between systems. It is the container for everything that survives a season boundary. | owner mandate |
+| G2.1d | **Reset without losing progression.** The season jump discards accumulated world state ("crud") in the old system, but **progression carries over**. What counts as progression versus world state is settled in G3/G6; the mothership boundary is the rule of thumb: aboard it persists, left behind is gone. | owner mandate |
 | G2.2 | **Three spacecraft classes**, distinguished by how they move: | owner mandate |
 | G2.2a | **Fast-response craft** carry a **jump drive**. Jump travel takes **seconds to minutes** anywhere in the system. | owner mandate |
 | G2.2b | **Escorts** have **no jump capability**. They fight alongside and are moved by other means (carried, or flip-and-burn). | owner mandate |
@@ -48,7 +52,10 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 - **Flip-and-burn ships are durable, unattended simulation.** A cargo run lasting a day outlives any session. Its trajectory is deterministic from a few parameters (burn start, thrust, mass, target), so it should be persisted as a **plan** and evaluated lazily, not ticked at 60 Hz. This is the first concrete case of "the world moves while nobody is there" and should settle the PvE durability question (G8) at the same time.
 - **Unattended cargo is a PvP target.** Interception of an offline player's freighter must have an authority owner, witnesses and a deterministic outcome without the victim present. This is the hardest trust case in the game and is the design driver for the low-population path (ADR-0029).
 - **Escorts imply formation and carriage.** Either escorts ride inside a jump-capable hull (nesting, G1) or they arrive by flip-and-burn ahead of time. Both make fleet movement a planned, persisted thing.
-- **Seasons are the persistence lifecycle** under the assumed reading of G2.1: a season boundary defines what is retained, what carries over (ADR-0020, ADR-0023), and what a fresh world seed produces (doc 12). Under the alternative reading, seasons are a slow global parameter that changes surface conditions and must be replicated consistently (ADR-0021 ruleset distribution).
+- **Seasons are the persistence lifecycle.** A season boundary is the retention rule (ADR-0020, ADR-0023): the old system's grids are dropped wholesale, a fresh seed (doc 12) produces the next system, and only the mothership's contents cross. This bounds unbounded growth of terrain edits, wrecks and abandoned structures by construction rather than by garbage collection.
+- **The mothership is the one grid that is never discarded.** It is the durable root of player state: inventory aboard, research, blueprints, standing. It needs the strongest persistence guarantees in the game and its jump is a whole-population migration, the extreme case of the jump handoff above.
+- **Season quests are shared, server-wide goals with a deadline.** Their progress is a value-bearing aggregate (contributions from many players) and therefore a quorum-attested write (R8). "Completed" is a consensus fact, and it triggers the season end, so it must be adjudicable by replay.
+- **Two end conditions mean the deadline is a hard clock.** A wall-clock deadline is a global parameter that every node must agree on (ADR-0021), and the end-of-season sequence (stop accepting writes to the old system, migrate, seed, reopen) is an ops procedure (doc 09) that needs a rehearsed runbook.
 
 ## Open — to be settled by the owner
 
