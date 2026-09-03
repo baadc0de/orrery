@@ -428,7 +428,12 @@ impl TimerResolution {
         {
             // TIME_PERIOD-equivalent: 1 ms. `timeBeginPeriod` returns 0 on
             // success; a failure leaves `active` false and the report says so.
-            let status = windows_sys::Win32::Media::timeBeginPeriod(_ms);
+            // SAFETY: `timeBeginPeriod` is a plain Win32 call with no
+            // pointer arguments and no aliasing requirement. Its only
+            // contract is that a successful raise is matched by exactly one
+            // `timeEndPeriod` with the same period, which `Drop` does — and
+            // only when `active`, so a failed raise never releases.
+            let status = unsafe { windows_sys::Win32::Media::timeBeginPeriod(_ms) };
             Self {
                 active: status == 0,
             }
@@ -458,7 +463,10 @@ impl Drop for TimerResolution {
     fn drop(&mut self) {
         #[cfg(windows)]
         if self.active {
-            windows_sys::Win32::Media::timeEndPeriod(1);
+            // SAFETY: paired with the successful `timeBeginPeriod(1)` in
+            // `raise`; guarded by `self.active`, so this releases exactly the
+            // raise it matches and never an unraised period.
+            unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         }
     }
 }
