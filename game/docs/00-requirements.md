@@ -314,5 +314,6 @@ Decided with the owner on 2026-09-03; recorded as [game ADR-0002](adr/0002-clien
 Loose ends collected from the sections above.
 
 - **Fair-value formula, NPC take-up delay, renown weights and floors** (G5.3, G5.5, G6.2a): numbers, to be tuned with telemetry.
+- **Brief discipline for observer-shaped work.** Every lane touching the macro/micro fold (G8), replication filters and viewer-dependent visibility (G7.8, G8.2, G9), or witnessing must establish which actor produced an observation before treating it as evidence; the observer (including a test harness) can manufacture the observation. Recorded from the Orrery session's 2026-09-03 experience of misdiagnoses read off logs.
 - **Orrery follow-up ADRs** to be filed against this document, in particular an amendment of R9 and of ADR-0004's client scope for the Unreal host (G10), the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
 
