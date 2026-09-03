@@ -93,6 +93,16 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 | G4.7 | **No foothold at season start.** When a season opens, the mothership's forces hold nothing on any body. They build structures and set up resource extraction while **staving off or displacing existing occupants and fauna**. | owner mandate |
 | G4.8 | **Planetary territory is temporary by construction.** Everything built on a body is left behind at the season jump (G2.1d). | derived from G2.1d, G4.7 |
 | G4.9 | **PvP aboard the mothership is fully open.** No mechanical safe zone. Deterrence is in-world: **NPC security** responds to violence, and aggressors pay in **renown** (G4.3), which gates command and shared assets. | owner mandate (G4 open decision 1, answered 2026-09-03) |
+| G4.10 | **One mothership** for the first release; **multiple** eventually. Design nothing that assumes a single root grid, but ship with one. | owner mandate (decision 2) |
+| G4.11 | **Surface building is NPC-driven.** Players have agency in **establishing the conditions** for building (clearing, securing, supplying, choosing) but the actual construction is **long-term NPC activity**. Players do not place structures. | owner mandate (decision 3) |
+| G4.12 | **Deterrence radius.** Defensive structures project a deterrence radius. Because placement is organic and NPC-driven, this radius only influences **other NPC factions**; it is not a player claim mechanic. | owner mandate (decision 5) |
+| G4.13 | **Surface structures do not decay** but **take damage and can be destroyed**. | owner mandate (decisions 4, 10) |
+| G4.14 | **Apartments require upkeep.** Failing upkeep makes the player **homeless**; the apartment's contents are **escrowed** until a new apartment is purchased. | owner mandate (decision 6) |
+| G4.15 | **Docked ships are packed.** A ship left docked is eventually **packed into the mothership** to free docking space (stored, not lost). | owner mandate (decision 7) |
+| G4.16 | **Drop pods and landing craft are consumables.** They are "inflatable" equipment a ship carries in cargo, counted as ship equipment and **expended** on use. | owner mandate (decision 8) |
+| G4.17 | **NPC counter-pressure is real and fauna repopulates.** Balance target: **organized, well-equipped players can push ever forward** and meet **harder, more challenging resistance** as they do. | owner mandate (decision 9) |
+| G4.18 | **Death aboard the mothership:** loot drops and is takeable **until NPC security reaches it**; security then **deposits it in the victim's apartment**, or in escrow if homeless. | owner mandate (decision 11) |
+| G4.19 | **Teleport (a) site-to-site within the mothership**, and **(b) from anywhere to the mothership**, allowed only when **not engaged**, with a **cooldown**. No other teleport. | owner mandate (decision 12) |
 
 ### Engineering consequences of G4
 
@@ -103,6 +113,11 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 - **Nesting depth is now known:** avatar → mech → drop pod → ship → mothership, five levels. The authority chain and the interest radius per level must be designed for that depth, not two.
 - **Surface structures are the territory game and are disposable.** They need build, upkeep, damage and destruction rules but no cross-season persistence. Their journals are retained only for the season (ADR-0020).
 - **Open PvP on the mothership means the trust model has no safe grid.** Hit registration, loot drops and witnessing (R8) must hold at full-server population in one hub, and every bystander is a candidate witness. NPC security is server-authoritative PvE (G8) that must react within the same tick budget as the players it polices, and renown penalties are attested writes triggered by adjudicated violence, so a false accusation (or a missed one) is a reputation exploit. Crime detection needs a deterministic definition (who fired first, who was where) that replay can settle.
+- **NPC-driven building makes surface expansion a long-running server process.** Construction progresses over hours or days from player-supplied conditions, with no player present, so it is another lazily evaluated plan (G2, G3) with attested inputs (what was delivered, what was cleared). NPC factions, deterrence radii and fauna repopulation are the same class: **the surface is a slow simulation layered under the 60 Hz one**, and it needs its own tick, its own authority (server-side, not a player witness set) and a defined interface to the fast layer (when a player arrives, the slow state is materialised into entities).
+- **Escrow is a durable, mothership-scoped store** for a player's items outside any entity: homeless contents and security-collected loot both land there. It is the second player-state root after carried inventory and is never exposed to other players, so it can be replicated to its owner only.
+- **Recall-to-mothership from anywhere is a teleport exit from any grid.** "Not engaged" must be a deterministic, witnessable predicate (recent damage dealt or taken, proximity to hostiles) or it becomes the universal PvP escape. The cooldown is a per-avatar durable timer. What happens to the mech, ship, or pod left behind on recall must be specified: it stays as an unattended object (G2 consequences apply).
+- **Packing docked ships and expending pods are inventory transformations**, ship-to-item and item-to-entity. Both are value-bearing writes and both are grid transitions (the packed ship leaves the docking grid). Pods in particular are a "consumable that becomes a vehicle mid-flight", a spawn-under-prediction case for ADR-0008.
+- **The single-mothership release must not bake in a singleton.** Ownership, escrow, renown and teleport targets take a mothership id from day one, even if only one value exists.
 - **Existing occupants and fauna are the PvE baseline** (G8). "Displacing" them means NPC territory is a real quantity that shrinks as players build. NPC presence must therefore be durable state for the season, not respawned decoration.
 
 ### G4 — open decisions
@@ -110,17 +125,17 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 Numbered so they can be answered one at a time.
 
 1. ~~PvP scope on the mothership.~~ **Answered: fully open, with NPC security and renown as deterrents (G4.9).**
-2. **One mothership or several.** If every player shares one mothership, PvP is intra-faction rivalry on the surface and in space. If there are several (rival factions, or one per shard), PvP is inter-faction and each mothership is its own root grid. This also fixes what G7 grouping means.
-3. **Who may build on the surface.** Individuals, groups (G7), or only the mothership's collective effort? And who owns the resulting structure and its extracted resources?
-4. **Structure conflict rules.** Can players destroy or capture each other's structures? Offline raiding allowed, or only within a declared window (siege timers)? What is salvaged from a destroyed structure?
-5. **Exclusion or claim mechanics.** Does a structure claim a radius that blocks others from building, or is territory purely what you can physically hold?
-6. **Apartment scarcity and tenure.** Fixed number of apartments? Rent or upkeep? Reassignment on inactivity? Are they tradeable?
-7. **Hangar and docking capacity.** Is docking space finite and contested, and what happens to a ship whose owner cannot dock?
-8. **Landing craft and drop pod ownership.** Player, ship, or mothership assets? Are they lost on a bad insertion?
-9. **NPC counter-pressure.** Do displaced occupants retake territory, escalate, or stay displaced? Does fauna repopulate?
-10. **Upkeep and decay of surface structures.** Do abandoned structures decay within a season, and can others take them over?
-11. **Corpse and loot location on the mothership.** If G3 death can happen aboard, where does the loot go and who can take it (ties to 1).
-12. **Transit as fast travel.** Mothership transit implies teleport-like movement within one grid; is that also allowed ship-to-ship or only within the hub?
+2. ~~One mothership or several.~~ **Answered: one now, multiple later (G4.10).**
+3. ~~Who may build on the surface.~~ **Answered: NPC-driven building; players set conditions (G4.11).**
+4. ~~Structure conflict rules.~~ **Answered: structures are damageable and destructible, do not decay (G4.13); capture unstated.**
+5. ~~Exclusion or claim mechanics.~~ **Answered: deterrence radius, NPC-vs-NPC only (G4.12).**
+6. ~~Apartment scarcity and tenure.~~ **Answered: upkeep; homelessness with escrow (G4.14).**
+7. ~~Hangar and docking capacity.~~ **Answered: idle docked ships are packed (G4.15).**
+8. ~~Landing craft and drop pod ownership.~~ **Answered: consumable ship equipment (G4.16).**
+9. ~~NPC counter-pressure.~~ **Answered: NPCs push back, fauna repopulates, difficulty scales with push (G4.17).**
+10. ~~Upkeep and decay of surface structures.~~ **Answered: no decay (G4.13); takeover unstated.**
+11. ~~Corpse and loot location on the mothership.~~ **Answered: drops until NPC security collects, then apartment or escrow (G4.18).**
+12. ~~Transit as fast travel.~~ **Answered: intra-mothership and recall-to-mothership only, not engaged, cooldown (G4.19).**
 
 ## Open — to be settled by the owner
 
