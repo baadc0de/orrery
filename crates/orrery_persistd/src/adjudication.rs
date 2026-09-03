@@ -1455,7 +1455,12 @@ mod tests {
     }
 
     fn bundle(ruleset: RulesetId) -> EvidenceBundle {
-        let subject = key(1);
+        bundle_with_subject(ruleset, &key(1))
+    }
+
+    /// [`bundle`] with the subject this run chose, so the durable rows the
+    /// FDB filing test writes are keyed by a node no other run claims.
+    fn bundle_with_subject(ruleset: RulesetId, subject: &iroh_base::SecretKey) -> EvidenceBundle {
         let mut claim = StateClaim {
             entity: PersistId::new(1),
             chain_epoch: 0,
@@ -1466,7 +1471,7 @@ mod tests {
             ruleset,
             sig: subject.sign(b"x"),
         };
-        orrery_core::log::sign_claim(&subject, &mut claim);
+        orrery_core::log::sign_claim(subject, &mut claim);
         EvidenceBundle {
             ruleset,
             entity: PersistId::new(1),
@@ -1480,7 +1485,7 @@ mod tests {
             // adjudicator now agrees, because frames withheld wholesale are the
             // #874 omission attack at its limit: every tick would replay with no
             // inputs and diverge from what the authority signed.
-            frames: vec![covering_frame(&subject, ruleset)],
+            frames: vec![covering_frame(subject, ruleset)],
             sibling_heads: vec![Vec::new()],
             disputed_claims: Vec::new(),
             claimed_hashes: vec![[0; 32]],
@@ -2170,6 +2175,111 @@ mod tests {
         assert_eq!(executor.strike_metrics().suppressed_error, 1);
     }
 
+    /// A node identity this run chose, not a fixed fixture.
+    ///
+    /// The dev cluster is shared, and a fixed fixture id turns a sibling
+    /// lane's suite red — the reason the cooldown test's account id in
+    /// `persistd_binary.rs` carries the pid. The seed byte names the role
+    /// and the pid makes the identity this run's, so two concurrent runs
+    /// claim disjoint binding rows and restore-hold spans, and a repeated
+    /// run against the same cluster starts from spans its predecessor's
+    /// cleanup already cleared.
+    #[cfg(feature = "fdb")]
+    fn run_key(role: u8) -> iroh_base::SecretKey {
+        let mut bytes = [0u8; 32];
+        bytes[0] = role;
+        bytes[1..5].copy_from_slice(&std::process::id().to_le_bytes());
+        iroh_base::SecretKey::from_bytes(&bytes)
+    }
+
+    /// The durable spans and rows one strike-filing test claims on the
+    /// shared cluster, in the form both its setup and its cleanup clear.
+    ///
+    /// The cleanup that cleared only the `ya` span was #1000: one filing
+    /// writes three families — the `ya` strike row, the `yb` episode-dedup
+    /// marker, and the filing notice — and a `yb` survivor of the first
+    /// run made the second run's filing deduplicate to `Duplicate`, so no
+    /// `ya` row was written at all and the subject-row assertion saw zero.
+    /// The claims are per-run (pid-scoped accounts, [`run_key`] nodes), so
+    /// nothing a sibling run or lane wrote is ever inside them, and
+    /// clearing them clears exactly what this test wrote and nothing else.
+    #[cfg(feature = "fdb")]
+    struct StrikeFixtureClaims {
+        spans: Vec<(Vec<u8>, Vec<u8>)>,
+        rows: Vec<Vec<u8>>,
+    }
+
+    #[cfg(feature = "fdb")]
+    impl StrikeFixtureClaims {
+        /// Everything one filing can write for two claimed accounts — the
+        /// `ya` strike span, the `yb` episode-dedup span, the filing
+        /// notice — plus the binding rows the filing resolves through and
+        /// the restore-hold span it projects into.
+        fn for_accounts(
+            subject_node: &NodeId,
+            reporter_node: &NodeId,
+            source_node: &NodeId,
+            entity: PersistId,
+            subject_account: AccountId,
+            reporter_account: AccountId,
+        ) -> Self {
+            let mut spans = Vec::new();
+            let mut rows = Vec::new();
+            for account in [subject_account, reporter_account] {
+                spans.push((
+                    crate::keyspace::strike_account_range_start(account),
+                    crate::keyspace::strike_account_range_end(account),
+                ));
+                // The episode index is one `yb` row per (account, episode
+                // digest), so the account's whole digest space is its span:
+                // the all-zero digest opens it and one past the all-ff
+                // digest closes it, both bounds inside this account's
+                // prefix.
+                let mut episodes_end =
+                    crate::keyspace::strike_episode_key(account, &[0xff; 32]).to_vec();
+                episodes_end.push(0);
+                spans.push((
+                    crate::keyspace::strike_episode_key(account, &[0; 32]).to_vec(),
+                    episodes_end,
+                ));
+                rows.push(crate::keyspace::filing_notice_key(account).to_vec());
+            }
+            rows.push(crate::keyspace::binding_key(subject_node).to_vec());
+            rows.push(crate::keyspace::binding_key(reporter_node).to_vec());
+            spans.push((
+                crate::keyspace::restore_hold_range_start(source_node, entity),
+                crate::keyspace::restore_hold_range_end(source_node, entity),
+            ));
+            Self { spans, rows }
+        }
+
+        /// Clear every claimed span and row in one transaction.
+        async fn clear(&self, db: &foundationdb::Database) {
+            let spans = self.spans.clone();
+            let rows = self.rows.clone();
+            db.run(|trx, _| {
+                let spans = spans.clone();
+                let rows = rows.clone();
+                async move {
+                    for (start, end) in &spans {
+                        trx.clear_range(start, end);
+                    }
+                    for row in &rows {
+                        trx.clear(row);
+                    }
+                    Ok::<_, foundationdb::FdbBindingError>(())
+                }
+            })
+            .await
+            .expect("clear the claimed spans and rows");
+        }
+    }
+
+    /// #1000's behaviour under test is D33 clause (e)'s durable half: a
+    /// confirmed verdict files one strike row against the subject's
+    /// account and nothing against the reporter's, and the filing projects
+    /// a restore-hold index row for the strike it wrote — all through the
+    /// real ledger, on a real cluster.
     #[cfg(feature = "fdb")]
     #[tokio::test]
     async fn fdb_verdict_files_subject_row_and_no_reporter_row() {
@@ -2178,7 +2288,22 @@ mod tests {
             return;
         };
         let ledger = Arc::new(FdbStrikeLedger::connect(&cluster).expect("connect strike ledger"));
-        let report = report();
+        // An id in this issue's own band, with the pid above the slot: the
+        // dev cluster is shared, and a fixed fixture id turns a sibling
+        // lane's suite red — the same treatment the cooldown test's account
+        // id gets in `persistd_binary.rs`.
+        let subject_account =
+            AccountId(0x0215_0000_0000_0000 | (u64::from(std::process::id()) << 4) | 1);
+        let reporter_account =
+            AccountId(0x0215_0000_0000_0000 | (u64::from(std::process::id()) << 4) | 2);
+        let subject_key = run_key(1);
+        let reporter_key = run_key(2);
+        let source_node = run_key(7).public();
+        let report = orrery_witness::sign_report(
+            &reporter_key,
+            subject_key.public(),
+            bundle_with_subject(V1.id(), &subject_key),
+        );
         let journal_dir = tempfile::tempdir().expect("journal tempdir");
         let journal = Arc::new(
             crate::journal::Journal::open(&crate::journal::JournalConfig {
@@ -2187,49 +2312,43 @@ mod tests {
             })
             .expect("journal opens"),
         );
-        let source_node = key(7).public();
         ledger.configure_restore_hold_index(source_node);
-        let subject_account = AccountId(0x0215_0000_0000_0001);
-        let reporter_account = AccountId(0x0215_0000_0000_0002);
-        let subject_key = crate::keyspace::binding_key(&report.subject);
-        let reporter_key = crate::keyspace::binding_key(&report.reporter);
-        let subject_start = strike_account_range_start(subject_account);
-        let subject_end = strike_account_range_end(subject_account);
-        let reporter_start = strike_account_range_start(reporter_account);
-        let reporter_end = strike_account_range_end(reporter_account);
+        let subject_binding = crate::keyspace::binding_key(&report.subject);
+        let reporter_binding = crate::keyspace::binding_key(&report.reporter);
+        let claims = StrikeFixtureClaims::for_accounts(
+            &report.subject,
+            &report.reporter,
+            &source_node,
+            report.bundle.entity,
+            subject_account,
+            reporter_account,
+        );
         let db = Arc::clone(&ledger.db);
         let hold_start =
             crate::keyspace::restore_hold_range_start(&source_node, report.bundle.entity);
         let hold_end = crate::keyspace::restore_hold_range_end(&source_node, report.bundle.entity);
-        db.run(|trx, _| {
-            let subject_start = subject_start.clone();
-            let subject_end = subject_end.clone();
-            let reporter_start = reporter_start.clone();
-            let reporter_end = reporter_end.clone();
-            let hold_start = hold_start.clone();
-            let hold_end = hold_end.clone();
-            async move {
-                trx.clear_range(&subject_start, &subject_end);
-                trx.clear_range(&reporter_start, &reporter_end);
-                trx.clear_range(&hold_start, &hold_end);
-                trx.set(
-                    &subject_key,
-                    &postcard::to_stdvec(&crate::keyspace::BindingRow {
-                        account: subject_account,
-                        bound_at_ms: 1,
-                    })
-                    .expect("encode binding"),
-                );
-                trx.set(
-                    &reporter_key,
-                    &postcard::to_stdvec(&crate::keyspace::BindingRow {
-                        account: reporter_account,
-                        bound_at_ms: 1,
-                    })
-                    .expect("encode binding"),
-                );
-                Ok(())
-            }
+        // The pre-clear and the final cleanup are the same operation: the
+        // spans this run claims, emptied, so the bindings below are written
+        // into a keyspace this run owns outright.
+        claims.clear(&db).await;
+        db.run(|trx, _| async move {
+            trx.set(
+                &subject_binding,
+                &postcard::to_stdvec(&crate::keyspace::BindingRow {
+                    account: subject_account,
+                    bound_at_ms: 1,
+                })
+                .expect("encode binding"),
+            );
+            trx.set(
+                &reporter_binding,
+                &postcard::to_stdvec(&crate::keyspace::BindingRow {
+                    account: reporter_account,
+                    bound_at_ms: 1,
+                })
+                .expect("encode binding"),
+            );
+            Ok(())
         })
         .await
         .expect("seed bindings");
@@ -2242,6 +2361,27 @@ mod tests {
                 kind: orrery_protocol::DeviationKind::DiscreteMismatch,
             },
         );
+
+        // The filing notice is the one claimed row nothing here asserts on,
+        // and the `yd` family is drained fleet-wide by every reactor sweep
+        // in the tree: retire it now, inside the same millisecond the
+        // filing wrote it, rather than after the assertions, so a
+        // concurrently-running suite's sweep cannot observe it.
+        let notices = [
+            crate::keyspace::filing_notice_key(subject_account).to_vec(),
+            crate::keyspace::filing_notice_key(reporter_account).to_vec(),
+        ];
+        db.run(|trx, _| {
+            let notices = notices.clone();
+            async move {
+                for notice in &notices {
+                    trx.clear(notice);
+                }
+                Ok(())
+            }
+        })
+        .await
+        .expect("retire the filing notices");
 
         assert_eq!(
             ledger
@@ -2294,28 +2434,10 @@ mod tests {
                     && account == subject_account
         ));
 
-        let subject_start = strike_account_range_start(subject_account);
-        let subject_end = strike_account_range_end(subject_account);
-        let reporter_start = strike_account_range_start(reporter_account);
-        let reporter_end = strike_account_range_end(reporter_account);
-        db.run(|trx, _| {
-            let subject_start = subject_start.clone();
-            let subject_end = subject_end.clone();
-            let reporter_start = reporter_start.clone();
-            let reporter_end = reporter_end.clone();
-            let hold_start = hold_start.clone();
-            let hold_end = hold_end.clone();
-            async move {
-                trx.clear(&subject_key);
-                trx.clear(&reporter_key);
-                trx.clear_range(&subject_start, &subject_end);
-                trx.clear_range(&reporter_start, &reporter_end);
-                trx.clear_range(&hold_start, &hold_end);
-                Ok(())
-            }
-        })
-        .await
-        .expect("wipe strike test rows");
+        // Leave the cluster exactly as this run found it: every span and
+        // row the setup and the filing claimed, cleared — the too-narrow
+        // cleanup that stopped at the `ya` span was the defect (#1000).
+        claims.clear(&db).await;
         journal.close().await.expect("journal closes");
     }
 }

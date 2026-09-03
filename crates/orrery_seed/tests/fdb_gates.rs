@@ -100,6 +100,12 @@ async fn run_seed(args: &[&str], scenario: &std::path::Path) -> std::process::Ou
         .expect("run seed binary")
 }
 
+/// Run the production `wipe` verb.
+///
+/// Only for the tests whose subject *is* the wipe: the verb clears the
+/// cluster-global `content/version` row alongside the grid it is aimed at,
+/// which is right for an operator and wrong for a test fixture (#999 — see
+/// [`reset_grid`]).
 #[cfg(feature = "fdb")]
 async fn wipe_scenario(scenario: &std::path::Path, content_build: &str) {
     let output = run_seed(
@@ -107,7 +113,68 @@ async fn wipe_scenario(scenario: &std::path::Path, content_build: &str) {
         scenario,
     )
     .await;
-    maybe_assert_success(&output, "pre-wipe");
+    maybe_assert_success(&output, "wipe");
+}
+
+/// Clear exactly the seeded rows a test owns for one grid — the per-test
+/// fixture reset (#999).
+///
+/// Every reset that is not itself under test clears only what the test
+/// claims: its grid's world span and the grid-scoped rows of the two
+/// global id families — the same per-grid scope the `wipe` verb clears,
+/// minus the global `content/version` row no test may clear except by
+/// testing the wipe, and minus the checkpoint rows the wipe deliberately
+/// leaves. Before this, the suite's fixture resets were `wipe` calls, and
+/// every one of them cleared the global row a sibling gate was about to
+/// read.
+#[cfg(feature = "fdb")]
+async fn reset_grid(db: &Database, grid: GridId) {
+    let world_start = keyspace::world_range_start(grid, CellId::ROOT);
+    let world_end = keyspace::world_range_end(grid, CellId::ROOT);
+    let seedmap_start = keyspace::seedmap_range_start();
+    let seedmap_end = keyspace::seedmap_range_end();
+    let seedprog_start = keyspace::seedprog_range_start();
+    let seedprog_end = keyspace::seedprog_range_end();
+    db.run(|trx, _| {
+        let world_start = world_start.clone();
+        let world_end = world_end.clone();
+        let seedmap_start = seedmap_start.clone();
+        let seedmap_end = seedmap_end.clone();
+        let seedprog_start = seedprog_start.clone();
+        let seedprog_end = seedprog_end.clone();
+        async move {
+            trx.clear_range(&world_start, &world_end);
+            let seedmap_opt = RangeOption {
+                begin: KeySelector::first_greater_or_equal(seedmap_start.as_slice()),
+                end: KeySelector::first_greater_or_equal(seedmap_end.as_slice()),
+                ..RangeOption::default()
+            };
+            let mut seedmap_rows = trx.get_ranges_keyvalues(seedmap_opt, false);
+            while let Some(row) = seedmap_rows.try_next().await? {
+                if orrery_seed::idmap::decode_seedmap_value(row.value())
+                    .is_ok_and(|seed_row| seed_row.grid == grid)
+                {
+                    trx.clear(row.key());
+                }
+            }
+            let seedprog_opt = RangeOption {
+                begin: KeySelector::first_greater_or_equal(seedprog_start.as_slice()),
+                end: KeySelector::first_greater_or_equal(seedprog_end.as_slice()),
+                ..RangeOption::default()
+            };
+            let mut seedprog_rows = trx.get_ranges_keyvalues(seedprog_opt, false);
+            while let Some(row) = seedprog_rows.try_next().await? {
+                if keyspace::decode_seedprog_key(row.key())
+                    .is_some_and(|(_, row_grid, _)| row_grid == grid)
+                {
+                    trx.clear(row.key());
+                }
+            }
+            Ok::<_, foundationdb::FdbBindingError>(())
+        }
+    })
+    .await
+    .expect("reset the test grid's rows");
 }
 
 #[cfg(feature = "fdb")]
@@ -239,11 +306,11 @@ async fn wipe_clears_seeded_v1_world_rows_after_terrain_removal() {
         .join("smoke.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("terrainless wipe", &with_grid(&source, grid, true));
-    wipe_scenario(temp.path(), "smoke-2026-08-13").await;
+    let db = open_db(&cluster);
+    reset_grid(&db, grid).await;
 
     let applied = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
     maybe_assert_success(&applied, "apply before terrainless wipe");
-    let db = open_db(&cluster);
     assert!(
         !scan_world_rows(&db, grid)
             .await
@@ -268,15 +335,14 @@ async fn fdb_reseed_preserves_persist_ids() {
     let Some(cluster) = skip_if_no_fdb() else {
         return;
     };
-    let _ = cluster;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
         .join("p2demo.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9402), false));
-    wipe_scenario(temp.path(), "demo-2026-08-13").await;
+    let db = open_db(&cluster);
+    reset_grid(&db, GridId::new(9402)).await;
 
-    let db = open_db(&fdb_cluster_file().unwrap());
     let first = run_seed(
         &["apply", "--profile", "demo", "--allow-opaque"],
         temp.path(),
@@ -328,8 +394,9 @@ async fn wipe_in_another_grid_preserves_seedmap_ids() {
         &with_grid(&source, retained_grid, false),
     );
     let wiped = write_temp_scenario("wiped scenario", &with_grid(&source, wiped_grid, false));
-    wipe_scenario(retained.path(), "demo-2026-08-13").await;
-    wipe_scenario(wiped.path(), "demo-2026-08-13").await;
+    let db = open_db(&cluster);
+    reset_grid(&db, retained_grid).await;
+    reset_grid(&db, wiped_grid).await;
 
     let first = run_seed(
         &["apply", "--profile", "demo", "--allow-opaque"],
@@ -338,7 +405,6 @@ async fn wipe_in_another_grid_preserves_seedmap_ids() {
     .await;
     maybe_assert_success(&first, "retained apply");
 
-    let db = open_db(&cluster);
     let before: Vec<_> = scan_world_rows(&db, retained_grid)
         .await
         .expect("scan retained before wipe")
@@ -396,18 +462,17 @@ async fn every_written_value_carries_the_live_tag() {
     let Some(cluster) = skip_if_no_fdb() else {
         return;
     };
-    let _ = cluster;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
         .join("smoke.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9401), true));
-    wipe_scenario(temp.path(), "smoke-2026-08-13").await;
+    let db = open_db(&cluster);
+    reset_grid(&db, GridId::new(9401)).await;
 
     let output = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
     maybe_assert_success(&output, "smoke apply");
 
-    let db = open_db(&fdb_cluster_file().unwrap());
     let rows = scan_world_rows(&db, GridId::new(9401))
         .await
         .expect("scan world");
@@ -459,29 +524,56 @@ async fn oversize_value_is_rejected_at_plan_time() {
     );
 }
 
+/// The `content/version` row round-trips: `apply` writes the scenario's
+/// content build and manifest digest, and reading the durable row back
+/// yields both.
+///
+/// `content/version` is a single global key, so a concurrent gate in this
+/// same binary can overwrite or clear it between this test's write and its
+/// read (#999). The scenario therefore carries a `content_build` nobody
+/// else uses, and the read is retried until the row it finds is the one
+/// this test wrote — which is also what stops the assertion from passing
+/// against somebody else's row. The fixture reset is grid-scoped
+/// (`reset_grid`), so this test never clears the row for anyone else; the
+/// only remaining clearers are the wipes this suite runs because the wipe
+/// itself is under test.
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_content_version_roundtrips() {
+    const BUILD: &str = "demo-999-roundtrip";
+
     let Some(cluster) = skip_if_no_fdb() else {
         return;
     };
-    let _ = cluster;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
         .join("p2demo.toml");
-    let source = std::fs::read_to_string(&root).expect("read scenario");
+    let source = std::fs::read_to_string(&root)
+        .expect("read scenario")
+        .replace("\"demo-2026-08-13\"", &format!("\"{BUILD}\""));
     let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9404), false));
-    wipe_scenario(temp.path(), "demo-2026-08-13").await;
-    let output = run_seed(
-        &["apply", "--profile", "demo", "--allow-opaque"],
-        temp.path(),
-    )
-    .await;
-    maybe_assert_success(&output, "demo apply");
+    let db = open_db(&cluster);
+    reset_grid(&db, GridId::new(9404)).await;
 
-    let db = open_db(&fdb_cluster_file().unwrap());
-    let version = read_content_version(&db).await.expect("content version");
-    assert_eq!(version.content_build, "demo-2026-08-13");
+    let mut seen = None;
+    for _ in 0..4 {
+        let output = run_seed(
+            &["apply", "--profile", "demo", "--allow-opaque"],
+            temp.path(),
+        )
+        .await;
+        maybe_assert_success(&output, "demo apply");
+        let Ok(version) = read_content_version(&db).await else {
+            continue;
+        };
+        if version.content_build == BUILD {
+            seen = Some(version);
+            break;
+        }
+    }
+    let version =
+        seen.expect("a concurrent gate overwrote or cleared content/version on every attempt");
+    assert_eq!(version.content_build, BUILD);
     assert!(!version.manifest_digest.is_empty());
 }
 
@@ -502,7 +594,7 @@ async fn wipe_leaves_ckpt_rows_intact() {
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9406), false));
     retire_fdb_checkpoint_fence(&fdb_cluster_file().unwrap(), GridId::new(9406)).await;
-    wipe_scenario(temp.path(), "demo-2026-08-13").await;
+    reset_grid(&db, GridId::new(9406)).await;
     activate_fdb_checkpoint_fence(&fdb_cluster_file().unwrap(), GridId::new(9406)).await;
 
     let rt = CellRuntime::open(&runtime_config(dir.path(), GridId::new(9406)), &store)
@@ -557,13 +649,9 @@ async fn cold_area_load_returns_seeded_entities() {
     let grid = GridId::new(9403);
     let centre = cell(4, 0, 0);
     let cells = centre.neighbors27();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("scenarios")
-        .join("p2demo.toml");
-    let source = std::fs::read_to_string(&root).expect("read scenario");
-    let temp = write_temp_scenario("scenario", &with_grid(&source, grid, false));
+    let db = open_db(&cluster);
     retire_fdb_checkpoint_fence(&cluster, grid).await;
-    wipe_scenario(temp.path(), "demo-2026-08-13").await;
+    reset_grid(&db, grid).await;
     activate_fdb_checkpoint_fence(&cluster, grid).await;
 
     let rt = CellRuntime::open(&runtime_config(dir.path(), grid), &store_ckpt)
@@ -616,10 +704,15 @@ async fn cold_area_load_returns_seeded_entities() {
 /// universe's secret never has to reach a seeding host.
 ///
 /// `content/version` is a single global key, so a concurrent gate in this same
-/// binary can overwrite it between this test's write and its read. The
+/// binary can overwrite or clear it between this test's write and its read. The
 /// scenario therefore carries a `content_build` nobody else uses, and the read
-/// is retried until the row it finds is the one this test wrote — which is
-/// also what stops the assertion from passing against somebody else's row.
+/// is retried until the row it finds is the one this test wrote — which is also
+/// what stops the assertion from passing against somebody else's row. An absent
+/// row is as little ours as a stranger's build, so a sibling's wipe is retried
+/// the same way (#999). The fixture resets around the applies are grid-scoped
+/// (`reset_grid`), so this test never clears the row for anyone else; the only
+/// remaining clearers are the wipes this suite runs because the wipe itself is
+/// under test.
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn apply_seals_the_world_to_a_universe_seed_fingerprint() {
@@ -628,7 +721,6 @@ async fn apply_seals_the_world_to_a_universe_seed_fingerprint() {
     let Some(cluster) = skip_if_no_fdb() else {
         return;
     };
-    let _ = cluster;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
         .join("smoke.toml");
@@ -636,11 +728,11 @@ async fn apply_seals_the_world_to_a_universe_seed_fingerprint() {
         .expect("read scenario")
         .replace("\"smoke-2026-08-13\"", &format!("\"{BUILD}\""));
     let temp = write_temp_scenario("seal", &with_grid(&source, GridId::new(9470), true));
-    wipe_scenario(temp.path(), BUILD).await;
+    let db = open_db(&cluster);
+    reset_grid(&db, GridId::new(9470)).await;
 
     let seed = orrery_protocol::UniverseSeed([0x94; 32]);
     let expected = seed.fingerprint();
-    let db = open_db(&fdb_cluster_file().unwrap());
 
     let mut seen = None;
     for _ in 0..4 {
@@ -659,13 +751,16 @@ async fn apply_seals_the_world_to_a_universe_seed_fingerprint() {
             String::from_utf8_lossy(&output.stdout).contains(&expected.to_hex()),
             "the report must show the operator what the world was sealed to"
         );
-        let version = read_content_version(&db).await.expect("content version");
+        let Ok(version) = read_content_version(&db).await else {
+            continue;
+        };
         if version.content_build == BUILD {
             seen = Some(version);
             break;
         }
     }
-    let version = seen.expect("a concurrent gate overwrote content/version on every attempt");
+    let version =
+        seen.expect("a concurrent gate overwrote or cleared content/version on every attempt");
     assert_eq!(
         version.universe_seed_fingerprint,
         Some(expected),
@@ -675,11 +770,13 @@ async fn apply_seals_the_world_to_a_universe_seed_fingerprint() {
     // A re-apply without the flag leaves the world unsealed rather than
     // inventing a seal — the seeder never derives one, because it never sees
     // a seed.
-    wipe_scenario(temp.path(), BUILD).await;
+    reset_grid(&db, GridId::new(9470)).await;
     for _ in 0..4 {
         let output = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
         maybe_assert_success(&output, "unsealed apply");
-        let version = read_content_version(&db).await.expect("content version");
+        let Ok(version) = read_content_version(&db).await else {
+            continue;
+        };
         if version.content_build == BUILD {
             assert_eq!(
                 version.universe_seed_fingerprint, None,
@@ -688,5 +785,5 @@ async fn apply_seals_the_world_to_a_universe_seed_fingerprint() {
             return;
         }
     }
-    panic!("a concurrent gate overwrote content/version on every attempt");
+    panic!("a concurrent gate overwrote or cleared content/version on every attempt");
 }
