@@ -1,8 +1,10 @@
-# 16 — Game design requirements
+# Mothership — 00 — Game design requirements
 
-**Status:** Draft · **Owner:** project owner · **Date:** 2026-09-03
+**Status:** Accepted via [game ADR-0001](adr/0001-requirements.md) · **Owner:** project owner · **Date:** 2026-09-03 · **Working title:** *Mothership* (provisional)
 
-This document records the game-design requirements that dictate how Orrery is developed from here on. It is normative in the same sense as [ADR-0001](adr/0001-requirements.md): every engineering decision must be traceable to a requirement here or to an ADR that cites one. Requirements are numbered `G<n>` so they can be cited alongside the `R<n>` engineering requirements. Once settled they are promoted to an ADR and indexed in [DECISIONS.md](DECISIONS.md).
+*Mothership* is a game built on the Orrery framework. It is a **separate project** with its own decision trail under [`game/docs/adr/`](adr/), co-located in this repository because Orrery has to grow to support it. This document records the game-design requirements that dictate that growth. Requirements are numbered `G<n>` so they can be cited alongside Orrery's `R<n>` engineering requirements ([Orrery ADR-0001](../../docs/adr/0001-requirements.md)). Orrery changes made to satisfy a `G` requirement are recorded as Orrery ADRs that cite it; game decisions are indexed in [game DECISIONS.md](DECISIONS.md).
+
+Cross-references of the form ADR-00xx, R<n> and "doc NN" refer to Orrery's trail under [`docs/`](../../docs/).
 
 ## G1 — Genre
 
@@ -287,5 +289,5 @@ Numbered so they can be answered one at a time.
 Loose ends collected from the sections above.
 
 - **Fair-value formula, NPC take-up delay, renown weights and floors** (G5.3, G5.5, G6.2a): numbers, to be tuned with telemetry.
-- **Promotion to ADR**: once the owner marks this document settled, G1–G9 become ADR-0052 (superseding the scope of ADR-0001 where they overlap) and the engineering consequences are triaged into follow-up ADRs, in particular the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
+- **Orrery follow-up ADRs** to be filed against this document, in particular the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
 
