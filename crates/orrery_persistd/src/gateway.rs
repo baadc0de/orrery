@@ -3080,6 +3080,24 @@ impl RampMeters {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Every meter in the bundle, in D32 clause (c)'s control order.
+    ///
+    /// The measurement-window flusher and the startup reload iterate this
+    /// rather than naming four fields, for the reason the bundle exists at
+    /// all: a fifth measurable control should reach both by being added here,
+    /// not by two call sites each remembering. Each meter carries its own
+    /// [`RampMeter::control`] name, which is the `ramp/{control}` and
+    /// `rampw/{control}` suffix, so a caller needs nothing else to key a row.
+    #[must_use]
+    pub fn all(&self) -> [&Arc<RampMeter>; 4] {
+        [
+            &self.attestation_quorum,
+            &self.quarantine_validation,
+            &self.authority_correction,
+            &self.strikes,
+        ]
+    }
 }
 
 /// A point-in-time C4 counter snapshot.

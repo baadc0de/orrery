@@ -84,6 +84,24 @@
 //!   into the validator's context; until it does, this module reports no
 //!   bucket rather than a bucket everything falls into.
 //!
+//! # `W` and the counters outlive the process
+//!
+//! They did not always. `first_ms`, `last_ms` and every tally were fields of
+//! this module's in-process `Mutex<Tallies>`, so a `persistd` restart reset
+//! them — and a routine deploy is a restart. Clause (e)'s `W ≥ 30 days` term
+//! was therefore unreachable no matter how long a fleet ran, which is not a
+//! traffic problem and no amount of production traffic would have fixed it
+//! ([#990]).
+//!
+//! [`super::window`] is the durable form: one `rampw/{control}` row holding
+//! the window's bounds and its counters, with clause (e)'s armed/natural split
+//! carried through per count. [`RampMeter::take_delta`] drains the live
+//! counters into it on a background cadence, [`RampMeter::restore`] reads it
+//! back at startup so a restart *continues* the window, and
+//! [`RampMeter::snapshot`] reports the sum. `orrery-ramp window show` is the
+//! operator's view of the row and `orrery-ramp window reset` is the deliberate
+//! way to start a fresh one.
+//!
 //! # Regenerating the committed artifact
 //!
 //! ```sh
@@ -97,6 +115,7 @@
 //! days` term is the one no harness can supply.
 //!
 //! [#221]: https://github.com/baadc0de/orrery/issues/221
+//! [#990]: https://github.com/baadc0de/orrery/issues/990
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -108,6 +127,7 @@ use super::shadow::{
     QuarantineValidationObservation, QuarantineValidationObserver, ShadowObservation,
     ShadowObserver, ShadowVerdict, ATTESTATION_QUORUM_CONTROL,
 };
+use super::window::{DurableTally, RampWindowDelta, RampWindowRow, WindowCounts};
 
 /// The schema string every artifact this module writes carries.
 ///
@@ -622,20 +642,103 @@ struct Tallies {
 /// wiring, and it overrides [`ShadowObserver::record_qualifying`] — the
 /// denominator's counting point — which the default implementation ignores.
 ///
+/// # Durability
+///
+/// The counters and `W`'s bounds are periodically flushed to
+/// [`super::window`]'s `rampw/{control}` row and reloaded at startup, so a
+/// restart *continues* the window instead of opening a new one. The meter
+/// therefore holds two things: the live [`Tallies`] the admission path writes,
+/// and a [`MeterState`] recording what the durable row already contains.
+/// [`Self::snapshot`] reports their sum.
+///
 /// # Cost, against D16's budget
 ///
-/// Two `Mutex` acquisitions per intent on the admission path, each holding a
-/// `BTreeMap` lookup and a handful of integer adds, and only when a validator
-/// was built with an observer at all (the field is an `Option` and the default
-/// is `None`). D16 budgets the whole intent commit at a 10 ms p99; this is an
-/// uncontended lock and a tree descent of depth `log₂(|accounts|)`. Shadow is
-/// a temporary posture paying a temporary tax, which is the same trade D32
-/// clause (d) prices for the marked `AttestRow`.
+/// **On the admission path**, unchanged: two `Mutex` acquisitions per intent,
+/// each holding a `BTreeMap` lookup and a handful of integer adds, and only
+/// when a validator was built with an observer at all (the field is an
+/// `Option` and the default is `None`). D16 budgets the whole intent commit at
+/// a 10 ms p99; this is an uncontended lock and a tree descent of depth
+/// `log₂(|accounts|)`. Shadow is a temporary posture paying a temporary tax,
+/// which is the same trade D32 clause (d) prices for the marked `AttestRow`.
+///
+/// The durability work adds **nothing** to that path. It is not a second lock
+/// on it: [`Self::take_delta`] takes the same `tallies` lock the counters
+/// already use, once per flush interval, and the cohort join it performs runs
+/// on the drained copy after the lock is released. The flush itself is one
+/// FoundationDB read-modify-write per control per interval, on a background
+/// task — at the default 60 s cadence and four measurable controls that is
+/// `4/60 ≈ 0.067` transactions per second per process, against a budget
+/// written for a 10 ms *per intent* path. The only figure a deployment should
+/// weigh is the loss bound: an ungraceful stop discards at most one flush
+/// interval of counters, which over clause (e)'s thirty days is
+/// `60 s / 30 d ≈ 0.0023%` of the window.
 #[derive(Debug)]
 pub struct RampMeter {
     control: &'static str,
     capacity: usize,
     tallies: Mutex<Tallies>,
+    durable: Mutex<MeterState>,
+}
+
+/// What the meter knows about its durable window, plus the process-local
+/// bookkeeping a drain must not destroy.
+///
+/// `base` is what the `rampw/{control}` row held as of the last successful
+/// flush or load — including contributions from *other* processes metering the
+/// same control. `pending` is what this process has drained out of `tallies`
+/// and not yet had acknowledged by a write.
+///
+/// The three-way split (live / pending / base) is what makes a failed flush
+/// lossless: a drained delta lives in `pending` until the store confirms it,
+/// and the next flush retries with `pending` plus whatever `tallies` collected
+/// meanwhile. Nothing is counted twice, because a count is in exactly one of
+/// the three at any moment.
+#[derive(Debug, Default)]
+struct MeterState {
+    base: RampWindowRow,
+    pending: WindowCounts,
+    retained: RetainedAccounts,
+}
+
+/// The distinct-account sets a drain moves out of [`Tallies`] and keeps.
+///
+/// Volumes can be summed after a drain; cardinalities cannot, so the ids
+/// themselves have to survive it. Without this, every flush would reset
+/// [`RampSnapshot::accounts_qualifying`] and friends to zero and the reported
+/// spread would describe one flush interval instead of the process's run —
+/// a regression the durability work must not introduce while fixing the
+/// window.
+///
+/// These are **not** persisted, for the reason [`super::window`]'s module docs
+/// give: at [`DEFAULT_ACCOUNT_CAPACITY`] the fleet-side ids do not fit in a
+/// FoundationDB value, and an approximation would be a fabricated number. They
+/// are bounded by the meter's own capacity, since only accounts that earned an
+/// individual tally ever enter them.
+#[derive(Debug, Default)]
+struct RetainedAccounts {
+    qualifying: BTreeSet<AccountId>,
+    observed: BTreeSet<AccountId>,
+    would_act: BTreeSet<AccountId>,
+    truncated: BTreeSet<AccountId>,
+}
+
+impl RetainedAccounts {
+    /// Absorb the account identities out of a drained `Tallies`.
+    fn absorb(&mut self, tallies: &Tallies) {
+        for (account, tally) in &tallies.per_account {
+            if tally.qualifying > 0 {
+                self.qualifying.insert(*account);
+            }
+            if tally.observed > 0 {
+                self.observed.insert(*account);
+            }
+            if tally.would_act > 0 {
+                self.would_act.insert(*account);
+            }
+        }
+        self.truncated
+            .extend(tallies.truncated_accounts.iter().copied());
+    }
 }
 
 impl Default for RampMeter {
@@ -658,6 +761,7 @@ impl RampMeter {
             control,
             capacity: capacity.max(1),
             tallies: Mutex::new(Tallies::default()),
+            durable: Mutex::new(MeterState::default()),
         }
     }
 
@@ -771,6 +875,156 @@ impl RampMeter {
         tallies.per_account.entry(account).or_default()
     }
 
+    fn durable(&self) -> std::sync::MutexGuard<'_, MeterState> {
+        self.durable
+            .lock()
+            .expect("ramp meter durable state poisoned")
+    }
+
+    /// The durable window this meter believes it is measuring, as of its last
+    /// load or flush, **plus** what it has drained but not yet written.
+    ///
+    /// Not the live counters: those are still in `tallies` until a flush
+    /// drains them. [`Self::snapshot`] is what sums all three.
+    #[must_use]
+    pub fn durable_window(&self) -> RampWindowRow {
+        let durable = self.durable();
+        let mut row = durable.base.clone();
+        row.counts.fold(&durable.pending);
+        row
+    }
+
+    /// The generation this meter is measuring into.
+    #[must_use]
+    pub fn window_id(&self) -> u64 {
+        self.durable().base.window_id
+    }
+
+    /// Adopt a durable window read at startup, so the process *continues* it.
+    ///
+    /// This is the half of the fix that makes clause (e)'s `W ≥ 30 days`
+    /// reachable at all: without it, `first_ms` was `None` after every deploy
+    /// and the window restarted on a cadence far shorter than thirty days.
+    ///
+    /// Call it before the meter is attached to anything. Any drained-but-
+    /// unwritten counters are discarded, because a process that has just
+    /// started has none and one that has not cannot know they belong to the
+    /// generation it just read.
+    pub fn restore(&self, row: RampWindowRow) {
+        let mut durable = self.durable();
+        durable.base = row;
+        durable.pending = WindowCounts::default();
+        durable.retained = RetainedAccounts::default();
+    }
+
+    /// Record that a flush was accepted, adopting the row the store returned.
+    ///
+    /// The row is taken from the store rather than computed locally on
+    /// purpose: it carries every *other* process's contribution to the same
+    /// control, so this meter's snapshot reports the fleet's window and not
+    /// its own share of it.
+    pub fn commit_flush(&self, applied: RampWindowRow) {
+        let mut durable = self.durable();
+        durable.base = applied;
+        durable.pending = WindowCounts::default();
+    }
+
+    /// Adopt a window generation this meter was not measuring into, discarding
+    /// the delta it was holding.
+    ///
+    /// The reset path. The discarded counters were observed under the retired
+    /// generation, and folding them into the fresh one would put pre-reset
+    /// observations into a window opened precisely to exclude them — see
+    /// [`super::window`]'s module docs on why a reset is allowed to cost one
+    /// flush interval.
+    pub fn adopt_window(&self, row: RampWindowRow) {
+        self.restore(row);
+    }
+
+    /// Drain the live counters into a flushable delta, joined to `H`.
+    ///
+    /// The cohort join happens here rather than at count time because the
+    /// counting points are on the admission path and the cohort is an
+    /// operator-written roster: a per-intent membership lookup would put a
+    /// second tree descent inside D16's budget for no measurement benefit.
+    /// This runs once per flush interval, on a background task, over only the
+    /// accounts that produced traffic since the last one.
+    ///
+    /// An account sampled into **both** halves is counted as armed, matching
+    /// [`HonestCohort::len`]'s treatment of it as one member: the two halves'
+    /// volumes must sum to the cohort's, and counting such an account twice
+    /// would inflate `coverage`'s denominator with traffic that happened once.
+    ///
+    /// The returned delta includes anything a previous flush drained and did
+    /// not get written, so a failed flush is retried rather than lost. Exactly
+    /// one flusher may be in flight per meter, since a second would clear a
+    /// `pending` the store has not acknowledged; `persistd` runs a single task
+    /// that visits every control in turn.
+    pub fn take_delta(&self, cohort: &HonestCohort) -> RampWindowDelta {
+        let drained = std::mem::take(&mut *self.lock());
+        let counts = Self::counts_from(&drained, cohort);
+        let mut durable = self.durable();
+        durable.retained.absorb(&drained);
+        durable.pending.fold(&counts);
+        RampWindowDelta {
+            window_id: durable.base.window_id,
+            counts: durable.pending.clone(),
+        }
+    }
+
+    /// Fold one drained `Tallies` into the durable shape, splitting `H` into
+    /// its two halves on the way.
+    fn counts_from(tallies: &Tallies, cohort: &HonestCohort) -> WindowCounts {
+        let mut counts = WindowCounts {
+            first_ms: tallies.first_ms,
+            last_ms: tallies.last_ms,
+            fleet_truncation_seen: !tallies.truncated_accounts.is_empty(),
+            ..WindowCounts::default()
+        };
+        for (account, tally) in &tallies.per_account {
+            let durable = durable_tally(tally);
+            counts.fleet.fold(&durable);
+            // Armed first: an account in both halves is one member, and the
+            // half whose honesty is a property of the operator's harness is
+            // the one that describes it.
+            let half = if cohort.armed.contains(account) {
+                Some((
+                    &mut counts.armed,
+                    &mut counts.armed_active,
+                    &mut counts.armed_would_act,
+                ))
+            } else if cohort.natural.contains(account) {
+                Some((
+                    &mut counts.natural,
+                    &mut counts.natural_active,
+                    &mut counts.natural_would_act,
+                ))
+            } else {
+                None
+            };
+            if let Some((volumes, active, would_act)) = half {
+                volumes.fold(&durable);
+                if tally.qualifying > 0 {
+                    active.insert(*account);
+                }
+                if tally.would_act > 0 {
+                    would_act.insert(*account);
+                }
+            }
+        }
+        // The truncation bucket joins the fleet total and is deliberately kept
+        // out of the halves', for `snapshot`'s reason: its accounts are not
+        // individually known, so attributing any of it to `H` would be a guess.
+        counts.fleet.fold(&durable_tally(&tallies.truncated));
+        counts.unattributed = durable_tally(&tallies.unattributed);
+        counts.by_verdict = tallies
+            .by_verdict
+            .iter()
+            .map(|(verdict, count)| ((*verdict).to_owned(), *count))
+            .collect();
+        counts
+    }
+
     /// Freeze the counters into D32 clause (e)'s terms, computed against `H`.
     ///
     /// Every gate figure the report renders is computed here and nowhere else:
@@ -785,30 +1039,45 @@ impl RampMeter {
 
         let mut all = AccountTally::default();
         let mut honest = AccountTally::default();
-        let mut accounts_qualifying = 0_u64;
-        let mut accounts_observed = 0_u64;
-        let mut accounts_would_act = 0_u64;
-        let mut honest_active = 0_u64;
-        let mut honest_accounts_would_act = 0_u64;
+        // The fleet-side cardinalities are unions and not running counts: a
+        // drain moves the counters out of `per_account` but keeps the ids in
+        // `retained`, so an account that produced traffic in two flush
+        // intervals is one account here rather than two.
+        let (
+            mut accounts_qualifying,
+            mut accounts_observed,
+            mut accounts_would_act,
+            mut accounts_truncated,
+        ) = {
+            let durable = self.durable();
+            (
+                durable.retained.qualifying.clone(),
+                durable.retained.observed.clone(),
+                durable.retained.would_act.clone(),
+                durable.retained.truncated.clone(),
+            )
+        };
+        let mut honest_active: BTreeSet<AccountId> = BTreeSet::new();
+        let mut honest_accounts_would_act: BTreeSet<AccountId> = BTreeSet::new();
 
         for (account, tally) in &tallies.per_account {
             all.fold(tally);
             if tally.qualifying > 0 {
-                accounts_qualifying += 1;
+                accounts_qualifying.insert(*account);
             }
             if tally.observed > 0 {
-                accounts_observed += 1;
+                accounts_observed.insert(*account);
             }
             if tally.would_act > 0 {
-                accounts_would_act += 1;
+                accounts_would_act.insert(*account);
             }
             if cohort.contains(*account) {
                 honest.fold(tally);
                 if tally.qualifying > 0 {
-                    honest_active += 1;
+                    honest_active.insert(*account);
                 }
                 if tally.would_act > 0 {
-                    honest_accounts_would_act += 1;
+                    honest_accounts_would_act.insert(*account);
                 }
             }
         }
@@ -819,55 +1088,117 @@ impl RampMeter {
         // `accounts_truncated` is the honest third option, and the report
         // script refuses an artifact with a nonzero one.
         all.fold(&tallies.truncated);
+        accounts_truncated.extend(tallies.truncated_accounts.iter().copied());
 
-        let coverage = if honest.qualifying == 0 {
+        // Everything the durable window already holds — this process's earlier
+        // flushes, every other process's, and every process that ran before
+        // the last restart. Summed here rather than in the counting path so
+        // the admission path never touches it.
+        let carried = self.durable_window();
+        let mut fleet = durable_tally(&all);
+        fleet.fold(&carried.counts.fleet);
+        let mut honest_volumes = durable_tally(&honest);
+        honest_volumes.fold(&carried.counts.armed);
+        honest_volumes.fold(&carried.counts.natural);
+        let mut unattributed = durable_tally(&tallies.unattributed);
+        unattributed.fold(&carried.counts.unattributed);
+
+        let coverage = if honest_volumes.qualifying == 0 {
             None
         } else {
             // `f64::from` on a u64 does not exist for a reason; both counts are
             // event counts and exceeding 2^53 of them is not a shadow period.
             #[allow(clippy::cast_precision_loss)]
-            Some(honest.observed as f64 / honest.qualifying as f64)
+            Some(honest_volumes.observed as f64 / honest_volumes.qualifying as f64)
         };
 
-        let first = tallies.first_ms.unwrap_or_default();
-        let last = tallies.last_ms.unwrap_or_default();
+        let first = merge_bound(tallies.first_ms, carried.counts.first_ms, u64::min);
+        let last = merge_bound(tallies.last_ms, carried.counts.last_ms, u64::max);
         #[allow(clippy::cast_precision_loss)]
-        let window_days = (last.saturating_sub(first)) as f64 / 86_400_000.0;
+        let window_days = (last
+            .unwrap_or_default()
+            .saturating_sub(first.unwrap_or_default())) as f64
+            / 86_400_000.0;
+
+        let mut by_verdict = string_keys(&tallies.by_verdict);
+        fold_string_counts(&mut by_verdict, &carried.counts.by_verdict);
+
+        for account in carried
+            .counts
+            .armed_active
+            .union(&carried.counts.natural_active)
+        {
+            honest_active.insert(*account);
+        }
+        for account in carried
+            .counts
+            .armed_would_act
+            .union(&carried.counts.natural_would_act)
+        {
+            honest_accounts_would_act.insert(*account);
+        }
 
         RampSnapshot {
             control: self.control.to_owned(),
-            observed_from_ms: first,
-            observed_to_ms: last,
+            observed_from_ms: first.unwrap_or_default(),
+            observed_to_ms: last.unwrap_or_default(),
             window_days,
-            qualifying: all.qualifying,
-            observed: all.observed,
-            unevaluated: all.unevaluated,
-            would_act: all.would_act,
-            accounts_qualifying,
-            accounts_observed,
-            accounts_would_act,
-            accounts_truncated: tallies.truncated_accounts.len() as u64,
+            qualifying: fleet.qualifying,
+            observed: fleet.observed,
+            unevaluated: fleet.unevaluated,
+            would_act: fleet.would_act,
+            accounts_qualifying: accounts_qualifying.len() as u64,
+            accounts_observed: accounts_observed.len() as u64,
+            accounts_would_act: accounts_would_act.len() as u64,
+            accounts_truncated: accounts_truncated.len() as u64,
             unattributed: UnattributedTally {
-                qualifying: tallies.unattributed.qualifying,
-                observed: tallies.unattributed.observed,
-                would_act: tallies.unattributed.would_act,
+                qualifying: unattributed.qualifying,
+                observed: unattributed.observed,
+                would_act: unattributed.would_act,
             },
-            by_verdict: string_keys(&tallies.by_verdict),
-            by_cause: string_keys(&all.causes),
+            by_verdict,
+            by_cause: fleet.causes,
             cohort: CohortEvidence {
                 armed: cohort.armed.len() as u64,
                 natural: cohort.natural.len() as u64,
                 size: cohort.len() as u64,
-                active: honest_active,
-                qualifying: honest.qualifying,
-                observed: honest.observed,
-                unevaluated: honest.unevaluated,
+                active: honest_active.len() as u64,
+                qualifying: honest_volumes.qualifying,
+                observed: honest_volumes.observed,
+                unevaluated: honest_volumes.unevaluated,
                 coverage,
-                fp_count: honest.would_act,
-                accounts_would_act: honest_accounts_would_act,
-                by_cause: string_keys(&honest.causes),
+                fp_count: honest_volumes.would_act,
+                accounts_would_act: honest_accounts_would_act.len() as u64,
+                by_cause: honest_volumes.causes,
             },
         }
+    }
+}
+
+/// One in-process account tally in the durable shape.
+fn durable_tally(tally: &AccountTally) -> DurableTally {
+    DurableTally {
+        qualifying: tally.qualifying,
+        observed: tally.observed,
+        unevaluated: tally.unevaluated,
+        would_act: tally.would_act,
+        causes: string_keys(&tally.causes),
+    }
+}
+
+/// Take one side of `W` across the live and durable halves.
+fn merge_bound(live: Option<u64>, durable: Option<u64>, pick: fn(u64, u64) -> u64) -> Option<u64> {
+    match (live, durable) {
+        (Some(live), Some(durable)) => Some(pick(live, durable)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+fn fold_string_counts(into: &mut BTreeMap<String, u64>, from: &BTreeMap<String, u64>) {
+    for (label, count) in from {
+        let slot = into.entry(label.clone()).or_default();
+        *slot = slot.saturating_add(*count);
     }
 }
 
@@ -991,17 +1322,45 @@ pub struct RampSnapshot {
     pub unevaluated: u64,
     /// Of the observed ones, the ones live mode would have acted on.
     pub would_act: u64,
-    /// Distinct accounts with any qualifying activity.
+    /// Distinct accounts with any qualifying activity, **over this process's
+    /// run** rather than over the durable window.
+    ///
+    /// The scope is stated rather than papered over, because it is the one
+    /// figure in this struct that a restart still resets. Distinct-account
+    /// counts cannot be added across flushes or across processes — the same
+    /// account seen in two of them is one account, and only the ids can say so
+    /// — and the fleet-side ids do not fit in a FoundationDB value: the meter
+    /// tracks up to [`DEFAULT_ACCOUNT_CAPACITY`] of them. See
+    /// [`super::window`]'s module docs for the table of what is durable and
+    /// why this is not, and note that the cohort-side cardinalities in
+    /// [`CohortEvidence::active`] and [`CohortEvidence::accounts_would_act`]
+    /// *are* durable, because `H` is a hand-sampled roster whose ids do fit.
+    ///
+    /// A flush does not disturb it. The ids are retained in-process when the
+    /// counters are drained, so this counts the run and not the interval since
+    /// the last flush.
     pub accounts_qualifying: u64,
-    /// Distinct accounts with any observation.
+    /// Distinct accounts with any observation, over this process's run — see
+    /// [`Self::accounts_qualifying`].
     pub accounts_observed: u64,
     /// Distinct accounts with a would-have-acted event — clause (f)'s
     /// `spread`, which is cardinality rather than volume because
     /// docs/07:237's alarm is "across unrelated accounts" and an event counter
     /// cannot answer it.
+    ///
+    /// Over this process's run, and no promotion decision hangs on that: the
+    /// auto-suspend breaker computes clause (f)'s `spread` independently in
+    /// [`super::autosuspend::SuspendMonitor`], over its own
+    /// [`WINDOW_MS`](super::autosuspend::WINDOW_MS) rolling window, and does
+    /// not read this field.
     pub accounts_would_act: u64,
-    /// Distinct accounts folded into the truncation bucket. Nonzero means
-    /// account spread and the cohort denominator are both understated.
+    /// Distinct accounts folded into the truncation bucket, over this
+    /// process's run. Nonzero means account spread and the cohort denominator
+    /// are both understated.
+    ///
+    /// A durable window whose *earlier* processes truncated carries
+    /// [`super::window::WindowCounts::fleet_truncation_seen`] instead — a
+    /// flag, because the count is a cardinality and cardinalities do not add.
     pub accounts_truncated: u64,
     /// Submissions with no account.
     pub unattributed: UnattributedTally,
@@ -1433,5 +1792,241 @@ mod tests {
         assert!(absent[0].reason.contains("would-be annulments"));
         assert!(absent[0].reason.contains("clause (h)"));
         assert!(absent[0].reason.contains("fabricate C3 evidence"));
+    }
+
+    /// A cohort with both halves populated, so a test can check the split is
+    /// still legible after whatever it is testing.
+    fn split_cohort(
+        armed: impl IntoIterator<Item = u64>,
+        natural: impl IntoIterator<Item = u64>,
+    ) -> HonestCohort {
+        let mut cohort = HonestCohort::new();
+        for member in armed {
+            cohort.arm(AccountId::new(member));
+        }
+        for member in natural {
+            cohort.sample(AccountId::new(member));
+        }
+        cohort
+    }
+
+    /// Stand in for the durable store: fold a delta into a row the way
+    /// [`super::super::window::FdbRampWindowStore::flush`] does, without
+    /// needing a cluster.
+    ///
+    /// The FDB-backed proof of the same property is
+    /// `window::tests::a_window_survives_a_simulated_persistd_restart`; this
+    /// one runs in the default lane, so a regression in the *merge* is caught
+    /// even in a checkout with no cluster — which is where `fdb-tests.sh` is
+    /// not run.
+    fn apply(row: &mut RampWindowRow, delta: &RampWindowDelta) {
+        assert_eq!(row.window_id, delta.window_id, "generations must match");
+        row.counts.fold(&delta.counts);
+        row.flushes += 1;
+    }
+
+    /// The defect #990 names, at the seam that fixes it.
+    ///
+    /// Before this, `first_ms`/`last_ms` and every counter were fields of the
+    /// in-process `Mutex<Tallies>`: dropping the meter — which is what a
+    /// deploy does — reset `W` to zero and lost the counts observed over `H`.
+    /// A thirty-day window was therefore unreachable no matter how long the
+    /// fleet ran.
+    #[test]
+    fn a_window_and_both_halves_survive_dropping_the_meter() {
+        const DAY_MS: u64 = 86_400_000;
+        let cohort = split_cohort([1, 2], [3, 4]);
+        let mut stored = RampWindowRow::opened(0, 0, None);
+
+        // ── The process that ran for the first nineteen days ──────────────
+        let before = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
+        for day in 0..20_u64 {
+            for account in [1_u64, 2, 3, 4] {
+                before.record_qualifying(Some(AccountId::new(account)));
+                before.record(obs(Some(account), ShadowVerdict::WouldAdmit, day * DAY_MS));
+            }
+        }
+        // One would-have-acted event in each half, which is the distinction a
+        // promotion reviewer actually reads.
+        for account in [1_u64, 3] {
+            before.record_qualifying(Some(AccountId::new(account)));
+            before.record(obs(
+                Some(account),
+                ShadowVerdict::WouldRefuse(RejectionCause::ThresholdNotMet),
+                19 * DAY_MS,
+            ));
+        }
+
+        let first_half = before.snapshot(&cohort);
+        assert!((first_half.window_days - 19.0).abs() < 1e-9);
+        assert_eq!(first_half.cohort.fp_count, 2);
+
+        let delta = before.take_delta(&cohort);
+        apply(&mut stored, &delta);
+        before.commit_flush(stored.clone());
+
+        // The armed and natural volumes reached the durable row apart, which
+        // is the non-negotiable part: a row that summed them could not tell
+        // "would have refused a bot" from "would have refused a player".
+        assert_eq!(stored.counts.armed.would_act, 1);
+        assert_eq!(stored.counts.natural.would_act, 1);
+        assert_eq!(stored.counts.armed_would_act.len(), 1);
+        assert_eq!(stored.counts.natural_would_act.len(), 1);
+
+        // ── The deploy ────────────────────────────────────────────────────
+        drop(before);
+
+        // ── The process that came up after it ─────────────────────────────
+        let after = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
+        let restarted = after.snapshot(&cohort);
+        assert!(
+            restarted.window_days.abs() < f64::EPSILON,
+            "a meter that has not reloaded is exactly the old behaviour, and \
+             this is the assertion that would have caught #990"
+        );
+
+        after.restore(stored.clone());
+        let continued = after.snapshot(&cohort);
+        assert_eq!(continued.observed_from_ms, 0);
+        assert_eq!(continued.observed_to_ms, 19 * DAY_MS);
+        assert!(
+            (continued.window_days - 19.0).abs() < 1e-9,
+            "the window continued rather than restarted"
+        );
+        assert_eq!(continued.qualifying, first_half.qualifying);
+        assert_eq!(continued.observed, first_half.observed);
+        assert_eq!(continued.cohort.fp_count, 2);
+        assert_eq!(continued.cohort.active, 4);
+        assert_eq!(continued.cohort.accounts_would_act, 2);
+        assert_eq!(continued.cohort.coverage, first_half.cohort.coverage);
+
+        // ── Eleven more days, and clause (e)'s time term is reached ───────
+        for day in 20..31_u64 {
+            for account in [1_u64, 2, 3, 4] {
+                after.record_qualifying(Some(AccountId::new(account)));
+                after.record(obs(Some(account), ShadowVerdict::WouldAdmit, day * DAY_MS));
+            }
+        }
+        let whole = after.snapshot(&cohort);
+        assert!(
+            whole.window_days >= 30.0,
+            "thirty days across a restart is exactly what #990 said was \
+             structurally unreachable; it is {} days",
+            whole.window_days
+        );
+        assert_eq!(whole.qualifying, first_half.qualifying + 44);
+        assert_eq!(
+            whole.cohort.fp_count, 2,
+            "the pre-restart false positives are still counted against H"
+        );
+    }
+
+    /// A flush that fails is retried, not lost: the drained counters stay in
+    /// the meter's pending half and the next delta carries them again.
+    #[test]
+    fn an_unacknowledged_flush_is_carried_into_the_next_delta() {
+        let cohort = split_cohort([7], []);
+        let meter = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
+        meter.record_qualifying(Some(AccountId::new(7)));
+        meter.record(obs(Some(7), ShadowVerdict::WouldAdmit, 5_000));
+
+        let lost = meter.take_delta(&cohort);
+        assert_eq!(lost.counts.armed.qualifying, 1);
+        // No `commit_flush`: the write failed.
+
+        meter.record_qualifying(Some(AccountId::new(7)));
+        meter.record(obs(Some(7), ShadowVerdict::WouldAdmit, 9_000));
+        let retried = meter.take_delta(&cohort);
+        assert_eq!(
+            retried.counts.armed.qualifying, 2,
+            "the unacknowledged counts are in the retry, not dropped"
+        );
+        assert_eq!(retried.counts.first_ms, Some(5_000));
+        assert_eq!(retried.counts.last_ms, Some(9_000));
+
+        // And the snapshot never double-counted them while they were pending.
+        let snapshot = meter.snapshot(&cohort);
+        assert_eq!(snapshot.cohort.qualifying, 2);
+    }
+
+    /// Draining does not disturb what a snapshot reports, which is the
+    /// property that lets the flush run on its own cadence beside a producer.
+    #[test]
+    fn a_drain_is_invisible_to_the_snapshot() {
+        let cohort = split_cohort([], [11]);
+        let meter = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
+        for tick in 0..50_u64 {
+            meter.record_qualifying(Some(AccountId::new(11)));
+            meter.record(obs(Some(11), ShadowVerdict::WouldAdmit, 1_000 + tick));
+        }
+        let before = meter.snapshot(&cohort);
+        let delta = meter.take_delta(&cohort);
+        assert_eq!(
+            before,
+            meter.snapshot(&cohort),
+            "a drain moves counters, it does not spend them"
+        );
+
+        let mut stored = RampWindowRow::opened(0, 0, None);
+        apply(&mut stored, &delta);
+        meter.commit_flush(stored);
+        assert_eq!(
+            meter.snapshot(&cohort),
+            before,
+            "nor does the acknowledgement"
+        );
+    }
+
+    /// An account sampled into both halves is one member with one set of
+    /// volumes, so `armed + natural` still sums to the cohort's total.
+    #[test]
+    fn a_member_of_both_halves_is_counted_once_and_as_armed() {
+        let mut cohort = HonestCohort::new();
+        cohort.arm(AccountId::new(5));
+        cohort.sample(AccountId::new(5));
+        let meter = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
+        for tick in 0..4_u64 {
+            meter.record_qualifying(Some(AccountId::new(5)));
+            meter.record(obs(Some(5), ShadowVerdict::WouldAdmit, tick));
+        }
+        let delta = meter.take_delta(&cohort);
+        assert_eq!(delta.counts.armed.qualifying, 4);
+        assert_eq!(delta.counts.natural.qualifying, 0);
+        assert_eq!(
+            delta.counts.armed.qualifying + delta.counts.natural.qualifying,
+            meter.snapshot(&cohort).cohort.qualifying,
+            "the halves sum to the cohort, which is what makes them a split"
+        );
+    }
+
+    /// A delta measured under a retired generation is discarded, so a
+    /// straggler cannot undo a reset.
+    #[test]
+    fn adopting_a_new_generation_discards_the_delta_measured_under_the_old_one() {
+        let cohort = split_cohort([2], []);
+        let meter = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
+        for tick in 0..10_u64 {
+            meter.record_qualifying(Some(AccountId::new(2)));
+            meter.record(obs(Some(2), ShadowVerdict::WouldAdmit, tick));
+        }
+        let stale = meter.take_delta(&cohort);
+        assert_eq!(stale.window_id, 0);
+
+        // The operator reset the window while that delta was in flight.
+        meter.adopt_window(RampWindowRow::opened(
+            1,
+            500_000,
+            Some("ruleset v9".to_owned()),
+        ));
+
+        let snapshot = meter.snapshot(&cohort);
+        assert_eq!(
+            snapshot.cohort.qualifying, 0,
+            "observations taken before a semantic change do not enter the \
+             window opened to exclude them"
+        );
+        assert!(snapshot.window_days.abs() < f64::EPSILON);
+        assert_eq!(meter.window_id(), 1);
+        assert_eq!(meter.take_delta(&cohort).window_id, 1);
     }
 }

@@ -71,6 +71,30 @@
 //! orrery-ramp cohort show --fdb-cluster-file /etc/orrery/fdb.cluster
 //! ```
 //!
+//! # The window subcommand: D32 clause (e)'s `W`
+//!
+//! ```sh
+//! # What the promotion review's time term actually stands at, with clause
+//! # (e)'s armed/natural split reported apart.
+//! orrery-ramp window show --control attestation_quorum \
+//!     --fdb-cluster-file /etc/orrery/fdb.cluster
+//!
+//! # Retire the window because a semantic change invalidated what it saw.
+//! # The counters are gone afterwards; read them first if you need them.
+//! orrery-ramp window reset --control attestation_quorum \
+//!     --reason "ruleset v9 rewrote the quorum predicate" \
+//!     --fdb-cluster-file /etc/orrery/fdb.cluster
+//! ```
+//!
+//! There is no `window set`, and the absence is the design. Counters are
+//! measurements; an operator who could write them could write clause (e)'s
+//! evidence directly, which would make the whole ramp ceremonial. The two
+//! verbs an operator has are *read* and *start again*.
+//!
+//! Resetting is not automatic on a ruleset change. Whether it should be is a
+//! policy question for the owner rather than a gap in this tool — see
+//! `orrery_persistd::intent::window`'s module docs.
+//!
 //! Cohort rows carry no signature, unlike the posture rows above, and the
 //! asymmetry is deliberate: a posture row commands enforcement, a cohort row
 //! names a member of a measurement population. A forged membership row cannot
@@ -84,6 +108,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use orrery_persistd::intent::cohort::{CohortHalf, CohortMemberRow, FdbHonestCohortStore};
 use orrery_persistd::intent::posture::{self, SignedRampPosture};
+use orrery_persistd::intent::window::{FdbRampWindowStore, RampWindowRow};
 use orrery_persistd::intent::{FdbRampPostureStore, PostureSource, RampMode, RampPosture};
 
 /// The longest `reason` this tool will sign.
@@ -160,6 +185,37 @@ enum Command {
     /// Record, remove and inspect D32 clause (e)'s known-honest cohort.
     #[command(subcommand)]
     Cohort(CohortCommand),
+    /// Inspect and reset D32 clause (e)'s durable measurement window `W`.
+    #[command(subcommand)]
+    Window(WindowCommand),
+}
+
+/// The measurement window's two verbs.
+#[derive(Subcommand)]
+enum WindowCommand {
+    /// Show one control's durable window: its generation, `W` in days, and
+    /// clause (e)'s counters with the armed/natural split intact.
+    Show {
+        /// One of D32 clause (c)'s stable control names.
+        #[arg(long, value_name = "CONTROL")]
+        control: String,
+    },
+    /// Retire the current window and open a fresh one.
+    ///
+    /// The deliberate reset. Use it when a semantic change — a ruleset
+    /// version, a rewritten predicate — invalidates what the window already
+    /// observed: clause (e) evidence spanning such a change would be worse
+    /// than a short window. The retired counters are **not** archived, so read
+    /// them with `window show` first if you need them.
+    Reset {
+        /// One of D32 clause (c)'s stable control names.
+        #[arg(long, value_name = "CONTROL")]
+        control: String,
+        /// Why the prior observations no longer apply. Recorded in the row,
+        /// bounded at 256 bytes.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+    },
 }
 
 /// The cohort subcommand's three verbs.
@@ -394,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Cohort(cohort) => run_cohort(cohort, &context).await?,
+        Command::Window(window) => run_window(window, &context).await?,
     }
     Ok(())
 }
@@ -470,6 +527,131 @@ async fn run_cohort(
             println!(
                 "clause (e)'s floor is |H| ≥ 100 with the split reported separately; \
                  an artifact's `active` count is the one that makes the size mean something"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The lines `window show` renders for one control's durable window.
+///
+/// Split out from [`run_window`] so the shape is testable without a cluster.
+/// Every figure comes from the row; nothing is re-derived here, for the reason
+/// `RampMeter::snapshot` gives about `scripts/ramp-report.py` — a second
+/// implementation of a gate figure disagrees with the first exactly when it
+/// matters. The one computed value is `window_days`, and it is
+/// [`RampWindowRow::window_days`] rather than an arithmetic expression typed
+/// out again here.
+fn window_lines(control: &str, row: &RampWindowRow) -> Vec<String> {
+    let counts = &row.counts;
+    let mut lines = vec![
+        format!(
+            "rampw/{control}: window {} opened at {} ms{}",
+            row.window_id,
+            row.opened_at_ms,
+            row.reset_reason
+                .as_ref()
+                .map_or_else(String::new, |reason| format!(" ({reason:?})"))
+        ),
+        format!(
+            "  W = {:.3} days, from {} to {} ms, over {} flush(es)",
+            row.window_days(),
+            counts
+                .first_ms
+                .map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
+            counts
+                .last_ms
+                .map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
+            row.flushes
+        ),
+        format!(
+            "  fleet: qualifying={} observed={} unevaluated={} would_act={}",
+            counts.fleet.qualifying,
+            counts.fleet.observed,
+            counts.fleet.unevaluated,
+            counts.fleet.would_act
+        ),
+        // The two halves on their own lines, never summed: a reviewer reading
+        // this is deciding whether the control would have refused players or
+        // bots, and one number cannot answer that.
+        format!(
+            "  armed:   qualifying={} observed={} would_act={} active_members={} would_act_members={}",
+            counts.armed.qualifying,
+            counts.armed.observed,
+            counts.armed.would_act,
+            counts.armed_active.len(),
+            counts.armed_would_act.len()
+        ),
+        format!(
+            "  natural: qualifying={} observed={} would_act={} active_members={} would_act_members={}",
+            counts.natural.qualifying,
+            counts.natural.observed,
+            counts.natural.would_act,
+            counts.natural_active.len(),
+            counts.natural_would_act.len()
+        ),
+        format!(
+            "  unattributed: qualifying={} observed={} would_act={}",
+            counts.unattributed.qualifying,
+            counts.unattributed.observed,
+            counts.unattributed.would_act
+        ),
+    ];
+    if counts.cohort_accounts_truncated > 0 {
+        lines.push(format!(
+            "  WARNING: {} cohort account id(s) did not fit the row; the \
+             active and would-act member counts above are understated by at \
+             most that much",
+            counts.cohort_accounts_truncated
+        ));
+    }
+    if counts.fleet_truncation_seen {
+        lines.push(
+            "  WARNING: this window folded traffic from the meter's \
+             past-capacity truncation bucket; fleet account spread and the \
+             cohort denominator are both understated by an unknown amount"
+                .to_owned(),
+        );
+    }
+    lines.push(
+        "clause (e) needs W >= 30 days and |H| >= 100 with fp_count = 0; \
+         `cohort show` is where |H| lives, and distinct-account counts \
+         fleet-wide are per-process and are not in this row"
+            .to_owned(),
+    );
+    lines
+}
+
+/// Run one `window` verb against the durable measurement window.
+async fn run_window(
+    command: WindowCommand,
+    context: &orrery_persistd::FdbContext,
+) -> anyhow::Result<()> {
+    let store = FdbRampWindowStore::from_context(context);
+    match command {
+        WindowCommand::Show { control } => match store.load(&control).await? {
+            None => println!(
+                "rampw/{control}: no window row; no process has flushed one yet, \
+                 so clause (e)'s W is zero"
+            ),
+            Some(row) => {
+                for line in window_lines(&control, &row) {
+                    println!("{line}");
+                }
+            }
+        },
+        WindowCommand::Reset { control, reason } => {
+            let row = store.reset(&control, &reason, now_ms()).await?;
+            println!(
+                "rampw/{control}: window {} opened at {} ms; the previous \
+                 window's counters are gone",
+                row.window_id, row.opened_at_ms
+            );
+            println!(
+                "every persistd metering this control discards the delta it \
+                 was holding on its next flush, so at most one flush interval \
+                 of post-reset observations is lost — which is the trade: no \
+                 observation from before this reset can enter the new window"
             );
         }
     }
@@ -632,5 +814,86 @@ mod tests {
         let line = cohort_member_line(4242, &row);
         assert!(line.contains("4242 natural"), "{line}");
         assert!(line.contains("decided_at_ms=2000"), "{line}");
+    }
+
+    /// `window show` renders the halves apart, which is the same rule
+    /// `cohort show` follows and for the same reason: the number a reviewer
+    /// needs is *which* forty accounts would have been refused.
+    #[test]
+    fn the_window_summary_reports_the_halves_separately() {
+        let mut row = RampWindowRow::opened(2, 900, Some("ruleset v9".to_owned()));
+        row.counts.observe_at(0);
+        row.counts.observe_at(86_400_000 * 31);
+        row.counts.armed.qualifying = 400;
+        row.counts.armed.would_act = 1;
+        row.counts.natural.qualifying = 600;
+        row.counts.natural.would_act = 40;
+        row.counts.fleet.qualifying = 1_000;
+        row.flushes = 12;
+
+        let rendered = window_lines("attestation_quorum", &row).join("\n");
+        assert!(rendered.contains("window 2 opened at 900 ms"), "{rendered}");
+        assert!(rendered.contains("\"ruleset v9\""), "{rendered}");
+        assert!(rendered.contains("W = 31.000 days"), "{rendered}");
+        assert!(rendered.contains("over 12 flush(es)"), "{rendered}");
+        assert!(
+            rendered.contains("armed:   qualifying=400 observed=0 would_act=1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("natural: qualifying=600 observed=0 would_act=40"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("would_act=41"),
+            "the halves are never summed into one figure: {rendered}"
+        );
+    }
+
+    /// Truncation is reported rather than absorbed, in both of the two ways a
+    /// window can be understated.
+    #[test]
+    fn the_window_summary_warns_about_every_understated_figure() {
+        let mut row = RampWindowRow::opened(0, 0, None);
+        row.counts.cohort_accounts_truncated = 3;
+        row.counts.fleet_truncation_seen = true;
+        let rendered = window_lines("strikes", &row).join("\n");
+        assert!(
+            rendered.contains("3 cohort account id(s) did not fit"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("truncation bucket"), "{rendered}");
+    }
+
+    #[test]
+    fn a_window_with_no_observations_renders_absent_bounds_rather_than_zero() {
+        let row = RampWindowRow::opened(0, 5_000, None);
+        let rendered = window_lines("strikes", &row).join("\n");
+        assert!(
+            rendered.contains("from — to — ms"),
+            "an unobserved window has no bounds, and printing 0 would read as \
+             an observation at the epoch: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_window_reset_verb_parses_with_its_reason() {
+        let parsed = Cli::try_parse_from([
+            "orrery-ramp",
+            "--fdb-cluster-file",
+            "/tmp/fdb.cluster",
+            "window",
+            "reset",
+            "--control",
+            "attestation_quorum",
+            "--reason",
+            "ruleset v9",
+        ])
+        .expect("window reset parses");
+        let Command::Window(WindowCommand::Reset { control, reason }) = parsed.command else {
+            panic!("expected the window reset subcommand");
+        };
+        assert_eq!(control, "attestation_quorum");
+        assert_eq!(reason, "ruleset v9");
     }
 }

@@ -600,6 +600,45 @@ pub fn cohort_range_end() -> Vec<u8> {
     b"vd".to_vec()
 }
 
+/// Key for one D32 clause (e) measurement-window row:
+/// `rampw/{control}`, one per clause (c) control.
+///
+/// The row holds the window's bounds (`W`'s two endpoints) and the counters
+/// observed inside it, with clause (e)'s armed/natural split carried through
+/// verbatim. It exists because `W` and the tallies were fields of an
+/// in-process `Mutex<Tallies>`: every `persistd` restart reset them, so
+/// clause (e)'s `W ≥ 30 days` term was unreachable no matter how long the
+/// fleet ran — a routine deploy was enough to start the window again.
+///
+/// The rows share the registered `v` family and occupy their own `b"vm"`
+/// sub-span, per D32 clause (c)'s allocation rule. The profile match against
+/// the family is the argument for the sub-span, exactly as it was for
+/// [`cohort_key`]: written by the measurement plane on a slow cadence (one
+/// read-modify-write per control per flush interval, never on the intent
+/// path), read by measurement tooling and at process startup, and retained
+/// for the whole promotion window. `b"vm"` sorts strictly between the `b"vc"`
+/// cohort span and the `b"vr"` posture span, so all three are disjoint by
+/// construction and no family byte is spent.
+#[must_use]
+pub fn ramp_window_key(control: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + control.len());
+    key.extend_from_slice(b"vm");
+    key.extend_from_slice(control.as_bytes());
+    key
+}
+
+/// Inclusive start of the measurement-window sub-span.
+#[must_use]
+pub fn ramp_window_range_start() -> Vec<u8> {
+    b"vm".to_vec()
+}
+
+/// Exclusive end of the measurement-window sub-span.
+#[must_use]
+pub fn ramp_window_range_end() -> Vec<u8> {
+    b"vn".to_vec()
+}
+
 // ---------------------------------------------------------------------------
 // Intent idempotency family: `intent/{intent_id}`
 // ---------------------------------------------------------------------------
@@ -3132,6 +3171,37 @@ mod tests {
         let posture = ramp_key("attestation_quorum");
         assert!(posture >= ramp_range_start() && posture < ramp_range_end());
         assert!(key < posture, "even the extreme cohort key stays below");
+    }
+
+    #[test]
+    fn ramp_window_rows_are_a_third_disjoint_v_family_subspan() {
+        let key = ramp_window_key("attestation_quorum");
+        assert_eq!(key, b"vmattestation_quorum");
+        assert!(content_version_key().as_slice() < ramp_window_range_start().as_slice());
+        assert!(ramp_window_range_start() <= key);
+        assert!(key < ramp_window_range_end());
+        assert!(ramp_window_range_end().as_slice() < [b'w'].as_slice());
+
+        // The three `v` sub-spans in allocation order, each strictly below the
+        // next, so a range read over any one of them never observes another's
+        // rows. ADR-0032's amendment records the failure this asserts against:
+        // a discriminator chosen without checking the accepted set.
+        assert!(
+            cohort_range_end() <= ramp_window_range_start(),
+            "cohort rows sort strictly before every `vm` window row"
+        );
+        assert!(
+            ramp_window_range_end() <= ramp_range_start(),
+            "window rows sort strictly before every `vr` posture row"
+        );
+        assert!(key > cohort_key(AccountId::new(u64::MAX)));
+        assert!(key < ramp_key("attestation_quorum"));
+
+        // The empty control name is the shortest key the family admits, and it
+        // must still land inside the span rather than on its boundary's far
+        // side.
+        assert!(ramp_window_range_start() <= ramp_window_key(""));
+        assert!(ramp_window_key("") < ramp_window_range_end());
     }
 
     // -----------------------------------------------------------------------

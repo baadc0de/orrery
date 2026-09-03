@@ -76,6 +76,14 @@ pub use cohort::{
     DEFAULT_PROBATION_MS, MAX_COHORT_REASON_BYTES,
 };
 
+pub mod window;
+#[cfg(feature = "fdb")]
+pub use window::FdbRampWindowStore;
+pub use window::{
+    DurableTally, FlushOutcome, RampWindowDelta, RampWindowError, RampWindowRow, WindowCounts,
+    MAX_DURABLE_COHORT_ACCOUNTS, MAX_WINDOW_REASON_BYTES,
+};
+
 pub mod stages;
 pub use stages::{intent_stage_metrics, IntentStageMetrics, IntentStageSnapshot, IntentTrace};
 
