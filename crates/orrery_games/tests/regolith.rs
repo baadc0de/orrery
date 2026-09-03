@@ -3358,8 +3358,10 @@ fn v25_tether_constants_are_derived_from_the_island_and_the_bloom_cadence() {
     );
     assert_eq!(TETHER_ESCAPE_SPEED_MMS, 33_333);
     assert_eq!(TETHER_DRAG_PER_SEC_PER_MILLE, 1_750);
-    assert!(
-        TETHER_DRAG_PER_SEC_PER_MILLE > DRAG_PER_SEC_PER_MILLE,
-        "a tether weaker than ordinary drag would anchor nothing"
-    );
+    const {
+        assert!(
+            TETHER_DRAG_PER_SEC_PER_MILLE > DRAG_PER_SEC_PER_MILLE,
+            "a tether weaker than ordinary drag would anchor nothing"
+        );
+    }
 }
