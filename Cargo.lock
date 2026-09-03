@@ -7916,6 +7916,7 @@ dependencies = [
  "orrery_authority",
  "orrery_core",
  "orrery_games",
+ "orrery_ipc",
  "orrery_net",
  "orrery_persist_client",
  "orrery_predict",
@@ -8250,6 +8251,7 @@ dependencies = [
 name = "orrery_sidecar"
 version = "0.1.0"
 dependencies = [
+ "aeronet_iroh",
  "bevy",
  "bevy_state",
  "bytes",
@@ -8258,6 +8260,7 @@ dependencies = [
  "orrery",
  "orrery_authority",
  "orrery_core",
+ "orrery_ipc",
  "orrery_net",
  "orrery_predict",
  "orrery_protocol",
