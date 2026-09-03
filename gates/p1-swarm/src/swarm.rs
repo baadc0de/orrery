@@ -2524,7 +2524,36 @@ impl Swarm {
         }
     }
 
-    fn refresh_live_witnesses(&mut self) {
+    /// Republish every bot's witness set, and arm host-side watches against the
+    /// seats named in `bound` — **only** those.
+    ///
+    /// `bound` is the set of exteriors that finished their handshake on this
+    /// tick, and the restriction is the whole correctness of this function.
+    /// A seat's join anchor is verified against the host tick the handshake ran
+    /// at (`bridge::PendingJoin::finish`, `verify_join_anchor`), so it is a
+    /// usable arming point at that instant and never again: the subject keeps
+    /// authoring, and its head walks away from the claim.
+    ///
+    /// Arming every live exterior on every membership change is what #963 was.
+    /// A membership change is *any* join or release, and the common one is the
+    /// first human seat saying goodbye a few hundred milliseconds before the
+    /// second — at which point every bot was armed against the surviving seat
+    /// with its **tick-zero lobby anchor**, thousands of ticks stale. Such a
+    /// watch cannot recover: with no folded frame there is no verified head, so
+    /// the preimage is rebuilt from the anchor claim and every subsequent frame
+    /// fails its *signature* check rather than its chain check
+    /// (`WitnessCounters::frames_rejected_unanchored`) — a rejection opens no
+    /// repair, so re-anchoring is never reached. Worse, the first frame it is
+    /// shown charges `shown_ticks` from `min(frame.first_tick, anchor_tick)`,
+    /// which for a tick-zero anchor is the subject's entire timeline at once.
+    /// One such watch per bot took `observation_coverage` to exactly 3/4 and
+    /// the attempt was refused, losing the hour for the humans and the cohort
+    /// together.
+    ///
+    /// Seats seated in the lobby are not in `bound` at any tick and stay
+    /// unarmed, exactly as [`Self::seed_witnesses`] leaves them; that half of
+    /// the asymmetry closes with the rendered client (#386).
+    fn refresh_live_witnesses(&mut self, bound: &[usize]) {
         if !self.config.witnessing {
             return;
         }
@@ -2541,6 +2570,7 @@ impl Swarm {
         let subjects = self
             .exteriors
             .iter()
+            .filter(|(slot, _)| bound.contains(slot))
             .filter_map(|(slot, exterior)| {
                 exterior
                     .anchor
@@ -2582,6 +2612,10 @@ impl Swarm {
         });
         let island_seats = self.live_joins.as_ref().map_or(0, |live| live.island_seats);
         let mut changed = false;
+        // The seats that bind on *this* tick, and the only ones a host-side
+        // watch may be armed against: their join anchor was verified against
+        // this tick and is stale by the next membership change (#963).
+        let mut bound = Vec::new();
         for seat in joined {
             eprintln!(
                 "gates/p1-swarm: live seat {} bound as {} at tick {}",
@@ -2613,6 +2647,7 @@ impl Swarm {
                     next_tick: tick + 1,
                 },
             );
+            bound.push(seat.slot);
             changed = true;
         }
 
@@ -2686,7 +2721,7 @@ impl Swarm {
         }
         if changed {
             let _ = self.refresh_rosters(tick);
-            self.refresh_live_witnesses();
+            self.refresh_live_witnesses(&bound);
             self.publish_live_manifests(tick);
         }
         if !due_manifest_slots.is_empty() {
@@ -4132,6 +4167,176 @@ mod tests {
                  one session, or `send_peer_packets` picks between duplicates"
             );
         }
+    }
+
+    /// A lobby anchor for `slot`, exactly as `peer_runner` ships one: the
+    /// slot's own signed tick-`tick` epoch-zero claim over its seeded state.
+    fn join_anchor(
+        slot: usize,
+        island_seats: usize,
+        seed: u64,
+        tick: u64,
+    ) -> (orrery_protocol::StateClaim, RegolithState) {
+        let mut universe = [0u8; 32];
+        universe[0..8].copy_from_slice(&seed.to_le_bytes());
+        let mut peer = crate::bot::Bot::new(crate::bot::BotSpec {
+            index: slot,
+            count: island_seats,
+            seed: UniverseSeed(universe),
+            cell_edge_m: SwarmConfig::default().cell_edge_m,
+            witnessing: true,
+            cheat: None,
+            enforcing: false,
+        });
+        let state = peer.state();
+        let claim = peer
+            .chain
+            .as_mut()
+            .expect("witnessing implies a chain")
+            .anchor(tick, &state);
+        (claim, state)
+    }
+
+    /// A membership change must not arm a host-side watch against a seat whose
+    /// anchor is old (#963).
+    ///
+    /// This is the whole of #963, and nothing about the run's inputs predicted
+    /// it. Two humans seat in the lobby; `seed_witnesses` deliberately leaves
+    /// them unwatched host-side, because a bot cannot be armed by a remote
+    /// subject's tick-zero anchor once the run is under way (#386). Then the
+    /// first seat says goodbye — a few hundred milliseconds before the second,
+    /// which is what two client processes started in sequence actually do — and
+    /// the release marks membership `changed`. Before this guard, that refresh
+    /// armed every bot against the *surviving* seat using its tick-zero lobby
+    /// anchor, thousands of ticks stale. The watch could never fold: with no
+    /// verified head the preimage comes from the anchor claim, so frames neither
+    /// chain nor open a repair, and the first one shown charges `shown_ticks`
+    /// from tick zero — the subject's whole timeline in one step. Four bots,
+    /// one surviving seat, `observation_coverage` 0.7488, and
+    /// `p4-attempt-accounting` correctly refused to derive the hour.
+    ///
+    /// Measured in `tests/attempt_report_seam.rs` against three real processes,
+    /// the failing runs released their two seats six ticks apart and the passing
+    /// ones four — a coin flip against the witness send cadence, not a seed.
+    ///
+    /// The second half of the test is the reason the guard is a *when*, not a
+    /// deletion: a seat that binds mid-run had its anchor verified against this
+    /// very tick (`bridge::verify_join_anchor`), and the shipped client anchors
+    /// at its join tick, so arming it there is correct and must survive.
+    #[test]
+    fn a_membership_change_does_not_arm_a_watch_against_a_stale_lobby_anchor() {
+        let seed = SwarmConfig::default().seed;
+        let (lobby_host, _lobby_remote) = crate::exterior::link_pair();
+        let (survivor_host, _survivor_remote) = crate::exterior::link_pair();
+        let (joiner_host, _joiner_remote) = crate::exterior::link_pair();
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let membership = Arc::new(Mutex::new(LiveMembership {
+            attempt_id: "attempt-963".to_owned(),
+            active: [2usize, 3]
+                .into_iter()
+                .map(|slot| {
+                    (
+                        slot,
+                        LiveSeatBinding {
+                            node: crate::bot::bot_key(slot).public(),
+                            session_id: format!("session-{slot}"),
+                        },
+                    )
+                })
+                .collect(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeSet::new(),
+            tick: 0,
+            running: true,
+            path: None,
+        }));
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: 2,
+                witnessing: true,
+                ..SwarmConfig::default()
+            },
+            5,
+        )
+        .with_external_session_at(
+            2,
+            5,
+            crate::bot::bot_key(2).public(),
+            "session-2".to_owned(),
+            Some(join_anchor(2, 5, seed, 0)),
+            lobby_host,
+        )
+        .with_external_session_at(
+            3,
+            5,
+            crate::bot::bot_key(3).public(),
+            "session-3".to_owned(),
+            Some(join_anchor(3, 5, seed, 0)),
+            survivor_host,
+        )
+        .with_live_joins(joined_rx, membership, 5);
+
+        swarm.form_island();
+        swarm.seed_witnesses();
+        assert!(
+            !swarm
+                .armed_external_watches
+                .iter()
+                .any(|(_watcher, subject)| *subject >= 2),
+            "`seed_witnesses` leaves a lobby seat unwatched host-side (#386)"
+        );
+
+        // The first human leaves. Only that changes.
+        swarm.exteriors[&2]
+            .link
+            .goodbye
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        swarm.process_live_membership(2_772);
+
+        assert!(
+            !swarm.exteriors.contains_key(&2),
+            "the departing seat is released"
+        );
+        let stale: Vec<_> = swarm
+            .armed_external_watches
+            .iter()
+            .filter(|(_watcher, subject)| *subject == 3)
+            .copied()
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "one seat leaving armed {} host-side watches against the seat that \
+             stayed, using its tick-zero lobby anchor: {stale:?}. Each is its \
+             subject's whole timeline shown and none of it judged, which is \
+             observation coverage 3/4 and a refused attempt (#963)",
+            stale.len(),
+        );
+
+        // ...and the arming that *is* correct still happens: a seat binding
+        // mid-run carries an anchor this tick verified.
+        joined_tx
+            .send(JoinedExternal {
+                slot: 4,
+                node: crate::bot::bot_key(4).public(),
+                session_id: "session-four".to_owned(),
+                anchor: Some(join_anchor(4, 5, seed, 2_800)),
+                link: joiner_host,
+            })
+            .expect("join reaches the standing swarm");
+        swarm.process_live_membership(2_800);
+
+        let armed: Vec<_> = swarm
+            .armed_external_watches
+            .iter()
+            .filter(|(_watcher, subject)| *subject == 4)
+            .copied()
+            .collect();
+        assert_eq!(
+            armed.len(),
+            swarm.bots.len(),
+            "every bot must watch a seat that bound with a current anchor, or \
+             a human hour goes host-side unwitnessed: {armed:?}"
+        );
     }
 
     #[test]

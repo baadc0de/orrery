@@ -36,8 +36,18 @@
 //! `total_bad_body` and no seated attempt could hold its own clauses. #962 fixed
 //! that, and the flag is gone: the host is now held to every criterion clause on
 //! a seated, witnessed, impaired run, and `total_bad_body == 0` is asserted
-//! rather than merely printed. What still fails the leg intermittently is #963,
-//! and the failure path names it.
+//! rather than merely printed.
+//!
+//! **This leg is what found #963, and the counters it prints are what diagnosed
+//! it.** Two of nine runs were refused for observation coverage — 0.7489 and
+//! 0.9224 — with `judged_ticks` identical in every run and only `shown_ticks`
+//! moving. Neither failing run had a live join: both seats bound in the lobby,
+//! exactly as the passing runs did. What differed was the gap between the two
+//! seats' *goodbyes* — six ticks in a failing run against four in a passing one
+//! — because a seat's release marks membership changed, and the refresh that
+//! followed armed host-side watches against the seat that stayed using its
+//! tick-zero lobby anchor. See `Swarm::refresh_live_witnesses` for the
+//! mechanism and `swarm::tests` for the unit-level pin.
 
 #![allow(missing_docs)]
 
@@ -277,12 +287,15 @@ fn a_real_host_report_banks_human_and_bot_hours_through_the_real_ledger() {
         .args([
             "--peers",
             &BOTS.to_string(),
-            // Exactly as many exterior slots as seats that will be filled.
-            // An island sized for seats nobody occupies arms witness watches on
-            // them, and a watch that never folds a frame is shown timeline it
-            // never judges: two spare slots out of eight cost exactly a quarter
-            // of the attempt's observation coverage, which the accounting then
-            // refuses — correctly — as a blind witness.
+            // Exactly as many exterior slots as seats that will be filled, so
+            // the island the bots are dealt into is the island that plays.
+            //
+            // An earlier note here blamed the coverage refusal on spare slots
+            // arming watches. That does not hold at this commit: an unoccupied
+            // slot never enters `Swarm::exteriors`, so nothing can be armed
+            // against it. The refusal was #963 — a *released* seat triggering
+            // a re-arm against a surviving one — and it reproduced at
+            // `--external-slots 2` with every slot filled.
             "--external-slots",
             "2",
             // Long enough for two Bevy processes to boot and complete their
@@ -367,20 +380,27 @@ fn a_real_host_report_banks_human_and_bot_hours_through_the_real_ledger() {
             std::fs::read_to_string(&host_err_path).unwrap_or_default()
         );
         // The report is written before the criterion is judged, so a failing
-        // host still leaves the evidence that says *why*. #963 is the clause
-        // this leg trips: an exterior is intermittently armed as a host-side
-        // watcher of every bot, folds nothing, and takes observation coverage
-        // to exactly 3/4. Naming it here is the difference between a diagnosis
-        // and "the host failed" — and since #961 landed it is the only clause
-        // between this seam and a banked hour.
+        // host still leaves the evidence that says *why*. Naming the clause
+        // here is the difference between a diagnosis and "the host failed".
+        //
+        // #963 was the clause this leg tripped: a seat's release re-armed
+        // host-side watches against the seat that stayed, using a lobby anchor
+        // thousands of ticks stale, so each such watch was shown its subject's
+        // whole timeline and judged none of it. It is fixed, and this assertion
+        // stays as its live guard — the unit test pins the arming decision, and
+        // only three real processes can prove the timing race is gone.
         if let Ok(raw) = std::fs::read(&report_path) {
             if let Ok(partial) = serde_json::from_slice::<serde_json::Value>(&raw) {
                 let coverage = partial["observation_coverage"].as_f64().unwrap_or(1.0);
                 assert!(
                     coverage >= 0.95,
-                    "observation coverage {coverage:.4}: an exterior was armed as a \
-                     watcher that folded nothing (#963), not a failure of the \
-                     accounting seam. total_bad_body {} and total_undecodable {} — \
+                    "observation coverage {coverage:.4}: a host-side watch was \
+                     shown timeline it never judged, which is #963's shape and not \
+                     a failure of the accounting seam. Read the host's \
+                     'watches never folded a frame' line beside its 'live seat N \
+                     released at tick T' lines: if a watch was armed against a seat \
+                     that was still connected when another left, #963 has \
+                     regressed. total_bad_body {} and total_undecodable {} — \
                      neither #961 nor #964 is in play here.",
                     partial["total_bad_body"],
                     partial["total_undecodable"],
