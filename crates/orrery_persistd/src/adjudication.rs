@@ -1707,6 +1707,78 @@ mod tests {
         assert_eq!(ramp.cohort.coverage, None);
     }
 
+    /// The armed/natural split is what lets a promotion reviewer tell "would
+    /// have refused 40 honest players" from "would have refused 40 cheats", so
+    /// the C5 meter must score would-be filings against *either* half of the
+    /// cohort — an armed-honest subject and a naturally-honest reporter alike
+    /// — and none against an account outside it. A counter that only scored
+    /// the armed half would certify harness traffic and stay silent about the
+    /// players clause (e) actually protects.
+    #[test]
+    fn c5_meter_scores_the_natural_half_of_the_cohort_too() {
+        let against_armed = report();
+        let against_outside =
+            orrery_witness::sign_report(&key(2), key(3).public(), bundle(V1.id()));
+        let armed = AccountId(81);
+        let natural = AccountId(82);
+        let outside = AccountId(89);
+        let ledger = Arc::new(MemStrikeLedger::new());
+        ledger.bind(against_armed.subject, armed);
+        // An `EvidenceForged` verdict files against the *reporter*, so binding
+        // the reporter into the cohort's natural half makes that filing a
+        // would-be action against a natural-honest member.
+        ledger.bind(against_armed.reporter, natural);
+        ledger.bind(against_outside.subject, outside);
+        let meter = Arc::new(RampMeter::new("strikes"));
+        let executor = filing_executor(Arc::clone(&ledger), StrikeMode::Shadow)
+            .with_strike_ramp_meter(Arc::clone(&meter));
+
+        executor.file_report_verdict(
+            &against_armed,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+        );
+        executor.file_report_verdict(
+            &against_armed,
+            Verdict::EvidenceForged(orrery_protocol::ForgeryProof::ClaimSignatureInvalid),
+        );
+        executor.file_report_verdict(
+            &against_outside,
+            Verdict::Confirms {
+                at: Tick::new(1),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+        );
+
+        assert_eq!(ledger.rows(armed).len(), 1);
+        assert_eq!(ledger.rows(natural).len(), 1);
+        assert_eq!(ledger.rows(outside).len(), 1);
+
+        let mut cohort = crate::intent::HonestCohort::new();
+        cohort.arm(armed);
+        cohort.sample(natural);
+        let ramp = meter.snapshot(&cohort);
+        assert_eq!(ramp.cohort.armed, 1, "the halves are reported separately");
+        assert_eq!(ramp.cohort.natural, 1);
+        assert_eq!(ramp.cohort.size, 2);
+        assert_eq!(
+            ramp.cohort.fp_count, 2,
+            "a would-be filing against either half of H is a false positive; \
+             the account outside H is not"
+        );
+        assert_eq!(ramp.cohort.accounts_would_act, 2);
+        assert_eq!(ramp.cohort.by_cause.get("deviation"), Some(&1));
+        assert_eq!(ramp.cohort.by_cause.get("evidence_forged"), Some(&1));
+        assert_eq!(ramp.qualifying, 3);
+        assert_eq!(
+            ramp.would_act, 3,
+            "the account outside H still counts fleet-wide"
+        );
+        assert_eq!(ramp.cohort.coverage, Some(1.0));
+    }
+
     #[test]
     fn resubmitting_the_same_evidence_does_not_stack_weight() {
         let report = report();

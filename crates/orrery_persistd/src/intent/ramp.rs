@@ -54,9 +54,18 @@
 //! The same meter now consumes **C1** attestation observations, **C2**
 //! quarantined-intent incidence, **C4** correction evaluations and **C5**
 //! strike-ledger filing results. Each mechanism supplies the account before a
-//! snapshot joins it to [`HonestCohort`]. **C3** remains absent: there is no
-//! write-refusal or compensating-write observation seam to meter, and a raw
-//! annulment-shaped count would not be clause (e) evidence.
+//! snapshot joins it to [`HonestCohort`]. **C3** remains absent, for reasons
+//! specific enough to check against the tree: its shadow evaluation computes a
+//! refusal set (pending intents) plus an annulment set (journaled effects,
+//! inverse ops computed), and no seam can produce either. The control has no
+//! enforcement machinery to shadow — no posture type, no poller, no evaluation
+//! path — so there is no C3 predicate to meter; the verdict seam where C4 and
+//! C5 meter has no join to the write machinery that would compute those sets;
+//! and the store exposes no per-account journaled-effects surface to size them
+//! from. The annulment machinery that does exist — D29's deadline-expiry and
+//! spot-replay sweep — is the always-on fail-closed path clause (h) excludes
+//! from the ramp, so an annulment-shaped count would fabricate C3 evidence
+//! rather than measure it.
 //!
 //! Two dimensions D32 and [#221] ask for are **not** here, and are named rather
 //! than approximated:
@@ -1075,8 +1084,16 @@ impl RampArtifact {
 pub fn absent_controls() -> Vec<AbsentControl> {
     [(
         "write_annulment",
-        "D32 clause (d): C3 has no write-refusal or compensating-write observation seam, \
-             so neither qualifying honest activity nor would-be annulments can be measured.",
+        "D32 clause (d): C3's shadow evaluation computes a refusal set (pending intents) \
+             plus an annulment set (journaled effects, inverse ops computed), and no seam \
+             can produce either, so neither qualifying honest activity nor would-be \
+             annulments can be measured. The control has no enforcement machinery to \
+             shadow — no posture type, no poller, no evaluation path; the verdict seam \
+             where C4 and C5 meter has no join to the write machinery that would compute \
+             those sets; and the store exposes no per-account journaled-effects surface \
+             to size them from. D29's annulment sweep is the always-on fail-closed path \
+             clause (h) excludes from the ramp, so an annulment-shaped count would \
+             fabricate C3 evidence rather than measure it.",
     )]
     .into_iter()
     .map(|(control, reason)| AbsentControl {
@@ -1316,6 +1333,53 @@ mod tests {
         assert_eq!(cohort.len(), 2);
     }
 
+    /// A would-be action against *either* half of `H` is a false positive
+    /// against it, and one against an account in neither half is not.
+    ///
+    /// The armed/natural split is the whole point of the cohort: it is what
+    /// lets an operator tell "would have refused 40 honest players" from
+    /// "would have refused 40 cheats", and the halves are reported separately
+    /// so a promotion reviewer can tell a hundred bots from a hundred players.
+    /// Every control this module meters scores over the union — a natural
+    /// member's would-act is exactly as disqualifying as an armed one — so the
+    /// split must survive the snapshot for every control seam, not just the
+    /// fixture meter.
+    #[test]
+    fn a_would_act_by_any_cohort_half_reaches_fp_count() {
+        let armed = AccountId::new(31);
+        let natural = AccountId::new(32);
+        let outside = AccountId::new(39);
+        let mut cohort = HonestCohort::new();
+        cohort.arm(armed);
+        cohort.sample(natural);
+
+        let meter = RampMeter::new(ATTESTATION_QUORUM_CONTROL);
+        let refusal = ShadowVerdict::WouldRefuse(RejectionCause::ThresholdNotMet);
+        for (account, at_ms) in [(armed, 1_000), (natural, 1_001), (outside, 1_002)] {
+            meter.record_qualifying(Some(account));
+            meter.record(obs(Some(account.0), refusal, at_ms));
+        }
+
+        let snapshot = meter.snapshot(&cohort);
+        assert_eq!(
+            snapshot.cohort.armed, 1,
+            "the halves are reported separately"
+        );
+        assert_eq!(snapshot.cohort.natural, 1);
+        assert_eq!(snapshot.cohort.size, 2);
+        assert_eq!(
+            snapshot.cohort.fp_count, 2,
+            "the armed member's and the natural member's would-acts both count; \
+             the account outside H does not"
+        );
+        assert_eq!(snapshot.cohort.accounts_would_act, 2);
+        assert_eq!(
+            snapshot.would_act, 3,
+            "the outside account's would-act still counts fleet-wide"
+        );
+        assert_eq!(snapshot.cohort.coverage, Some(1.0));
+    }
+
     /// The artifact round-trips, and enumerates all five of clause (c)'s
     /// controls between `controls` and `absent`.
     #[test]
@@ -1352,9 +1416,22 @@ mod tests {
         let absent = absent_controls();
         assert_eq!(absent.len(), 1);
         assert_eq!(absent[0].control, "write_annulment");
-        assert!(absent[0].reason.contains("no write-refusal"));
-        assert!(absent[0].reason.contains("compensating-write"));
+        // The reason is what an operator reads in the artifact, so it carries
+        // each specific missing seam rather than a summary: what C3's shadow
+        // would compute, why neither half of it is computable today, and why
+        // the annulment count that does exist must not stand in for it.
+        assert!(absent[0].reason.contains("refusal set"));
+        assert!(absent[0].reason.contains("pending intents"));
+        assert!(absent[0].reason.contains("annulment set"));
+        assert!(absent[0].reason.contains("journaled effects"));
+        assert!(absent[0].reason.contains("no posture type"));
+        assert!(absent[0].reason.contains("no poller"));
+        assert!(absent[0].reason.contains("no evaluation path"));
+        assert!(absent[0].reason.contains("verdict seam"));
+        assert!(absent[0].reason.contains("per-account journaled-effects"));
         assert!(absent[0].reason.contains("qualifying honest activity"));
         assert!(absent[0].reason.contains("would-be annulments"));
+        assert!(absent[0].reason.contains("clause (h)"));
+        assert!(absent[0].reason.contains("fabricate C3 evidence"));
     }
 }
