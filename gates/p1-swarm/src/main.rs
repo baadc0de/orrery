@@ -711,14 +711,23 @@ fn decode_join_anchor(
         .transpose()
 }
 
+/// Hold the seat a live joiner asked for, or say it is already taken.
+///
+/// The hold is published, so admission counts the seat taken for as long as
+/// this host is holding a connection for it rather than for the arrival lease
+/// alone (#1016). Every way out of the handshake that is not a bind therefore
+/// has to give the hold back — see [`abandon_live_join`].
 fn reserve_live_join(
     live: &mut swarm::LiveMembership,
     slot: usize,
-) -> Option<(String, u64, Vec<ConnectedSeat>)> {
-    if live.active.contains_key(&slot) || !live.pending.insert(slot) {
-        return None;
+) -> Result<Option<(String, u64, Vec<ConnectedSeat>)>> {
+    if !live
+        .hold_pending(slot)
+        .context("publish the held seat for a live join")?
+    {
+        return Ok(None);
     }
-    Some((
+    Ok(Some((
         live.attempt_id.clone(),
         live.tick,
         live.active
@@ -728,7 +737,55 @@ fn reserve_live_join(
                 node: binding.node,
             })
             .collect(),
-    ))
+    )))
+}
+
+/// Give back a seat held for a live join that will never bind.
+///
+/// The caller is already returning the reason the join failed, and that reason
+/// is the one worth propagating: a republication that also fails is an
+/// operator's line, not a replacement diagnosis. What must not happen is the
+/// hold outliving the handshake — admission would keep the seat for a
+/// connection that is gone.
+fn abandon_live_join(membership: &Arc<Mutex<swarm::LiveMembership>>, slot: usize) {
+    if let Err(error) = membership
+        .lock()
+        .expect("membership lock")
+        .drop_pending(slot)
+    {
+        eprintln!(
+            "gates/p1-swarm: seat {slot} could not be given back after a failed live join: \
+             {error:#}"
+        );
+    }
+}
+
+/// Seat one lobby arrival, or say its slot is already taken.
+///
+/// Two readers have to agree about a lobby seat, and this is where they are
+/// made to: `pending`, which is what `StartV1` will be authored from, and the
+/// published feed, which is what admission offers seats out of. Before #1016
+/// only the first of them knew about a seat waiting in the lobby, so admission
+/// re-offered it once its arrival lease ran out and the host then refused the
+/// second dialler with `reservation_slot_occupied` — correctly, and for a
+/// reason neither volunteer could act on.
+fn seat_lobby_arrival<P: LobbyPeer>(
+    pending: &[P],
+    slot: usize,
+    membership: Option<&Arc<Mutex<swarm::LiveMembership>>>,
+) -> Result<bool> {
+    if pending.iter().any(|peer| peer.index() == slot) {
+        return Ok(false);
+    }
+    let Some(live) = membership else {
+        return Ok(true);
+    };
+    let held = live
+        .lock()
+        .expect("membership lock")
+        .hold_pending(slot)
+        .context("publish the held seat for a lobby arrival")?;
+    Ok(held)
 }
 
 /// Bind one seat, and stop calling its session released if it was.
@@ -1133,7 +1190,7 @@ async fn accept_live_join(
     }
     let snapshot = {
         let mut live = membership.lock().expect("membership lock");
-        reserve_live_join(&mut live, slot)
+        reserve_live_join(&mut live, slot)?
     };
     let Some((attempt_id, tick, mut connected)) = snapshot else {
         let _ = prepared
@@ -1162,11 +1219,7 @@ async fn accept_live_join(
     let manifest = match manifest {
         Ok(manifest) => manifest,
         Err(error) => {
-            membership
-                .lock()
-                .expect("membership lock")
-                .pending
-                .remove(&slot);
+            abandon_live_join(membership, slot);
             return Err(error);
         }
     };
@@ -1174,22 +1227,14 @@ async fn accept_live_join(
     let (link, anchor, joined_node, joined_slot) = match finished {
         Ok(joined) => joined,
         Err(error) => {
-            membership
-                .lock()
-                .expect("membership lock")
-                .pending
-                .remove(&slot);
+            abandon_live_join(membership, slot);
             return Err(error);
         }
     };
     let anchor = match decode_join_anchor(anchor) {
         Ok(anchor) => anchor,
         Err(error) => {
-            membership
-                .lock()
-                .expect("membership lock")
-                .pending
-                .remove(&slot);
+            abandon_live_join(membership, slot);
             return Err(error);
         }
     };
@@ -1472,6 +1517,14 @@ fn main() -> Result<()> {
                     let _ = prepared.refuse(reason).await;
                     continue;
                 }
+                if !seat_lobby_arrival(&pending, prepared.index(), membership.as_ref())? {
+                    let reason = format!(
+                        "reservation_slot_occupied: slot {} is already bound",
+                        prepared.index()
+                    );
+                    let _ = prepared.refuse(reason).await;
+                    continue;
+                }
                 eprintln!(
                     "gates/p1-swarm: reservation seat {} connected as {}",
                     prepared.index(),
@@ -1539,10 +1592,7 @@ fn main() -> Result<()> {
                     let _ = prepared.refuse(reason).await;
                     continue;
                 }
-                if pending
-                    .iter()
-                    .any(|joined: &bridge::PendingJoin| joined.index() == prepared.index())
-                {
+                if !seat_lobby_arrival(&pending, prepared.index(), membership.as_ref())? {
                     let reason = format!(
                         "reservation_slot_occupied: slot {} is already bound",
                         prepared.index()
@@ -2185,8 +2235,9 @@ mod session_geometry_tests {
         )
         .expect("live seat binding records");
 
-        let (_, _, inherited) =
-            reserve_live_join(&mut membership, 6).expect("next live join reserves its slot");
+        let (_, _, inherited) = reserve_live_join(&mut membership, 6)
+            .expect("holding the slot publishes")
+            .expect("next live join reserves its slot");
         assert_eq!(
             inherited.iter().map(|seat| seat.slot).collect::<Vec<_>>(),
             vec![5],
@@ -2376,6 +2427,45 @@ mod start_join_tests {
             }
         }
 
+        /// A harness whose membership publishes to a real file, so a test can
+        /// read the same feed `scripts/admission.py` reads.
+        fn publishing() -> (Self, std::path::PathBuf) {
+            let directory = std::env::temp_dir().join(format!(
+                "p1-lobby-feed-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("test clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&directory).expect("temp dir");
+            let path = directory.join("active-seats.json");
+            let harness = Self::new();
+            harness
+                .membership
+                .lock()
+                .expect("membership lock")
+                .path
+                .clone_from(&Some(path.clone()));
+            (harness, path)
+        }
+
+        /// Slots the published feed names as held-but-unbound, and as bound.
+        fn feed(path: &std::path::Path) -> (Vec<usize>, Vec<usize>) {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).expect("feed written"))
+                    .expect("feed parses");
+            let slots = |key: &str| -> Vec<usize> {
+                value[key]
+                    .as_array()
+                    .expect("the feed names a slot list")
+                    .iter()
+                    .map(|slot| slot.as_u64().expect("a slot is a number") as usize)
+                    .collect()
+            };
+            (slots("pending_slots"), slots("active_slots"))
+        }
+
         fn peer(&self, slot: usize, failure: Option<&'static str>) -> FakeJoin {
             FakeJoin {
                 slot,
@@ -2460,6 +2550,97 @@ mod start_join_tests {
     /// and eighteen `EXTERIOR_MAX_IDLE_TIMEOUT` windows. It costs microseconds
     /// here because the seam is the beat, not the clock.
     const A_THREE_MINUTE_LOBBY: usize = 90;
+
+    #[tokio::test]
+    async fn a_volunteer_who_waits_out_the_arrival_lease_keeps_their_seat_and_starts() {
+        // #1016. A lobby runs `lobby_seconds` (180 s) and admission's arrival
+        // lease is 45 s, so the ordinary case -- arriving early and waiting for
+        // the run to fill -- used to make the seat invisible to admission a
+        // quarter of the way in. The bound is a parameter of the sweep here,
+        // not a clock: `A_THREE_MINUTE_LOBBY` beats is four arrival leases,
+        // and it costs microseconds because the seam is the beat.
+        let (harness, path) = StartHarness::publishing();
+        let mut lobby = vec![harness.peer(5, None)];
+        assert!(
+            seat_lobby_arrival(&[] as &[FakeJoin], 5, Some(&harness.membership))
+                .expect("the held seat publishes"),
+            "the first arrival takes the seat admission reserved for it"
+        );
+        assert_eq!(
+            StartHarness::feed(&path),
+            (vec![5], vec![]),
+            "the seat is held from the moment the host has a connection for it"
+        );
+
+        for _ in 0..A_THREE_MINUTE_LOBBY {
+            assert_eq!(
+                sweep_lobby(&mut lobby, 2, Some(&harness.membership), SWEPT_AT)
+                    .await
+                    .expect("the lobby sweep publishes"),
+                0,
+                "a peer that keeps answering is never given back"
+            );
+        }
+        assert_eq!(
+            StartHarness::feed(&path),
+            (vec![5], vec![]),
+            "four arrival leases into the lobby the seat is still visibly held"
+        );
+
+        // The defect's second victim: while the first volunteer holds the
+        // seat, the next dialler must be offered a different one by admission
+        // rather than sent at this one and refused by the host.
+        assert!(
+            !seat_lobby_arrival(&lobby, 5, Some(&harness.membership))
+                .expect("a refused arrival publishes nothing"),
+            "a held seat is not re-offered while its volunteer is sitting in it"
+        );
+
+        let finished = finish_start_joins(lobby, &roster(), Some(&harness.membership), SWEPT_AT)
+            .await
+            .expect("the waiting volunteer starts");
+        assert_eq!(finished.len(), 1, "the volunteer who waited is in the run");
+        assert_eq!(
+            StartHarness::feed(&path),
+            (vec![], vec![5]),
+            "a bound seat leaves the held set in the same publication that binds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_seat_whose_volunteer_stops_answering_is_given_back() {
+        // The other direction, and the reason the fix is not "hold the seat
+        // longer". A seat is held for exactly as long as the host has a
+        // connection for it; the moment the heartbeat stops landing the seat
+        // goes back to admission, which is what #996 and #1001 exist to keep
+        // true. A reservation the host never saw a connection for is never
+        // held here at all, and its arrival lease frees it as it always did.
+        let (harness, path) = StartHarness::publishing();
+        assert!(
+            seat_lobby_arrival(&[] as &[FakeJoin], 6, Some(&harness.membership))
+                .expect("the held seat publishes")
+        );
+        let mut lobby = vec![harness.fading_peer(6, 2)];
+
+        let mut lost = 0;
+        for _ in 0..A_THREE_MINUTE_LOBBY {
+            lost += sweep_lobby(&mut lobby, 2, Some(&harness.membership), SWEPT_AT)
+                .await
+                .expect("the lobby sweep publishes");
+        }
+        assert_eq!(lost, 1, "the peer that stopped answering was given back");
+        assert!(lobby.is_empty());
+        assert_eq!(
+            StartHarness::feed(&path),
+            (vec![], vec![]),
+            "a seat nobody is arriving to is held by nothing at all"
+        );
+        assert!(
+            seat_lobby_arrival(&lobby, 6, Some(&harness.membership))
+                .expect("the reopened seat publishes"),
+            "the freed seat is available to the next arrival"
+        );
+    }
 
     #[tokio::test]
     async fn a_reachable_peer_waits_out_a_long_lobby_and_still_starts() {
