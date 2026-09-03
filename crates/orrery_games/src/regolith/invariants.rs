@@ -3,8 +3,8 @@ use super::{
     state::{Craft, CraftSection, RegolithState, Rock, RockSection, PITCH_LIMIT_URAD, TAU_URAD},
     weapon::WeaponKind,
     BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_MAX_LIVE_ROCKS, DRAG_PER_SEC_PER_MILLE,
-    ISLAND_CRAFT_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, LOCK_ACQUISITION_TICKS,
-    RESPAWN_TICKS,
+    ISLAND_BOUNDARY_MM, ISLAND_CRAFT_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
+    LOCK_ACQUISITION_TICKS, RESPAWN_TICKS, TETHER_DRAG_PER_SEC_PER_MILLE,
 };
 use orrery_core::invariants::checks;
 use orrery_core::{
@@ -105,9 +105,20 @@ fn acceleration_cap(sample: &InvariantSample<'_, Craft>) -> Result<(), Invariant
         return Ok(());
     }
     let limits = current.archetype.limits();
-    let per_tick = limits.max_accel_mmss / TICKS_PER_SEC
+    let mut per_tick = limits.max_accel_mmss / TICKS_PER_SEC
         + limits.max_speed_mms * DRAG_PER_SEC_PER_MILLE / (1_000 * TICKS_PER_SEC)
         + VEL_MARGIN_MMS;
+    // The tether (#955) is a second drag, and a craft outside the island can
+    // shed velocity faster than thrust and ordinary drag together explain. The
+    // allowance is granted *only* where the tether can act, because this bound
+    // is a cheat-detection surface: widening it everywhere would buy the
+    // anchor at the price of every impossible acceleration inside the island,
+    // which is where all the play is. `previous` is the position the tether
+    // read on the tick that produced `current`, so it is the honest witness to
+    // whether the tether could have been running.
+    if outside_the_island(previous.pos) {
+        per_tick += limits.max_speed_mms * TETHER_DRAG_PER_SEC_PER_MILLE / (1_000 * TICKS_PER_SEC);
+    }
     if checks::exceeds_acceleration(previous.vel, current.vel, sample.elapsed_ticks, per_tick) {
         Err(InvariantViolation::new(
             InvariantKind::AccelerationCap,
@@ -117,6 +128,18 @@ fn acceleration_cap(sample: &InvariantSample<'_, Craft>) -> Result<(), Invariant
         Ok(())
     }
 }
+/// Whether a craft is outside the square island edge on any axis.
+///
+/// The same per-axis box test [`super::craft::apply_tether`] applies, and
+/// deliberately the same shape as the rock reflection at
+/// [`ISLAND_BOUNDARY_MM`]: a radius here would be a second, disagreeing
+/// definition of one boundary.
+fn outside_the_island(pos: orrery_core::QPos) -> bool {
+    pos.x.unsigned_abs() > ISLAND_BOUNDARY_MM as u64
+        || pos.y.unsigned_abs() > ISLAND_BOUNDARY_MM as u64
+        || pos.z.unsigned_abs() > ISLAND_BOUNDARY_MM as u64
+}
+
 fn teleport(sample: &InvariantSample<'_, RegolithState>) -> Result<(), InvariantViolation> {
     let Some(previous) = sample.previous else {
         return Ok(());

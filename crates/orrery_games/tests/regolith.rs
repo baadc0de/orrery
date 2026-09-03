@@ -23,10 +23,11 @@ use orrery_games::regolith::{
     weapon::{WeaponKind, MAX_WEAPON_REACH_MM},
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
     CAMPAIGN_CELL_EDGE_M, CAMPAIGN_MIN_CELL_EDGE_M, CAMPAIGN_ROCK_COUNT, DRAG_PER_SEC_PER_MILLE,
-    ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
-    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS,
-    LOCK_DECAY_PER_TICK, MAX_ENGAGEMENT_RANGE_MM, MAX_NEIGHBOR_READS, MAX_TARGET_RADIUS_MM,
-    PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
+    ISLAND_BOUNDARY_MM, ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET,
+    ISLAND_ROCK_BUDGET, ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS,
+    LOCK_BREAK_TICKS, LOCK_DECAY_PER_TICK, MAX_ENGAGEMENT_RANGE_MM, MAX_NEIGHBOR_READS,
+    MAX_TARGET_RADIUS_MM, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
+    TETHER_BAND_MM, TETHER_DRAG_PER_SEC_PER_MILLE, TETHER_ESCAPE_SPEED_MMS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -475,7 +476,7 @@ fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
 
 #[test]
 fn v24_ecs_craft_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 24);
+    assert_eq!(REGOLITH_RULESET.version, 25);
     assert_eq!(
         PITCH_LIMIT_URAD, 1_570_796,
         "a quarter turn either side of level, on the micro-radian lattice"
@@ -3200,4 +3201,165 @@ fn a_section_lifted_check_runs_on_its_own_section_and_passes_every_other() {
             "a motionless section passes every lifted check",
         );
     }
+}
+
+// ── the island tether (#955) ────────────────────────────────────────────
+
+/// Flies one interceptor straight out along +X at full throttle from `start`,
+/// and reports its position and velocity after `ticks`.
+fn burn_outward(start_mm: i64, ticks: u64) -> (QPos, QVel) {
+    let entity = PersistId::new(1);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x95; 32]));
+    executor.insert(entity, RegolithState::Craft(craft_at(start_mm)));
+    let thrust = Order::Thrust {
+        accel_mmss: Archetype::Interceptor.limits().max_accel_mmss as i32,
+        yaw_urad: 0,
+        pitch_urad: 0,
+    };
+    for tick in 1..=ticks {
+        executor
+            .step_entity(entity, Tick::new(tick), core::slice::from_ref(&thrust))
+            .expect("craft exists");
+    }
+    match executor.state(entity) {
+        Some(RegolithState::Craft(craft)) => (craft.pos, craft.vel),
+        _ => panic!("craft remains a craft"),
+    }
+}
+
+/// One tick for a craft placed at `start_mm` with velocity `vel`, no thrust.
+fn coast_one_tick(start_mm: i64, vel: QVel) -> QVel {
+    let entity = PersistId::new(1);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x95; 32]));
+    let mut craft = craft_at(start_mm);
+    craft.vel = vel;
+    executor.insert(entity, RegolithState::Craft(craft));
+    let coast = Order::Thrust {
+        accel_mmss: 0,
+        yaw_urad: 0,
+        pitch_urad: 0,
+    };
+    executor
+        .step_entity(entity, Tick::new(1), core::slice::from_ref(&coast))
+        .expect("craft exists");
+    match executor.state(entity) {
+        Some(RegolithState::Craft(craft)) => craft.vel,
+        _ => panic!("craft remains a craft"),
+    }
+}
+
+/// #955's headline: held throttle must stop being a way to leave by accident.
+///
+/// The measured failure was that the interest block is 1536 m across and the
+/// interceptor ceiling is 480 m/s, so a few seconds of held throttle carried
+/// the 2026-09-02 volunteer out of the populated volume and spent the rest of
+/// their session witnessing an empty region. Untethered, one minute of that
+/// throttle covers well over twenty kilometres.
+#[test]
+fn held_throttle_settles_at_the_tether_escape_speed_instead_of_the_chassis_ceiling() {
+    let limits = Archetype::Interceptor.limits();
+    let (pos, vel) = burn_outward(0, u64::from(TICK_HZ) * 60);
+
+    assert!(
+        vel.x <= TETHER_ESCAPE_SPEED_MMS + 1_000,
+        "a fully tethered interceptor at full throttle must settle at about \
+         {TETHER_ESCAPE_SPEED_MMS} mm/s, not its {} mm/s ceiling; got {} mm/s",
+        limits.max_speed_mms,
+        vel.x
+    );
+
+    // Untethered, a minute of this burn is roughly 27 km. The bound below is
+    // deliberately far looser than the tether's own answer (~3.7 km) and still
+    // an order of magnitude tighter than the behaviour it replaces.
+    assert!(
+        pos.x < 8 * ISLAND_BOUNDARY_MM,
+        "a minute of held throttle must not carry a craft eight island-widths \
+         out; got {} mm",
+        pos.x
+    );
+
+    // But leaving is still a *choice*, not an impossibility: the craft is
+    // outside, still moving out, and was never stopped or turned around.
+    assert!(
+        pos.x > ISLAND_BOUNDARY_MM,
+        "the tether must not be a wall — a determined pilot still crosses the \
+         island edge; got {} mm",
+        pos.x
+    );
+    assert!(
+        vel.x > 0,
+        "the tether must never reverse a craft; got {}",
+        vel.x
+    );
+}
+
+/// One coasting tick under ordinary drag alone, in millimetres per second.
+///
+/// Stated as arithmetic rather than as "whatever a craft inside the island
+/// does", because a comparison against a live baseline is satisfied by a
+/// tether that wrongly acts on *both* craft — a mutation that acted
+/// everywhere and in both directions passed the comparison phrasing of these
+/// two tests and was invisible until they were rewritten this way.
+fn pure_drag_mms(vel_mms: i64) -> i64 {
+    let retained = 1.0 - (DRAG_PER_SEC_PER_MILLE as f64 / 1_000.0) / f64::from(TICK_HZ);
+    (vel_mms as f64 * retained) as i64
+}
+
+/// The tether is a restoring force and not a cage: inward flight is untouched.
+#[test]
+fn a_craft_flying_home_is_unimpeded_outside_the_island() {
+    let ceiling = Archetype::Interceptor.limits().max_speed_mms;
+    let inward = QVel {
+        x: -ceiling,
+        y: 0,
+        z: 0,
+    };
+    let deep_outside = ISLAND_BOUNDARY_MM + TETHER_BAND_MM * 4;
+    assert_eq!(
+        coast_one_tick(deep_outside, inward).x,
+        pure_drag_mms(-ceiling),
+        "a craft pointed home must lose exactly ordinary drag and nothing more,          however far outside the island it is"
+    );
+}
+
+/// Nothing changes for the play the campaign is actually about.
+#[test]
+fn the_tether_is_inert_inside_the_island() {
+    let ceiling = Archetype::Interceptor.limits().max_speed_mms;
+    let outward = QVel {
+        x: ceiling,
+        y: 0,
+        z: 0,
+    };
+    // On the edge itself, not merely near it: the boundary is exclusive, the
+    // same way `world::drift` reflects a rock only once it is past the edge.
+    for start in [0, ISLAND_BOUNDARY_MM / 2, ISLAND_BOUNDARY_MM] {
+        assert_eq!(
+            coast_one_tick(start, outward).x,
+            pure_drag_mms(ceiling),
+            "the island's own volume must fly exactly as it did before #955;              failed at {start} mm"
+        );
+    }
+}
+
+/// The tether's numbers are derived, and the derivation is the pin.
+#[test]
+fn v25_tether_constants_are_derived_from_the_island_and_the_bloom_cadence() {
+    assert_eq!(REGOLITH_RULESET.version, 25);
+    assert_eq!(
+        TETHER_BAND_MM as f64,
+        CAMPAIGN_CELL_EDGE_M * 1_000.0,
+        "the ramp band is one interest cell edge"
+    );
+    assert_eq!(
+        TETHER_ESCAPE_SPEED_MMS,
+        ISLAND_BOUNDARY_MM * 2 / (BLOOM_CADENCE_TICKS as i64 / TICK_HZ as i64),
+        "the escape speed is one island diameter per bloom cadence"
+    );
+    assert_eq!(TETHER_ESCAPE_SPEED_MMS, 33_333);
+    assert_eq!(TETHER_DRAG_PER_SEC_PER_MILLE, 1_750);
+    assert!(
+        TETHER_DRAG_PER_SEC_PER_MILLE > DRAG_PER_SEC_PER_MILLE,
+        "a tether weaker than ordinary drag would anchor nothing"
+    );
 }

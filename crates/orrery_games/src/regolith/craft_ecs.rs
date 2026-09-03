@@ -74,10 +74,11 @@ craft_adapter!(craft_apply_orders, &craft::CONTROL[3]);
 craft_adapter!(craft_resolve_lock_reply, &craft::CONTROL[4]);
 craft_adapter!(craft_clamp_speed, &craft::MOTION[0]);
 craft_adapter!(craft_apply_drag, &craft::MOTION[1]);
-craft_adapter!(craft_integrate, &craft::MOTION[2]);
-craft_adapter!(craft_respawn, &craft::MOTION[3]);
-craft_adapter!(craft_store_kinematics, &craft::MOTION[4]);
-craft_adapter!(craft_advance_trail, &craft::MOTION[5]);
+craft_adapter!(craft_apply_tether, &craft::MOTION[2]);
+craft_adapter!(craft_integrate, &craft::MOTION[3]);
+craft_adapter!(craft_respawn, &craft::MOTION[4]);
+craft_adapter!(craft_store_kinematics, &craft::MOTION[5]);
+craft_adapter!(craft_advance_trail, &craft::MOTION[6]);
 craft_adapter!(craft_apply_cover_claim, &CLAIMS_APPLY[0]);
 craft_adapter!(craft_propagate_claim_overflow, &CLAIMS_APPLY[1]);
 craft_adapter!(craft_emit_visibility, &CLAIMS_APPLY[2]);
@@ -98,6 +99,7 @@ fn module_schedule(ordering: Ordering) -> Schedule {
         craft_resolve_lock_reply,
         craft_clamp_speed,
         craft_apply_drag,
+        craft_apply_tether,
         craft_integrate,
         craft_respawn,
         craft_store_kinematics,
