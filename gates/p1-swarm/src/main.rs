@@ -738,6 +738,217 @@ fn record_live_binding(
     Ok(())
 }
 
+/// One completed start handshake: the host end of the link, the peer's join
+/// anchor, and the transport identity and seat it bound.
+type JoinedSeat = (
+    exterior::HostLink,
+    Option<exterior::AnchorFrame>,
+    NodeId,
+    usize,
+);
+
+/// The frozen-lobby shape [`finish_start_joins`] needs from one prepared peer.
+///
+/// [`bridge::PendingJoin`] is the production implementor. The trait exists so
+/// the tests can inject a peer whose `finish` fails: the live failure is a
+/// ten-second `EXTERIOR_MAX_IDLE_TIMEOUT` expiring on a lobby connection that
+/// went quiet minutes earlier (#994), and waiting that out in a test would buy
+/// a slow flaky test rather than coverage.
+trait StartJoin: Sized {
+    /// Admission-authoritative seat this peer holds.
+    fn index(&self) -> usize;
+    /// QUIC-authenticated transport identity.
+    fn remote(&self) -> NodeId;
+    /// Admission session whose reservation authorized the connection.
+    fn session_id(&self) -> Option<&str>;
+    /// Send this peer its `StartV1` and arm its pumps.
+    fn finish(
+        self,
+        manifest: Option<exterior::StartManifest>,
+        wants_anchor: bool,
+    ) -> impl std::future::Future<Output = Result<JoinedSeat>>;
+}
+
+impl StartJoin for bridge::PendingJoin {
+    fn index(&self) -> usize {
+        Self::index(self)
+    }
+
+    fn remote(&self) -> NodeId {
+        Self::remote(self)
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        Self::session_id(self)
+    }
+
+    async fn finish(
+        self,
+        manifest: Option<exterior::StartManifest>,
+        wants_anchor: bool,
+    ) -> Result<JoinedSeat> {
+        Self::finish(self, manifest, wants_anchor).await
+    }
+}
+
+/// Everything the start path needs to author a `StartV1` for a given roster.
+struct StartRoster<'a> {
+    attempt_id: Option<&'a str>,
+    seed: u64,
+    seconds: u64,
+    bot_seats: usize,
+    island_seats: usize,
+    witnessing: bool,
+}
+
+impl StartRoster<'_> {
+    /// The per-seat `StartV1` set for exactly these connected humans, or
+    /// `None` when this run is not attempt-bound and sends no manifest at all.
+    fn manifests(
+        &self,
+        connected: &[ConnectedSeat],
+    ) -> Result<Option<BTreeMap<usize, exterior::StartManifest>>> {
+        self.attempt_id
+            .map(|attempt_id| {
+                build_start_manifests(
+                    attempt_id,
+                    self.seed,
+                    self.seconds,
+                    self.bot_seats,
+                    self.island_seats,
+                    connected,
+                    0,
+                )
+            })
+            .transpose()
+    }
+}
+
+/// Bind every prepared seat, dropping the ones that cannot finish rather than
+/// taking the attempt down with them (#994).
+///
+/// A lobby peer may sit for minutes waiting for the run to fill while
+/// `EXTERIOR_MAX_IDLE_TIMEOUT` is ten seconds, so a stale connection is an
+/// expected outcome here, not an exceptional one. The old loop propagated the
+/// first `finish` error out of `main`: one dead peer dropped every healthy
+/// player, exited the process, and measured nothing for anyone.
+///
+/// Three things follow from dropping a seat instead:
+///
+/// * **The seat is released**, through the one release path
+///   ([`swarm::LiveMembership::release_seat`]), so admission reopens it and the
+///   published feed never names a seat the transport did not admit (#954).
+/// * **The roster is re-authored.** Peers still to be bound receive a `StartV1`
+///   without the dropped seat; peers already bound are sent the corrected
+///   membership on the Meta lane, the same wire shape the live path uses. A
+///   survivor would otherwise spend the whole run broadcasting to — and
+///   expecting witness coverage from — a seat nobody is in.
+/// * **The failure is named.** `seat N dropped at start: <reason>` is what an
+///   operator reads back to the volunteer whose session ended.
+///
+/// The viability rule is "at least one seat bound". The criterion judges the
+/// peers that *attached* — every clause in `Swarm::judge` iterates
+/// `self.external` — so a run with fewer humans is measured by exactly the same
+/// rules, and a seat that never attached is neither a pass nor a failure, it is
+/// absent. What the criterion cannot express is a run with no external peer at
+/// all: it would bank an attempt while measuring nothing about human play,
+/// which is the shape #375 exists to refuse. So that case, and only that case,
+/// fails hard and lets the supervisor open a fresh lobby.
+async fn finish_start_joins<J: StartJoin>(
+    pending: Vec<J>,
+    roster: &StartRoster<'_>,
+    membership: Option<&Arc<Mutex<swarm::LiveMembership>>>,
+) -> Result<Vec<(JoinedSeat, Option<String>)>> {
+    let prepared_seats = pending.len();
+    let mut connected = pending
+        .iter()
+        .map(|join| ConnectedSeat {
+            slot: join.index(),
+            node: join.remote(),
+        })
+        .collect::<Vec<_>>();
+    let mut manifests = roster.manifests(&connected)?;
+    let mut finished: Vec<(JoinedSeat, Option<String>)> = Vec::with_capacity(prepared_seats);
+    let mut dropped = 0usize;
+
+    for prepared in pending {
+        let slot = prepared.index();
+        let session_id = prepared.session_id().map(ToOwned::to_owned);
+        let manifest = manifests
+            .as_ref()
+            .and_then(|by_slot| by_slot.get(&slot))
+            .cloned();
+        let joined = match prepared.finish(manifest, roster.witnessing).await {
+            Ok(joined) => joined,
+            Err(error) => {
+                eprintln!("gates/p1-swarm: seat {slot} dropped at start: {error:#}");
+                dropped += 1;
+                connected.retain(|seat| seat.slot != slot);
+                manifests = roster.manifests(&connected)?;
+                if let (Some(live), Some(session_id)) = (membership, &session_id) {
+                    let mut live = live.lock().expect("membership lock");
+                    live.release_seat(slot, session_id)
+                        .context("republish active seats after a start-path drop")?;
+                }
+                continue;
+            }
+        };
+        if let (Some(live), Some(session_id)) = (membership, &session_id) {
+            let mut live = live.lock().expect("membership lock");
+            record_live_binding(&mut live, joined.3, joined.2, session_id.clone())
+                .context("republish active seats after initial bind")?;
+        }
+        finished.push((joined, session_id));
+    }
+
+    if finished.is_empty() {
+        bail!(
+            "no seat completed its start handshake: all {prepared_seats} prepared peers were \
+             dropped, so the attempt would measure no human play at all"
+        );
+    }
+    if dropped > 0 {
+        eprintln!(
+            "gates/p1-swarm: StartV1 continues with {} of {prepared_seats} prepared seats \
+             ({dropped} dropped)",
+            finished.len()
+        );
+        republish_start_roster(&finished, manifests.as_ref()).await;
+    }
+    Ok(finished)
+}
+
+/// Re-send the corrected `StartV1` to seats bound before a peer was dropped.
+///
+/// Same lane and same JSON as `Swarm::publish_live_manifests_for`; the client
+/// adopts it through the live-membership path it already has. Only the seats
+/// bound *before* the first drop hold a stale roster, but re-sending to all of
+/// them is idempotent and cheaper than tracking which.
+async fn republish_start_roster(
+    finished: &[(JoinedSeat, Option<String>)],
+    manifests: Option<&BTreeMap<usize, exterior::StartManifest>>,
+) {
+    let Some(by_slot) = manifests else {
+        return;
+    };
+    for ((link, _, _, slot), _) in finished {
+        let Some(manifest) = by_slot.get(slot) else {
+            continue;
+        };
+        let frame = exterior::Frame {
+            peer: u32::MAX,
+            lane: exterior::Lane::Meta,
+            payload: bytes::Bytes::from(serde_json::to_vec(manifest).expect("StartV1 serializes")),
+        };
+        if link.downlink.send(frame).await.is_err() {
+            eprintln!(
+                "gates/p1-swarm: seat {slot} could not be sent the corrected start roster; its \
+                 downlink is already gone"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn accept_live_join(
     endpoint: &iroh::Endpoint,
@@ -1151,35 +1362,12 @@ fn main() -> Result<()> {
                 pending.push(prepared);
             }
 
-            let connected = pending
-                .iter()
-                .map(|join| ConnectedSeat {
-                    slot: join.index(),
-                    node: join.remote(),
-                })
-                .collect::<Vec<_>>();
-            let manifests = args
-                .attempt_id
-                .as_deref()
-                .map(|attempt_id| {
-                    build_start_manifests(
-                        attempt_id,
-                        config.seed,
-                        config.seconds,
-                        config.peers,
-                        island_seats,
-                        &connected,
-                        0,
-                    )
-                })
-                .transpose()?;
             eprintln!(
                 "gates/p1-swarm: StartV1 begins with {} active humans across {} seats",
                 pending.len(),
                 island_seats
             );
 
-            let mut finished = Vec::with_capacity(pending.len());
             let membership = args.attempt_id.as_ref().map(|attempt_id| {
                 Arc::new(Mutex::new(swarm::LiveMembership {
                     attempt_id: attempt_id.clone(),
@@ -1191,20 +1379,19 @@ fn main() -> Result<()> {
                     path: args.active_seats_file.clone(),
                 }))
             });
-            for prepared in pending {
-                let session_id = prepared.session_id().map(ToOwned::to_owned);
-                let manifest = manifests
-                    .as_ref()
-                    .and_then(|by_slot| by_slot.get(&prepared.index()))
-                    .cloned();
-                let joined = prepared.finish(manifest, config.witnessing).await?;
-                if let (Some(live), Some(session_id)) = (&membership, &session_id) {
-                    let mut live = live.lock().expect("membership lock");
-                    record_live_binding(&mut live, joined.3, joined.2, session_id.clone())
-                        .context("republish active seats after initial bind")?;
-                }
-                finished.push((joined, session_id));
-            }
+            let finished = finish_start_joins(
+                pending,
+                &StartRoster {
+                    attempt_id: args.attempt_id.as_deref(),
+                    seed: config.seed,
+                    seconds: config.seconds,
+                    bot_seats: config.peers,
+                    island_seats,
+                    witnessing: config.witnessing,
+                },
+                membership.as_ref(),
+            )
+            .await?;
             let live_joins = if let Some(membership) = membership {
                 {
                     let mut live = membership.lock().expect("membership lock");
@@ -1812,6 +1999,281 @@ mod session_geometry_tests {
         assert_eq!(
             membership.active[&5].session_id, "session-five",
             "the active binding retains the release key for the live seat"
+        );
+    }
+}
+
+#[cfg(test)]
+mod start_join_tests {
+    use super::*;
+
+    /// A prepared peer whose handshake outcome the test chooses.
+    ///
+    /// The live failure is `EXTERIOR_MAX_IDLE_TIMEOUT` expiring on a lobby
+    /// connection that went quiet minutes ago (#994). Reproducing that for real
+    /// would cost ten seconds of wall clock per case and still be timing
+    /// dependent, so the seam is [`StartJoin`] and the failure is injected.
+    struct FakeJoin {
+        slot: usize,
+        session_id: Option<String>,
+        /// `Some` if this peer cannot finish, carrying the transport reason.
+        failure: Option<&'static str>,
+        /// The `StartV1` each peer was handed at `Accept`, in bind order.
+        accepted: Arc<Mutex<Vec<(usize, Option<exterior::StartManifest>)>>>,
+        /// Remote ends of the bound links, kept alive so the corrected roster
+        /// the host republishes is readable rather than dropped on the floor.
+        remotes: Arc<Mutex<Vec<(usize, exterior::RemoteLink)>>>,
+    }
+
+    impl StartJoin for FakeJoin {
+        fn index(&self) -> usize {
+            self.slot
+        }
+
+        fn remote(&self) -> NodeId {
+            bot::bot_key(self.slot).public()
+        }
+
+        fn session_id(&self) -> Option<&str> {
+            self.session_id.as_deref()
+        }
+
+        async fn finish(
+            self,
+            manifest: Option<exterior::StartManifest>,
+            _wants_anchor: bool,
+        ) -> Result<JoinedSeat> {
+            self.accepted
+                .lock()
+                .expect("accepted lock")
+                .push((self.slot, manifest));
+            if let Some(reason) = self.failure {
+                bail!("connection lost: {reason}");
+            }
+            let node = bot::bot_key(self.slot).public();
+            let (host, remote) = exterior::link_pair();
+            self.remotes
+                .lock()
+                .expect("remotes lock")
+                .push((self.slot, remote));
+            Ok((host, None, node, self.slot))
+        }
+    }
+
+    struct StartHarness {
+        accepted: Arc<Mutex<Vec<(usize, Option<exterior::StartManifest>)>>>,
+        remotes: Arc<Mutex<Vec<(usize, exterior::RemoteLink)>>>,
+        membership: Arc<Mutex<swarm::LiveMembership>>,
+    }
+
+    impl StartHarness {
+        fn new() -> Self {
+            Self {
+                accepted: Arc::new(Mutex::new(Vec::new())),
+                remotes: Arc::new(Mutex::new(Vec::new())),
+                membership: Arc::new(Mutex::new(swarm::LiveMembership {
+                    attempt_id: "attempt-994".to_owned(),
+                    active: BTreeMap::new(),
+                    pending: BTreeSet::new(),
+                    released_sessions: BTreeSet::new(),
+                    tick: 0,
+                    running: false,
+                    // No feed file: `publish` is a no-op and the assertions
+                    // read the in-memory bookkeeping the feed is written from.
+                    path: None,
+                })),
+            }
+        }
+
+        fn peer(&self, slot: usize, failure: Option<&'static str>) -> FakeJoin {
+            FakeJoin {
+                slot,
+                session_id: Some(format!("session-{slot}")),
+                failure,
+                accepted: Arc::clone(&self.accepted),
+                remotes: Arc::clone(&self.remotes),
+            }
+        }
+
+        /// Slots the given peer's `Accept` manifest named as active.
+        fn accepted_slots(&self, slot: usize) -> Vec<usize> {
+            self.accepted
+                .lock()
+                .expect("accepted lock")
+                .iter()
+                .find(|(seat, _)| *seat == slot)
+                .and_then(|(_, manifest)| manifest.as_ref())
+                .expect("the peer was handed a StartV1")
+                .active
+                .iter()
+                .map(|seat| seat.slot)
+                .collect()
+        }
+
+        /// Slots named by the last membership frame pushed to a bound seat, or
+        /// `None` when the host sent it no correction.
+        fn republished_slots(&self, slot: usize) -> Option<Vec<usize>> {
+            let remotes = self.remotes.lock().expect("remotes lock");
+            let (_, remote) = remotes
+                .iter()
+                .find(|(seat, _)| *seat == slot)
+                .expect("the seat bound");
+            let mut downlink = remote.downlink.lock().expect("downlink lock");
+            let mut latest = None;
+            while let Ok(frame) = downlink.try_recv() {
+                assert_eq!(frame.lane, exterior::Lane::Meta);
+                let manifest: exterior::StartManifest =
+                    serde_json::from_slice(&frame.payload).expect("a StartV1 on the Meta lane");
+                latest = Some(manifest.active.iter().map(|seat| seat.slot).collect());
+            }
+            latest
+        }
+    }
+
+    fn roster() -> StartRoster<'static> {
+        StartRoster {
+            attempt_id: Some("attempt-994"),
+            seed: 17,
+            seconds: 20,
+            bot_seats: 5,
+            island_seats: 8,
+            witnessing: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_peer_is_dropped_and_the_attempt_starts_with_the_rest() {
+        // Seat 6 fails in the middle of the bind order on purpose: seat 5 is
+        // already bound and holding a roster that names 6, and seat 7 has not
+        // been handed one yet. Both halves of the correction are live here.
+        let harness = StartHarness::new();
+        let pending = vec![
+            harness.peer(5, None),
+            harness.peer(6, Some("timed out")),
+            harness.peer(7, None),
+        ];
+
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+            .await
+            .expect("one stale peer must not take the attempt down");
+
+        assert_eq!(
+            finished
+                .iter()
+                .map(|((_, _, _, slot), _)| *slot)
+                .collect::<Vec<_>>(),
+            vec![5, 7],
+            "the healthy peers must start"
+        );
+
+        let live = harness.membership.lock().expect("membership lock");
+        assert_eq!(
+            live.active.keys().copied().collect::<Vec<_>>(),
+            vec![5, 7],
+            "the dropped seat must not be bound"
+        );
+        assert!(
+            live.pending.is_empty(),
+            "the dropped seat must not be left reserved"
+        );
+        assert_eq!(
+            live.released_sessions.iter().cloned().collect::<Vec<_>>(),
+            vec!["session-6".to_owned()],
+            "the dropped seat's session is spent, so admission reopens the seat"
+        );
+        drop(live);
+
+        assert_eq!(
+            harness.accepted_slots(7),
+            vec![0, 1, 2, 3, 4, 5, 7],
+            "a peer bound after the drop is handed a roster without the dropped seat"
+        );
+        assert_eq!(
+            harness.accepted_slots(5),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "the peer bound before the drop was handed the pre-drop roster"
+        );
+        assert_eq!(
+            harness.republished_slots(5),
+            Some(vec![0, 1, 2, 3, 4, 5, 7]),
+            "so it must be sent the corrected membership before the run starts (#954)"
+        );
+        assert_eq!(
+            harness.republished_slots(7),
+            Some(vec![0, 1, 2, 3, 4, 5, 7]),
+            "the correction goes to every bound seat, idempotently"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_drop_means_no_correction_frame() {
+        let harness = StartHarness::new();
+        let pending = vec![harness.peer(5, None), harness.peer(6, None)];
+
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+            .await
+            .expect("a clean lobby starts");
+
+        assert_eq!(finished.len(), 2);
+        assert_eq!(
+            harness.republished_slots(5),
+            None,
+            "an uncorrected roster is not resent; the Accept manifest already named everyone"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_every_prepared_peer_fails_the_attempt() {
+        // The viability boundary. One of several dropping is survivable; the
+        // last one dropping is not, because a run with no external peer banks
+        // an attempt while measuring nothing about human play — the shape #375
+        // refuses. It still releases the seat, so the supervisor's fresh lobby
+        // finds it free.
+        let harness = StartHarness::new();
+        let pending = vec![
+            harness.peer(5, Some("timed out")),
+            harness.peer(6, Some("timed out")),
+        ];
+
+        let error = finish_start_joins(pending, &roster(), Some(&harness.membership))
+            .await
+            .expect_err("an attempt with no bound seat is not viable");
+        assert!(
+            format!("{error:#}").contains("no seat completed its start handshake"),
+            "the failure must name itself: {error:#}"
+        );
+
+        let live = harness.membership.lock().expect("membership lock");
+        assert!(
+            live.active.is_empty() && live.pending.is_empty(),
+            "no seat may be left named by the feed"
+        );
+        assert_eq!(
+            live.released_sessions.iter().cloned().collect::<Vec<_>>(),
+            vec!["session-5".to_owned(), "session-6".to_owned()],
+            "both seats are released for the next lobby"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_seat_without_a_session_still_leaves_the_attempt_running() {
+        // The legacy single-peer path presents no invite session id, so there
+        // is no reservation to release. The drop must still be survivable.
+        let harness = StartHarness::new();
+        let mut stale = harness.peer(6, Some("timed out"));
+        stale.session_id = None;
+        let pending = vec![harness.peer(5, None), stale];
+
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership))
+            .await
+            .expect("a session-less peer dropping must not take the attempt down");
+
+        assert_eq!(finished.len(), 1);
+        let live = harness.membership.lock().expect("membership lock");
+        assert_eq!(live.active.keys().copied().collect::<Vec<_>>(), vec![5]);
+        assert!(
+            live.released_sessions.is_empty(),
+            "there was no reservation to spend"
         );
     }
 }
