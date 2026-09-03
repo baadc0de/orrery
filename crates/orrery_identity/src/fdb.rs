@@ -1477,10 +1477,19 @@ mod tests {
                 scorer,
                 StrikesPosture::new(StrikesEnforcement::Live),
             );
-            let sweep = reactor.sweep().await.expect("sweep the durable queue");
+            // The `yd` queue is global to the cluster this suite shares, so
+            // this sweep may also have counted another test's notices, and a
+            // concurrently-running sweep may have drained this one's first.
+            // The crossing that matters is this account's: a `Live` sweep
+            // leaves its `dc` row behind, whichever sweep did the work.
+            reactor.sweep().await.expect("sweep the durable queue");
             assert!(
-                sweep.published >= 1,
-                "the sweep recorded the crossing: {sweep:?}"
+                store
+                    .cooldown_entry(account)
+                    .await
+                    .expect("read entry")
+                    .is_some(),
+                "the sweep recorded the crossing: a `dc` row exists for the filed account"
             );
 
             let published = StandingInvalidationSource::new(Arc::clone(&store))
@@ -1611,6 +1620,7 @@ mod tests {
         a_shadow_filing_queues_a_notice_that_publishes_nothing,
         |store| async move {
             use crate::filing::{FilingNoticeQueue, StandingFilingReactor};
+            use crate::invalidation::StandingInvalidationSource;
             use crate::ComputedStanding;
             use orrery_persistd::adjudication::StrikeMode;
             use orrery_persistd::gateway::{StrikesEnforcement, StrikesPosture};
@@ -1657,9 +1667,22 @@ mod tests {
                 StrikesPosture::new(StrikesEnforcement::Live),
             );
             let sweep = reactor.sweep().await.expect("sweep");
-            assert_eq!(
-                sweep.published, 0,
-                "a_shadow_filing_queues_a_notice_that_publishes_nothing: {sweep:?}"
+            // The `yd` queue is global to the cluster this suite shares, so a
+            // concurrently-running test's live filing lands in this same
+            // sweep, and `sweep.published` counts it. The claim is about
+            // *this* account, so assert on the account, not on the global
+            // total: with only shadow rows filed, no invalidation may name it.
+            let published = StandingInvalidationSource::new(Arc::clone(&store))
+                .current()
+                .await
+                .expect("read the published set");
+            assert!(
+                !published
+                    .iter()
+                    .any(|invalidation| invalidation.account == account),
+                "a_shadow_filing_queues_a_notice_that_publishes_nothing: \
+                 a shadow filing published an invalidation for the filed \
+                 account (sweep: {sweep:?}; published: {published:?})"
             );
             assert_eq!(
                 store.cooldown_entry(account).await.expect("read entry"),
