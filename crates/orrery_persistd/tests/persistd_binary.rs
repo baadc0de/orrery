@@ -31,6 +31,31 @@ fn persistd_binary() -> &'static str {
     env!("CARGO_BIN_EXE_persistd")
 }
 
+/// Build a `persistd` command with the ambient `ORRERY_*` environment removed.
+///
+/// #865 gave every CLI flag an environment fallback, which made the process
+/// environment a second, invisible source of configuration. A test that spawns
+/// the binary therefore inherits whatever the *runner* exported, and the
+/// nightly `fdb-gated` job exports `ORRERY_FDB_CLUSTER_FILE` for the cluster
+/// the suite runs against. Six tests in this file failed there and nowhere
+/// else: a chain follower refuses a cluster file it never asked for, and the
+/// authority's "requires --fdb-cluster-file" refusal never fired because the
+/// environment had already supplied one.
+///
+/// Scrubbing the whole prefix rather than that one variable is deliberate.
+/// Any of the twelve `ORRERY_*` fallbacks persistd reads can reconfigure a
+/// spawned binary silently, so a test asserting on argument handling must
+/// start from an environment that says nothing.
+fn persistd_command() -> Command {
+    let mut cmd = Command::new(persistd_binary());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("ORRERY_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd
+}
+
 fn issuer_key_arg() -> String {
     format!("{}@{}", support::ISSUER_KEY_ID, support::issuer().public())
 }
@@ -57,7 +82,7 @@ fn process_session_token(node: NodeId) -> Vec<u8> {
 /// to `127.0.0.1:0` so each run gets an ephemeral port.
 fn run_persistd(args: &[&str]) -> (String, String) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let mut cmd = Command::new(persistd_binary());
+    let mut cmd = persistd_command();
     cmd.arg("--dir")
         .arg(dir.path())
         .arg("--bind")
@@ -123,7 +148,7 @@ fn try_spawn_persistd_in(
     dir: &std::path::Path,
     args: &[String],
 ) -> Result<(Child, serde_json::Value), String> {
-    let mut cmd = Command::new(persistd_binary());
+    let mut cmd = persistd_command();
     cmd.arg("--dir")
         .arg(dir)
         .arg("--allow-volatile-leases")
@@ -362,7 +387,7 @@ fn free_loopback_addr() -> SocketAddr {
 /// Run `persistd` and return its exit status plus stderr output.
 fn run_persistd_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let output = Command::new(persistd_binary())
+    let output = persistd_command()
         .arg("--dir")
         .arg(dir.path())
         .arg("--bind")
