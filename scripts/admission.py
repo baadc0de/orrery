@@ -221,6 +221,22 @@ class StandingHostMembership:
     """One generation's host-authored seat bindings."""
     attempt_id: str
     active_slots: frozenset[int]
+    # Seats the host holds a connection for but has not bound: a volunteer
+    # waiting in the lobby, or one part-way through a live join handshake.
+    #
+    # The arrival lease below answers "how long is a seat held for somebody who
+    # has not turned up?", and it is 45 s because that is all a reservation
+    # proves.  It was the *only* thing holding a lobby seat, and a lobby runs
+    # `lobby_seconds` (180 s), so any volunteer who arrived more than 45 s
+    # before the run started went invisible here: their row was dropped, their
+    # slot re-offered, and the next dialler refused by the host with
+    # `reservation_slot_occupied` because the first player was still in it
+    # (#1016).  A seat the host is visibly holding is not a seat nobody is
+    # arriving to, so the lease is the wrong instrument for it and this is the
+    # right one.  Nothing here is a liveness claim -- such a seat draws
+    # `reserved`, not `active` -- and a host too old to publish the key simply
+    # holds no seats this way, which is the pre-#1016 behaviour.
+    pending_slots: frozenset[int]
     released_sessions: frozenset[str]
     running: bool
     # session -> the second the host lost the binding, for the releases it says
@@ -231,6 +247,11 @@ class StandingHostMembership:
     # host too old to publish `released_at` -- is spent on sight, exactly as
     # every release was before #1001.
     released_at: dict[str, int]
+
+    @property
+    def held_slots(self) -> frozenset[int]:
+        """Every seat the host says it has, bound or merely connected."""
+        return self.active_slots | self.pending_slots
 
     def reclaimable(self, session_id: Any, now: int) -> bool:
         """True while only the identity that held this seat may have it back."""
@@ -386,6 +407,7 @@ class Admission:
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             slots = value["active_slots"]
+            held = value.get("pending_slots", [])
             released = value.get("released_sessions", [])
             released_at = value.get("released_at", {})
             running = value["running"]
@@ -410,12 +432,20 @@ class Admission:
                        or not isinstance(when, int) or isinstance(when, bool) or when < 0
                        for session, when in released_at.items())):
             return None
-        if (any(not isinstance(slot, int) or isinstance(slot, bool)
-                or not campaign.peers <= slot < campaign.peers + campaign.humans for slot in slots)
-                or len(set(slots)) != len(slots)):
+        if not isinstance(held, list):
             return None
-        return StandingHostMembership(attempt_id, frozenset(slots), frozenset(released), running,
-                                      dict(released_at))
+        for listed in (slots, held):
+            if (any(not isinstance(slot, int) or isinstance(slot, bool)
+                    or not campaign.peers <= slot < campaign.peers + campaign.humans
+                    for slot in listed)
+                    or len(set(listed)) != len(listed)):
+                return None
+        # A seat cannot be both bound and merely connected, and the safe reading
+        # of a contradiction is that this feed says nothing (#1016).
+        if set(slots) & set(held):
+            return None
+        return StandingHostMembership(attempt_id, frozenset(slots), frozenset(held),
+                                      frozenset(released), running, dict(released_at))
 
     def _standing_host_membership(self, campaign: Campaign, attempt: dict[str, Any]
                                   ) -> StandingHostMembership | None:
@@ -423,7 +453,8 @@ class Admission:
         try:
             membership = self._published_standing_host_membership(campaign)
         except FileNotFoundError:
-            return StandingHostMembership(attempt["attempt_id"], frozenset(), frozenset(), False, {})
+            return StandingHostMembership(attempt["attempt_id"], frozenset(), frozenset(),
+                                          frozenset(), False, {})
         if membership is None or membership.attempt_id != attempt["attempt_id"]:
             return None
         return membership
@@ -436,6 +467,12 @@ class Admission:
         the identity that held it may still redial (#1001), and not one second
         longer: `spent` is what drops it, and once it drops the seat is free for
         whoever asks next.
+
+        A row whose seat the host *holds* -- bound, or connected and waiting in
+        the lobby -- outlives its arrival lease for as long as the host keeps
+        saying so (#1016).  The lease still governs the rows nobody is arriving
+        for, which is every row the host has never seen a connection for, and
+        those are exactly the rows it was written for.
         """
         membership = self._standing_host_membership(campaign, attempt)
         if membership is None:
@@ -445,7 +482,7 @@ class Admission:
                       if row.get("attempt_id") == attempt["attempt_id"]]
         current = [row for row in generation
                    if not membership.spent(row.get("session_id"), now)
-                   and (row.get("slot") in membership.active_slots
+                   and (row.get("slot") in membership.held_slots
                         or membership.reclaimable(row.get("session_id"), now)
                         or (isinstance(row.get("expires_at"), int)
                             and row["expires_at"] > now))]
@@ -506,6 +543,17 @@ class Admission:
                         and row.get("slot") in bound.active_slots
                         and row.get("session_id") not in bound.released_sessions):
                     occupied[row["slot"]] = SeatOccupancy(row=row, bound=True)
+            # A seat the host holds a lobby connection for is taken, and taken
+            # for as long as the host holds it rather than for the arrival
+            # lease (#1016).  It draws `reserved`, not `active`: the host is
+            # talking to that volunteer, but nothing is bound to the transport
+            # and a reservation is still not a liveness claim.
+            for row in rows:
+                if (row.get("slot") not in occupied
+                        and row.get("attempt_id") == bound.attempt_id
+                        and row.get("slot") in bound.pending_slots
+                        and row.get("session_id") not in bound.released_sessions):
+                    occupied[row["slot"]] = SeatOccupancy(row=row, bound=False)
         generation = (bound if bound is not None and attempt is not None
                       and bound.attempt_id == attempt["attempt_id"] else None)
         released = generation.released_sessions if generation is not None else frozenset()
@@ -936,11 +984,13 @@ class AdmissionTests(unittest.TestCase):
         (host / "listening.txt").write_text("f2a1 0.0.0.0:52011\n")
         return attempt
     def publish_seats(self, attempt: dict[str, Any], *, active: tuple[int, ...] = (),
+                      pending: tuple[int, ...] = (),
                       released: tuple[str, ...] = (), released_at: dict[str, int] | None = None,
                       running: bool = True) -> None:
         """Write one host membership publication, exactly as the harness does."""
         (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
             "attempt_id": attempt["attempt_id"], "active_slots": list(active),
+            "pending_slots": list(pending),
             "released_sessions": list(released), "released_at": released_at or {},
             "running": running}))
 
@@ -1233,6 +1283,103 @@ class AdmissionTests(unittest.TestCase):
                          "admission must use the same configured initial delay as the host")
         answer = self.service.join("test", self.request())
         self.assertEqual(answer["join"]["slot"], 5)
+
+    def expire_every_reservation(self) -> None:
+        """Age every row past its arrival lease without waiting one out.
+
+        The lease is 45 s and a lobby is 180 s, so the interesting instant is
+        always "after the lease, during the lobby".  Naming it by moving the
+        rows is deterministic; sleeping it is a slow flaky test.
+        """
+        path = self.state / "test" / "slots.json"
+        rows = json.loads(path.read_text())
+        for row in rows:
+            row["expires_at"] = int(time.time()) - 1
+        path.write_text(json.dumps(rows))
+
+    def test_a_lobby_seat_the_host_holds_outlives_its_arrival_lease(self) -> None:
+        # #1016. The ordinary join: a volunteer reserves a seat, dials the
+        # host, and waits in the lobby for the run to fill.  The lobby is
+        # `lobby_seconds` (180 s) and the arrival lease is 45 s, so a quarter of
+        # the way in their row used to be dropped and their seat re-offered --
+        # and the volunteer who took the offer was then refused by the host
+        # with `reservation_slot_occupied`, because the first player was
+        # correctly still sitting in it.  Neither of them could act on that.
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        slot = first["join"]["slot"]
+        self.publish_seats(attempt, pending=(slot,), running=False)
+        self.expire_every_reservation()
+
+        self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
+                         ["reserved", "empty", "empty", "empty"],
+                         "a seat the host holds a lobby connection for is taken, "
+                         "and reserved rather than active: nothing is bound to it yet")
+        listing = self.service.listing()["campaigns"][0]
+        self.assertEqual((listing["phase"], listing["slots_free"]), ("lobby", 3),
+                         "the lobby stays joinable, with the held seat counted taken")
+
+        second_request = self.request(); second_request.update({"nickname": "lin", "node": "b" * 64})
+        second = self.service.join("test", second_request)
+        self.assertNotEqual(second["join"]["slot"], slot,
+                            "the seat under a waiting volunteer must never be re-offered")
+        self.assertEqual(second["join"]["slot"], slot + 1)
+        rows = json.loads((self.state / "test" / "slots.json").read_text())
+        self.assertEqual(sorted(row["slot"] for row in rows), [slot, slot + 1],
+                         "the waiting volunteer's row survives its arrival lease")
+
+        # And the seat is still theirs when the run finally starts.
+        self.publish_seats(attempt, active=(slot,), pending=(slot + 1,), running=True)
+        self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
+                         ["active", "reserved", "empty", "empty"])
+
+    def test_a_seat_the_host_stops_holding_frees_even_though_the_lobby_runs_on(self) -> None:
+        # The other direction, and why this is not "make the lease longer".
+        # The host holds a seat for exactly as long as it has a connection for
+        # it; a volunteer who never dialled, or whose connection lapsed and was
+        # swept, is named by nothing, and the arrival lease -- which is what it
+        # is actually for -- frees the seat inside one lobby window.
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        slot = first["join"]["slot"]
+        self.publish_seats(attempt, pending=(slot,), running=False)
+        self.expire_every_reservation()
+        self.publish_seats(attempt, running=False)
+
+        second_request = self.request(); second_request.update({"nickname": "lin", "node": "b" * 64})
+        second = self.service.join("test", second_request)
+        self.assertEqual(second["join"]["slot"], slot,
+                         "a seat nobody is arriving to is freed by the arrival lease")
+        rows = json.loads((self.state / "test" / "slots.json").read_text())
+        self.assertEqual(len(rows), 1, "the abandoned row is dropped, not merely hidden")
+
+    def test_a_feed_that_calls_one_seat_both_bound_and_held_is_refused(self) -> None:
+        # A slot cannot be bound and merely connected at once; the host removes
+        # it from one set in the same publication that adds it to the other.
+        # A feed that says both is not readable, and the safe reading of an
+        # unreadable feed is that this generation admits nobody.
+        attempt = self.enable_always_on()
+        self.service.join("test", self.request())
+        self.publish_seats(attempt, active=(4,), pending=(4,), running=False)
+        self.assertEqual(self.service.listing()["campaigns"][0]["phase"], "restarting")
+        (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [], "pending_slots": [99],
+            "released_sessions": [], "released_at": {}, "running": False}))
+        self.assertEqual(self.service.listing()["campaigns"][0]["phase"], "restarting",
+                         "a held seat outside the human range is not a seat")
+
+    def test_a_host_that_publishes_no_held_seats_behaves_exactly_as_before(self) -> None:
+        # `pending_slots` is additive: a host too old to publish it holds no
+        # seats that way, and every row falls back on its arrival lease.  That
+        # is the pre-#1016 reading, and it is the safe direction.
+        attempt = self.enable_always_on()
+        self.service.join("test", self.request())
+        (self.standing_host_state / "test" / "active-seats.json").write_text(json.dumps({
+            "attempt_id": attempt["attempt_id"], "active_slots": [],
+            "released_sessions": [], "running": False}))
+        self.expire_every_reservation()
+        second_request = self.request(); second_request.update({"nickname": "lin", "node": "b" * 64})
+        self.assertEqual(self.service.join("test", second_request)["join"]["slot"], 4)
 
     def test_no_show_reservation_expires_after_the_arrival_lease(self) -> None:
         attempt = self.enable_always_on()

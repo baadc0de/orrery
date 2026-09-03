@@ -96,6 +96,20 @@ impl SeatReclaim {
 pub(crate) struct LiveMembership {
     pub(crate) attempt_id: String,
     pub(crate) active: BTreeMap<usize, LiveSeatBinding>,
+    /// Seats this host is talking to but has not bound yet: a peer waiting in
+    /// the lobby, or one part-way through a live join handshake.
+    ///
+    /// It is published (`pending_slots`), and that is the whole point of it
+    /// (#1016). Admission bounds a reservation by an arrival lease, because a
+    /// reservation proves only that somebody is *arriving*; the lobby they are
+    /// arriving into runs far longer than that lease. A seat this host is
+    /// visibly holding a connection for must therefore say so, or admission
+    /// re-offers it a quarter of the way into an ordinary lobby.
+    ///
+    /// Every entry is withdrawn by [`Self::drop_pending`], [`Self::release_seat`]
+    /// or a bind. Nothing else may touch it: a slot that stays here with no
+    /// connection under it is an immortal seat, which is exactly what the
+    /// arrival lease exists to prevent.
     pub(crate) pending: BTreeSet<usize>,
     /// Sessions whose binding is gone *and has not come back*, each with what
     /// admission may still do with its reservation. A session re-bound by
@@ -123,6 +137,7 @@ impl LiveMembership {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "attempt_id": self.attempt_id,
             "active_slots": self.active.keys().copied().collect::<Vec<_>>(),
+            "pending_slots": self.pending.iter().copied().collect::<Vec<_>>(),
             "released_sessions": self.released_sessions.keys().collect::<Vec<_>>(),
             "released_at": self
                 .released_sessions
@@ -138,6 +153,48 @@ impl LiveMembership {
         std::fs::rename(&temporary, path)?;
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Hold one seat for a peer this host is talking to but has not bound, and
+    /// publish it so admission stops counting the seat free (#1016).
+    ///
+    /// **Which side owns the timing.** Admission owns the arrival lease and
+    /// keeps it: it is the right instrument for a reservation whose holder has
+    /// not reached this host at all, and such a seat never enters this set. The
+    /// host owns a seat from the moment a connection for it exists, because the
+    /// host is the only side that can see that connection — it beats on it
+    /// every `bridge::LOBBY_HEARTBEAT_INTERVAL` and gives the seat back
+    /// through [`Self::release_seat`] the moment it stops answering. Neither
+    /// side holds a seat nobody is arriving to.
+    ///
+    /// Returns `false` when the slot is already held, so the caller refuses the
+    /// arrival instead of double-booking. A publication that fails takes the
+    /// hold back with it: a caller told `Ok(true)` may rely on the feed naming
+    /// the seat.
+    pub(crate) fn hold_pending(&mut self, slot: usize) -> std::io::Result<bool> {
+        if self.active.contains_key(&slot) || !self.pending.insert(slot) {
+            return Ok(false);
+        }
+        if let Err(error) = self.publish() {
+            self.pending.remove(&slot);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Withdraw a held seat that will never bind, and publish the withdrawal.
+    ///
+    /// The seat is dropped from the set even when the publication fails. That
+    /// leaves the feed briefly naming a seat this host no longer holds, which
+    /// the next publication corrects; keeping it would make every later
+    /// publication repeat the claim, and a seat asserted forever by a host that
+    /// has nothing connected to it is the one failure mode the arrival lease
+    /// exists to rule out (#996, #1001).
+    pub(crate) fn drop_pending(&mut self, slot: usize) -> std::io::Result<()> {
+        if self.pending.remove(&slot) {
+            self.publish()?;
         }
         Ok(())
     }
@@ -4263,6 +4320,90 @@ mod tests {
             .expect("membership manifest queued");
         assert_eq!(frame.lane, Lane::Meta);
         serde_json::from_slice(&frame.payload).expect("Meta frame is a membership manifest")
+    }
+
+    /// A scratch feed path for a test that reads what admission would read.
+    fn feed_path(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "p1-live-feed-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        directory.join("active-seats.json")
+    }
+
+    #[test]
+    fn the_published_feed_names_a_held_seat_until_it_binds_or_is_given_back() {
+        // The #1016 half of the contract with `scripts/admission.py`. A seat
+        // the host holds a connection for is named in `pending_slots` from the
+        // moment the connection exists, so admission stops counting it free
+        // while the volunteer waits out a lobby far longer than their arrival
+        // lease. It leaves that set only by binding or by being given back --
+        // never by simply staying there, which is what would make the seat
+        // immortal.
+        let path = feed_path("held");
+        let mut membership = LiveMembership {
+            attempt_id: "attempt-1016".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
+            tick: 0,
+            running: false,
+            path: Some(path.clone()),
+        };
+        let read = |path: &PathBuf| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).expect("feed written"))
+                .expect("feed parses")
+        };
+
+        assert!(membership.hold_pending(5).expect("publishing a held seat"));
+        assert!(membership.hold_pending(6).expect("publishing a held seat"));
+        let published = read(&path);
+        assert_eq!(
+            published["pending_slots"],
+            serde_json::json!([5, 6]),
+            "a seat waiting in the lobby is published the moment it connects"
+        );
+        assert_eq!(
+            published["active_slots"],
+            serde_json::json!([]),
+            "holding a seat is not a claim that anybody is playing in it"
+        );
+
+        assert!(
+            !membership
+                .hold_pending(5)
+                .expect("a re-hold publishes nothing"),
+            "a held seat must be refused to the next dialler, not double-booked"
+        );
+
+        membership
+            .drop_pending(6)
+            .expect("publishing a given-back seat");
+        assert_eq!(
+            read(&path)["pending_slots"],
+            serde_json::json!([5]),
+            "a seat whose arrival gave up is given back, not held for the lobby"
+        );
+
+        membership
+            .release_seat(
+                5,
+                "018f8f4e-5c90-7abc-8123-000000000005",
+                SeatReclaim::LostAt {
+                    released_at_s: 1_756_900_000,
+                },
+            )
+            .expect("publishing a lost lobby seat");
+        assert_eq!(
+            read(&path)["pending_slots"],
+            serde_json::json!([]),
+            "the one release path gives a held seat back as well as a bound one"
+        );
     }
 
     #[test]

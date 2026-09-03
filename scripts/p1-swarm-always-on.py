@@ -180,18 +180,27 @@ class Supervisor:
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             return None
         now = int(time.time())
-        active_slots: set[int] = set()
+        # Bound seats and seats the host merely holds a lobby connection for
+        # both count: a volunteer waiting for the run to fill is arriving, and
+        # their arrival lease runs out long before the lobby does (#1016).
+        # Reading only `active_slots` here reported an empty lobby with a
+        # volunteer sitting in it, and advanced the generation's lease clock on
+        # the strength of it.
+        held_slots: set[int] = set()
         try:
             active = json.loads((self.args.state / "active-seats.json").read_text(encoding="utf-8"))
             if active.get("attempt_id") != attempt_id or not isinstance(active.get("active_slots"), list):
                 return None
-            active_slots = set(active["active_slots"])
+            pending = active.get("pending_slots", [])
+            if not isinstance(pending, list):
+                return None
+            held_slots = set(active["active_slots"]) | set(pending)
         except FileNotFoundError:
             pass
         except (OSError, json.JSONDecodeError, AttributeError, TypeError):
             return None
         return any(row.get("attempt_id") == attempt_id
-                   and (row.get("slot") in active_slots
+                   and (row.get("slot") in held_slots
                         or (isinstance(row.get("expires_at"), int) and row["expires_at"] > now))
                    for row in rows)
 
@@ -401,6 +410,23 @@ class Tests(unittest.TestCase):
             }))
             self.assertTrue(supervisor.has_reservations("attempt-7"),
                             "a bound player remains live after the arrival lease")
+            # A volunteer waiting in the lobby is arriving, and their arrival
+            # lease runs out long before the lobby does (#1016).  Reading only
+            # `active_slots` reported an empty lobby with somebody sitting in
+            # it, and advanced this generation's lease clock on the strength of
+            # it.
+            (state / "active-seats.json").write_text(json.dumps({
+                "attempt_id": "attempt-7", "active_slots": [], "pending_slots": [4],
+                "released_sessions": [], "running": False,
+            }))
+            self.assertTrue(supervisor.has_reservations("attempt-7"),
+                            "a seat the host holds in the lobby is not an empty lobby")
+            (state / "active-seats.json").write_text(json.dumps({
+                "attempt_id": "attempt-7", "active_slots": [], "pending_slots": [],
+                "released_sessions": [], "running": False,
+            }))
+            self.assertFalse(supervisor.has_reservations("attempt-7"),
+                             "a seat the host stopped holding is an empty lobby again")
 
     def test_running_empty_membership_is_not_an_idle_lobby(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
