@@ -295,6 +295,53 @@ self_test() {
     | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000011"' human '018f8f4e-5c90-7abc-8123-000000000011' >/dev/null
   "$0" append "$dir/r.json" >/dev/null 2>&1 \
     || die 'self-test: an honestly flagged mismatching row was refused'
+  # #973: the ordinary case. A real link configured at 3.0% loss and 100 ms
+  # jitter measures 2.94% and a few milliseconds off, and its flag is correctly
+  # clear. Recomputing by exact equality refused this row -- every honest row --
+  # so the campaign could bank only rows a fixture had written observed ==
+  # configured, and the exit criterion below could only pass on those.
+  st_report 12 '.player_hours = 1 | .seconds = 3600 | .peers = 1
+    | .session = {
+        session_id: "018f8f4e-5c90-7abc-8123-000000000012",
+        wall_start: "2026-08-23T12:00:00Z", wall_end: "2026-08-23T13:00:00Z",
+        distinct_play_minutes: 60, banked_minutes: 60,
+        platform_triple: "x86_64-unknown-linux-gnu", client_rev: "self-test",
+        ruleset_id: "52", ruleset_version: 2, pipeline_digest: "selftestpipeline",
+        actor: "human", configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
+        observed_loss_pct: 2.94, observed_jitter_p50_ms: 103, observed_jitter_p99_ms: 96,
+        afk_seconds: 0, afk_capped: false, impairment_mismatch: false
+      }
+    | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000012"' human '018f8f4e-5c90-7abc-8123-000000000012' >/dev/null
+  "$0" append "$dir/r.json" >/dev/null 2>&1 \
+    || die 'self-test: an honest measurement of a correctly-impaired link was refused'
+  # And the band has not swallowed the property the flag exists to provide: a
+  # seat that never received its impairment reads ~0 against a configured 3.0
+  # and 100, and a clear flag over those numbers is still refused.
+  #
+  # Built through `st_report`, which *signs* the row, rather than edited into
+  # shape afterwards: an edited row is refused by the signature stage before
+  # the arithmetic ever runs, and a fixture refused for the wrong reason is
+  # not evidence that this check works. The refusal message is checked too.
+  st_report 13 '.player_hours = 1 | .seconds = 3600 | .peers = 1
+    | .session = {
+        session_id: "018f8f4e-5c90-7abc-8123-000000000013",
+        wall_start: "2026-08-23T12:00:00Z", wall_end: "2026-08-23T13:00:00Z",
+        distinct_play_minutes: 60, banked_minutes: 60,
+        platform_triple: "x86_64-unknown-linux-gnu", client_rev: "self-test",
+        ruleset_id: "52", ruleset_version: 2, pipeline_digest: "selftestpipeline",
+        actor: "human", configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
+        observed_loss_pct: 0.02, observed_jitter_p50_ms: 1, observed_jitter_p99_ms: 2,
+        afk_seconds: 0, afk_capped: false, impairment_mismatch: false
+      }
+    | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000013"' human '018f8f4e-5c90-7abc-8123-000000000013' >/dev/null
+  local st_unapplied
+  if st_unapplied=$("$0" append "$dir/r.json" 2>&1); then
+    die 'self-test: a session that never received its impairment banked with a clear flag'
+  fi
+  case $st_unapplied in
+    *'impairment_mismatch contradicts'*) ;;
+    *) die "self-test: the unapplied-impairment row was refused for the wrong reason: $st_unapplied" ;;
+  esac
 
   # Each of these is a run that must add no hours at all. The count is checked
   # as well as the exit status: a refusal that has already written the line is
@@ -861,13 +908,27 @@ validate_session_record() {
   # tamper-evident: a post-hoc edit of observed_loss_pct (to hide a mismatch,
   # or to fake one) leaves the flag contradicting the numbers next to it, and
   # a row whose own fields disagree with each other is not evidence.
+  #
+  # Recomputed within the band the *client* computed the flag with (#973), not
+  # by exact float equality: a measurement never lands exactly on its
+  # configuration, so equality here refused every honest row the client ever
+  # signed. The band and its derivation live at IMPAIRMENT_LOSS_TOLERANCE_PCT
+  # in scripts/p4-attempt-accounting.py, which mirrors
+  # clients/regolith/src/session.rs; that file's --self-test holds all three
+  # copies of these numbers against each other.
   jq -e '
     if .session? == null then true else
       .session as $s
-      | ($s.impairment_mismatch ==
-          (($s.observed_loss_pct != $s.configured_impairment_profile.loss_pct)
-           or ($s.observed_jitter_p50_ms != $s.configured_impairment_profile.jitter_p50_ms)
-           or ($s.observed_jitter_p99_ms != $s.configured_impairment_profile.jitter_p99_ms)))
+      | $s.configured_impairment_profile as $c
+      | ((((($s.observed_loss_pct - $c.loss_pct) | fabs) > 2.0)
+          or ((($s.observed_jitter_p50_ms - $c.jitter_p50_ms) | fabs) > 40)
+          or ((($s.observed_jitter_p99_ms - $c.jitter_p99_ms) | fabs) > 40)) as $outside
+        # The client suppresses the flag below 200 observed packets, which the
+        # signed row does not carry; 200 packets is 200/20/60 minutes of play
+        # at the 20 Hz send cadence, and below that a clear flag stands.
+        | ($s.impairment_mismatch == true and $outside)
+          or ($s.impairment_mismatch == false
+              and (($outside | not) or ($s.distinct_play_minutes < (200 / 20 / 60)))))
     end
   ' "$report" >/dev/null \
     || die 'refusing to bank: session impairment_mismatch contradicts the row'\''s own observed/configured impairment'
