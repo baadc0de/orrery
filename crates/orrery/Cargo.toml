@@ -16,6 +16,12 @@ license = "MIT OR Apache-2.0"
 orrery_authority = { path = "../orrery_authority" }
 # The `Ruleset` bound `WitnessPlugin` is generic over.
 orrery_core = { path = "../orrery_core" }
+# The engine-boundary schema (#898 step 2). The shooter-side claim path is
+# built from the very `EntityFrame` the extractor hands the engine, so the
+# composition root names that type rather than a private copy of its basis.
+# The direction is down the spine: `orrery_ipc` depends on `orrery_protocol`
+# alone and `core-gates.sh` keeps it Bevy-free.
+orrery_ipc = { path = "../orrery_ipc" }
 orrery_net = { path = "../orrery_net" }
 orrery_persist_client = { path = "../orrery_persist_client" }
 orrery_predict = { path = "../orrery_predict" }

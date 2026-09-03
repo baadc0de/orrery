@@ -34,4 +34,8 @@ lightyear = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+# The two-endpoint fixture reaches for the real iroh endpoint the facade opens,
+# to dial the other sidecar with (#898 step 4).
+aeronet_iroh = { workspace = true }
 bytes = { workspace = true }
+orrery_ipc = { path = "../orrery_ipc" }
