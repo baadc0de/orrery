@@ -6,6 +6,7 @@
 //! pulled in every subsystem's vocabulary would collide with the game's own.
 
 pub use crate::hit::{CanonicalPose, OrreryHitRegistrationPlugin};
+pub use crate::ipc::{IpcOutbound, OrreryIpcExportPlugin, PresentationFrame};
 pub use crate::{
     bind_island_membership, queue_authority_corrections, track_predicted_authority,
     OrreryAuthorityAttributionPlugin, OrreryClientPlugins, OrreryConfig, OrreryIslandBindingPlugin,

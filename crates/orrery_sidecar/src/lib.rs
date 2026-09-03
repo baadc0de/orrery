@@ -15,7 +15,12 @@
 //!   the rules stamped;
 //! - a [`HitClaim`](orrery_protocol::HitClaim) arriving on a real peer link is
 //!   answered with a [`HitVerdict`](orrery_protocol::HitVerdict) by
-//!   [`orrery::hit::answer_hit_claims`].
+//!   [`orrery::hit::answer_hit_claims`];
+//! - a live world the rules stepped is extracted into `orrery_ipc` frames
+//!   every tick (#898 step 3): the shipped sidecar is a frame producer, its
+//!   interpolation runs through the basis-exporting path, and
+//!   [`orrery::ipc::export_ipc_frames`] reads the presented value-and-basis
+//!   pairs out as `SidecarToEngine` batches.
 //!
 //! The rules themselves are not here. They are `orrery_synthetic`, which is
 //! Bevy-free: D42 (a) / D43 (e)(1) keep a `Ruleset` out of any crate with Bevy
@@ -32,18 +37,22 @@ use bevy::prelude::*;
 use bevy::MinimalPlugins;
 use bevy_state::app::StatesPlugin;
 use lightyear::prelude::{
-    AppComponentExt, Diffable, InterpolationRegistrationExt, LocalTimeline, Predicted,
-    PredictionBuilderExt,
+    AppComponentExt, Diffable, Interpolated, LocalTimeline, Predicted, PredictionBuilderExt,
 };
 use serde::{Deserialize, Serialize};
 
 use orrery::hit::{CanonicalPose, OrreryHitRegistrationPlugin};
+use orrery::ipc::{OrreryIpcExportPlugin, PresentationFrame};
 use orrery::{OrreryClientPlugins, OrreryConfig};
 use orrery_authority::{AuthorityPhase, HitRules, PersistIdentity, PoseSample};
 use orrery_core::{tick_rng, OrderedInputs, Ruleset, StateView};
+use orrery_ipc::QuantizedTransform;
 use orrery_net::plugin::NetConfig;
-use orrery_predict::{AppReconciliationExt, PredictedBy, ReconciliationResidual, TickBridge};
-use orrery_protocol::{LatticePoint, PersistId, UniverseSeed, WeaponRef};
+use orrery_predict::{
+    AppInterpolationBasisExt as _, AppReconciliationExt, InterpolateWithBasis, PredictedBy,
+    ReconciliationResidual, TickBridge,
+};
+use orrery_protocol::{LatticePoint, PersistId, QuantizedDir, UniverseSeed, WeaponRef};
 use orrery_synthetic::{Synthetic, SyntheticState};
 
 /// The universe seed the sidecar's per-tick RNG is derived from.
@@ -114,6 +123,33 @@ impl Diffable for PredictedPosition {
 impl ReconciliationResidual for PredictedPosition {
     fn pos_error_mm(&self) -> i64 {
         self.0.abs()
+    }
+}
+
+impl InterpolateWithBasis for PredictedPosition {
+    fn interpolate(
+        from: Self,
+        to: Self,
+        alpha: f32,
+        _sample_delta: Option<std::time::Duration>,
+    ) -> Self {
+        interpolate_position(from, to, alpha)
+    }
+}
+
+/// The projection the IPC extractor frames this game's presented state with.
+///
+/// The synthetic entity moves along the lattice's x axis and faces along it;
+/// its one integer of state *is* the x translation in millimetres, so the
+/// projection is exact. A real game projects whichever component it actually
+/// presents.
+impl PresentationFrame for PredictedPosition {
+    fn frame(&self) -> QuantizedTransform {
+        QuantizedTransform {
+            translation: LatticePoint::new(self.0, 0, 0),
+            forward: QuantizedDir::new(1, 0, 0),
+            up: QuantizedDir::new(0, 1, 0),
+        }
     }
 }
 
@@ -236,9 +272,21 @@ pub fn sidecar(secret_key: iroh::SecretKey, simulation_enabled: bool) -> App {
     app.add_plugins(OrreryHitRegistrationPlugin::<SyntheticHitRules>::new());
     app.component::<PredictedPosition>()
         .replicate()
-        .add_interpolation_with(interpolate_position)
         .predict()
         .add_correction_fn::<PredictedPosition>(interpolate_position);
+    // Interpolation runs through the facade's basis-exporting path, so every
+    // presented value is paired with the `RenderedInterpBasis` that produced
+    // it — which is what the extractor below frames and what a shooter-side
+    // claim is built from (#898 step 4).
+    app.interpolate_with_basis::<PredictedPosition>();
+    // #898 step 3: the shipped sidecar is a frame producer. Its predicted
+    // entities are lightyear's `Predicted` copies, its interpolated ones
+    // lightyear's `Interpolated` copies — the markers the game already names.
+    app.add_plugins(OrreryIpcExportPlugin::<
+        Predicted,
+        Interpolated,
+        PredictedPosition,
+    >::new());
     app.track_reconciliation::<PredictedPosition>();
     app.insert_resource(SimulationEnabled(simulation_enabled));
     app.init_resource::<StepTrace>();

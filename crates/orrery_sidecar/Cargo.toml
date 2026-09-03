@@ -20,6 +20,10 @@ path = "src/main.rs"
 orrery = { path = "../orrery" }
 orrery_authority = { path = "../orrery_authority" }
 orrery_core = { path = "../orrery_core" }
+# The extraction contract the shipped sidecar produces against (#898 step 3):
+# the game projects its presented component onto `QuantizedTransform`, so the
+# schema type is named in production, not just by the transport's tests.
+orrery_ipc = { path = "../orrery_ipc" }
 orrery_net = { path = "../orrery_net" }
 orrery_predict = { path = "../orrery_predict" }
 orrery_protocol = { path = "../orrery_protocol" }
@@ -38,4 +42,3 @@ serde = { workspace = true }
 # to dial the other sidecar with (#898 step 4).
 aeronet_iroh = { workspace = true }
 bytes = { workspace = true }
-orrery_ipc = { path = "../orrery_ipc" }
