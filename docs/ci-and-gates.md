@@ -167,6 +167,24 @@ second time because it retains Fjall's known shutdown-hang exposure.
 feature unification, because `bevy/serialize` is off and they need
 `Transform: Serialize`.
 
+**The `clippy` lane also cross-checks Windows (#1020, owner decision
+2026-09-03).** After the lint passes it runs `cargo check -p
+orrery_ipc_transport --target x86_64-pc-windows-gnu`, because `#[cfg(windows)]`
+code compiled nowhere in any per-commit gate — not in these lanes, not on any
+pull request, not in the Linux nightly legs — and an E0133 in the sidecar's
+`timeBeginPeriod` call sat red in the nightly `sidecar-ipc` leg as the proof.
+The scope is deliberate: `orrery_ipc_transport` is the only crate whose Windows
+code carries a Windows-only dependency (`windows-sys`); regolith's three
+Windows arms are std-only path handling, and cross-checking that workspace
+would compile the whole Bevy/wgpu graph for a second target, re-opening the
+on-demand cross-platform build decision of 2026-08-24. The gnu target, not
+msvc — a dependency's build script needs `ml64.exe` under msvc, which exists
+on no Linux box — and `cargo check`, not `build`: no linking, no MinGW
+toolchain. When the target is not installed the stage is skipped with a NOTE
+naming `rustup target add x86_64-pc-windows-gnu` and the run still passes;
+that is detection, never a swallowed cargo failure, so where the target exists
+a real compile break still fails the lane.
+
 One thing to know while you are in there: **`[workspace.lints]` still reaches
 only the vendored crates.** `vendor/aeronet_iroh`, `vendor/aeronet_tokio_runtime`
 and `vendor/bevy_replicon` are the only manifests with `[lints] workspace = true`,

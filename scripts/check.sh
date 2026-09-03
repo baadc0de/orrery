@@ -3,7 +3,9 @@
 #
 #   ./scripts/check.sh              every lane, in CI's order
 #   ./scripts/check.sh fmt          rustfmt over all twelve workspaces
-#   ./scripts/check.sh clippy       both feature sets, -D warnings
+#   ./scripts/check.sh clippy       both feature sets, -D warnings, plus the
+#                                   Windows cross-check (skipped, with a NOTE,
+#                                   when the gnu target is not installed)
 #   ./scripts/check.sh gates        static gates, harness self-tests, tool tests
 #   ./scripts/check.sh test         the root workspace's test suite
 #   ./scripts/check.sh doctor       delegate to dev-cache.sh: is the cache wired up?
@@ -229,6 +231,17 @@ lane_fmt() {
     done
 }
 
+# Whether the Windows cross-check can run: `x86_64-pc-windows-gnu` installed
+# for the toolchain this directory resolves to — rust-toolchain.toml, the same
+# toolchain the `cargo check` below will use. Detection, deliberately, and not
+# a swallowed cargo failure: when this returns 0 the check runs for real and a
+# compile break fails the lane; when it returns 1 the stage is skipped with a
+# NOTE naming the exact command that enables it, so a contributor without the
+# target still gets a working gate. Nothing is installed here.
+windows_target_installed() {
+    rustup target list --installed 2>/dev/null | grep -qx 'x86_64-pc-windows-gnu'
+}
+
 # ci.yml `clippy`, verbatim. Both steps, in the workflow's order.
 lane_clippy() {
     lane_target_dir
@@ -269,6 +282,35 @@ lane_clippy() {
     run cargo clippy -p orrery_persistd --all-targets --no-deps \
         --no-default-features --features journal-fjall,chain-grpc \
         -- -D warnings
+
+    # #1020's owner decision (2026-09-03): the Windows cross-check. Everything
+    # above compiles Linux code only, and `#[cfg(windows)]` code compiled
+    # nowhere in any per-commit gate — not in these lanes, not on any pull
+    # request, not in the Linux nightly legs — which is how a bare call to
+    # `timeBeginPeriod` sat red in the nightly `sidecar-ipc` leg unnoticed.
+    # The project publishes a Windows client, so that code path ships.
+    #
+    # Scope: orrery_ipc_transport is the only crate in the repository whose
+    # Windows code carries a Windows-only dependency — its clock reads and
+    # timer-resolution grant are the `windows-sys` users, and every
+    # `#[cfg(windows)]` site with real FFI is there. regolith's three Windows
+    # arms are std-only (`APPDATA`/`HOME` joins and a const enum) with no
+    # Windows-only dependency, and checking that workspace for Windows would
+    # cross-compile the whole Bevy/wgpu graph for a second target: the
+    # client's cross-platform builds are deliberately on-demand (ci.yml,
+    # 2026-08-24), and a per-commit one would re-open that decision to guard
+    # two path joins.
+    #
+    # The gnu target, not msvc: a dependency's build script needs `ml64.exe`
+    # under msvc, which exists on no Linux box, while gnu cross-checks with no
+    # extra toolchain. And `cargo check`, never `build`: checking does not
+    # link, which is what keeps this stage at seconds against a warm cache.
+    if windows_target_installed; then
+        run cargo check -p orrery_ipc_transport --target x86_64-pc-windows-gnu
+    else
+        note 'windows cross-check skipped: x86_64-pc-windows-gnu is not installed for this toolchain'
+        note 'windows cross-check: to enable it, run: rustup target add x86_64-pc-windows-gnu'
+    fi
 }
 
 # ci.yml `gates`, verbatim: the static gates, every harness self-test in
@@ -810,6 +852,16 @@ self_test() {
     grep -Fq 'journal-fjall,chain-grpc' <(sed -n '/^lane_test() {/,/^}/p' "$0") \
         || die 'self-test: the test lane no longer exercises D19 journal-fjall fallback'
     note 'self-test: both D19 journal backends are covered by clippy and tests'
+
+    # And #1020's Windows cross-check must stay in the clippy lane: a stage
+    # that quietly disappears protects nothing. Anchored to the `run cargo
+    # check` invocation shape, which a comment line cannot have — the
+    # skip-path NOTE names the same target triple and must not satisfy this
+    # grep in the stage's place.
+    grep -Eq '^ *run cargo check .*--target x86_64-pc-windows-gnu' \
+        <(sed -n '/^lane_clippy() {/,/^}/p' "$0") \
+        || die 'self-test: the clippy lane no longer carries the Windows cross-check'
+    note 'self-test: the Windows cross-check is wired into the clippy lane'
 
     # Functional, not structural: exercise the guarded stage with a command
     # that cannot finish inside the bound, then require both timeout's status

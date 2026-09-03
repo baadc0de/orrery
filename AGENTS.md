@@ -98,6 +98,12 @@ whether a change passes is to run it, not to push and wait:
 ./scripts/check.sh doctor       # delegates to dev-cache.sh: is the cache working?
 ```
 
+The `clippy` lane also carries the Windows cross-check (`cargo check -p
+orrery_ipc_transport --target x86_64-pc-windows-gnu`, #1020): `#[cfg(windows)]`
+code compiled nowhere else per commit. Without the target installed the stage
+skips with a NOTE and the run still passes; `rustup target add
+x86_64-pc-windows-gnu` enables it.
+
 ### The push is the gate
 
 **`./scripts/check.sh` is always run before pushing a branch for a pull
