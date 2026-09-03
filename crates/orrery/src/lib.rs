@@ -38,6 +38,15 @@
 //! carries a claim off a link to the ring and the verdict back, can only be
 //! written where every one of those crates is already a dependency.
 //!
+//! [`ipc`] adds the sixth (#898 step 3), for the same reason with one more
+//! crate in the set: `orrery_ipc` is Bevy-free by mechanical gate and must
+//! not learn about ECS, `orrery_predict` must not learn what an IPC frame
+//! is, and the lightyear markers that identify the predicted and
+//! interpolated classes may only be named by a game that already uses them.
+//! The extraction of a [`FrameBatch`](orrery_ipc::FrameBatch) from the live
+//! world — the producer #967's transport had and nothing else supplied — can
+//! therefore only be written here.
+//!
 //! ```no_run
 //! use bevy::prelude::*;
 //! use orrery::prelude::*;
@@ -79,6 +88,7 @@ use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
 use orrery_witness::{ReportFiled, WitnessPlugin};
 
 pub mod hit;
+pub mod ipc;
 pub mod prelude;
 
 /// The aggregate client configuration: one struct carrying every member
