@@ -1426,12 +1426,68 @@ pub fn binding_range_start() -> Vec<u8> {
 
 /// The exclusive end of the `id/db/…` binding sub-space.
 ///
-/// `b"dc"` names nothing: `c` is the gap the discriminators `a < b < h`
-/// deliberately leave, so this bound is one past every binding key and short of
-/// every history key.
+/// `b"dc"` is [`cooldown_range_start`], the first key of D33's cooldown-entry
+/// sub-space: adjacent and disjoint, the same construction every other bound in
+/// this family uses. It was the gap the discriminators `a < b < h` deliberately
+/// left until D33 claimed it, and the bound is correct either way — one past
+/// every binding key and short of every cooldown key.
 #[must_use]
 pub fn binding_range_end() -> Vec<u8> {
     vec![b'd', b'c']
+}
+
+/// Key for D33's cooldown entry: `id/dc/{account_id}` -> `entered_at_ms:u64-be`.
+///
+/// `'d'`, then the sub-space discriminator `'c'`, then the 8-byte [`AccountId`]
+/// big-endian — the same shape as [`account_key`], so cooldown entries sort by
+/// account and the sub-space is one contiguous range. The value is a bare
+/// eight-byte big-endian instant with no postcard framing, which is what lets a
+/// reader decode a row without linking the writer's types.
+///
+/// # Why an identity-owned row's key lives here
+///
+/// `orrery_identity` is this family's **sole writer** (D31 clause (b)) and this
+/// module does not change that: nothing in `orrery_persistd` writes a `dc` row.
+/// What lives here is the *bytes*, beside the five sibling bounds of the same
+/// family — `account_key`/[`account_range_start`] (`da`),
+/// [`binding_range_start`] (`db`), [`binding_history_range_start`] (`dh`),
+/// [`binding_window_range_start`] (`dw`). This builder used to be private to
+/// `orrery_identity::fdb`, the one `d`-family key builder in the tree outside
+/// this module, which was safe only while identity was also the family's sole
+/// *reader*. It is not: `orrery_persistd::standing_feed::DcCooldownFeed` reads
+/// it, and `orrery_identity` cannot be named from a `persistd` binary
+/// (`docs/spikes/862-gateway-consumer-dependency-cycle.md` carries the cargo
+/// error). Two copies of these ten bytes in two crates is the outcome
+/// `crates/orrery_identity/Cargo.toml:29` records as "the one thing D31 clause
+/// (b) cannot survive", so there is one definition and it is this one.
+#[must_use]
+pub fn cooldown_entry_key(account: AccountId) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'd';
+    key[1] = b'c';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// The first key of the `id/dc/…` cooldown-entry sub-space (D33).
+///
+/// Identical to [`binding_range_end`] by construction, because the sub-spaces
+/// are adjacent: one family's exclusive end *is* the next family's inclusive
+/// start. Call the one that names what you are scanning.
+#[must_use]
+pub fn cooldown_range_start() -> Vec<u8> {
+    vec![b'd', b'c']
+}
+
+/// The exclusive end of the `id/dc/…` cooldown-entry sub-space.
+///
+/// `b"dd"` is not a key anything writes; it is the successor of the two-byte
+/// `dc` prefix, so `[dc, dd)` contains every `dc ‖ account` row and nothing
+/// else. Deriving the bound from the prefix rather than from `account =
+/// u64::MAX` keeps it correct if the row ever grows a suffix.
+#[must_use]
+pub fn cooldown_range_end() -> Vec<u8> {
+    vec![b'd', b'd']
 }
 
 /// The first key of the `id/dh/…` binding-history sub-space.
@@ -4066,6 +4122,11 @@ mod tests {
                             discriminator: b'b',
                             name: "id/db bindings",
                             sample: binding_key(&node(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'c',
+                            name: "id/dc cooldown entries",
+                            sample: cooldown_entry_key(AccountId::new(1)).to_vec(),
                         },
                         SubKind {
                             discriminator: b'h',

@@ -1,8 +1,19 @@
 # #862 box 2 item 3 — persistd's gateway consumer, and the dependency cycle
 
-**Status: spike. Proposes, decides nothing.** The working artifact is
-[`862-gateway-consumer/`](862-gateway-consumer/); it runs green against a real
-FoundationDB cluster and its central assertion has been mutation-checked.
+**Status: spike, now settled. Proposes, decides nothing.** The working artifact
+is [`862-gateway-consumer/`](862-gateway-consumer/); it runs green against a
+real FoundationDB cluster and its central assertion has been mutation-checked.
+
+> **Outcome, 2026-09-03.** The owner took **candidate B**. It shipped as
+> `orrery_persistd::standing_feed::DcCooldownFeed`, with the key builder moved
+> to `orrery_persistd::keyspace::cooldown_entry_key` (its five `d`-family
+> siblings' module) and identity calling it from there — one definition of
+> those bytes, which is what makes B safe. The `persistd` binary installs the
+> feed whenever it has a cluster, and the enforcement the spike deliberately
+> left unwired is wired: C5's posture is read at the Hello arm and at the top of
+> each sweep *and* again per session, so an auto-suspend demotes mid-sweep.
+> Candidate D remains the named successor; taking it deletes `DcCooldownFeed`
+> and changes nothing else.
 
 Written 2026-09-03, against `main` at `8c42868` (#958, which landed less than an
 hour before this spike started and moved this territory).

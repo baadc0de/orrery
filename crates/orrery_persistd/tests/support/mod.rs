@@ -100,9 +100,24 @@ pub fn session_token(
     issued_at_ms: u64,
     ttl_ms: u64,
 ) -> Vec<u8> {
+    session_token_for_account(issuer, AccountId::new(7), bound_node, issued_at_ms, ttl_ms)
+}
+
+/// [`session_token`] over a caller-chosen account.
+///
+/// The account is a parameter because the FDB-gated suites write rows keyed by
+/// it into a **shared** dev cluster, where the fixed `AccountId::new(7)` every
+/// in-memory test uses would collide with a sibling lane. Nothing else differs.
+pub fn session_token_for_account(
+    issuer: &iroh_base::SecretKey,
+    account: AccountId,
+    bound_node: NodeId,
+    issued_at_ms: u64,
+    ttl_ms: u64,
+) -> Vec<u8> {
     SessionTokenV1::sign(
         SessionTokenClaimsV1::new(
-            AccountId::new(7),
+            account,
             bound_node,
             UnixMillis::new(issued_at_ms),
             SessionTokenTtlMs::new(ttl_ms),

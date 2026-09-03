@@ -45,6 +45,8 @@ pub mod placement;
 pub mod reliable;
 pub mod runtime;
 pub mod schema;
+#[cfg(feature = "fdb")]
+pub mod standing_feed;
 pub mod witness_epoch;
 
 pub use actor::{

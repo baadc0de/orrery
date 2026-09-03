@@ -1167,3 +1167,161 @@ fn readiness_reports_the_owned_shard_set_with_per_shard_epochs() {
 
     stop(&mut child);
 }
+
+/// The wiring #862 adds, proved against the compiled binary: a deployed
+/// `persistd` at `--strikes live` refuses a `Hello` for an account identity has
+/// cooled down.
+///
+/// This is the whole chain in one process — identity's durable `dc` row, the
+/// `DcCooldownFeed` the binary installs, the 1 s maintenance sweep, C5's
+/// posture, and the admission arm — over a real cluster and a real QUIC dial.
+/// Before it, `GatewayConfig::standing_feed` had no setter outside
+/// `tests/gateway_standing.rs`, so C5 was switched off at the transport layer
+/// in every deployment no matter which posture an operator selected. The
+/// posture arms themselves (`Off` reads nothing, `Shadow` evaluates and does
+/// not act) are in that suite's `dc_feed` module, against the same feed.
+///
+/// The row is written as raw bytes because no target in this crate may name
+/// `orrery_identity` — it depends on `orrery_persistd`. What keeps that honest
+/// is [`orrery_persistd::keyspace::cooldown_entry_key`]: since #862 it is the
+/// single definition of these ten bytes, and identity's `observe_cooldown`
+/// calls it too.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn a_deployed_persistd_refuses_a_hello_for_an_account_identity_cooled_down() {
+    use orrery_persistd::keyspace;
+    use orrery_protocol::AccountId;
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let cluster_string = cluster.display().to_string();
+    let Ok(context) = FdbContext::connect(&cluster_string) else {
+        eprintln!("skipping: unable to open FDB cluster file");
+        return;
+    };
+    let store = orrery_persistd::fence::FdbFenceStore::from_context(&context);
+    if store.read(GridId::ROOT, CellId::ROOT).await.is_err() {
+        eprintln!("skipping: FDB cluster is not reachable");
+        return;
+    }
+    let db = context.database();
+
+    // An id in #862's own band, with the pid in the low half: the dev cluster
+    // is shared, and a fixed fixture id turns a sibling lane's suite red.
+    let account = AccountId::new(0x0862_0006_0000_0000 | u64::from(std::process::id()));
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_millis(),
+    )
+    .expect("current timestamp fits u64");
+    // The token predates the crossing, which is the only case an invalidation
+    // is *for*: it was cryptographically valid when minted and stays so for its
+    // whole TTL, and nothing but this feed can take it back.
+    let issued_at_ms = now_ms - 10_000;
+    let entered_at_ms = now_ms;
+
+    db.run(|trx, _| async move {
+        trx.set(
+            &keyspace::cooldown_entry_key(account),
+            &entered_at_ms.to_be_bytes(),
+        );
+        Ok(())
+    })
+    .await
+    .expect("write the dc cooldown entry");
+
+    let client_key = iroh::SecretKey::generate();
+    let bind_addr = free_loopback_addr();
+    let args = vec![
+        "--bind".to_string(),
+        bind_addr.to_string(),
+        "--fdb-cluster-file".to_string(),
+        cluster_string,
+        "--strikes".to_string(),
+        "live".to_string(),
+    ];
+    let (_dir, mut child, ready) = spawn_persistd(&args);
+    let gateway = ready["node_id"]
+        .as_str()
+        .expect("gateway node id")
+        .parse::<NodeId>()
+        .expect("valid gateway node id");
+
+    // The sweep that populates the consumer rides the accept loop's `select!`
+    // maintenance arm, whose 1 s sleep is **restarted every time a connection
+    // is accepted**. So this waits between dials rather than hammering: a
+    // client reconnecting faster than once a second would keep cancelling the
+    // very sweep it is waiting for, and the test would report "the binary
+    // installs no standing feed" for a scheduling reason. Two and a half
+    // seconds is two full maintenance ticks of quiet.
+    let quiet = Duration::from_millis(2_500);
+    tokio::time::sleep(quiet).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut last = String::from("no Hello was ever answered");
+    let refused = loop {
+        let client = Builder::new(N0)
+            .alpns(vec![GATEWAY_ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .secret_key(client_key.clone())
+            .bind()
+            .await
+            .expect("client endpoint");
+        let connection = client
+            .connect(
+                iroh::EndpointAddr::new(gateway).with_ip_addr(bind_addr),
+                GATEWAY_ALPN,
+            )
+            .await
+            .expect("connect to the deployed gateway");
+        let mut admission = connection.accept_uni().await.expect("gateway admission");
+        assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
+        let connection = lanes::GatewayLanes::attach(connection);
+        connection
+            .send_control(&GatewayMsg::VersionedHello {
+                token: support::session_token_for_account(
+                    &support::issuer(),
+                    account,
+                    client_key.public(),
+                    issued_at_ms,
+                    support::TOKEN_TTL_MS,
+                ),
+                node: client_key.public(),
+                version: orrery_protocol::PROTOCOL_VERSION,
+            })
+            .await;
+        match connection.next_reply(lanes::LIVENESS_CEILING).await {
+            Some(GatewayReply::HelloRefused { reason, .. })
+                if reason == GatewayReply::HELLO_REFUSED_STANDING =>
+            {
+                break true;
+            }
+            Some(other) => last = format!("{other:?}"),
+            None => last = format!("silence for {:?}", lanes::LIVENESS_CEILING),
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(quiet).await;
+    };
+
+    stop(&mut child);
+    // Leave the shared cluster as it was found, whatever the verdict.
+    let _ = db
+        .run(|trx, _| async move {
+            trx.clear(&keyspace::cooldown_entry_key(account));
+            Ok(())
+        })
+        .await;
+
+    assert!(
+        refused,
+        "a deployed persistd at --strikes live admitted an account whose dc \
+         cooldown entry identity had written; the last answer was {last}. \
+         Either the binary installs no standing feed, or the feed cannot read \
+         the dc family."
+    );
+}

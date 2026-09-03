@@ -273,28 +273,16 @@ async fn read_window(
 
 /// Key for D33's identity-owned cooldown entry: `dc ‖ account:u64-be`.
 ///
-/// `dc` is the formerly unused sub-span immediately after D31's `db` range
-/// end. This crate is the `d` family's sole writer; the key is local because
-/// cooldown is derived identity state rather than a persistd concern.
+/// A thin alias for [`keyspace::cooldown_entry_key`], which is where the bytes
+/// live: beside every other `d`-family builder, in the module that owns the
+/// family's layout. This crate remains the family's **sole writer** — the move
+/// changed who may compute the key, not who may set it — but it is no longer
+/// the sole reader, because a `persistd` gateway consumes these rows and cannot
+/// name this crate (see that function's doc for why one definition is
+/// load-bearing).
 fn cooldown_entry_key(account: AccountId) -> [u8; 10] {
-    let mut key = [0u8; 10];
-    key[0] = b'd';
-    key[1] = b'c';
-    key[2..].copy_from_slice(&account.0.to_be_bytes());
-    key
+    keyspace::cooldown_entry_key(account)
 }
-
-/// Inclusive start of the whole `dc` family: every cooldown entry sorts at or
-/// after `dc\0…`.
-const COOLDOWN_RANGE_START: [u8; 2] = [b'd', b'c'];
-
-/// Exclusive end of the whole `dc` family.
-///
-/// `dd` is not a key this crate writes; it is simply the successor of the two
-/// byte `dc` prefix, so `[dc, dd)` contains every 10-byte `dc ‖ account` row
-/// and nothing else. Deriving the bound from the prefix rather than from
-/// `account = u64::MAX` keeps it correct if the row ever grows a suffix.
-const COOLDOWN_RANGE_END: [u8; 2] = [b'd', b'd'];
 
 /// Read the fixed-width `dc` timestamp inside one transaction.
 async fn read_cooldown_entry(
@@ -646,10 +634,10 @@ impl AccountStore for FdbAccountStore {
                 let mut stream = trx.get_ranges_keyvalues(
                     foundationdb::RangeOption {
                         begin: foundationdb::KeySelector::first_greater_or_equal(
-                            COOLDOWN_RANGE_START.as_slice(),
+                            keyspace::cooldown_range_start(),
                         ),
                         end: foundationdb::KeySelector::first_greater_or_equal(
-                            COOLDOWN_RANGE_END.as_slice(),
+                            keyspace::cooldown_range_end(),
                         ),
                         ..foundationdb::RangeOption::default()
                     },

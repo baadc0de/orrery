@@ -1453,6 +1453,19 @@ async fn main() -> anyhow::Result<()> {
         .map(|executor| executor.retained().collect())
         .unwrap_or_default();
     gateway_config.adjudicator = adjudicator;
+    // D33 clause (e)'s consumption half, wired for the first time outside a
+    // test (#862). Identity publishes a cooldown entry when an account crosses
+    // `C`; this gateway reads that family directly, because `[[bin]] persistd`
+    // lives inside `crates/orrery_persistd` and so can never name
+    // `orrery_identity` — see `orrery_persistd::standing_feed` and
+    // `docs/spikes/862-gateway-consumer-dependency-cycle.md`.
+    //
+    // Installing it is behaviour-preserving on its own: C5 defaults to `Off`,
+    // and an `Off` sweep returns before it polls, so a deployment that has not
+    // selected `--strikes shadow` or `--strikes live` neither reads this family
+    // nor acts on it. The posture cell below is what decides.
+    #[cfg(feature = "fdb")]
+    install_standing_feed(&mut gateway_config, fdb_context.as_ref());
     #[cfg(feature = "fdb")]
     let (attestation_poller, strikes_poller, authority_correction_poller) =
         if let Some(context) = fdb_context.as_ref() {
@@ -2652,6 +2665,36 @@ struct AttestationWiring {
     posture: AttestationPosture,
     epochs: Arc<orrery_persistd::witness_epoch::WitnessEpochAuthority>,
     bindings: orrery_persistd::gateway::SharedBindingAuthority,
+}
+
+/// Install D33 clause (e)'s consumption half on `config` (#862).
+///
+/// Separated from the call site so the wiring itself has a test: it is one
+/// `if let`, and an `if let` that silently stopped installing the feed would
+/// leave every posture arm inert with nothing red — exactly the failure mode
+/// this issue exists to close, since `standing_feed` had **no** non-test setter
+/// before now.
+///
+/// `None` — no `--fdb-cluster-file` — installs nothing, because the feed is a
+/// read of a durable family and there is no cluster to read.
+#[cfg(feature = "fdb")]
+fn install_standing_feed(config: &mut GatewayConfig, context: Option<&FdbContext>) {
+    let Some(context) = context else {
+        return;
+    };
+    config.standing_feed = Some(Arc::new(
+        orrery_persistd::standing_feed::DcCooldownFeed::from_context(context),
+    )
+        as orrery_persistd::gateway::SharedStandingInvalidationFeed);
+    // Said once at startup, because "is this gateway consuming standing at
+    // all?" is otherwise only answerable by reading the source: the feed is
+    // silent at `Off`, and an operator who has selected `--strikes live` needs
+    // to be able to tell "nothing is invalidated" from "nothing is being read".
+    tracing::info!(
+        control = orrery_persistd::gateway::STRIKES_CONTROL,
+        posture = ?config.strikes_posture.get(),
+        "gateway consumes identity's dc cooldown family (D33 clause (e))"
+    );
 }
 
 fn gateway_config<F>(
@@ -4436,6 +4479,25 @@ mod tests {
             "removing the row restores the off startup default"
         );
         poller.abort();
+    }
+
+    /// Without a cluster there is nothing to read, so nothing is installed.
+    ///
+    /// The positive half is deliberately not here: booting the FDB client
+    /// network inside this binary's own unit-test harness segfaults the process
+    /// on exit, which would turn `check.sh` red for a reason that has nothing to
+    /// do with standing. It is proved end to end instead, against the compiled
+    /// binary, by `tests/persistd_binary.rs`'s
+    /// `a_deployed_persistd_refuses_a_hello_for_an_account_identity_cooled_down`.
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn no_cluster_file_installs_no_standing_feed() {
+        let mut config = GatewayConfig::default();
+        install_standing_feed(&mut config, None);
+        assert!(
+            config.standing_feed.is_none(),
+            "a gateway with no --fdb-cluster-file has no dc family to read"
+        );
     }
 
     /// C5 reaches the gateway's posture cell, rather than stopping at clap.
