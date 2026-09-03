@@ -138,11 +138,35 @@ Numbered so they can be answered one at a time.
 11. ~~Corpse and loot location on the mothership.~~ **Answered: drops until NPC security collects, then apartment or escrow (G4.18).**
 12. ~~Transit as fast travel.~~ **Answered: intra-mothership and recall-to-mothership only, not engaged, cooldown (G4.19).**
 
+## G5 — Economy: contracts, money, standing
+
+| # | Requirement | Source |
+|---|---|---|
+| G5 | **The contract is the unit of economic activity.** Gathering, delivery, crafting, procurement, retrieval and clandestine work are all expressed as contracts. | derived from G4.20, G3.3 |
+| G5.1 | **Issuers:** players, the mothership, insurance (G3.3), and NPC factions. | owner mandate |
+| G5.2 | **Working against the mothership is allowed.** Players may take NPC-faction contracts for **clandestine ops** against the mothership's interests. Doing so may affect **renown and standing**. | owner mandate |
+| G5.3 | **Player contracts are priced by the player.** A **suggest** feature computes a "fair" value from macro-service data; the player may ignore it. | owner mandate |
+| G5.4 | **Automatic pricing** for mothership, insurance and NPC-faction contracts, computed by the macro service. | owner mandate |
+| G5.5 | **Players get first refusal.** NPCs let a contract run for a while before taking it, so a player has the chance to take it first. | owner mandate |
+| G5.6 | **Player-taken is micro, NPC-taken is macro.** A contract taken by a player is fulfilled in the micro simulation. Macro fulfilment is an optimisation for when no player is involved, and is expected to carry **a good chunk of the boring supply economy**. | owner mandate |
+| G5.7 | **Contracts exchange money, work and goods in any combination.** There is a currency, but a contract need not use it. | owner mandate |
+| G5.8 | **Two reputation axes.** **Renown** (G4.3) is achievement and command eligibility; **standing** is the relationship with a faction (the mothership or an NPC faction). Clandestine work trades standing with one for standing with another. | derived from G4.3, G5.2 |
+
+### Engineering consequences of G5
+
+- **The contract is a state machine with a ledger.** Issued → open (player window, G5.5) → taken (by player: micro; by NPC: macro) → fulfilled / failed / expired → settled. Every transition is a value-bearing write. The player-window timer and the NPC take-up decision live in the macro service; the take-by-player transition is the one place the two layers hand a job across, and it must be atomic (a contract cannot be taken twice).
+- **Settlement is escrowed.** Money, goods and the promise of work are locked at issue or at take, and released at settlement, so neither party can default mid-contract and no item exists in two places. The escrow store from G4 generalises to contract escrow.
+- **Micro fulfilment must be verifiable by the macro service.** "Delivered 40 t of ore to structure X" is a micro-layer fact that the macro ledger acts on. It must arrive as an attested event (R8, ADR-0027), not as a client claim, and the macro service is a consumer of the witnessed journal (ADR-0019), not of live entity state.
+- **Macro and micro fulfilment must be ledger-equivalent.** The same contract, fulfilled by an NPC in the macro service or by a player in the micro layer, must produce the same resource movements. This is the invariant that keeps macro fulfilment an optimisation rather than a second economy, and it is a property-testable statement.
+- **Fair-value suggestion is a read-only macro query** over prices, distances, travel time (G2.2c), risk and scarcity. It needs a price history, so the macro service keeps a time series of settlements.
+- **Clandestine ops need concealment as a game fact.** A contract against the mothership must be hidden from the mothership's view (NPC security, other players' contract boards) until discovered, so contract visibility is per-viewer and the "discovered" transition is an attested event that triggers standing loss. Under open PvP (G4.9) this is also how players police each other.
+- **Currency is a durable balance per player**, mothership-scoped (G4.10), with faucets and sinks owned by the macro service (contract pricing, upkeep G3.1/G4.14). Inflation control is a macro-service tuning problem and needs telemetry from the first playtest.
+- **NPC take-up is the demand floor.** Because NPCs eventually take any priced contract, no player-issued contract starves; the delay in G5.5 is the parameter that decides how much of the economy is player-run and is a season-tunable value (ADR-0016).
+
 ## Open — to be settled by the owner
 
 Sections reserved; each becomes a `G<n>` block when decided.
 
-- G5 — Economy rules (currency, NPC sinks/faucets, player-only trade)
 - G6 — Progression (skills, blueprints, ship/mech tiers)
 - G7 — Population and grouping (factions, crews, guilds)
 - G8 — PvE content model (NPC ships, fauna, missions)
