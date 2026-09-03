@@ -1,0 +1,32 @@
+{
+  "schema": "orrery-ipc-harness/1",
+  "role": "sidecar",
+  "platform": "linux",
+  "clock": "CLOCK_MONOTONIC",
+  "entities": 128,
+  "inputs_processed": 36600,
+  "frames_pushed": 36600,
+  "drops": {
+    "input_dropped": 0,
+    "forward_seq_gaps": 0,
+    "forward_seq_reorders": 0,
+    "frame_discarded_sidecar": 30,
+    "frame_overwritten_observer": 0,
+    "return_seq_gaps": 0,
+    "return_seq_reorders": 0,
+    "spawn_missing": 0,
+    "despawn_missing": 0,
+    "samples_missing_sidecar_timing": 0,
+    "probe_replies_missing": 0,
+    "tick_overruns": 0
+  },
+  "extract_local_ns": {
+    "n": 36600,
+    "mean_ns": 881.2529781420765,
+    "min_ns": 151,
+    "p50_ns": 611,
+    "p99_ns": 6553,
+    "p99_9_ns": 15489,
+    "max_ns": 353280
+  }
+}

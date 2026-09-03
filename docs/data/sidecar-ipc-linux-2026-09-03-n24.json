@@ -1,0 +1,160 @@
+{
+  "schema": "orrery-ipc-harness/1",
+  "role": "observer",
+  "platform": "linux",
+  "arch": "x86_64",
+  "clock": "CLOCK_MONOTONIC",
+  "transport": "tcp-loopback",
+  "tcp_nodelay": true,
+  "time_begin_period": false,
+  "entities": 24,
+  "tick_hz": 60,
+  "warmup_ticks": 600,
+  "ticks": 36000,
+  "samples": 36000,
+  "duration_s": 600.004174491,
+  "loadavg_start": [
+    0.76,
+    21.44,
+    41.08
+  ],
+  "loadavg_end": [
+    0.88,
+    3.53,
+    21.65
+  ],
+  "phases_ns": {
+    "hop_in": {
+      "n": 36000,
+      "mean_ns": 13831.8665,
+      "min_ns": 3517,
+      "p50_ns": 12954,
+      "p99_ns": 24796,
+      "p99_9_ns": 90659,
+      "max_ns": 1745766
+    },
+    "hop_out": {
+      "n": 36000,
+      "mean_ns": 18596.973305555555,
+      "min_ns": 2475,
+      "p50_ns": 18043,
+      "p99_ns": 39343,
+      "p99_9_ns": 61364,
+      "max_ns": 2169517
+    },
+    "decode_out": {
+      "n": 36000,
+      "mean_ns": 1120.4596388888888,
+      "min_ns": 200,
+      "p50_ns": 982,
+      "p99_ns": 2083,
+      "p99_9_ns": 3637,
+      "max_ns": 27230
+    },
+    "ipc_added": {
+      "n": 36000,
+      "mean_ns": 43055.87363888889,
+      "min_ns": 13325,
+      "p50_ns": 41738,
+      "p99_ns": 70852,
+      "p99_9_ns": 198280,
+      "max_ns": 5186905
+    },
+    "encode": {
+      "n": 36000,
+      "mean_ns": 9254.8805,
+      "min_ns": 2043,
+      "p50_ns": 6512,
+      "p99_ns": 26659,
+      "p99_9_ns": 42239,
+      "max_ns": 3729367
+    },
+    "phase": {
+      "n": 36000,
+      "mean_ns": 16617213.730527777,
+      "min_ns": 10221808,
+      "p50_ns": 16619583,
+      "p99_ns": 16642666,
+      "p99_9_ns": 16646523,
+      "max_ns": 19814012
+    },
+    "phase_after_decode": {
+      "n": 36000,
+      "mean_ns": 16616093.27088889,
+      "min_ns": 10194578,
+      "p50_ns": 16618530,
+      "p99_ns": 16642075,
+      "p99_9_ns": 16646052,
+      "max_ns": 19812139
+    },
+    "extract": {
+      "n": 36000,
+      "mean_ns": 251.69369444444445,
+      "min_ns": 50,
+      "p50_ns": 201,
+      "p99_ns": 541,
+      "p99_9_ns": 1313,
+      "max_ns": 64340
+    }
+  },
+  "baselines_ns": {
+    "extract_inproc": {
+      "n": 36000,
+      "mean_ns": 265.60630555555554,
+      "min_ns": 70,
+      "p50_ns": 251,
+      "p99_ns": 621,
+      "p99_9_ns": 3506,
+      "max_ns": 17964
+    },
+    "hop_null_out": {
+      "n": 36600,
+      "mean_ns": 13833.360327868853,
+      "min_ns": 2806,
+      "p50_ns": 11822,
+      "p99_ns": 26680,
+      "p99_9_ns": 62106,
+      "max_ns": 1657993
+    },
+    "hop_null_rtt": {
+      "n": 36600,
+      "mean_ns": 33670.80959016393,
+      "min_ns": 8997,
+      "p50_ns": 31699,
+      "p99_ns": 58489,
+      "p99_9_ns": 130283,
+      "max_ns": 5068285
+    },
+    "hop_null_back": {
+      "n": 36600,
+      "mean_ns": 12293.202595628416,
+      "min_ns": 1794,
+      "p50_ns": 10750,
+      "p99_ns": 32080,
+      "p99_9_ns": 38351,
+      "max_ns": 2235770
+    }
+  },
+  "drops": {
+    "input_dropped": 0,
+    "forward_seq_gaps": 0,
+    "forward_seq_reorders": 0,
+    "frame_discarded_sidecar": 0,
+    "frame_overwritten_observer": 0,
+    "return_seq_gaps": 0,
+    "return_seq_reorders": 0,
+    "spawn_missing": 0,
+    "despawn_missing": 0,
+    "samples_missing_sidecar_timing": 0,
+    "probe_replies_missing": 0,
+    "tick_overruns": 0
+  },
+  "notes": [
+    "phase is the wait for the next observer tick, reported separately and excluded from ipc_added: it exists in embedded too (issue #920, lie 6)",
+    "ipc_added = hop_in + extract + encode + hop_out + decode_out = t_decode - t0",
+    "the #920 stand/overturn bands are defined at N = 24 on WINDOWS; a report from any other platform is informational only",
+    "warmup ticks are excluded from every sample (allocator and branch warmth, issue #920 lie 9)",
+    "I/O is blocking std on dedicated threads; no async runtime is measured (issue #920 lie 8)",
+    "the sidecar is event-driven, so no scheduling wait is hidden inside its columns; the extraction contract is shape-faithful, not a Bevy App"
+  ]
+}
