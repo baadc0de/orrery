@@ -563,6 +563,38 @@ fn fdb_cluster_file() -> Option<std::path::PathBuf> {
     }
 }
 
+/// A `--shard` value naming a cell nothing else claims on the shared dev
+/// cluster, so two spawned binaries can hold disjoint startup fences and
+/// still run in parallel.
+///
+/// The startup fence is exclusive over a shard set, and a single-mode node
+/// without `--shard` claims `CellId::ROOT`. Two tests in this file spawn a
+/// real persistd against the one dev cluster, so left at the default both
+/// claim ROOT's set and whichever activation commits second dies with
+/// "startup fence activation conflicted" before its readiness line (#993) —
+/// a race that few hosted cores schedule into overlap and any workstation
+/// with more exposes.
+///
+/// The remedy is the one this file already knew: the account id in the
+/// cooldown test below carries the pid because "the dev cluster is shared,
+/// and a fixed fixture id turns a sibling lane's suite red". The shard claim
+/// gets the same treatment. The band constant 0x0993 — this issue — rides in
+/// the top bits, the pid occupies bits 1..32, and `slot` (unique per test in
+/// this file) sits above the pid, so distinct processes never name the same
+/// cell and the two spawns this file makes within one test process are
+/// separated by `slot`. Bit 0 is the level-21 sentinel, so every value this
+/// builds is a well-formed deepest-level cell; and a pid reused by a later
+/// sequential run is harmless, because re-activating a row whose owner is
+/// the default node id 0 is the ordinary serial path, not a conflict.
+///
+/// Raw bits, the form `--shard` accepts and the readiness line reports.
+#[cfg(feature = "fdb")]
+fn fixture_shard(slot: u64) -> String {
+    let bits = 0x0993_0000_0000_0001 | (u64::from(std::process::id()) << 1) | (slot << 33);
+    let cell = CellId::from_bits(bits).expect("the sentinel bit keeps the cell id non-zero");
+    format!("{:#x}", cell.to_bits())
+}
+
 /// The fdb-enabled binary must reach its JSON readiness line after building
 /// fence, checkpoint, and intent adapters from one process-scoped context.
 ///
@@ -589,6 +621,11 @@ async fn fdb_binary_reaches_readiness_with_shared_context() {
     let args = vec![
         "--bind".to_string(),
         "127.0.0.1:0".to_string(),
+        // A fixture cell rather than the default ROOT claim: the fence is
+        // exclusive over a shard set, and this spawn must not race a sibling
+        // test's activation on the shared dev cluster (#993).
+        "--shard".to_string(),
+        fixture_shard(0),
         "--fdb-cluster-file".to_string(),
         cluster_string,
     ];
@@ -1268,6 +1305,11 @@ async fn a_deployed_persistd_refuses_a_hello_for_an_account_identity_cooled_down
         cluster_string,
         "--strikes".to_string(),
         "live".to_string(),
+        // The readiness test spawns against the same shared cluster at the
+        // same moment; a fixture cell keeps the two fence claims disjoint
+        // (#993), where the default ROOT claim would kill one of them.
+        "--shard".to_string(),
+        fixture_shard(1),
     ];
     let (_dir, mut child, ready) = spawn_persistd(&args);
     let gateway = ready["node_id"]
