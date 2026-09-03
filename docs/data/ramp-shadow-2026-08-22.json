@@ -151,7 +151,7 @@
   "absent": [
     {
       "control": "write_annulment",
-      "reason": "D32 clause (d): C3 has no write-refusal or compensating-write observation seam, so neither qualifying honest activity nor would-be annulments can be measured."
+      "reason": "D32 clause (d): C3's shadow evaluation computes a refusal set (pending intents) plus an annulment set (journaled effects, inverse ops computed), and no seam can produce either, so neither qualifying honest activity nor would-be annulments can be measured. The control has no enforcement machinery to shadow — no posture type, no poller, no evaluation path; the verdict seam where C4 and C5 meter has no join to the write machinery that would compute those sets; and the store exposes no per-account journaled-effects surface to size them from. D29's annulment sweep is the always-on fail-closed path clause (h) excludes from the ramp, so an annulment-shaped count would fabricate C3 evidence rather than measure it."
     }
   ]
 }
