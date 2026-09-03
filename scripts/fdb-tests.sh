@@ -7,10 +7,12 @@
 #
 # ── Why this exists ──────────────────────────────────────────────────────────
 #
-# `orrery_persistd`, `orrery_seed` and `orrery_identity` carry a whole tier of
+# `orrery_persistd`, `orrery_seed`, `orrery_identity` and `orrery_coordinator`
+# carry a whole tier of
 # tests that only compile under `--features fdb` — checkpoint write and restore,
-# the `actor/{shard}` fence CAS, the lease CAS, intent commit, seed apply, and
-# the `id/` subspace's one-transaction bind. Every one
+# the `actor/{shard}` fence CAS, the lease CAS, intent commit, seed apply,
+# the `id/` subspace's one-transaction bind, and D33 clause (e)'s standing
+# chain from a filed `ya` row to a coordinator ending the session. Every one
 # of them opens with a guard that looks for a cluster and, not finding one,
 # `eprintln!("skipping: ...")` and returns `Ok`.
 #
@@ -293,6 +295,14 @@ REQUIRED_TARGETS=(
   # effects, which is the property that makes a retrospective audit of the draw
   # non-vacuous, and there is no such transaction without a cluster.
   intent_witness_epoch
+  # D33 clause (e), whole: the executor's `ya`/`yd` write, identity's filing
+  # reactor turning that notice into a `dc` entry, and a real coordinator
+  # consuming it over real iroh endpoints to end an open session and refuse the
+  # token that held it. Every link shipped and was covered separately; nothing
+  # read what the previous link wrote, and none of it means anything against a
+  # memory store — what is asserted is that three processes' durable bytes
+  # agree.
+  standing_invalidation_chain
   # D32 clause (i)'s reader-side authentication and clause (c)'s 2 s bound.
   # The claim these carry — that possession of the cluster file is not
   # authority over fleet enforcement posture — is a claim about what a real
@@ -489,8 +499,19 @@ set +e
   cd "$ROOT"
   # The workflows force colour on; a log that has to be parsed does not want it.
   CARGO_TERM_COLOR=never \
+  # `orrery_coordinator` joined the invocation with #862's chain suite. It is
+  # the only crate that may name all three of the executor, identity and the
+  # coordinator — `orrery_identity` depends on `orrery_persistd`, and the
+  # coordinator on both — so D33 clause (e) can only be assembled whole at its
+  # downstream end, and this is the only runner that gives that assembly a
+  # cluster. Its two features are spelled out because neither is in a `default`
+  # set: `standing-feed` is the packaging decision #862 box 2 forced, and
+  # `fdb-state` is what puts `orrery_persistd/fdb` in the coordinator's own
+  # graph. Both resolve to features this command already turns on elsewhere, so
+  # they add no unification the other packages can see.
   cargo test -p orrery_persistd -p orrery_seed -p orrery_identity \
-    --features orrery_persistd/fdb,orrery_seed/fdb,orrery_identity/fdb \
+    -p orrery_coordinator \
+    --features orrery_persistd/fdb,orrery_seed/fdb,orrery_identity/fdb,orrery_coordinator/standing-feed,orrery_coordinator/fdb-state \
     -- --nocapture
 ) 2>&1 | tee "$LOG"
 status="${PIPESTATUS[0]}"

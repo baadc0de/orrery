@@ -34,7 +34,18 @@ fdb-state = ["dep:orrery_persistd", "orrery_persistd/fdb"]
 # Independent of `fdb-state`, which reads D32's `ramp/` posture rows through
 # persistd's keyspace. Both may be on; cargo unifies the FoundationDB features
 # they each imply.
-standing-feed = ["dep:orrery_identity", "orrery_identity/fdb"]
+#
+# `dep:foundationdb` rides along for `tests/standing_invalidation_chain.rs`,
+# and only for it: that suite writes through two production writers on a
+# *shared* development cluster, so it has to clear the ranges it wrote or the
+# next run finds an account it believes it just created already cooled down.
+# There is no public range-clear helper — `orrery_persistd::fdb` exposes a
+# context, a bound handle and the key builders, and nothing that erases — and
+# a dev-dependency cannot be optional, so a plain one would drag the
+# FoundationDB C client into the FDB-free island build `nightly.yml` documents
+# as deliberate. Declared here instead, where the feature that already links
+# the client is the thing that turns it on. No `src/` module names it.
+standing-feed = ["dep:orrery_identity", "orrery_identity/fdb", "dep:foundationdb"]
 
 [[bin]]
 name = "orrery-coordinator"
@@ -53,6 +64,14 @@ orrery_persistd = { path = "../orrery_persistd", default-features = false, featu
 # coordinator → identity → persistd and never back, which is why the adapter
 # is here rather than the trait impl being over there.
 orrery_identity = { path = "../orrery_identity", optional = true }
+# Behind `standing-feed`, and used by that feature's integration test alone —
+# see the feature's own comment for why it is declared here rather than in
+# `[dev-dependencies]`. Pinned to the same 0.11 / `fdb-7_3` pair every other
+# member of this workspace uses (D14): two versions of the C bindings in one
+# graph is a link-time failure, not a resolution one.
+foundationdb = { version = "0.11", default-features = false, features = [
+    "fdb-7_3",
+], optional = true }
 # The standing-invalidation feed (D33 clause (e)) is an async trait, the same
 # shape persistd's gateway-side seam uses.
 async-trait = "0.1"
