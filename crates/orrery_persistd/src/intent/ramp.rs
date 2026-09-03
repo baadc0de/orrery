@@ -102,6 +102,21 @@
 //! operator's view of the row and `orrery-ramp window reset` is the deliberate
 //! way to start a fresh one.
 //!
+//! # Getting the counters back out
+//!
+//! Metering them and being able to *read* them are two different landings, and
+//! for a while only the first had happened: the meters counted in the deployed
+//! composition and nothing in the tree called [`RampMeter::snapshot`] outside
+//! a test, so the durable cohort and the durable window could not reach an
+//! artifact at all ([#991]). That was a code gap and not a traffic gap.
+//!
+//! [`super::report`] is the exit. `orrery-ramp report` loads the durable
+//! cohort and every control's durable window, replays them into a meter that
+//! never metered anything — [`RampMeter::restore`] then
+//! [`RampMeter::snapshot`], the same two calls `persistd` makes at startup —
+//! and writes a [`RampArtifact`]. It runs in an operator tool and not in the
+//! coordinator, which ADR-0031 clause (d) forbids from reading.
+//!
 //! # Regenerating the committed artifact
 //!
 //! ```sh
@@ -116,6 +131,7 @@
 //!
 //! [#221]: https://github.com/baadc0de/orrery/issues/221
 //! [#990]: https://github.com/baadc0de/orrery/issues/990
+//! [#991]: https://github.com/baadc0de/orrery/issues/991
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -134,7 +150,38 @@ use super::window::{DurableTally, RampWindowDelta, RampWindowRow, WindowCounts};
 /// Versioned from the first write, because `scripts/ramp-report.py` reads it
 /// and a reader that guesses at a shape it was not written for reports numbers
 /// that are wrong rather than absent.
-pub const RAMP_ARTIFACT_SCHEMA: &str = "orrery.ramp.report/1";
+///
+/// # Why `/2`
+///
+/// `/1` could only be produced by an in-memory harness, and it shows: three of
+/// its fields cannot be filled honestly by an artifact assembled from the
+/// durable window [`super::window`] landed, and one identity it implies does
+/// not hold on traffic with sessionless submissions in it. `/2` is the shape
+/// an emit path reading durable state can fill without inventing anything:
+///
+/// - [`RampSnapshot::accounts_qualifying`], `accounts_observed`,
+///   `accounts_would_act` and `accounts_truncated` became `Option<u64>`. They
+///   are distinct-account cardinalities, which are per-process by construction
+///   — see [`super::window`]'s module docs — so an assembler that never
+///   metered anything has no value for them. `None` says so. This is the
+///   change that forces the version rather than an additive one: a `/1` reader
+///   handed `null` there either raises formatting it or, reading it through a
+///   defaulting accessor, treats "unknown" as `0` — and `0` distinct accounts
+///   *satisfies* clause (f)'s spread term. A reader that guesses reports a
+///   safety term as met.
+/// - [`RampSnapshot::truncation_seen`] is new, and is the only durable form
+///   the truncation warning has: the count is a cardinality and does not fold,
+///   so [`super::window::WindowCounts::fleet_truncation_seen`] carries a flag
+///   and this carries it into the artifact. Without it a restored meter's
+///   snapshot reported `accounts_truncated = 0` for a window an *earlier*
+///   process had truncated, which understates two figures silently.
+/// - [`UnattributedTally::unevaluated`] is new, for the reconciliation its own
+///   documentation states.
+/// - [`Provenance::windows`] is new: the durable rows' own identity —
+///   generation, open time, flush count, reset reason — so a `traffic:
+///   production` claim is checkable against the rows it was made from instead
+///   of taken on the producer's word.
+pub const RAMP_ARTIFACT_SCHEMA: &str = "orrery.ramp.report/2";
 
 /// D32's three cached enforcement postures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1147,13 +1194,19 @@ impl RampMeter {
             observed: fleet.observed,
             unevaluated: fleet.unevaluated,
             would_act: fleet.would_act,
-            accounts_qualifying: accounts_qualifying.len() as u64,
-            accounts_observed: accounts_observed.len() as u64,
-            accounts_would_act: accounts_would_act.len() as u64,
-            accounts_truncated: accounts_truncated.len() as u64,
+            accounts_qualifying: Some(accounts_qualifying.len() as u64),
+            accounts_observed: Some(accounts_observed.len() as u64),
+            accounts_would_act: Some(accounts_would_act.len() as u64),
+            accounts_truncated: Some(accounts_truncated.len() as u64),
+            // Either this process truncated, or a process that flushed into
+            // this window before it did. The second half is why the flag
+            // exists at all: the count cannot fold, so a restored meter would
+            // otherwise report a clean sheet for a window that is understated.
+            truncation_seen: !accounts_truncated.is_empty() || carried.counts.fleet_truncation_seen,
             unattributed: UnattributedTally {
                 qualifying: unattributed.qualifying,
                 observed: unattributed.observed,
+                unevaluated: unattributed.unevaluated,
                 would_act: unattributed.would_act,
             },
             by_verdict,
@@ -1264,6 +1317,20 @@ pub struct UnattributedTally {
     pub qualifying: u64,
     /// Of those, the ones the control produced a verdict for.
     pub observed: u64,
+    /// Recorded evaluations that produced no verdict (clause (b)'s degraded
+    /// arm), which are neither numerator nor denominator.
+    ///
+    /// Carried because [`RampSnapshot::by_verdict`] counts *every* recorded
+    /// verdict, unattributed ones included, while
+    /// [`RampSnapshot::observed`] and [`RampSnapshot::unevaluated`] count only
+    /// attributed traffic and the truncation bucket. Without this field the
+    /// outcome split cannot be reconciled against the volumes that produced
+    /// it on any traffic with sessionless submissions in it — which is all
+    /// production traffic, and none of the harness traffic the `/1` artifact
+    /// was written from. The reconciliation is
+    /// `sum(by_verdict) = observed + unevaluated + unattributed.observed +
+    /// unattributed.unevaluated`, and `scripts/ramp-report.py` checks it.
+    pub unevaluated: u64,
     /// Of those, the ones live mode would have acted on.
     pub would_act: u64,
 }
@@ -1323,7 +1390,8 @@ pub struct RampSnapshot {
     /// Of the observed ones, the ones live mode would have acted on.
     pub would_act: u64,
     /// Distinct accounts with any qualifying activity, **over this process's
-    /// run** rather than over the durable window.
+    /// run** rather than over the durable window — or `None` when no process
+    /// run stands behind the figure at all.
     ///
     /// The scope is stated rather than papered over, because it is the one
     /// figure in this struct that a restart still resets. Distinct-account
@@ -1339,10 +1407,17 @@ pub struct RampSnapshot {
     /// A flush does not disturb it. The ids are retained in-process when the
     /// counters are drained, so this counts the run and not the interval since
     /// the last flush.
-    pub accounts_qualifying: u64,
+    ///
+    /// `None` is the artifact assembler's answer — see
+    /// [`Self::without_process_cardinalities`]. An operator tool reading the
+    /// durable window has *no* process run behind it, and reporting `0` there
+    /// would be a plausible number where there is no measurement: a window
+    /// holding five million admission decisions "across 0 accounts" reads as a
+    /// finding rather than as an absence.
+    pub accounts_qualifying: Option<u64>,
     /// Distinct accounts with any observation, over this process's run — see
     /// [`Self::accounts_qualifying`].
-    pub accounts_observed: u64,
+    pub accounts_observed: Option<u64>,
     /// Distinct accounts with a would-have-acted event — clause (f)'s
     /// `spread`, which is cardinality rather than volume because
     /// docs/07:237's alarm is "across unrelated accounts" and an event counter
@@ -1353,15 +1428,30 @@ pub struct RampSnapshot {
     /// [`super::autosuspend::SuspendMonitor`], over its own
     /// [`WINDOW_MS`](super::autosuspend::WINDOW_MS) rolling window, and does
     /// not read this field.
-    pub accounts_would_act: u64,
+    ///
+    /// This is the field that makes `/2` a version bump rather than an
+    /// addition. `None` here must render as *not evaluated*: `0` distinct
+    /// accounts is under clause (f)'s spread bound, so a reader that defaults
+    /// the absence to zero reports a safety term as satisfied by an artifact
+    /// that never measured it.
+    pub accounts_would_act: Option<u64>,
     /// Distinct accounts folded into the truncation bucket, over this
     /// process's run. Nonzero means account spread and the cohort denominator
     /// are both understated.
     ///
-    /// A durable window whose *earlier* processes truncated carries
-    /// [`super::window::WindowCounts::fleet_truncation_seen`] instead — a
-    /// flag, because the count is a cardinality and cardinalities do not add.
-    pub accounts_truncated: u64,
+    /// `None` for an assembled artifact, whose truncation evidence is
+    /// [`Self::truncation_seen`] instead — a flag, because the count is a
+    /// cardinality and cardinalities do not fold across flushes.
+    pub accounts_truncated: Option<u64>,
+    /// Whether *any* traffic in this window was folded into the meter's
+    /// past-capacity truncation bucket, by this process or an earlier one.
+    ///
+    /// The durable form of the truncation warning, carried from
+    /// [`super::window::WindowCounts::fleet_truncation_seen`]. True means the
+    /// fleet-wide account spread and the cohort denominator are both
+    /// understated by an unknown amount, and `scripts/ramp-report.py` refuses
+    /// to cite the artifact.
+    pub truncation_seen: bool,
     /// Submissions with no account.
     pub unattributed: UnattributedTally,
     /// Every recorded verdict by its label, admitting ones included: the
@@ -1372,6 +1462,32 @@ pub struct RampSnapshot {
     pub by_cause: BTreeMap<String, u64>,
     /// The same, restricted to `H`.
     pub cohort: CohortEvidence,
+}
+
+impl RampSnapshot {
+    /// The same measurement with the fleet-wide distinct-account
+    /// cardinalities marked *unassembled* rather than reported as zero.
+    ///
+    /// The artifact assembler's honesty valve. Those four fields count
+    /// distinct accounts over the metering process's own run
+    /// ([`Self::accounts_qualifying`] says why they can be nothing else), and
+    /// an assembler that loaded a durable window has no run: it never sat on
+    /// an admission path. The counters it did load are a fleet's, so writing
+    /// `0` beside them would not be a small error, it would be a fabricated
+    /// finding — and for [`Self::accounts_would_act`] a fabricated *safe*
+    /// finding, since zero spread is under clause (f)'s bound.
+    ///
+    /// [`Self::truncation_seen`] is deliberately left alone: it is a flag and
+    /// it does fold, so it survives the durable window and is the one piece of
+    /// truncation evidence an assembled artifact can carry honestly.
+    #[must_use]
+    pub fn without_process_cardinalities(mut self) -> Self {
+        self.accounts_qualifying = None;
+        self.accounts_observed = None;
+        self.accounts_would_act = None;
+        self.accounts_truncated = None;
+        self
+    }
 }
 
 /// A control D32 names that this tree cannot measure yet, and why.
@@ -1387,6 +1503,43 @@ pub struct AbsentControl {
     pub reason: String,
 }
 
+/// One durable measurement window's own identity, as the artifact producer
+/// found it.
+///
+/// This is what makes a `traffic: production` claim *checkable* rather than
+/// merely asserted. Nothing in a `rampw/{control}` row records which fleet
+/// wrote it — the row is counters, and [`super::window`]'s module docs are
+/// explicit that possession of the cluster file is the trust boundary here —
+/// so an artifact cannot prove its own provenance from the bytes. What it can
+/// do is carry the row's identity, so a reviewer holding the same cluster file
+/// can read the same generation back and see the same numbers, and so a
+/// reviewer *not* holding it can see the shape of the measurement: a window
+/// whose counters are large and whose `flushes` is 1 was written by one
+/// process once, which is not a fleet.
+///
+/// `flushes` is reported, never compared against a floor. Clause (e)'s terms
+/// and their thresholds are the record's; adding a "flushes ≥ n" gate here
+/// would invent one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowProvenance {
+    /// The `rampw/{control}` suffix this row was read from.
+    pub control: String,
+    /// [`super::window::RampWindowRow::window_id`] — which generation of the
+    /// window these counters belong to.
+    pub window_id: u64,
+    /// When the generation was opened, as distinct from its first observation.
+    pub opened_at_ms: u64,
+    /// How many flushes folded into the row.
+    pub flushes: u64,
+    /// The operator's reason for the reset that opened this generation, absent
+    /// for the one a first flush opened implicitly.
+    pub reset_reason: Option<String>,
+    /// `H` account ids the row could not record because a set was full.
+    /// Nonzero means the cohort's `active` and `accounts_would_act` figures
+    /// are understated by at most this much.
+    pub cohort_accounts_truncated: u64,
+}
+
 /// Where an artifact's numbers came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
@@ -1397,6 +1550,13 @@ pub struct Provenance {
     pub source: String,
     /// Anything a reader needs in order not to over-read the numbers.
     pub note: String,
+    /// The durable windows this artifact was assembled from, one per control
+    /// that had a row.
+    ///
+    /// Empty for an artifact produced from in-process counters — a harness
+    /// run has no durable window, and an empty list beside `traffic:
+    /// production` is itself a fact a reviewer should notice.
+    pub windows: Vec<WindowProvenance>,
 }
 
 /// The whole artifact `scripts/ramp-report.py` reads.
@@ -1603,8 +1763,8 @@ mod tests {
         let two = two.snapshot(&cohort);
 
         assert_eq!(one.would_act, two.would_act, "the event counts agree");
-        assert_eq!(one.accounts_would_act, 1);
-        assert_eq!(two.accounts_would_act, 2);
+        assert_eq!(one.accounts_would_act, Some(1));
+        assert_eq!(two.accounts_would_act, Some(2));
         assert_eq!(one.cohort.accounts_would_act, 1);
         assert_eq!(two.cohort.accounts_would_act, 2);
     }
@@ -1661,8 +1821,11 @@ mod tests {
         assert_eq!(snapshot.cohort.fp_count, 0);
         assert_eq!(snapshot.cohort.coverage, None);
         assert_eq!(
-            snapshot.accounts_would_act, 0,
-            "spread is over accounts, and this submission has none"
+            snapshot.accounts_would_act,
+            Some(0),
+            "spread is over accounts, and this submission has none — and a meter that \
+             *did* meter reports zero of them, which is not the same as the absent \
+             cardinality an assembled artifact carries"
         );
     }
 
@@ -1676,8 +1839,12 @@ mod tests {
         }
         let snapshot = meter.snapshot(&HonestCohort::new());
         assert_eq!(snapshot.qualifying, 5, "no event is lost");
-        assert_eq!(snapshot.accounts_qualifying, 2);
-        assert_eq!(snapshot.accounts_truncated, 3);
+        assert_eq!(snapshot.accounts_qualifying, Some(2));
+        assert_eq!(snapshot.accounts_truncated, Some(3));
+        assert!(
+            snapshot.truncation_seen,
+            "the flag is the only form the warning takes in a durable window"
+        );
     }
 
     /// `|H|` is the union: an account in both halves is one member.
@@ -1752,6 +1919,7 @@ mod tests {
                 traffic: "harness".to_owned(),
                 source: "unit test".to_owned(),
                 note: String::new(),
+                windows: Vec::new(),
             },
             vec![
                 meter.snapshot(&cohort),

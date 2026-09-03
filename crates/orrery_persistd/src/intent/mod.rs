@@ -66,7 +66,7 @@ pub use ramp::FdbRampPostureStore;
 pub use ramp::{
     AbsentControl, CohortEvidence, HonestCohort, PostureSource, Provenance, RampArtifact,
     RampMeter, RampMode, RampPosture, RampPostureError, RampPostureReader, RampSnapshot,
-    SharedRampPostureReader, UnattributedTally, RAMP_ARTIFACT_SCHEMA,
+    SharedRampPostureReader, UnattributedTally, WindowProvenance, RAMP_ARTIFACT_SCHEMA,
 };
 
 pub mod cohort;
@@ -83,6 +83,9 @@ pub use window::{
     DurableTally, FlushOutcome, RampWindowDelta, RampWindowError, RampWindowRow, WindowCounts,
     MAX_DURABLE_COHORT_ACCOUNTS, MAX_WINDOW_REASON_BYTES,
 };
+
+pub mod report;
+pub use report::{assemble_from_durable, DurableControl, ProvenanceRefusal, TrafficClaim};
 
 pub mod stages;
 pub use stages::{intent_stage_metrics, IntentStageMetrics, IntentStageSnapshot, IntentTrace};
@@ -4448,6 +4451,12 @@ mod tests {
                        coverage and its denominator, |H|, account spread — is measured from \
                        the same shadow arm a deployment would run."
                     .to_owned(),
+                // A harness has no durable window: these counters never
+                // reached a `rampw/{control}` row and were never read back out
+                // of one. `orrery-ramp report` is the producer that fills
+                // this, and an empty list beside `traffic: harness` is the
+                // consistent reading.
+                windows: Vec::new(),
             },
             vec![
                 meter.snapshot(&cohort),
