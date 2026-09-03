@@ -348,7 +348,10 @@ lane_gates() {
     # package-client's Linux leg; these fixtures prove that a green process
     # with no seated client, and a trio with only one seated client, both fail
     # their named checks. It also hides the third craft from the first two and
-    # requires both directed third-seat checks to fail by name.
+    # requires both directed third-seat checks to fail by name. Its roster
+    # fixture proves the #1008 live guard: a campaign with a human seat taken
+    # or an attempt in progress is refused before any client starts,
+    # --force-live overrides it, and an empty campaign is not refused.
     run scripts/client-campaign-preflight.sh --self-test
 
     # #774's packaging smoke, which exercises the archive rather than the

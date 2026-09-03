@@ -5,6 +5,7 @@
 # #681).
 #
 #   scripts/client-campaign-preflight.sh --binary PATH --campaign ID
+#   scripts/client-campaign-preflight.sh --binary PATH --campaign ID --force-live
 #   scripts/client-campaign-preflight.sh --self-test
 #
 # The binary is the probe. Its --build-info supplies the baked origin, and the
@@ -14,6 +15,13 @@
 # nickname to a craft that arrived through replication. HTTP substitutes such
 # as curl are deliberately absent.
 #
+# These clients take human seats and move no uplink frames, so any attempt
+# they are frozen into fails its participation clause and banks nothing -- and
+# a volunteer seated nearby reads as a broken player, which is how #995 came
+# to be filed against a real one (#1008). A campaign with human seats taken or
+# an attempt in progress is therefore refused before anything starts; a run
+# against a live campaign is a decision, made by passing --force-live.
+#
 # Every client gets its own X server, and how that is arranged is load-bearing
 # rather than incidental -- see `choose_display_isolation` (#1003).
 set -uo pipefail
@@ -22,6 +30,7 @@ readonly NAME=client-campaign-preflight
 
 BINARY=
 CAMPAIGN=
+FORCE_LIVE=0
 TIMEOUT_SECS=1020
 LATE_JOIN_DELAY_SECS=185
 REJOIN_DELAY_SECS=3
@@ -183,23 +192,84 @@ outside its assertions -- read the end of the log before blaming the campaign'
     result FAIL "$check" "binary exited $status$detail (log: $log)"
 }
 
-campaign_phase() { # campaign id, origin
-    "$PYTHON_BIN" - "$1" "$2" <<'PHASE' 2>/dev/null
+# The campaign's phase and taken human seats, from one roster poll.
+#
+# A taken human seat counts the way admission counts it (and its listing with
+# it): `kind: human` with a state other than `empty`, `reserved` included
+# because a reservation is a person mid-join. `unreachable` is an answer, not
+# a failure -- the fixtures in this script's own self-test have no origin to
+# poll, and a real origin this unreachable fails every clause below anyway.
+campaign_live_state() { # campaign id, origin
+    "$PYTHON_BIN" - "$1" "$2" <<'STATE' 2>/dev/null
 import json, sys, urllib.request
 campaign, origin = sys.argv[1], sys.argv[2]
 try:
     with urllib.request.urlopen(f"{origin}/v1/campaigns/{campaign}/roster", timeout=10) as answer:
-        print(json.load(answer).get("phase") or "unknown")
+        body = json.load(answer)
 except Exception:
     print("unreachable")
-PHASE
+    raise SystemExit(0)
+roster = body.get("roster") or []
+humans = sum(1 for seat in roster
+             if seat.get("kind") == "human" and seat.get("state") != "empty")
+print(f"phase={body.get('phase') or 'unknown'} humans={humans}")
+STATE
+}
+
+# Refuse to seat this harness where people are, before anything starts (#1008).
+#
+# These clients take human seats and move no uplink frames, so the attempt
+# they are frozen into fails its participation clause and banks nothing, and
+# anyone playing in it loses the session. The criterion is right to fail such
+# a peer; what is wrong is the harness sitting in its scope, and the exterior
+# wire has no way to say "this seat is a harness" without a protocol bump.
+# The refusal therefore lives here, at the only place that can choose not to
+# go.
+#
+# One poll is a moment in time and cannot see a human who joins during the
+# run. What it buys is that a run against a live campaign is a decision --
+# --force-live, named in the refusal -- rather than an accident.
+guard_live_campaign() { # campaign id, origin
+    local state phase humans
+    state="$(campaign_live_state "$1" "$2")"
+    if [[ $state == unreachable ]]; then
+        printf 'NOTE live-guard %s is not reachable; cannot tell who is on it, so nothing is refused\n' "$2"
+        return 0
+    fi
+    phase=${state%% *}
+    phase=${phase#phase=}
+    humans=${state##*humans=}
+    if ! [[ $phase =~ ^[a-z]+$ && $humans =~ ^[0-9]+$ ]]; then
+        die "live-guard: could not read $1's roster state: '$state'"
+    fi
+    printf 'NOTE live-guard %s is %s with %s human seat(s) taken\n' "$1" "$phase" "$humans"
+    if ((humans > 0)); then
+        if ((FORCE_LIVE)); then
+            printf 'NOTE live-guard forcing past the occupied seats on %s\n' "$1"
+            return 0
+        fi
+        die "live-guard: $1 has $humans human seat(s) taken; these clients take human seats and move no \
+uplink frames, so any attempt they are frozen into fails its participation clause and banks nothing, \
+ending the session of anyone playing in it (#1008); run with --force-live to proceed deliberately"
+    fi
+    if [[ $phase == running ]]; then
+        if ((FORCE_LIVE)); then
+            printf 'NOTE live-guard forcing past the attempt in progress on %s\n' "$1"
+            return 0
+        fi
+        die "live-guard: $1 has an attempt in progress; these clients would be seated into it and, moving \
+no uplink frames, fail its participation clause and bank nothing for the hours it ran (#1008); run \
+with --force-live to proceed deliberately"
+    fi
 }
 
 # Wait for a lobby that has just opened, so the whole scenario fits one attempt.
 wait_for_fresh_lobby() { # campaign id, origin
-    local campaign=$1 origin=$2 current= waited=0
+    local campaign=$1 origin=$2 state current= waited=0
     while ((waited < FRESH_LOBBY_TIMEOUT_SECS)); do
-        current="$(campaign_phase "$campaign" "$origin")"
+        state="$(campaign_live_state "$campaign" "$origin")"
+        current=${state%% *}
+        current=${current#phase=}
         # An origin we cannot poll tells us nothing about the cycle, so waiting
         # buys nothing and costs the whole timeout. The fixtures in this
         # script's own self-test are exactly that case.
@@ -308,6 +378,7 @@ print(origin.rstrip("/"))
         return "$wrapper_status"
     }
 
+    guard_live_campaign "$CAMPAIGN" "$origin"
     choose_display_isolation
     wait_for_fresh_lobby "$CAMPAIGN" "$origin"
 
@@ -368,7 +439,8 @@ summary() {
 }
 
 self_test() {
-    local dir output status passing=0 mutations=0 pass_count fail_count
+    local dir output status real_python passing=0 mutations=0
+    local ST_PYTHON_BIN= pass_count fail_count
 
     # The gate must start on a lobby that has just opened, not on the word
     # "lobby" -- which is equally true one second before it closes, and that is
@@ -488,11 +560,40 @@ fi
 SH
     chmod +x "$dir/bin/xvfb-run" "$dir/bin/client"
 
+    # The live-guard arms poll a campaign that answers, so a fixture python
+    # stands in for the interpreter and answers the roster poll by campaign
+    # id. Only the poll is the fixture's business: the build-info parse is
+    # handed to the real interpreter, captured before the shim can shadow it.
+    real_python="$(command -v python3)" \
+        || die 'self-test: no python3 for the roster fixture to delegate the build-info parse to'
+    cat >"$dir/bin/python3" <<'PYS'
+#!/usr/bin/env bash
+# `-` is the poll form (`python - campaign origin`); `-c` is not.
+if [[ ${1:-} == -c ]]; then
+    exec '@REAL_PYTHON@' "$@"
+fi
+case ${2:-} in
+    live-humans) echo 'phase=lobby humans=1' ;;
+    live-running) echo 'phase=running humans=0' ;;
+    *) echo 'phase=lobby humans=0' ;;
+esac
+PYS
+    sed -i "s|@REAL_PYTHON@|$real_python|" "$dir/bin/python3"
+    chmod +x "$dir/bin/python3"
+
+    # The fixture name is also the campaign id: the roster fixture keys its
+    # answers on it, and every campaign marker the preflight requires is
+    # written from the same id, so nothing else has to know both. Arms that
+    # set ST_PYTHON_BIN poll through the roster fixture; the rest keep an
+    # origin no poll can reach.
     st_run() {
+        local fixture=$1
+        shift
         CLIENT_CAMPAIGN_PREFLIGHT_XVFB_RUN="$dir/bin/xvfb-run" \
-            CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE="$1" \
-            "$0" --binary "$dir/bin/client" --campaign fixture --timeout-secs 1 \
-                --late-join-delay-secs 0 --rejoin-delay-secs 0 2>&1
+            CLIENT_CAMPAIGN_PREFLIGHT_PYTHON="${ST_PYTHON_BIN:-python3}" \
+            CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE="$fixture" \
+            "$0" --binary "$dir/bin/client" --campaign "$fixture" --timeout-secs 1 \
+                --late-join-delay-secs 0 --rejoin-delay-secs 0 "$@" 2>&1
     }
 
     status=0; output="$(st_run good)" || status=$?
@@ -635,7 +736,63 @@ SH
         || die "self-test third-peer mutation counted $pass_count pass / $fail_count fail, expected 25 / 2"
     ((mutations += 1))
 
-    echo "$NAME: self-test passed ($passing baselines: ordinary (--auto-display) + numbered-display fallback + wrapper-cleanup each 27 pass / 0 fail; client-error mutation 23 pass / 4 fail at client-a-exit + client-b-exit + client-c-exit + client-d-rejoin-exit; $mutations total mutations: lost-display 23 pass / 4 fail at every exit check with the fault attributed to the harness, no-seat 23 pass / 4 fail at all seated checks, one-seat 24 pass / 3 fail at client-b-seated + client-c-seated + client-d-rejoin-seated, one-peer 23 pass / 4 fail at every B/C observation, third-peer-hidden 25 pass / 2 fail at client-a-peer-c + client-b-peer-c)"
+    # The live guard refuses a campaign with a human seat taken before any
+    # client starts, reports what it saw, and names the flag that overrides it.
+    ST_PYTHON_BIN=$dir/bin/python3
+    status=0; output="$(st_run live-humans)" || status=$?
+    ((status != 0)) || die 'self-test: a campaign with a human seat taken was not refused'
+    grep -Fq 'NOTE live-guard live-humans is lobby with 1 human seat(s) taken' <<<"$output" \
+        || die 'self-test humans-present refusal did not report what it saw on the campaign'
+    grep -Fq 'live-guard: live-humans has 1 human seat(s) taken' <<<"$output" \
+        || die 'self-test humans-present refusal did not refuse by name'
+    grep -Fq -- '--force-live' <<<"$output" \
+        || die 'self-test humans-present refusal did not name the override flag'
+    ! grep -Fq 'client-a-exit' <<<"$output" \
+        || die 'self-test humans-present refusal started clients anyway'
+    ((mutations += 1))
+
+    # The same for an attempt already in progress on an otherwise empty
+    # campaign: nobody to displace, still refused, because the attempt is what
+    # banks nothing.
+    status=0; output="$(st_run live-running)" || status=$?
+    ((status != 0)) || die 'self-test: a campaign with an attempt in progress was not refused'
+    grep -Fq 'NOTE live-guard live-running is running with 0 human seat(s) taken' <<<"$output" \
+        || die 'self-test attempt-in-progress refusal did not report what it saw on the campaign'
+    grep -Fq 'live-guard: live-running has an attempt in progress' <<<"$output" \
+        || die 'self-test attempt-in-progress refusal did not refuse by name'
+    ! grep -Fq 'client-a-exit' <<<"$output" \
+        || die 'self-test attempt-in-progress refusal started clients anyway'
+    ((mutations += 1))
+
+    # --force-live is the deliberate run: the occupied campaign is announced
+    # and the whole scenario still proves what it proves, lobby included --
+    # the answered roster is one pass more than the unreachable arms count.
+    status=0; output="$(st_run live-humans --force-live)" || status=$?
+    ((status == 0)) || die "self-test forced run against an occupied campaign failed ($output)"
+    grep -Fq 'NOTE live-guard forcing past the occupied seats on live-humans' <<<"$output" \
+        || die 'self-test forced run did not announce what it was forcing past'
+    grep -Fq 'PASS fresh-lobby started from a lobby after 0s' <<<"$output" \
+        || die 'self-test forced run did not start from the answered lobby'
+    pass_count=$(grep -c '^PASS ' <<<"$output" || true)
+    fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
+    [[ $pass_count == 28 && $fail_count == 0 ]] \
+        || die "self-test forced run counted $pass_count pass / $fail_count fail, expected 28 / 0"
+    ((passing += 1))
+
+    # A live campaign with nobody on it is not refused: the guard reads the
+    # roster, announces it, and stays out of the way.
+    status=0; output="$(st_run live-empty)" || status=$?
+    ((status == 0)) || die "self-test run against an empty live campaign failed ($output)"
+    grep -Fq 'NOTE live-guard live-empty is lobby with 0 human seat(s) taken' <<<"$output" \
+        || die 'self-test empty-live run was not announced by the guard'
+    pass_count=$(grep -c '^PASS ' <<<"$output" || true)
+    fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
+    [[ $pass_count == 28 && $fail_count == 0 ]] \
+        || die "self-test empty-live run counted $pass_count pass / $fail_count fail, expected 28 / 0"
+    ((passing += 1))
+    ST_PYTHON_BIN=
+
+    echo "$NAME: self-test passed ($passing baselines: ordinary (--auto-display) + numbered-display fallback + wrapper-cleanup each 27 pass / 0 fail, forced-live + empty-live each 28 pass / 0 fail through the live guard; client-error mutation 23 pass / 4 fail at client-a-exit + client-b-exit + client-c-exit + client-d-rejoin-exit; $mutations total mutations: lost-display 23 pass / 4 fail at every exit check with the fault attributed to the harness, no-seat 23 pass / 4 fail at all seated checks, one-seat 24 pass / 3 fail at client-b-seated + client-c-seated + client-d-rejoin-seated, one-peer 23 pass / 4 fail at every B/C observation, third-peer-hidden 25 pass / 2 fail at client-a-peer-c + client-b-peer-c, live-guard humans-present refused before any client ran and attempt-in-progress refused)"
 }
 
 while (($#)); do
@@ -645,6 +802,7 @@ while (($#)); do
         --timeout-secs) shift; (($#)) || die '--timeout-secs needs a value'; TIMEOUT_SECS=$1 ;;
         --late-join-delay-secs) shift; (($#)) || die '--late-join-delay-secs needs a value'; LATE_JOIN_DELAY_SECS=$1 ;;
         --rejoin-delay-secs) shift; (($#)) || die '--rejoin-delay-secs needs a value'; REJOIN_DELAY_SECS=$1 ;;
+        --force-live) FORCE_LIVE=1 ;;
         --self-test) self_test; exit $? ;;
         --help|-h) usage; exit 0 ;;
         *) die "unknown argument '$1'" ;;
