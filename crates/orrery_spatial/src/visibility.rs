@@ -14,6 +14,14 @@
 //! not have to guess what its island-mates want: it reads the manifest it was
 //! already handed.
 //!
+//! That convenience is also the manifest's one disclosure: `PeerEntry.cells`
+//! reaches every island member, not only the source that consumes it here, so
+//! wiring this plugin into a shipping client is the point at which a
+//! design-level disclosure becomes a live beyond-AOI feed. The review, the
+//! consumer trace and the owner's 2026-08-30 ruling are in
+//! `docs/spikes/island-manifest-cells-disclosure.md` (issue #535); the field's
+//! own doc comment carries the summary. Read it before changing the wiring.
+//!
 //! The one thing this crate cannot know is which replicon client entity belongs
 //! to which peer, because that mapping is made by whatever transport adapter
 //! accepted the session. The app attaches [`ClientNode`]; everything after that

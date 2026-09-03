@@ -74,6 +74,37 @@ pub struct PeerEntry {
     /// The peer's NodeId.
     pub node: NodeId,
     /// The cells this peer occupies.
+    ///
+    /// # This field is disclosed island-wide, deliberately
+    ///
+    /// The manifest carrying it is broadcast unfiltered to every peer it
+    /// names (`IslandManifest::peers` below), so **every island member learns
+    /// every other member's active interest set at cell granularity**,
+    /// independently of its own AOI subscription. That is a property of the
+    /// design, not an oversight: the field exists so a peer acting as a
+    /// replication *source* can read its island-mates' AOIs out of the
+    /// handout it already holds instead of over a second channel
+    /// (`orrery_spatial::visibility`, the only non-test reader outside the
+    /// P1 swarm harness). Membership itself needs `node` only.
+    ///
+    /// What a recipient can therefore derive: the peer's committed cell (an
+    /// unswept `neighbors27` block has one centre), its movement between
+    /// reports, its presence or absence, and heading from a swept set's
+    /// asymmetry. Not derivable: sub-cell position or entity identity.
+    ///
+    /// The disclosure was reviewed in full, with the consumer trace and the
+    /// quantities, in `docs/spikes/island-manifest-cells-disclosure.md`
+    /// (issue #535). Its status, recorded so a later reader does not have to
+    /// re-derive it: no Accepted record designs or reviews the manifest's
+    /// wire shape — D12 and D16 are silent on it — and the two records that
+    /// do discuss it, D40 and D50, are Proposed and therefore non-normative.
+    /// The owner accepted the disclosure as it stands on 2026-08-30, to be
+    /// revisited on observed abuse or when coordinator presence reporting and
+    /// `AoiVisibilityPlugin` are wired into a shipping client, whichever
+    /// comes first. Neither has happened: no shipping client reports
+    /// presence, and the plugin's absence from the default client group is
+    /// asserted in `orrery/tests/client_group.rs`. **Changing that wiring is
+    /// the trigger to revisit, not a routine step.**
     pub cells: Vec<CellId>,
 }
 
