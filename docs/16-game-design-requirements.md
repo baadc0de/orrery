@@ -244,7 +244,7 @@ Numbered so they can be answered one at a time.
 | G8.8 | **Environmental hazards exist but are few.** The core opposition is an active force. | owner mandate |
 | G8.9 | **NPCs drop items and wrecks** under the same rules as players (G3.2, G3.8). | owner mandate |
 | G8.10 | **NPC factions are macro-only when no player is present**, exactly like the mothership faction (G4.20). | owner mandate |
-| G8.11 | **The mothership faction is one faction among several**, modelled in the macro service by the same machinery as its opponents; it differs only in that players belong to it by default (G7.1). | derived from G8.10 |
+| G8.11 | **The mothership faction is one faction among many** in principle and mechanism: the same macro machinery runs it and its opponents. Its **configuration** (tech, structures, abilities, and that players belong to it by default, G7.1) is very different from theirs, as each NPC faction's is from the others. | owner mandate (confirmed 2026-09-03) |
 
 ### Engineering consequences of G8
 
