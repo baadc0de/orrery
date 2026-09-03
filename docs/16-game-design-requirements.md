@@ -190,7 +190,7 @@ Numbered so they can be answered one at a time.
 - **Renown gates are threshold checks at service boundaries** (teleport, clone, dock, command). Each check happens where the service is authoritative (mothership grid or macro service), reads attested standing, and is itself witnessable, so a client cannot claim a grade it lacks. The list of gated services will grow; keep it a table in the ruleset, not code.
 - **Items are the capability system.** "Ability" and "buff" are properties of an item in the ruleset, resolved on equip, so the avatar's effective capabilities are a pure function of attested inventory. This makes full loot (G3.2) also a loss of capability, and it means hit registration and movement (ADR-0008) take their parameters from equipment, which prediction must know before the tick.
 - **A ship is an item with a grid inside it.** Packing (G4.15) is the item form; undocking materialises the grid. The owner is always an organization or the mothership, never an avatar, so ownership is an **organization-level attribute** and **captain assignment** is a separate, revocable right. Ownership and command are different attributes, and both are attested.
-- **Jump-capable ships are respawn points (G3.6).** A mission member who dies respawns at the ship's printer, paying clone upkeep (G3.1) and dropping loot at the death site (G3.2). Whether printer capacity is finite per mission (a "tickets" budget) is a G8 balance decision.
+- **Jump-capable ships are respawn points (G3.6).** A mission member who dies respawns at the ship's printer, paying clone upkeep (G3.1) and dropping loot at the death site (G3.2). Printer capacity is the clone charges loaded aboard (G8.7).
 - **A mission is provisioned before undock (G6.8).** The owner's loadout definitions and the stocked consumables are the mission's budget, fixed at load time and drawn down as crew launch. Loadout choice by a crew member is a claim against that budget, so it is an attested reservation, not a client pick. Contested picks (two players want the last heavy mech) resolve in tick order under the ship grid's authority.
 - **Vehicle parameters are a function of (loadout, pilot inventory) (G6.9).** The effective mech or craft is computed from the owner's loadout plus the pilot's attested on-body items at inflate time, and re-derived if the pilot's equipment changes. Prediction (ADR-0008) needs both inputs before the vehicle spawns, and the witness set must be able to reproduce the derivation, so it is a pure ruleset function (ADR-0021).
 - **Escorts and mechs are spawned from ship inventory under prediction.** A crew member requesting a launch causes an item-to-entity transformation (G4 consequences) at the ship, and the entity is owned by the ship, piloted by the player. When it is destroyed the item is gone; when it returns it may be compacted again. The player never carries the vehicle; only their avatar and its loadout are theirs to lose.
@@ -229,9 +229,37 @@ Numbered so they can be answered one at a time.
 - **Official rivalry is presentation, not rules (G7.9a).** It is a declared relation between two organizations, replicated so clients can colour friend-or-foe, and the simulation never reads it. Combined with viewer-dependent identity (G7.8) the indicator can only mark what the viewer is allowed to know: an unrevealed rival shows as unknown, not as hostile.
 - **Defection items are a parallel tech tree keyed on NPC-faction standing (G7.10)**, so faction standing is not a score but an unlock table, and the same renown-gate mechanism (G6) evaluates it at the NPC faction's authority (macro service or a faction-controlled surface structure).
 
+## G8 — PvE: NPC factions, encounters, quests
+
+| # | Requirement | Source |
+|---|---|---|
+| G8 | **The existing occupants are organized, spacefaring forces** with ships, ground forces and structures. Tech level varies: some are primitive, some **far exceed** player technology. | owner mandate |
+| G8.1 | **The deeper, the meaner.** Opposition strength depends on **location** and **depth of penetration** into a faction's territory. | owner mandate |
+| G8.2 | **NPC fleets are active.** Factions field ships, execute **fleet manoeuvres** against players, plant **decoys** and **bait**, and run **ambush tactics**. | owner mandate |
+| G8.3 | **Fauna: to be decided.** | owner, open |
+| G8.4 | **Clandestine missions.** Some NPC factions offer missions for rewards: thwart NPC or player forces on a mission, raid another NPC faction in their stead, and the like. These pay in **items and exotic, high-value resources**. | owner mandate |
+| G8.5 | **Difficulty scales by numbers and tech**, with **scripted encounters** and **objective triggers**. | owner mandate |
+| G8.6 | **Season quests are both handcrafted per season and continuously auto-generated** from system content. | owner mandate |
+| G8.7 | **Clone charges are a limited, replenishable resource**, stocked like any other (ship printers G3.6, G6.8). | owner mandate |
+| G8.8 | **Environmental hazards exist but are few.** The core opposition is an active force. | owner mandate |
+| G8.9 | **NPCs drop items and wrecks** under the same rules as players (G3.2, G3.8). | owner mandate |
+| G8.10 | **NPC factions are macro-only when no player is present**, exactly like the mothership faction (G4.20). | owner mandate |
+| G8.11 | **The mothership faction is one faction among several**, modelled in the macro service by the same machinery as its opponents; it differs only in that players belong to it by default (G7.1). | derived from G8.10 |
+
+### Engineering consequences of G8
+
+- **Symmetric faction model.** The macro service runs every faction, the mothership's included, through one faction simulation: territory, structures, fleets, contracts, standing. Asymmetry is data (tech level, aggression, depth curves), not code. This is the single biggest simplification available and should be an ADR constraint: no mothership-specific macro logic.
+- **Depth is a field over the system**, per faction, computed by the macro service from territory (deterrence radii G4.12, structures, fleet presence). Difficulty parameters (numbers, tech tier) are functions of that field at a location, so "the deeper, the meaner" is a lookup, not a script. Player expansion reshapes the field, which is how G4.17 scaling happens.
+- **NPC fleet tactics are micro-layer AI with macro-layer intent.** The macro service decides *that* a faction ambushes a convoy route or baits a mission; the micro layer executes the manoeuvre when players arrive, with server-side authority (NPC entities never have a player authority owner, R5 applies only to player-owned entities). Decoys and bait are entities whose replicated appearance differs from their attested truth, the same viewer-dependent replication as hidden identity (G7.8), so the replication filter must be able to lie by ruleset.
+- **Scripted encounters and objective triggers are ruleset content**, distributed with the season (ADR-0021) and evaluated deterministically so witnesses agree on when a trigger fired. Triggers are attested events that the macro service consumes (a trigger can complete a quest step or move a faction).
+- **Quest generation is a macro-service producer.** Handcrafted quests are season data; generated ones are derived from macro state (which resources exist where, which faction holds what) by a generator that must be deterministic given the macro journal so the same season replays the same quests. Both feed the season-end condition (G2.1b) as attested aggregates.
+- **Clone charges are inventory.** A printer with zero charges does not respawn; a respawn consumes one under the printer grid's authority. Charges are craftable/purchasable (G6.3), delivered by contract (G5), and the mission's ticket budget (G6 open question) is simply the charges loaded at undock. The player-chosen respawn point (G3.7) lists only printers with charges.
+- **NPC loot and wrecks reuse the corpse and salvage entities** (G3 consequences), with content derived from the NPC's attested loadout. High-value clandestine rewards are contract settlements (G5), so the exotic-resource faucet is metered by the macro service like any other.
+- **Materialise and fold are the whole PvE pipeline.** A faction's macro state (fleet positions, structure health, patrol plans) materialises into micro entities when a player enters range and folds back (kills, damage, looted stock, triggered scripts) when the last player leaves. Because factions never run micro without a player, the fold must be complete: nothing that happened in micro may be lost, and nothing that did not happen may be invented. The fold is derived from the witnessed journal (ADR-0019), not from the last authoritative snapshot.
+- **Environmental hazards are ruleset fields** (radiation, pressure, weather) that modify avatar and vehicle parameters (G6.9 derivation) and are few enough to be per-body constants for the first release.
+
 ## Open — to be settled by the owner
 
 Sections reserved; each becomes a `G<n>` block when decided.
 
-- G8 — PvE content model (NPC ships, fauna, missions)
 - G9 — Time (real-time, accelerated, day/night, orbital mechanics)
