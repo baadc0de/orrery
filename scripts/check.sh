@@ -558,6 +558,16 @@ lane_gates() {
     # remembered to. It is a few `find`s and a `grep`; it belongs in the gate.
     run scripts/check.sh --self-test
 
+    # #920's sidecar IPC report renderer. It reads the measurement harness's
+    # observer report and prints the phase table and, only for a Windows
+    # report, the verdict the issue's bands define. Its self-test proves the
+    # three band classifications classify, that a report without the phase
+    # column is refused (the tick wait must stay out of ipc_added), that a
+    # tampered report whose columns no longer sum is refused, that a
+    # non-Windows platform never prints a verdict, and that a fast report
+    # with dropped input cannot read as a stand.
+    run scripts/ipc-report.py --self-test
+
     # #779's pre-push audit. It checks the current branch against origin/main for
     # reverting merged hunks, whole-file truncation, a stale merge-base, and a
     # deletion surge. The self-test rebuilds both failure directions in a

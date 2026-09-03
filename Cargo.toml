@@ -35,6 +35,12 @@ members = [
     # crate at all (D42 (a), D43 (e)(1)).
     "crates/orrery_synthetic",
     "crates/orrery_sidecar",
+    # The length-prefixed byte-stream transport for the IPC schema (#920), and
+    # the sidecar IPC measurement harness. A root member, not a fourteenth
+    # workspace, for the same reason `orrery_identity` is one. Bevy-free, and
+    # named in `core-gates.sh`'s `DECLARED_BEVY_FREE_CRATES` so that stays
+    # mechanical.
+    "crates/orrery_ipc_transport",
 ]
 
 # The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /

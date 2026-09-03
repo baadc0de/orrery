@@ -1,0 +1,160 @@
+{
+  "schema": "orrery-ipc-harness/1",
+  "role": "observer",
+  "platform": "linux",
+  "arch": "x86_64",
+  "clock": "CLOCK_MONOTONIC",
+  "transport": "tcp-loopback",
+  "tcp_nodelay": true,
+  "time_begin_period": false,
+  "entities": 128,
+  "tick_hz": 60,
+  "warmup_ticks": 600,
+  "ticks": 36000,
+  "samples": 35949,
+  "duration_s": 600.008142182,
+  "loadavg_start": [
+    0.94,
+    3.25,
+    20.88
+  ],
+  "loadavg_end": [
+    8.62,
+    7.07,
+    13.87
+  ],
+  "phases_ns": {
+    "hop_in": {
+      "n": 35949,
+      "mean_ns": 26033.602631505742,
+      "min_ns": 3527,
+      "p50_ns": 14718,
+      "p99_ns": 148587,
+      "p99_9_ns": 1794278,
+      "max_ns": 7631362
+    },
+    "decode_out": {
+      "n": 35949,
+      "mean_ns": 2589.6454143369774,
+      "min_ns": 611,
+      "p50_ns": 2054,
+      "p99_ns": 10479,
+      "p99_9_ns": 26830,
+      "max_ns": 1574058
+    },
+    "phase": {
+      "n": 35949,
+      "mean_ns": 16579610.814820996,
+      "min_ns": 254195,
+      "p50_ns": 16613653,
+      "p99_ns": 16640374,
+      "p99_9_ns": 20421631,
+      "max_ns": 71396811
+    },
+    "ipc_added": {
+      "n": 35949,
+      "mean_ns": 75043.24331692119,
+      "min_ns": 11932,
+      "p50_ns": 47769,
+      "p99_ns": 384247,
+      "p99_9_ns": 4144645,
+      "max_ns": 24545577
+    },
+    "hop_out": {
+      "n": 35949,
+      "mean_ns": 29649.084592060975,
+      "min_ns": 1964,
+      "p50_ns": 20398,
+      "p99_ns": 84147,
+      "p99_9_ns": 1859321,
+      "max_ns": 13455771
+    },
+    "encode": {
+      "n": 35949,
+      "mean_ns": 15890.332554452141,
+      "min_ns": 2435,
+      "p50_ns": 8045,
+      "p99_ns": 57357,
+      "p99_9_ns": 1408429,
+      "max_ns": 21143047
+    },
+    "extract": {
+      "n": 35949,
+      "mean_ns": 880.5781245653565,
+      "min_ns": 151,
+      "p50_ns": 611,
+      "p99_ns": 6472,
+      "p99_9_ns": 15479,
+      "max_ns": 353280
+    },
+    "phase_after_decode": {
+      "n": 35949,
+      "mean_ns": 16577021.16940666,
+      "min_ns": 249566,
+      "p50_ns": 16611480,
+      "p99_ns": 16639002,
+      "p99_9_ns": 20414347,
+      "max_ns": 71395789
+    }
+  },
+  "baselines_ns": {
+    "hop_null_out": {
+      "n": 36567,
+      "mean_ns": 27537.099734733503,
+      "min_ns": 3456,
+      "p50_ns": 14426,
+      "p99_ns": 91851,
+      "p99_9_ns": 1923840,
+      "max_ns": 19855192
+    },
+    "hop_null_rtt": {
+      "n": 36567,
+      "mean_ns": 69136.93081193426,
+      "min_ns": 7654,
+      "p50_ns": 37110,
+      "p99_ns": 231532,
+      "p99_9_ns": 5605491,
+      "max_ns": 47627402
+    },
+    "hop_null_back": {
+      "n": 36567,
+      "mean_ns": 26715.69674843438,
+      "min_ns": 2124,
+      "p50_ns": 12202,
+      "p99_ns": 54933,
+      "p99_9_ns": 2345617,
+      "max_ns": 44341400
+    },
+    "extract_inproc": {
+      "n": 36000,
+      "mean_ns": 1000.12475,
+      "min_ns": 290,
+      "p50_ns": 531,
+      "p99_ns": 8086,
+      "p99_9_ns": 17132,
+      "max_ns": 625979
+    }
+  },
+  "drops": {
+    "input_dropped": 0,
+    "forward_seq_gaps": 0,
+    "forward_seq_reorders": 0,
+    "frame_discarded_sidecar": 30,
+    "frame_overwritten_observer": 21,
+    "return_seq_gaps": 30,
+    "return_seq_reorders": 0,
+    "spawn_missing": 0,
+    "despawn_missing": 0,
+    "samples_missing_sidecar_timing": 0,
+    "probe_replies_missing": 0,
+    "tick_overruns": 20
+  },
+  "notes": [
+    "phase is the wait for the next observer tick, reported separately and excluded from ipc_added: it exists in embedded too (issue #920, lie 6)",
+    "ipc_added = hop_in + extract + encode + hop_out + decode_out = t_decode - t0",
+    "the #920 stand/overturn bands are defined at N = 24 on WINDOWS; a report from any other platform is informational only",
+    "warmup ticks are excluded from every sample (allocator and branch warmth, issue #920 lie 9)",
+    "I/O is blocking std on dedicated threads; no async runtime is measured (issue #920 lie 8)",
+    "the sidecar is event-driven, so no scheduling wait is hidden inside its columns; the extraction contract is shape-faithful, not a Bevy App"
+  ]
+}

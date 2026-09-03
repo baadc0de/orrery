@@ -57,7 +57,7 @@ readonly DECLARED_GATED_CRATES=(orrery_core orrery_games orrery_conformance)
 # be role-discovered above. Name them separately so clause 1 still makes their
 # Bevy-free dependency boundary mechanical. This list does not opt a crate into
 # the determinism source scans, which are meaningful only for canonical rules.
-readonly DECLARED_BEVY_FREE_CRATES=(orrery_ipc)
+readonly DECLARED_BEVY_FREE_CRATES=(orrery_ipc orrery_ipc_transport)
 
 # Crates whose sources are a `Ruleset` rather than the machinery around one.
 # The neighbour clause below applies to these only; `orrery_core` defines and
@@ -742,6 +742,7 @@ make_discovery_fixture() {
     "$fixture/crates/bevy_replicon/src" \
     "$fixture/crates/orrery_core/src" \
     "$fixture/crates/orrery_ipc/src" \
+    "$fixture/crates/orrery_ipc_transport/src" \
     "$fixture/crates/orrery_games/src/regolith" \
     "$fixture/crates/orrery_conformance/src" \
     "$fixture/crates/orrery_replicon/src" \
@@ -798,6 +799,19 @@ edition = "2024"
 EOF
   cat >"$fixture/crates/orrery_ipc/src/lib.rs" <<'EOF'
 pub struct Schema;
+EOF
+  # The schema's transport, named beside orrery_ipc in the same declared list.
+  # Present in every synthetic workspace for the same reason: the declared
+  # names must resolve, or a fixture dies before reaching the clause it was
+  # built to test.
+  cat >"$fixture/crates/orrery_ipc_transport/Cargo.toml" <<'EOF'
+[package]
+name = "orrery_ipc_transport"
+version = "0.0.0"
+edition = "2024"
+EOF
+  cat >"$fixture/crates/orrery_ipc_transport/src/lib.rs" <<'EOF'
+pub struct Framing;
 EOF
   cat >"$fixture/crates/orrery_games/Cargo.toml" <<'EOF'
 [package]
