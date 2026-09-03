@@ -34,7 +34,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 /// The connection's application protocol. Must match `gates/p1-swarm`'s
 /// `bridge::EXTERIOR_ALPN`; a grammar change bumps it there and here together.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/4";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/5";
 
 /// Longest frame the wire will carry or accept (`exterior::MAX_FRAME_BYTES`).
 pub const MAX_FRAME_BYTES: u32 = 64 * 1_024;
@@ -319,7 +319,7 @@ pub struct JoinRequest {
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 4;
+    const VERSION: u16 = 5;
 
     /// A plain, identity-less join.
     #[must_use]
@@ -450,6 +450,23 @@ pub enum JoinReply {
         /// Why the join was refused.
         reason: String,
     },
+    /// The lobby is still filling and this client is still in it (#994).
+    ///
+    /// The host beats this every [`crate::LOBBY_HEARTBEAT_GRACE`]/4 for as
+    /// long as the seat waits. Hearing one is what lets this client tell
+    /// "queued" from "the host lost me minutes ago and I will find out when
+    /// my dial deadline expires".
+    LobbyWait {
+        /// Human seats connected to the lobby so far.
+        seated: u16,
+        /// Human seats the lobby is waiting to fill.
+        needed: u16,
+    },
+    /// The host gave this client's seat back while it waited in the lobby.
+    Evicted {
+        /// Why the seat was given back, in words a player reads.
+        reason: String,
+    },
 }
 
 /// The signed join-tick claim and canonical state sent after join acceptance.
@@ -497,6 +514,26 @@ impl JoinReply {
                     return Err("reject reason truncated");
                 };
                 Ok(Self::Reject {
+                    reason: String::from_utf8_lossy(reason).into_owned(),
+                })
+            }
+            Some(2) => {
+                let Some(body) = bytes.get(1..5) else {
+                    return Err("lobby wait truncated");
+                };
+                Ok(Self::LobbyWait {
+                    seated: u16::from_le_bytes(body[0..2].try_into().expect("two bytes")),
+                    needed: u16::from_le_bytes(body[2..4].try_into().expect("two bytes")),
+                })
+            }
+            Some(3) => {
+                let Some(&len) = bytes.get(1) else {
+                    return Err("eviction truncated");
+                };
+                let Some(reason) = bytes.get(2..2 + usize::from(len)) else {
+                    return Err("eviction reason truncated");
+                };
+                Ok(Self::Evicted {
                     reason: String::from_utf8_lossy(reason).into_owned(),
                 })
             }
@@ -682,6 +719,142 @@ impl CampaignLink {
     }
 }
 
+/// QUIC application close code the host uses when it evicts a lobby peer.
+///
+/// Must match `bridge::LOBBY_EVICTION_CLOSE_CODE`. A close carrying this code
+/// carries the eviction reason with it, which is the second of the notice's
+/// two chances to reach a path that is failing rather than gone.
+pub const LOBBY_EVICTION_CLOSE_CODE: u64 = 0x9_94;
+
+/// Prefix that marks a join error as "the host gave your seat back".
+///
+/// Distinct from a refusal (`the host refused the join: …`), which happens
+/// before this client was ever queued, and from a plain dial failure. The
+/// campaign session reads it back off the error to reach
+/// [`crate::campaign::JoinState::Evicted`].
+pub const LOBBY_EVICTION_PREFIX: &str = "the host gave your seat back: ";
+
+/// What the client says when the lobby went silent and nothing explained it.
+///
+/// This is what #994's tester should have read at 12:57 instead of
+/// `read join reply: handshake closed mid-length`: it names where the join
+/// was (waiting for the run to fill), what happened to the seat, and what to
+/// do next.
+pub const LOBBY_LOST_CONTACT: &str = "lost contact with the host while waiting for the run to \
+     fill; the seat has been given up, so ask for a new invite and try again";
+
+/// The handshake replies a joining client reads while the lobby fills.
+///
+/// The trait is the seam the tests inject through. The behaviour under test is
+/// what this client does after several seconds of silence and after a
+/// connection closes underneath it, and a test that produced those for real
+/// would be a slow flaky test rather than coverage (#994) — the same reason
+/// `p1-swarm`'s start path grew its `StartJoin` seam.
+pub(crate) trait LobbyReplies {
+    /// The next length-prefixed handshake message, or why none will come.
+    fn next_reply(&mut self) -> impl std::future::Future<Output = Result<Vec<u8>, String>>;
+    /// The eviction reason the transport itself carried, when the host closed
+    /// the connection with one.
+    fn eviction_close_reason(&self) -> Option<String>;
+}
+
+/// Wait out the host's lobby and return its verdict.
+///
+/// Before #994 this was one read with a 210-second bound: whatever went wrong
+/// in those 210 seconds, the client reported the shape of the truncated read.
+/// Now the host beats `LobbyWait` while the lobby fills, and three things
+/// follow. `on_wait` sees the lobby's progress, so the client knows it is
+/// queued. The read bound tightens to [`crate::LOBBY_HEARTBEAT_GRACE`] once a
+/// beat has been heard, so silence is caught in eight seconds rather than
+/// three and a half minutes. And a failure after a beat is attributed to the
+/// lobby instead of to a length prefix.
+///
+/// The bound only tightens *after* a beat, so every host and every path that
+/// answers without opening a lobby keeps exactly the bound it had.
+///
+/// # Errors
+/// A refusal, an eviction (prefixed [`LOBBY_EVICTION_PREFIX`]), a manifest
+/// this client cannot adopt, or the lobby going silent.
+pub(crate) async fn await_lobby_verdict<S: LobbyReplies>(
+    replies: &mut S,
+    expect: &crate::lobby::StartExpectation,
+    first_reply_timeout: Duration,
+    heartbeat_grace: Duration,
+    on_wait: &mut dyn FnMut(u16, u16),
+) -> Result<Option<crate::lobby::AcceptedStart>, String> {
+    let mut window = first_reply_timeout;
+    loop {
+        let read = tokio::time::timeout(window, replies.next_reply()).await;
+        let bytes = match read {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                return Err(match replies.eviction_close_reason() {
+                    Some(reason) => format!("{LOBBY_EVICTION_PREFIX}{reason}"),
+                    None if window != first_reply_timeout => LOBBY_LOST_CONTACT.to_owned(),
+                    None => format!("read join reply: {error}"),
+                });
+            }
+            Err(_) => {
+                return Err(match replies.eviction_close_reason() {
+                    Some(reason) => format!("{LOBBY_EVICTION_PREFIX}{reason}"),
+                    None if window != first_reply_timeout => LOBBY_LOST_CONTACT.to_owned(),
+                    None => "handshake read timed out".to_owned(),
+                });
+            }
+        };
+        match JoinReply::decode(&bytes) {
+            Ok(JoinReply::LobbyWait { seated, needed }) => {
+                window = heartbeat_grace;
+                on_wait(seated, needed);
+            }
+            Ok(JoinReply::Accept { index, manifest }) => {
+                if index != expect.slot {
+                    return Err(format!(
+                        "the host assigned slot {index}; this client reserved slot {}",
+                        expect.slot
+                    ));
+                }
+                return match manifest {
+                    None => Ok(None),
+                    Some(manifest) => crate::lobby::accept_start(&manifest, expect)
+                        .map(Some)
+                        .map_err(|mismatch| mismatch.player_sentence()),
+                };
+            }
+            Ok(JoinReply::Reject { reason }) => {
+                return Err(format!("the host refused the join: {reason}"));
+            }
+            Ok(JoinReply::Evicted { reason }) => {
+                return Err(format!("{LOBBY_EVICTION_PREFIX}{reason}"));
+            }
+            Err(reason) => return Err(format!("the host's reply did not decode: {reason}")),
+        }
+    }
+}
+
+/// The live handshake stream, read one length-prefixed message at a time.
+struct HandshakeReplies<'a> {
+    recv: &'a mut iroh::endpoint::RecvStream,
+    connection: &'a iroh::endpoint::Connection,
+}
+
+impl LobbyReplies for HandshakeReplies<'_> {
+    async fn next_reply(&mut self) -> Result<Vec<u8>, String> {
+        read_message(self.recv).await
+    }
+
+    fn eviction_close_reason(&self) -> Option<String> {
+        match self.connection.close_reason()? {
+            iroh::endpoint::ConnectionError::ApplicationClosed(frame)
+                if u64::from(frame.error_code) == LOBBY_EVICTION_CLOSE_CODE =>
+            {
+                crate::lobby::plain_ascii(&String::from_utf8_lossy(&frame.reason))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Dials the host and runs the client half of slice 1's handshake.
 ///
 /// `anchor` authors the joining commitment after `StartV1` has been accepted,
@@ -744,32 +917,22 @@ where
         .await
         .map_err(|error| format!("send join request: {error}"))?;
     step("join request written");
-    let reply_bytes = tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, read_message(&mut recv))
-        .await
-        .map_err(|_| "handshake read timed out".to_string())?
-        .map_err(|error| format!("read join reply: {error}"))?;
+    let accepted_start = await_lobby_verdict(
+        &mut HandshakeReplies {
+            recv: &mut recv,
+            connection: &connection,
+        },
+        expect,
+        HANDSHAKE_READ_TIMEOUT,
+        crate::LOBBY_HEARTBEAT_GRACE,
+        &mut |seated, needed| {
+            // Said once per beat, and cheap: the volunteer's own evidence that
+            // they are still queued rather than staring at a stalled screen.
+            bevy::log::info!("campaign: waiting in the lobby - {seated} of {needed} seats filled");
+        },
+    )
+    .await?;
     step("join reply read");
-    let accepted_start = match JoinReply::decode(&reply_bytes) {
-        Ok(JoinReply::Accept { index, manifest }) => {
-            if index != expect.slot {
-                return Err(format!(
-                    "the host assigned slot {index}; this client reserved slot {}",
-                    expect.slot
-                ));
-            }
-            match manifest {
-                None => None,
-                Some(manifest) => Some(
-                    crate::lobby::accept_start(&manifest, expect)
-                        .map_err(|mismatch| mismatch.player_sentence())?,
-                ),
-            }
-        }
-        Ok(JoinReply::Reject { reason }) => {
-            return Err(format!("the host refused the join: {reason}"));
-        }
-        Err(reason) => return Err(format!("the host's reply did not decode: {reason}")),
-    };
 
     // Two separately framed messages, exactly as the headless producer ships:
     // signed claim first, then the canonical state it commits to. The empty
@@ -1023,6 +1186,251 @@ fn spawn_connection_watcher(connection: iroh::endpoint::Connection, connected: A
 mod tests {
     use super::*;
 
+    /// A scripted lobby: each entry is the next thing the host does.
+    ///
+    /// The seam exists so the cases below run in microseconds. The live
+    /// behaviour is "sit through three minutes of a filling lobby, then
+    /// several seconds of silence" (#994); reproducing that for real would
+    /// have bought a ten-second flaky test per case, which is why nothing
+    /// exercised it before.
+    enum Beat {
+        /// The host sends this reply.
+        Reply(JoinReply),
+        /// The host says nothing, ever again — a lapsed path.
+        Silence,
+        /// The stream ends under the reader.
+        Truncated,
+    }
+
+    struct ScriptedLobby {
+        beats: std::collections::VecDeque<Beat>,
+        /// The eviction reason the CONNECTION_CLOSE carried, if any.
+        close_reason: Option<String>,
+    }
+
+    impl ScriptedLobby {
+        fn new(beats: Vec<Beat>) -> Self {
+            Self {
+                beats: beats.into(),
+                close_reason: None,
+            }
+        }
+
+        fn closed_with(mut self, reason: &str) -> Self {
+            self.close_reason = Some(reason.to_owned());
+            self
+        }
+    }
+
+    impl LobbyReplies for ScriptedLobby {
+        async fn next_reply(&mut self) -> Result<Vec<u8>, String> {
+            match self.beats.pop_front() {
+                Some(Beat::Reply(reply)) => Ok(reply.encode()),
+                Some(Beat::Truncated) | None => Err("handshake closed mid-length".to_owned()),
+                Some(Beat::Silence) => std::future::pending().await,
+            }
+        }
+
+        fn eviction_close_reason(&self) -> Option<String> {
+            self.close_reason.clone()
+        }
+    }
+
+    /// The host's reply encoder, mirroring `exterior::JoinReply::encode`.
+    ///
+    /// The client only ever decodes, so this lives in the tests: the bytes it
+    /// produces are the contract both halves are pinned to.
+    impl JoinReply {
+        fn encode(&self) -> Vec<u8> {
+            match self {
+                Self::Accept { index, manifest } => {
+                    assert!(manifest.is_none(), "the fixtures send bare accepts");
+                    let mut out = vec![0];
+                    out.extend_from_slice(&(*index as u64).to_le_bytes());
+                    out
+                }
+                Self::Reject { reason } => {
+                    let mut out = vec![1, u8::try_from(reason.len()).expect("short reason")];
+                    out.extend_from_slice(reason.as_bytes());
+                    out
+                }
+                Self::LobbyWait { seated, needed } => {
+                    let mut out = vec![2];
+                    out.extend_from_slice(&seated.to_le_bytes());
+                    out.extend_from_slice(&needed.to_le_bytes());
+                    out
+                }
+                Self::Evicted { reason } => {
+                    let mut out = vec![3, u8::try_from(reason.len()).expect("short reason")];
+                    out.extend_from_slice(reason.as_bytes());
+                    out
+                }
+            }
+        }
+    }
+
+    fn seat_four() -> crate::lobby::StartExpectation {
+        crate::lobby::StartExpectation {
+            slot: 4,
+            entity: 5,
+            node_hex: "ab".repeat(32),
+            island_seats: 8,
+        }
+    }
+
+    /// Both bounds are passed in, so a test picks microseconds where the live
+    /// client picks minutes and seconds. No test here waits for a clock.
+    async fn verdict(
+        lobby: &mut ScriptedLobby,
+        waits: &mut Vec<(u16, u16)>,
+    ) -> Result<Option<crate::lobby::AcceptedStart>, String> {
+        await_lobby_verdict(
+            lobby,
+            &seat_four(),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            &mut |seated, needed| waits.push((seated, needed)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_beaten_lobby_is_waited_out_and_the_seat_still_arrives() {
+        // Ninety beats is the three-minute wait #994's tester sat through,
+        // eighteen times the ten-second idle timeout. Each one resets the
+        // read window, so the wait costs the join nothing.
+        let mut beats: Vec<Beat> = (0..90)
+            .map(|_| {
+                Beat::Reply(JoinReply::LobbyWait {
+                    seated: 2,
+                    needed: 3,
+                })
+            })
+            .collect();
+        beats.push(Beat::Reply(JoinReply::Accept {
+            index: 4,
+            manifest: None,
+        }));
+        let mut lobby = ScriptedLobby::new(beats);
+        let mut waits = Vec::new();
+
+        let start = verdict(&mut lobby, &mut waits)
+            .await
+            .expect("a beaten lobby seats the player");
+
+        assert!(start.is_none(), "a bare accept carries no manifest");
+        assert_eq!(waits.len(), 90, "the player was told where the lobby was");
+        assert_eq!(waits[0], (2, 3));
+    }
+
+    #[tokio::test]
+    async fn a_lobby_that_goes_silent_says_so_in_words_a_tester_can_act_on() {
+        // #994's live outcome, at the seam. What the tester actually read was
+        // `read join reply: handshake closed mid-length`, three minutes after
+        // being told they were queued.
+        let mut lobby = ScriptedLobby::new(vec![
+            Beat::Reply(JoinReply::LobbyWait {
+                seated: 1,
+                needed: 2,
+            }),
+            Beat::Silence,
+        ]);
+        let mut waits = Vec::new();
+
+        let reason = verdict(&mut lobby, &mut waits)
+            .await
+            .expect_err("silence after a beat is not a seat");
+
+        assert_eq!(reason, LOBBY_LOST_CONTACT);
+        assert!(
+            !reason.contains("handshake"),
+            "the wire's vocabulary is not the volunteer's: {reason}"
+        );
+        assert!(
+            reason.contains("try again"),
+            "and it has to answer 'do I retry?': {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_read_after_a_beat_is_the_lobby_not_the_length_prefix() {
+        let mut lobby = ScriptedLobby::new(vec![
+            Beat::Reply(JoinReply::LobbyWait {
+                seated: 1,
+                needed: 2,
+            }),
+            Beat::Truncated,
+        ]);
+        assert_eq!(
+            verdict(&mut lobby, &mut Vec::new()).await,
+            Err(LOBBY_LOST_CONTACT.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_never_opens_a_lobby_keeps_the_bound_and_the_words_it_had() {
+        // Nothing tightens before a beat is heard: every path that answers
+        // without a lobby — a mid-run join, the headless harness — is
+        // unchanged, down to the error text.
+        let mut lobby = ScriptedLobby::new(vec![Beat::Truncated]);
+        assert_eq!(
+            verdict(&mut lobby, &mut Vec::new()).await,
+            Err("read join reply: handshake closed mid-length".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eviction_notice_is_reported_as_an_eviction_however_it_arrives() {
+        // On the stream, when the host could still write.
+        let told = ScriptedLobby::new(vec![
+            Beat::Reply(JoinReply::LobbyWait {
+                seated: 1,
+                needed: 2,
+            }),
+            Beat::Reply(JoinReply::Evicted {
+                reason: "the host lost contact".to_owned(),
+            }),
+        ]);
+        // Or on the CONNECTION_CLOSE, when only that got through.
+        let closed = ScriptedLobby::new(vec![
+            Beat::Reply(JoinReply::LobbyWait {
+                seated: 1,
+                needed: 2,
+            }),
+            Beat::Truncated,
+        ])
+        .closed_with("the host lost contact");
+
+        for mut lobby in [told, closed] {
+            let reason = verdict(&mut lobby, &mut Vec::new())
+                .await
+                .expect_err("an evicted client holds no seat");
+            assert_eq!(
+                reason,
+                format!("{LOBBY_EVICTION_PREFIX}the host lost contact"),
+                "both routes reach the one client-visible outcome"
+            );
+            assert!(
+                reason.strip_prefix(LOBBY_EVICTION_PREFIX).is_some(),
+                "and the campaign session reads that prefix to reach JoinState::Evicted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_during_a_lobby_is_still_a_refusal() {
+        // An eviction must not swallow the refusal path: they reach different
+        // states and mean different things to the player.
+        let mut lobby = ScriptedLobby::new(vec![Beat::Reply(JoinReply::Reject {
+            reason: "campaign closed".to_owned(),
+        })]);
+        let reason = verdict(&mut lobby, &mut Vec::new())
+            .await
+            .expect_err("a rejection is not a seat");
+        assert_eq!(reason, "the host refused the join: campaign closed");
+        assert!(reason.strip_prefix(LOBBY_EVICTION_PREFIX).is_none());
+    }
+
     #[test]
     fn exterior_endpoint_applies_the_ten_second_idle_timeout_pin() {
         assert_eq!(
@@ -1039,7 +1447,7 @@ mod tests {
         );
     }
 
-    /// The exact bytes the host reads. A plain `JoinRequest` v4 is
+    /// The exact bytes the host reads. A plain `JoinRequest` v5 is
     /// `[ORRX][04 00][rev len][rev]`; if this vector and `gates/p1-swarm` ever
     /// disagree, one side changed the grammar and both must move together.
     #[test]
@@ -1049,7 +1457,7 @@ mod tests {
             request.encode(),
             vec![
                 b'O', b'R', b'R', b'X', // magic
-                0x04, 0x00, // version 4, LE
+                0x05, 0x00, // version 5, LE
                 7,    // revision length
                 b'a', b'b', b'c', b'1', b'2', b'3', b'4',
             ]
@@ -1094,7 +1502,7 @@ mod tests {
             request.encode(),
             vec![
                 b'O', b'R', b'R', b'X', // magic
-                0x04, 0x00, // version 4, LE
+                0x05, 0x00, // version 5, LE
                 2, b'a', b'b', // revision
                 2, b'c', b'd', // session id
                 0x02, 0x00, // token length, LE

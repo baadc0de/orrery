@@ -240,6 +240,15 @@ pub enum JoinState {
     Joined,
     /// The host answered with `Reject`; the reason names itself.
     Refused(String),
+    /// The host gave this client's seat back while it waited in the lobby, and
+    /// said so (#994).
+    ///
+    /// Distinct from [`Self::Refused`], which is the host declining a join
+    /// that never got a seat, and from [`Self::Failed`], which is a
+    /// malfunction. This one is neither: the seat was real, the wait was real,
+    /// and the seat is now somebody else's — the only thing the player needs
+    /// is a new invite.
+    Evicted(String),
     /// Dial failure, timeout, or protocol error.
     Failed(String),
     /// The link ended after having been live.
@@ -1013,7 +1022,15 @@ impl CampaignRuntime {
             Some(Err(reason)) => {
                 // A host refusal is a named outcome, not a malfunction; the
                 // operator sees why. Anything else failed outright.
-                if reason.contains("refused the join") {
+                if let Some(why) = reason.strip_prefix(net::LOBBY_EVICTION_PREFIX) {
+                    // Not a malfunction and not a refusal: this client was
+                    // queued, the host lost it, and the seat went back to
+                    // admission (#994). Saying that is the whole point — the
+                    // volunteer who waited three minutes for
+                    // `handshake closed mid-length` could not act on it.
+                    bevy::log::warn!("campaign: the host gave this seat back: {why}");
+                    self.state = JoinState::Evicted(why.to_owned());
+                } else if reason.contains("refused the join") {
                     let why = reason
                         .strip_prefix("the host refused the join: ")
                         .unwrap_or(&reason)
@@ -2009,6 +2026,7 @@ impl CampaignRuntime {
                 self.downlink.total_missing(),
             ),
             JoinState::Refused(reason) => format!("campaign: REFUSED - {reason}"),
+            JoinState::Evicted(reason) => format!("campaign: SEAT GIVEN BACK - {reason}"),
             JoinState::Failed(reason) => format!("campaign: FAILED - {reason}"),
             JoinState::Closed { host_said_goodbye } => {
                 format!("campaign: closed (host said goodbye: {host_said_goodbye})")

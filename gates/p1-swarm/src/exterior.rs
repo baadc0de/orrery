@@ -539,7 +539,7 @@ pub struct JoinRequest {
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 4;
+    const VERSION: u16 = 5;
 
     /// A plain, identity-less join — what the headless bot runner sends.
     #[must_use]
@@ -900,6 +900,32 @@ pub enum JoinReply {
         /// Why the join was refused.
         reason: String,
     },
+    /// The lobby is still filling and this seat is still held.
+    ///
+    /// Sent on a fixed cadence for as long as the seat waits (#994). Two
+    /// things ride on it. It is *traffic*: a lobby wait of minutes across a
+    /// ten-second [`crate::bridge::EXTERIOR_MAX_IDLE_TIMEOUT`] should never be
+    /// carried by QUIC keep-alive PINGs alone, and a write that fails is how
+    /// the host learns it has lost the peer while the lobby is still open
+    /// rather than at `StartV1`. And it is *news*: a client that has heard one
+    /// knows it is queued, and a client that stops hearing them knows it is
+    /// not, instead of waiting out a dial deadline for a truncated handshake.
+    LobbyWait {
+        /// Human seats connected to this lobby so far.
+        seated: u16,
+        /// Human seats the lobby is waiting to fill.
+        needed: u16,
+    },
+    /// The host gave this seat back while the peer waited in the lobby.
+    ///
+    /// Best effort by construction: the common cause is a connection the host
+    /// can no longer write to. The client's own lobby-heartbeat grace is what
+    /// makes the outcome intelligible when this cannot be delivered; a peer
+    /// whose path is degraded rather than gone still gets told why.
+    Evicted {
+        /// Why the seat was given back.
+        reason: String,
+    },
 }
 
 impl JoinReply {
@@ -920,6 +946,17 @@ impl JoinReply {
             }
             Self::Reject { reason } => {
                 out.push(1);
+                let reason = reason.as_bytes();
+                out.push(u8::try_from(reason.len()).unwrap_or(u8::MAX));
+                out.extend_from_slice(&reason[..reason.len().min(u8::MAX.into())]);
+            }
+            Self::LobbyWait { seated, needed } => {
+                out.push(2);
+                out.extend_from_slice(&seated.to_le_bytes());
+                out.extend_from_slice(&needed.to_le_bytes());
+            }
+            Self::Evicted { reason } => {
+                out.push(3);
                 let reason = reason.as_bytes();
                 out.push(u8::try_from(reason.len()).unwrap_or(u8::MAX));
                 out.extend_from_slice(&reason[..reason.len().min(u8::MAX.into())]);
@@ -955,6 +992,26 @@ impl JoinReply {
                     return Err("reject reason truncated");
                 };
                 Ok(Self::Reject {
+                    reason: String::from_utf8_lossy(reason).into_owned(),
+                })
+            }
+            Some(2) => {
+                let Some(body) = bytes.get(1..5) else {
+                    return Err("lobby wait truncated");
+                };
+                Ok(Self::LobbyWait {
+                    seated: u16::from_le_bytes(body[0..2].try_into().expect("two bytes")),
+                    needed: u16::from_le_bytes(body[2..4].try_into().expect("two bytes")),
+                })
+            }
+            Some(3) => {
+                let Some(&len) = bytes.get(1) else {
+                    return Err("eviction truncated");
+                };
+                let Some(reason) = bytes.get(2..2 + usize::from(len)) else {
+                    return Err("eviction reason truncated");
+                };
+                Ok(Self::Evicted {
                     reason: String::from_utf8_lossy(reason).into_owned(),
                 })
             }
@@ -1509,6 +1566,27 @@ mod tests {
             reason: "client rev pinned out".to_owned(),
         };
         assert_eq!(JoinReply::decode(&reject.encode()), Ok(reject.clone()));
+
+        let waiting = JoinReply::LobbyWait {
+            seated: 2,
+            needed: 3,
+        };
+        assert_eq!(JoinReply::decode(&waiting.encode()), Ok(waiting.clone()));
+        assert_eq!(
+            JoinReply::decode(&waiting.encode()[..3]),
+            Err("lobby wait truncated"),
+            "a half-read beat is not a beat"
+        );
+
+        let evicted = JoinReply::Evicted {
+            reason: "the host lost contact while the run was filling".to_owned(),
+        };
+        assert_eq!(JoinReply::decode(&evicted.encode()), Ok(evicted.clone()));
+        assert_ne!(
+            evicted.encode()[0],
+            reject.encode()[0],
+            "an eviction is not a refusal: the client reaches a different state for each"
+        );
 
         assert!(JoinReply::decode(&[7]).is_err(), "unknown tag refused");
         assert!(

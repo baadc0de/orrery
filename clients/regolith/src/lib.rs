@@ -56,6 +56,18 @@ pub const JOIN_HANDSHAKE_READ_TIMEOUT: Duration =
 pub const JOIN_DEADLINE: Duration =
     JOIN_HANDSHAKE_READ_TIMEOUT.saturating_add(Duration::from_secs(30));
 
+/// How long the client will sit through silence *after* the host has started
+/// beating `LobbyWait` at it, before it declares the lobby lost (#994).
+///
+/// Four times the host's two-second cadence, so three beats may go missing to
+/// jitter without a verdict, and still under the ten-second QUIC idle timeout
+/// — which is the point. The connection dies at ten seconds either way; the
+/// only question is whether the volunteer is told they were dropped from the
+/// lobby or is handed `handshake closed mid-length`. It applies only once a
+/// beat has actually been heard, so a host that answers immediately, and every
+/// path that never opens a lobby at all, keep the bound they had.
+pub const LOBBY_HEARTBEAT_GRACE: Duration = Duration::from_secs(8);
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -506,7 +518,9 @@ impl SessionPresentation {
             Some(JoinState::Dialing) => Self::Dialing,
             Some(JoinState::Joined) => Self::Live,
             Some(JoinState::Failed(_)) => Self::Failed,
-            Some(JoinState::Refused(_)) => Self::Refused,
+            // An eviction is a refusal as far as presentation goes: the seat is
+            // not this client's, and the panel it belongs on is the lobby's.
+            Some(JoinState::Refused(_) | JoinState::Evicted(_)) => Self::Refused,
             Some(JoinState::Closed { .. }) => Self::Disconnected,
         }
     }
@@ -1117,6 +1131,16 @@ fn refresh_lobby_panel(
     // words; nothing here paraphrases them.
     let notice = match session.join_state() {
         Some(JoinState::Refused(reason)) => Some(lobby::refusal_sentence(None, Some(reason), None)),
+        // The host's own words for why the seat went back, in the room where
+        // this player spent the wait (#994). Nothing here paraphrases them.
+        Some(JoinState::Evicted(reason)) => Some(
+            lobby::plain_ascii(reason)
+                .map_or_else(
+                    || "The host gave your seat back while you were waiting.".to_owned(),
+                    |reason| format!("The host gave your seat back: {reason}"),
+                )
+                .to_owned(),
+        ),
         Some(JoinState::Failed(reason)) => {
             lobby::plain_ascii(reason).map(|reason| format!("Could not join: {reason}"))
         }
