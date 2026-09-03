@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod admission;
+pub mod anchor;
 pub mod aoi;
 pub mod assets;
 pub mod campaign;
@@ -764,6 +765,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<SelectedLock>()
             .init_resource::<LockCandidates>()
             .init_resource::<CombatView>()
+            .init_resource::<anchor::AnchorView>()
             .init_resource::<grab::ReachView>()
             .init_resource::<grab::GrabLatch>()
             .init_resource::<ProjectileTracks>()
@@ -837,6 +839,7 @@ impl Plugin for RegolithSkinPlugin {
                     // and every overlay body is placed against the transforms
                     // `sync_rendered_state` wrote this frame.
                     read_combat_state,
+                    read_anchor_state,
                     hud::sync_lock_reticle,
                     hud::sync_range_rings,
                     hud::sync_grab_reach_ring,
@@ -1697,6 +1700,16 @@ fn read_combat_state(session: Res<ActiveSession>, mut view: ResMut<CombatView>) 
         .target
         .and_then(|target| session.replica_age_ticks(target));
     *view = next;
+}
+
+/// Refreshes what the campaign is holding this pilot with (#955).
+///
+/// Separate from `read_combat_state` because it is about a different question
+/// — where the pilot is against the island, and where the island's own
+/// content is — and because nothing it produces is allowed to reach the
+/// intent path. It only ever writes `AnchorView`.
+fn read_anchor_state(session: Res<ActiveSession>, mut view: ResMut<anchor::AnchorView>) {
+    *view = anchor::AnchorView::read(session.executor(), session.local_entity());
 }
 
 fn archetype_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<Archetype> {

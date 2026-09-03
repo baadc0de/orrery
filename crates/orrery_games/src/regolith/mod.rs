@@ -156,6 +156,67 @@ pub const KILL_SCORE_POINTS: u64 = 25;
 pub const PICKUP_SCORE_POINTS: u64 = 5;
 /// Rocks reflect from this square island edge with integer velocity negation.
 pub const ISLAND_BOUNDARY_MM: i64 = 1_000_000;
+
+// ── the island tether (#955) ────────────────────────────────────────────
+//
+// The island edge above is the ruleset's own statement of where the game is:
+// every rock reflects off it, blooms seed inside a quarter of it, and craft
+// spawn within 150 m of its centre. Craft were the one body it did not reach.
+//
+// #955 measured what that cost: the replication interest block is 1536 m
+// across and the interceptor ceiling is 480 m/s, so three seconds of held
+// throttle carried the 2026-09-02 volunteer out of the populated volume, and
+// the remaining fourteen minutes of their session witnessed an empty region.
+// The throttle was binary and authored — the flying was legitimate, which is
+// why no host-side signal could catch it.
+//
+// The tether is not a wall and not a reflection. Outside the boundary, and
+// only on a velocity component that points *further out*, an extra linear
+// drag ramps in over one interest cell. Inward motion is never touched, so a
+// pilot who turns around is free the instant they do, and nothing here can
+// trap a craft or bounce it in a direction it did not ask for. Leaving stays
+// possible; it stops being free.
+
+/// Width of the tether's ramp band beyond [`ISLAND_BOUNDARY_MM`], millimetres.
+///
+/// One interest cell edge ([`CAMPAIGN_CELL_EDGE_M`]). The band is the stretch
+/// over which the restoring drag grows from nothing to full, and sizing it to
+/// a cell edge keeps the rule and the skin's cue in one currency: a craft
+/// crosses at most one cell's worth of space while the tether comes in.
+pub const TETHER_BAND_MM: i64 = 512_000;
+const _: () = assert!(TETHER_BAND_MM as f64 == CAMPAIGN_CELL_EDGE_M * 1_000.0);
+
+/// Seconds between two bloom announcements.
+const BLOOM_CADENCE_SECS: i64 = BLOOM_CADENCE_TICKS as i64 / TICK_HZ as i64;
+
+/// Outward speed a fully tethered craft can still hold, millimetres per second.
+///
+/// The island's own diameter per bloom cadence: a pilot who holds the throttle
+/// outward against a fully-ramped tether needs the whole interval between two
+/// bloom announcements to put one island-width between themselves and it.
+/// #955's measurement was a comparable distance crossed in three seconds; this
+/// is the same distance turned back into a decision.
+pub const TETHER_ESCAPE_SPEED_MMS: i64 = ISLAND_BOUNDARY_MM * 2 / BLOOM_CADENCE_SECS;
+
+/// Total drag a fully tethered craft flies against, per-mille per second.
+///
+/// Under linear drag a craft at constant thrust settles at `accel / drag`, so
+/// this is the drag that puts the *fastest* chassis at
+/// [`TETHER_ESCAPE_SPEED_MMS`]. Every slower chassis settles slower still,
+/// which is the right ordering: the interceptor that produced #955 is the one
+/// the number is sized against.
+const TETHER_TOTAL_DRAG_PER_SEC_PER_MILLE: i64 =
+    archetype::Archetype::Interceptor.limits().max_accel_mmss * 1_000 / TETHER_ESCAPE_SPEED_MMS;
+
+/// Extra drag the tether adds at full ramp, on the outward component only.
+pub const TETHER_DRAG_PER_SEC_PER_MILLE: i64 =
+    TETHER_TOTAL_DRAG_PER_SEC_PER_MILLE - DRAG_PER_SEC_PER_MILLE;
+
+// The tether must actually restrain, and its per-tick retention must stay in
+// (0, 1) or the integrator would invert velocity instead of damping it —
+// which is the reflection this deliberately is not.
+const _: () = assert!(TETHER_DRAG_PER_SEC_PER_MILLE > 0);
+const _: () = assert!(TETHER_TOTAL_DRAG_PER_SEC_PER_MILLE < 1_000 * TICK_HZ as i64);
 const JITTER_MIN_URAD: u32 = 785_398;
 const JITTER_MAX_URAD: u32 = 1_308_997;
 /// Pickup lifetime: 30 seconds at 60 Hz.
@@ -367,8 +428,14 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
 /// tick-zero positions either side of this change. Calling both builds v20
 /// would let them enter one session and disagree before the first input; v21
 /// makes admission refuse that mixed campaign instead.
+/// **v25 is the island tether** (#955). Craft became subject to
+/// [`ISLAND_BOUNDARY_MM`], the island edge every rock already reflects off, as
+/// an outward-only restoring drag. It is a rules change and not a cue, so it
+/// moves the ruleset digest, the schedule digest and the state goldens
+/// together, and admission must refuse a v24 peer rather than let one enter a
+/// session where held throttle means something different.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 24,
+    version: 25,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 
@@ -873,13 +940,17 @@ pub const STAGE_CLAIMS_APPLY: ScheduleStageId = ScheduleStageId("claims-apply");
 
 /// D43 clause (g)'s pinned schedule digest.
 ///
+/// Moved at v25 (#955): `craft-apply-tether` joined the craft-motion stage
+/// between `craft-apply-drag` and `craft-integrate`, with the ordering edges
+/// that pin it there.
+///
 /// Recomputed by `schedule_tests::the_schedule_digest_is_pinned`. Moving a
 /// system, renaming one, or changing an ordering edge moves this value, and
 /// that is the point: state goldens hash states, not graphs, so a reorder that
 /// happens not to change any pinned chain is otherwise invisible.
 pub const REGOLITH_SCHEDULE_DIGEST: [u8; 32] = [
-    0x2c, 0xdb, 0x2f, 0x33, 0xce, 0xc3, 0x0e, 0xd5, 0x06, 0xc1, 0xda, 0xfe, 0xee, 0xe3, 0xf1, 0x57,
-    0x4b, 0x2e, 0x8d, 0x37, 0x32, 0x61, 0xeb, 0x3d, 0x0b, 0xef, 0xda, 0xe9, 0x94, 0x84, 0xb3, 0x64,
+    0xc0, 0x73, 0x00, 0x01, 0xa3, 0xe5, 0xda, 0x56, 0xe4, 0xe2, 0x48, 0xff, 0xba, 0x9b, 0x78, 0xd6,
+    0xb4, 0xad, 0xaf, 0x79, 0x9d, 0x19, 0x3a, 0xa4, 0xc3, 0xc1, 0x34, 0xe8, 0xe3, 0x86, 0x16, 0x22,
 ];
 
 /// The declared schedule topology D43 clause (g) digests.
@@ -940,6 +1011,7 @@ pub const REGOLITH_SCHEDULE_STAGES: &[ScheduleStageManifest] = &[
         systems: &[
             SystemId("craft-clamp-speed"),
             SystemId("craft-apply-drag"),
+            SystemId("craft-apply-tether"),
             SystemId("craft-integrate"),
             SystemId("craft-respawn"),
             SystemId("craft-store-kinematics"),
@@ -1001,6 +1073,13 @@ pub const REGOLITH_SCHEDULE_EDGES: &[ScheduleOrderingEdge] = &[
     },
     ScheduleOrderingEdge {
         before: SystemId("craft-apply-drag"),
+        after: SystemId("craft-apply-tether"),
+    },
+    // The tether reads the position it is restraining, so it must run while
+    // that position is still this tick's *input* — before the integrator
+    // moves the craft using the velocity the tether is there to damp.
+    ScheduleOrderingEdge {
+        before: SystemId("craft-apply-tether"),
         after: SystemId("craft-integrate"),
     },
     ScheduleOrderingEdge {

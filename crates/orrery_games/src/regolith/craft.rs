@@ -24,8 +24,9 @@ use super::state::{Craft, LockClass, PITCH_LIMIT_URAD, TAU_URAD};
 use super::{
     order::{LockBreakReason, Order, Outcome, ShotResult},
     projectile_resolution, spawn_pose, velocity_within_limit, weapon, Cx, ProjectileResolution,
-    Regolith, RegolithLocals, COVER_CLAIM_INTERVAL_TICKS, DRAG_PER_SEC, DT, LOCK_ACQUISITION_TICKS,
-    LOCK_DECAY_PER_TICK, RESPAWN_TICKS,
+    Regolith, RegolithLocals, COVER_CLAIM_INTERVAL_TICKS, DRAG_PER_SEC, DT, ISLAND_BOUNDARY_MM,
+    LOCK_ACQUISITION_TICKS, LOCK_DECAY_PER_TICK, RESPAWN_TICKS, TETHER_BAND_MM,
+    TETHER_DRAG_PER_SEC_PER_MILLE,
 };
 
 /// Age both per-tick cooldowns by one tick.
@@ -432,6 +433,47 @@ pub(crate) fn apply_drag(_craft: &mut Craft, cx: &mut Cx<'_>) {
     }
 }
 
+/// Pull an outbound craft back toward the island (#955).
+///
+/// The island edge is the ruleset's own statement of where the game is, and
+/// until now craft were the only body that could not feel it. This is a
+/// restoring drag, not a wall: it acts **only** outside
+/// [`ISLAND_BOUNDARY_MM`], **only** on a velocity component that points
+/// further out, and it ramps in over [`TETHER_BAND_MM`] rather than switching
+/// on at a line. A pilot who turns around is unimpeded on the same tick they
+/// do, so nothing here can trap a craft, bounce it, or move it in a direction
+/// it did not ask for.
+///
+/// Per axis independently, because the island is a box and not a sphere:
+/// [`ISLAND_BOUNDARY_MM`] is the same square edge `world::drift` reflects
+/// rocks off, and measuring a radius here would be a second, disagreeing
+/// definition of one boundary — the failure #499 and #502 already cost.
+pub(crate) fn apply_tether(_craft: &mut Craft, cx: &mut Cx<'_>) {
+    let boundary_m = ISLAND_BOUNDARY_MM as f64 / 1_000.0;
+    let band_m = TETHER_BAND_MM as f64 / 1_000.0;
+    let full_drag_per_sec = TETHER_DRAG_PER_SEC_PER_MILLE as f64 / 1_000.0;
+    let scratch = &mut cx.locals.craft;
+    for axis in 0..3 {
+        let pos = scratch.pos_m[axis];
+        let vel = scratch.vel_mps[axis];
+        let over_m = libm::fabs(pos) - boundary_m;
+        if over_m <= 0.0 {
+            continue;
+        }
+        // Outward is "the same sign as the position", which is why a craft
+        // exactly on an axis plane (pos == 0.0) can never be outside on it.
+        let outward = if pos > 0.0 { vel > 0.0 } else { vel < 0.0 };
+        if !outward {
+            continue;
+        }
+        let mut ramp = over_m / band_m;
+        if ramp > 1.0 {
+            ramp = 1.0;
+        }
+        scratch.vel_mps[axis] = vel * (1.0 - full_drag_per_sec * ramp * DT);
+    }
+}
+
 /// Integrate position from velocity.
 pub(crate) fn integrate(_craft: &mut Craft, cx: &mut Cx<'_>) {
     let scratch = &mut cx.locals.craft;
@@ -506,6 +548,7 @@ pub(crate) const CONTROL: &[System<Regolith, RegolithLocals>] = &[
 pub(crate) const MOTION: &[System<Regolith, RegolithLocals>] = &[
     craft_system!("craft-clamp-speed", clamp_speed),
     craft_system!("craft-apply-drag", apply_drag),
+    craft_system!("craft-apply-tether", apply_tether),
     craft_system!("craft-integrate", integrate),
     craft_system!("craft-respawn", respawn),
     craft_system!("craft-store-kinematics", store_kinematics),
