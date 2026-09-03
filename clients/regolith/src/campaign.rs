@@ -1524,18 +1524,44 @@ impl CampaignRuntime {
         })
     }
 
+    /// Publishes one already-`encode_witness`d record to every witness
+    /// recipient, adding the transport frame tag the peer stack would.
+    ///
+    /// The outer tag is not decoration. A bot publishes witness traffic as
+    /// `SendPacket { channel: State, mode: Shared }` carrying
+    /// `encode_witness(..)`, whose own bytes already open with the inner
+    /// `[TAG_STATE]` (`orrery_witness::plugin::publish_authored`), and
+    /// `send_peer_packets` then prepends the *transport's* tag before the
+    /// bytes leave. The host's `receive_peer_packets` strips exactly that one
+    /// byte and hands the rest to `ingest_peer_traffic`, which calls
+    /// `decode_witness` — so what must reach the wire is the double-tagged
+    /// `[State][State][TAG_WITNESS][postcard]`, and this client bypasses the
+    /// peer stack, so the outer tag is ours to add.
+    ///
+    /// #964 shipped the single-tagged form: every one of the human seat's
+    /// claims and frames arrived one byte short, `decode_witness` returned
+    /// `None`, and the witness plugin `continue`d past all of them while the
+    /// seat still reported `witness_anchored = true`. That is the identical
+    /// mistake #386 made on the replication lane and #387 fixed — see
+    /// `encode_state_broadcast`, which pins the same double tag — and
+    /// `send_remote_delivery` already had it right on the delivered-input
+    /// lane. This is the third and last uplink producer to agree with them.
     fn publish_witness_payload(
         &mut self,
         link: &CampaignLink,
         recipients: &[usize],
         payload: Bytes,
     ) {
+        let framed = Bytes::from(orrery_protocol::channels::tag(
+            orrery_protocol::channels::Channel::State,
+            &payload,
+        ));
         for recipient in recipients {
             if link
                 .try_uplink(net::Frame {
                     peer: *recipient as u32,
                     lane: Lane::StreamShared,
-                    payload: payload.clone(),
+                    payload: framed.clone(),
                 })
                 .is_err()
             {

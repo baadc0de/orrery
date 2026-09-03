@@ -59,7 +59,15 @@ pub struct PeerPacket {
     pub from: NodeId,
     /// Which lane it came in on.
     pub channel: Channel,
-    /// The untagged payload.
+    /// The payload the sender wrote: an `orrery_protocol::channels`
+    /// `encode_*` blob, byte for byte what its [`SendPacket::payload`] held.
+    ///
+    /// **Still tagged.** [`receive_peer_packets`] strips the *transport's*
+    /// frame tag, not this one — an `encode_*` blob ends by calling `tag`
+    /// itself, so it opens with a channel tag of its own that every sub-tag
+    /// decoder (`decode_witness`, `decode_replication`, `decode_hit`) untags
+    /// before reading its sub-tag. Calling one of those on a payload you have
+    /// already untagged returns `None`, and none of them say why (#964).
     pub payload: Bytes,
 }
 
@@ -201,6 +209,36 @@ impl FaultWarns {
 /// `orrery_persistd`'s gateway speaks the same framing over raw iroh streams
 /// without this crate's session machinery, and two encodings of one wire
 /// surface is how they drift.
+///
+/// # The payload contract, stated once
+///
+/// The byte this system strips is the **transport's** frame tag, the one
+/// [`send_peer_packets`] adds. It is not the payload's. The contract across
+/// the whole peer seam is an identity:
+///
+/// ```text
+/// PeerPacket.payload  ==  SendPacket.payload  ==  an `encode_*` blob
+/// ```
+///
+/// and every `orrery_protocol::channels` encoder — `encode_witness`,
+/// `encode_replication`, `encode_hit`, `encode_delivered_input` — ends by
+/// calling `tag(..)` itself, so that blob *opens with a channel tag of its
+/// own. `PeerPacket.payload` is therefore still tagged, which is exactly why
+/// every sub-tag decoder calls `untag` before reading its sub-tag, and why
+/// `orrery_predict`'s bridge documents the resulting double tag on the wire
+/// (`bridge.rs`, `send_replication_packets`) rather than treating it as a bug.
+///
+/// [`PeerPacket::channel`] is the *lane*, for consumers that must refuse a
+/// message on the wrong one — `ingest_peer_traffic` rejects an
+/// `IntentProposal` off `Channel::Control`. It is not a licence to skip the
+/// `untag`, and reading this system's stripping of one byte as "the payload is
+/// the untagged body" is what #964 cost: a producer outside this crate
+/// (`orrery_regolith_client`'s witness publish) wrote the wire without the
+/// transport tag, this system's `untag` then ate the payload's own, and the
+/// host silently discarded 100% of a human seat's witness records. #386/#387
+/// was the same mistake on the replication lane. Any producer that bypasses
+/// [`send_peer_packets`] and writes a peer frame directly owes it that outer
+/// tag; `peer_packet_payload_is_the_encoded_blob` pins the identity.
 pub fn receive_peer_packets(
     mut sessions: Query<(&Peer, &mut aeronet_io::Session, Option<&mut IrohStreamIo>)>,
     mut packets: MessageWriter<PeerPacket>,
