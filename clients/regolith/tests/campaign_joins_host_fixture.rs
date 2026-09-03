@@ -618,9 +618,27 @@ async fn pump(
                     continue;
                 }
 
-                let message =
-                    orrery_protocol::channels::decode_witness::<WitnessMsg>(&frame.payload)
-                        .expect("the rendered client's shared stream carries a witness message");
+                // Model the real host, not a convenient decoder (#964). A
+                // stream frame reaching a host is drained by
+                // `orrery_net::receive_peer_packets`, which strips exactly one
+                // transport tag and puts the channel in `PeerPacket.channel`;
+                // `orrery_witness::ingest_peer_traffic` then calls
+                // `decode_witness` on what is left. Calling `decode_witness`
+                // on the raw frame — as this branch used to, while the
+                // delivered-input branch three lines above already untagged —
+                // is what let the client ship the single-tagged form and made
+                // the host discard 100% of a human seat's witness records
+                // while `witness_anchored` still read true.
+                let (channel, body) = orrery_protocol::channels::untag(&frame.payload)
+                    .expect("the client's stream frame carries a transport channel tag");
+                assert_eq!(
+                    channel,
+                    orrery_protocol::channels::Channel::State,
+                    "witness traffic rides the State channel on the shared stream, as \
+                     `orrery_witness::plugin::publish_authored` sends it"
+                );
+                let message = orrery_protocol::channels::decode_witness::<WitnessMsg>(body)
+                    .expect("the rendered client's shared stream carries a witness message");
                 match message {
                     WitnessMsg::Frame { frame, heads } => {
                         assert_eq!(heads.len(), 1, "one authored entity per client frame");
