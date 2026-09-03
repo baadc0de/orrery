@@ -1448,3 +1448,118 @@ jobs:
             fi
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+# ── D. The #920 sidecar IPC measurement ──────────────────────────────────────
+#
+# The deciding number issue #920 defines: `ipc_added` at N = 24 (HIGH_RATE_SET)
+# at 60 Hz on WINDOWS, where TCP loopback with TCP_NODELAY is the *worst
+# reasonable* transport candidate — if it clears the bands there, every other
+# candidate does and the sidecar-versus-embedded decision closes cheaply.
+# Until this runs, the decision rests on #898's recommendation; the report
+# this job uploads is what lets it rest on evidence instead.
+#
+# This is a measurement, not a gate: a verdict of SIDECAR OVERTURNED is a
+# finding for the owner (#898's decision 2), never a red run. The job stays
+# green so the number is always collectible; the report carries the verdict
+# text because `scripts/ipc-report.py` refuses a verdict for any platform but
+# windows — a Linux or macOS report of the same run shape is informational by
+# construction.
+#
+# Two runs, because #920's lie 1 asks for both: the headline run with
+# `timeBeginPeriod(1)` raised (`--time-period`), and a short reference run at
+# the default 15.6 ms timer granularity so the gap between them is attributable
+# to the timer quantum rather than the transport. The reference run is short
+# (7 200 ticks ≈ 2 minutes) because only its difference from the headline run
+# is load-bearing.
+sidecar-ipc-windows:
+  name: sidecar-ipc (windows, N=24)
+  runs-on: windows-latest
+  timeout-minutes: 30
+  defaults:
+    run:
+      # Git Bash, like every other Windows leg here — the harness invocation
+      # below is the same line a Linux run uses.
+      shell: bash
+  permissions:
+    contents: read
+  steps:
+    - name: Check out with LF line endings
+      run: git config --global core.autocrlf input
+    - uses: actions/checkout@v7
+    - name: Install the pinned toolchain
+      run: rustup show active-toolchain || rustup toolchain install
+    # The harness is Bevy-free: orrery_ipc_transport depends on orrery_ipc,
+    # orrery_protocol, libc/windows-sys and serde_json, so a cold build is a
+    # fraction of the spine's. The key hashes only what this build reads.
+    - uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: sidecar-ipc-${{ hashFiles('Cargo.toml', 'crates/orrery_ipc/Cargo.toml', 'crates/orrery_ipc_transport/Cargo.toml', 'rust-toolchain.toml') }}
+        restore-keys: sidecar-ipc-
+    - name: Build the harness
+      run: cargo build --release -p orrery_ipc_transport --bin orrery-ipc-bench
+    # The headline run: ≥ 36 000 samples (10 minutes at 60 Hz), 600 warmup
+    # ticks excluded, timer resolution raised. The observer binds an ephemeral
+    # port (`--port 0`) and prints it; the sidecar greps that line, so the job
+    # needs no fixed port and no coordination beyond process order.
+    - name: Run the measurement (timeBeginPeriod raised)
+      run: |
+        set -euo pipefail
+        ./target/release/orrery-ipc-bench.exe observer \
+          --port 0 --entities 24 --ticks 36000 --warmup 600 \
+          --report sidecar-ipc-n24-time-period.json --time-period \
+          > observer.log 2>&1 &
+        observer_pid=$!
+        addr=""
+        for _ in $(seq 1 100); do
+          addr=$(grep -o '127\.0\.0\.1:[0-9]*' observer.log | head -1 || true)
+          [[ -n $addr ]] && break
+          sleep 0.2
+        done
+        [[ -n $addr ]] || { cat observer.log; exit 1; }
+        ./target/release/orrery-ipc-bench.exe sidecar \
+          --addr "$addr" --entities 24 --time-period
+        wait "$observer_pid"
+        test -s sidecar-ipc-n24-time-period.json
+    # The granularity reference: same shape, default timer resolution, short.
+    - name: Run the timer-granularity reference (default resolution)
+      run: |
+        set -euo pipefail
+        ./target/release/orrery-ipc-bench.exe observer \
+          --port 0 --entities 24 --ticks 7200 --warmup 600 \
+          --report sidecar-ipc-n24-default-resolution.json \
+          > observer-ref.log 2>&1 &
+        observer_pid=$!
+        addr=""
+        for _ in $(seq 1 100); do
+          addr=$(grep -o '127\.0\.0\.1:[0-9]*' observer-ref.log | head -1 || true)
+          [[ -n $addr ]] && break
+          sleep 0.2
+        done
+        [[ -n $addr ]] || { cat observer-ref.log; exit 1; }
+        ./target/release/orrery-ipc-bench.exe sidecar \
+          --addr "$addr" --entities 24
+        wait "$observer_pid"
+        test -s sidecar-ipc-n24-default-resolution.json
+    - name: Render the verdict into the summary
+      run: |
+        {
+          echo '# Sidecar IPC measurement (windows, N = 24)'
+          echo
+          python3 scripts/ipc-report.py sidecar-ipc-n24-time-period.json
+          echo
+          echo '## Timer-granularity reference (default resolution)'
+          echo
+          python3 scripts/ipc-report.py sidecar-ipc-n24-default-resolution.json
+        } >> "$GITHUB_STEP_SUMMARY"
+    - uses: actions/upload-artifact@v7
+      with:
+        name: sidecar-ipc-windows
+        path: |
+          sidecar-ipc-n24-time-period.json
+          sidecar-ipc-n24-default-resolution.json
+        if-no-files-found: error
