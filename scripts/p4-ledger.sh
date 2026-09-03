@@ -948,10 +948,23 @@ validate_attempt_binding() {
   # assuming presence for the whole attempt is exactly how a cohort over-counts.
   # One tick of tolerance absorbs the boundary rounding between the client's
   # wall clock and the host's tick clock, and nothing else.
+  #
+  # The span is the host's own wall bracket when the seat carries one (#971):
+  # a tick count scaled at the *nominal* rate is not a duration, because the
+  # host's metronome sleeps out a remainder and never makes up an overrun, so
+  # it runs at or below 60 Hz and the scaled count understates a real seat by
+  # however much it lagged. The tick basis stays as the fallback for a report
+  # without stamps, and it is the conservative one — shorter for a lagging
+  # host — so omitting the bracket refuses more readily, never less.
   jq -e '
     (.seconds / .ticks) as $per
-    | (.binding.connected_ticks * $per / 60) as $connected
-    | (((.binding.connected_minutes // $connected) - $connected) | . * . < 1e-9)
+    | .binding as $b
+    | (if ($b.connected_since_unix_millis | type == "number")
+          and ($b.connected_until_unix_millis | type == "number")
+       then ($b.connected_until_unix_millis - $b.connected_since_unix_millis) / 60000
+       else ($b.connected_ticks * $per / 60) end) as $connected
+    | $connected >= 0
+      and (((.binding.connected_minutes // $connected) - $connected) | . * . < 1e-9)
       and (.session.banked_minutes <= $connected + $per / 60)
   ' "$report" >/dev/null \
     || die "refusing to bank: slot $(jq -r '.binding.slot' "$report") banks $(jq -r '.session.banked_minutes' "$report") min, more than the seat's own connected span"

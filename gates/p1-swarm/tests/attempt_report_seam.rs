@@ -311,6 +311,11 @@ fn a_real_host_report_banks_human_and_bot_hours_through_the_real_ledger() {
             "1",
             "--impaired",
             "--witness",
+            // #971: the seat's connected span is a wall-clock fact, and this is
+            // the switch that lets the host stamp one. Without it the seam
+            // below falls back to scaling a tick count at the nominal rate,
+            // which is the arithmetic that refused seven honest attempts.
+            "--stamp-wall-clock",
             "--external-peer",
             "--attempt-id",
             &attempt_id,
@@ -514,7 +519,39 @@ fn a_real_host_report_banks_human_and_bot_hours_through_the_real_ledger() {
             .expect("the seat's own connected span");
         let ticks = report["ticks"].as_u64().expect("the attempt's tick count");
         let seconds = report["seconds"].as_u64().expect("the attempt's seconds");
-        let connected_minutes = connected_ticks as f64 * (seconds as f64 / ticks as f64) / 60.0;
+        let nominal_minutes = connected_ticks as f64 * (seconds as f64 / ticks as f64) / 60.0;
+
+        // #971. The host's own wall bracket is the basis the accounting uses,
+        // and this is the one place it is read off a *real* host rather than a
+        // fixture — which is the whole point, because in a fixture the host's
+        // tick rate and the client's agree by construction and the defect
+        // cannot appear. The host's metronome sleeps out the remainder of a
+        // tick and accumulates no deadline, so it runs at or below its nominal
+        // rate and never makes an overrun back: the bracket is therefore at
+        // least as long as the nominal scaling of the same seat, and the gap
+        // between the two is this run's measured drift.
+        let since = seat["connected_since_unix_millis"]
+            .as_u64()
+            .expect("the host stamps when it bound this seat");
+        let until = seat["connected_until_unix_millis"]
+            .as_u64()
+            .expect("the host stamps when this seat stopped being connected");
+        assert!(
+            until >= since,
+            "slot {slot} reports a bracket that runs backwards: {since} to {until}"
+        );
+        let connected_minutes = (until - since) as f64 / 60_000.0;
+        assert!(
+            connected_minutes + 1e-9 >= nominal_minutes,
+            "slot {slot}: the host's wall bracket is {connected_minutes:.4} min but its \
+             own tick count scales to {nominal_minutes:.4} min. A sleep-only metronome \
+             cannot outrun its nominal rate, so this is a broken stamp, not fast ticking"
+        );
+        eprintln!(
+            "seat {slot}: wall bracket {connected_minutes:.4} min, nominal tick scaling \
+             {nominal_minutes:.4} min, drift {:.1} ms",
+            (connected_minutes - nominal_minutes) * 60_000.0
+        );
         assert!(
             connected_minutes >= BANKED_MINUTES,
             "slot {slot} was connected for {connected_minutes:.4} min, so a \

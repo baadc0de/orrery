@@ -539,6 +539,19 @@ pub struct RunIdentity {
     pub commit: &'static str,
 }
 
+/// Host wall clock in Unix milliseconds.
+///
+/// Called only on the exterior-seat path, and only when the caller asked for
+/// wall stamps: the swarm proper must stay a function of its seed, and an
+/// `--external-peer` run already is not one.
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// What the host observed about the external peer over one run (#385).
 #[derive(Debug, Clone, Serialize)]
 pub struct ExteriorReport {
@@ -551,7 +564,33 @@ pub struct ExteriorReport {
     /// Whether the bridge believed the connection was alive at report time.
     pub connected: bool,
     /// Host ticks during which the bridge reported this slot connected.
+    ///
+    /// A *count*, not a duration: the host's metronome is sleep-only and never
+    /// makes up an overrun, so scaling this by the nominal tick period
+    /// understates the seat's real connected span by however much the host
+    /// lagged (#971 measured 55.3-59.8 Hz against a 60 Hz nominal). Use it for
+    /// what it is - work the host did for this seat - and use the wall
+    /// bracket below for how long the seat was actually connected.
     pub connected_ticks: u64,
+    /// Host wall-clock milliseconds at which this seat was bound, present only
+    /// when the caller asked for wall stamps (`--stamp-wall-clock`).
+    ///
+    /// The open end of the host's own record of the seat's connected span. It
+    /// is stamped when the host admits the seat, which is at or before the
+    /// moment the client starts counting its own play, so the bracket
+    /// *contains* the client's interval rather than sampling a subinterval of
+    /// it (#971).
+    pub connected_since_unix_millis: Option<u64>,
+    /// Host wall-clock milliseconds at which this seat stopped being connected.
+    ///
+    /// Whichever the host saw first: the tick at which the bridge reported the
+    /// link down, or - the common case for a clean leg - the moment the report
+    /// was taken, which for a seat released on its goodbye is the tick the host
+    /// processed that goodbye and for a seat still connected is the end of the
+    /// run. Every one of those is at or after the seat's real close and never
+    /// before it, by at most one tick. `None` exactly when
+    /// [`Self::connected_since_unix_millis`] is.
+    pub connected_until_unix_millis: Option<u64>,
     /// Frames forwarded from the remote into the router.
     pub uplink_frames: u64,
     /// Uplink datagrams retained by the impairment router.
@@ -1339,6 +1378,15 @@ pub struct ExteriorSlot {
     uplink_frames: u64,
     /// Host ticks during which the bridge reported this slot connected.
     connected_ticks: u64,
+    /// Host wall-clock milliseconds at which this seat was bound. `None` when
+    /// the caller did not ask for wall stamps, which is also what keeps a
+    /// seedless run seedless: nothing else in the swarm consults a clock.
+    seated_at_unix_millis: Option<u64>,
+    /// Host wall-clock milliseconds at the first tick this seat was observed
+    /// no longer connected. Stays `None` for a seat released on its own
+    /// goodbye and for one still connected when the clock stopped; both report
+    /// the moment the report was taken instead, which is the same tick.
+    released_at_unix_millis: Option<u64>,
     /// Uplink datagrams retained by the impairment router.
     uplink_delivered: u64,
     /// Uplink datagrams discarded by the impairment router.
@@ -1503,6 +1551,10 @@ impl ExteriorSlot {
             node: self.node,
             connected,
             connected_ticks: self.connected_ticks,
+            connected_since_unix_millis: self.seated_at_unix_millis,
+            connected_until_unix_millis: self
+                .seated_at_unix_millis
+                .map(|_| self.released_at_unix_millis.unwrap_or_else(unix_millis_now)),
             uplink_frames: self.uplink_frames,
             uplink_delivered: self.uplink_delivered,
             uplink_dropped: self.uplink_dropped,
@@ -1612,6 +1664,11 @@ impl ExteriorSlot {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             self.connected_ticks += 1;
+        } else if self.seated_at_unix_millis.is_some() && self.released_at_unix_millis.is_none() {
+            // The close end of the bracket, stamped at the first tick the host
+            // saw the link down. Late by up to one tick, never early, so the
+            // span it reports still contains the seat's real one (#971).
+            self.released_at_unix_millis = Some(unix_millis_now());
         }
         let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
         if debug && tick.is_multiple_of(60) {
@@ -1970,6 +2027,8 @@ impl Swarm {
                 link,
                 uplink_frames: 0,
                 connected_ticks: 0,
+                seated_at_unix_millis: self.config.started_at_unix_secs.map(|_| unix_millis_now()),
+                released_at_unix_millis: None,
                 uplink_delivered: 0,
                 uplink_dropped: 0,
                 downlink_frames: 0,

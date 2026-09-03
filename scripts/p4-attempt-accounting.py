@@ -132,10 +132,12 @@ def normalize_exteriors(attempt: dict[str, Any]) -> list[dict[str, Any]]:
 
     What the host does **not** yet emit is `session_id` per seat —
     `ExteriorReport` (`gates/p1-swarm/src/swarm.rs`, after #579) carries `index`,
-    `node`, `connected_ticks`, the frame counters, `said_goodbye`, `connected`
-    and `witness_anchored`, and no invite id. So `session_id` stays `None` for a
-    host-emitted seat, and the seat's identity comes from the node the host
-    admitted there plus the operator's pinned id; see `seat_for` in `derive`.
+    `node`, `connected_ticks`, the host wall bracket added by #971
+    (`connected_since_unix_millis` / `connected_until_unix_millis`), the frame
+    counters, `said_goodbye`, `connected` and `witness_anchored`, and no invite
+    id. So `session_id` stays `None` for a host-emitted seat, and the seat's
+    identity comes from the node the host admitted there plus the operator's
+    pinned id; see `seat_for` in `derive`.
     """
 
     def one(entry: Any) -> dict[str, Any]:
@@ -157,6 +159,8 @@ def normalize_exteriors(attempt: dict[str, Any]) -> list[dict[str, Any]]:
             "session_id": entry.get("session_id"),
             "node": entry.get("node"),
             "connected_ticks": entry.get("connected_ticks"),
+            "connected_since_unix_millis": entry.get("connected_since_unix_millis"),
+            "connected_until_unix_millis": entry.get("connected_until_unix_millis"),
             "frames": {
                 "uplink": entry.get("uplink_frames", 0),
                 "downlink": entry.get("downlink_frames", 0),
@@ -226,6 +230,56 @@ def valid_attempt_seconds(attempt: dict[str, Any]) -> float:
     if not isinstance(seconds, (int, float)) or seconds <= 0:
         refuse("the attempt accumulated no valid seconds")
     return float(seconds)
+
+
+def connected_span_minutes(entry: dict[str, Any], per_tick: float) -> tuple[float, str]:
+    """How long the host had this seat connected, in minutes, and on what basis.
+
+    Two bases, and the difference between them is #971.
+
+    The **wall bracket** — `connected_since_unix_millis` to
+    `connected_until_unix_millis`, both stamped by the host — is the honest one,
+    because the connected span is a wall-clock fact and this measures it
+    directly. The host opens the bracket when it binds the seat, at or before
+    the moment the client starts counting, and closes it at the first tick it
+    saw the link down or at report time; so the bracket *contains* the client's
+    interval and the one-tick tolerance at the call site is again only the
+    boundary rounding between two clocks that its comment claims it is.
+
+    The **tick count** — `connected_ticks` scaled by the report's nominal period
+    — is the fallback, for a report that carries no stamps (one produced without
+    `--stamp-wall-clock`, or archived from before this seam existed). It is
+    *not* equivalent. `gates/p1-swarm`'s metronome sleeps out the remainder of a
+    tick and never accumulates a deadline, so an overrun is lost permanently and
+    the host runs at or below its nominal rate: 55.3-59.8 Hz measured against a
+    60 Hz nominal, which understated a real 60 s seat by 13 to 153 ticks and
+    refused seven honest attempts in a row.
+
+    The fallback is safe precisely because it errs that way. A lagging host's
+    tick basis is *shorter* than its wall bracket, so a report that omits the
+    stamps can only be refused more readily, never less — omitting them is not a
+    way to bank an interval the host did not seat.
+    """
+    def stamp(value: Any) -> bool:
+        # `bool` is an `int` in Python and `true` is not a millisecond.
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    since = entry.get("connected_since_unix_millis")
+    until = entry.get("connected_until_unix_millis")
+    if stamp(since) and stamp(until):
+        if until < since:
+            refuse(
+                f"slot {entry.get('slot')} reports a seat released at {until} before it was "
+                f"seated at {since}; a connected span cannot run backwards"
+            )
+        return (until - since) / 60_000.0, "host wall bracket"
+    if since is not None or until is not None:
+        refuse(
+            f"slot {entry.get('slot')} stamps only one end of its connected span; a bracket "
+            "needs both ends or neither"
+        )
+    connected_ticks = entry.get("connected_ticks")
+    return connected_ticks * per_tick / 60.0, "host tick count at the nominal rate"
 
 
 def seconds_per_tick(attempt: dict[str, Any]) -> float:
@@ -560,7 +614,7 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         connected_ticks = entry.get("connected_ticks")
         if not isinstance(connected_ticks, int) or connected_ticks <= 0:
             refuse(f"slot {slot} reports no connected ticks; an unseated slot banks nothing")
-        connected_minutes = connected_ticks * per_tick / 60.0
+        connected_minutes, span_basis = connected_span_minutes(entry, per_tick)
         banked_minutes = row.get("banked_minutes")
         distinct = row.get("distinct_play_minutes")
         if not isinstance(banked_minutes, (int, float)) or banked_minutes < 0:
@@ -574,8 +628,8 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         if banked_minutes > connected_minutes + per_tick / 60.0:
             refuse(
                 f"session {session_id} banks {banked_minutes:g} min but slot {slot} was "
-                f"connected for {connected_minutes:.4f} min; an interval cannot exceed its seat's "
-                "connected span"
+                f"connected for {connected_minutes:.4f} min ({span_basis}); an interval cannot "
+                "exceed its seat's connected span"
             )
 
         platform = row.get("platform_triple")
@@ -619,6 +673,8 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             "session_id": session_id,
             "node": node,
             "connected_ticks": connected_ticks,
+            "connected_since_unix_millis": entry.get("connected_since_unix_millis"),
+            "connected_until_unix_millis": entry.get("connected_until_unix_millis"),
             "connected_minutes": connected_minutes,
             "close": close,
         }
