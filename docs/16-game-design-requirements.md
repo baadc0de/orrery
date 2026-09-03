@@ -198,10 +198,36 @@ Numbered so they can be answered one at a time.
 - **Missions are the only multiplayer unit.** Every player reaches space and the surface as crew of a ship owned by someone else, so the ship grid's authority, its crew list, its inventory of consumable vehicles, and the captain's control of undock, jump, launch and recall are the primary group-play mechanics. Crew rights when the owning organization has no officer aboard need a rule.
 - **"Extremely expensive" is a tuning target with telemetry**, not a number: the macro service should report ships per organization and mission participation per active player, and the season economy is tuned so that ships stay rare and missions stay full.
 
+## G7 — Organizations, crews, squads, rivalry
+
+| # | Requirement | Source |
+|---|---|---|
+| G7 | **Every player is always a member of exactly one organization.** | owner mandate |
+| G7.1 | **Training organization.** A default organization exists on the mothership. Every character joins it at creation and **returns to it automatically** when kicked from or leaving any other organization. | owner mandate |
+| G7.2 | **Joining and leaving is player activity** and may require **fees, upkeep, and standing or renown gates**. | owner mandate |
+| G7.3 | **One guild leader per organization.** The leader **passes leadership** and is the **only member who can kick**. | owner mandate |
+| G7.4 | **Mission crew is contract-only** (G5). Eligibility may be **scoped to an organization**, like any other contract gate. | owner mandate |
+| G7.5 | **NPC pilot fallback.** When neither CO nor XO is aboard, an NPC pilot takes the ship: **holds steady**, and if damage is critical **requests an emergency mothership teleport-out** of the ship. | owner mandate |
+| G7.6 | **Full friendly fire, everywhere.** Anyone can turn on anyone, including their own crew and organization. NPC security responds as it does everywhere (G4.9). | owner mandate |
+| G7.7 | **Squads are ad hoc**, with basic **text and voice** comms. A squad may be marked **open** so random players find it through social tools. | owner mandate |
+| G7.8 | **Identity reveal only on death.** In clandestine ops (G5.2), identity is revealed and standing lost **only on corpse capture**. Being seen or contacted costs nothing. | owner mandate |
+| G7.9 | **Rivalry is the core PvP mechanic.** Organizations can hold rivalries, **loot each other for resources** and **interrupt each other's missions**. Gathering is slow; stealing is faster but risky. | owner mandate |
+| G7.10 | **Defection is a strategy.** Aligning with opposing NPC factions can bring **alternative, powerful items**, at the risk of both failing to procure resources and losing standing. | owner mandate |
+| G7.11 | **CO and XO** are the commanding and executive officer roles on a ship, assigned by the owner (G4.3, G6.6). | derived from G7.5 |
+
+### Engineering consequences of G7
+
+- **Organization membership is a total function** from avatar to organization, never null. The training organization is the mothership-owned default (G4.10 mothership id applies) and membership changes are attested writes with a fee/gate check at the boundary, the same shape as renown gates (G6). Kick is a leader-only write; leadership transfer is a two-party write (or leader-only if the leader may assign unilaterally: to confirm).
+- **Roles on a ship are a small rights table**: owner (organization or mothership), CO, XO, crew. The NPC pilot is a server-side actor that holds authority over the ship grid's movement when no CO/XO is aboard, so the ship grid always has a controller and never drifts unowned. "Damage critical" and the teleport-out request are macro-visible events; the teleport itself is the G4.19 recall applied to a whole ship's crew, and it is the ship's escape hatch, so the not-engaged predicate and cooldown apply to it too or the ship is unkillable. **To confirm: does the ship itself teleport out, or only the crew, leaving the hull as a wreck?**
+- **Friendly fire everywhere means no team flag in the damage model.** Damage is faction-agnostic; standing and NPC security are the only consequences. This simplifies hit registration (no ally check) and moves all of the cost into the standing ledger and the crime definition (G4.9 consequences).
+- **Squads are ephemeral and outside the simulation.** Text, voice and the open-squad directory are social services (doc 09), not replicated state; they need presence and a directory, and nothing about them is witnessed. Voice is a separate transport concern.
+- **Identity-on-death makes the corpse an evidence object.** Corpse capture (G3.2 loot container) is the attested event that reveals identity and applies the standing penalty. The avatar entity as seen live must therefore carry a **viewer-dependent identity**: an unrevealed avatar replicates as anonymous to non-crew, and only the death write attaches the durable identity. This is a replication-filter requirement (ADR-0003) and a witnessing subtlety: witnesses attest the entity id, not the player, until reveal.
+- **Rivalry is a value-transfer game and the macro service must model it.** Looting an organization's structure or convoy is a micro-layer event whose ledger effect (resources move from one organization to another) folds into macro state; interrupting a mission is a micro event whose macro effect is contract failure. Both feed the risk term of the fair-value suggestion (G5.3). Organization-level standing between rival organizations may be needed as a ledger for the social tools and NPC reaction; to confirm.
+- **Defection items are a parallel tech tree keyed on NPC-faction standing (G7.10)**, so faction standing is not a score but an unlock table, and the same renown-gate mechanism (G6) evaluates it at the NPC faction's authority (macro service or a faction-controlled surface structure).
+
 ## Open — to be settled by the owner
 
 Sections reserved; each becomes a `G<n>` block when decided.
 
-- G7 — Population and grouping (factions, crews, guilds)
 - G8 — PvE content model (NPC ships, fauna, missions)
 - G9 — Time (real-time, accelerated, day/night, orbital mechanics)
