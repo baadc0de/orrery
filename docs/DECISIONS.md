@@ -102,6 +102,26 @@ families, one clean prefix byte; D32 clause (c)'s arithmetic and allocation
 rule carry the same correction. The recovered byte is **not pre-spent** by
 any of them (D51 §(c)).
 
+D52 and D53 are **proposed, not accepted**, and are deliberately absent from
+the index above, which is the accepted set.
+[ADR-0052](adr/0052-client-platform-scope.md) proposes narrowing R9's platform
+row to a client set (Windows first, Linux second) and a server set (Linux),
+leaving the native-only/no-WASM clause verbatim and leaving the determinism
+matrix and the P4 accumulation leg untouched.
+[ADR-0053](adr/0053-unreal-client-host-scope.md) proposes scoping D4 — the
+Bevy client is one host, an Unreal client is another — and records which
+`orrery_sim_host` C ABI seams carry to such a host and which do not.
+
+Both are **the first Orrery records to cite the game project's `G` numbers**,
+which is the convention they establish: an Orrery change made to satisfy a
+`G`-numbered *Mothership* requirement is an Orrery ADR citing that number, not
+a game record reaching into this trail. Both therefore cite
+[#1021](https://github.com/baadc0de/orrery/pull/1021), which is **open, not
+merged**; their `game/docs/...` links are dead until it lands, and **neither
+can be accepted before it does**. Neither amends any accepted record while
+Proposed: D52's amendment of D1's R9 row and of `00-overview.md` §2 takes
+effect only on acceptance, and D53 amends no record's normative text at all.
+
 **Keyspace and at-rest allocation, 2026-09-03 (#947).**
 `content/version` gained a seventh field, `universe_seed_fingerprint`, and with
 it two allocations that are recorded here rather than by a new ADR, because
