@@ -6,7 +6,7 @@ This decision is normative for the *Mothership* game project. See the [game ADR 
 
 ## Decision
 
-1. The client is **Unreal Engine 5.8**, pinned. PCG (production-ready), Mesh Terrain, Nanite Foliage and the Procedural Vegetation Editor (all Experimental in 5.8) and Lumen are used for presentation. Experimental status is accepted because nothing canonical depends on them.
+1. The client is **Unreal Engine 5.8**, pinned. PCG, Lumen, **MegaLights** and **Substrate** (all production-ready) and Mesh Terrain, Nanite Foliage and the Procedural Vegetation Editor (all Experimental in 5.8) are used for presentation. Lighting is fully dynamic with no baked path; Substrate is the sole material model, deferred rendering only. Experimental status is accepted because nothing canonical depends on any of them.
 2. **Orrery runs in-process**: a Rust static library in an Unreal plugin behind a C ABI, Bevy headless inside the game process. Unreal actors mirror engine-neutral canonical state per Orrery ADR-0042; Unreal replication, CharacterMovementComponent and Chaos are presentation only.
 3. **Season content is cooked with dual output**: one commandlet run per season seed produces the Unreal package and the deterministic ruleset collision package, distributed together with a shared digest. PCG runs at cook time only.
 4. **Platforms**: Windows first, Linux second, macOS dropped for the client. Server builds stay engine-free on Linux. This amends Orrery R9 and is to be recorded on the Orrery trail.
