@@ -8063,6 +8063,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_ipc_transport"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "orrery_ipc",
+ "orrery_protocol",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "orrery_net"
 version = "0.1.0"
 dependencies = [

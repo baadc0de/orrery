@@ -57,7 +57,7 @@ readonly DECLARED_GATED_CRATES=(orrery_core orrery_games orrery_conformance)
 # be role-discovered above. Name them separately so clause 1 still makes their
 # Bevy-free dependency boundary mechanical. This list does not opt a crate into
 # the determinism source scans, which are meaningful only for canonical rules.
-readonly DECLARED_BEVY_FREE_CRATES=(orrery_ipc)
+readonly DECLARED_BEVY_FREE_CRATES=(orrery_ipc orrery_ipc_transport)
 
 # Crates whose sources are a `Ruleset` rather than the machinery around one.
 # The neighbour clause below applies to these only; `orrery_core` defines and

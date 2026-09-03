@@ -1,0 +1,39 @@
+[package]
+name = "orrery_ipc_transport"
+version = "0.1.0"
+edition = "2021"
+description = "Length-prefixed reliable byte-stream transport for the orrery_ipc schema, and the #920 sidecar IPC latency harness"
+license = "MIT OR Apache-2.0"
+
+# `orrery_ipc` is a codec and must stay one: no I/O, and a schema that carries
+# no outer length prefix (decode refuses trailing bytes, and MAGIC can occur
+# inside an opaque input payload). This crate is the new code beside it — the
+# framing layer the byte-stream transport needs — plus the #920 measurement
+# harness. It is Bevy-free like `orrery_ipc`; `scripts/core-gates.sh` names it
+# in `DECLARED_BEVY_FREE_CRATES` so that stays mechanical.
+[dependencies]
+orrery_ipc = { path = "../orrery_ipc" }
+orrery_protocol = { path = "../orrery_protocol" }
+serde = { workspace = true }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Both crates are already in Cargo.lock transitively; these entries make the
+# system-wide monotonic clock a direct, named dependency rather than a
+# transitive accident. QPC is the Windows clock `std::time::Instant` uses;
+# `Win32_Media` is `timeBeginPeriod`, which #920 lie 1 wants measured with and
+# without.
+windows-sys = { version = "0.61", features = [
+    "Win32_Media",
+    "Win32_System_Performance",
+] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "orrery-ipc-bench"
+path = "src/bin/orrery-ipc-bench.rs"
