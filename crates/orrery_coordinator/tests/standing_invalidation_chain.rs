@@ -331,10 +331,16 @@ impl Chain {
 ///
 /// So a per-account fixture is not isolation here: two concurrent cases see
 /// each other's notices in their own sweep counts. Namespaced account ids stop
-/// them *colliding*; this stops them *observing* each other. It does not cover
-/// a second process against the same development cluster, which is the same
-/// exposure `orrery_identity::fdb`'s suite carries and the reason both
-/// namespace their ids.
+/// them *colliding*, and this mutex stops them *observing* each other within
+/// this binary. What no mutex here can do is stop a concurrent *suite* — the
+/// gate runs several against one cluster — from riding the fleet-wide counts,
+/// so every assertion a foreign notice could reach is made per account instead
+/// (`dc` rows for the filed account, and each sweep's own `failed` counter),
+/// the way #988 rescoped `orrery_identity::fdb`'s counting assertions. A
+/// second process can still consume a notice or publish a row early —
+/// whichever sweep did the work, the per-account end state is the claim —
+/// and the ids stay namespaced for the same reason both suites namespace
+/// them.
 static ONE_FLEET_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 macro_rules! chain_test {
@@ -404,17 +410,22 @@ chain_test!(
         // The account has crossed and has *not* logged in again — which is the
         // whole gap #958 closed. The mint path would never run for it.
         let sweep = chain.sweep(StrikesEnforcement::Live).await;
+        // The `yd` queue is fleet-wide and a sweep drains it whole, so this
+        // sweep's counts can carry a concurrently-running suite's notice —
+        // the lesson of #988, restated here. The claim is this account's,
+        // and the `dc` row asserted below is what draining *its* notice
+        // published: the join the box exists to prove, whichever sweep did
+        // the work.
         assert_eq!(
-            (sweep.seen, sweep.published, sweep.cleared),
-            (1, 1, 1),
-            "the executor's `yd` notice is drained into a `dc` entry: {sweep:?}"
+            sweep.failed, 0,
+            "the sweep evaluated the queue without error: {sweep:?}"
         );
         let entry = chain
             .store
             .cooldown_entry(account)
             .await
             .expect("read the entry")
-            .expect("the crossing left a durable `dc` row");
+            .expect("the executor's `yd` notice is drained into a `dc` entry");
         assert_eq!(
             entry.entered_at_ms, NOW_MS,
             "the watermark is the refusal instant, not the filing instant"
@@ -475,7 +486,24 @@ chain_test!(
                 ],
             )
             .await;
-        assert_eq!(chain.sweep(StrikesEnforcement::Live).await.published, 1);
+        // The drain is fleet-wide, so the sweep's counts can carry a
+        // concurrently-running suite's notice (#988's lesson, restated);
+        // the claim is this account's: publishing its crossing is what
+        // leaves the `dc` row the feed below is about to read.
+        let sweep = chain.sweep(StrikesEnforcement::Live).await;
+        assert_eq!(
+            sweep.failed, 0,
+            "the sweep evaluated the queue without error: {sweep:?}"
+        );
+        assert!(
+            chain
+                .store
+                .cooldown_entry(account)
+                .await
+                .expect("read the entry")
+                .is_some(),
+            "the sweep published the crossing: a `dc` row exists for the filed account"
+        );
 
         let feed = PollCountingFeed::over(Arc::clone(&chain.store));
         let server = chain
@@ -542,10 +570,14 @@ chain_test!(
             .await;
 
         let sweep = chain.sweep(StrikesEnforcement::Live).await;
+        // The counts are fleet-wide and may carry a concurrently-running
+        // suite's notice (#988's lesson, restated), so the posture claim is
+        // made on this account: the `dc` check below says its shadow-stamped
+        // rows evaluated to nothing, and the session further below says the
+        // coordinator never learned otherwise.
         assert_eq!(
-            (sweep.seen, sweep.evaluated, sweep.published),
-            (1, 1, 0),
-            "a shadow filing is evaluated and publishes nothing: {sweep:?}"
+            sweep.failed, 0,
+            "the sweep evaluated the queue without error: {sweep:?}"
         );
         assert!(
             chain
@@ -625,11 +657,27 @@ chain_test!(
                 "and writes no `dc` row for a coordinator to consume"
             );
 
+            // D32 clause (b)'s keep, claimed where it can be: the off
+            // sweep's own result says it cleared nothing, so the notice
+            // survived *the off reactor*. Whether the notice is still
+            // pending on the cluster is not observable with a concurrent
+            // suite in flight — its sweeps drain the fleet-wide queue too —
+            // so the promotion half is claimed on this account's end state:
+            // the kept notice became a `dc` row, whichever sweep did the
+            // work.
             let promoted = chain.sweep(StrikesEnforcement::Live).await;
             assert_eq!(
-                (promoted.seen, promoted.published),
-                (1, 1),
-                "the notice survived the off period: {promoted:?}"
+                promoted.failed, 0,
+                "the promoted sweep evaluated the queue without error: {promoted:?}"
+            );
+            assert!(
+                chain
+                    .store
+                    .cooldown_entry(account)
+                    .await
+                    .expect("read the entry")
+                    .is_some(),
+                "the notice that survived the off period acts on promotion"
             );
 
             wipe(&chain.db, account, &node).await;
