@@ -2425,9 +2425,13 @@ pub const MIN_LEGIBLE_DIAMETER_PX: f32 = 4.0;
 /// * [`CAMERA_MIN_HEIGHT_M`] = 150 m shows +/- 62 m — a 22 m hull is about a
 ///   sixth of the screen height, close enough to read facing and the arc
 ///   marking, and the closest useful framing before the ship fills the view.
-/// * [`CAMERA_DEFAULT_HEIGHT_M`] = 900 m shows +/- 373 m, so the widest ring
-///   the table draws — Heavy's 360 m envelope — fits. This is the framing the
-///   weapon is fought at.
+/// * [`CAMERA_DEFAULT_HEIGHT_M`] = 725 m shows +/- 300 m. Owner decision,
+///   2026-09-03: start closer than the 900 m this was, for a hull that reads
+///   its facing and arc marking at a glance. 725 m is the floor, not a taste:
+///   `the_default_framing_holds_the_weapons_optimal_ring` requires the 300 m
+///   optimal ring to fit, and at a 45-degree FOV the visible half-height is
+///   `0.414 * height`, so 300 / 0.414 = 724.6 m. Closer than this and the ring
+///   the weapon is aimed with runs off the screen at the default.
 /// * [`CAMERA_MAX_HEIGHT_M`] = 4000 m shows +/- 1657 m, enough to hold the
 ///   ~2.5 km campaign crowd orbit in view. Past that a 22 m hull is under two
 ///   pixels on a 1080-line window and the view stops being usable.
@@ -2446,7 +2450,7 @@ pub const CAMERA_MIN_HEIGHT_M: f32 = 150.0;
 /// The furthest the chase camera is allowed to fly. See [`CameraZoom`].
 pub const CAMERA_MAX_HEIGHT_M: f32 = 4_000.0;
 /// Where the chase camera starts. See [`CameraZoom`].
-pub const CAMERA_DEFAULT_HEIGHT_M: f32 = 900.0;
+pub const CAMERA_DEFAULT_HEIGHT_M: f32 = 725.0;
 /// Multiplicative zoom per wheel notch. See [`CameraZoom`].
 pub const CAMERA_ZOOM_STEP: f32 = 1.15;
 /// Pixels of a pixel-unit scroll event that count as one notch.
