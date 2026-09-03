@@ -150,7 +150,7 @@ Numbered so they can be answered one at a time.
 | G5.5 | **Players get first refusal.** NPCs let a contract run for a while before taking it, so a player has the chance to take it first. | owner mandate |
 | G5.6 | **Player-taken is micro, NPC-taken is macro.** A contract taken by a player is fulfilled in the micro simulation. Macro fulfilment is an optimisation for when no player is involved, and is expected to carry **a good chunk of the boring supply economy**. | owner mandate |
 | G5.7 | **Contracts exchange money, work and goods in any combination.** There is a currency, but a contract need not use it. | owner mandate |
-| G5.8 | **Two reputation axes.** **Renown** (G4.3) is achievement and command eligibility; **standing** is the relationship with a faction (the mothership or an NPC faction). Clandestine work trades standing with one for standing with another. | derived from G4.3, G5.2 |
+| G5.8 | **Two reputation quantities.** **Standing** is per-faction (G6.1); **renown** is the aggregate of standing with the mothership's own organizations (G6.2). Clandestine work trades standing with one faction for standing with another. | owner mandate, detailed in G6 |
 
 ### Engineering consequences of G5
 
@@ -163,11 +163,33 @@ Numbered so they can be answered one at a time.
 - **Currency is a durable balance per player**, mothership-scoped (G4.10), with faucets and sinks owned by the macro service (contract pricing, upkeep G3.1/G4.14). Inflation control is a macro-service tuning problem and needs telemetry from the first playtest.
 - **NPC take-up is the demand floor.** Because NPCs eventually take any priced contract, no player-issued contract starves; the delay in G5.5 is the parameter that decides how much of the economy is player-run and is a season-tunable value (ADR-0016).
 
+## G6 — Progression: standing, renown, items, ships
+
+| # | Requirement | Source |
+|---|---|---|
+| G6 | **Progression is standing plus possessions.** There is no separate skill tree: what a player can do is what their standing unlocks and what their items grant. | derived from G6.1–G6.4 |
+| G6.1 | **Standing** is gained and lost against **NPC factions** and against **mothership NPC organizations**, which are segmented (**security, logistics, industry, research**, and the like). Each is its own ledger. | owner mandate |
+| G6.2 | **Renown** is the **cumulative standing across the mothership's NPC organizations**. It gates **mothership services**: teleports (G4.19), **clone grades** (G3.1), **apartment luxury** (G4.14), **rights to dock** (G4.15), ship command (G4.3), and so on. | owner mandate |
+| G6.3 | **Items grant abilities and buffs.** Players accumulate and spend resources, craft or purchase items, and those items are what give abilities and buffs. | owner mandate |
+| G6.4 | **Ships are items**, and an **extremely expensive** investment. | owner mandate |
+| G6.5 | **Most players do not own ships.** The economy must push the majority toward owning **light craft** at most and otherwise **joining expeditions** on ships owned by others or by the mothership (G4.2). | owner mandate |
+| G6.6 | **Organizations may pool resources to own a ship** and **assign a captain** from their ranks. | owner mandate |
+| G6.7 | **Standing and renown cross seasons** (G2.1d); they are progression, not world state. Items cross only if aboard the mothership. | derived from G2.1d |
+
+### Engineering consequences of G6
+
+- **Standing is a set of per-faction ledgers on the player**, each a durable signed integer (or bounded scalar) with an attested change log. Renown is a **derived** value, computed from the mothership organizations' ledgers, never stored independently, so it cannot drift from its inputs. The aggregation function (sum, weighted, floor of the minimum) is a ruleset parameter (ADR-0021) and changing it re-derives every player's renown at once.
+- **Renown gates are threshold checks at service boundaries** (teleport, clone, dock, command). Each check happens where the service is authoritative (mothership grid or macro service), reads attested standing, and is itself witnessable, so a client cannot claim a grade it lacks. The list of gated services will grow; keep it a table in the ruleset, not code.
+- **Items are the capability system.** "Ability" and "buff" are properties of an item in the ruleset, resolved on equip, so the avatar's effective capabilities are a pure function of attested inventory. This makes full loot (G3.2) also a loss of capability, and it means hit registration and movement (ADR-0008) take their parameters from equipment, which prediction must know before the tick.
+- **A ship is an item with a grid inside it.** Packing (G4.15) is the item form; undocking materialises the grid. Ownership of the item is what ownership of the ship means, so organization ownership (G6.6) is a **shared-owner item** with a **captain assignment** as a separate, revocable right. Ownership and command are different attributes, and both are attested.
+- **Organizations are a first-class entity before G7 says anything else.** They own property, hold a resource pool, and grant rights to members. That is a ledger with a membership list and a rights table, mothership-scoped (G4.10).
+- **Expeditions are the default multiplayer unit.** A ship with a captain and a crew of non-owners is the normal way most players reach the surface, so the ship grid's authority, its passenger list and the captain's control of undock, jump, pod launch and recall are the primary group-play mechanics. Passenger rights on a ship whose owner is not aboard need a rule.
+- **"Extremely expensive" is a tuning target with telemetry**, not a number: the macro service should report ship ownership rate per active player, and the season economy is tuned until the majority own at most light craft (G6.5).
+
 ## Open — to be settled by the owner
 
 Sections reserved; each becomes a `G<n>` block when decided.
 
-- G6 — Progression (skills, blueprints, ship/mech tiers)
 - G7 — Population and grouping (factions, crews, guilds)
 - G8 — PvE content model (NPC ships, fauna, missions)
 - G9 — Time (real-time, accelerated, day/night, orbital mechanics)
