@@ -316,13 +316,25 @@ impl FdbHonestCohortStore {
         db.run(move |trx, _| {
             let row = row.clone();
             async move {
-                if trx
+                // The refusal names the half the *stored* row is in, not the
+                // one being asked for. An operator resampling an armed
+                // account as natural is told which half it is already in —
+                // the only fact that tells them whether to remove-and-resample
+                // or to leave it alone. Reporting the requested half here
+                // would answer their question with their own question, in the
+                // one module whose entire purpose is keeping the two halves
+                // distinguishable.
+                if let Some(existing) = trx
                     .get(&crate::keyspace::cohort_key(account), false)
                     .await
                     .map_err(store_err("read cohort row"))?
-                    .is_some()
                 {
-                    return Ok(Err(SampleRefusal::AlreadySampled { account, half }));
+                    let existing: CohortMemberRow =
+                        postcard::from_bytes(&existing).map_err(store_err("decode cohort row"))?;
+                    return Ok(Err(SampleRefusal::AlreadySampled {
+                        account,
+                        half: existing.half,
+                    }));
                 }
                 if matches!(half, CohortHalf::Natural) {
                     let account_bytes = trx
@@ -716,10 +728,14 @@ mod tests {
             .await
             .expect("first decision records");
 
+        // Resampled into the *other* half, so the assertion below can tell
+        // "the row it found" from "the half you asked for". Resampling armed
+        // as armed cannot: both answers are `Armed`, and a refusal that
+        // echoed the request back would pass it.
         let refused = store
             .sample(
                 account(id),
-                CohortHalf::Armed,
+                CohortHalf::Natural,
                 "second decision",
                 2_000,
                 2_000,
@@ -731,9 +747,15 @@ mod tests {
                 assert_eq!(
                     half,
                     CohortHalf::Armed,
-                    "the refusal names the row it found"
+                    "the refusal names the half of the row it found, not the \
+                     half that was asked for"
                 );
             }
+            // The already-sampled check runs before the natural half's fact
+            // checks, so an account with no identity row still refuses as
+            // `AlreadySampled` rather than `AccountUnknown`. That ordering is
+            // the operator-legible one: "it is already in the armed half"
+            // answers their question; "no account row" does not.
             other => panic!("expected AlreadySampled, got {other:?}"),
         }
         let row = store.read(account(id)).await.expect("read").expect("row");
