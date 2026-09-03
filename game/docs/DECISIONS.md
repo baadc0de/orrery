@@ -9,6 +9,7 @@
 | Decision | Record | Scope |
 |---|---|---|
 | GD1 | [Game ADR-0001](adr/0001-requirements.md) | Settled game design requirements G1–G9 |
+| GD2 | [Game ADR-0002](adr/0002-client-engine.md) | Unreal 5.8 client, in-process Orrery, cooked season content (G10) |
 
 ## Documents
 

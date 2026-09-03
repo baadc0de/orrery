@@ -284,10 +284,33 @@ Numbered so they can be answered one at a time.
 - **Accumulating pressure is a macro parameter**, a faction-aggression term that rises with season time, so the last weeks of a season are harder by design. It can be the same field as depth (G8 consequences) with a time-dependent scale.
 - **Nothing in the micro layer depends on wall-clock time.** The 60 Hz tick (R10) is the only clock the verifiable core sees; season time enters micro only as an attested input (the tick at which the season clock read T), so replay (R8) never needs the real clock.
 
+## G10 — Client engine and content pipeline
+
+Decided with the owner on 2026-09-03; recorded as [game ADR-0002](adr/0002-client-engine.md).
+
+| # | Requirement | Source |
+|---|---|---|
+| G10 | **The client is Unreal Engine 5.8**, with heavy use of **PCG**, **Mesh Terrain**, **Nanite Foliage** (with the Procedural Vegetation Editor) and **Lumen**. | owner mandate |
+| G10.1 | **Experimental features are accepted.** Mesh Terrain, Nanite Foliage and the Procedural Vegetation Editor are Experimental in 5.8, the last UE5 release. They are presentation only; nothing canonical depends on them. | owner decision |
+| G10.2 | **Orrery runs in-process** as a Rust static library in an Unreal plugin over a C ABI, with Bevy headless inside the game process. Unreal actors are mirrors of engine-neutral canonical state (Orrery ADR-0042). | owner decision |
+| G10.3 | **Unreal networking and physics are not canonical.** Replication, CharacterMovementComponent and Chaos are presentation. Movement and hit registration are adjudicated by the Rust ruleset against its own deterministic collision data (Orrery ADR-0013). | derived from G10.2, Orrery ADR-0009/0013 |
+| G10.4 | **Season content is cooked, with dual output.** A commandlet turns the season seed into the Unreal package and a deterministic ruleset collision package, distributed together (Orrery ADR-0021). PCG runs at cook time only. | owner decision |
+| G10.5 | **Platforms: Windows first, Linux second, macOS dropped.** The server remains engine-free on Linux. Amends Orrery R9 by an Orrery ADR. | owner decision |
+| G10.6 | **No runtime terrain deformation.** Mesh Terrain does not support it and Orrery ADR-0051 already excludes terrain from durable state. Destruction is scoped to structures and vehicles. | derived from G10, Orrery ADR-0051 |
+
+### Engineering consequences of G10
+
+- **The C ABI surface is the product boundary.** `orrery_sim_host` already exports step, snapshot and restore across a C ABI; what is missing is the network client and prediction loop behind the same kind of surface (today they are Bevy plugins in the sidecar). The plugin needs: connect, submit input, step, read mirror frames, read events, plus lifecycle. Toolchain ABI compatibility per platform (MSVC on Windows, clang on Linux) is a build-system task, not a design one.
+- **Two geometry representations of one world.** The cook produces Unreal assets and ruleset collision from the same seed in the same run, and the season package carries a digest of both so a client with mismatched assets is refused. Collision resolution (what the ruleset walks and shoots against) is coarser than what Nanite draws, and the gap is a presentation-only tolerance that hit registration must never depend on.
+- **Interior spaces are ruleset geometry too.** Caves and buildings (G4.6), the mothership interior (G4), and ship interiors (G6) all need collision in the ruleset package, so the cook covers hand-authored levels as well as PCG output.
+- **The macro service and the witness engine need no Unreal.** They consume the ruleset collision package only, so the server build matrix stays Rust-only on Linux.
+- **Minimum client spec is a hardware-raytracing GPU** because Lumen is converging on the HWRT-only path at 60 Hz.
+- **Foliage and clutter are presentation** unless the ruleset says otherwise: Nanite Foliage instances have no canonical existence, so cover is a ruleset collision decision made at cook time, not a per-leaf fact.
+
 ## Open items
 
 Loose ends collected from the sections above.
 
 - **Fair-value formula, NPC take-up delay, renown weights and floors** (G5.3, G5.5, G6.2a): numbers, to be tuned with telemetry.
-- **Orrery follow-up ADRs** to be filed against this document, in particular the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
+- **Orrery follow-up ADRs** to be filed against this document, in particular an amendment of R9 and of ADR-0004's client scope for the Unreal host (G10), the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
 
