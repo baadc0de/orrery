@@ -20,11 +20,21 @@
 //! the write before the router decides anything, so a figure built there would
 //! report success for exactly the frames impairment dropped.
 //!
-//! **Downlink loss** — gaps in received replication ticks. Each broadcast
-//! carries the sender's absolute tick; bots broadcast on a fixed stride, so a
-//! sender whose tick advances by more than one stride has had broadcasts lost
-//! in between. Reordered arrivals (jitter delays whole packets) are not loss:
-//! they carry already-seen-or-past ticks and only refresh timing.
+//! **Downlink loss** — send slots that produced no delivery. Every
+//! broadcast lands on the send-slot grid (`SEND_EVERY_TICKS`), so a slot
+//! the client never received was dropped by the link, or has not arrived
+//! yet (the impaired profile reorders a tenth of all datagrams by 100 ms,
+//! two slots), or was never sent (interest gating scopes a peer out; an
+//! unchanged state skips a delta). The tracker separates the three: a gap
+//! stays open for the reorder window so a late arrival can retract its
+//! slot, and a settled gap counts as loss only when its width matches the
+//! cadence the sender had been exhibiting — dense replication every slot,
+//! or the one-hertz keyframe heartbeat. Gaps matching neither (interest
+//! churn, mid-stride silences, outages) are indistinguishable from loss
+//! in a tick stream: they are counted in
+//! [`DownlinkTracker::unattributed_slots`] and never scored. The exact
+//! count they hide is what a sequence number on the replication envelope
+//! would make countable; the wire does not carry one today.
 //!
 //! **Jitter** — the deviation of consecutive inter-arrival intervals of
 //! downlink datagram frames, sampled once per arrival, pooled across senders.
@@ -36,7 +46,7 @@
 //! be *compared against* the measurement, which is what
 //! `SessionRecord::impairment_mismatch` is for.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -242,31 +252,123 @@ pub enum JoinState {
 /// One downlink arrival's measurement yield.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arrival {
-    /// Broadcasts expected since the previous arrival that did not arrive.
+    /// Loss newly attributed by this arrival: the settled gaps it closed
+    /// out. A gap opens when an arrival's tick skips send slots and
+    /// settles once it is too old for a delayed packet to still fill it,
+    /// so a loss is reported an arrival or two after the hole — late,
+    /// because a packet that is merely reordered must not be scored.
     pub missing: u64,
     /// Deviation of this interval from the previous one, when there was a
     /// previous interval to deviate from.
     pub deviation_ms: Option<u64>,
 }
 
-/// Per-sender accounting for replication-tick gaps and arrival intervals.
+/// Send slots a delayed datagram may arrive late before waiting for it is
+/// pointless.
 ///
-/// Bots broadcast every stride ticks (20 Hz at 60 Hz sim). The stride is
-/// *learned* from the first two arrivals rather than assumed: the criterion's
-/// send cadence is harness configuration, and a measurement that assumed it
-/// would be configuration echo by another door.
+/// The impaired profile's jitter holds a packet for 100 ms
+/// (`Impairment::p4_profile` in `gates/p1-swarm`), six ticks — two send
+/// slots at the broadcast cadence — so roughly a tenth of all datagrams
+/// arrive two slots behind their place on the grid. A gap stays open this
+/// long past its end; a tick that lands inside it retracts one missing.
+/// Whatever is still missing when the window closes was dropped or never
+/// sent, not delayed.
+const REORDER_WINDOW_SLOTS: u64 = 2;
+
+/// How many recent advancing gaps (in send slots) define a sender's
+/// exhibited cadence. Dense replication advances one slot per datagram;
+/// an idle craft advances twenty (the one-hertz keyframe heartbeat). The
+/// mode of the last few widths is which of those the sender has been
+/// doing, and it is the only thing that lets a gap be read as loss
+/// rather than as a change in the sender's cadence.
+const CADENCE_HISTORY: usize = 8;
+
+/// Open gaps held per sender. At the broadcast cadence a gap closes two
+/// slots after it opens, so more than a couple can only pile up if a
+/// future impairment profile reorders far wider than
+/// [`REORDER_WINDOW_SLOTS`] assumes; the oldest is then force-settled
+/// under the usual rule rather than growing the queue without bound.
+const MAX_OPEN_GAPS: usize = 4;
+
+/// Per-sender accounting for replication send slots and arrival intervals.
+///
+/// Every broadcast lands on the send-slot grid (`SEND_EVERY_TICKS`), so the
+/// ticks a sender's datagrams carry measure its cadence in slots. A slot
+/// the client never received was dropped by the link, or has not arrived
+/// yet (reordering), or was never sent (interest gating scopes the peer
+/// out; an unchanged state skips a delta). The tracker separates the three:
+/// a gap stays open for [`REORDER_WINDOW_SLOTS`] so a late arrival can
+/// retract its slot, and a settled gap counts as loss only when its width
+/// matches the cadence the sender had been exhibiting. Gaps matching
+/// neither cadence — interest churn, mid-stride silences, outages — are
+/// indistinguishable from loss in a tick stream, so they are counted in
+/// [`DownlinkTracker::unattributed_slots`] and never scored.
 #[derive(Debug, Default)]
 pub struct DownlinkTracker {
     senders: BTreeMap<u32, SenderTrack>,
     total_missing: u64,
+    unattributed_slots: u64,
+    unattributed_gaps: u64,
 }
 
 #[derive(Debug, Default)]
 struct SenderTrack {
+    /// The newest tick seen from this sender: its replication frontier.
     last_tick: Option<u64>,
-    stride: Option<u64>,
     last_interval_ms: Option<f64>,
     last_arrival_ms: Option<f64>,
+    /// Gaps waiting out the reorder window before they settle.
+    open_gaps: Vec<OpenGap>,
+    /// Widths (in send slots) of the most recent advancing gaps.
+    cadence: VecDeque<u64>,
+}
+
+/// A stretch of send slots between two arrivals, not yet settled.
+#[derive(Debug)]
+struct OpenGap {
+    start_tick: u64,
+    end_tick: u64,
+    /// Stale ticks already credited to this gap, so a retransmitted
+    /// keyframe retracts its slot once, however often it repeats. The
+    /// slots it spans minus the one that closed it, less this set, is
+    /// what settlement still owes.
+    filled: BTreeSet<u64>,
+}
+
+/// The sender's exhibited cadence: the mode of its recent gap widths,
+/// ties resolved to the narrower width. An empty history reads as dense
+/// replication, the default for a craft in scope.
+fn cadence_mode(history: &VecDeque<u64>) -> u64 {
+    let mut best_width = 1u64;
+    let mut best_count = 0u64;
+    for &width in history {
+        let count = history.iter().filter(|&&w| w == width).count() as u64;
+        if count > best_count || (count == best_count && width < best_width) {
+            best_width = width;
+            best_count = count;
+        }
+    }
+    best_width
+}
+
+/// What one settled gap of `slots` send slots means, given the cadence the
+/// sender had been exhibiting and the fills it already absorbed.
+///
+/// A gap whose width matches the exhibited cadence reads as missing
+/// broadcasts: dense replication (`cadence` 1) sends every slot, so each
+/// unfilled slot is a drop; the keyframe heartbeat (`cadence` 20) sends
+/// once every twenty slots, so only a multiple beyond the first is a
+/// drop. A gap matching neither — interest churn, a mid-stride silence,
+/// an outage — is a change in the sender's cadence, which a tick stream
+/// cannot tell from loss: `None`, and the caller counts the slots as
+/// unattributable rather than scoring them.
+fn attribute_gap(slots: u64, fills: u64, cadence: u64) -> Option<u64> {
+    let window = 2u64.max(cadence / 2);
+    if slots.abs_diff(cadence) > window {
+        return None;
+    }
+    let due = (slots as f64 / cadence as f64).round() as u64;
+    Some(due.saturating_sub(1 + fills))
 }
 
 impl DownlinkTracker {
@@ -277,30 +379,72 @@ impl DownlinkTracker {
     /// Account for one replication packet from `sender` carrying tick `at`,
     /// arriving `now_ms` milliseconds after session start.
     ///
-    /// Reordered arrivals — an older tick than the newest seen — are counted
-    /// as arrivals (they are timing samples) but never as gaps: their ticks
-    /// were already accounted for when a later tick closed past them.
+    /// Reordered arrivals — an older tick than the newest seen — are
+    /// deliveries, never losses: one landing strictly inside an open gap
+    /// retracts one missing from it (the packet was delayed by the link,
+    /// not dropped by it), and a repeat of an already-credited tick
+    /// retracts nothing.
     pub fn record(&mut self, sender: u32, at: u64, now_ms: f64) -> Arrival {
         let track = self.senders.entry(sender).or_default();
         let mut missing = 0u64;
+        let mut unattributed_slots = 0u64;
+        let mut unattributed_gaps = 0u64;
         match track.last_tick {
             None => {
                 track.last_tick = Some(at);
             }
             Some(last) if at <= last => {
-                // Late or duplicate: no gap arithmetic on stale ticks.
+                // Late or duplicate: a delivery, never a loss.
+                for gap in &mut track.open_gaps {
+                    if gap.start_tick < at && at < gap.end_tick && gap.filled.insert(at) {
+                        break;
+                    }
+                }
             }
             Some(last) => {
-                let delta = at - last;
-                // First delta IS the stride candidate unless zero (two
-                // broadcasts sharing a tick cannot happen at a fixed cadence,
-                // but refuse to divide by zero).
-                let stride = *track.stride.get_or_insert_with(|| delta.max(1));
-                // Broadcasts due between the two arrivals, rounded to the
-                // nearest multiple of the learned stride; one of them is the
-                // packet that just arrived, the rest are missing.
-                let due = ((delta as f64 / stride as f64).round() as u64).max(1);
-                missing = due - 1;
+                // Settle every gap old enough that a delayed packet can no
+                // longer fill it: whatever is still missing after the fills
+                // is loss, but only if the gap's width matches the cadence
+                // the sender has been exhibiting.
+                let cadence = cadence_mode(&track.cadence);
+                track.open_gaps.retain(|gap| {
+                    if at < gap.end_tick + REORDER_WINDOW_SLOTS * SEND_EVERY_TICKS {
+                        return true;
+                    }
+                    let slots = (gap.end_tick - gap.start_tick) / SEND_EVERY_TICKS;
+                    match attribute_gap(slots, gap.filled.len() as u64, cadence) {
+                        Some(owed) => missing += owed,
+                        None => {
+                            unattributed_gaps += 1;
+                            unattributed_slots += slots - 1;
+                        }
+                    }
+                    false
+                });
+                let slots = (at - last) / SEND_EVERY_TICKS;
+                if slots > 1 {
+                    track.open_gaps.push(OpenGap {
+                        start_tick: last,
+                        end_tick: at,
+                        filled: BTreeSet::new(),
+                    });
+                    while track.open_gaps.len() > MAX_OPEN_GAPS {
+                        let oldest = track.open_gaps.first().expect("len checked above");
+                        let slots = (oldest.end_tick - oldest.start_tick) / SEND_EVERY_TICKS;
+                        match attribute_gap(slots, oldest.filled.len() as u64, cadence) {
+                            Some(owed) => missing += owed,
+                            None => {
+                                unattributed_gaps += 1;
+                                unattributed_slots += slots - 1;
+                            }
+                        }
+                        track.open_gaps.remove(0);
+                    }
+                }
+                track.cadence.push_back(slots);
+                while track.cadence.len() > CADENCE_HISTORY {
+                    track.cadence.pop_front();
+                }
                 track.last_tick = Some(at);
             }
         }
@@ -324,6 +468,8 @@ impl DownlinkTracker {
             }
         }
         self.total_missing += missing;
+        self.unattributed_slots += unattributed_slots;
+        self.unattributed_gaps += unattributed_gaps;
         Arrival {
             missing,
             deviation_ms: timing.and_then(|(_, deviation)| deviation),
@@ -334,6 +480,24 @@ impl DownlinkTracker {
     #[must_use]
     pub fn total_missing(&self) -> u64 {
         self.total_missing
+    }
+
+    /// Send slots whose silence could not be attributed to loss.
+    ///
+    /// Interest gating, state-unchanged slots and outages all look exactly
+    /// like loss in a tick stream; the cadence check keeps them out of the
+    /// loss figure at the cost of this honest hole in the measurement. The
+    /// exact count they hide is what a sequence number on the replication
+    /// envelope would make countable.
+    #[must_use]
+    pub fn unattributed_slots(&self) -> u64 {
+        self.unattributed_slots
+    }
+
+    /// Gaps whose silence could not be attributed to loss.
+    #[must_use]
+    pub fn unattributed_gaps(&self) -> u64 {
+        self.unattributed_gaps
     }
 
     /// Distinct senders seen.
@@ -1021,7 +1185,11 @@ impl CampaignRuntime {
         (self.uplink_acks, self.uplink_dropped)
     }
 
-    /// `(downlink arrivals, broadcasts those arrivals found missing)`.
+    /// `(downlink arrivals, send slots those arrivals found missing)`.
+    ///
+    /// The missing count is settled loss only — gaps that outlived the
+    /// reorder window and matched the sender's cadence — so an arrival
+    /// from moments ago may still be waiting out its window.
     #[must_use]
     pub fn downlink_accounting(&self) -> (u64, u64) {
         (self.downlink_arrivals, self.downlink.total_missing())
@@ -2669,13 +2837,14 @@ mod tests {
         );
     }
 
-    /// Stride is learned from the first delta; afterwards every stride-
-    /// sized advance is clean and every double-stride gap is one loss.
+    /// Dense replication is exact: every unfilled send slot inside the
+    /// reorder window is a drop, counted once the window has passed — not
+    /// on the arrival that opened the gap, because a packet the link only
+    /// delayed could still land and retract it.
     #[test]
-    fn gaps_are_counted_against_the_learned_stride() {
+    fn dense_streaming_counts_real_loss_exactly() {
         let mut tracker = DownlinkTracker::default();
         let t = |n| f64::from(n) * 1_000.0;
-        // First arrival: baseline, no deviation (nothing to deviate from).
         assert_eq!(
             tracker.record(7, 100, t(0)),
             Arrival {
@@ -2683,7 +2852,6 @@ mod tests {
                 deviation_ms: None
             }
         );
-        // Second: sets stride 3, interval established.
         assert_eq!(
             tracker.record(7, 103, t(50)),
             Arrival {
@@ -2691,34 +2859,207 @@ mod tests {
                 deviation_ms: None
             }
         );
-        // Clean strides: nothing missing, steady intervals → zero deviation.
         assert_eq!(tracker.record(7, 106, t(100)).missing, 0);
         assert_eq!(tracker.record(7, 109, t(150)).deviation_ms, Some(0));
-        // A skipped broadcast: tick jumps two strides.
-        let arrival = tracker.record(7, 115, t(200));
-        assert_eq!(arrival.missing, 1, "ticks 112 was lost");
-        assert_eq!(arrival.deviation_ms, Some(0), "interval held at 50 ms");
-        // A long hole: four strides of jump = three losses.
-        assert_eq!(tracker.record(7, 127, t(300)).missing, 3);
-        assert_eq!(tracker.total_missing(), 4);
+        // Tick 112 is dropped: the gap opens here, reporting nothing yet.
+        assert_eq!(tracker.record(7, 115, t(200)).missing, 0);
+        assert_eq!(tracker.record(7, 118, t(250)).missing, 0);
+        // …and settles as one loss only once the reorder window has passed.
+        assert_eq!(tracker.record(7, 121, t(300)).missing, 1);
+        // Two consecutive drops (127, 130) settle as two.
+        assert_eq!(tracker.record(7, 124, t(350)).missing, 0);
+        assert_eq!(tracker.record(7, 133, t(400)).missing, 0);
+        assert_eq!(tracker.record(7, 139, t(450)).missing, 2);
+        assert_eq!(tracker.total_missing(), 3);
+        assert_eq!(tracker.unattributed_slots(), 0);
         assert_eq!(tracker.senders(), 1);
     }
 
-    /// Reordered arrivals are timing samples, never losses: an older tick
-    /// than the newest seen carries no gap arithmetic either way.
+    /// A gap wider than the reorder window matches no cadence the sender
+    /// exhibited, so it is counted as unattributable rather than scored as
+    /// loss. This is the stated limit of what a tick stream can decide —
+    /// three consecutive drops and three send slots of silence look
+    /// identical from the client — and the reason an exact count wants a
+    /// sequence number on the replication envelope.
     #[test]
-    fn reordered_arrivals_are_not_loss() {
+    fn a_gap_wider_than_the_reorder_window_is_silence_not_loss() {
+        let mut tracker = DownlinkTracker::default();
+        let _ = tracker.record(1, 100, 0.0);
+        let _ = tracker.record(1, 103, 50.0);
+        let _ = tracker.record(1, 106, 100.0);
+        // Ticks 109, 112 and 115 never arrive.
+        let _ = tracker.record(1, 118, 200.0);
+        let _ = tracker.record(1, 121, 250.0);
+        let _ = tracker.record(1, 124, 300.0);
+        assert_eq!(tracker.total_missing(), 0);
+        assert_eq!(tracker.unattributed_gaps(), 1);
+        assert_eq!(tracker.unattributed_slots(), 3);
+    }
+
+    /// The impaired profile delays a tenth of all datagrams by two send
+    /// slots, so the overtaken packet arrives after the one behind it. The
+    /// gap the overtake seemed to open must be retracted when the delayed
+    /// packet lands: the estimator this replaced scored every such gap as
+    /// loss, which is how a link measurably running at 3% read as 13-30%.
+    #[test]
+    fn a_reordered_packet_retracts_the_gap_it_fills() {
         let mut tracker = DownlinkTracker::default();
         let _ = tracker.record(2, 30, 0.0);
         let _ = tracker.record(2, 33, 50.0);
         let _ = tracker.record(2, 36, 100.0);
-        // A delayed packet from two broadcasts ago lands now.
-        let arrival = tracker.record(2, 33, 160.0);
-        assert_eq!(arrival.missing, 0);
-        assert_eq!(tracker.total_missing(), 0, "no phantom loss from reorder");
-        // The next fresh tick resumes counting from the newest seen (36):
-        // broadcasts land every three ticks, so 42 arriving means 39 was lost.
-        assert_eq!(tracker.record(2, 42, 210.0).missing, 1);
+        // Tick 39 is two slots late; tick 42 overtakes it.
+        let _ = tracker.record(2, 42, 150.0);
+        let _ = tracker.record(2, 39, 200.0);
+        let _ = tracker.record(2, 45, 250.0);
+        assert_eq!(
+            tracker.record(2, 48, 300.0).missing,
+            0,
+            "the late packet was delivered, not lost"
+        );
+        assert_eq!(tracker.total_missing(), 0);
+    }
+
+    /// Heartbeat and churn silences are cadence, not loss. A craft that
+    /// goes idle still sends its one-hertz keyframe (twenty slots apart);
+    /// interest gating takes a peer out of scope entirely. Both read as
+    /// wide gaps in the tick stream, and the estimator this replaced
+    /// scored every silent slot as a lost broadcast — the part of #972
+    /// that grew with session length.
+    #[test]
+    fn heartbeat_and_churn_silences_are_not_scored_as_loss() {
+        let mut tracker = DownlinkTracker::default();
+        // Dense replication: a datagram every send slot.
+        for tick in (300..=321u32).step_by(3) {
+            let _ = tracker.record(3, u64::from(tick), f64::from(tick));
+        }
+        // Idle: the one-hertz keyframe heartbeat, twenty slots apart. The
+        // first of these is a cadence change and lands in the
+        // unattributable bucket; once heartbeats dominate the history, a
+        // heartbeat gap settles as zero missing through the ordinary rule.
+        for beat in 1..=7u64 {
+            let tick = 321 + beat * 60;
+            let _ = tracker.record(3, tick, f64::from(u32::try_from(tick).expect("small")));
+        }
+        let unattributed_heartbeats = tracker.unattributed_gaps();
+        let _ = tracker.record(3, 801, 801.0);
+        let _ = tracker.record(3, 861, 861.0);
+        assert_eq!(
+            tracker.unattributed_gaps(),
+            unattributed_heartbeats,
+            "a steady heartbeat gap is cadence, not silence"
+        );
+        assert_eq!(tracker.total_missing(), 0);
+        // Interest churn: the peer leaves scope for three seconds and
+        // comes back. Nothing about that is loss.
+        let _ = tracker.record(3, 1041, 1041.0);
+        let _ = tracker.record(3, 1044, 1044.0);
+        let _ = tracker.record(3, 1047, 1047.0);
+        assert_eq!(tracker.total_missing(), 0);
+        assert!(
+            tracker.unattributed_slots() > 0,
+            "the churn is counted honestly as unattributable, not hidden"
+        );
+    }
+
+    /// The stride is the send-slot grid, not a learned value: a first
+    /// interval that happens to span a loss must not poison every later
+    /// gap. The estimator this replaced locked its stride onto the first
+    /// delta, so a loss-straddling first interval turned every later
+    /// real loss into zero.
+    #[test]
+    fn a_loss_straddling_first_interval_does_not_poison_the_grid() {
+        let mut tracker = DownlinkTracker::default();
+        let _ = tracker.record(4, 100, 0.0);
+        // First interval spans a loss (tick 103 never arrives)...
+        let _ = tracker.record(4, 106, 50.0);
+        let _ = tracker.record(4, 109, 100.0);
+        let _ = tracker.record(4, 112, 150.0);
+        let _ = tracker.record(4, 115, 200.0);
+        // ...but once dense replication re-establishes the cadence, both
+        // the straddled loss and a later one (tick 118) are counted.
+        let _ = tracker.record(4, 121, 250.0);
+        assert_eq!(tracker.record(4, 124, 300.0).missing, 0);
+        assert_eq!(tracker.record(4, 127, 350.0).missing, 1);
+        assert_eq!(tracker.total_missing(), 2);
+    }
+
+    /// Stale and duplicate ticks are deliveries. A retransmitted keyframe
+    /// (an old tick, re-sent when a peer re-enters scope) retracts the
+    /// slot it carries — once, however often it repeats — and a duplicate
+    /// of the newest tick retracts nothing.
+    #[test]
+    fn stale_and_duplicate_arrivals_are_deliveries_not_loss() {
+        let mut tracker = DownlinkTracker::default();
+        let _ = tracker.record(5, 100, 0.0);
+        let _ = tracker.record(5, 103, 50.0);
+        let _ = tracker.record(5, 106, 100.0);
+        // Tick 109 is dropped; a retransmission of it arrives late.
+        let _ = tracker.record(5, 112, 150.0);
+        let _ = tracker.record(5, 109, 175.0);
+        let _ = tracker.record(5, 109, 180.0);
+        let _ = tracker.record(5, 112, 200.0);
+        assert_eq!(
+            tracker.record(5, 118, 250.0).missing,
+            0,
+            "the retransmission retracted the slot, exactly once"
+        );
+        // Tick 115 is genuinely dropped.
+        assert_eq!(tracker.record(5, 124, 300.0).missing, 1);
+        assert_eq!(tracker.total_missing(), 1);
+    }
+
+    /// The whole estimator, replayed against a captured run with the
+    /// host's own per-directed-link counters as ground truth (#965's
+    /// `per_link_impairment`).
+    ///
+    /// The fixture is the client-side arrival stream (sender, tick,
+    /// arrival time) of a real 30 s witnessed impaired attempt driven for
+    /// #972: the shipped client dialling a `p1-swarm --external-peer`
+    /// host over QUIC under the 3% / 100 ms profile. The host counted
+    /// 5642 datagrams on the links toward the client's slot and dropped
+    /// 169 of them — 2.995%. The estimator this replaced reported 20.5%
+    /// from this same stream. No clamping pins the answer: the replayed
+    /// missing count is asserted exactly, and its rate must sit beside
+    /// the host's, not merely inside the criterion's 2-point tolerance.
+    #[test]
+    fn captured_impaired_run_replays_beside_the_host_per_link_truth() {
+        const CAPTURE: &str = include_str!("../tests/fixtures/downlink-capture-972.csv");
+        // From the attempt report the host wrote for this run.
+        const HOST_DELIVERED: u64 = 5473;
+        const HOST_DROPPED: u64 = 169;
+
+        let mut tracker = DownlinkTracker::default();
+        let mut arrivals = 0u64;
+        for row in CAPTURE.lines().filter(|line| !line.is_empty()) {
+            let mut fields = row.split(',');
+            let sender: u32 = fields.next().expect("sender").parse().expect("sender");
+            let tick: u64 = fields.next().expect("tick").parse().expect("tick");
+            let now_ms: f64 = fields.next().expect("now_ms").parse().expect("now_ms");
+            let _ = tracker.record(sender, tick, now_ms);
+            arrivals += 1;
+        }
+        // Pinned exactly: any change to the estimator's arithmetic moves
+        // this number and must be re-validated against ground truth. The
+        // session's final gap per sender is deliberately absent: once the
+        // stream ends, nothing can distinguish its drops from its late
+        // packets, so a settled count is the only count.
+        assert_eq!(tracker.total_missing(), 145);
+        assert_eq!(arrivals, 3758);
+        let rate =
+            tracker.total_missing() as f64 * 100.0 / (tracker.total_missing() + arrivals) as f64;
+        let host_rate = HOST_DROPPED as f64 * 100.0 / (HOST_DELIVERED + HOST_DROPPED) as f64;
+        assert!(
+            (rate - host_rate).abs() <= 1.0,
+            "client measured {rate:.2}% but the host counted {host_rate:.2}% on the same links"
+        );
+        // The honest hole stays visible and bounded: unattributable
+        // silence exists in every real session, but must never swallow
+        // the measurement.
+        assert!(tracker.unattributed_slots() > 0);
+        assert!(
+            tracker.unattributed_slots() < arrivals,
+            "unattributable silence exceeded the observed stream"
+        );
     }
 
     /// Jitter deviations come from consecutive inter-arrival intervals,
