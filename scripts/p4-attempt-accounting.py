@@ -90,6 +90,73 @@ PIPELINE_TREES = (
 LINK_SAMPLE_FLOOR = 1000
 LINK_BAND_SIGMAS = 3.0
 
+# ── The impairment tolerance band (#973) ─────────────────────────────────────
+#
+# `impairment_mismatch` is computed by the client, in
+# `clients/regolith/src/session.rs::CampaignSession::finish`, against a band
+# (#718). This file *recomputes* the flag to check the row is internally
+# coherent, and until #973 it recomputed with three bare `!=` against the
+# configured floats. A measurement never lands exactly on its configuration, so
+# the recomputation disagreed with every honest row the client ever signed, and
+# `p4-ledger.sh`'s "impairment verified applied" criterion could only pass on a
+# fixture that had written both sides equal.
+#
+# A recomputer is not an independent judge: it is a coherence check on the
+# producer's arithmetic. It must therefore use the producer's band, not one of
+# its own — a narrower band here would refuse rows the client correctly called
+# clean, which is the same defect pointed the other way. `--self-test` holds
+# these against `session.rs` and against `p4-ledger.sh`'s jq, so the three
+# cannot drift apart.
+#
+# Why the loss band is 2.0 *percentage points*, absolute:
+#
+#   * Its floor is set by how far an honest measurement can sit from the
+#     configuration. Two independent errors stack. The host's own acceptance
+#     band for a leg is three binomial sigmas at the sample floor above —
+#     +/-1.62 pp at p = 0.03, n = 1000 — so a link this file has already
+#     *accepted* may genuinely have run 1.62 pp off the configured rate. On top
+#     of that the client's estimator carries a residual: post-#976 the shipped
+#     client reads 3.12-3.27% against host counters of 2.98-3.11% on the same
+#     links, i.e. it over-reports by 0.14-0.27 pp. 1.62 + 0.27 = 1.89 pp is the
+#     narrowest honest band; anything tighter flags links the host accepted.
+#   * Its ceiling is set by the property the flag exists to provide. A session
+#     that did not receive its impairment reads ~0% against a configured 3.0%,
+#     a gap of the full 3.0 pp. The band must stay below that, and 2.0 leaves a
+#     whole percentage point of margin.
+#
+# So the band is bracketed by [1.89, 3.00) and 2.0 is the round number inside
+# it. It is also, not by coincidence, the width of the criterion's own 3-5%
+# loss band, which is the reasoning `session.rs` records.
+#
+# Why jitter is an absolute millisecond band and loss is not a *relative* one:
+# the unimpaired profile configures 0% loss and 0 ms jitter, and a relative
+# band collapses to zero width there — it would flag every clean session ever
+# recorded. Both bands are therefore absolute.
+#
+# Why 40 ms: the profile injects 100 ms into a tenth of the datagrams, and the
+# percentiles are taken over inter-arrival *deviations* on a 20 Hz send grid,
+# so a percentile can legitimately land a fraction of a send slot (50 ms) away
+# from the configured figure. 40 ms is under one slot and well under the 100 ms
+# the profile injects, so an unapplied delay (100 ms of gap) is still flagged.
+IMPAIRMENT_LOSS_TOLERANCE_PCT = 2.0
+IMPAIRMENT_JITTER_TOLERANCE_MS = 40.0
+
+# The client suppresses the flag entirely below `MIN_IMPAIRMENT_SAMPLES` = 200
+# observed packets, because below that a single drop moves the rate by whole
+# percentage points. That denominator is *not* carried in the signed row, so it
+# cannot be recomputed here. What the row does carry is how long the seat
+# played, and 200 samples is one second of play at the 20 Hz send cadence the
+# constant is named for; 200 / 20 / 60 minutes is the duration below which the
+# client's suppression is a possible explanation for a clear flag. Above it,
+# a clear flag over numbers outside the band is a row disagreeing with itself.
+#
+# The residual this leaves: a seat that played for minutes over a link that
+# carried almost nothing has few samples and a long span, and its suppressed
+# flag is refused here. That is the safe side — a session that banked minutes
+# while measuring nothing is not evidence of impairment either way.
+IMPAIRMENT_SUPPRESSION_SAMPLES = 200.0
+IMPAIRMENT_SUPPRESSION_MINUTES = IMPAIRMENT_SUPPRESSION_SAMPLES / 20 / 60
+
 # A close reason that leaves the leg's evidence intact. `queue_overflow` does
 # not: the host counted downlink frames it could not deliver, so that human's
 # observed link is the pump's backlog and not the declared profile.
@@ -413,20 +480,79 @@ def verify_signature(row: dict[str, Any], node: str) -> None:
         )
 
 
-def check_mismatch_flag(row: dict[str, Any]) -> None:
-    """Retained from `p4-ledger.sh` and `p4-campaign-session.sh`, unchanged.
+def impairment_number(row: dict[str, Any], key: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        refuse(f"a client row's {key} is not a number; its impairment cannot be recomputed")
+    return float(value)
 
-    The flag is recomputable from the row's own numbers; a row whose flag
-    contradicts them is not evidence, in either direction.
+
+def outside_impairment_band(row: dict[str, Any]) -> bool:
+    """Does the row's observed impairment disagree with its configured profile?
+
+    The band, and the reasoning behind its width, is at
+    `IMPAIRMENT_LOSS_TOLERANCE_PCT`. The comparison is `>`, not `>=`, exactly as
+    `clients/regolith/src/session.rs` writes it: a gap of exactly the tolerance
+    is inside the band.
     """
-    configured = row.get("configured_impairment_profile", {})
-    expected = (
-        row.get("observed_loss_pct") != configured.get("loss_pct")
-        or row.get("observed_jitter_p50_ms") != configured.get("jitter_p50_ms")
-        or row.get("observed_jitter_p99_ms") != configured.get("jitter_p99_ms")
+    configured = row.get("configured_impairment_profile")
+    if not isinstance(configured, dict):
+        refuse("a client row carries no configured_impairment_profile to recompute against")
+    gaps = (
+        (
+            abs(
+                impairment_number(row, "observed_loss_pct", row.get("observed_loss_pct"))
+                - impairment_number(row, "loss_pct", configured.get("loss_pct"))
+            ),
+            IMPAIRMENT_LOSS_TOLERANCE_PCT,
+        ),
+        (
+            abs(
+                impairment_number(
+                    row, "observed_jitter_p50_ms", row.get("observed_jitter_p50_ms")
+                )
+                - impairment_number(row, "jitter_p50_ms", configured.get("jitter_p50_ms"))
+            ),
+            IMPAIRMENT_JITTER_TOLERANCE_MS,
+        ),
+        (
+            abs(
+                impairment_number(
+                    row, "observed_jitter_p99_ms", row.get("observed_jitter_p99_ms")
+                )
+                - impairment_number(row, "jitter_p99_ms", configured.get("jitter_p99_ms"))
+            ),
+            IMPAIRMENT_JITTER_TOLERANCE_MS,
+        ),
     )
-    if row.get("impairment_mismatch") != expected:
-        refuse("a client row's impairment_mismatch contradicts its own observed/configured numbers")
+    return any(gap > tolerance for gap, tolerance in gaps)
+
+
+def check_mismatch_flag(row: dict[str, Any]) -> None:
+    """Retained from `p4-ledger.sh` and `p4-campaign-session.sh`.
+
+    The flag is recomputable from the row's own numbers *within the band the
+    client computed it with* (#973); a row whose flag contradicts them is not
+    evidence, in either direction.
+    """
+    flag = row.get("impairment_mismatch")
+    if not isinstance(flag, bool):
+        refuse("a client row's impairment_mismatch is not a boolean")
+    outside = outside_impairment_band(row)
+    if flag and not outside:
+        refuse(
+            "a client row's impairment_mismatch fired while its observed impairment sits "
+            "inside the tolerance band its own configured profile allows"
+        )
+    if not flag and outside:
+        played = row.get("distinct_play_minutes")
+        if isinstance(played, bool) or not isinstance(played, (int, float)):
+            refuse("a client row does not say how long it played; its clear flag cannot stand")
+        if float(played) >= IMPAIRMENT_SUPPRESSION_MINUTES:
+            refuse(
+                "a client row's impairment_mismatch is clear while its observed impairment "
+                "sits outside the tolerance band, over a span long enough to have sampled "
+                "the packets the flag needs"
+            )
 
 
 # ── The derivation ───────────────────────────────────────────────────────────
@@ -751,7 +877,17 @@ def fixture_row(
     banked_minutes: float,
     platform: str,
     secret_byte: int,
+    observed: tuple[float, float, float] = (3, 100, 100),
+    mismatch: bool = False,
 ) -> dict[str, Any]:
+    """A signed client row.
+
+    `observed` defaults to the configured profile exactly, which no measurement
+    ever does; #973's regressions pass realistic figures instead. `mismatch` is
+    the flag as the client would have written it, so a row can be signed with a
+    flag that disagrees with its own numbers rather than edited into one (an
+    edit fails the signature stage first, and never reaches the recomputation).
+    """
     return sign_row(
         {
             "session_id": session_id,
@@ -770,12 +906,12 @@ def fixture_row(
                 "jitter_p50_ms": 100,
                 "jitter_p99_ms": 100,
             },
-            "observed_loss_pct": 3,
-            "observed_jitter_p50_ms": 100,
-            "observed_jitter_p99_ms": 100,
+            "observed_loss_pct": observed[0],
+            "observed_jitter_p50_ms": observed[1],
+            "observed_jitter_p99_ms": observed[2],
             "afk_seconds": 0,
             "afk_capped": False,
-            "impairment_mismatch": False,
+            "impairment_mismatch": mismatch,
         },
         secret_byte,
     )
@@ -935,6 +1071,30 @@ def self_test() -> None:
             "self-test: the pipeline tree list drifted from p4-ledger.sh; the stamped digest "
             "would fail its cross-check"
         )
+
+    # #973: this file recomputes `impairment_mismatch` against a band, and a
+    # recomputer using a different band from the producer refuses honest rows
+    # just as surely as exact equality did. Hold all three copies together.
+    session_rs = (ROOT / "clients" / "regolith" / "src" / "session.rs").read_text()
+    for declaration, ours in (
+        ("LOSS_TOLERANCE_PCT: f64", IMPAIRMENT_LOSS_TOLERANCE_PCT),
+        ("JITTER_TOLERANCE_MS: u64", IMPAIRMENT_JITTER_TOLERANCE_MS),
+        ("MIN_IMPAIRMENT_SAMPLES: u64", IMPAIRMENT_SUPPRESSION_SAMPLES),
+    ):
+        found = re.search(rf"^const {re.escape(declaration)} = ([0-9.]+);", session_rs, re.M)
+        if found is None:
+            die(f"self-test: cannot read {declaration} out of clients/regolith/src/session.rs")
+        if float(found.group(1)) != ours:
+            die(
+                f"self-test: {declaration} is {found.group(1)} in session.rs but {ours} here; "
+                "the recomputation would refuse rows the client called clean"
+            )
+    for fragment in ("| fabs) > 2.0", "| fabs) > 40", "(200 / 20 / 60)"):
+        if fragment not in ledger:
+            die(
+                f"self-test: p4-ledger.sh's append-time recomputation no longer carries "
+                f"{fragment!r}; its band drifted from this one"
+            )
 
     os.environ["P4_PIPELINE_ID"] = "selftestpipeline"
     with tempfile.TemporaryDirectory() as raw:
@@ -1248,6 +1408,69 @@ def self_test() -> None:
         flag_only["impairment_mismatch"] = True
         test.must_refuse(cohort, [flag_only, row_b], "tampered-flag", "signature did not verify")
         test.ok("flipping_the_mismatch_flag_is_refused")
+
+        # ── #973: the flag is recomputed within a band ──────────────────────
+        #
+        # A real link configured at 3.0% loss and 100 ms jitter does not measure
+        # 3.0 and 100. Until #973 this row refused, and P4's "impairment
+        # verified applied" criterion could pass only on a fixture that had
+        # written observed == configured by construction.
+        honest = fixture_row(
+            SESSION_A, 50, "x86_64-unknown-linux-gnu", 0x11, observed=(2.94, 103, 96)
+        )
+        test.must_derive(cohort, [honest, row_b], "honest-measurement")
+        test.ok("an_honest_measurement_off_its_configuration_derives")
+
+        # And the property the flag exists to provide survives: a seat that
+        # plainly never received its impairment is still refused.
+        unapplied = fixture_row(
+            SESSION_A, 50, "x86_64-unknown-linux-gnu", 0x11, observed=(0, 0, 0)
+        )
+        test.must_refuse(
+            cohort,
+            [unapplied, row_b],
+            "impairment-not-applied",
+            "is clear while its observed impairment sits outside the tolerance band",
+        )
+        test.ok("a_session_that_never_received_its_impairment_is_refused")
+
+        # Half-applied, too: the loss arrived and the delay did not.
+        no_jitter = fixture_row(
+            SESSION_A, 50, "x86_64-unknown-linux-gnu", 0x11, observed=(2.94, 3, 4)
+        )
+        test.must_refuse(
+            cohort,
+            [no_jitter, row_b],
+            "jitter-not-applied",
+            "is clear while its observed impairment sits outside the tolerance band",
+        )
+        test.ok("a_session_whose_delay_was_never_applied_is_refused")
+
+        # The other direction, signed rather than edited so it reaches the
+        # recomputation: a flag fired over numbers that agree.
+        faked = fixture_row(
+            SESSION_A, 50, "x86_64-unknown-linux-gnu", 0x11, observed=(2.94, 103, 96), mismatch=True
+        )
+        test.must_refuse(
+            cohort,
+            [faked, row_b],
+            "faked-mismatch",
+            "fired while its observed impairment sits inside the tolerance band",
+        )
+        test.ok("a_flag_fired_inside_the_band_is_refused")
+
+        # The band's own edge, on the side that must still be refused: 3.0
+        # configured read as 0.9 is a 2.1 point gap, wider than the band.
+        edge = fixture_row(
+            SESSION_A, 50, "x86_64-unknown-linux-gnu", 0x11, observed=(0.9, 100, 100)
+        )
+        test.must_refuse(
+            cohort,
+            [edge, row_b],
+            "band-edge",
+            "is clear while its observed impairment sits outside the tolerance band",
+        )
+        test.ok("a_gap_wider_than_the_band_is_refused")
 
         # ── attempt-wide clauses ────────────────────────────────────────────
         for mutation, fragment, name in (
