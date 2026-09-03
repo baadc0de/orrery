@@ -1,0 +1,25 @@
+# #862 / D33 clause (e): the standing chain, joined end to end.
+#
+# `crates/orrery_coordinator/tests/standing_invalidation_chain.rs` adds four
+# tests that mean nothing without a cluster, because what they assert is that
+# three separately-deployed writers and readers agree on durable bytes:
+#
+#   - a verdict filed through the executor's `FdbStrikeLedger` becomes a `yd`
+#     notice, which identity's `StandingFilingReactor` turns into a `dc` entry,
+#     which the coordinator's shipped `IdentityStandingFeed` consumes — ending
+#     an already-open session and refusing the same token at the next `Hello`;
+#   - the same chain refusing a `Hello` outright when the crossing precedes the
+#     session;
+#   - a shadow-stamped verdict travelling the whole wired path and changing no
+#     standing, which is acceptance box 4 one link past where #956 took it;
+#   - an `Off` reactor reading nothing and *keeping* the notice, so a later
+#     promotion of C5 still acts on everything filed while it was off.
+#
+# This is also the run that first selects `orrery_coordinator` at all, so its
+# other suites (`coordinator_server`, `standing_mint_refusal`, the library's
+# own unit tests) now execute here too. They are deliberately **not** claimed:
+# they pass without a cluster and the floor is a lower bound, so counting them
+# would inflate the tripwire with tests this tier does not speak for.
+#
+# The floor rises by the four: 524 -> 528.
+4

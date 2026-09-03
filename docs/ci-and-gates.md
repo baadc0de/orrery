@@ -277,12 +277,14 @@ cluster, and P3's island gate, which needs eight peer processes and a real
 times in one process to catch per-process nondeterminism.
 
 **The `fdb` feature has its own nightly test job, and a wrapper script is the
-reason it means anything.** `orrery_persistd` and `orrery_seed` carry a tier of
-tests that only compile under `--features fdb`, and every one of them opens
+reason it means anything.** `orrery_persistd`, `orrery_seed`, `orrery_identity`
+and `orrery_coordinator` carry a tier of
+tests that only compile under a cluster-backed feature, and every one of them
+opens
 with a guard that `eprintln!("skipping: …")` and returns `Ok` when it cannot
 find a cluster. That guard is right for a developer's `cargo test` and a trap
 for CI: `cargo test --features fdb` on a runner with no cluster is 27 passes
-that assert nothing. So `scripts/fdb-tests.sh` runs them — both packages in one
+that assert nothing. So `scripts/fdb-tests.sh` runs them — every package in one
 invocation, per C-8 — captures stderr with `--nocapture`, fails on any
 `skipping:` line, and asserts a floor on how many tests actually executed. Its
 `--self-test` proves those assertions against six synthetic logs and runs

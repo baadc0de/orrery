@@ -7977,6 +7977,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "foundationdb",
  "glam 0.32.1",
  "hkdf",
  "iroh",
