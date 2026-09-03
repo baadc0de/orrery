@@ -384,6 +384,22 @@ def render(artifact: dict) -> list[str]:
                 "account id(s) did not fit the row; the active and would-act member "
                 "counts below are understated by at most that much"
             )
+        # The ruleset stamp, D32 open question 6's resolution: a window that
+        # spanned a change names every ruleset it observed, on one line, so a
+        # reviewer sees the span and judges it instead of the fleet resetting
+        # for them. Rendered only when present and nonempty — a pre-stamp
+        # artifact and a protocol-level control's window (C1 and C2; clause
+        # (f) scopes the dimension to verdict-driven C3/C4/C5) are both
+        # honestly silent here, and silence is not a claim.
+        rulesets = window.get("ruleset_ids") or []
+        if rulesets:
+            lines.append(f"              rulesets    {', '.join(rulesets)}")
+        if window.get("rulesets_truncated"):
+            lines.append(
+                f"              WARNING {window['rulesets_truncated']} ruleset id(s) did not "
+                "fit the row; the ruleset line above names fewer rulesets than this "
+                "window actually observed"
+            )
     if provenance.get("traffic") == "production" and not (provenance.get("windows") or []):
         lines.append(
             "  window      none listed — a production claim resting on no durable "
@@ -590,6 +606,10 @@ def assembled(qualifying: int, observed: int, fp_count: int) -> dict:
                 "flushes": 43_200,
                 "reset_reason": None,
                 "cohort_accounts_truncated": 0,
+                # Two rulesets, so the self-test sees a window that spanned a
+                # change — the shape D32 open question 6's stamp exists for.
+                "ruleset_ids": ["v9:" + "aa" * 32, "v10:" + "bb" * 32],
+                "rulesets_truncated": 0,
             }
         ],
     }
@@ -713,6 +733,50 @@ def zero_of_zero_is_distinguishable() -> list[str]:
     if unwatched_terms[coverage_term]:
         failures.append(
             "0-of-0: the production leg's coverage term held over an empty cohort"
+        )
+    return failures
+
+
+def a_window_spanning_a_ruleset_change_says_so() -> list[str]:
+    """The stamp behind D32 open question 6's resolution, rendered.
+
+    A window that observed two `RulesetId`s shows both, on the window's own
+    ruleset line, so a reviewer sees the span instead of assuming one ruleset
+    behind every number. An artifact written before the stamp existed renders
+    without inventing an empty claim, and an understated span is reported
+    rather than absorbed.
+    """
+    failures: list[str] = []
+    doc = assembled(qualifying=10_000, observed=10_000, fp_count=0)
+    lines = render(doc)
+
+    span = [line for line in lines if "v9:" in line and "v10:" in line]
+    if not span:
+        failures.append(
+            "ruleset stamp: a window that observed two rulesets did not render "
+            "them together; the span a reviewer must judge is not visible"
+        )
+    elif not span[0].strip().startswith("rulesets"):
+        failures.append(
+            "ruleset stamp: the span rendered, but not as the window's ruleset "
+            f"line: {span[0].strip()!r}"
+        )
+
+    pre_stamp = copy.deepcopy(doc)
+    for window in pre_stamp["provenance"]["windows"]:
+        window.pop("ruleset_ids", None)
+        window.pop("rulesets_truncated", None)
+    if any("ruleset" in line for line in render(pre_stamp)):
+        failures.append(
+            "ruleset stamp: a pre-stamp artifact rendered a ruleset claim it "
+            "cannot have made"
+        )
+
+    truncated = copy.deepcopy(doc)
+    truncated["provenance"]["windows"][0]["rulesets_truncated"] = 4
+    if not any("4 ruleset id(s)" in line for line in render(truncated)):
+        failures.append(
+            "ruleset stamp: an understated span rendered no truncation warning"
         )
     return failures
 
@@ -847,6 +911,7 @@ def self_test(artifact: dict) -> int:
 
     mutation_failures.extend(zero_of_zero_is_distinguishable())
     mutation_failures.extend(an_absent_cardinality_is_never_read_as_zero())
+    mutation_failures.extend(a_window_spanning_a_ruleset_change_says_so())
 
     if mutation_failures:
         print("SELF-TEST FAILED: guarded facts")
@@ -863,7 +928,8 @@ def self_test(artifact: dict) -> int:
         f"coverage {rate(measured['cohort']['coverage'], measured['cohort']['observed'], measured['cohort']['qualifying'])}, "
         f"{len(mutations)} guarded-fact mutations rejected, "
         "0-of-0 distinguishable from 0-of-10000, "
-        "an unassembled cardinality never read as zero"
+        "an unassembled cardinality never read as zero, "
+        "a window spanning a ruleset change says so"
     )
     return 0
 

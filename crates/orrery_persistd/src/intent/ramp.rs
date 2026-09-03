@@ -70,11 +70,18 @@
 //! Two dimensions D32 and [#221] ask for are **not** here, and are named rather
 //! than approximated:
 //!
-//! - **`RulesetId`.** Clause (f) scopes the auto-suspend trigger per rule
-//!   version only "where the control is verdict-driven — C3, C4, C5"; it says
-//!   in the same sentence that "C1 and C2 are protocol-level and suspend
-//!   globally". C1 owes no `RulesetId` dimension, and inventing one would be a
-//!   column that is always the same value.
+//! - **`RulesetId` as a per-observation trigger dimension.** Clause (f)
+//!   scopes the auto-suspend trigger per rule version only "where the control
+//!   is verdict-driven — C3, C4, C5"; it says in the same sentence that "C1
+//!   and C2 are protocol-level and suspend globally". C1 owes no `RulesetId`
+//!   dimension, and inventing one would be a column that is always the same
+//!   value. What *is* here, since the owner decided D32 open question 6 on
+//!   2026-09-03, is the window-level stamp: [`RampMeter::observe_ruleset`]
+//!   records the rulesets a control's counters saw, the durable window unions
+//!   them into one set, and the artifact publishes it — so a window that
+//!   spanned a ruleset change says so and a reviewer judges it, instead of
+//!   the fleet resetting for them. The per-observation dimension clause (f)'s
+//!   trigger needs remains unbuilt.
 //! - **Network-quality bucket.** R-6's early warning is a discrepancy rate
 //!   "correlating with peer RTT/loss rather than accounts", and clause (f)
 //!   calls the bucket a required dimension. [`ShadowObservation`] carries no
@@ -136,7 +143,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-use orrery_protocol::AccountId;
+use orrery_protocol::{AccountId, RulesetId};
 use serde::{Deserialize, Serialize};
 
 use super::shadow::{
@@ -181,6 +188,14 @@ use super::window::{DurableTally, RampWindowDelta, RampWindowRow, WindowCounts};
 ///   generation, open time, flush count, reset reason — so a `traffic:
 ///   production` claim is checkable against the rows it was made from instead
 ///   of taken on the producer's word.
+///
+/// Two fields joined `provenance.windows` later, additively and still `/2`:
+/// `ruleset_ids` and `rulesets_truncated`, the stamp behind D32 open question
+/// 6's 2026-09-03 resolution. The same test that forced the version marks
+/// them additive: a previous reader cannot misread a field it does not know,
+/// and nothing — gate figure, bound, verdict — defaults through it. The `/1`
+/// failure was a *known* field whose value changed meaning under a
+/// defaulting accessor; a new field beside the old ones has no such path.
 pub const RAMP_ARTIFACT_SCHEMA: &str = "orrery.ramp.report/2";
 
 /// D32's three cached enforcement postures.
@@ -679,6 +694,11 @@ struct Tallies {
     by_verdict: BTreeMap<&'static str, u64>,
     first_ms: Option<u64>,
     last_ms: Option<u64>,
+    /// The rulesets this control's counters saw since the last drain — the
+    /// live half of the window stamp. Small by construction and folded by
+    /// union, so a delta re-sending it after a failed flush cannot
+    /// double-count.
+    ruleset_ids: BTreeSet<RulesetId>,
 }
 
 /// The per-control counters D32 clause (e)'s predicate and clause (f)'s
@@ -882,6 +902,28 @@ impl RampMeter {
         Self::entry(&mut tallies, capacity, subject).unevaluated += 1;
     }
 
+    /// Stamp one `RulesetId` into the window this meter is measuring — the
+    /// owner's 2026-09-03 resolution of D32 open question 6.
+    ///
+    /// A window that spanned a ruleset change must say so, because the owner
+    /// declined the automatic reset: a reset discards evidence irreversibly
+    /// and would fire only for the controls clause (f) scopes to a rule
+    /// version, an inconsistency worse than the problem. The stamp is the
+    /// alternative that neither loses evidence nor hides the span. Call it
+    /// where the meter first sees the ruleset — the same counting point as
+    /// the denominator, so the set describes the window's counters and not
+    /// one arm of them. C1's and C2's meters are never handed one: clause (f)
+    /// scopes the dimension to the verdict-driven C3/C4/C5, and their stamps
+    /// would be a column that is always the same value.
+    ///
+    /// The durable set unions across flushes like the account sets and is
+    /// bounded by
+    /// [`MAX_DURABLE_RULESET_IDS`](super::window::MAX_DURABLE_RULESET_IDS)
+    /// with the overflow reported rather than absorbed.
+    pub fn observe_ruleset(&self, ruleset: RulesetId) {
+        self.lock().ruleset_ids.insert(ruleset);
+    }
+
     fn record_time_and_verdict(tallies: &mut Tallies, verdict: &'static str, observed_at_ms: u64) {
         tallies.first_ms = Some(
             tallies
@@ -1026,6 +1068,7 @@ impl RampMeter {
             first_ms: tallies.first_ms,
             last_ms: tallies.last_ms,
             fleet_truncation_seen: !tallies.truncated_accounts.is_empty(),
+            ruleset_ids: tallies.ruleset_ids.clone(),
             ..WindowCounts::default()
         };
         for (account, tally) in &tallies.per_account {
@@ -1538,6 +1581,29 @@ pub struct WindowProvenance {
     /// Nonzero means the cohort's `active` and `accounts_would_act` figures
     /// are understated by at most this much.
     pub cohort_accounts_truncated: u64,
+    /// Every `RulesetId` the window's counters observed — the stamp the owner
+    /// chose for D32 open question 6 on 2026-09-03, spelled by
+    /// [`ruleset_stamp_label`](super::window::ruleset_stamp_label) as
+    /// `v<version>:<64 hex>` and ordered by version then digest.
+    ///
+    /// A reviewer reads this list for the span: two ids mean the window's
+    /// counters straddle a ruleset change, and the promotion evidence in this
+    /// artifact was observed under more than one ruleset — theirs to judge,
+    /// not the fleet's to reset away. Protocol-level controls (C1, C2) carry
+    /// an empty list by construction; clause (f) scopes the dimension to
+    /// verdict-driven C3/C4/C5.
+    ///
+    /// Absent (`[]` by this field's `default`) in artifacts written before
+    /// the stamp landed. The field is additive within `/2` deliberately: no
+    /// previous reader knows it, so none can misread it, and nothing — no
+    /// gate figure, no bound, no verdict — derives from it. That is the test
+    /// `/2`'s own bump applied, and it is why this is not `/3`.
+    #[serde(default)]
+    pub ruleset_ids: Vec<String>,
+    /// Distinct rulesets [`Self::ruleset_ids`] could not name because the row
+    /// was already at its bound. Nonzero means the span above is understated.
+    #[serde(default)]
+    pub rulesets_truncated: u64,
 }
 
 /// Where an artifact's numbers came from.

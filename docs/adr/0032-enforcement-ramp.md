@@ -960,14 +960,34 @@ is supposed to sit there.
    conditions years before public launch; it also means shadow acts on
    someone. Left to the C4 promotion review, with the note that clause (d)
    already routes that proof through [#222]'s harness leg instead.
-6. **Whether a ruleset change should reset the measurement window
-   automatically.** [#990] gave clause (e)'s `W` and its counters a durable
-   form (`rampw/{control}`, the `vm` sub-span) and an *operator-driven* reset:
-   `orrery-ramp window reset --control C --reason "..."` retires the current
-   window and opens the next generation, and every live `persistd` discards
-   the delta it was holding on its next flush. That much is mechanism and is
-   landed. What is left is policy, and it is genuinely a judgement rather than
-   a missing feature:
+6. ~~**Whether a ruleset change should reset the measurement window
+   automatically.**~~ **Closed 2026-09-03 in the negative, by owner decision
+   on [#864], and implemented in the same change: a ruleset change does not
+   reset the window, automatically or otherwise, and `orrery-ramp window
+   reset` remains the deliberate operator act, unchanged. The window row is
+   instead stamped with the `RulesetId`s observed in it — folded by union
+   exactly like the account sets, bounded with the overflow reported rather
+   than absorbed, published in `provenance.windows`, and rendered by
+   `scripts/ramp-report.py` — so a reviewer sees a window that spanned a
+   change and judges the evidence themselves.** The mechanism underneath is
+   unchanged: [#990] gave clause (e)'s `W` and its counters their durable
+   form (`rampw/{control}`, the `vm` sub-span), and #997's operator-driven
+   reset — `orrery-ramp window reset --control C --reason "..."` — retires
+   the current window and opens the next generation, every live `persistd`
+   discarding the delta it was holding on its next flush. The decision is
+   only about what happens on a ruleset change the operator does *not*
+   reset for. The case against is the one
+   that held, on both of its reasons: this store keeps no history, so an
+   automatic reset discards evidence irreversibly; and clause (f)'s own
+   scoping of `RulesetId` to the verdict-driven controls means an automatic
+   reset would fire for C3/C4/C5 and not C1/C2, an inconsistency worse than
+   the problem. What landed is the third option priced below — the only one
+   of the three that neither loses evidence nor presents it as though
+   nothing happened. The stamp's cost is the one that option always named:
+   it rides the metering entry of the controls that have a ruleset, and
+   protocol-level C1/C2 carry an empty stamp by construction.
+
+   The reasoning that was priced before the decision:
 
    - **The case for automatic.** Clause (e) evidence spanning a semantic
      change is worse than a short window, and the failure mode is silent: an
@@ -994,11 +1014,11 @@ is supposed to sit there.
      that spans a change rather than have the fleet decide for them. That
      needs the `RulesetId` dimension clause (f) declines to require of C1 and
      C2, so it is not free either — but it is the only one of the three that
-     neither loses evidence nor presents it as though nothing happened.
-
-   Deferred to the owner. Nothing promotes while it is open: the operator
-   reset is sufficient for a supervised promotion review, and the automatic
-   variant is only worth building once someone has been through one.
+     neither loses evidence nor presents it as though nothing happened. The
+     landed shape takes the stamp at the metering entry rather than per
+     observation, which keeps C1 and C2 out of it: their windows stamp
+     nothing, which is the honest value of a column that would otherwise be
+     one constant.
 
 [#106]: https://github.com/baadc0de/orrery/issues/106
 [#105]: https://github.com/baadc0de/orrery/issues/105
@@ -1013,6 +1033,7 @@ is supposed to sit there.
 [#226]: https://github.com/baadc0de/orrery/issues/226
 [#248]: https://github.com/baadc0de/orrery/issues/248
 [#863]: https://github.com/baadc0de/orrery/issues/863
+[#864]: https://github.com/baadc0de/orrery/issues/864
 [#875]: https://github.com/baadc0de/orrery/issues/875
 [#932]: https://github.com/baadc0de/orrery/pull/932
 [ADR-0031]: 0031-id-account-subspace.md

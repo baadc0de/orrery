@@ -709,19 +709,32 @@ impl AdjudicationExecutor {
                     "strike_filed",
                     Some(kind.as_str()),
                     issued_at_ms,
+                    report.bundle.ruleset,
                 );
             }
             Ok(StrikeFileOutcome::Duplicate { account }) => {
                 self.strike_metrics
                     .duplicate
                     .fetch_add(1, Ordering::Relaxed);
-                self.record_strike_ramp(filer.mode, Some(account), "duplicate", None, issued_at_ms);
+                self.record_strike_ramp(
+                    filer.mode,
+                    Some(account),
+                    "duplicate",
+                    None,
+                    issued_at_ms,
+                    report.bundle.ruleset,
+                );
             }
             Ok(StrikeFileOutcome::UnresolvedBinding) => {
                 self.strike_metrics
                     .suppressed_unresolved
                     .fetch_add(1, Ordering::Relaxed);
-                self.record_strike_ramp_unevaluated(filer.mode, "unresolved_binding", issued_at_ms);
+                self.record_strike_ramp_unevaluated(
+                    filer.mode,
+                    "unresolved_binding",
+                    issued_at_ms,
+                    report.bundle.ruleset,
+                );
             }
             Err(error) => {
                 self.strike_metrics
@@ -731,6 +744,7 @@ impl AdjudicationExecutor {
                     filer.mode,
                     "strike_filing_error",
                     issued_at_ms,
+                    report.bundle.ruleset,
                 );
                 tracing::warn!(%error, ?kind, "strike filing failed; verdict remains deliverable");
             }
@@ -744,6 +758,7 @@ impl AdjudicationExecutor {
         verdict: &'static str,
         action: Option<&'static str>,
         observed_at_ms: u64,
+        ruleset: RulesetId,
     ) {
         if mode != StrikeMode::Shadow {
             return;
@@ -753,6 +768,12 @@ impl AdjudicationExecutor {
         };
         meter.qualify(account);
         meter.observe(account, verdict, action, observed_at_ms);
+        // D32 open question 6, resolved 2026-09-03: the window stamps the
+        // rulesets it observed instead of resetting on a change, so a
+        // reviewer sees a window that spanned one and judges it. The row the
+        // control filed names the ruleset; the stamp rides the metering
+        // entry beside the denominator.
+        meter.observe_ruleset(ruleset);
     }
 
     fn record_strike_ramp_unevaluated(
@@ -760,6 +781,7 @@ impl AdjudicationExecutor {
         mode: StrikeMode,
         reason: &'static str,
         observed_at_ms: u64,
+        ruleset: RulesetId,
     ) {
         if mode != StrikeMode::Shadow {
             return;
@@ -769,6 +791,7 @@ impl AdjudicationExecutor {
         };
         meter.qualify(None);
         meter.observe_unevaluated(None, reason, observed_at_ms);
+        meter.observe_ruleset(ruleset);
     }
 
     /// Append D33's executor-authorized compensating fact for an upheld
