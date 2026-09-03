@@ -960,6 +960,45 @@ is supposed to sit there.
    conditions years before public launch; it also means shadow acts on
    someone. Left to the C4 promotion review, with the note that clause (d)
    already routes that proof through [#222]'s harness leg instead.
+6. **Whether a ruleset change should reset the measurement window
+   automatically.** [#990] gave clause (e)'s `W` and its counters a durable
+   form (`rampw/{control}`, the `vm` sub-span) and an *operator-driven* reset:
+   `orrery-ramp window reset --control C --reason "..."` retires the current
+   window and opens the next generation, and every live `persistd` discards
+   the delta it was holding on its next flush. That much is mechanism and is
+   landed. What is left is policy, and it is genuinely a judgement rather than
+   a missing feature:
+
+   - **The case for automatic.** Clause (e) evidence spanning a semantic
+     change is worse than a short window, and the failure mode is silent: an
+     operator who forgets to reset presents a reviewer with thirty days of
+     evidence about a predicate that changed on day nine, and nothing in the
+     artifact says so. Clause (f) already accepts automation that makes the
+     fleet safer without asking, and discarding stale evidence is squarely
+     that direction.
+   - **The case against.** The trigger is not obvious. Clause (f) scopes
+     `RulesetId` per rule version only "where the control is verdict-driven —
+     C3, C4, C5", and says in the same sentence that "C1 and C2 are
+     protocol-level"; C1's meter carries no `RulesetId` dimension at all
+     (`intent/ramp.rs`'s module docs say why, and inventing one would be a
+     column that is always the same value). So an automatic reset would fire
+     for two or three of the five controls and not the rest, on a dimension
+     two of them do not have. And a reset is destructive — this store keeps no
+     history, deliberately, because open question 2's journal shadow is where
+     append-only measurement history belongs. Automation that silently
+     discards twenty-nine days of evidence on a deploy that touched an
+     unrelated rule is a denial-of-evidence lever, which is the shape clause
+     (f) refuses for `AutoSuspend → Off`.
+   - **A third option worth pricing before either.** Stamp the window row with
+     the `RulesetId` set observed in it, and let the *reviewer* see a window
+     that spans a change rather than have the fleet decide for them. That
+     needs the `RulesetId` dimension clause (f) declines to require of C1 and
+     C2, so it is not free either — but it is the only one of the three that
+     neither loses evidence nor presents it as though nothing happened.
+
+   Deferred to the owner. Nothing promotes while it is open: the operator
+   reset is sufficient for a supervised promotion review, and the automatic
+   variant is only worth building once someone has been through one.
 
 [#106]: https://github.com/baadc0de/orrery/issues/106
 [#105]: https://github.com/baadc0de/orrery/issues/105

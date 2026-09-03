@@ -443,6 +443,28 @@ struct Cli {
     )]
     hot_ledger_sweep_interval_ms: u64,
 
+    /// D32 clause (e) measurement-window flush cadence in milliseconds; 0
+    /// disables the flush and with it the window's durability.
+    ///
+    /// The meters' counters and `W`'s bounds live in an in-process structure
+    /// that a restart resets. Without a flush, clause (e)'s `W ≥ 30 days` term
+    /// is unreachable no matter how long the fleet runs, because a routine
+    /// deploy restarts the window (#990).
+    ///
+    /// The default costs one FoundationDB read-modify-write per measurable
+    /// control per interval, plus one cohort scan — at 60 s and four controls
+    /// that is under 0.1 transactions per second, on a background task and
+    /// never on the intent path D16 budgets. The figure to weigh when changing
+    /// it is the loss bound: an ungraceful stop discards at most one interval
+    /// of counters, which at the default is 0.0023% of a thirty-day window.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 60_000,
+        env = "ORRERY_RAMP_WINDOW_FLUSH_INTERVAL_MS"
+    )]
+    ramp_window_flush_interval_ms: u64,
+
     /// Append server-internal latency batches and gateway counter records to
     /// this JSONL file.
     ///
@@ -1512,6 +1534,39 @@ async fn main() -> anyhow::Result<()> {
         } else {
             (None, None, None)
         };
+    // D32 clause (e)'s window, made durable (#990). The reload runs *here*,
+    // in the gateway process, and never in the coordinator: ADR-0031 clause
+    // (d) is "identity writes; the gateway reads; the coordinator does not
+    // read", and `orrery_coordinator` declares no `foundationdb` dependency at
+    // all, so the constraint holds structurally rather than by convention.
+    //
+    // Reloading before the gateway starts is what makes a restart *continue*
+    // the window. Without it `first_ms` is `None` after every deploy and
+    // clause (e)'s `W >= 30 days` term is unreachable no matter how long the
+    // fleet runs.
+    #[cfg(feature = "fdb")]
+    let ramp_window_flusher = if let (Some(context), false) =
+        (fdb_context.as_ref(), cli.ramp_window_flush_interval_ms == 0)
+    {
+        let meters = gateway_config.ramp_meters.clone();
+        let window_store =
+            orrery_persistd::intent::window::FdbRampWindowStore::from_context(context);
+        let cohort_store =
+            orrery_persistd::intent::cohort::FdbHonestCohortStore::from_context(context);
+        restore_ramp_windows(&window_store, &meters).await;
+        Some(spawn_ramp_window_flusher(
+            window_store,
+            cohort_store,
+            meters,
+            Duration::from_millis(cli.ramp_window_flush_interval_ms),
+        ))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "fdb"))]
+    let ramp_window_flusher: Option<JoinHandle<()>> = None;
+    let _ = &ramp_window_flusher;
+
     #[cfg(feature = "fdb")]
     if let (Some(context), false) = (fdb_context.as_ref(), cli.hot_ledger_sweep_interval_ms == 0) {
         spawn_hot_ledger_sweeper(
@@ -3169,6 +3224,123 @@ fn spawn_hot_ledger_sweeper(
     })
 }
 
+/// Reload each measurable control's durable measurement window, so this
+/// process continues clause (e)'s `W` rather than opening a new one.
+///
+/// A control with no row yet is left alone: the first flush opens generation
+/// 0. A control whose row cannot be read is *also* left alone, with a loud
+/// log, because a meter that started from zero is a short window and a meter
+/// that started from a half-decoded row is a wrong one.
+#[cfg(feature = "fdb")]
+async fn restore_ramp_windows(
+    store: &orrery_persistd::intent::window::FdbRampWindowStore,
+    meters: &RampMeters,
+) {
+    for meter in meters.all() {
+        match store.load(meter.control()).await {
+            Ok(Some(row)) => {
+                tracing::info!(
+                    control = meter.control(),
+                    window_id = row.window_id,
+                    window_days = row.window_days(),
+                    flushes = row.flushes,
+                    "continuing D32 clause (e)'s measurement window across the restart"
+                );
+                meter.restore(row);
+            }
+            Ok(None) => tracing::info!(
+                control = meter.control(),
+                "no durable measurement window yet; the first flush opens one"
+            ),
+            Err(error) => tracing::error!(
+                control = meter.control(),
+                %error,
+                "could not read this control's measurement window; it starts from \
+                 zero, which understates clause (e)'s W rather than misstating it"
+            ),
+        }
+    }
+}
+
+/// Flush every meter's counters and window bounds on their cadence.
+///
+/// One task for all four controls, and one cohort load per tick rather than
+/// per control: the join to `H` is the same roster for every meter, and
+/// reading it once is the difference between one range scan a minute and four.
+///
+/// A failed flush is not a lost one. [`RampMeter::take_delta`] leaves the
+/// drained counters pending until the store acknowledges them, so the next
+/// tick retries with the accumulated delta. A tick that cannot even load the
+/// cohort skips entirely rather than flushing with an empty one, because an
+/// empty cohort would attribute every honest account's traffic to neither
+/// half and clause (e)'s split is the thing the flush exists to carry.
+#[cfg(feature = "fdb")]
+fn spawn_ramp_window_flusher(
+    store: orrery_persistd::intent::window::FdbRampWindowStore,
+    cohort_store: orrery_persistd::intent::cohort::FdbHonestCohortStore,
+    meters: RampMeters,
+    interval: Duration,
+) -> JoinHandle<()> {
+    use orrery_persistd::intent::window::FlushOutcome;
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let cohort = match cohort_store.load().await {
+                Ok(cohort) => cohort,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not load the known-honest cohort; skipping this ramp \
+                         window flush rather than writing counters with no armed / \
+                         natural split"
+                    );
+                    continue;
+                }
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since_epoch| since_epoch.as_millis() as u64);
+            for meter in meters.all() {
+                let delta = meter.take_delta(&cohort);
+                match store.flush(meter.control(), &delta, now_ms).await {
+                    Ok(FlushOutcome::Applied(row)) => {
+                        tracing::debug!(
+                            control = meter.control(),
+                            window_id = row.window_id,
+                            window_days = row.window_days(),
+                            armed_would_act = row.counts.armed.would_act,
+                            natural_would_act = row.counts.natural.would_act,
+                            "flushed D32 clause (e) counters"
+                        );
+                        meter.commit_flush(*row);
+                    }
+                    Ok(FlushOutcome::WindowChanged(row)) => {
+                        tracing::warn!(
+                            control = meter.control(),
+                            window_id = row.window_id,
+                            opened_at_ms = row.opened_at_ms,
+                            reason = row.reset_reason.as_deref().unwrap_or(""),
+                            "an operator reset this control's measurement window; \
+                             discarding the counters measured under the retired one \
+                             and continuing in the new one"
+                        );
+                        meter.adopt_window(*row);
+                    }
+                    Err(error) => tracing::warn!(
+                        control = meter.control(),
+                        %error,
+                        "ramp window flush failed; the counters stay pending and \
+                         the next tick retries with them"
+                    ),
+                }
+            }
+        }
+    })
+}
+
 /// Run D32 clause (g)'s archive-consuming pass on its daily start cadence.
 ///
 /// The blocking Parquet scan stays off Tokio's executor. A pass captures its
@@ -4062,6 +4234,7 @@ mod tests {
                 orrery_persistd::audit::conservation::DEFAULT_FULL_SWEEP_INTERVAL_MS,
             checkpoint_interval_ms: None,
             hot_ledger_sweep_interval_ms: 3_600_000,
+            ramp_window_flush_interval_ms: 60_000,
             dev_seed: None,
             secret_key: None,
             shard: Vec::new(),

@@ -349,6 +349,7 @@ Every non-excluded flag on every CLI binary outside the frozen trees falls back 
 | `persistd` | `--receipt-archive-page-rows` | `ORRERY_RECEIPT_ARCHIVE_PAGE_ROWS` |
 | `persistd` | `--hot-ledger-sweep-interval-ms` | `ORRERY_HOT_LEDGER_SWEEP_INTERVAL_MS` |
 | `persistd` | `--full-conservation-sweep-interval-ms` | `ORRERY_FULL_CONSERVATION_SWEEP_INTERVAL_MS` |
+| `persistd` | `--ramp-window-flush-interval-ms` | `ORRERY_RAMP_WINDOW_FLUSH_INTERVAL_MS` |
 | `persistd` | `--audit-work-dir` | `ORRERY_AUDIT_WORK_DIR` |
 | `persistd` | `--metrics-jsonl` | `ORRERY_METRICS_JSONL` |
 | `orrery-coordinator` | `--bind` | `ORRERY_COORDINATOR_BIND` |
