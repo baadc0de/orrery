@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import fcntl
+import http.client
 import ipaddress
 import json
 import logging
@@ -27,7 +28,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 MINT_FLOOR_BYTES = 10 * 1024**3
@@ -39,12 +40,138 @@ DISPLAY_LABEL_MAX_CHARS = 32
 LOBBY_SECONDS = 180
 ARRIVAL_LEASE_SECONDS = 45
 RESTART_DELAY_SECONDS = 5
+UPLOAD_PROBE_SESSION = "00000000-0000-7000-8000-000000000002"
+UPLOAD_PROBE_OTHER_SESSION = "00000000-0000-7000-8000-000000000003"
+UPLOAD_PROBE_TIMEOUT_SECONDS = 10
+UPLOAD_PROBE_STEP_BYTES = 1024**2
 
 
 def display_label(raw: str) -> str | None:
     """Return the bounded ASCII text the client is allowed to draw."""
     cleaned = "".join(glyph for glyph in raw if " " <= glyph <= "~").strip()
     return cleaned[:DISPLAY_LABEL_MAX_CHARS] or None
+
+
+@dataclass(frozen=True)
+class UploadLimit:
+    """What the startup probe could prove about the public origin's body ceiling (#1002)."""
+    status: str  # "ok", "too_small" or "unverifiable"; only too_small fails startup
+    verified: int | None  # largest body size proven to reach admission, if any
+    detail: str  # why the verdict is what it is, for the operator's log
+
+
+def probe_body(size: int) -> bytes:
+    """An upload-shaped body of exactly `size` bytes that can never be stored.
+
+    The probe session is never minted (a zero-timestamp UUIDv7) and its records
+    name another synthetic session, so admission refuses before any write and
+    the probe cannot collide with a real upload in either direction.
+    """
+    head = json.dumps({"records": [{"session_id": UPLOAD_PROBE_OTHER_SESSION}]}, separators=(",", ":"))[:-1] + ',"telemetry_jsonl":"'
+    pad = size - len(head) - 2
+    if pad < 0: raise ValueError("the probe size cannot hold the upload shape")
+    return (head + "x" * pad + '"}').encode()
+
+
+def post_json(url: str, body: bytes) -> tuple[int, str]:
+    """One POST through whatever fronts the public origin: HTTP statuses return, network trouble raises OSError.
+
+    The body goes to the socket before the response is read, so a proxy that
+    refuses an oversized body mid-send and closes can still have its 413 read
+    out of the socket afterwards; a reset with nothing to read is network
+    trouble, not a verdict.
+    """
+    parts = urlparse(url)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=UPLOAD_PROBE_TIMEOUT_SECONDS)
+    try:
+        conn.putrequest("POST", parts.path or "/")
+        conn.putheader("Content-Type", "application/json"); conn.putheader("Content-Length", str(len(body))); conn.putheader("Connection", "close")
+        try: conn.endheaders(message_body=body)
+        except (BrokenPipeError, ConnectionResetError): pass  # the refusal may already be in flight; getresponse reads it
+        response = conn.getresponse()
+        return response.status, response.read(65536).decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def reached_admission(status: int, text: str) -> bool:
+    """True only when the probe's whole body demonstrably arrived at this service.
+
+    A proxy that refused the body first answers with an HTML error page or a
+    redirect-follower's answer, neither of which is admission's own JSON
+    refusal for the probe path. `unknown_session` is the normal marker; `wrong_session`
+    also counts, though the probe's shape makes it unreachable in practice.
+    """
+    try: payload = json.loads(text)
+    except (ValueError, json.JSONDecodeError): return False
+    return (status in (HTTPStatus.NOT_FOUND, HTTPStatus.UNPROCESSABLE_ENTITY)
+            and isinstance(payload, dict) and payload.get("error") in ("unknown_session", "wrong_session"))
+
+
+def probe_once(url: str, size: int, post: Callable[[str, bytes], tuple[int, str]]) -> bool | None:
+    """One probe POST of `size` bytes: True arrived, False was refused for size, None is network trouble."""
+    try: status, text = post(url, probe_body(size))
+    except (OSError, http.client.HTTPException): return None
+    if status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE: return False
+    return reached_admission(status, text)
+
+
+def probe_upload_limit(origin: str, post: Callable[[str, bytes], tuple[int, str]] = post_json) -> UploadLimit:
+    """POST a body of exactly MAX_UPLOAD_BYTES to the public origin and read what answers (#1002).
+
+    nginx's 1 MiB default refused every volunteer upload with 413 before
+    admission saw it, and #735's refusal logging in `_store_upload` never fired
+    for those because the rejection happened one layer up. This checks the
+    effective ceiling end to end instead of parsing any proxy's config: a 413
+    proves the ceiling is smaller than the application's, and a bounded search
+    walks down to name the number an operator must raise. Network trouble or an
+    answer without admission's marker returns unverifiable, which is not
+    evidence of a small ceiling.
+    """
+    url = origin.rstrip("/") + "/v1/sessions/" + UPLOAD_PROBE_SESSION + "/upload"
+    try: status, text = post(url, probe_body(MAX_UPLOAD_BYTES))
+    except (OSError, http.client.HTTPException) as e:
+        return UploadLimit("unverifiable", None, f"{type(e).__name__}: {e}")
+    if reached_admission(status, text):
+        return UploadLimit("ok", MAX_UPLOAD_BYTES, "")
+    if status != HTTPStatus.REQUEST_ENTITY_TOO_LARGE:
+        return UploadLimit("unverifiable", None, f"HTTP {status} did not carry admission's refusal marker ({text[:120]!r}); is --public-origin the origin clients upload to, without a redirect?")
+    floor = probe_once(url, UPLOAD_PROBE_STEP_BYTES, post)
+    if floor is None:
+        return UploadLimit("too_small", None, "the search for the effective limit lost the network")
+    if not floor:
+        return UploadLimit("too_small", None, f"even a body of {UPLOAD_PROBE_STEP_BYTES} bytes was refused")
+    low, high = UPLOAD_PROBE_STEP_BYTES, MAX_UPLOAD_BYTES
+    while high - low > UPLOAD_PROBE_STEP_BYTES:
+        mid = (low + high) // 2 // UPLOAD_PROBE_STEP_BYTES * UPLOAD_PROBE_STEP_BYTES
+        verdict = probe_once(url, mid, post)
+        if verdict is None:
+            return UploadLimit("too_small", None, "the search for the effective limit lost the network")
+        if verdict: low = mid
+        else: high = mid
+    return UploadLimit("too_small", low, "")
+
+
+def enforce_upload_limit(origin: str, post: Callable[[str, bytes], tuple[int, str]] = post_json) -> None:
+    """Fail startup when the public origin's body ceiling is smaller than ours.
+
+    `_store_upload` says out loud when it refuses an upload (#735), because
+    silence there is indistinguishable from a player who never played, which is
+    the blind spot #711 existed to close. A proxy refusing the body one layer
+    up (#1002) never reaches that logging, so this closes the same blind spot
+    from above: prove at startup that a MAX_UPLOAD_BYTES body can actually
+    arrive, and refuse to serve 413-generating silence when it cannot.
+    """
+    check = probe_upload_limit(origin, post)
+    wanted = f"{MAX_UPLOAD_BYTES} bytes ({MAX_UPLOAD_BYTES // 1024**2} MiB)"
+    if check.status == "ok":
+        logging.info("upload-limit self-check passed: the public origin accepted a probe body of %s", wanted); return
+    if check.status == "unverifiable":
+        logging.warning("upload-limit self-check cannot verify: %s. Continuing without proof that the public origin accepts a probe body of %s; if it does not, volunteer uploads are refused upstream with HTTP 413 and their sessions never bank (#1002)", check.detail, wanted); return
+    got = (f"the largest body it accepted was {check.verified} bytes ({check.verified // 1024**2} MiB)" if check.verified is not None
+           else f"no accepted body could be measured ({check.detail})")
+    logging.critical("refusing to start: the public origin rejected a probe body of %s with HTTP 413 before admission saw it; %s. Volunteer uploads are being refused upstream of this service and their sessions never bank (#1002). Raise the proxy's request-body limit to at least MAX_UPLOAD_BYTES = %s — for nginx, set `client_max_body_size 64m;` in the site fronting this origin, then reload — and start admission again.", wanted, got, wanted)
+    raise SystemExit(1)
 
 
 class Refusal(Exception):
@@ -641,7 +768,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(); p.add_argument("--control", type=Path, default=Path("/etc/orrery/campaigns.conf")); p.add_argument("--state", type=Path, default=Path("/var/lib/orrery-admission")); p.add_argument("--invite", default="orrery-invite"); p.add_argument("--ssh", default="ssh"); p.add_argument("--ssh-key", type=Path, default=Path("/var/lib/orrery-admission/campaign_ssh_key")); p.add_argument("--issuer", type=Path, default=Path("/var/lib/orrery-admission/issuer.cred")); p.add_argument("--swarm", default="p1-swarm"); p.add_argument("--standing-host-state", type=Path, default=Path("/var/lib/orrery-p1-swarm")); p.add_argument("--listen", default="127.0.0.1:8323"); p.add_argument("--self-test", action="store_true"); a = p.parse_args()
+    p = argparse.ArgumentParser(); p.add_argument("--control", type=Path, default=Path("/etc/orrery/campaigns.conf")); p.add_argument("--state", type=Path, default=Path("/var/lib/orrery-admission")); p.add_argument("--invite", default="orrery-invite"); p.add_argument("--ssh", default="ssh"); p.add_argument("--ssh-key", type=Path, default=Path("/var/lib/orrery-admission/campaign_ssh_key")); p.add_argument("--issuer", type=Path, default=Path("/var/lib/orrery-admission/issuer.cred")); p.add_argument("--swarm", default="p1-swarm"); p.add_argument("--standing-host-state", type=Path, default=Path("/var/lib/orrery-p1-swarm")); p.add_argument("--public-origin", default=""); p.add_argument("--listen", default="127.0.0.1:8323"); p.add_argument("--self-test", action="store_true"); a = p.parse_args()
     if a.self_test:
         loader = unittest.TestLoader()
         selected = os.environ.get("ADMISSION_TEST")
@@ -655,7 +782,16 @@ def main() -> None:
         raise SystemExit(0 if result.wasSuccessful() else 1)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     host, port = a.listen.rsplit(":", 1); Handler.service = Admission(a.control, a.state, a.invite, a.ssh, a.ssh_key, a.issuer, a.swarm, a.standing_host_state)
-    ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
+    server = ThreadingHTTPServer((host, int(port)), Handler)
+    if a.public_origin:
+        # The probe needs the service answering behind the public origin, so a
+        # temporary server thread carries it while the gate runs (#1002); a
+        # failed gate exits the process before steady serving starts.
+        keeper = threading.Thread(target=server.serve_forever, daemon=True); keeper.start()
+        enforce_upload_limit(a.public_origin)
+        server.shutdown(); keeper.join()
+    else: logging.info("upload-limit self-check is off: no --public-origin configured, so the effective upstream body limit cannot be verified (#1002)")
+    server.serve_forever()
 
 
 class AdmissionTests(unittest.TestCase):
@@ -1064,6 +1200,43 @@ class AdmissionTests(unittest.TestCase):
             self.assertIn(error, line)
         # An upload that is accepted stays quiet on the error channel.
         self.service.upload(sid, json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "x"}).encode())
+    def test_an_origin_with_a_smaller_body_limit_refuses_to_start(self) -> None:
+        # #1002: nginx's 1 MiB default sat invisibly in front of the 64 MiB
+        # ceiling, so every volunteer upload died with HTTP 413 before
+        # admission saw it and #735's refusal logging never fired. The startup
+        # probe must fail the process, name both numbers, and say what to change.
+        def fake_post(url: str, body: bytes) -> tuple[int, str]:
+            if len(body) > UPLOAD_PROBE_STEP_BYTES: return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "<html>413 Request Entity Too Large</html>"
+            return HTTPStatus.NOT_FOUND, json.dumps({"error": "unknown_session"})
+        with self.assertLogs(level=logging.CRITICAL) as logs, self.assertRaises(SystemExit) as x:
+            enforce_upload_limit("https://campaigns.example", fake_post)
+        line = "\n".join(logs.output)
+        self.assertIn(str(MAX_UPLOAD_BYTES), line, "the message must name the ceiling the application wanted")
+        self.assertIn("1 MiB", line, "the message must name the effective limit the origin actually has")
+        self.assertIn("client_max_body_size", line, "the message must say what an operator changes")
+        self.assertEqual(x.exception.code, 1)
+    def test_an_unreachable_origin_warns_but_starts(self) -> None:
+        # A dev box, a container in CI, or a firewall leaves the public origin
+        # unreachable; that is not evidence of a small ceiling, so it must not
+        # fail startup (#1002).
+        def fake_post(url: str, body: bytes) -> tuple[int, str]: raise ConnectionRefusedError("connection refused")
+        with self.assertLogs(level=logging.WARNING) as logs:
+            self.assertIsNone(enforce_upload_limit("https://campaigns.example", fake_post))
+        line = "\n".join(logs.output)
+        self.assertIn("cannot verify", line)
+        self.assertIn(str(MAX_UPLOAD_BYTES), line, "the warning must still name the ceiling it could not verify")
+    def test_an_origin_that_passes_the_full_probe_verifies_and_starts(self) -> None:
+        seen = []
+        def fake_post(url: str, body: bytes) -> tuple[int, str]:
+            seen.append((url, len(body)))
+            return HTTPStatus.NOT_FOUND, json.dumps({"error": "unknown_session"})
+        with self.assertLogs(level=logging.INFO) as logs:
+            self.assertIsNone(enforce_upload_limit("https://campaigns.example/", fake_post))
+        line = "\n".join(logs.output)
+        self.assertIn("accepted", line)
+        self.assertIn(str(MAX_UPLOAD_BYTES), line)
+        self.assertEqual(seen, [("https://campaigns.example/v1/sessions/" + UPLOAD_PROBE_SESSION + "/upload", MAX_UPLOAD_BYTES)],
+                         "the happy path is exactly one probe, carrying exactly the ceiling it claims to verify")
     def test_the_mint_floor_refuses_new_admissions_below_10gb(self) -> None:
         self.service.statvfs = lambda _: type("V", (), {"f_bavail": MINT_FLOOR_BYTES - 1, "f_frsize": 1})()
         with self.assertRaises(Refusal) as x: self.service.join("test", self.request())
