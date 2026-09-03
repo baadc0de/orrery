@@ -635,6 +635,12 @@ pub struct ExteriorReport {
     /// Downlink frames refused because the queue was full. Zero at criterion
     /// rates; non-zero means the pump fell behind the swarm's clock.
     pub downlink_dropped: u64,
+    /// Downlink frames queued after the transport had closed and the pump's
+    /// writer with it. Non-zero for every seat that disconnected mid-attempt
+    /// (the host queues through the transport-close grace) and says nothing
+    /// about the queue or the host's clock; it is the size of the grace
+    /// window in deliveries, not a backlog (#1007).
+    pub downlink_after_close: u64,
     /// Whether the peer shipped a witness anchor at its join tick. `false`
     /// for a rendered client (#387): its slot is seated unwitnessed, and the
     /// witnessed clauses of this report cover the bot cohort only.
@@ -1428,6 +1434,15 @@ pub struct ExteriorSlot {
     downlink_frames: u64,
     /// Downlink frames refused on a full queue.
     downlink_dropped: u64,
+    /// Downlink frames queued after the pump's writer had already gone.
+    ///
+    /// The writer exits when the transport closes, and the host keeps
+    /// queuing for the seat through the whole transport-close grace: the two
+    /// idle-timeout drops of 2026-09-03 15:17 each measured 127-128 of these
+    /// over the 120-tick grace, every one refused by a *closed* channel, not
+    /// a full one (#1007). They are counted apart from
+    /// [`Self::downlink_dropped`] so a disconnect never reports as a backlog.
+    downlink_after_close: u64,
     /// True once the runner's clean end-of-run marker arrived. Shared with
     /// the bridge's reader task, which is what sees the marker first.
     pub goodbye: Arc<std::sync::atomic::AtomicBool>,
@@ -1593,6 +1608,7 @@ impl ExteriorSlot {
             uplink_dropped: self.uplink_dropped,
             downlink_frames: self.downlink_frames,
             downlink_dropped: self.downlink_dropped,
+            downlink_after_close: self.downlink_after_close,
             said_goodbye,
             witness_anchored: self.witness_anchored,
             session_id: self.session_id.clone(),
@@ -1643,6 +1659,13 @@ impl ExteriorSlot {
     /// Queues one frame on the established synchronous side of the bridge.
     /// `try_send` performs the send immediately; unlike `Sender::send`, it
     /// creates no future that could be dropped without being polled.
+    ///
+    /// The two refusals are different facts. `Full` is backpressure: the
+    /// writer is alive and behind, which is the host's clock or the peer's
+    /// path. `Closed` is the writer gone — it exits on the first failed write
+    /// after the transport closes — and the frame was never deliverable by
+    /// anybody; folding it into the backpressure count made every mid-attempt
+    /// disconnect read as a full queue and close as `queue_overflow` (#1007).
     fn queue_downlink(&mut self, frame: Frame) {
         match self.link.downlink.try_send(frame) {
             Ok(()) => self.downlink_frames += 1,
@@ -1650,7 +1673,7 @@ impl ExteriorSlot {
                 self.downlink_dropped += 1;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.downlink_dropped += 1;
+                self.downlink_after_close += 1;
             }
         }
     }
@@ -2066,6 +2089,7 @@ impl Swarm {
                 uplink_dropped: 0,
                 downlink_frames: 0,
                 downlink_dropped: 0,
+                downlink_after_close: 0,
                 goodbye: goodbye_flag,
             },
         );
@@ -3953,12 +3977,15 @@ impl SwarmReport {
                 failures.push(CriterionFailure {
                     clause: "the external peer stays connected",
                     detail: format!(
-                        "slot {} bridge reported a disconnect; {} uplink / {} downlink frames \
-                         before it dropped, {} downlink refused on a full queue",
+                        "slot {} bridge reported a disconnect ({}); {} uplink / {} downlink \
+                         frames before it dropped, {} downlink refused on a full queue, {} \
+                         queued into the closed transport during the release grace",
                         external.index,
+                        external.close,
                         external.uplink_frames,
                         external.downlink_frames,
                         external.downlink_dropped,
+                        external.downlink_after_close,
                     ),
                 });
             }
@@ -5734,6 +5761,102 @@ mod tests {
             serde_json::to_string(&stamped.identity).unwrap(),
             serde_json::to_string(&passing().identity).unwrap()
         );
+    }
+
+    /// One external seat over a `link_pair`, connected for one host tick so
+    /// its close reason is judged on how it ended and not as `never_connected`.
+    fn seated_external() -> (Swarm, crate::exterior::RemoteLink) {
+        use crate::bot::bot_key;
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 1,
+            ..SwarmConfig::default()
+        });
+        let (host_link, remote_link) = crate::exterior::link_pair();
+        swarm = swarm.with_external(bot_key(1).public(), None, host_link);
+        swarm
+            .exteriors
+            .get_mut(&1)
+            .expect("external slot")
+            .pump_uplink(1, &mut swarm.router);
+        (swarm, remote_link)
+    }
+
+    /// The live host of 2026-09-03 15:25 reported two disconnected seats with
+    /// "128 downlink refused on a full queue" and closed them as
+    /// `queue_overflow`. The queue holds 4 096; the 128 were the deliveries
+    /// the host kept queuing through the two-second release grace after the
+    /// writer had exited on the closed transport — refused by a closed
+    /// channel, not a full one — and the count then failed "the host keeps
+    /// up with its own clock" for a host that was keeping up (#1007).
+    #[test]
+    fn frames_queued_after_the_transport_closed_are_not_a_full_queue() {
+        let (mut swarm, remote_link) = seated_external();
+        let connected = Arc::clone(&remote_link.connected);
+        // The transport closes: the bridge marks the link dead and the writer
+        // task exits, dropping the downlink receiver.
+        connected.store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(remote_link);
+
+        let exterior = swarm.exteriors.get_mut(&1).expect("external slot");
+        for _ in 0..TRANSPORT_CLOSE_GRACE_TICKS {
+            exterior.deliver_from(0, None, Bytes::from_static(b"into the void"));
+        }
+
+        assert_eq!(
+            exterior.downlink_dropped, 0,
+            "nothing was refused by a full queue"
+        );
+        assert_eq!(
+            exterior.downlink_after_close, TRANSPORT_CLOSE_GRACE_TICKS,
+            "every grace-window delivery is counted as queued after close"
+        );
+        let report = exterior.report();
+        assert_eq!(
+            report.close, "disconnected",
+            "a transport that closed under the seat is a disconnect, not a backlog"
+        );
+
+        let mut swarm_report = passing();
+        swarm_report.external = vec![report];
+        let clauses: Vec<&str> = swarm_report
+            .against_criterion(STRICT)
+            .into_iter()
+            .map(|failure| failure.clause)
+            .collect();
+        assert!(
+            clauses.contains(&"the external peer stays connected"),
+            "a mid-attempt disconnect stays a failure: {clauses:?}"
+        );
+        assert!(
+            !clauses.contains(&"the host keeps up with its own clock"),
+            "frames the writer could never have taken say nothing about the host's clock: \
+             {clauses:?}"
+        );
+    }
+
+    /// The other refusal keeps its meaning: a writer that is alive and
+    /// behind fills the bounded queue, and that is the backlog
+    /// `queue_overflow` names.
+    #[test]
+    fn a_full_downlink_queue_is_still_a_queue_overflow() {
+        let (mut swarm, remote_link) = seated_external();
+        let exterior = swarm.exteriors.get_mut(&1).expect("external slot");
+        for _ in 0..=crate::exterior::LINK_QUEUE_DEPTH {
+            exterior.deliver_from(0, None, Bytes::from_static(b"undrained"));
+        }
+
+        assert_eq!(
+            exterior.downlink_frames,
+            u64::try_from(crate::exterior::LINK_QUEUE_DEPTH).expect("depth fits")
+        );
+        assert_eq!(
+            exterior.downlink_dropped, 1,
+            "the one past the depth was refused full"
+        );
+        assert_eq!(exterior.downlink_after_close, 0);
+        assert_eq!(exterior.report().close, "queue_overflow");
+        drop(remote_link);
     }
 
     #[test]
