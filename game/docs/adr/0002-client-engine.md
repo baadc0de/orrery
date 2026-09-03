@@ -22,6 +22,7 @@ This decision is normative for the *Mothership* game project. See the [game ADR 
 
 ## Consequences for Orrery
 
-- A C ABI for the network client and prediction loop, alongside the existing `orrery_sim_host` ABI.
+- A C ABI for the network client (connect) and, above all, the prediction loop, spawn/despawn streaming, interpolation, area-of-interest and the hit-claim path, all of which are Bevy plugins today; `orrery_sim_host` already exports step, snapshot, restore, command and event calls. Plus a `staticlib` crate type and a Windows-capable C-consumer proof. Proposed as Orrery D53 (PR #1022).
+- A Windows measurement of the sidecar IPC threshold (#920) before D52/D53 are accepted, so the in-process choice rests on evidence.
 - A season cook step in the ruleset-distribution path (ADR-0021) that emits and digests the collision package.
-- Amendments to R9 (platforms) and ADR-0004 (the Bevy client is one host; the Unreal host is another).
+- Amendments to R9 (platforms, Orrery D52) and ADR-0004 (the Bevy client is one host; the Unreal host is another, Orrery D53), both in PR #1022. D52 recommends narrowing R9 now and dropping the macOS asset only when the Bevy client stops being the playtest client, since a macOS volunteer banked verified minutes on 2026-09-02 and the CI gates assert a three-runner matrix.
