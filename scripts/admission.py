@@ -82,7 +82,13 @@ def post_json(url: str, body: bytes) -> tuple[int, str]:
     trouble, not a verdict.
     """
     parts = urlparse(url)
-    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=UPLOAD_PROBE_TIMEOUT_SECONDS)
+    # The scheme decides the connection class. Dialling an https origin over
+    # plain HTTP lands on whatever answers port 80 -- for a TLS-fronted origin
+    # that is a 301 to itself, which carries no refusal marker and leaves the
+    # check permanently unverifiable. That is exactly how this probe was inert
+    # against the only origin it exists to protect (#1002).
+    connect = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = connect(parts.hostname, parts.port, timeout=UPLOAD_PROBE_TIMEOUT_SECONDS)
     try:
         conn.putrequest("POST", parts.path or "/")
         conn.putheader("Content-Type", "application/json"); conn.putheader("Content-Length", str(len(body))); conn.putheader("Connection", "close")
@@ -1225,6 +1231,26 @@ class AdmissionTests(unittest.TestCase):
         line = "\n".join(logs.output)
         self.assertIn("cannot verify", line)
         self.assertIn(str(MAX_UPLOAD_BYTES), line, "the warning must still name the ceiling it could not verify")
+    def test_the_probe_dials_https_over_tls_not_port_80(self) -> None:
+        # `post_json` chose its connection class unconditionally, so an https
+        # origin was dialled over plain HTTP; a TLS-fronted origin answers port
+        # 80 with a 301 that carries no refusal marker, and the check sat
+        # permanently unverifiable against the only origin it protects. The
+        # other arms here stub `post_json` and so could not see it (#1002).
+        import http.client as _hc
+        dialled: list[tuple[str, object, object]] = []
+        class _Recorder:
+            def __init__(self, kind: str) -> None: self.kind = kind
+            def __call__(self, host, port, timeout=None):  # noqa: ANN001 - stdlib signature
+                dialled.append((self.kind, host, port)); raise ConnectionRefusedError("recorded")
+        real_https, real_http = _hc.HTTPSConnection, _hc.HTTPConnection
+        _hc.HTTPSConnection, _hc.HTTPConnection = _Recorder("https"), _Recorder("http")
+        try:
+            with self.assertRaises(OSError): post_json("https://campaigns.example/v1/x", b"{}")
+            with self.assertRaises(OSError): post_json("http://localhost:8080/v1/x", b"{}")
+        finally:
+            _hc.HTTPSConnection, _hc.HTTPConnection = real_https, real_http
+        self.assertEqual([d[0] for d in dialled], ["https", "http"], "the url scheme must pick the connection class")
     def test_an_origin_that_passes_the_full_probe_verifies_and_starts(self) -> None:
         seen = []
         def fake_post(url: str, body: bytes) -> tuple[int, str]:
