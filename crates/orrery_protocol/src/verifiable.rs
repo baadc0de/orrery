@@ -70,6 +70,76 @@ pub struct RulesetId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UniverseSeed(pub [u8; 32]);
 
+/// The blake3 `derive_key` context for [`UniverseSeed::fingerprint`].
+///
+/// Domain separation is the whole safety argument: this context appears
+/// nowhere else, so a fingerprint cannot be replayed as, or confused with, a
+/// seed-tree key (`orrery.seeder.v1`) or any other derived material.
+pub const UNIVERSE_SEED_FINGERPRINT_CONTEXT: &str = "orrery.universe-seed-fingerprint.v1";
+
+/// A one-way, domain-separated fingerprint of a [`UniverseSeed`].
+///
+/// It exists so a durable record can say *which* universe it belongs to
+/// without ever holding the universe's secret. 128 bits is a name, not a
+/// secret: it is published in `content/version` and in the seeding manifest,
+/// and inverting it to the seed would mean inverting blake3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct UniverseSeedFingerprint(pub [u8; 16]);
+
+impl UniverseSeedFingerprint {
+    /// The 32 hexadecimal characters an operator types or reads.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Parse the 32-hexadecimal-character form.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when `text` is not exactly 32
+    /// hexadecimal characters.
+    pub fn from_hex(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.len() != 32 {
+            return Err(format!(
+                "expected a 16-byte universe seed fingerprint as 32 hexadecimal characters, got {} characters",
+                text.len()
+            ));
+        }
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+                .map_err(|_| format!("invalid hexadecimal digit at byte {i} in fingerprint"))?;
+        }
+        Ok(Self(out))
+    }
+}
+
+impl core::fmt::Display for UniverseSeedFingerprint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl UniverseSeed {
+    /// The published name of the universe this seed opens.
+    ///
+    /// `blake3::derive_key(UNIVERSE_SEED_FINGERPRINT_CONTEXT, seed)`, truncated
+    /// to its first 16 bytes. One-way and domain-separated: what lands in the
+    /// keyspace names the universe, and the seed itself never does.
+    #[must_use]
+    pub fn fingerprint(&self) -> UniverseSeedFingerprint {
+        let derived = blake3::derive_key(UNIVERSE_SEED_FINGERPRINT_CONTEXT, &self.0);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&derived[..16]);
+        UniverseSeedFingerprint(out)
+    }
+}
+
 /// Where one logged input came from (docs/06 §6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecordSource {
@@ -633,6 +703,57 @@ pub enum Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fingerprint_names_its_seed_and_only_its_seed() {
+        let a = UniverseSeed([0x11; 32]);
+        let b = UniverseSeed([0x12; 32]);
+        assert_eq!(
+            a.fingerprint(),
+            UniverseSeed([0x11; 32]).fingerprint(),
+            "the name of a universe must not depend on when it was asked for"
+        );
+        assert_ne!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "two universes must not share a name"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_discloses_no_part_of_its_seed() {
+        // The carve-out this type exists under (docs/08 §6) is that a
+        // *fingerprint* may live in the keyspace and the seed may not. That
+        // holds only if the fingerprint is not the seed with a haircut.
+        let seed = UniverseSeed([0x5a; 32]);
+        let fingerprint = seed.fingerprint();
+        assert_ne!(
+            fingerprint.0.as_slice(),
+            &seed.0[..16],
+            "a truncation is not a one-way function"
+        );
+        let undomained: [u8; 16] = blake3::hash(&seed.0).as_bytes()[..16]
+            .try_into()
+            .expect("16 bytes");
+        assert_ne!(
+            fingerprint.0, undomained,
+            "an undomained hash would collide with every other use of blake3 on this seed"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_round_trips_through_the_form_an_operator_types() {
+        let fingerprint = UniverseSeed([0x77; 32]).fingerprint();
+        let hex = fingerprint.to_hex();
+        assert_eq!(hex.len(), 32, "32 hexadecimal characters, not 64");
+        assert_eq!(hex, fingerprint.to_string());
+        assert_eq!(
+            UniverseSeedFingerprint::from_hex(&hex).expect("parses"),
+            fingerprint
+        );
+        assert!(UniverseSeedFingerprint::from_hex("beef").is_err());
+        assert!(UniverseSeedFingerprint::from_hex(&"z".repeat(32)).is_err());
+    }
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];

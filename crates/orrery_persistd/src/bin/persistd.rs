@@ -1447,7 +1447,8 @@ async fn main() -> anyhow::Result<()> {
         fdb_context.as_ref(),
         #[cfg(feature = "fdb")]
         strike_restore_hold_source,
-    )?;
+    )
+    .await?;
     let adjudicator_rulesets: Vec<_> = adjudicator
         .as_ref()
         .map(|executor| executor.retained().collect())
@@ -2820,7 +2821,7 @@ where
 /// a dynamic loading path: a production composition replaces this function's
 /// concrete registration at link time.
 #[cfg(feature = "reference-ruleset")]
-fn configured_adjudicator(
+async fn configured_adjudicator(
     universe_seed: Option<UniverseSeedSpec>,
     strikes: StrikesEnforcement,
     strikes_meter: Option<Arc<orrery_persistd::intent::RampMeter>>,
@@ -2833,6 +2834,10 @@ fn configured_adjudicator(
              with `reference-ruleset`: replay must use the universe's VC-3 seed"
         )
     })?;
+    #[cfg(feature = "fdb")]
+    if let Some(context) = fdb_context {
+        check_universe_seed_against_cluster(context, seed.0).await?;
+    }
     let mut executor = AdjudicationExecutor::new(seed.0);
     if let Some(mode) = strike_filing_mode(strikes) {
         #[cfg(feature = "fdb")]
@@ -2866,6 +2871,92 @@ fn configured_adjudicator(
     Ok(Some(Arc::new(executor)))
 }
 
+/// Refuse to adjudicate a universe this process was not given the seed for.
+///
+/// `--universe-seed` is a typed deployment input, and a mistyped one used to
+/// be undetectable: the adjudicator would replay every disputed window against
+/// the wrong keyed RNG stream and return confident verdicts about a world that
+/// never existed. That is worse than an outage, because nothing about it looks
+/// like one.
+///
+/// The cluster's answer is `content/version`'s
+/// `universe_seed_fingerprint` — a one-way, domain-separated name for the
+/// universe, written by `orrery-seed apply --universe-seed-fingerprint` at
+/// universe-creation time (docs/12 §9.3, docs/08 §6). Comparing the
+/// fingerprint of the supplied seed against it turns a silent wrong answer
+/// into a refusal, before the readiness line prints and therefore before any
+/// harness can route a report here.
+///
+/// **An absent row, or a row with no fingerprint, warns and proceeds.** This
+/// is D32's ramp idiom, and the reason is not politeness: every cluster seeded
+/// before this field exists is unsealed, and refusing on absent would brick
+/// all of them on upgrade. "Unsealed" is a fact about the world, not evidence
+/// against the seed.
+#[cfg(all(feature = "fdb", feature = "reference-ruleset"))]
+async fn check_universe_seed_against_cluster(
+    context: &FdbContext,
+    seed: UniverseSeed,
+) -> anyhow::Result<()> {
+    use foundationdb::FdbBindingError;
+
+    let database = context.database();
+    let row = database
+        .run(|trx, _| async move {
+            trx.get(&orrery_persistd::keyspace::content_version_key(), false)
+                .await
+                .map_err(|e| FdbBindingError::new_custom_error(Box::new(e)))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("read content/version to check --universe-seed: {e}"))?;
+
+    let Some(bytes) = row else {
+        tracing::warn!(
+            row = "content/version",
+            "no content/version row: this cluster is unseeded or predates the universe seed \
+             fingerprint, so --universe-seed cannot be checked against it"
+        );
+        return Ok(());
+    };
+
+    let record = orrery_persistd::content_version::decode(&bytes)
+        .map_err(|e| anyhow::anyhow!("read content/version to check --universe-seed: {e}"))?;
+
+    let Some(durable) = record.universe_seed_fingerprint else {
+        tracing::warn!(
+            row = "content/version",
+            content_build = %record.content_build,
+            "content/version carries no universe_seed_fingerprint: this world was seeded \
+             without one, so --universe-seed cannot be checked against it"
+        );
+        return Ok(());
+    };
+
+    let supplied = seed.fingerprint();
+    if supplied != durable {
+        // Name the flag, the row, and both values: an operator reading this
+        // has to be able to tell "I typed the wrong seed" from "I pointed at
+        // the wrong cluster", and neither fingerprint discloses a seed.
+        anyhow::bail!(
+            "--universe-seed does not open the universe this cluster holds: \
+             the content/version row records universe_seed_fingerprint {durable}, \
+             but the seed passed to --universe-seed (or ORRERY_UNIVERSE_SEED) fingerprints \
+             as {supplied}. Refusing to adjudicate: replaying against the wrong universe \
+             returns confident verdicts about a world that never existed. \
+             Pass the seed for content_build {build}, or point --fdb-cluster-file at that \
+             universe's cluster.",
+            build = record.content_build
+        );
+    }
+
+    tracing::info!(
+        row = "content/version",
+        fingerprint = %durable,
+        content_build = %record.content_build,
+        "--universe-seed matches the universe this cluster holds"
+    );
+    Ok(())
+}
+
 /// Map C5's one startup policy to its two distinct enforcement points.
 ///
 /// `StrikeMode` stamps facts at the adjudicator; `StrikesEnforcement` governs
@@ -2884,7 +2975,7 @@ fn strike_filing_mode(strikes: StrikesEnforcement) -> Option<StrikeMode> {
 /// adjudicator. Keeping this as an explicit composition result, rather than a
 /// `GatewayConfig` default side effect, leaves the binary hand-off visible.
 #[cfg(not(feature = "reference-ruleset"))]
-fn configured_adjudicator(
+async fn configured_adjudicator(
     universe_seed: Option<UniverseSeedSpec>,
     strikes: StrikesEnforcement,
     strikes_meter: Option<Arc<orrery_persistd::intent::RampMeter>>,

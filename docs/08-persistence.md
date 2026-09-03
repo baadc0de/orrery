@@ -3237,9 +3237,39 @@ Hot-key conflict retries are application responsibility under optimistic concurr
 | `epoch/{cell_id}` | witness-epoch record: seed-key commitment (blake3), epoch bounds, revealed key at epoch end | coordinator (via gateway) | D10 witness-set seeding; commitment published in the epoch announcement, key revealed for retroactive verifiability |
 | `coord/leader` | coordinator leader lease (TTL) | coordinator (CAS) | active + warm-standby failover ([09-services-and-ops.md](09-services-and-ops.md)) |
 | `pid/next` | next unallocated `PersistId` (atomic add) | gateway (block grants) · intent path | block grants: contiguous ranges (default **4096**) leased per session, journaled, usable offline (§4) |
-| `content/version` | `(content build id, manifest digest, scenario seed, config digest, toolchain, seeded_at)` | offline import tool | designed-content diff/patch on later deploys (§17, [12-world-seeding.md](12-world-seeding.md) §9.3) |
+| `content/version` | `(content build id, manifest digest, scenario seed, config digest, toolchain, seeded_at, universe seed fingerprint?)` | offline import tool | designed-content diff/patch on later deploys (§17, [12-world-seeding.md](12-world-seeding.md) §9.3); the fingerprint names the universe (§6.1) |
 | `seedmap/{content_key}` | `(PersistId, grid, cell, first_seen_build)` | offline import tool | the idmap that makes a re-seed keep its `PersistId`s ([12-world-seeding.md](12-world-seeding.md) §9.2) |
 | `seedprog/{emit}/{grid}/{cell}` | subtree completion marker | offline import tool | resume marker for an interrupted bulk load ([12-world-seeding.md](12-world-seeding.md) §11.1) |
+
+### 6.1 The one secret-adjacent value in the keyspace, and its carve-out
+
+**A domain-separated one-way fingerprint of the universe seed may appear in the
+keyspace; the seed itself may not.** The VC-3 `UniverseSeed` is the key every
+`TickRng` is derived from — publishing it would hand any reader the loot and
+crit rolls of every future tick — so nothing in this table holds it, and
+nothing ever should.
+
+But "which universe is this world?" is a question the keyspace has to be able
+to answer, because `persistd --universe-seed` is a typed deployment input and a
+mistyped one is otherwise **undetectable**: the adjudicator replays every
+disputed window against the wrong keyed stream and returns confident verdicts
+about a world that never existed. That failure does not look like an outage.
+
+`content/version.universe_seed_fingerprint` is the answer, and it is a *name*,
+not a secret: `blake3::derive_key("orrery.universe-seed-fingerprint.v1", seed)`
+truncated to 16 bytes. The context string appears nowhere else, so the value
+cannot be replayed as, or confused with, any other derived material, and
+recovering the seed from it means inverting blake3. It is written by
+`orrery-seed apply --universe-seed-fingerprint <hex32>` — the operator passes
+the *fingerprint*, so the seed never has to travel to a seeding host at all —
+and read by `persistd` at startup, which refuses to install an adjudicator when
+the seed it was handed fingerprints to something else.
+
+**Absent is not evidence.** A row with no fingerprint, or no row at all, means
+the world was seeded before this field existed. `persistd` warns and proceeds:
+refusing on absent would brick every pre-existing cluster on upgrade, and
+"unsealed" is a fact about the world, not a fact about the seed
+([D32](adr/0032-enforcement-ramp.md)'s ramp idiom).
 
 **Implementation.** The byte layout of every row above is defined once, in
 `orrery_persistd::keyspace` — one module used by the checkpointer, the cold

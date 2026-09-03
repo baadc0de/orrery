@@ -59,9 +59,16 @@ pub async fn run(
         &scenario,
         &root,
         &existing_seedmap,
-        &content_build,
-        &seed_display,
-        &config_digest,
+        apply::ContentStamp {
+            content_build: &content_build,
+            seed_display: &seed_display,
+            config_digest: &config_digest,
+            // `verify` does not seal: the fingerprint is whatever the cluster
+            // already holds, read back below. Recomputing a row that claims a
+            // seal the cluster never received is the one thing a read-back
+            // check must not do.
+            universe_seed_fingerprint: None,
+        },
     )
     .await?;
     let existing = apply::load_existing_rows(&db, &scenario, &desired).await?;
@@ -74,12 +81,23 @@ pub async fn run(
         // The trailer is the `content/version` row this same pass built, so
         // the manifest carries the digest the cluster records rather than a
         // separately derived one that could disagree with it.
-        let record = desired
+        let mut record = desired
             .iter()
             .find(|row| row.key == keyspace::content_version_key().to_vec())
-            .map(|row| postcard::from_bytes::<apply::ContentVersion>(&row.value))
-            .transpose()
-            .map_err(|e| format!("decode content/version: {e}"))?;
+            .map(|row| orrery_persistd::content_version::decode(&row.value))
+            .transpose()?;
+        // …with one field that is *not* recomputable: the universe seed
+        // fingerprint was supplied at `apply` time and exists only in the
+        // cluster. Carrying it into the artifact is what lets `verify` later
+        // cross-check a cluster against a manifest offline, which is the whole
+        // reason the seal lives in this record rather than in a row of its own.
+        if let Some(record) = record.as_mut() {
+            record.universe_seed_fingerprint = existing
+                .get(keyspace::content_version_key().as_slice())
+                .map(|bytes| orrery_persistd::content_version::decode(bytes))
+                .transpose()?
+                .and_then(|durable| durable.universe_seed_fingerprint);
+        }
         write_manifest(
             path,
             desired.iter().filter_map(|row| row.manifest.as_ref()),
@@ -250,6 +268,7 @@ mod tests {
             config_digest: "c".to_string(),
             toolchain: "rustc 1.96.0".to_string(),
             seeded_at_ms: 7,
+            universe_seed_fingerprint: None,
         };
         write_manifest(&path, entries.iter(), Some(&record)).expect("write");
 
@@ -288,6 +307,7 @@ mod tests {
             config_digest: "c".to_string(),
             toolchain: "rustc 1.96.0".to_string(),
             seeded_at_ms: 7,
+            universe_seed_fingerprint: None,
         };
         write_manifest(&path, entries.iter(), Some(&record)).expect("write");
 

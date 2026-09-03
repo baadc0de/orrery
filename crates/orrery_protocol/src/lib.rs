@@ -104,6 +104,7 @@ pub use verifiable::{
     AttestationRefusalReason, AttestationVerdict, ChainHash, DeviationKind, DiscrepancyReport,
     EntitySlice, EvidenceBundle, EvidenceCommitment, ForgeryProof, FrameHead, InputRecord,
     IntentContextRef, IntentProposal, IntentResponse, LogFrame, LogRangeRequest, LogRangeResponse,
-    RecordSource, RollingHead, RulesetId, StateClaim, UnadjudicableReason, UniverseSeed, Verdict,
-    WitnessMsg, EVIDENCE_COMMITMENT_PREIMAGE_LEN, MAX_ADJUDICATION_TICKS,
+    RecordSource, RollingHead, RulesetId, StateClaim, UnadjudicableReason, UniverseSeed,
+    UniverseSeedFingerprint, Verdict, WitnessMsg, EVIDENCE_COMMITMENT_PREIMAGE_LEN,
+    MAX_ADJUDICATION_TICKS, UNIVERSE_SEED_FINGERPRINT_CONTEXT,
 };

@@ -1,0 +1,23 @@
+# #947 / D38 clause (d)(1): the universe seed fingerprint in `content/version`.
+#
+# Seven tests execute in this invocation
+# (`-p orrery_persistd -p orrery_seed --features .../fdb`):
+#
+#   - six `orrery_persistd::content_version` library tests pinning the trailer
+#     migration in both directions — a v1 row round-tripping, a v1 row with no
+#     fingerprint, an untagged v0 row bootstrapping to an absent fingerprint,
+#     what an old `postcard::from_bytes` reader actually does with a v1 row
+#     (it reads the same six fields and ignores the rest), a strict reader
+#     refusing it instead of truncating, and the leading-tag counterfactual
+#     that would have corrupted the same read. These need no cluster but run
+#     here and count the same;
+#   - one `orrery_seed` gate, `apply_seals_the_world_to_a_universe_seed_
+#     fingerprint`, which does need one: it drives the shipped binary and reads
+#     the durable row back.
+#
+# The binary refusal proof — a persistd whose `--universe-seed` contradicts the
+# sealed universe exiting instead of printing `"adjudicator": true` — lives in
+# `persistd_ruleset_registration.rs`, which is `#![cfg(feature =
+# "reference-ruleset")]` and so is *not* selected by this invocation. It is not
+# claimed in this floor. That whole file being uncovered by CI predates #947.
+7

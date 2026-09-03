@@ -102,6 +102,32 @@ families, one clean prefix byte; D32 clause (c)'s arithmetic and allocation
 rule carry the same correction. The recovered byte is **not pre-spent** by
 any of them (D51 §(c)).
 
+**Keyspace and at-rest allocation, 2026-09-03 (#947).**
+`content/version` gained a seventh field, `universe_seed_fingerprint`, and with
+it two allocations that are recorded here rather than by a new ADR, because
+neither changes a decision — each spends an allowance an accepted record
+already grants.
+
+- **D31's family arithmetic is untouched.** No prefix byte was allocated and no
+  sub-span was carved: `v` is the same family holding the same single key
+  (`[b'v']`), and the registered-family count is unchanged. This extends a
+  *value*, not the keyspace. The clean byte
+  [D51](adr/0051-v1-terrain-is-not-durable-state.md) recovered stays unspent.
+- **D38 clause (d)(1) allocates encoding version 1 for the `content/version`
+  envelope.** The mechanism is the clause's **trailer**, not a first-byte
+  schema tag: this row has an untagged predecessor, so a leading tag would be
+  read by an old binary as the length varint of `content_build` and shift every
+  field after it — the exact failure the trailer exists to prevent. The shape
+  is `postcard(ContentVersion) ‖ 0x01`, and an **absent trailer is v0** (the
+  bootstrap rule `orrery_protocol::atrest` states). Encoding versions for this
+  envelope are allocated here; the next one is 2.
+
+The consequential carve-out lives with the record it constrains rather than
+here: [08-persistence.md](08-persistence.md) §6.1 states that a
+domain-separated one-way fingerprint of the universe seed may appear in the
+keyspace and the seed itself may not, which is what makes the field legal at
+all.
+
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
 ADR file. D19 deliberately follows that reserved gap.
