@@ -45,6 +45,7 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 | G2.2b | **Escorts (light craft)** have **no jump capability**. They are **expendable equipment of a ship**: carried compacted in its inventory, inflated on demand when a crew member launches, and lost when destroyed (G4.16). Nobody owns an escort; the ship stocks them. | owner mandate (revised 2026-09-03) |
 | G2.2c | **Flip-and-burn craft** use continuous-thrust physics (accelerate, flip, decelerate) with **slightly exaggerated** constants so that in-system travel takes **hours to days**. Used for automated resource delivery, planet and moon landing, and other tasks that are not time-sensitive. | owner mandate |
 | G2.3 | **Two time scales of travel coexist.** Jump (seconds–minutes) is the player's tactical mobility; flip-and-burn (hours–days) is the logistics layer and continues whether or not the owning player is online. | derived from G2.2 |
+| G2.4 | **Bodies are static within a season.** Rotation gives day–night (G9.1); positions are fixed by the season seed, so flip-and-burn plans, jump targets and intercept geometry are stable for the season. | owner decision 2026-09-03 |
 
 ### Engineering consequences of G2
 
@@ -109,6 +110,7 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 | G4.18 | **Death aboard the mothership:** loot drops and is takeable **until NPC security reaches it**; security then **deposits it in the victim's apartment**, or in escrow if homeless. | owner mandate (decision 11) |
 | G4.19 | **Teleport (a) site-to-site within the mothership**, and **(b) from anywhere to the mothership**, allowed only when **not engaged**, with a **cooldown**. No other teleport. | owner mandate (decision 12) |
 | G4.20 | **Macro simulation is a separate service.** A dedicated service advances the slow-moving simulation on its own: buildings raised, **contracts issued**, **contracts taken by NPCs**, and **fulfilled without micro simulation**. The 60 Hz micro simulation never ticks this state. | owner mandate |
+| G4.21 | **Capture by clearing, then NPC conversion.** Players clear and hold an enemy structure; the macro service then converts it to their faction over time, by the same NPC-driven building as G4.11. A captured printer becomes a forward respawn (G3.6). | owner decision 2026-09-03 |
 
 ### Engineering consequences of G4
 
@@ -175,6 +177,7 @@ Numbered so they can be answered one at a time.
 | G6 | **Progression is standing plus possessions.** There is no separate skill tree: what a player can do is what their standing unlocks and what their items grant. | derived from G6.1–G6.4 |
 | G6.1 | **Standing** is gained and lost against **NPC factions** and against **mothership NPC organizations**, which are segmented (**security, logistics, industry, research**, and the like). Each is its own ledger. | owner mandate |
 | G6.2 | **Renown** is the **cumulative standing across the mothership's NPC organizations**. It gates **mothership services**: teleports (G4.19), **clone grades** (G3.1), **apartment luxury** (G4.14), **rights to dock** (G4.15), ship command (G4.3), and so on. | owner mandate |
+| G6.2a | **Renown is a weighted sum of the mothership organization standings, with per-gate floors.** Each gated service may additionally require a minimum standing in a named organization (docking → logistics, clone grade → research, and so on). | owner decision 2026-09-03 |
 | G6.3 | **Items grant abilities and buffs.** Players accumulate and spend resources, craft or purchase items, and those items are what give abilities and buffs. | owner mandate |
 | G6.4 | **Ships are items**, an **extremely expensive** investment, and **only organizations and the mothership can own them** (G4.2). | owner mandate (revised 2026-09-03) |
 | G6.5 | **The core loop is clonable crew.** Players join a **mission** on a ship, use the ship's resources (escorts, mechs, pods, G4.16), fight in **fleet and mech engagements**, die, **respawn aboard the ship** and try again. No player is out doing content alone in a jump-capable hull. Ownership is never the player's burden. | owner mandate (revised 2026-09-03) |
@@ -186,7 +189,7 @@ Numbered so they can be answered one at a time.
 
 ### Engineering consequences of G6
 
-- **Standing is a set of per-faction ledgers on the player**, each a durable signed integer (or bounded scalar) with an attested change log. Renown is a **derived** value, computed from the mothership organizations' ledgers, never stored independently, so it cannot drift from its inputs. The aggregation function (sum, weighted, floor of the minimum) is a ruleset parameter (ADR-0021) and changing it re-derives every player's renown at once.
+- **Standing is a set of per-faction ledgers on the player**, each a durable signed integer (or bounded scalar) with an attested change log. Renown is a **derived** value, computed from the mothership organizations' ledgers, never stored independently, so it cannot drift from its inputs. The weights and per-gate floors (G6.2a) are ruleset parameters (ADR-0021) and changing them re-derives every player's renown at once.
 - **Renown gates are threshold checks at service boundaries** (teleport, clone, dock, command). Each check happens where the service is authoritative (mothership grid or macro service), reads attested standing, and is itself witnessable, so a client cannot claim a grade it lacks. The list of gated services will grow; keep it a table in the ruleset, not code.
 - **Items are the capability system.** "Ability" and "buff" are properties of an item in the ruleset, resolved on equip, so the avatar's effective capabilities are a pure function of attested inventory. This makes full loot (G3.2) also a loss of capability, and it means hit registration and movement (ADR-0008) take their parameters from equipment, which prediction must know before the tick.
 - **A ship is an item with a grid inside it.** Packing (G4.15) is the item form; undocking materialises the grid. The owner is always an organization or the mothership, never an avatar, so ownership is an **organization-level attribute** and **captain assignment** is a separate, revocable right. Ownership and command are different attributes, and both are attested.
@@ -216,6 +219,7 @@ Numbered so they can be answered one at a time.
 | G7.9a | **Anyone can loot anyone.** An **official rivalry** is a declared state that serves as a **friend-or-foe indicator** in the UI; it grants no permission and imposes no restriction. | owner mandate |
 | G7.10 | **Defection is a strategy.** Aligning with opposing NPC factions can bring **alternative, powerful items**, at the risk of both failing to procure resources and losing standing. | owner mandate |
 | G7.11 | **CO and XO** are the commanding and executive officer roles on a ship, assigned by the owner (G4.3, G6.6). | derived from G7.5 |
+| G7.12 | **Crew rights without an officer aboard.** Contract crew may launch stocked loadouts and respawn, but may not move, undock or jump the ship, nor open non-loadout cargo. The NPC pilot (G7.5) holds position. | owner decision 2026-09-03 |
 
 ### Engineering consequences of G7
 
@@ -236,7 +240,7 @@ Numbered so they can be answered one at a time.
 | G8 | **The existing occupants are organized, spacefaring forces** with ships, ground forces and structures. Tech level varies: some are primitive, some **far exceed** player technology. | owner mandate |
 | G8.1 | **The deeper, the meaner.** Opposition strength depends on **location** and **depth of penetration** into a faction's territory. | owner mandate |
 | G8.2 | **NPC fleets are active.** Factions field ships, execute **fleet manoeuvres** against players, plant **decoys** and **bait**, and run **ambush tactics**. | owner mandate |
-| G8.3 | **Fauna: to be decided.** | owner, open |
+| G8.3 | **Fauna is hazard and harvest only.** A local threat to avatars and a resource source (hide, biomass, exotic reagents). Never a mech- or ship-scale threat; no taming. | owner decision 2026-09-03 |
 | G8.4 | **Clandestine missions.** Some NPC factions offer missions for rewards: thwart NPC or player forces on a mission, raid another NPC faction in their stead, and the like. These pay in **items and exotic, high-value resources**. | owner mandate |
 | G8.5 | **Difficulty scales by numbers and tech**, with **scripted encounters** and **objective triggers**. | owner mandate |
 | G8.6 | **Season quests are both handcrafted per season and continuously auto-generated** from system content. | owner mandate |
@@ -280,11 +284,7 @@ Numbered so they can be answered one at a time.
 
 Loose ends collected from the sections above.
 
-- **Fauna** (G8.3): scope and behaviour undecided.
-- **Structure capture** (G4.13): players can destroy NPC-built structures; whether they can capture or take over one is unstated.
-- **Orbital mechanics** (G2, G9): whether bodies move during a season, which affects flip-and-burn geometry and jump targets.
-- **Fair-value formula and NPC take-up delay** (G5.3, G5.5): numbers, to be tuned with telemetry.
-- **Renown aggregation function** (G6.2): sum, weighted, or minimum.
-- **Crew rights** when no organization officer is aboard (G7).
+- **Fair-value formula, NPC take-up delay, renown weights and floors** (G5.3, G5.5, G6.2a): numbers, to be tuned with telemetry.
+- **Capture hold condition** (G4.21): what "holding" a cleared structure means (presence, time, supplies) before conversion starts.
 - **Promotion to ADR**: once the owner marks this document settled, G1–G9 become ADR-0052 (superseding the scope of ADR-0001 where they overlap) and the engineering consequences are triaged into follow-up ADRs, in particular the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
 
