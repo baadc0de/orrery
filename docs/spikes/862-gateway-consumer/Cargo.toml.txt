@@ -1,0 +1,32 @@
+[workspace]
+
+[package]
+name = "spike-862-gateway-consumer"
+version = "0.0.0"
+edition = "2021"
+
+# `main.rs` sits beside the manifest rather than under `src/`, so the whole
+# spike is three files in one directory and the run recipe is a rename.
+[[bin]]
+name = "spike-862-gateway-consumer"
+path = "main.rs"
+
+# The point of the spike is the asymmetry between these two rows.
+#
+# `orrery_persistd` is what the *feed implementation* uses, and it is the only
+# dependency it uses. That is the claim under test: a gateway-side consumer of
+# D33 clause (e)'s invalidations needs nothing from `orrery_identity`, so it
+# adds no edge to the spine and closes no cycle.
+#
+# `orrery_identity` appears only in the harness, as the *writer* — it stands in
+# for the deployed `orrery-identity` binary that really produces `dc` rows. A
+# real persistd binary would not have this row, and could not have it: see
+# `README.md` for the cargo error that proves so.
+[dependencies]
+orrery_persistd = { path = "../../../crates/orrery_persistd", features = ["fdb"] }
+orrery_protocol = { path = "../../../crates/orrery_protocol" }
+orrery_identity = { path = "../../../crates/orrery_identity", features = ["fdb"] }
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"] }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
