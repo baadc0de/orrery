@@ -1,0 +1,36 @@
+# /etc/systemd/system/orrery-admission.service, tracked in the repository by
+# the owner decision of 2026-09-03 (issue #1002): the settings that make
+# banking work must survive a host rebuild, and one of them already failed
+# to.
+#
+# The load-bearing part of the ExecStart is --public-origin
+# https://campaigns.distopik.com. Without it admission skips its startup
+# upload probe entirely -- it logs "upload-limit self-check is off" (#1011)
+# -- and a lost client_max_body_size in the nginx site fronting this origin
+# is silent again, which is exactly how #1002's 413s went unnoticed.
+#
+# What was recorded from the live host on 2026-09-03 is here verbatim: the
+# ExecStart line, and nothing else. The unit's scaffolding -- Description,
+# Type, the user it runs as, restart policy, WantedBy -- was not recorded,
+# and is left as an ORRERY_PLACEHOLDER marker rather than guessed: a unit
+# that looks right and boots the box office as the wrong user or type is
+# worse than one that refuses to install. scripts/deploy-web-tier.sh
+# refuses to install while any marker remains; fill them from the live host
+# (`systemctl cat orrery-admission.service`), commit, and deploy. Delete a
+# placeholder line outright if the live unit simply carries no such key.
+
+[Unit]
+Description=ORRERY_PLACEHOLDER_UNIT_DESCRIPTION
+# ORRERY_PLACEHOLDER_UNIT_EXTRAS: any other [Unit] keys the live unit
+# carries (After=, Wants=, ...) were not recorded. Replace this comment
+# with them.
+
+[Service]
+Type=ORRERY_PLACEHOLDER_SERVICE_TYPE
+# ORRERY_PLACEHOLDER_SERVICE_EXTRAS: User=/Group=, Restart=, Environment=
+# and any other [Service] keys the live unit carries were not recorded.
+# Replace this comment with them, keeping the ExecStart below verbatim.
+ExecStart=/usr/bin/python3 /opt/orrery/bin/admission.py --control /etc/orrery/campaigns.conf --state /var/lib/orrery-admission --invite /opt/orrery/bin/orrery-invite --issuer /var/lib/orrery-admission/issuer.cred --swarm /opt/orrery/bin/p1-swarm --ssh-key /var/lib/orrery-admission/campaign_ssh_key --listen 127.0.0.1:8080 --public-origin https://campaigns.distopik.com
+
+[Install]
+WantedBy=ORRERY_PLACEHOLDER_WANTED_BY

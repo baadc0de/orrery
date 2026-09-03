@@ -373,6 +373,22 @@ lane_gates() {
     run cargo build --quiet -p orrery_identity --bins
     run python3 scripts/admission.py --self-test
 
+    # #1002's owner decision (2026-09-03) tracks the campaigns host's
+    # web-tier config in the repo, next to the application whose ceiling it
+    # serves: scripts/campaigns.nginx.conf and
+    # scripts/orrery-admission.service, installed by
+    # scripts/deploy-web-tier.sh. The defect was two limits where the
+    # smaller one was invisible -- nginx's 1 MiB default sat in front of
+    # admission's MAX_UPLOAD_BYTES and silently 413'd every volunteer
+    # upload -- so the self-test pins the tracked nginx limit to
+    # MAX_UPLOAD_BYTES read from scripts/admission.py itself, pins
+    # --public-origin on the unit's ExecStart (without it #1011's startup
+    # probe is off and the regression is silent again), and exercises the
+    # installer's placeholder refusal, idempotent re-run and
+    # refuse-on-drift behaviour against throwaway roots. No host, no root,
+    # no nginx, no network; about a second.
+    run scripts/deploy-web-tier.sh --self-test
+
     # #474's standing-host supervisor. Its process test proves a failed
     # harness child is reaped before a fresh attempt starts, with a separate
     # report directory; the real binary is deliberately not needed here.
