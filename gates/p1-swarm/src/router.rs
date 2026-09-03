@@ -202,9 +202,49 @@ struct PacketFate {
 
 /// Which lane a fate draw belongs to, so the two never collide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum FateLane {
+pub enum FateLane {
     Datagram,
     Stream,
+}
+
+impl FateLane {
+    /// The wire spelling used in the attempt report's `per_link_impairment`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Datagram => "datagram",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+/// One directed link and the lane its packets took.
+///
+/// Named rather than a `(LinkId, FateLane)` tuple: the two are not
+/// interchangeable and a tuple key says nothing about which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LinkLane {
+    link: LinkId,
+    lane: FateLane,
+}
+
+/// What one directed link carried on one lane.
+///
+/// The swarm-wide [`RouterCounters`] cannot answer #572 §6.1: a cohort attempt
+/// has one leg per human, and a band computed from the cohort aggregate would
+/// pass an attempt in which one human's leg ran clean. These are the per-leg
+/// numbers that band is drawn over.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LinkCounters {
+    /// Packets carried end to end on this link and lane.
+    pub delivered: u64,
+    /// Datagrams the loss model discarded. Zero on the stream lane by
+    /// construction: a reliable message is retransmitted, never dropped.
+    pub dropped: u64,
+    /// Packets the jitter model held back.
+    pub delayed: u64,
+    /// Wire bytes offered, including per-datagram overhead.
+    pub bytes: u64,
 }
 
 impl PacketFate {
@@ -253,6 +293,8 @@ pub struct Router {
     shared_tail: Vec<(LinkId, u64)>,
     /// Counters, exposed for the report.
     pub counters: RouterCounters,
+    /// The same counters split per directed link and lane, for #572 §6.1.
+    per_link: BTreeMap<LinkLane, LinkCounters>,
 }
 
 impl Router {
@@ -266,7 +308,24 @@ impl Router {
             in_flight: VecDeque::new(),
             shared_tail: Vec::new(),
             counters: RouterCounters::default(),
+            per_link: BTreeMap::new(),
         }
+    }
+
+    /// Per-directed-link, per-lane impairment evidence, in link order.
+    ///
+    /// Yields `(from, to, lane, counters)`. The caller owns the translation
+    /// from transport identity to swarm slot; the router never knew the
+    /// sender's slot, only its `NodeId`.
+    pub fn per_link(&self) -> impl Iterator<Item = (NodeId, usize, FateLane, LinkCounters)> + '_ {
+        self.per_link
+            .iter()
+            .map(|(key, counters)| (key.link.from, key.link.to, key.lane, *counters))
+    }
+
+    /// The bucket one packet's fate is counted in.
+    fn link_counters(&mut self, link: LinkId, lane: FateLane) -> &mut LinkCounters {
+        self.per_link.entry(LinkLane { link, lane }).or_default()
     }
 
     /// The impairment stream for one directed link, created on first use.
@@ -345,6 +404,9 @@ impl Router {
         payload: Bytes,
     ) {
         self.counters.bytes += payload.len() as u64 + DATAGRAM_OVERHEAD;
+        let offered_bytes = payload.len() as u64 + DATAGRAM_OVERHEAD;
+        self.link_counters(LinkId { from, to }, FateLane::Stream)
+            .bytes += offered_bytes;
 
         // Retransmit until it lands. A real stream retries a *segment*, so a
         // large message is more likely to need at least one — charge it per
@@ -414,13 +476,18 @@ impl Router {
         payload: Bytes,
     ) -> DatagramDisposition {
         self.counters.bytes += payload.len() as u64 + DATAGRAM_OVERHEAD;
-        match self.schedule(tick, LinkId { from, to }, &payload) {
+        let link = LinkId { from, to };
+        self.link_counters(link, FateLane::Datagram).bytes +=
+            payload.len() as u64 + DATAGRAM_OVERHEAD;
+        match self.schedule(tick, link, &payload) {
             Fate::Dropped => {
                 self.counters.dropped += 1;
+                self.link_counters(link, FateLane::Datagram).dropped += 1;
                 DatagramDisposition::Dropped
             }
             Fate::Delayed(due) => {
                 self.counters.delayed += 1;
+                self.link_counters(link, FateLane::Datagram).delayed += 1;
                 self.in_flight.push_back(InFlight {
                     to,
                     from,
@@ -453,11 +520,21 @@ impl Router {
         let mut held = VecDeque::with_capacity(self.in_flight.len());
         while let Some(packet) = self.in_flight.pop_front() {
             if packet.due <= tick {
-                if packet.stream.is_some() {
+                let lane = if packet.stream.is_some() {
                     self.counters.stream_delivered += 1;
+                    FateLane::Stream
                 } else {
                     self.counters.delivered += 1;
-                }
+                    FateLane::Datagram
+                };
+                self.link_counters(
+                    LinkId {
+                        from: packet.from,
+                        to: packet.to,
+                    },
+                    lane,
+                )
+                .delivered += 1;
                 out.push(Delivery {
                     to: packet.to,
                     from: packet.from,
