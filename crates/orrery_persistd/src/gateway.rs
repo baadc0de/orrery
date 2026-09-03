@@ -8687,6 +8687,12 @@ async fn apply_authority_correction(
     };
     if let Some(meter) = metrics.ramp_meter.as_deref() {
         meter.qualify(subject_account);
+        // D32 open question 6, resolved 2026-09-03: the window records the
+        // RulesetIds it observed rather than resetting on a change, so a
+        // reviewer sees a window that spanned one and judges it. The report
+        // is the evidence naming the ruleset, and the stamp rides the same
+        // ungated counting point as the denominator.
+        meter.observe_ruleset(report.bundle.ruleset);
     }
 
     let mode = posture.get();

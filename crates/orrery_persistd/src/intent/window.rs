@@ -42,6 +42,7 @@
 //! | fleet, armed, natural, unattributed volumes | yes | clause (e)'s `coverage` and `fp_count` |
 //! | verdict and cause histograms | yes | the outcome split, exhaustive |
 //! | `H` accounts that were active / would-have-acted | yes, as **sets** | a cardinality cannot be folded from counts, and `\|H\|` is bounded by an operator's sampling |
+//! | the `RulesetId`s the window observed | yes, as a **set** | the stamp, below — a window that spanned a ruleset change says so instead of resetting |
 //! | fleet-wide distinct-account cardinalities | **no** | see below |
 //!
 //! Set cardinalities cannot be added across flushes or across processes — the
@@ -78,13 +79,31 @@
 //! process the new window instead. A reset therefore costs at most one flush
 //! interval of post-reset observations per live process, and buys the property
 //! it exists for: no observation taken before a semantic change can be counted
-//! into the window opened after it. Clause (e) evidence spanning a ruleset
-//! change would be worse than a short window, which is the trade this makes
-//! explicitly.
+//! into the window opened after it. A semantic change the operator *does*
+//! reset for is excluded that way; one they do not is the stamp's business,
+//! in the next section.
 //!
-//! Whether a ruleset change should reset the window *automatically* is a
-//! policy question and is not decided here. See the owner note in
-//! `docs/adr/0032-enforcement-ramp.md`'s open questions.
+//! # The ruleset stamp, and why a ruleset change does not reset the window
+//!
+//! Whether a ruleset change should reset the window *automatically* was D32
+//! open question 6, and the owner decided it on 2026-09-03: **no**. A reset
+//! discards evidence irreversibly — this store keeps no history — and clause
+//! (f) scopes `RulesetId` to the verdict-driven controls C3/C4/C5 only, so an
+//! automatic reset would fire for some controls and not others, an
+//! inconsistency worse than the problem it solved. `orrery-ramp window
+//! reset` remains the deliberate operator act, unchanged.
+//!
+//! What landed instead is the stamp: [`WindowCounts::ruleset_ids`] records
+//! the `RulesetId`s the window's counters observed, folding by union exactly
+//! like the account sets and bounded by [`MAX_DURABLE_RULESET_IDS`] with the
+//! overflow reported rather than absorbed. A window that spanned a ruleset
+//! change therefore carries both ids, and
+//! [`super::report`]'s `provenance.windows` publishes them, so a reviewer
+//! sees the span and judges the evidence instead of the fleet deciding for
+//! them. The stamp rides the same counting point as the denominator:
+//! `RampMeter::observe_ruleset` is called where the meter first sees the
+//! ruleset, which for C4 is every metered report and for C5 every
+//! shadow-filed strike.
 //!
 //! # Why these rows carry no signature
 //!
@@ -110,7 +129,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use orrery_protocol::AccountId;
+use orrery_protocol::{AccountId, RulesetId};
 use serde::{Deserialize, Serialize};
 
 /// How many `H` account ids one window row records per set.
@@ -133,6 +152,36 @@ pub const MAX_DURABLE_COHORT_ACCOUNTS: usize = 1_024;
 /// document, for the same reason: the one free-text field an operator controls
 /// must not become a storage amplifier.
 pub const MAX_WINDOW_REASON_BYTES: usize = 256;
+
+/// How many distinct `RulesetId`s one window row records.
+///
+/// Distinct rulesets are build identities, not per-account cardinalities: a
+/// fleet that is not churning its rules observes a handful over even a
+/// thirty-day window, and 64 leaves an order of magnitude over the most
+/// churned plausible one. The ids are not operator- or meter-chosen, though —
+/// they arrive inside evidence bundles — so the set is bounded anyway, and
+/// 64 × 36 B keeps it far inside FoundationDB's 100 KiB value bound even
+/// alongside four full cohort account sets. Overflow is *reported* through
+/// [`WindowCounts::rulesets_truncated`] rather than absorbed, on the same
+/// principle as [`MAX_DURABLE_COHORT_ACCOUNTS`]: a window's ruleset span that
+/// is silently understated is exactly the fact this stamp exists to surface.
+pub const MAX_DURABLE_RULESET_IDS: usize = 64;
+
+/// The spelling an observed `RulesetId` takes in the artifact and in
+/// `orrery-ramp window show`: `v<version>:<64 hex>`.
+///
+/// The full digest is kept, not shortened to a prefix: the label is evidence,
+/// and a truncated one could not distinguish two builds of the same version —
+/// which is the exact situation a window spanning a ruleset change presents.
+#[must_use]
+pub fn ruleset_stamp_label(ruleset: &RulesetId) -> String {
+    let digest: String = ruleset
+        .digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("v{}:{digest}", ruleset.version)
+}
 
 /// One population's volumes inside the window.
 ///
@@ -215,12 +264,29 @@ pub struct WindowCounts {
     /// promotion review reads first, because these are real players the
     /// control would have refused.
     pub natural_would_act: BTreeSet<AccountId>,
+    /// Every `RulesetId` this window's counters observed — D32 open question
+    /// 6's stamp, decided 2026-09-03.
+    ///
+    /// A window that spanned a ruleset change carries every id it saw, so a
+    /// reviewer judges the span instead of the fleet resetting for them. The
+    /// set folds by union exactly like the account sets above, is bounded by
+    /// [`MAX_DURABLE_RULESET_IDS`], and its overflow is counted in
+    /// [`Self::rulesets_truncated`] rather than dropped. Protocol-level
+    /// controls (C1, C2) carry an empty set by construction: clause (f)
+    /// scopes the dimension to the verdict-driven C3/C4/C5, and their meters
+    /// are never handed a ruleset.
+    pub ruleset_ids: BTreeSet<RulesetId>,
     /// Every recorded verdict by its label, admitting ones included.
     pub by_verdict: BTreeMap<String, u64>,
     /// Distinct `H` accounts a set could not record because it was already at
     /// [`MAX_DURABLE_COHORT_ACCOUNTS`]. Nonzero means the cohort's `active`
     /// and `accounts_would_act` figures are understated by at most this much.
     pub cohort_accounts_truncated: u64,
+    /// Distinct `RulesetId`s [`Self::ruleset_ids`] could not record because it
+    /// was already at [`MAX_DURABLE_RULESET_IDS`]. Nonzero means the window's
+    /// ruleset span is understated — there were rulesets it saw that the row
+    /// cannot name.
+    pub rulesets_truncated: u64,
     /// Whether any flush into this window carried traffic from the meter's
     /// past-capacity truncation bucket.
     ///
@@ -234,16 +300,24 @@ pub struct WindowCounts {
     pub fleet_truncation_seen: bool,
 }
 
-fn fold_set(into: &mut BTreeSet<AccountId>, from: &BTreeSet<AccountId>, truncated: &mut u64) {
-    for account in from {
-        if into.contains(account) {
+/// Union `from` into `into`, counting the ids that did not fit `cap` into
+/// `truncated` rather than dropping them silently. One body for the cohort
+/// account sets and the ruleset stamp, at their own bounds.
+fn fold_set<T: Copy + Ord>(
+    into: &mut BTreeSet<T>,
+    from: &BTreeSet<T>,
+    cap: usize,
+    truncated: &mut u64,
+) {
+    for item in from {
+        if into.contains(item) {
             continue;
         }
-        if into.len() >= MAX_DURABLE_COHORT_ACCOUNTS {
+        if into.len() >= cap {
             *truncated = truncated.saturating_add(1);
             continue;
         }
-        into.insert(*account);
+        into.insert(*item);
     }
 }
 
@@ -265,23 +339,39 @@ impl WindowCounts {
         self.armed.fold(&other.armed);
         self.natural.fold(&other.natural);
         let mut truncated = self.cohort_accounts_truncated;
-        fold_set(&mut self.armed_active, &other.armed_active, &mut truncated);
+        fold_set(
+            &mut self.armed_active,
+            &other.armed_active,
+            MAX_DURABLE_COHORT_ACCOUNTS,
+            &mut truncated,
+        );
         fold_set(
             &mut self.natural_active,
             &other.natural_active,
+            MAX_DURABLE_COHORT_ACCOUNTS,
             &mut truncated,
         );
         fold_set(
             &mut self.armed_would_act,
             &other.armed_would_act,
+            MAX_DURABLE_COHORT_ACCOUNTS,
             &mut truncated,
         );
         fold_set(
             &mut self.natural_would_act,
             &other.natural_would_act,
+            MAX_DURABLE_COHORT_ACCOUNTS,
             &mut truncated,
         );
         self.cohort_accounts_truncated = truncated.saturating_add(other.cohort_accounts_truncated);
+        let mut rulesets_truncated = self.rulesets_truncated;
+        fold_set(
+            &mut self.ruleset_ids,
+            &other.ruleset_ids,
+            MAX_DURABLE_RULESET_IDS,
+            &mut rulesets_truncated,
+        );
+        self.rulesets_truncated = rulesets_truncated.saturating_add(other.rulesets_truncated);
         self.fleet_truncation_seen |= other.fleet_truncation_seen;
         for (verdict, count) in &other.by_verdict {
             let slot = self.by_verdict.entry(verdict.clone()).or_default();
@@ -492,9 +582,9 @@ impl FdbRampWindowStore {
     /// `persistd` processes meter the same control and an absolute write would
     /// silently drop every other writer's contribution. Every field of
     /// [`WindowCounts`] folds monotonically — volumes add, bounds take min and
-    /// max, account sets union — so the transaction needs no coordination
-    /// beyond FoundationDB's own serializability, and a retried transaction
-    /// applies the same delta once.
+    /// max, account and ruleset sets union — so the transaction needs no
+    /// coordination beyond FoundationDB's own serializability, and a retried
+    /// transaction applies the same delta once.
     ///
     /// A row absent altogether is *opened* here, at generation 0, with
     /// `opened_at_ms = now_ms`. The implicit open is deliberate: a fleet that
@@ -549,8 +639,10 @@ impl FdbRampWindowStore {
     /// Open a fresh generation, retiring everything the current one observed.
     ///
     /// The deliberate reset. It is an operator act and not an automatic one:
-    /// see the module docs, and the owner note on whether a ruleset change
-    /// should trigger it without asking.
+    /// the owner declined the automatic trigger for D32 open question 6 on
+    /// 2026-09-03 — the window stamps the rulesets it observed instead — so
+    /// this stays the only way a ruleset change retires a window. See the
+    /// module docs.
     ///
     /// Returns the row it wrote. The previous generation's counters are
     /// **gone** — this store keeps no history, because D32 open question 2's
@@ -761,6 +853,53 @@ mod tests {
         );
     }
 
+    fn ruleset(version: u32, byte: u8) -> RulesetId {
+        RulesetId {
+            version,
+            digest: [byte; 32],
+        }
+    }
+
+    /// The owner's 2026-09-03 decision on D32 open question 6, at the row's
+    /// level: a window that observed two rulesets stamps both, and the set
+    /// unions across folds exactly the way the account sets do — a ruleset
+    /// seen by two flushes is one entry, and a change mid-window leaves both
+    /// ids on the row for a reviewer to judge.
+    #[test]
+    fn a_window_that_observed_two_rulesets_carries_both_and_unions_across_folds() {
+        let mut into = WindowCounts {
+            ruleset_ids: [ruleset(9, 0xAA)].into_iter().collect(),
+            ..WindowCounts::default()
+        };
+        into.fold(&WindowCounts {
+            ruleset_ids: [ruleset(9, 0xAA), ruleset(10, 0xBB)].into_iter().collect(),
+            ..WindowCounts::default()
+        });
+        assert_eq!(
+            into.ruleset_ids,
+            [ruleset(9, 0xAA), ruleset(10, 0xBB)].into_iter().collect(),
+            "the shared ruleset is one entry and the change is visible as both"
+        );
+        assert_eq!(into.rulesets_truncated, 0);
+    }
+
+    #[test]
+    fn the_ruleset_set_bound_reports_its_overflow_instead_of_absorbing_it() {
+        let mut into = WindowCounts::default();
+        let wide: BTreeSet<RulesetId> = (0..u32::try_from(MAX_DURABLE_RULESET_IDS).unwrap() + 3)
+            .map(|version| ruleset(version, 0x11))
+            .collect();
+        into.fold(&WindowCounts {
+            ruleset_ids: wide,
+            ..WindowCounts::default()
+        });
+        assert_eq!(into.ruleset_ids.len(), MAX_DURABLE_RULESET_IDS);
+        assert_eq!(
+            into.rulesets_truncated, 3,
+            "the three that did not fit are reported, not silently dropped"
+        );
+    }
+
     #[test]
     fn window_days_is_zero_for_a_window_with_no_observations() {
         let row = RampWindowRow::opened(3, 1_000, Some("ruleset v9".to_owned()));
@@ -786,9 +925,26 @@ mod tests {
         row.counts.armed = tally(3, 2, 1);
         row.counts.armed_would_act = [account(77)].into_iter().collect();
         row.counts.by_verdict.insert("would_refuse".to_owned(), 1);
+        row.counts.ruleset_ids = [ruleset(9, 0xAA), ruleset(10, 0xBB)].into_iter().collect();
         let bytes = postcard::to_allocvec(&row).expect("encode");
         let back: RampWindowRow = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(row, back);
+    }
+
+    /// The stamp's spelling, as the artifact and `window show` render it.
+    /// The full digest is kept: two builds of one version must be
+    /// distinguishable, which is the situation a spanning window presents.
+    #[test]
+    fn the_stamp_label_carries_the_version_and_the_whole_digest() {
+        assert_eq!(
+            ruleset_stamp_label(&ruleset(9, 0xAB)),
+            format!("v9:{}", "ab".repeat(32))
+        );
+        assert_ne!(
+            ruleset_stamp_label(&ruleset(9, 0xAB)),
+            ruleset_stamp_label(&ruleset(9, 0xCD)),
+            "same version, different build — a shortened digest could not tell them apart"
+        );
     }
 }
 
@@ -1083,6 +1239,69 @@ mod fdb_tests {
         let seen = right.snapshot(&cohort);
         assert_eq!(seen.cohort.qualifying, 12);
         assert!((seen.window_days - 12.0).abs() < 1e-9);
+
+        store.clear(control).await.expect("clear");
+    }
+
+    /// The ruleset stamp folds across flushes the way every other window
+    /// field does: two processes, each observing a different pair of
+    /// rulesets, leave one row naming all three — so a window that spanned a
+    /// change says so durably, per the owner's 2026-09-03 decision on D32
+    /// open question 6.
+    #[tokio::test]
+    async fn a_ruleset_stamp_folds_across_flushes_like_the_other_fields() {
+        let Some(_) = fdb_cluster_file() else {
+            return;
+        };
+        let control = "test_window_rulesets";
+        let store = store();
+        store.clear(control).await.expect("clear");
+        let cohort = cohort();
+
+        let v9 = RulesetId {
+            version: 9,
+            digest: [0xAA; 32],
+        };
+        let v10 = RulesetId {
+            version: 10,
+            digest: [0xBB; 32],
+        };
+        let v11 = RulesetId {
+            version: 11,
+            digest: [0xCC; 32],
+        };
+
+        let before = RampMeter::new("attestation_quorum");
+        before.observe_ruleset(v9);
+        before.observe_ruleset(v10);
+        run_traffic(&before, 0..2);
+        let first = before.take_delta(&cohort);
+        let FlushOutcome::Applied(row) = store.flush(control, &first, 1).await.expect("flush")
+        else {
+            panic!("nothing else writes this control's window");
+        };
+        before.commit_flush(*row);
+
+        // The change: the second flush observes v10 again — which must stay
+        // one entry — and a new v11, which must join it.
+        let after = RampMeter::new("attestation_quorum");
+        after.restore(store.load(control).await.expect("load").expect("row"));
+        after.observe_ruleset(v10);
+        after.observe_ruleset(v11);
+        run_traffic(&after, 2..4);
+        let second = after.take_delta(&cohort);
+        let FlushOutcome::Applied(row) = store.flush(control, &second, 2).await.expect("flush")
+        else {
+            panic!("same generation, so the delta applies");
+        };
+        assert_eq!(row.flushes, 2);
+        assert_eq!(
+            row.counts.ruleset_ids,
+            [v9, v10, v11].into_iter().collect(),
+            "the row names every ruleset the window observed, across both flushes"
+        );
+        assert_eq!(row.counts.rulesets_truncated, 0);
+        after.commit_flush(*row);
 
         store.clear(control).await.expect("clear");
     }

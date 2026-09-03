@@ -141,7 +141,7 @@ use orrery_persistd::intent::posture::{self, SignedRampPosture};
 use orrery_persistd::intent::report::{
     assemble_from_durable, DurableControl, ProvenanceRefusal, TrafficClaim,
 };
-use orrery_persistd::intent::window::{FdbRampWindowStore, RampWindowRow};
+use orrery_persistd::intent::window::{ruleset_stamp_label, FdbRampWindowStore, RampWindowRow};
 use orrery_persistd::intent::{FdbRampPostureStore, PostureSource, RampMode, RampPosture};
 
 /// The longest `reason` this tool will sign.
@@ -682,6 +682,20 @@ fn window_lines(control: &str, row: &RampWindowRow) -> Vec<String> {
             counts.unattributed.would_act
         ),
     ];
+    // The ruleset stamp, D32 open question 6's resolution: a window that
+    // spanned a ruleset change names every ruleset it observed, and the
+    // operator reading this sees the span the artifact will publish.
+    if !counts.ruleset_ids.is_empty() {
+        let labels: Vec<String> = counts.ruleset_ids.iter().map(ruleset_stamp_label).collect();
+        lines.push(format!("  rulesets observed: {}", labels.join(", ")));
+    }
+    if counts.rulesets_truncated > 0 {
+        lines.push(format!(
+            "  WARNING: {} ruleset id(s) did not fit the row; the list above \
+             names fewer rulesets than this window actually observed",
+            counts.rulesets_truncated
+        ));
+    }
     if counts.cohort_accounts_truncated > 0 {
         lines.push(format!(
             "  WARNING: {} cohort account id(s) did not fit the row; the \
@@ -861,6 +875,7 @@ mod tests {
     use super::*;
     use orrery_persistd::gateway::STRIKES_CONTROL;
     use orrery_persistd::intent::QUARANTINE_VALIDATION_CONTROL;
+    use orrery_protocol::RulesetId;
 
     fn key() -> iroh::SecretKey {
         iroh::SecretKey::from_bytes(&[3; 32])
@@ -1061,6 +1076,54 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("truncation bucket"), "{rendered}");
+    }
+
+    /// The ruleset stamp renders for the operator the way it renders in the
+    /// artifact: a window that spanned a change names every ruleset it saw,
+    /// and an understated span is warned about rather than absorbed.
+    #[test]
+    fn the_window_summary_names_the_rulesets_it_observed() {
+        let mut row = RampWindowRow::opened(0, 0, None);
+        row.counts.ruleset_ids = [
+            RulesetId {
+                version: 9,
+                digest: [0xAB; 32],
+            },
+            RulesetId {
+                version: 10,
+                digest: [0xCD; 32],
+            },
+        ]
+        .into_iter()
+        .collect();
+        let rendered = window_lines("strikes", &row).join("\n");
+        assert!(
+            rendered.contains(&ruleset_stamp_label(&RulesetId {
+                version: 9,
+                digest: [0xAB; 32]
+            })),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&ruleset_stamp_label(&RulesetId {
+                version: 10,
+                digest: [0xCD; 32]
+            })),
+            "{rendered}"
+        );
+
+        row.counts.rulesets_truncated = 5;
+        let rendered = window_lines("strikes", &row).join("\n");
+        assert!(
+            rendered.contains("5 ruleset id(s) did not fit"),
+            "{rendered}"
+        );
+
+        // And a window that observed no rulesets says nothing, rather than
+        // inventing an empty claim.
+        let silent =
+            window_lines("attestation_quorum", &RampWindowRow::opened(0, 0, None)).join("\n");
+        assert!(!silent.contains("rulesets"), "{silent}");
     }
 
     #[test]

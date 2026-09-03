@@ -62,12 +62,15 @@
 //!    thresholds: clause (e)'s floors stay in the record and in
 //!    `scripts/ramp-report.py`.
 //! 3. **What it rests on is published with it.** [`Provenance::windows`]
-//!    carries each row's generation, open time, flush count and reset reason,
-//!    so a reviewer holding the same cluster file reads the same rows back,
-//!    and a reviewer without one still sees whether this was a fleet
-//!    measurement or one process writing once. The note is *assembled*, not
-//!    typed: the assembler states the gaps itself, so the operator's free text
-//!    is additional rather than the only place the caveats could have lived.
+//!    carries each row's generation, open time, flush count, reset reason and
+//!    the `RulesetId`s the window observed, so a reviewer holding the same
+//!    cluster file reads the same rows back, and a reviewer without one still
+//!    sees whether this was a fleet measurement or one process writing once —
+//!    and whether the window's counters straddle a ruleset change, which is
+//!    the stamp behind D32 open question 6's 2026-09-03 resolution. The note
+//!    is *assembled*, not typed: the assembler states the gaps itself, so the
+//!    operator's free text is additional rather than the only place the
+//!    caveats could have lived.
 //!
 //! What this deliberately does **not** do is invent a cryptographic
 //! provenance. Signing the artifact, or the rows behind it, would need a
@@ -81,7 +84,7 @@
 use super::ramp::{
     Provenance, RampArtifact, RampMeter, RampSnapshot, WindowProvenance, RAMP_ARTIFACT_SCHEMA,
 };
-use super::window::RampWindowRow;
+use super::window::{ruleset_stamp_label, RampWindowRow};
 use super::HonestCohort;
 
 /// What an operator asserts about the traffic behind a run.
@@ -226,6 +229,13 @@ pub fn assemble_from_durable(
                 flushes: row.flushes,
                 reset_reason: row.reset_reason.clone(),
                 cohort_accounts_truncated: row.counts.cohort_accounts_truncated,
+                ruleset_ids: row
+                    .counts
+                    .ruleset_ids
+                    .iter()
+                    .map(ruleset_stamp_label)
+                    .collect(),
+                rulesets_truncated: row.counts.rulesets_truncated,
             })
         })
         .collect::<Vec<_>>();
@@ -343,6 +353,7 @@ pub const fn schema() -> &'static str {
 mod tests {
     use super::*;
     use orrery_protocol::AccountId;
+    use orrery_protocol::RulesetId;
 
     const C1: &str = super::super::ATTESTATION_QUORUM_CONTROL;
     const C5: &str = crate::gateway::STRIKES_CONTROL;
@@ -359,6 +370,13 @@ mod tests {
             cohort.sample(AccountId::new(account));
         }
         cohort
+    }
+
+    fn ruleset(version: u32, byte: u8) -> RulesetId {
+        RulesetId {
+            version,
+            digest: [byte; 32],
+        }
     }
 
     /// A window with clause (e)'s halves populated separately, as a fleet's
@@ -390,6 +408,9 @@ mod tests {
         row.counts.natural_would_act = [AccountId::new(2)].into_iter().collect();
         row.counts.by_verdict.insert("would_admit".to_owned(), 959);
         row.counts.by_verdict.insert("would_refuse".to_owned(), 41);
+        // A window whose counters straddle a ruleset change: the stamp the
+        // owner chose for D32 open question 6 instead of an automatic reset.
+        row.counts.ruleset_ids = [ruleset(9, 0xAA), ruleset(10, 0xBB)].into_iter().collect();
         row
     }
 
@@ -519,6 +540,55 @@ mod tests {
         let c1 = &artifact.controls[0];
         assert!(c1.truncation_seen, "the row's flag reaches the artifact");
         assert!(artifact.provenance.note.contains("truncation bucket"));
+    }
+
+    /// The ruleset stamp reaches `provenance.windows` beside the row's other
+    /// identity: both ids a spanning window observed, ordered, with any
+    /// truncation reported rather than absorbed.
+    #[test]
+    fn provenance_publishes_the_rulesets_the_window_observed() {
+        let artifact = assemble_from_durable(
+            TrafficClaim::Production,
+            &cohort_of([1], [2, 3]),
+            &controls(Some(window())),
+            "test",
+            None,
+        )
+        .expect("assembles");
+        let stamped = &artifact.provenance.windows[0];
+        assert_eq!(
+            stamped.ruleset_ids,
+            vec![
+                ruleset_stamp_label(&ruleset(9, 0xAA)),
+                ruleset_stamp_label(&ruleset(10, 0xBB)),
+            ],
+            "both rulesets, in the row's own order, so the span is readable"
+        );
+        assert_eq!(stamped.rulesets_truncated, 0);
+
+        let mut truncated_row = window();
+        truncated_row.counts.rulesets_truncated = 2;
+        let artifact = assemble_from_durable(
+            TrafficClaim::Production,
+            &cohort_of([1], [2, 3]),
+            &controls(Some(truncated_row)),
+            "test",
+            None,
+        )
+        .expect("assembles");
+        assert_eq!(
+            artifact.provenance.windows[0].rulesets_truncated, 2,
+            "the understated span is reported, not absorbed"
+        );
+
+        // The artifact is what the report script reads, so the stamp must be
+        // in the file's own spelling.
+        let json = artifact.to_json().expect("serializable");
+        assert!(json.contains("\"ruleset_ids\""), "{json}");
+        assert!(
+            json.contains(&ruleset_stamp_label(&ruleset(9, 0xAA))),
+            "{json}"
+        );
     }
 
     #[test]
