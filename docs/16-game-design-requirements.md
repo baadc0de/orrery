@@ -37,6 +37,7 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 | G2.1 | **Seasonal.** A season is a bounded period during which one solar system is live. At the end of a season the **mothership jumps to a new system**; the old system is discarded. | owner mandate (confirmed 2026-09-03) |
 | G2.1a | **Season quests.** At season start players receive **season-length quests**: acquire resources, research technology, stockpile goods, craft. | owner mandate |
 | G2.1b | **Two end conditions.** The season ends when the quests are **completed** or when **time runs out**, whichever comes first. | owner mandate |
+| G2.1b' | **"Completed" means the handcrafted season quest set is complete** (G8.6). Auto-generated quests feed the economy and standing but never end a season. | owner decision 2026-09-03 |
 | G2.1c | **Mothership.** A persistent, jump-capable hull that carries the players (and whatever they have stockpiled aboard it) between systems. It is the container for everything that survives a season boundary. | owner mandate |
 | G2.1d | **Reset without losing progression.** The season jump discards accumulated world state ("crud") in the old system, but **progression carries over**. What counts as progression versus world state is settled in G3/G6; the mothership boundary is the rule of thumb: aboard it persists, left behind is gone. | owner mandate |
 | G2.1e | **The jump is offline.** The season transition is a **maintenance window**, not a live event. The old system is closed, the migration and new-system seed run with no players connected, and the new system opens afterwards. | owner mandate |
@@ -111,6 +112,7 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 | G4.19 | **Teleport (a) site-to-site within the mothership**, and **(b) from anywhere to the mothership**, allowed only when **not engaged**, with a **cooldown**. No other teleport. | owner mandate (decision 12) |
 | G4.20 | **Macro simulation is a separate service.** A dedicated service advances the slow-moving simulation on its own: buildings raised, **contracts issued**, **contracts taken by NPCs**, and **fulfilled without micro simulation**. The 60 Hz micro simulation never ticks this state. | owner mandate |
 | G4.21 | **Capture by clearing, then NPC conversion.** Players clear and hold an enemy structure; the macro service then converts it to their faction over time, by the same NPC-driven building as G4.11. A captured printer becomes a forward respawn (G3.6). | owner decision 2026-09-03 |
+| G4.21a | **Hold condition.** A crew member must remain inside an uncontested radius of the cleared structure for a fixed time; conversion then starts and proceeds only while the macro service can fulfil a **supply contract** to it (G5). | owner decision 2026-09-03 |
 
 ### Engineering consequences of G4
 
@@ -285,6 +287,5 @@ Numbered so they can be answered one at a time.
 Loose ends collected from the sections above.
 
 - **Fair-value formula, NPC take-up delay, renown weights and floors** (G5.3, G5.5, G6.2a): numbers, to be tuned with telemetry.
-- **Capture hold condition** (G4.21): what "holding" a cleared structure means (presence, time, supplies) before conversion starts.
 - **Promotion to ADR**: once the owner marks this document settled, G1–G9 become ADR-0052 (superseding the scope of ADR-0001 where they overlap) and the engineering consequences are triaged into follow-up ADRs, in particular the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
 
