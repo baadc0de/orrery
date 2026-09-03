@@ -3663,7 +3663,7 @@ pub struct Criterion {
     pub min_cells: usize,
     /// Visible proxy pops tolerated.
     pub max_pops: u64,
-    /// Packets the send path may shed for want of budget.
+    /// Upper edge of the band the shed count must fall inside.
     ///
     /// Zero is the criterion. It is a knob only because the witness lane makes
     /// the transient at island formation real: a peer recovering from a hitch
@@ -3671,7 +3671,48 @@ pub struct Criterion {
     /// sheds the cheap lane to afford it (docs/03-replication.md §5.3a). That
     /// count is flat between five minutes and an hour, which is what
     /// distinguishes it from an overrun.
+    ///
+    /// **A band, and no longer a per-seed ratchet** (#974). The ratchet's
+    /// premise was that at a fixed seed and a fixed loss point this count is a
+    /// single number, so a run that moved it had found something. It is not.
+    /// The impairment model hashes the *payload bytes* into packet identity
+    /// (`router.rs`, `PacketFate::of`) and draws loss and jitter from
+    /// `(seed, packet, draw)` — deliberately, because it buys order-independence
+    /// — so any change to any byte on the wire re-rolls the whole loss
+    /// realisation, and with it which packets tip over the cap. Holding the
+    /// simulation completely fixed (seed 1, 3% loss, 32 peers, witnessed) and
+    /// re-rolling *only* that realisation 24 times, this count ranged **32 to
+    /// 420**, sd 81 — the same spread as the entire 180-cell seed × loss sweep
+    /// (58–399, sd 64). The seed carries almost no information about it; the
+    /// impairment realisation carries nearly all of it. Pinning an exact number
+    /// on a quantity with that dispersion is asserting a precision the harness
+    /// does not have, and #816's ruleset-digest change — which alters wire bytes
+    /// and nothing else — is what collected on it.
+    ///
+    /// See [`Self::max_unsheddable_over_budget`] for the bound
+    /// docs/03-replication.md §9.3 actually names, and `scripts/p1-swarm-gate.sh`
+    /// for the derivation of the numbers the legs pass.
     pub max_shed: u64,
+    /// Unsheddable sends charged while over budget, tolerated before the clause
+    /// fails.
+    ///
+    /// This is §9.3's *normative* overrun signal, and until #974 it was
+    /// measured, printed and never judged. The document names exactly two
+    /// quantities — `UploadMeter::unsheddable_over_budget` and the windowed rate
+    /// — and explicitly refuses a "did we shed" boolean, because a quiet frame
+    /// would clear it. A shed *count* is neither of them: it says the backstop
+    /// worked, whereas this counter says the lanes that could not be shed were
+    /// paid for anyway, so the overrun is real rather than an artefact of
+    /// shedding.
+    ///
+    /// Zero is the criterion and zero is what it reads on every leg that is not
+    /// a 32-peer witnessed island: both cruise-only hours and both 8-peer
+    /// conviction legs measure exactly 0 (#974). The witnessed 32-peer legs
+    /// cannot assert zero — 228 healthy runs at HEAD read 1–42, never 0 — so
+    /// they pass a derived allowance instead. It is a count and not a rate
+    /// because the condition is a formation transient: it is identical at 30
+    /// simulated seconds, five minutes and fifteen minutes.
+    pub max_unsheddable_over_budget: u64,
     /// Ticks a deviation may survive between first changing the subject's state
     /// and an independent re-run of a filed report confirming it.
     ///
@@ -3698,6 +3739,7 @@ impl Default for Criterion {
             min_cells: 64,
             max_pops: 0,
             max_shed: 0,
+            max_unsheddable_over_budget: 0,
             max_detection_ticks: MAX_ADJUDICATION_TICKS,
         }
     }
@@ -3737,6 +3779,7 @@ impl SwarmReport {
             min_cells,
             max_pops,
             max_shed,
+            max_unsheddable_over_budget,
             max_detection_ticks,
         } = criterion;
         let mut failures = Vec::new();
@@ -3757,6 +3800,22 @@ impl SwarmReport {
             failures.push(CriterionFailure {
                 clause: "no load shed to stay within budget",
                 detail: format!("{} packets shed (allowance {max_shed})", self.total_shed),
+            });
+        }
+        if self.total_unsheddable_over_budget > max_unsheddable_over_budget {
+            // docs/03-replication.md §9.3's own overrun signal, judged rather
+            // than merely printed (#974). The clause above says the backstop
+            // shed; this one says what the backstop *could not* shed was sent
+            // and charged anyway, which is the overrun the document calls real.
+            // A bound rather than zero on the witnessed legs, and the reason is
+            // stated at `Criterion::max_unsheddable_over_budget`.
+            failures.push(CriterionFailure {
+                clause: "no unsheddable overrun beyond island formation",
+                detail: format!(
+                    "{} unsheddable packet(s) charged while over budget \
+                     (allowance {max_unsheddable_over_budget})",
+                    self.total_unsheddable_over_budget
+                ),
             });
         }
         // Guard against the harness measuring an empty world. Every clause
@@ -4961,6 +5020,7 @@ mod tests {
         min_cells: 64,
         max_pops: 0,
         max_shed: 0,
+        max_unsheddable_over_budget: 0,
         max_detection_ticks: MAX_ADJUDICATION_TICKS,
     };
 
@@ -5435,11 +5495,13 @@ mod tests {
             min_cells: 1,
             max_pops: 64,
             max_shed: 512,
+            max_unsheddable_over_budget: 48,
             ..STRICT
         };
         let mut report = passing();
         report.min_cells_visited = 1;
         report.total_shed = 206;
+        report.total_unsheddable_over_budget = 20;
         report.total_proxy_pops = 3;
         assert!(clauses(&report, witnessed).is_empty());
 
@@ -5453,6 +5515,57 @@ mod tests {
                 "the witness keeps watching for the whole run",
                 "the witness sees the stream it is judging",
             ]
+        );
+    }
+
+    #[test]
+    fn the_unsheddable_overrun_is_judged_and_not_merely_reported() {
+        // docs/03-replication.md §9.3 names exactly two overrun signals —
+        // `UploadMeter::unsheddable_over_budget` and the windowed rate — and
+        // explicitly refuses a "did we shed" boolean. Until #974 the first of
+        // them was surfaced in the report, printed on every run with its own
+        // explanatory line, and looked at by nothing: it read 1–42 across all
+        // 228 healthy runs measured for #974 and 1495 under a 30% budget
+        // shortfall, and no clause failed on either.
+        let mut report = passing();
+        report.total_unsheddable_over_budget = 1;
+        assert!(
+            clauses(&report, STRICT).contains(&"no unsheddable overrun beyond island formation")
+        );
+
+        // A bound, not an exemption: at the allowance and not above it.
+        let witnessed = Criterion {
+            max_unsheddable_over_budget: 48,
+            ..STRICT
+        };
+        report.total_unsheddable_over_budget = 48;
+        assert!(!clauses(&report, witnessed)
+            .contains(&"no unsheddable overrun beyond island formation"));
+        report.total_unsheddable_over_budget = 49;
+        assert!(
+            clauses(&report, witnessed).contains(&"no unsheddable overrun beyond island formation")
+        );
+    }
+
+    #[test]
+    fn the_shed_band_does_not_stand_in_for_the_signal_9_3_names() {
+        // The two clauses are not restatements of one another, which is the
+        // whole reason #974 added the second. The shed count says the backstop
+        // worked; §9.3's counter says the lanes it *could not* shed were sent
+        // and charged anyway, which is the overrun the document calls real. A
+        // run can sit inside the shed band and be plainly oversubscribed, and
+        // before #974 that run passed.
+        let witnessed = Criterion {
+            max_shed: 500,
+            max_unsheddable_over_budget: 48,
+            ..STRICT
+        };
+        let mut report = passing();
+        report.total_shed = 500;
+        report.total_unsheddable_over_budget = 200;
+        assert_eq!(
+            clauses(&report, witnessed),
+            vec!["no unsheddable overrun beyond island formation"]
         );
     }
 

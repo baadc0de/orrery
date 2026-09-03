@@ -667,6 +667,25 @@ shift in the distribution stays visible. The transient settles early enough to
 sample cheaply: seed 1 at 3% sheds 162 at 30 simulated seconds, at 5 minutes and
 at the hour; seed 5 at 4% sheds 180 at all three.
 
+> **Superseded 2026-09-03 (#974).** The claim above that "the gate's ratchet is
+> unaffected — it is one fixed seed, which is exactly the condition under which
+> an exact ratchet means something" is false, and the P4 accumulation legs
+> failing on every platform since 2026-09-02 are what it cost. A fixed seed does
+> not fix this count. `gates/p1-swarm/src/router.rs` hashes the payload bytes
+> into packet identity and draws loss and jitter from `(seed, packet, draw)`, so
+> any change to any byte on the wire re-rolls the whole loss realisation.
+> Holding seed, loss and simulation entirely fixed and re-rolling only that
+> realisation 24 times, `total_shed` ranges **32–420** (sd 81) — the same spread
+> as a 180-cell sweep across seeds and loss points (58–399, sd 64). The seed
+> carries almost no information about this count. #816's ruleset-digest change
+> (legitimate traffic: real blake3 build hashes replacing compressible
+> placeholder fill) did not break a bound, it collected on one asserting a
+> precision the harness never had. Both legs now pass a band derived from 228
+> healthy runs at `mean + 4·sd` — `--max-shed 500` — together with
+> `--max-unsheddable-over-budget 48`, which is docs/03-replication.md §9.3's own
+> normative overrun signal and had been measured, printed and judged by nothing.
+> The derivation is in `scripts/p1-swarm-gate.sh`.
+
 **Re-measured on Skirmish.** Swapping the ruleset was a physics migration, not a
 rename: Skirmish applies drag and a per-archetype speed clamp where the corpus
 kernel applied neither, so every trajectory in the swarm moved and with it the
