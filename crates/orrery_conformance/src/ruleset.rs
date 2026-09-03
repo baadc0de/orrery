@@ -56,7 +56,13 @@ pub const REFERENCE_RULESET: RulesetId = RulesetId {
     // channel module — the `WireFamily` table and the witness-set keyframe
     // sub-tag — by the same rule as versions 5 and 6. The rules and every
     // canonical chain are untouched; identity-only again.
-    version: 7,
+    //
+    // Version 8: `UniverseSeedFingerprint` and `UniverseSeed::fingerprint`
+    // (#947) landed in `orrery_protocol`'s verifiable module, by the same rule
+    // as versions 5, 6 and 7. Nothing derives a draw from them — the
+    // fingerprint names a universe, it does not seed one — so the rules and
+    // every canonical chain are untouched; identity-only again.
+    version: 8,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 

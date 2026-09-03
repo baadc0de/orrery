@@ -44,6 +44,18 @@ const UNREGISTERED_RULESET: RulesetId = RulesetId {
 };
 const TEST_UNIVERSE_SEED: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
 
+/// Serializes the tests in this file, because one of the things they share is
+/// not theirs to partition.
+///
+/// `content/version` is a single global key (`[b'v']`), so the #947 fixture's
+/// sealed row is visible to every other `persistd` this binary starts — and
+/// since #947 a seal that contradicts the seed a process was handed is exactly
+/// what makes that process refuse. Run in parallel, the fixture therefore
+/// fails its neighbours rather than itself, which is the least useful shape a
+/// test failure can take. There is no unique-id trick available: the key is a
+/// single byte with no room for one.
+static CLUSTER_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn free_loopback_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback port");
     listener.local_addr().expect("listener address")
@@ -369,6 +381,7 @@ async fn file(
 
 #[tokio::test]
 async fn reference_ruleset_binary_adjudicates_registered_builds_and_marks_unknown_builds() {
+    let _serial = CLUSTER_FIXTURE.lock().await;
     let dir = tempfile::tempdir().expect("temp dir");
     let bind = free_loopback_addr();
     let mut child = Command::new(env!("CARGO_BIN_EXE_persistd"))
@@ -465,6 +478,7 @@ async fn reference_ruleset_binary_adjudicates_registered_builds_and_marks_unknow
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn reference_ruleset_binary_strike_modes_reach_the_durable_ledger() {
+    let _serial = CLUSTER_FIXTURE.lock().await;
     let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
@@ -500,4 +514,211 @@ async fn reference_ruleset_binary_strike_modes_reach_the_durable_ledger() {
     assert_eq!(live.len(), 1, "live must persist one durable ya row");
     assert_eq!(live[0].mode, StrikeMode::Live);
     assert_eq!(live[0].weight_milli, 3_000);
+}
+
+// ---------------------------------------------------------------------------
+// #947: a seed that contradicts durable state must refuse, not adjudicate
+// ---------------------------------------------------------------------------
+
+/// The seed the fixture world is sealed to. Deliberately not
+/// [`TEST_UNIVERSE_SEED`]: the defect being fixed is a *mistyped* seed, so the
+/// two must differ.
+#[cfg(feature = "fdb")]
+const SEALED_UNIVERSE_SEED: &str =
+    "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+
+#[cfg(feature = "fdb")]
+fn seed_of(hex: &str) -> orrery_protocol::UniverseSeed {
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex seed");
+    }
+    orrery_protocol::UniverseSeed(seed)
+}
+
+/// Read `content/version` so the fixture can put it back.
+///
+/// The row is a single global key (`v`), so this test cannot isolate itself
+/// with a unique id the way the strike fixtures do. It saves what it found and
+/// restores it, which keeps a concurrent seeder's world stamp intact.
+#[cfg(feature = "fdb")]
+async fn take_content_version(context: &FdbContext) -> Option<Vec<u8>> {
+    context
+        .database()
+        .run(|trx, _| async move {
+            trx.get(&orrery_persistd::keyspace::content_version_key(), false)
+                .await
+                .map_err(|e| foundationdb::FdbBindingError::new_custom_error(Box::new(e)))
+        })
+        .await
+        .expect("read content/version")
+        .map(|v| v.to_vec())
+}
+
+#[cfg(feature = "fdb")]
+async fn put_content_version(context: &FdbContext, value: Option<Vec<u8>>) {
+    context
+        .database()
+        .run(|trx, _| {
+            let value = value.clone();
+            async move {
+                match value {
+                    Some(bytes) => {
+                        trx.set(&orrery_persistd::keyspace::content_version_key(), &bytes)
+                    }
+                    None => trx.clear(&orrery_persistd::keyspace::content_version_key()),
+                }
+                Ok(())
+            }
+        })
+        .await
+        .expect("write content/version");
+}
+
+#[cfg(feature = "fdb")]
+fn sealed_row(fingerprint: Option<orrery_protocol::UniverseSeedFingerprint>) -> Vec<u8> {
+    orrery_persistd::content_version::encode(&orrery_persistd::ContentVersion {
+        content_build: "seed-fingerprint-fixture-947".to_string(),
+        manifest_digest: "0".repeat(64),
+        scenario_seed: "947".to_string(),
+        config_digest: "0".repeat(64),
+        toolchain: "rustc 1.96.0".to_string(),
+        seeded_at_ms: 947,
+        universe_seed_fingerprint: fingerprint,
+    })
+    .expect("encode fixture content/version")
+}
+
+/// Start the binary against `cluster` with `seed` and report
+/// `(exit succeeded, readiness line if any, stderr)`.
+#[cfg(feature = "fdb")]
+fn start_with_seed(cluster: &str, seed: &str) -> (bool, String, String) {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bind = free_loopback_addr();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_persistd"))
+        .arg("--dir")
+        .arg(dir.path())
+        .arg("--bind")
+        .arg(bind.to_string())
+        .arg("--node-id")
+        .arg("947")
+        .arg("--allow-volatile-leases")
+        .arg("--fdb-cluster-file")
+        .arg(cluster)
+        .arg("--issuer-key")
+        .arg(issuer_key_arg())
+        // A shard of this fixture's own: `ROOT` is durably owned by another
+        // test's node, and startup would be rejected on activation before it
+        // ever reached the adjudicator this test is about.
+        .arg("--shard")
+        .arg(format!("0x{:x}", CellId::ROOT.children()[3].to_bits()))
+        .arg("--universe-seed")
+        .arg(seed)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn persistd");
+
+    let mut stdout = child.stdout.take().expect("stdout captured");
+    let mut stderr = child.stderr.take().expect("stderr captured");
+    // A refusing process exits, so a blocking read to EOF terminates. A
+    // started process prints its readiness line and then runs forever, so read
+    // exactly that line and kill it.
+    let mut line = String::new();
+    let read = std::io::BufReader::new(&mut stdout).read_line(&mut line);
+    if read.is_ok() && !line.trim().is_empty() {
+        let mut text = String::new();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr.read_to_string(&mut text);
+        return (true, line, text);
+    }
+    let status = child.wait().expect("wait for persistd");
+    let mut text = String::new();
+    let _ = stderr.read_to_string(&mut text);
+    (status.success(), line, text)
+}
+
+/// #947: `--universe-seed` is a typed deployment input, and a mistyped one
+/// used to be undetectable — the adjudicator replayed every disputed window
+/// against the wrong keyed RNG stream and answered confidently about a world
+/// that never existed.
+///
+/// The mutation this test exists for is the removal of
+/// `check_universe_seed_against_cluster` from `configured_adjudicator`:
+/// without it the contradicting process prints `"adjudicator": true` and
+/// serves.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn a_seed_contradicting_the_sealed_universe_refuses_instead_of_adjudicating() {
+    let _serial = CLUSTER_FIXTURE.lock().await;
+    let Some(cluster) = support::fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let context = FdbContext::connect(&cluster).expect("configured FDB cluster file opens");
+    let saved = take_content_version(&context).await;
+
+    let sealed_to = seed_of(SEALED_UNIVERSE_SEED).fingerprint();
+    put_content_version(&context, Some(sealed_row(Some(sealed_to)))).await;
+
+    // 1. The wrong seed: refuse before the readiness line exists.
+    let (ok, readiness, stderr) = start_with_seed(&cluster, TEST_UNIVERSE_SEED);
+    let mismatch_report = (ok, readiness.clone(), stderr.clone());
+
+    // 2. The right seed: the same cluster, the same row, and it serves.
+    let (matched_ok, matched_readiness, _) = start_with_seed(&cluster, SEALED_UNIVERSE_SEED);
+
+    // 3. No fingerprint on the row: unsealed worlds must not be bricked.
+    put_content_version(&context, Some(sealed_row(None))).await;
+    let (unsealed_ok, unsealed_readiness, _) = start_with_seed(&cluster, TEST_UNIVERSE_SEED);
+
+    // 4. No row at all: the same, for a cluster that was never seeded.
+    put_content_version(&context, None).await;
+    let (absent_ok, absent_readiness, _) = start_with_seed(&cluster, TEST_UNIVERSE_SEED);
+
+    put_content_version(&context, saved).await;
+
+    let (ok, readiness, stderr) = mismatch_report;
+    assert!(
+        !ok,
+        "a persistd whose seed contradicts the sealed universe must exit non-zero, \
+         not serve; readiness was {readiness:?}"
+    );
+    assert!(
+        !readiness.contains("\"adjudicator\": true") && !readiness.contains("\"adjudicator\":true"),
+        "the refusal must land before the readiness line: {readiness:?}"
+    );
+    assert!(
+        stderr.contains("--universe-seed") && stderr.contains("content/version"),
+        "the refusal must name the flag and the row: {stderr}"
+    );
+    assert!(
+        stderr.contains(&sealed_to.to_hex())
+            && stderr.contains(&seed_of(TEST_UNIVERSE_SEED).fingerprint().to_hex()),
+        "the refusal must name both values so an operator can tell a typo from a \
+         wrong cluster: {stderr}"
+    );
+    assert!(
+        !stderr.contains(SEALED_UNIVERSE_SEED) && !stderr.contains(TEST_UNIVERSE_SEED),
+        "no seed may appear in the refusal: it is a secret, and the fingerprint is \
+         the published name: {stderr}"
+    );
+
+    assert!(
+        matched_ok && matched_readiness.contains("\"adjudicator\":true")
+            || matched_readiness.contains("\"adjudicator\": true"),
+        "the seed the world is sealed to must start normally: {matched_readiness:?}"
+    );
+    assert!(
+        unsealed_ok,
+        "a row with no fingerprint is unsealed, not contradicted — warn and proceed: \
+         {unsealed_readiness:?}"
+    );
+    assert!(
+        absent_ok,
+        "an absent content/version row must not brick a cluster: {absent_readiness:?}"
+    );
 }

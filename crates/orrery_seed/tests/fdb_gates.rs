@@ -224,7 +224,7 @@ async fn read_content_version(db: &Database) -> Result<orrery_seed::apply::Conte
         .await
         .map_err(|e| format!("content/version read: {e}"))?
         .ok_or_else(|| "missing content/version row".to_string())?;
-    postcard::from_bytes(&bytes).map_err(|e| format!("decode content/version: {e}"))
+    orrery_persistd::content_version::decode(&bytes)
 }
 
 #[cfg(feature = "fdb")]
@@ -606,4 +606,87 @@ async fn cold_area_load_returns_seeded_entities() {
         "cold 27-cell area load: {:?} (D16 target < 50 ms, gated by gates/p2-dashboard)",
         started.elapsed()
     );
+}
+
+/// #947: `apply --universe-seed-fingerprint` seals the world to a universe,
+/// and the seal survives the round trip through the durable row.
+///
+/// The value is a fingerprint, never the seed: this is the whole reason the
+/// flag takes 32 hexadecimal characters rather than 64, and the reason the
+/// universe's secret never has to reach a seeding host.
+///
+/// `content/version` is a single global key, so a concurrent gate in this same
+/// binary can overwrite it between this test's write and its read. The
+/// scenario therefore carries a `content_build` nobody else uses, and the read
+/// is retried until the row it finds is the one this test wrote — which is
+/// also what stops the assertion from passing against somebody else's row.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn apply_seals_the_world_to_a_universe_seed_fingerprint() {
+    const BUILD: &str = "smoke-947-seal";
+
+    let Some(cluster) = skip_if_no_fdb() else {
+        return;
+    };
+    let _ = cluster;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scenarios")
+        .join("smoke.toml");
+    let source = std::fs::read_to_string(&root)
+        .expect("read scenario")
+        .replace("\"smoke-2026-08-13\"", &format!("\"{BUILD}\""));
+    let temp = write_temp_scenario("seal", &with_grid(&source, GridId::new(9470), true));
+    wipe_scenario(temp.path(), BUILD).await;
+
+    let seed = orrery_protocol::UniverseSeed([0x94; 32]);
+    let expected = seed.fingerprint();
+    let db = open_db(&fdb_cluster_file().unwrap());
+
+    let mut seen = None;
+    for _ in 0..4 {
+        let output = run_seed(
+            &[
+                "apply",
+                "--allow-opaque",
+                "--universe-seed-fingerprint",
+                &expected.to_hex(),
+            ],
+            temp.path(),
+        )
+        .await;
+        maybe_assert_success(&output, "sealed apply");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&expected.to_hex()),
+            "the report must show the operator what the world was sealed to"
+        );
+        let version = read_content_version(&db).await.expect("content version");
+        if version.content_build == BUILD {
+            seen = Some(version);
+            break;
+        }
+    }
+    let version = seen.expect("a concurrent gate overwrote content/version on every attempt");
+    assert_eq!(
+        version.universe_seed_fingerprint,
+        Some(expected),
+        "the seal the operator passed must be the seal the cluster holds"
+    );
+
+    // A re-apply without the flag leaves the world unsealed rather than
+    // inventing a seal — the seeder never derives one, because it never sees
+    // a seed.
+    wipe_scenario(temp.path(), BUILD).await;
+    for _ in 0..4 {
+        let output = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
+        maybe_assert_success(&output, "unsealed apply");
+        let version = read_content_version(&db).await.expect("content version");
+        if version.content_build == BUILD {
+            assert_eq!(
+                version.universe_seed_fingerprint, None,
+                "no flag means no seal, not a guessed one"
+            );
+            return;
+        }
+    }
+    panic!("a concurrent gate overwrote content/version on every attempt");
 }

@@ -39,23 +39,41 @@ pub struct ApplyOptions {
     pub allow_opaque: bool,
     /// Flatten nested grids into grid 0.
     pub single_grid: bool,
+    /// Seal the world to a universe by recording this fingerprint in
+    /// `content/version`.
+    ///
+    /// The operator passes the *fingerprint*, not the seed: universe creation
+    /// is where the secret lives, and it has no business travelling to the
+    /// host that runs the seeder. `None` leaves the world unsealed, which is
+    /// what every pre-existing world already is.
+    pub universe_seed_fingerprint: Option<orrery_protocol::UniverseSeedFingerprint>,
 }
 
-/// A content-version row.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ContentVersion {
-    /// The content build id.
-    pub content_build: String,
-    /// The manifest digest.
-    pub manifest_digest: String,
-    /// The scenario seed used to derive the world.
-    pub scenario_seed: String,
-    /// A digest of the resolved scenario config.
-    pub config_digest: String,
-    /// The rustc version.
-    pub toolchain: String,
-    /// Wall-clock time the seeder wrote the world.
-    pub seeded_at_ms: u64,
+/// The `content/version` row this seeder writes.
+///
+/// The type belongs to `orrery_persistd`, which owns the key and is the other
+/// reader of the row (`persistd` checks its `--universe-seed` against the
+/// fingerprint here at startup). Re-exported so the seeder's callers keep the
+/// path they had.
+pub use orrery_persistd::content_version::ContentVersion;
+
+/// Everything a seeding run stamps onto the world, gathered rather than passed
+/// one string at a time.
+///
+/// These four travel together — they are exactly the fields of
+/// [`ContentVersion`] that the row builder does not compute for itself — and
+/// three of them are `&str`, so a positional signature made a transposition
+/// between `seed_display` and `config_digest` a silent, type-checked bug.
+#[derive(Debug, Clone, Copy)]
+pub struct ContentStamp<'a> {
+    /// The content build id this run writes under.
+    pub content_build: &'a str,
+    /// The scenario seed, in the copy-pasteable form the report prints.
+    pub seed_display: &'a str,
+    /// The digest of the resolved scenario config.
+    pub config_digest: &'a str,
+    /// The universe this world is sealed to, if the operator sealed it.
+    pub universe_seed_fingerprint: Option<orrery_protocol::UniverseSeedFingerprint>,
 }
 
 /// A row planned for writing.
@@ -140,9 +158,12 @@ pub async fn run(
         &scenario,
         &root,
         &existing_seedmap,
-        &content_build,
-        &seed_display,
-        &config_digest,
+        ContentStamp {
+            content_build: &content_build,
+            seed_display: &seed_display,
+            config_digest: &config_digest,
+            universe_seed_fingerprint: options.universe_seed_fingerprint,
+        },
     )
     .await?;
     let existing = load_existing_rows(&db, &scenario, &desired).await?;
@@ -165,9 +186,8 @@ pub async fn run(
     let content_version = desired
         .iter()
         .find(|row| row.key == keyspace::content_version_key().to_vec())
-        .map(|row| postcard::from_bytes::<ContentVersion>(&row.value))
-        .transpose()
-        .map_err(|e| format!("decode content/version: {e}"))?
+        .map(|row| orrery_persistd::content_version::decode(&row.value))
+        .transpose()?
         .unwrap_or_else(|| ContentVersion {
             content_build,
             manifest_digest: plan_report.manifest_digest.clone(),
@@ -175,6 +195,7 @@ pub async fn run(
             config_digest,
             toolchain: plan_report.toolchain.clone(),
             seeded_at_ms: now_ms(),
+            universe_seed_fingerprint: options.universe_seed_fingerprint,
         });
 
     Ok(ApplyReport {
@@ -205,10 +226,14 @@ pub async fn build_desired_rows(
     scenario: &ResolvedScenario,
     root: &SeedRoot,
     existing_seedmap: &SeedMap,
-    content_build: &str,
-    seed_display: &str,
-    config_digest: &str,
+    stamp: ContentStamp<'_>,
 ) -> Result<Vec<DesiredRow>, String> {
+    let ContentStamp {
+        content_build,
+        seed_display,
+        config_digest,
+        universe_seed_fingerprint,
+    } = stamp;
     let mut out = Vec::new();
     let mut manifest = ManifestWriter::new();
     let mut grants: BTreeMap<GridId, BlockGrantCursor> = BTreeMap::new();
@@ -350,11 +375,16 @@ pub async fn build_desired_rows(
         config_digest: config_digest.to_string(),
         toolchain: crate::manifest::ToolchainStamp::current().rustc,
         seeded_at_ms: now_ms(),
+        universe_seed_fingerprint,
     };
 
     out.push(DesiredRow {
         key: keyspace::content_version_key().to_vec(),
-        value: postcard::to_stdvec(&content_version).map_err(|e| e.to_string())?,
+        // D38 clause (d)(1): the version is a *trailer*, so a value written
+        // before this field existed stays readable by its own rule (absent
+        // trailer == v0) instead of being re-read against a leading tag.
+        value: orrery_persistd::content_version::encode(&content_version)
+            .map_err(|e| e.to_string())?,
         manifest: None,
     });
     Ok(out)

@@ -38,6 +38,24 @@ struct ApplyArgs {
     allow_opaque: bool,
     #[arg(long, env = "ORRERY_SINGLE_GRID")]
     single_grid: bool,
+    /// Seal the seeded world to a universe: the 32-hexadecimal-character
+    /// fingerprint of that universe's VC-3 seed, recorded in
+    /// `content/version` so `persistd` can refuse a seed that contradicts it.
+    ///
+    /// This is the *fingerprint*, never the seed. Universe creation is where
+    /// the seed lives, and it has no business travelling to a seeding host.
+    #[arg(
+        long,
+        value_name = "HEX32",
+        env = "ORRERY_UNIVERSE_SEED_FINGERPRINT",
+        value_parser = parse_seed_fingerprint
+    )]
+    universe_seed_fingerprint: Option<orrery_protocol::UniverseSeedFingerprint>,
+}
+
+/// `clap` value parser for the 32-hexadecimal-character fingerprint form.
+fn parse_seed_fingerprint(text: &str) -> Result<orrery_protocol::UniverseSeedFingerprint, String> {
+    orrery_protocol::UniverseSeedFingerprint::from_hex(text)
 }
 
 #[derive(Debug, Parser)]
@@ -235,6 +253,7 @@ async fn run_apply(args: ApplyArgs) -> Result<ExitCode, String> {
     let options = ApplyOptions {
         allow_opaque: args.allow_opaque,
         single_grid: args.single_grid,
+        universe_seed_fingerprint: args.universe_seed_fingerprint,
     };
     let report = apply::run(&source, resolved, options)
         .await
@@ -246,6 +265,10 @@ async fn run_apply(args: ApplyArgs) -> Result<ExitCode, String> {
     );
     println!("  changed rows      {}", report.changed_rows);
     println!("  commit p99        {:.2} ms", report.commit_p99_ms);
+    match report.content_version.universe_seed_fingerprint {
+        Some(fingerprint) => println!("  universe seal     {fingerprint}"),
+        None => println!("  universe seal     none (world unsealed)"),
+    }
     Ok(ExitCode::SUCCESS)
 }
 

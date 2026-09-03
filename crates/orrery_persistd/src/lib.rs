@@ -31,6 +31,7 @@ pub mod audit;
 pub mod census;
 pub mod checkpoint;
 pub mod cluster;
+pub mod content_version;
 mod crc;
 #[cfg(feature = "fdb")]
 pub mod fdb;
@@ -61,6 +62,7 @@ pub use checkpoint::{
     ColdCellReader, MemCheckpointStore, QuiesceSignal,
 };
 pub use cluster::{Cluster, ColdFallbackRouter, Router};
+pub use content_version::{ContentVersion, CONTENT_VERSION_ENCODING_V1};
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbContext, FdbContextError};
 pub use fence::{
