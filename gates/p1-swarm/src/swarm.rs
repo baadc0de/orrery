@@ -4227,6 +4227,94 @@ mod tests {
         );
     }
 
+    /// The converse of the test above, and the one #1003 suspected of being
+    /// broken: a peer that has been in the run since the lobby must be *told*
+    /// when somebody joins after it.
+    ///
+    /// A late joiner is a roster change for everybody already bound, and the
+    /// established peer learns about it from exactly one place — the Meta-lane
+    /// membership frame [`Swarm::publish_live_manifests`] queues on the tick
+    /// the seat binds. Nothing else in the run will ever mention the newcomer
+    /// to it: the client's own broadcast audience is
+    /// `AcceptedStart::active_slots` minus itself, so a peer that never
+    /// adopted the corrected membership never addresses the joiner, never has
+    /// its uplink to that slot settled, and reports the newcomer as absent for
+    /// the rest of the attempt even though every host-side signal is clean.
+    ///
+    /// The sibling test above pins the *joiner's* view and deliberately drops
+    /// the established peer's link (`_existing_remote`), so until this test
+    /// the established half of the exchange had no coverage at all.
+    #[test]
+    fn a_peer_already_in_the_run_is_told_about_a_late_joiner() {
+        let (existing_host, existing_remote) = crate::exterior::link_pair();
+        let (joined_host, _joined_remote) = crate::exterior::link_pair();
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let membership = Arc::new(Mutex::new(LiveMembership {
+            attempt_id: "attempt-live".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeSet::new(),
+            tick: 0,
+            running: true,
+            path: None,
+        }));
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: 2,
+                ..SwarmConfig::default()
+            },
+            4,
+        )
+        .with_external_session_at(
+            2,
+            4,
+            crate::bot::bot_key(2).public(),
+            "session-two".to_owned(),
+            None,
+            existing_host,
+        )
+        .with_live_joins(joined_rx, membership, 4);
+
+        // Nothing is owed to the established seat until the roster changes:
+        // that is what makes the frame below attributable to the join.
+        assert!(
+            existing_remote
+                .downlink
+                .lock()
+                .expect("downlink lock")
+                .try_recv()
+                .is_err(),
+            "a standing seat is sent no membership frame while the roster holds"
+        );
+
+        joined_tx
+            .send(JoinedExternal {
+                slot: 3,
+                node: crate::bot::bot_key(3).public(),
+                session_id: "session-three".to_owned(),
+                anchor: None,
+                link: joined_host,
+            })
+            .expect("join reaches the standing swarm");
+        swarm.process_live_membership(120);
+
+        let manifest = next_membership(&existing_remote);
+        assert_eq!(
+            manifest
+                .active
+                .iter()
+                .map(|seat| seat.slot)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "the established seat's corrected membership must name the late joiner"
+        );
+        assert_eq!(
+            manifest.witness_recipients,
+            witness_recipients(&[0, 1, 2, 3], 2),
+            "the corrected membership is personalized for its own subject"
+        );
+    }
+
     /// A seat that binds after the run started must be **linked**, not merely
     /// rostered.
     ///

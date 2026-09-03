@@ -1773,12 +1773,22 @@ impl CampaignRuntime {
             if accepted.tick < current.tick {
                 return Err("the host sent an older membership snapshot".to_owned());
             }
-            let departed = current
-                .active_slots
-                .iter()
-                .copied()
-                .filter(|slot| !accepted.active_slots.contains(slot))
-                .collect::<Vec<_>>();
+            let (arrived, departed) =
+                membership_delta(&current.active_slots, &accepted.active_slots);
+            // Say it out loud, because until #1003 nothing did. `poll_join`
+            // logs the StartV1 this client joined on and the live path logged
+            // nothing at all, so a session in which a late joiner was — or was
+            // not — adopted read identically in the log, and the only way to
+            // tell the two apart was to guess. A roster change is rare, so
+            // this is one line per change, not per frame.
+            if !arrived.is_empty() || !departed.is_empty() {
+                bevy::log::info!(
+                    "campaign: adopted live membership at host tick {} - {} active, \
+                     arrived {arrived:?}, departed {departed:?}",
+                    accepted.tick,
+                    accepted.active_slots.len()
+                );
+            }
             for slot in departed {
                 let entity = PersistId::new(slot as u64 + 1);
                 if entity != self.entity {
@@ -2095,6 +2105,27 @@ fn broadcast_recipients(
             .collect(),
         None => (0..own_slot).collect(),
     }
+}
+
+/// What one adopted membership changed, as `(arrived, departed)` seat slots.
+///
+/// Both halves matter to this client for different reasons: a departed seat
+/// has replica, route and focus state to retire, and an arrived seat is a
+/// craft it must start addressing. Naming them together is also the only
+/// observability the live-membership path has — see `adopt_live_membership`.
+fn membership_delta(previous: &[usize], adopted: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    (
+        adopted
+            .iter()
+            .copied()
+            .filter(|slot| !previous.contains(slot))
+            .collect(),
+        previous
+            .iter()
+            .copied()
+            .filter(|slot| !adopted.contains(slot))
+            .collect(),
+    )
 }
 
 fn settle_broadcast_ack(
@@ -2741,6 +2772,33 @@ mod tests {
         assert!(
             !broadcast_recipients(Some(&after_departure), 5).contains(&4),
             "a remaining player must stop sending to the departed slot"
+        );
+    }
+
+    #[test]
+    fn a_membership_delta_names_the_arrival_as_well_as_the_departure() {
+        // The arrival half is what #1003 needed and did not have: a session
+        // that adopted a late joiner and one that never did produced
+        // byte-identical logs, so neither could be told from the other.
+        assert_eq!(
+            membership_delta(&[0, 1, 2, 5, 6], &[0, 1, 2, 5, 6, 7]),
+            (vec![7], vec![]),
+            "a late joiner is an arrival and nothing else"
+        );
+        assert_eq!(
+            membership_delta(&[0, 1, 2, 5, 6], &[0, 1, 2, 6]),
+            (vec![], vec![5]),
+            "a seat that left is a departure and nothing else"
+        );
+        assert_eq!(
+            membership_delta(&[0, 1, 2, 5], &[0, 1, 2, 7]),
+            (vec![7], vec![5]),
+            "a seat reused inside one attempt is both at once"
+        );
+        assert_eq!(
+            membership_delta(&[0, 1, 2, 5, 6], &[0, 1, 2, 5, 6]),
+            (vec![], vec![]),
+            "an unchanged roster is silent, so the log carries changes only"
         );
     }
 

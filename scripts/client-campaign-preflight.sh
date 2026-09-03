@@ -13,6 +13,9 @@
 # admission for a seat, completes the iroh handshake, and binds the requested
 # nickname to a craft that arrived through replication. HTTP substitutes such
 # as curl are deliberately absent.
+#
+# Every client gets its own X server, and how that is arranged is load-bearing
+# rather than incidental -- see `choose_display_isolation` (#1003).
 set -uo pipefail
 
 readonly NAME=client-campaign-preflight
@@ -28,6 +31,9 @@ FRESH_LOBBY_TIMEOUT_SECS=${CLIENT_CAMPAIGN_PREFLIGHT_FRESH_LOBBY_TIMEOUT:-1200}
 FRESH_LOBBY_POLL_SECS=5
 XVFB_RUN_BIN="${CLIENT_CAMPAIGN_PREFLIGHT_XVFB_RUN:-xvfb-run}"
 PYTHON_BIN="${CLIENT_CAMPAIGN_PREFLIGHT_PYTHON:-python3}"
+# How each client is given its own X server. Set by `choose_display_isolation`.
+XVFB_DISPLAY_MODE=
+XVFB_DISPLAY_BASE=99
 failures=0
 
 usage() {
@@ -70,6 +76,111 @@ require_marker() { # check, log, exact marker
 # campaign that is the normal case for CI.
 lobby_is_joinable() { # phase
     [[ $1 == lobby ]]
+}
+
+# Four clients, four X servers, and never `xvfb-run -a`.
+#
+# `-a`/`--auto-servernum` was this script's display allocator and it is the
+# whole of #1003. It picks a number in shell by walking `/tmp/.X<n>-lock`
+# (`find_free_servernum` in xvfb-run) -- a check that stakes no claim, so two
+# wrappers started in the same instant both see :99 free and both take it.
+# Only the first Xvfb starts; the second wrapper waits out its `--wait`, hands
+# its client `DISPLAY=:99` anyway, and that client silently attaches to the
+# *first* client's server. The two then share one X server, and whichever
+# finishes first kills it out from under the other: Xlib prints
+# "X connection to :99 broken" and calls `exit(1)`, so a client whose every
+# clause PASSED reports a nonzero status. The loser's wrapper also leaves
+# `kill: (PID) - No such process` in the log, because the Xvfb it thinks it
+# owns never existed. Both preserved failing runs of 2026-09-03 have exactly
+# those two lines in `b.log` and neither has a single `PREFLIGHT FAIL`;
+# reproduced here, three concurrent `xvfb-run -a` took :99 every time.
+#
+# xvfb-run's own help calls `-a` deprecated and points at `--auto-display`,
+# which asks Xvfb to bind a display and report the number it got
+# (`Xvfb -displayfd`). That is allocation and claim in one step, so it cannot
+# hand two wrappers the same server. Where the local xvfb-run is too old to
+# offer it, fall back to explicit per-side `--server-num`s taken from one
+# window of free numbers scanned before any client starts: still a check
+# without a claim against *other* users of the box, but no longer a collision
+# this script causes with itself.
+choose_display_isolation() {
+    if "$XVFB_RUN_BIN" --help 2>&1 | grep -Fq -- '--auto-display'; then
+        XVFB_DISPLAY_MODE=auto
+        printf 'NOTE display-isolation each client gets its own Xvfb via --auto-display\n'
+        return 0
+    fi
+    XVFB_DISPLAY_MODE=numbered
+    XVFB_DISPLAY_BASE="$(find_free_display_window 4)"
+    printf 'NOTE display-isolation %s has no --auto-display; using --server-num %s..%s\n' \
+        "$XVFB_RUN_BIN" "$XVFB_DISPLAY_BASE" "$((XVFB_DISPLAY_BASE + 3))"
+}
+
+# The lowest display number with `needed` consecutive free numbers after it.
+find_free_display_window() { # how many consecutive displays are needed
+    local needed=$1 base=99 offset free
+    while ((base < 500)); do
+        free=1
+        for ((offset = 0; offset < needed; offset++)); do
+            if [[ -e /tmp/.X$((base + offset))-lock ]]; then
+                free=0
+                break
+            fi
+        done
+        ((free)) && break
+        base=$((base + 1))
+    done
+    printf '%s\n' "$base"
+}
+
+# The display arguments for one side, as separate words.
+xvfb_display_args() { # side
+    local offset
+    case $1 in
+        a) offset=0 ;;
+        b) offset=1 ;;
+        c) offset=2 ;;
+        d) offset=3 ;;
+        *) die "internal error: no display slot for side $1" ;;
+    esac
+    if [[ $XVFB_DISPLAY_MODE == auto ]]; then
+        printf '%s\n' --auto-display
+    else
+        printf '%s\n%s\n' --server-num "$((XVFB_DISPLAY_BASE + offset))"
+    fi
+}
+
+# Whether this side's client lost its X server rather than failing a clause.
+#
+# Latching this is the difference between a day spent reading the replication
+# path and a line that names the harness: a nonzero client with no
+# `PREFLIGHT FAIL` of its own is not a verdict about the campaign, and #1003
+# was filed as a replication defect because nothing said so.
+client_lost_its_display() { # log
+    grep -Eq '^X connection to :[0-9]+ broken' "$1" 2>/dev/null
+}
+
+# One client's exit status, and what it is evidence of.
+#
+# A nonzero status stays a failure -- the criterion is not being softened. What
+# is added is attribution, because the status alone was ambiguous in exactly
+# the case that mattered: a client whose X server was pulled out from under it
+# exits 1 with every clause green, which reads identically to a client that
+# failed a clause, and #1003 was diagnosed as a replication defect on that
+# basis.
+client_exit_clause() { # check, status, log
+    local check=$1 status=$2 log=$3 detail=
+    if ((status == 0)); then
+        result PASS "$check" 'binary exited 0'
+        return
+    fi
+    if client_lost_its_display "$log"; then
+        detail="; its X server was torn down under it, so this is a display-isolation \
+fault in the harness and not a verdict about the campaign"
+    elif ! grep -Fq 'PREFLIGHT FAIL' "$log" 2>/dev/null; then
+        detail='; the binary printed no PREFLIGHT FAIL clause of its own, so the cause is \
+outside its assertions -- read the end of the log before blaming the campaign'
+    fi
+    result FAIL "$check" "binary exited $status$detail (log: $log)"
 }
 
 campaign_phase() { # campaign id, origin
@@ -163,8 +274,11 @@ print(origin.rstrip("/"))
         for peer in "$@"; do
             expected_args+=(--expect-peer "$peer")
         done
+        local display_args=()
+        mapfile -t display_args < <(xvfb_display_args "$side")
         timeout --kill-after=10s "${outer_timeout}s" \
-            "$XVFB_RUN_BIN" -a env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
+            "$XVFB_RUN_BIN" "${display_args[@]}" \
+            env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
             WGPU_BACKEND=vulkan bash -c '
                 status_file=$1
                 shift
@@ -194,6 +308,7 @@ print(origin.rstrip("/"))
         return "$wrapper_status"
     }
 
+    choose_display_isolation
     wait_for_fresh_lobby "$CAMPAIGN" "$origin"
 
     run_client a "$nickname_a" "$nickname_b" "$nickname_c" & local pid_a=$!
@@ -212,14 +327,10 @@ print(origin.rstrip("/"))
     local status_d=0
     run_client d "$nickname_d" || status_d=$?
 
-    if ((status_a == 0)); then result PASS client-a-exit 'binary exited 0';
-    else result FAIL client-a-exit "binary exited $status_a (log: $dir/a.log)"; fi
-    if ((status_b == 0)); then result PASS client-b-exit 'binary exited 0';
-    else result FAIL client-b-exit "binary exited $status_b (log: $dir/b.log)"; fi
-    if ((status_c == 0)); then result PASS client-c-exit 'binary exited 0';
-    else result FAIL client-c-exit "binary exited $status_c (log: $dir/c.log)"; fi
-    if ((status_d == 0)); then result PASS client-d-rejoin-exit 'binary exited 0';
-    else result FAIL client-d-rejoin-exit "binary exited $status_d (log: $dir/d.log)"; fi
+    client_exit_clause client-a-exit "$status_a" "$dir/a.log"
+    client_exit_clause client-b-exit "$status_b" "$dir/b.log"
+    client_exit_clause client-c-exit "$status_c" "$dir/c.log"
+    client_exit_clause client-d-rejoin-exit "$status_d" "$dir/d.log"
 
     require_marker client-a-origin "$dir/a.log" "PREFLIGHT PASS admission-origin origin=$origin"
     require_marker client-b-origin "$dir/b.log" "PREFLIGHT PASS admission-origin origin=$origin"
@@ -275,7 +386,33 @@ self_test() {
 
     cat >"$dir/bin/xvfb-run" <<'SH'
 #!/usr/bin/env bash
-shift # -a
+# The fixture answers --help the way the real wrapper does, because that is
+# what `choose_display_isolation` reads. The `no-auto-display` arm hides the
+# flag so the numbered fallback is exercised too.
+if [[ ${1:-} == --help ]]; then
+    echo 'Usage: xvfb-run [OPTION ...] COMMAND'
+    echo '-a        --auto-servernum          deprecated'
+    if [[ ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} != no-auto-display ]]; then
+        echo '-d        --auto-display            use the X server to find a display'
+    fi
+    echo '-n NUM    --server-num=NUM          server number to use (default: 99)'
+    exit 0
+fi
+# Record what display arguments the script chose, and refuse `-a`: taking it
+# again is the regression this fixture exists to catch.
+display_args=
+while (($#)); do
+    case "$1" in
+        -a|--auto-servernum)
+            echo 'fixture-xvfb-run: -a shares one display between concurrent clients' >&2
+            exit 6
+            ;;
+        -d|--auto-display) display_args="$1"; shift ;;
+        -n|--server-num) display_args="$1 $2"; shift 2 ;;
+        *) break ;;
+    esac
+done
+echo "fixture-xvfb-run display-args=$display_args" >&2
 [[ $1 == env ]] && shift
 while [[ ${1:-} == -* || ${1:-} == *=* ]]; do
     if [[ $1 == -u ]]; then shift 2; else shift; fi
@@ -341,6 +478,13 @@ esac
 if [[ ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} == client-error ]]; then
     exit 7
 fi
+# Every clause green, then the X server disappears: Xlib's own message,
+# followed by the exit(1) Xlib takes on a fatal IO error. This is what both
+# preserved failing runs of #1003 actually contained.
+if [[ ${CLIENT_CAMPAIGN_PREFLIGHT_FIXTURE:-good} == lost-display ]]; then
+    echo 'X connection to :99 broken (explicit kill or server shutdown).'
+    exit 1
+fi
 SH
     chmod +x "$dir/bin/xvfb-run" "$dir/bin/client"
 
@@ -355,10 +499,27 @@ SH
     ((status == 0)) || die "self-test baseline failed ($output)"
     grep -Fq 'SUMMARY PASS client-campaign-preflight failures=0' <<<"$output" \
         || die 'self-test baseline emitted no passing summary'
+    grep -Fq 'NOTE display-isolation each client gets its own Xvfb via --auto-display' \
+        <<<"$output" \
+        || die 'self-test baseline did not isolate each client on its own display'
     pass_count=$(grep -c '^PASS ' <<<"$output" || true)
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
     [[ $pass_count == 27 && $fail_count == 0 ]] \
         || die "self-test baseline counted $pass_count pass / $fail_count fail, expected 27 / 0"
+    ((passing += 1))
+
+    # An xvfb-run with no --auto-display must still give each client its own
+    # server, from a scanned window of numbers -- never the shared `-a`. The
+    # fixture wrapper exits 6 on `-a`, so a regression to it fails loudly here
+    # rather than becoming a coin-flip against the live campaign.
+    status=0; output="$(st_run no-auto-display)" || status=$?
+    ((status == 0)) || die "self-test numbered-display baseline failed ($output)"
+    grep -Eq '^NOTE display-isolation .* using --server-num [0-9]+\.\.[0-9]+$' <<<"$output" \
+        || die 'self-test numbered-display baseline did not fall back to --server-num'
+    pass_count=$(grep -c '^PASS ' <<<"$output" || true)
+    fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
+    [[ $pass_count == 27 && $fail_count == 0 ]] \
+        || die "self-test numbered-display baseline counted $pass_count pass / $fail_count fail, expected 27 / 0"
     ((passing += 1))
 
     status=0; output="$(st_run wrapper-cleanup-error)" || status=$?
@@ -391,6 +552,23 @@ SH
     fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
     [[ $pass_count == 23 && $fail_count == 4 ]] \
         || die "self-test client-error mutation counted $pass_count pass / $fail_count fail, expected 23 / 4"
+    ((mutations += 1))
+
+    # A client killed by a vanishing X server still fails -- the criterion is
+    # not softened -- but it must say so, because a nonzero client with every
+    # clause green and no `PREFLIGHT FAIL` of its own is what #1003 was read as
+    # a replication defect on.
+    status=0; output="$(st_run lost-display)" || status=$?
+    ((status != 0)) || die 'self-test mutation whose clients lost their display passed'
+    grep -Fq 'FAIL client-b-exit binary exited 1; its X server was torn down under it' \
+        <<<"$output" \
+        || die 'self-test lost-display mutation did not attribute the exit to the harness'
+    grep -Fq 'PASS client-b-peer-c ' <<<"$output" \
+        || die 'self-test lost-display mutation must keep every observation clause green'
+    pass_count=$(grep -c '^PASS ' <<<"$output" || true)
+    fail_count=$(grep -c '^FAIL ' <<<"$output" || true)
+    [[ $pass_count == 23 && $fail_count == 4 ]] \
+        || die "self-test lost-display mutation counted $pass_count pass / $fail_count fail, expected 23 / 4"
     ((mutations += 1))
 
     status=0; output="$(st_run not-seated)" || status=$?
@@ -457,7 +635,7 @@ SH
         || die "self-test third-peer mutation counted $pass_count pass / $fail_count fail, expected 25 / 2"
     ((mutations += 1))
 
-    echo "$NAME: self-test passed ($passing baselines: ordinary + wrapper-cleanup each 27 pass / 0 fail; client-error mutation 23 pass / 4 fail at client-a-exit + client-b-exit + client-c-exit + client-d-rejoin-exit; $mutations total mutations: no-seat 23 pass / 4 fail at all seated checks, one-seat 24 pass / 3 fail at client-b-seated + client-c-seated + client-d-rejoin-seated, one-peer 23 pass / 4 fail at every B/C observation, third-peer-hidden 25 pass / 2 fail at client-a-peer-c + client-b-peer-c)"
+    echo "$NAME: self-test passed ($passing baselines: ordinary (--auto-display) + numbered-display fallback + wrapper-cleanup each 27 pass / 0 fail; client-error mutation 23 pass / 4 fail at client-a-exit + client-b-exit + client-c-exit + client-d-rejoin-exit; $mutations total mutations: lost-display 23 pass / 4 fail at every exit check with the fault attributed to the harness, no-seat 23 pass / 4 fail at all seated checks, one-seat 24 pass / 3 fail at client-b-seated + client-c-seated + client-d-rejoin-seated, one-peer 23 pass / 4 fail at every B/C observation, third-peer-hidden 25 pass / 2 fail at client-a-peer-c + client-b-peer-c)"
 }
 
 while (($#)); do
