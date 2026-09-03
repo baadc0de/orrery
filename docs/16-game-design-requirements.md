@@ -258,8 +258,33 @@ Numbered so they can be answered one at a time.
 - **Materialise and fold are the whole PvE pipeline.** A faction's macro state (fleet positions, structure health, patrol plans) materialises into micro entities when a player enters range and folds back (kills, damage, looted stock, triggered scripts) when the last player leaves. Because factions never run micro without a player, the fold must be complete: nothing that happened in micro may be lost, and nothing that did not happen may be invented. The fold is derived from the witnessed journal (ADR-0019), not from the last authoritative snapshot.
 - **Environmental hazards are ruleset fields** (radiation, pressure, weather) that modify avatar and vehicle parameters (G6.9 derivation) and are few enough to be per-body constants for the first release.
 
-## Open — to be settled by the owner
+## G9 — Time
 
-Sections reserved; each becomes a `G<n>` block when decided.
+| # | Requirement | Source |
+|---|---|---|
+| G9 | **A season is 1–3 months of wall-clock time.** In-fiction: the longest a mothership dares stay in-system before overwhelming forces endanger it (G2.1, G8.1). | owner mandate |
+| G9.1 | **Mostly real time.** The game clock runs at wall-clock rate except that **day–night cycles are accelerated** so they occur more often. | owner mandate |
+| G9.2 | **Teleportation is the time-saver** (G4.19, G2.2a). No other time compression. | owner mandate |
+| G9.3 | **Flip-and-burn time is a spatial anchor.** Hours-to-days transit exists to give intercept and defend missions a **place and time to happen** and a **believable risk of failure**, not to be waited through. | owner mandate |
+| G9.4 | **The season clock is the fiction's pressure.** Overwhelming force accumulating over the season is what ends it if the quests do not (G2.1b). | derived from G9, G8.1 |
 
-- G9 — Time (real-time, accelerated, day/night, orbital mechanics)
+### Engineering consequences of G9
+
+- **One monotonic season clock**, wall-clock rate, agreed by every node (ADR-0021 parameter) and journaled, from which the deadline (G2.1b), contract windows (G5.5), upkeep accrual (G3.1, G4.14), recall cooldowns (G4.19) and flip-and-burn plans (G2.2c) are all evaluated. Day–night is a **separate derived clock** (season time times a per-body multiplier plus phase) that only presentation and hazard/ruleset fields read; nothing value-bearing keys on it.
+- **The macro service can advance the season clock unattended** because everything slow is a plan evaluated lazily against it. A season of 1–3 months means macro state accumulates for up to 90 days, which sets the journal retention floor for a season (ADR-0020) and the size of the end-of-season migration (G2.1e).
+- **Flip-and-burn plans are intercept geometry.** A cargo run is a known trajectory over known time, so an interceptor can be positioned by a rival organization or an NPC faction (G8.2) at a computable point. The macro service must expose trajectories to those entitled to see them (owner, and anyone who has scouted them by ruleset), which is another viewer-dependent view. Failure risk is real because the run resolves either macro (nobody came) or micro (someone did), and the fold (G8 consequences) decides the outcome.
+- **Accumulating pressure is a macro parameter**, a faction-aggression term that rises with season time, so the last weeks of a season are harder by design. It can be the same field as depth (G8 consequences) with a time-dependent scale.
+- **Nothing in the micro layer depends on wall-clock time.** The 60 Hz tick (R10) is the only clock the verifiable core sees; season time enters micro only as an attested input (the tick at which the season clock read T), so replay (R8) never needs the real clock.
+
+## Open items
+
+Loose ends collected from the sections above.
+
+- **Fauna** (G8.3): scope and behaviour undecided.
+- **Structure capture** (G4.13): players can destroy NPC-built structures; whether they can capture or take over one is unstated.
+- **Orbital mechanics** (G2, G9): whether bodies move during a season, which affects flip-and-burn geometry and jump targets.
+- **Fair-value formula and NPC take-up delay** (G5.3, G5.5): numbers, to be tuned with telemetry.
+- **Renown aggregation function** (G6.2): sum, weighted, or minimum.
+- **Crew rights** when no organization officer is aboard (G7).
+- **Promotion to ADR**: once the owner marks this document settled, G1–G9 become ADR-0052 (superseding the scope of ADR-0001 where they overlap) and the engineering consequences are triaged into follow-up ADRs, in particular the macro service (G4.20), the two-layer materialise/fold contract (G8), viewer-dependent replication (G7.8, G8.2), and mothership-scale interest management (G4).
+
