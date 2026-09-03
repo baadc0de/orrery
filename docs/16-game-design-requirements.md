@@ -29,11 +29,31 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 - **PvP means the trust model is adversarial by default.** Every witness may be an opponent of the party it is witnessing.
 - **PvE means the universe simulates without players present**, or appears to. Whether NPC state is durable or regenerated is a decision to be made (see ADR-0051 for the terrain precedent).
 
+## G2 — Universe scale and topology
+
+| # | Requirement | Source |
+|---|---|---|
+| G2 | **One solar system at a time.** The live universe is a single solar system of **dozens of bodies** (star, planets, moons; asteroids/stations as bodies or as content on them). | owner mandate |
+| G2.1 | **Seasonal.** The universe changes on a seasonal cadence. *Assumed reading:* a season is a bounded period during which one solar system is live; a new season opens a new (or regenerated) system. *Alternative reading:* planets have in-world seasons that change conditions over time. **Owner to confirm which, or both.** | owner mandate, reading unconfirmed |
+| G2.2 | **Three spacecraft classes**, distinguished by how they move: | owner mandate |
+| G2.2a | **Fast-response craft** carry a **jump drive**. Jump travel takes **seconds to minutes** anywhere in the system. | owner mandate |
+| G2.2b | **Escorts** have **no jump capability**. They fight alongside and are moved by other means (carried, or flip-and-burn). | owner mandate |
+| G2.2c | **Flip-and-burn craft** use continuous-thrust physics (accelerate, flip, decelerate) with **slightly exaggerated** constants so that in-system travel takes **hours to days**. Used for automated resource delivery, planet and moon landing, and other tasks that are not time-sensitive. | owner mandate |
+| G2.3 | **Two time scales of travel coexist.** Jump (seconds–minutes) is the player's tactical mobility; flip-and-burn (hours–days) is the logistics layer and continues whether or not the owning player is online. | derived from G2.2 |
+
+### Engineering consequences of G2
+
+- **Bodies are the unit of surface space.** Dozens of bodies, each landable, means dozens of surface grids plus one space grid, and the grid id is already part of the storage key (ADR-0022). Landing/take-off is a grid transition and an authority handoff, same class of event as boarding (G1 consequences).
+- **A jump is a teleport across the spatial model.** Interest sets, cell standing (ADR-0030) and witness sets (ADR-0028) at the destination must be assembled before arrival. The seconds-to-minutes spool time is the budget for that handoff; it should be treated as a design parameter (ADR-0016), not just flavour.
+- **Flip-and-burn ships are durable, unattended simulation.** A cargo run lasting a day outlives any session. Its trajectory is deterministic from a few parameters (burn start, thrust, mass, target), so it should be persisted as a **plan** and evaluated lazily, not ticked at 60 Hz. This is the first concrete case of "the world moves while nobody is there" and should settle the PvE durability question (G8) at the same time.
+- **Unattended cargo is a PvP target.** Interception of an offline player's freighter must have an authority owner, witnesses and a deterministic outcome without the victim present. This is the hardest trust case in the game and is the design driver for the low-population path (ADR-0029).
+- **Escorts imply formation and carriage.** Either escorts ride inside a jump-capable hull (nesting, G1) or they arrive by flip-and-burn ahead of time. Both make fleet movement a planned, persisted thing.
+- **Seasons are the persistence lifecycle** under the assumed reading of G2.1: a season boundary defines what is retained, what carries over (ADR-0020, ADR-0023), and what a fresh world seed produces (doc 12). Under the alternative reading, seasons are a slow global parameter that changes surface conditions and must be replicated consistently (ADR-0021 ruleset distribution).
+
 ## Open — to be settled by the owner
 
 Sections reserved; each becomes a `G<n>` block when decided.
 
-- G2 — Universe scale and topology (how many bodies, how far apart, travel time between them)
 - G3 — Death, loss and persistence of the avatar and its possessions
 - G4 — Ownership and territory (structures, bases, claims)
 - G5 — Economy rules (currency, NPC sinks/faucets, player-only trade)
