@@ -92,6 +92,7 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 | G4.6 | **Dismount.** An avatar may leave its mech, and must in order to traverse buildings and natural structures such as caves. | owner mandate |
 | G4.7 | **No foothold at season start.** When a season opens, the mothership's forces hold nothing on any body. They build structures and set up resource extraction while **staving off or displacing existing occupants and fauna**. | owner mandate |
 | G4.8 | **Planetary territory is temporary by construction.** Everything built on a body is left behind at the season jump (G2.1d). | derived from G2.1d, G4.7 |
+| G4.9 | **PvP aboard the mothership is fully open.** No mechanical safe zone. Deterrence is in-world: **NPC security** responds to violence, and aggressors pay in **renown** (G4.3), which gates command and shared assets. | owner mandate (G4 open decision 1, answered 2026-09-03) |
 
 ### Engineering consequences of G4
 
@@ -101,13 +102,14 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 - **Renown is a durable, non-transferable progression track** distinct from resources; it crosses seasons (G2.1d) and gates authority over shared assets. It is a reputation ledger and must be attested like any value-bearing write.
 - **Nesting depth is now known:** avatar → mech → drop pod → ship → mothership, five levels. The authority chain and the interest radius per level must be designed for that depth, not two.
 - **Surface structures are the territory game and are disposable.** They need build, upkeep, damage and destruction rules but no cross-season persistence. Their journals are retained only for the season (ADR-0020).
+- **Open PvP on the mothership means the trust model has no safe grid.** Hit registration, loot drops and witnessing (R8) must hold at full-server population in one hub, and every bystander is a candidate witness. NPC security is server-authoritative PvE (G8) that must react within the same tick budget as the players it polices, and renown penalties are attested writes triggered by adjudicated violence, so a false accusation (or a missed one) is a reputation exploit. Crime detection needs a deterministic definition (who fired first, who was where) that replay can settle.
 - **Existing occupants and fauna are the PvE baseline** (G8). "Displacing" them means NPC territory is a real quantity that shrinks as players build. NPC presence must therefore be durable state for the season, not respawned decoration.
 
 ### G4 — open decisions
 
 Numbered so they can be answered one at a time.
 
-1. **PvP scope on the mothership.** Is the mothership a safe zone (no weapons, no theft), partially safe (duels, sanctioned arenas), or fully open? This is the single biggest driver of the trust model at high population.
+1. ~~PvP scope on the mothership.~~ **Answered: fully open, with NPC security and renown as deterrents (G4.9).**
 2. **One mothership or several.** If every player shares one mothership, PvP is intra-faction rivalry on the surface and in space. If there are several (rival factions, or one per shard), PvP is inter-faction and each mothership is its own root grid. This also fixes what G7 grouping means.
 3. **Who may build on the surface.** Individuals, groups (G7), or only the mothership's collective effort? And who owns the resulting structure and its extracted resources?
 4. **Structure conflict rules.** Can players destroy or capture each other's structures? Offline raiding allowed, or only within a declared window (siege timers)? What is salvaged from a destroyed structure?
