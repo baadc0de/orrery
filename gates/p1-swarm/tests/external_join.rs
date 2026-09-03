@@ -325,6 +325,39 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
         Some(0),
         "an honest cohort filed signals against nobody"
     );
+    // #961. `--external-peer` is the only mode that seeds campaign rocks
+    // (`main.rs`: `campaign: args.external_peer`), so this is the one test in
+    // the tree that puts a non-craft body on the wire — and it asserted nothing
+    // about the decode counters, which is how a receiver that dropped every
+    // rock and charged it to `bad_body` stayed green for as long as it did.
+    assert_eq!(
+        report.get("total_bad_body").and_then(|v| v.as_u64()),
+        Some(0),
+        "a state packet decoded at the envelope but not as state; the receiver \
+         is refusing a body the sender legitimately replicated"
+    );
+    assert_eq!(
+        report.get("total_undecodable").and_then(|v| v.as_u64()),
+        Some(0),
+        "an inbound state packet did not decode at all"
+    );
+    // The anti-vacuity half: with the campaign's rocks in scope every bot holds
+    // more replicas than there are peers, so a receiver that silently went back
+    // to one-row-per-peer would fail here rather than pass a `bad_body` of zero
+    // it earned by dropping the bodies quietly.
+    let replicas = report
+        .get("total_replicas")
+        .and_then(|v| v.as_u64())
+        .expect("the report counts replicas");
+    let peers = report
+        .get("peers")
+        .and_then(|v| v.as_u64())
+        .expect("the report counts peers");
+    assert!(
+        replicas > peers * peers,
+        "{replicas} replicas across {peers} peers is at most one row per peer; the \
+         campaign's hosted rocks are not being tracked as bodies (#961)"
+    );
     assert_eq!(
         report.get("peers").and_then(|v| v.as_u64()),
         Some(4),

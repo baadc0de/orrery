@@ -508,14 +508,28 @@ impl SignalTally {
 /// neighborhood" fails against ghosts rather than against anything real.
 const REPLICA_TTL_TICKS: u64 = 120;
 
-/// The ECS entity mirroring another bot's body.
+/// The ECS entity mirroring another peer's replicated body, keyed by the
+/// canonical entity that body belongs to.
 ///
 /// Without these the interest selector has nothing to rank: `update_interest_set`
 /// queries the non-local entities with a position, and a harness that never
 /// spawned any would report zero churn, never reach the 24-entity cap, and
 /// certify an interest set it had not exercised.
+///
+/// The key is the *entity*, never the transport identity that carried it. A
+/// transport identity is not an entity identity (D2): one peer may hold several
+/// single-writer authorities, and campaign rocks are exactly that shape (see
+/// [`Bot::host_entity`]). Keying by `PersistId` is what lets a peer's craft and
+/// the rocks it hosts be separate bodies for the selector, rather than one row
+/// whose position is whichever packet happened to arrive last.
+///
+/// This is the same shape the shipping client uses — `clients/regolith`'s
+/// downlink installs by `PersistId` and filters on no variant at all — and the
+/// same shape [`Bot::receive_inbound`] already uses for the executor half of
+/// this receiver, where the streaming peer is tracked separately in
+/// `replica_authorities` because that is the copy authority matching reads.
 #[derive(Component)]
-pub struct Replica(pub NodeId);
+pub struct Replica(pub PersistId);
 
 /// The tick a replica was last refreshed, for [`REPLICA_TTL_TICKS`].
 #[derive(Component)]
@@ -638,12 +652,21 @@ pub(crate) fn decode_replica(
     })
 }
 
-/// Upserts a replica entity per peer from the state packets that arrive.
+/// Upserts a replica entity per replicated body from the state packets that arrive.
 ///
 /// This is the receiving half of replication, reduced to what the criterion
 /// measures: which entities a peer is tracking and where they are. Whether the
 /// bytes arrived as a delta or a snapshot is `orrery_predict`'s concern; the
 /// interest selector only needs a position and a cell.
+///
+/// One replica per *body*, not per peer (#961). `docs/03-replication.md` §4.1
+/// scores "every replicable entity in its 27-cell AOI", and §9.3's remedy for
+/// too many of them is to shed by relevance class or demote to a proxy — never
+/// for the receiver to refuse the body. A peer keyed model could not represent
+/// the multi-authority shape D2 permits and `Bot::host_entity` relies on, and
+/// discarding the bodies it could not represent is what made this receiver
+/// charge well-formed campaign rocks to `bad_body` — a counter whose contract
+/// is bytes the receiver's own codec refuses.
 pub fn apply_replicas(
     mut packets: MessageReader<PeerPacket>,
     mut commands: Commands,
@@ -720,10 +743,6 @@ pub fn apply_replicas(
             continue;
         };
         let entity = decoded.entity;
-        let RegolithState::Craft(craft) = &state else {
-            receive.counters.bad_body += 1;
-            continue;
-        };
         // Stage 1, on everything received, witnessed or not (docs/06 §3) — and
         // the sample store a blind watch re-anchors from. The state is the
         // authority's own, stamped with the tick it belongs to, so a claim's
@@ -737,16 +756,20 @@ pub fn apply_replicas(
             });
         }
 
+        // A scheduler occupies no point in the lattice, so it is not a spatial
+        // replica and the selector has nothing to rank it by. Not a fault: the
+        // body decoded, and the shipping client's own AOI code returns `None`
+        // for the same variant (`clients/regolith/src/aoi.rs`).
+        let Some(pos) = body_position(&state) else {
+            continue;
+        };
         // Position is for distance ranking; the *cell* is the authority's own
         // committed value, never recomputed here (D2).
-        let grid = grid_of(&craft.pos, edge.0);
-        match existing
-            .iter()
-            .find(|(_, replica)| replica.0 == packet.from)
-        {
-            Some((entity, _)) => {
+        let grid = grid_of(&pos, edge.0);
+        match existing.iter().find(|(_, replica)| replica.0 == entity) {
+            Some((mirror, _)) => {
                 receive.counters.updated += 1;
-                commands.entity(entity).insert((
+                commands.entity(mirror).insert((
                     Cell(decoded.cell),
                     GridPosition(grid),
                     LastSeen(tick.0),
@@ -755,7 +778,7 @@ pub fn apply_replicas(
             None => {
                 receive.counters.spawned += 1;
                 commands.spawn((
-                    Replica(packet.from),
+                    Replica(entity),
                     Cell(decoded.cell),
                     GridPosition(grid),
                     LastSeen(tick.0),
@@ -2570,13 +2593,25 @@ fn authored_cell(
     if entity == primary {
         return player_cell;
     }
-    let pos = match state {
-        RegolithState::Craft(craft) => craft.pos,
-        RegolithState::Rock(rock) => rock.pos,
-        RegolithState::Pickup(pickup) => pickup.pos,
-        RegolithState::BloomDirector(_) => QPos::default(),
-    };
-    cell_of(grid_of(&pos, cell_edge_m))
+    cell_of(grid_of(
+        &body_position(state).unwrap_or_default(),
+        cell_edge_m,
+    ))
+}
+
+/// Where a replicated body sits in the lattice, if it sits anywhere.
+///
+/// `None` for the bloom scheduler, which occupies no point — the same call the
+/// shipping client's `body_position_m` makes. Every other variant is an
+/// ordinary spatial body: `docs/01-spatial-model.md` says of a drifting
+/// asteroid that "it is an ordinary entity in its parent grid".
+fn body_position(state: &RegolithState) -> Option<QPos> {
+    match state {
+        RegolithState::Craft(craft) => Some(craft.pos),
+        RegolithState::Rock(rock) => Some(rock.pos),
+        RegolithState::Pickup(pickup) => Some(pickup.pos),
+        RegolithState::BloomDirector(_) => None,
+    }
 }
 
 fn is_delta_payload(payload: &[u8]) -> bool {

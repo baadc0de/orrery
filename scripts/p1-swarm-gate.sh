@@ -95,6 +95,13 @@ if [[ ${1:-} == --self-test ]]; then
   # about false-positive filing that shadow mode had not already decided.
   has '--witness --enforce' \
     || die 'self-test: the armed honest control is absent; "files nothing" would be shadow mode restating itself'
+  # The exterior leg is not a `"$BIN"` invocation, so `has` cannot see it: it is
+  # a two-process wall-clock proof driven through the ignored integration test.
+  # Without it no leg here ever passes `--external-peer`, and with no leg passing
+  # it the campaign's non-craft bodies are never replicated under the nightly —
+  # which is exactly how #961 hid.
+  grep -Fq -- 'an_external_peer_joins_witnesses_and_moves_frames' <<<"$legs" \
+    || die 'self-test: the exterior leg is absent; no leg then runs --external-peer and the campaign bodies are never on the wire'
   cargo run -q --manifest-path "$(dirname "$0")/../gates/p1-swarm/Cargo.toml" -- --self-test \
     || die 'self-test: the harness no longer covers every criterion clause'
   echo "$NAME: self-test passed"
@@ -219,3 +226,21 @@ note 'control run: the same island, witnesses armed, nobody modified — must fi
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/PASSED"
 note "every clause held on all five legs, the witnessed and conviction ones included; reports in $OUT"
+
+# The exterior leg (#961). Every leg above is a pure-bot island in one process:
+# `--external-peer` is the only mode that binds a real iroh endpoint, and — via
+# `main.rs`'s `campaign: args.external_peer` — the only one that seeds campaign
+# rocks, so it is the only leg that puts a body other than a `Craft` on the
+# wire. Nothing in this file passed it until now, which is how a receiver that
+# discarded every rock and charged it to `bad_body` survived: the counter ran at
+# 151 on an 8-second run and no nightly ever took one.
+#
+# Driven through the test rather than through "$BIN" because the proof needs two
+# processes at wall clock — a host and a dialling peer — and that orchestration
+# already exists, asserted, in `tests/external_join.rs`. It is `#[ignore]`d there
+# precisely so it runs here and not in every `cargo test`.
+note 'exterior leg: a real dialled peer against a campaign island, rocks on the wire'
+cargo test --release -q --manifest-path "$ROOT/gates/p1-swarm/Cargo.toml" \
+  --test external_join -- --ignored --exact \
+  an_external_peer_joins_witnesses_and_moves_frames \
+  || die 'the exterior join did not hold: see bad_body / total_replicas in its output (#961)'
