@@ -127,6 +127,12 @@ fn group_builds_every_member_in_dependency_order() {
     // The AOI visibility mapping is deliberately not a member: its
     // `AoiVisibilityBit` is built out of replicon's registries and panics
     // unless `RepliconPlugins` was added first.
+    //
+    // Its absence is also the standing state the owner's #535 ruling was made
+    // against: adding it to a shipping client is the named trigger to revisit
+    // the island manifest's per-peer cell disclosure
+    // (`docs/spikes/island-manifest-cells-disclosure.md`). If this assertion
+    // is being changed, that review is due — the change is not routine.
     assert!(!app.is_plugin_added::<orrery_spatial::AoiVisibilityPlugin>());
 }
 
