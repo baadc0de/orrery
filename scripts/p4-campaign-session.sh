@@ -105,7 +105,13 @@
 #     *fired* when observation disagreed with configuration — an assembled
 #     row whose flag contradicts its numbers is refused here, and again by
 #     `p4-ledger.sh` if edited after assembly);
-#   * no interval exceeds its own seat's connected span, one tick of tolerance;
+#   * no interval exceeds its own seat's connected span, one tick of tolerance.
+#     That span is the host's own wall bracket between binding the seat and
+#     releasing it, not a tick count scaled at the nominal rate: the host's
+#     metronome never makes up an overrun, so the scaled count is short by
+#     however much it lagged and refused seven honest attempts (#971). A
+#     report carrying no bracket still falls back to the tick count, which
+#     is the stricter of the two;
 #   * the pipeline digest is computed from the report's own commit over the
 #     same four trees `p4-ledger.sh` hashes, and stamped into each row, so the
 #     ledger's cross-check has something true to hold.
@@ -898,6 +904,71 @@ json.dump(row,sys.stdout,separators=(",",":")); print()' > "$dir/unflagged.json"
   cat "$dir/row-a.json" "$dir/row-b-huge.json" > "$dir/host-over.jsonl"
   st_refuses the_hosts_own_connected_ticks_bound_the_interval 'connected span' \
     "$dir/host-over-out" "$dir/host-shaped.json" "$dir/host-over.jsonl" "$dir/host-over-out"
+
+  # ── The two clocks disagreeing, which is what a real host does (#971) ────
+  #
+  # The fixture above cannot catch #971 and never could: its `connected_ticks`
+  # and its client rows were written from the same nominal 30 tps, so the two
+  # clocks agree *by construction*. A real host's do not. `gates/p1-swarm`'s
+  # metronome sleeps out the remainder of a tick and accumulates no deadline, so
+  # an overrun is lost for good and the host runs at or below its nominal rate —
+  # 55.3 to 59.8 Hz measured against 60 Hz nominal. Seven consecutive honest
+  # attempts with the shipped client were refused for banking 60.02 s against a
+  # seat the accounting scaled to 59.77 s.
+  #
+  # So this case builds the disagreement instead of assuming it away: both seats
+  # were connected for a real 55.02 wall minutes, and a host lagging ~1.1% ticked
+  # only 98,000 times over it — 54.444 min at the nominal rate. The rows bank 55
+  # minutes each, which the wall bracket contains and the tick count does not.
+  local lagging
+  lagging=$(jq '
+    .external = (.external | map(
+      . + { connected_ticks: 98000,
+            connected_since_unix_millis: 1750000000000,
+            connected_until_unix_millis: 1750003301200 }))' "$dir/host-shaped.json")
+  echo "$lagging" > "$dir/host-lagging.json"
+  st_row "$sid_a" 55 21 > "$dir/row-a-55.json"
+  st_row "$sid_b" 55 22 x86_64-pc-windows-msvc > "$dir/row-b-55.json"
+  cat "$dir/row-a-55.json" "$dir/row-b-55.json" > "$dir/lagging.jsonl"
+  st_assemble lagging "$dir/host-lagging.json" "$dir/lagging.jsonl" "$dir/lagging-out" \
+    "$sid_a" "$sid_b" \
+    || die "self-test [a_lagging_hosts_wall_bracket_banks_what_its_tick_count_would_refuse]: refused an interval the host's own wall bracket contains ('$(tr '\n' ' ' <"$dir/case/err")')"
+  jq -es '
+    (length == 3)
+    and (map(select(.identity.actor == "human")) | length == 2)
+    and (map(select(.identity.actor == "human")
+             | .binding.connected_minutes * 1000 | round) | unique == [55020])
+  ' "$dir/lagging-out"/*.json >/dev/null \
+    || die 'self-test [a_lagging_hosts_wall_bracket_banks_what_its_tick_count_would_refuse]: the span was not taken from the host wall bracket'
+  for input in "$dir/lagging-out"/*.json; do
+    P4_LEDGER_FILE="$dir/lagging-hours.jsonl" "$ROOT/scripts/p4-ledger.sh" append "$input" >/dev/null 2>&1 \
+      || die "self-test [a_lagging_hosts_wall_bracket_banks_what_its_tick_count_would_refuse]: p4-ledger.sh refused $(basename "$input")"
+  done
+  st_ok a_lagging_hosts_wall_bracket_banks_what_its_tick_count_would_refuse
+
+  # The control, and the proof that the bracket is what carried the case above
+  # rather than a widened tolerance: strip the stamps off the same report and
+  # the same rows, and the tick basis refuses it. That is the conservative
+  # direction, so a report without a bracket is never the easier one to bank.
+  jq 'del(.external[].connected_since_unix_millis, .external[].connected_until_unix_millis)' \
+    "$dir/host-lagging.json" > "$dir/host-lagging-bare.json"
+  st_refuses the_tick_count_alone_still_refuses_the_same_lagging_attempt 'connected span' \
+    "$dir/lagging-bare-out" "$dir/host-lagging-bare.json" "$dir/lagging.jsonl" \
+    "$dir/lagging-bare-out"
+
+  # Half a bracket is not a bracket.
+  jq 'del(.external[].connected_until_unix_millis)' "$dir/host-lagging.json" \
+    > "$dir/host-half-bracket.json"
+  st_refuses one_end_of_a_connected_span_is_not_a_bracket 'one end of its connected span' \
+    "$dir/half-bracket-out" "$dir/host-half-bracket.json" "$dir/lagging.jsonl" \
+    "$dir/half-bracket-out"
+
+  # A bracket that runs backwards is a broken clock, not a long seat.
+  jq '.external = (.external | map(.connected_until_unix_millis = 1749999999000))' \
+    "$dir/host-lagging.json" > "$dir/host-backwards.json"
+  st_refuses a_connected_span_cannot_run_backwards 'cannot run backwards' \
+    "$dir/backwards-out" "$dir/host-backwards.json" "$dir/lagging.jsonl" \
+    "$dir/backwards-out"
 
   # A report that seated nobody, in the array spelling the host emits.
   jq '.external = []' "$dir/host-shaped.json" > "$dir/host-empty.json"
