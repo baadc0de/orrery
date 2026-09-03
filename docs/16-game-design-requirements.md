@@ -58,11 +58,31 @@ Stated here so the pull on the architecture is visible; each line becomes a desi
 - **Season quests are shared, server-wide goals with a deadline.** Their progress is a value-bearing aggregate (contributions from many players) and therefore a quorum-attested write (R8). "Completed" is a consensus fact, and it triggers the season end, so it must be adjudicable by replay.
 - **Two end conditions mean the deadline is a hard clock.** A wall-clock deadline is a global parameter that every node must agree on (ADR-0021). Either end condition schedules a maintenance window rather than triggering the transition in-tick; the window itself (drain and close the old system, verify the mothership journal is fully attested and durable, migrate, seed, reopen) is an ops procedure (doc 09) with a rehearsed runbook and a rollback point before the old system is discarded.
 
+## G3 — Death, loss and insurance
+
+| # | Requirement | Source |
+|---|---|---|
+| G3 | **Avatar death is temporary.** Death never ends progression; the avatar returns. | owner mandate |
+| G3.1 | **Cloning.** Avatars resurrect as clones. Players pay **resource upkeep for clone quality**; a better-maintained clone is a better resurrection (what "quality" affects is settled in G6). | owner mandate |
+| G3.2 | **Full loot.** Everything carried at death is dropped where the avatar died. **What is dropped is dropped**: no partial protection, no soulbound items, no automatic return. | owner mandate |
+| G3.3 | **Opt-in insurance, in-game.** A player may insure items. On death, insurance **automatically creates procurement and delivery orders** that replace the insured items and bring them to the resurrected avatar. | owner mandate |
+| G3.4 | **Retrieval.** The same insurance system can instead **retrieve the dropped items** (a recovery order against the death site) rather than procure new ones. | owner mandate |
+| G3.5 | **Insurance is an economic actor**, not a menu option. Its orders are fulfilled through the trade and logistics systems (G1.6, G2.2c): procurement buys from players or stock, delivery is a flip-and-burn (or courier) run, retrieval is a trip to the corpse. | derived from G3.3, G3.4, G2.2c |
+
+### Engineering consequences of G3
+
+- **Death is a value transfer, not a state reset.** The drop is a persistence write that moves every carried item from the avatar to a loot container at the death site. Under PvP (G1.7) the killer is an interested party and often a witness, so the drop must be quorum-attested (R8) with the dropped set derived deterministically from the attested inventory, never from the client. Duplication on death (die, keep, and drop) is the primary exploit to design against.
+- **The corpse is a durable, contested object.** It outlives the victim's session and is a PvP target like unattended cargo (G2). It needs an authority owner and a lifetime rule (decay, or until retrieved) that is a world parameter (ADR-0016).
+- **Clone upkeep is a recurring resource sink** tied to the avatar, not to a session. It accrues while the player is offline and must be billed deterministically from durable state, so it is a lazily evaluated plan of the same kind as a flip-and-burn trajectory (G2), not a ticked process.
+- **Resurrection location matters.** Where the clone wakes (mothership, a clone bay planetside, a ship) determines how far insurance must deliver and how exposed the fresh clone is. Clone bays are structures (G4) and therefore territory.
+- **Insurance orders are automatic transactions on behalf of an absent player.** They create market orders, spend the player's resources, and dispatch craft without the player online. That is the first case of **system-initiated, player-owned intent**, and it must be signed in a way the attestation envelope (ADR-0027) can distinguish from live player input while still binding it to the player.
+- **Insurance is a delivery pipeline, so it can be griefed.** Intercepted delivery runs and camped corpses are legitimate PvP but the insurance contract must specify the outcome (pay out, retry, or fail) deterministically. This is the same low-population adjudication problem as offline cargo interception (ADR-0029).
+- **Full loot bounds per-avatar inventory to what can be lost.** The avatar's carried state is small and volatile; durable wealth lives in stockpiles (mothership, structures). This is a useful split for replication: carried inventory is hot state on the avatar entity, stockpiles are grid-owned and rarely replicated to non-owners.
+
 ## Open — to be settled by the owner
 
 Sections reserved; each becomes a `G<n>` block when decided.
 
-- G3 — Death, loss and persistence of the avatar and its possessions
 - G4 — Ownership and territory (structures, bases, claims)
 - G5 — Economy rules (currency, NPC sinks/faucets, player-only trade)
 - G6 — Progression (skills, blueprints, ship/mech tiers)
