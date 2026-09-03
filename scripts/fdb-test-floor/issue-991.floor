@@ -1,0 +1,23 @@
+# #991 / D32 clause (e): the emit path, from durable rows to an artifact.
+#
+# `orrery_persistd::intent::report::fdb_tests` adds two tests that mean nothing
+# without a cluster, because what they assert is that durable rows written by
+# one process become a readable artifact in another:
+#
+#   - the cohort roster written through `FdbHonestCohortStore::sample` (natural
+#     half included, so the store's durable checks run) and thirty-one days of
+#     counters flushed through `FdbRampWindowStore::flush` are read back by a
+#     producer that metered nothing, and come out as a `RampArtifact` whose
+#     `W`, `coverage`, `fp_count` and armed/natural halves are the rows' —
+#     with the fleet-wide account cardinalities `null` rather than zero;
+#   - a `--traffic production` claim refused against a cluster holding no
+#     window row at all, and the same state still assembling as `harness`.
+#
+# The eight sibling unit tests in the same module, and the four `orrery-ramp`
+# binary tests for the `report` verb, pass without a cluster. They execute in
+# this invocation and are deliberately **not** claimed: the floor is a lower
+# bound, and counting them would inflate the tripwire with tests this tier
+# does not speak for.
+#
+# The floor rises by the two: 528 -> 530.
+2

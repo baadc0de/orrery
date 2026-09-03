@@ -50,7 +50,18 @@ DATA = pathlib.Path(
 
 # The schema `RampArtifact` writes. A reader that guesses at a shape it was not
 # written for reports numbers that are wrong rather than absent.
-SCHEMA = "orrery.ramp.report/1"
+#
+# `/2` is the shape an artifact assembled from durable state can fill. Four
+# fields a `/1` artifact carried as counts became nullable there, because they
+# are distinct-account cardinalities and cardinalities are per-process by
+# construction: an assembler that read a `rampw/{control}` row never sat on an
+# admission path and has no value for them. That is what forces the version
+# rather than tolerating an addition. A `/1` reader handed `null` in
+# `accounts_would_act` — through `.get(name, 0)`, as this file's own accessors
+# would — reads it as *zero distinct accounts*, which is **under** clause (f)'s
+# spread bound: it would report a safety term as satisfied by an artifact that
+# never measured it. Absent is not zero, here least of all.
+SCHEMA = "orrery.ramp.report/2"
 
 # D32 clause (e)'s production leg. Every one of these is a dial the record
 # states without deriving, and each is named here so lowering one is a visible
@@ -202,25 +213,73 @@ def validate(artifact: dict) -> list[str]:
             <= control.get("qualifying", 0),
             "the same subset relation, fleet-wide",
         )
+        # Every recorded verdict, against every volume that could have
+        # produced one. The unattributed leg is part of the identity because
+        # `by_verdict` counts sessionless submissions and the fleet volumes
+        # above deliberately do not — see `UnattributedTally::unevaluated`.
+        # A `/1` artifact could omit it only because harness traffic has no
+        # sessionless submissions in it; production traffic does.
+        unattributed = control.get("unattributed") or {}
         check(
             f"{name} verdict split",
             sum((control.get("by_verdict") or {}).values())
-            == control.get("observed", 0) + control.get("unevaluated", 0),
+            == control.get("observed", 0)
+            + control.get("unevaluated", 0)
+            + unattributed.get("observed", 0)
+            + unattributed.get("unevaluated", 0),
             "every recorded verdict must appear in the outcome split; a split "
             "that is short is a split with an unnamed exit",
         )
         check(
-            f"{name} spread bound",
-            control.get("accounts_would_act", 0) <= control.get("accounts_observed", 0)
-            <= control.get("accounts_qualifying", 0),
-            "account cardinality must nest the way the event counts do",
+            f"{name} unattributed arithmetic",
+            unattributed.get("observed", 0) + unattributed.get("unevaluated", 0)
+            <= unattributed.get("qualifying", 0),
+            "the same subset relation, over the sessionless submissions clause "
+            "(e) puts outside H by construction",
         )
+
+        # The cardinalities are nullable in `/2`, and the two states are read
+        # apart rather than defaulted together: `None` means no process run
+        # stands behind the figure, and `0` means one does and counted none.
+        # Nesting is checked only where all three are actually present —
+        # comparing an absence against a count is what a `/1` reader would do,
+        # and it is what makes it report a safety term as met.
+        spread = [
+            control.get(field)
+            for field in ("accounts_would_act", "accounts_observed", "accounts_qualifying")
+        ]
+        if all(value is not None for value in spread):
+            check(
+                f"{name} spread bound",
+                spread[0] <= spread[1] <= spread[2],
+                "account cardinality must nest the way the event counts do",
+            )
+        else:
+            check(
+                f"{name} spread absence",
+                all(value is None for value in spread),
+                "the fleet-wide cardinalities are one measurement, taken over one "
+                "process run; some present and some absent means they came from "
+                f"different places ({spread})",
+            )
+
+        # Truncation, in both of the two forms it can take. The count is
+        # per-process and may be absent; the flag folds and never is, which is
+        # why it is the one an assembled artifact carries.
+        truncated = control.get("accounts_truncated")
         check(
             f"{name} truncation",
-            control.get("accounts_truncated", 0) == 0,
-            f"{control.get('accounts_truncated')} accounts were folded into the "
-            "meter's overflow bucket, so account spread and the cohort denominator "
-            "are both understated and neither can be cited",
+            not control.get("truncation_seen", False),
+            "this window folded traffic into the meter's overflow bucket, so "
+            "account spread and the cohort denominator are both understated and "
+            "neither can be cited",
+        )
+        check(
+            f"{name} truncation count",
+            truncated in (None, 0),
+            f"{truncated} accounts were folded into the meter's overflow bucket, "
+            "so account spread and the cohort denominator are both understated "
+            "and neither can be cited",
         )
 
     return failures
@@ -284,6 +343,21 @@ def rate(value: float | None, numerator: int, denominator: int) -> str:
 # ── rendering ────────────────────────────────────────────────────────────────
 
 
+def spread_of(control: dict, field: str) -> str:
+    """An account cardinality, or the reason there is none.
+
+    `rate`'s sibling, and guarded for the same reason one step further on. A
+    `/2` artifact may carry `null` here, and the two ways that can happen must
+    not render alike: `0` means a metering process counted no accounts, and
+    absent means nothing counted at all. Printing "across 0 accounts" beside
+    five million admission decisions would read as a finding.
+    """
+    value = control.get(field)
+    if value is None:
+        return "account spread not assembled (per-process figure; see provenance)"
+    return f"across {value:,} accounts"
+
+
 def render(artifact: dict) -> list[str]:
     lines: list[str] = []
     provenance = artifact["provenance"]
@@ -292,6 +366,29 @@ def render(artifact: dict) -> list[str]:
     lines.append(f"  source      {provenance['source']}")
     if provenance.get("note"):
         lines.append(f"  note        {provenance['note']}")
+    # The durable rows a production claim rests on. Rendered so a reviewer can
+    # read the same generations back off the same cluster instead of taking the
+    # word `production` on trust. `flushes` is shown and never compared
+    # against anything: the floors are clause (e)'s.
+    for window in provenance.get("windows") or []:
+        detail = (
+            f"  window      rampw/{window['control']} generation {window['window_id']}, "
+            f"opened at {window['opened_at_ms']} ms, {window['flushes']:,} flush(es)"
+        )
+        if window.get("reset_reason"):
+            detail += f", reset {window['reset_reason']!r}"
+        lines.append(detail)
+        if window.get("cohort_accounts_truncated"):
+            lines.append(
+                f"              WARNING {window['cohort_accounts_truncated']} cohort "
+                "account id(s) did not fit the row; the active and would-act member "
+                "counts below are understated by at most that much"
+            )
+    if provenance.get("traffic") == "production" and not (provenance.get("windows") or []):
+        lines.append(
+            "  window      none listed — a production claim resting on no durable "
+            "window is a claim about rows that are not there"
+        )
     lines.append("")
 
     for control in artifact["controls"]:
@@ -303,11 +400,11 @@ def render(artifact: dict) -> list[str]:
         )
         lines.append(
             f"    admission decisions {control['qualifying']:>8,}   "
-            f"across {control['accounts_qualifying']:,} accounts"
+            f"{spread_of(control, 'accounts_qualifying')}"
         )
         lines.append(
             f"    observed            {control['observed']:>8,}   "
-            f"across {control['accounts_observed']:,} accounts"
+            f"{spread_of(control, 'accounts_observed')}"
         )
         lines.append(
             f"    unevaluated         {control['unevaluated']:>8,}   "
@@ -315,7 +412,7 @@ def render(artifact: dict) -> list[str]:
         )
         lines.append(
             f"    would have acted    {control['would_act']:>8,}   "
-            f"across {control['accounts_would_act']:,} accounts"
+            f"{spread_of(control, 'accounts_would_act')}"
         )
         if control["unattributed"]["qualifying"]:
             lines.append(
@@ -366,12 +463,33 @@ def render(artifact: dict) -> list[str]:
         lines.append("      auditor liveness. The production leg is one conjunct of four.")
         lines.append("")
 
-        spread = control["accounts_would_act"]
+        spread = control.get("accounts_would_act")
         lines.append("    clause (f) auto-suspend, spread term only")
-        lines.append(
-            f"      spread ≥ {SUSPEND_SPREAD}          {spread} distinct accounts "
-            f"— {'over' if spread >= SUSPEND_SPREAD else 'under'} the bound"
-        )
+        if spread is None:
+            # The guarded branch. `0 distinct accounts` is *under* the bound,
+            # so defaulting an absent cardinality to zero would print a safety
+            # term as satisfied by an artifact that never measured it.
+            lines.append(
+                f"      spread ≥ {SUSPEND_SPREAD}          not evaluated — this artifact "
+                "was assembled from durable state and"
+            )
+            lines.append(
+                "                          carries no fleet-wide account cardinality; "
+                "absent is not zero, and"
+            )
+            lines.append(
+                "                          zero would be *under* the bound. The "
+                "auto-suspend breaker computes"
+            )
+            lines.append(
+                "                          this term in-process and never reads it off "
+                "an artifact."
+            )
+        else:
+            lines.append(
+                f"      spread ≥ {SUSPEND_SPREAD}          {spread} distinct accounts "
+                f"— {'over' if spread >= SUSPEND_SPREAD else 'under'} the bound"
+            )
         lines.append(
             "      The rate term needs a trailing 7-day hourly median this artifact "
             "does not carry,"
@@ -421,7 +539,13 @@ def synthetic(qualifying: int, observed: int, fp_count: int) -> dict:
                 "accounts_observed": 1 if observed else 0,
                 "accounts_would_act": 1 if fp_count else 0,
                 "accounts_truncated": 0,
-                "unattributed": {"qualifying": 0, "observed": 0, "would_act": 0},
+                "truncation_seen": False,
+                "unattributed": {
+                    "qualifying": 0,
+                    "observed": 0,
+                    "unevaluated": 0,
+                    "would_act": 0,
+                },
                 "by_verdict": {"would_admit": observed} if observed else {},
                 "by_cause": {"threshold_not_met": fp_count} if fp_count else {},
                 "cohort": {
@@ -445,6 +569,91 @@ def synthetic(qualifying: int, observed: int, fp_count: int) -> dict:
             if name != "attestation_quorum"
         ],
     }
+
+
+def assembled(qualifying: int, observed: int, fp_count: int) -> dict:
+    """The same artifact as an emit path assembled from durable state produces.
+
+    Identical numbers, and no fleet-wide account cardinalities at all — the
+    shape `orrery-ramp report` writes, and the one `/2` exists for.
+    """
+    doc = synthetic(qualifying, observed, fp_count)
+    doc["provenance"] = {
+        "traffic": "production",
+        "source": "ramp-report.py --self-test",
+        "note": "",
+        "windows": [
+            {
+                "control": "attestation_quorum",
+                "window_id": 3,
+                "opened_at_ms": 1_000,
+                "flushes": 43_200,
+                "reset_reason": None,
+                "cohort_accounts_truncated": 0,
+            }
+        ],
+    }
+    for field in (
+        "accounts_qualifying",
+        "accounts_observed",
+        "accounts_would_act",
+        "accounts_truncated",
+    ):
+        doc["controls"][0][field] = None
+    return doc
+
+
+def an_absent_cardinality_is_never_read_as_zero() -> list[str]:
+    """The `/2` half of the 0-of-0 rule, one field further out.
+
+    An artifact assembled from durable state carries no fleet-wide account
+    cardinality. `0` is a legal value of that field and it is *under* clause
+    (f)'s spread bound, so a reader that defaults the absence renders a safety
+    term as satisfied by an artifact that never measured it. The check is on
+    the rendered output, because rendering is where the distinction is kept or
+    thrown away.
+    """
+    failures: list[str] = []
+    doc = assembled(qualifying=10_000, observed=10_000, fp_count=0)
+
+    found = validate(doc)
+    if found:
+        failures.append(f"assembled: a durable-state artifact did not validate: {found}")
+        return failures
+
+    lines = render(doc)
+    spread_lines = [line for line in lines if "spread ≥" in line]
+    if not spread_lines:
+        failures.append("assembled: the clause (f) spread term rendered no line at all")
+    elif "under the bound" in spread_lines[0] or "over the bound" in spread_lines[0]:
+        failures.append(
+            "assembled: an absent account cardinality was rendered as a spread "
+            f"verdict: {spread_lines[0].strip()!r}"
+        )
+    elif "not evaluated" not in spread_lines[0]:
+        failures.append(
+            f"assembled: the absent spread term must say so: {spread_lines[0].strip()!r}"
+        )
+
+    # Only the three fleet-wide lines. The cohort's own `accounts_would_act`
+    # is durable — `H` is a bounded roster whose ids fit in the row — so `0`
+    # there is a measurement and must keep rendering as one.
+    fleet_labels = ("admission decisions", "observed  ", "would have acted")
+    for line in lines:
+        if line.strip().startswith(fleet_labels) and "across 0 accounts" in line:
+            failures.append(
+                "assembled: an absent cardinality rendered as zero accounts: "
+                f"{line.strip()!r}"
+            )
+    if not any("not assembled" in line for line in lines):
+        failures.append("assembled: the report never says the cardinalities are absent")
+
+    # And the rows behind the production claim are published with it.
+    if not any("rampw/attestation_quorum generation 3" in line for line in lines):
+        failures.append(
+            "assembled: the durable window a production claim rests on is not rendered"
+        )
+    return failures
 
 
 def zero_of_zero_is_distinguishable() -> list[str]:
@@ -596,9 +805,33 @@ def self_test(artifact: dict) -> int:
             lambda doc: control(doc).update(accounts_would_act=10**9),
         ),
         (
+            "half-absent cardinalities",
+            "spread absence",
+            lambda doc: control(doc).update(accounts_observed=None),
+        ),
+        (
             "truncation",
-            "truncation",
+            "truncation count",
             lambda doc: control(doc).update(accounts_truncated=1),
+        ),
+        (
+            "truncation flag",
+            "truncation",
+            lambda doc: control(doc).update(truncation_seen=True),
+        ),
+        (
+            "unattributed verdicts",
+            "verdict split",
+            lambda doc: control(doc)["unattributed"].update(
+                qualifying=5, observed=5
+            ),
+        ),
+        (
+            "unattributed arithmetic",
+            "unattributed arithmetic",
+            lambda doc: control(doc)["unattributed"].update(
+                qualifying=0, observed=0, unevaluated=1
+            ),
         ),
     ]
 
@@ -613,6 +846,7 @@ def self_test(artifact: dict) -> int:
             )
 
     mutation_failures.extend(zero_of_zero_is_distinguishable())
+    mutation_failures.extend(an_absent_cardinality_is_never_read_as_zero())
 
     if mutation_failures:
         print("SELF-TEST FAILED: guarded facts")
@@ -628,7 +862,8 @@ def self_test(artifact: dict) -> int:
         f"{measured['cohort']['observed']:,} observed, "
         f"coverage {rate(measured['cohort']['coverage'], measured['cohort']['observed'], measured['cohort']['qualifying'])}, "
         f"{len(mutations)} guarded-fact mutations rejected, "
-        "0-of-0 distinguishable from 0-of-10000"
+        "0-of-0 distinguishable from 0-of-10000, "
+        "an unassembled cardinality never read as zero"
     )
     return 0
 

@@ -95,19 +95,52 @@
 //! policy question for the owner rather than a gap in this tool — see
 //! `orrery_persistd::intent::window`'s module docs.
 //!
+//! # The report subcommand: getting clause (e)'s evidence back out
+//!
+//! ```sh
+//! # Assemble the promotion artifact from the durable cohort and the durable
+//! # windows. The traffic claim is mandatory and the tool refuses a
+//! # production claim the rows cannot support.
+//! orrery-ramp report --traffic production --out ramp-2026-10-01.json \
+//!     --fdb-cluster-file /etc/orrery/fdb.cluster
+//!
+//! # Then render it. Every gate figure is read, none re-derived.
+//! RAMP_REPORT_DATA=ramp-2026-10-01.json python3 scripts/ramp-report.py
+//! ```
+//!
+//! Until this verb existed, the meters counted in the deployed composition and
+//! nothing read them out: the only `RampArtifact` producer in the tree was an
+//! `#[ignore]`d harness test building its cohort in memory, so the durable
+//! cohort and the durable window could not reach an artifact at all. That was
+//! a code gap and not a traffic gap.
+//!
+//! `--traffic` has no default, and `production` is refused when the durable
+//! state contradicts it — no window row anywhere, or every row empty. The
+//! claim itself is the operator's, made against a cluster file; what the
+//! artifact does is publish the rows it rests on, so a reviewer can read the
+//! same generations back rather than take the adjective on trust. See
+//! `orrery_persistd::intent::report` for the whole argument.
+//!
+//! Reading durable state here is fine: ADR-0031 clause (d) forbids the
+//! *coordinator* from reading, and this is an operator tool.
+//!
 //! Cohort rows carry no signature, unlike the posture rows above, and the
 //! asymmetry is deliberate: a posture row commands enforcement, a cohort row
 //! names a member of a measurement population. A forged membership row cannot
 //! manufacture a clean `fp_count` or promote anything — see
 //! `orrery_persistd::intent::cohort`'s module docs for the full argument.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use orrery_persistd::gateway::RampMeters;
 use orrery_persistd::intent::cohort::{CohortHalf, CohortMemberRow, FdbHonestCohortStore};
 use orrery_persistd::intent::posture::{self, SignedRampPosture};
+use orrery_persistd::intent::report::{
+    assemble_from_durable, DurableControl, ProvenanceRefusal, TrafficClaim,
+};
 use orrery_persistd::intent::window::{FdbRampWindowStore, RampWindowRow};
 use orrery_persistd::intent::{FdbRampPostureStore, PostureSource, RampMode, RampPosture};
 
@@ -188,6 +221,48 @@ enum Command {
     /// Inspect and reset D32 clause (e)'s durable measurement window `W`.
     #[command(subcommand)]
     Window(WindowCommand),
+    /// Assemble D32 clause (e)'s promotion artifact from durable state.
+    ///
+    /// Loads the durable cohort and every measurable control's durable
+    /// window, replays them through the same `RampMeter::snapshot` the fleet
+    /// computes clause (e)'s terms with, and writes the artifact
+    /// `scripts/ramp-report.py` reads. Nothing is re-derived here.
+    Report {
+        /// What traffic produced the numbers. Mandatory, and `production` is
+        /// refused when the durable state cannot have come from a fleet.
+        #[arg(long, value_enum)]
+        traffic: TrafficArg,
+        /// Where to write the artifact. Omitted, it goes to stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Anything a reader needs beyond what the assembler already states.
+        /// Appended to the note; it does not replace it.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+}
+
+/// The traffic claim, on the command line.
+///
+/// A `ValueEnum` and not a free string, so the artifact's `traffic` field can
+/// only ever hold one of the two words `scripts/ramp-report.py` accepts — and
+/// so there is no default: the mistake worth preventing is a production claim
+/// nobody meant to make.
+#[derive(Clone, Copy, ValueEnum)]
+enum TrafficArg {
+    /// Simulated traffic. Claims nothing clause (e)'s production leg accepts.
+    Harness,
+    /// The fleet. Held up by the durable state or refused.
+    Production,
+}
+
+impl From<TrafficArg> for TrafficClaim {
+    fn from(value: TrafficArg) -> Self {
+        match value {
+            TrafficArg::Harness => Self::Harness,
+            TrafficArg::Production => Self::Production,
+        }
+    }
 }
 
 /// The measurement window's two verbs.
@@ -451,6 +526,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Cohort(cohort) => run_cohort(cohort, &context).await?,
         Command::Window(window) => run_window(window, &context).await?,
+        Command::Report { traffic, out, note } => {
+            run_report(
+                traffic.into(),
+                out.as_ref(),
+                note.as_deref(),
+                &cli.fdb_cluster_file,
+                &context,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -654,6 +739,119 @@ async fn run_window(
                  observation from before this reset can enter the new window"
             );
         }
+    }
+    Ok(())
+}
+
+/// Every control a `persistd` meters, named as the `rampw/{control}` rows are.
+///
+/// Taken from [`RampMeters`] rather than from a list typed out here, for the
+/// reason that bundle exists: the flusher and the startup reload already
+/// iterate it, and a fifth measurable control should reach the artifact by
+/// being added there instead of by a third call site remembering. Each meter
+/// carries its own name, which is the only thing this needs.
+fn measurable_controls() -> Vec<&'static str> {
+    RampMeters::default()
+        .all()
+        .iter()
+        .map(|meter| meter.control())
+        .collect()
+}
+
+/// The one-line `provenance.source` an assembled artifact carries.
+///
+/// It names the *rows* and the *cluster file*, not the operator's intent: a
+/// reviewer's first question about a production claim is which cluster it was
+/// read from, because that is the whole of the trust boundary here.
+fn report_source(cluster_file: &Path) -> String {
+    format!(
+        "orrery-ramp report, assembled from the cohort/* and rampw/* rows of {}",
+        cluster_file.display()
+    )
+}
+
+/// What the tool prints after writing an artifact.
+///
+/// Split out from [`run_report`] so the shape is testable without a cluster.
+/// It says where the numbers came from and what the artifact does *not*
+/// settle: this tool assembles evidence and the floors are clause (e)'s, read
+/// by `scripts/ramp-report.py` and by a human review that this cannot stand in
+/// for.
+fn report_summary(
+    traffic: &str,
+    controls: usize,
+    windows: usize,
+    destination: &str,
+) -> Vec<String> {
+    vec![
+        format!(
+            "wrote {destination}: {controls} measured control(s), {windows} durable \
+             window(s), traffic={traffic}"
+        ),
+        "render it with `RAMP_REPORT_DATA=<path> python3 scripts/ramp-report.py`; \
+         clause (e)'s floors live there and in the record, not here"
+            .to_owned(),
+        "the fleet-wide distinct-account cardinalities are absent by construction and \
+         the artifact says so — clause (f)'s spread term cannot be read off it"
+            .to_owned(),
+    ]
+}
+
+/// Assemble the artifact from durable state and write it.
+///
+/// The emit path. Two durable reads — the cohort roster and one
+/// `rampw/{control}` row per control — and then
+/// [`assemble_from_durable`], which restores each row into a meter and takes
+/// the same snapshot `persistd` takes. No clause (e) figure is computed in
+/// this file.
+async fn run_report(
+    claim: TrafficClaim,
+    out: Option<&PathBuf>,
+    note: Option<&str>,
+    cluster_file: &Path,
+    context: &orrery_persistd::FdbContext,
+) -> anyhow::Result<()> {
+    let cohort = FdbHonestCohortStore::from_context(context)
+        .load()
+        .await
+        .map_err(|error| anyhow::anyhow!("load the known-honest cohort: {error}"))?;
+    let windows = FdbRampWindowStore::from_context(context);
+    let mut controls = Vec::new();
+    for control in measurable_controls() {
+        let row = windows
+            .load(control)
+            .await
+            .map_err(|error| anyhow::anyhow!("load rampw/{control}: {error}"))?;
+        controls.push(DurableControl { control, row });
+    }
+
+    let artifact = assemble_from_durable(
+        claim,
+        &cohort,
+        &controls,
+        &report_source(cluster_file),
+        note,
+    )
+    .map_err(|refusal: ProvenanceRefusal| anyhow::anyhow!("{refusal}"))?;
+    let json = artifact.to_json()?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(path, &json)
+                .map_err(|error| anyhow::anyhow!("write {}: {error}", path.display()))?;
+            for line in report_summary(
+                &artifact.provenance.traffic,
+                artifact.controls.len(),
+                artifact.provenance.windows.len(),
+                &path.display().to_string(),
+            ) {
+                println!("{line}");
+            }
+        }
+        // Straight to stdout, so the artifact can be piped into the report
+        // script without touching the filesystem. Nothing else is printed in
+        // that case: a summary line would corrupt the JSON.
+        None => print!("{json}"),
     }
     Ok(())
 }
@@ -873,6 +1071,93 @@ mod tests {
             rendered.contains("from — to — ms"),
             "an unobserved window has no bounds, and printing 0 would read as \
              an observation at the epoch: {rendered}"
+        );
+    }
+
+    /// The emit path's verb parses, and its traffic claim has to be spelled
+    /// out: there is no default, because the mistake worth preventing is a
+    /// production claim nobody meant to make.
+    #[test]
+    fn the_report_verb_parses_and_demands_a_traffic_claim() {
+        let parsed = Cli::try_parse_from([
+            "orrery-ramp",
+            "--fdb-cluster-file",
+            "/tmp/fdb.cluster",
+            "report",
+            "--traffic",
+            "production",
+            "--out",
+            "/tmp/ramp.json",
+        ])
+        .expect("report parses");
+        let Command::Report { traffic, out, note } = parsed.command else {
+            panic!("expected the report subcommand");
+        };
+        assert!(matches!(
+            TrafficClaim::from(traffic),
+            TrafficClaim::Production
+        ));
+        assert_eq!(out.as_deref(), Some(Path::new("/tmp/ramp.json")));
+        assert_eq!(note, None);
+
+        Cli::try_parse_from([
+            "orrery-ramp",
+            "--fdb-cluster-file",
+            "/tmp/fdb.cluster",
+            "report",
+        ])
+        .map(|_| ())
+        .expect_err("--traffic has no default; an unstated provenance is not writable");
+
+        Cli::try_parse_from([
+            "orrery-ramp",
+            "--fdb-cluster-file",
+            "/tmp/fdb.cluster",
+            "report",
+            "--traffic",
+            "probably fine",
+        ])
+        .map(|_| ())
+        .expect_err("only the two words the report script accepts are spellable");
+    }
+
+    /// Every control the deployed bundle meters is a control the report
+    /// covers, and the bundle is the one list.
+    #[test]
+    fn the_report_covers_every_control_a_process_meters() {
+        let controls = measurable_controls();
+        assert_eq!(
+            controls.len(),
+            4,
+            "D32 clause (c)'s four measurable controls"
+        );
+        assert!(controls.contains(&QUARANTINE_VALIDATION_CONTROL));
+        assert!(controls.contains(&STRIKES_CONTROL));
+    }
+
+    /// The source line names the cluster the rows were read from, because
+    /// that is the whole of the trust boundary behind a production claim.
+    #[test]
+    fn the_report_source_names_the_cluster_it_read() {
+        let source = report_source(Path::new("/etc/orrery/fdb.cluster"));
+        assert!(source.contains("/etc/orrery/fdb.cluster"), "{source}");
+        assert!(source.contains("rampw/*"), "{source}");
+    }
+
+    /// The summary states the gap rather than leaving the operator to
+    /// remember it, and never claims the artifact settles a promotion.
+    #[test]
+    fn the_report_summary_states_the_gap_and_claims_no_promotion() {
+        let lines = report_summary("production", 4, 3, "ramp.json").join("\n");
+        assert!(lines.contains("traffic=production"), "{lines}");
+        assert!(lines.contains("3 durable window(s)"), "{lines}");
+        assert!(
+            lines.contains("spread term cannot be read off it"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("floors live there"),
+            "the tool assembles evidence; it does not judge it: {lines}"
         );
     }
 
