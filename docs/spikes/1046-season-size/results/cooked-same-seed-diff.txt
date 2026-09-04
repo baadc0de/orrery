@@ -1,0 +1,51 @@
+== Body_2.ubulk: 2131620 / 2131620 bytes, sha1 EQUAL (29d196781d56 / 29d196781d56), 0 differing bytes, 0 runs
+== Body_2.uexp: 4120165 / 4120165 bytes, sha1 DIFFER (bf2cacb92446 / 42f9bb461f34), 364 differing bytes, 24 runs
+  run @      52..67       ( 16 B)  a=746572007d6ea17dc455427aac20b34790d75b0000000000  b=746572004cdd3c00280c44d799cdf8bcd51ca0e500000000
+      nearby ASCII: @44 "Scatter"
+  run @     116..131      ( 16 B)  a=000000006f500fdbf5a54753818028cd2daddeb401000000  b=000000007b79c1b542bc42f39c91eed67db6ee8101000000
+      nearby ASCII: @44 "Scatter"
+  run @ 2890052..2890067  ( 16 B)  a=0000000097a61a4b7a7d4a5db471ec125b0d10fa01000000  b=00000000fd670112a29247c9a3f991347db97ef201000000
+  run @ 2890255..2890270  ( 16 B)  a=00060903c1d2d8c73e4f42ec9730b968b43005043d000000  b=0006090363d9dd5b203348999dd76542eeb252303d000000
+      nearby ASCII: @2890212 "PersistentLevel.MeshPartition_0"; @2890317 "PersistentLevel.MeshPartition_0"
+  run @ 2890412..2890427  ( 16 B)  a=756c74008a547deac22942708428c3af2ee6464f00000000  b=756c7400aac7b04ea5464bf3bc31a84440fc9df800000000
+      nearby ASCII: @2890317 "PersistentLevel.MeshPartition_0"; @2890388 "CompiledSection_Default"
+  run @ 2890465..2890468  (  4 B)  a=020a030159d5470100070112  b=020a0301be4fec4d00070112
+      nearby ASCII: @2890388 "CompiledSection_Default"
+  run @ 2890722..2890722  (  1 B)  a=0000050139e17b5b51  b=0000050103e15f69d3
+  run @ 2890724..2890753  ( 30 B)  a=050139e17b5b51731862978f33a30de239d7522143ea0c79439d89632a4a5f82cad801000000  b=050103e15f69d3c26cdd6c9822d7fda1dc1bd3fcbf3558b146d1966dfdec992524c701000000
+  run @ 2946747..2946750  (  4 B)  a=020a0301c2ea8141000701e1  b=020a030120ad3f35000701e1
+  run @ 2947004..2947035  ( 32 B)  a=000005019f55ce33236342fcc8edf26415cf3d785ceeb4601704415da243e4dc7e5b2c7b01000000  b=00000501d7920581feffb5ac22f3bbe20ef9281da416d72316a340ae9c72d377c9cdd64701000000
+  run @ 3060245..3060248  (  4 B)  a=020a030127885b38000701e1  b=020a03012f2b7f67000701e1
+  run @ 3060502..3060518  ( 17 B)  a=00000501dbefa4ea85f67569eba108e473ed011233c4ba410a  b=00000501b2d484ca9d9d0f7812c56b430c93bb934ec4d22e8d
+  run @ 3060520..3060525  (  6 B)  a=011233c4ba410a6b4ddaa2d926f0  b=bb934ec4d22e8d784843a284a366
+  run @ 3060527..3060533  (  7 B)  a=6b4ddaa2d926f09a16c6e801000000  b=784843a284a366fa17264401000000
+  run @ 3117679..3117682  (  4 B)  a=020a0301b7c607130007011d  b=020a0301e96a67550007011d
+      nearby ASCII: @3117710 "}A8=s@"
+  run @ 3117936..3117967  ( 32 B)  a=00000501ae6947eead4f253ea1c4fb0249c53c6761eec447ea7a4f01a720bf9681716d2e01000000  b=0000050128df15d82aae73096dfe064c80af6a1fbacf519183dd475383b5a2fe4dd1321001000000
+      nearby ASCII: @3117840 "}A8=s@"
+  run @ 3144254..3144269  ( 16 B)  a=12000000b73b832e5cd54ab5af56e9da64b4991f8e000000  b=12000000b86da7a142ab41479b24f51747a187ef8e000000
+      nearby ASCII: @3144310 "unreal"; @3144325 "/Engine/Maps/Entry"
+  run @ 3144606..3144621  ( 16 B)  a=000000000c91474306884a4cabdaa643a067f63600000000  b=000000004d8a3a1be9b84102b6262c6fe0b70c8700000000
+  run @ 3144937..3144968  ( 32 B)  a=0000050189cd33fe5a56addc0a0485e6585d63bd531f286b333a402985c116a7404018d901000000  b=0000050132b6599c01b7614a534123b53805431ced07a71b614b4a72bf39f2afe8b3d6f501000000
+      nearby ASCII: @3144955 "(k3:@)"
+  run @ 3548350..3548365  ( 16 B)  a=000000005d684e21bbab48978eb0d7198c7bfcf800000000  b=00000000c19971d2de4441d1abbb82e78198dc9a00000000
+  run @ 3550323..3550338  ( 16 B)  a=000000004689c72380a341e3936b4aba23653d7000000000  b=00000000526dc27878004337b187ef90abcc991d00000000
+  run @ 4120007..4120028  ( 22 B)  a=000005010f64b2eded700e3c4f781f5a4147025cd4879b3b3f304083b5bf  b=00000501aa401fb8c5a4edde60f08794353103204fada3b0dead40c8bf1e
+  run @ 4120030..4120038  (  9 B)  a=3b3f304083b5bf9f31e951992b01000000  b=b0dead40c8bf1e536379adcb8001000000
+  run @ 4120129..4120144  ( 16 B)  a=0000000093e110b43f9149c487d23e783c1228e100000000  b=000000002483c1ee87b548f381e56f16b10d658f00000000
+== Body_2.umap: 27118 / 27118 bytes, sha1 DIFFER (69877ba9930e / 56bb0106e7c6), 20 differing bytes, 1 runs
+  run @      24..43       ( 20 B)  a=00000000a8e0687f1f5e35e4893e40b2977d71799a0c74caee690000  b=00000000b4a30cd288502d2b8503fe0e7e5b43825857d457ee690000
+      nearby ASCII: @56 "/Game/Bodies/Body_2"
+---CHAIN
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.160791
+[18:55:43]   cooked-s2: 736327323 bytes in     1178 files; Game: 306631036; Engine: 169186140; Bodies: 50187074
+[18:55:44] sizes and patches on cooked output
+-rw-r--r--@ 1 baadc0de  staff  50225152 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s1-bodies.tar
+-rw-r--r--@ 1 baadc0de  staff  19675401 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s1-bodies.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  50256384 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s2-bodies.tar
+-rw-r--r--@ 1 baadc0de  staff  19390041 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s2-bodies.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  22689119 Sep  4 18:56 /Users/baadc0de/Development/orrery-onebody/s1046/patch-cooked-s1-s2.xdelta3
+-rw-r--r--@ 1 baadc0de  staff  18476731 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/patch-cooked-s1-s2.zstd.patch
