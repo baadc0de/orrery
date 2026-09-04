@@ -1,0 +1,53 @@
+== per-body (measured, fs = bytes on disk, zstd19 = zstd -19 of the raw bytes)
+season body instances umap_fs umap_zstd19 tri_fs tri_zstd19 hf_fs hf_zstd19 main_s
+s1 11 1977 6034408 2051499 20435384 2463583 1490836 611140 4.41
+s1 12 1979 5995072 1989933 20000688 2217333 1482956 553793 4.67
+s1 13 1977 6043242 2066988 21011600 2622387 1492916 631492 5.08
+s1 14 1977 6043624 2053004 19810832 2479032 1490836 633197 5.74
+s1 15 1971 6015232 2041041 19965056 2481467 1481292 603727 6.09
+s1 16 1974 6032015 2092635 19654328 2254590 1486060 621160 5.64
+s1 17 1980 6036739 2069679 20466032 2310648 1489380 594911 3.19
+s1 18 1981 6035425 2097442 19955800 2413472 1483372 605849 3.47
+s2 11 1972 6039700 2054239 20256016 2568820 1485644 615426 3.60
+s2 12 1971 6029134 2050897 19755440 2229331 1487512 570236 3.57
+s2 13 1979 6041121 2049278 20174304 2269779 1491252 599879 3.55
+s2 14 1982 6028236 2060008 20261064 2509237 1489796 577618 3.74
+s2 15 1977 6027515 2053317 19939472 2513554 1486684 601848 4.10
+s2 16 1967 6030888 2071387 19752000 2215446 1482528 565929 4.83
+s2 17 1976 6035326 2052248 20090736 2285427 1488548 585743 4.54
+s2 18 1974 6026798 2054439 20832392 2356098 1490204 597908 5.07
+
+== size(n) fits over the s1 bodies in id order, n = 1..8 (a = intercept bytes, b = bytes per body)
+umap_fs      a=      -13663 b=     6030376 max|resid|=     17696 (0.04% of size(8)); points=[6034408, 12029480, 18072722, 24116346, 30131578, 36163593, 42200332, 48235757]
+umap_zstd19  a=      -61915 b=     2060629 max|resid|=     52784 (0.32% of size(8)); points=[2051499, 4041432, 6108420, 8161424, 10202465, 12295100, 14364779, 16462221]
+tri_fs       a=      566485 b=    20105301 max|resid|=    565284 (0.35% of size(8)); points=[20435384, 40436072, 61447672, 81258504, 101223560, 120877888, 141343920, 161299720]
+tri_zstd19   a=       46922 b=     2408570 max|resid|=    183145 (0.95% of size(8)); points=[2463583, 4680916, 7303303, 9782335, 12263802, 14518392, 16829040, 19242512]
+hf_zstd19    a=      -24380 b=      610825 max|resid|=     32337 (0.67% of size(8)); points=[611140, 1164933, 1796425, 2429622, 3033349, 3654509, 4249420, 4855269]
+
+== per-body spread across the 16 bodies (both seeds), the error bar on b
+umap_fs      mean=     6030905 sd=     11596 min=5995072 max=6043624
+umap_zstd19  mean=     2056752 sd=     22813 min=1989933 max=2097442
+tri_fs       mean=    20147572 sd=    373351 min=19654328 max=21011600
+tri_zstd19   mean=     2386888 sd=    131062 min=2215446 max=2622387
+instances    mean=        1976 sd=         4 min=1967 max=1982
+
+== cook(n): sequential walls from timing-cook.log (one process per body, -NullRHI, crash reporters killed between cooks)
+engine start alone (TraceBody, no args) = 11.575901 s
+per-process walls = [16.613085, 16.857413, 16.56852, 17.473571, 16.395378, 17.282749, 16.763978, 16.301201]
+commandlet_main_s = [3.117794167250395, 3.0219275429844856, 3.244744125753641, 3.0570595413446426, 3.1288259588181973, 3.1428306698799133, 3.2717151269316673, 2.971774749457836]  mean=3.12 sd=0.10
+cook(n) sequential, one process per body: c=-0.2 s, d=16.85 s/body, max|resid|=0.35 s; cumulative=[16.6, 33.5, 50.0, 67.5, 83.9, 101.2, 118.0, 134.3]
+mean wall per body-process = 16.78 s = ~11.6 s engine start + 3.12 s commandlet main + exit/ensure overhead
+par2: 2 concurrent processes, total wall 18.7 s -> 9.4 s per body amortised (sequential would be 33.6 s)
+par4: 4 concurrent processes, total wall 26.8 s -> 6.7 s per body amortised (sequential would be 67.1 s)
+par8: 8 concurrent processes, total wall 50.9 s -> 6.4 s per body amortised (sequential would be 134.3 s)
+
+== season(N): bodies only, before interiors. One "body" here = one 256 m x 256 m tile (the thing spike 2 measured).
+   Columns: N tiles; umap+tri zstd19 (the transfer size a zstd-compressed bundle would carry); umap+tri raw (on disk after install)
+N= 12 tiles: zstd19 (umap+tri)     53.6 MB; raw    313.6 MB; zstd19 (umap+hf)     32.1 MB
+N= 24 tiles: zstd19 (umap+tri)    107.3 MB; raw    627.3 MB; zstd19 (umap+hf)     64.1 MB
+N= 36 tiles: zstd19 (umap+tri)    160.9 MB; raw    940.9 MB; zstd19 (umap+hf)     96.2 MB
+N= 48 tiles: zstd19 (umap+tri)    214.5 MB; raw   1254.5 MB; zstd19 (umap+hf)    128.2 MB
+per tile: zstd19 umap+tri = 4.47 MB, raw = 26.14 MB
+anchor 20 GB: 4475 tiles at zstd19 umap+tri; 765 tiles raw
+anchor 50 GB: 11188 tiles at zstd19 umap+tri; 1913 tiles raw
+anchor 100 GB: 22375 tiles at zstd19 umap+tri; 3826 tiles raw

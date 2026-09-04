@@ -1,0 +1,12 @@
+-rw-r--r--@ 1 baadc0de  staff  4445567 Sep  4 18:44 same-a.pak
+"body-2.tri.collision" offset: 0, size: 2230734 bytes, sha1: 45F9036F5CDF844F03C7A05DBCD4C91CFA5C088C, compression: Oodle.
+"Body_2.umap" offset: 2235639, size: 2206332 bytes, sha1: B02E053A3B87378EA3249804E386144B0DD8C682, compression: Oodle.
+-rw-r--r--@ 1 baadc0de  staff  4445570 Sep  4 18:45 same-b.pak
+"body-2.tri.collision" offset: 0, size: 2230734 bytes, sha1: 45F9036F5CDF844F03C7A05DBCD4C91CFA5C088C, compression: Oodle.
+"Body_2.umap" offset: 2235639, size: 2206335 bytes, sha1: 72D6F6567433280AE00DABC7AF1BBC15EE289AA3, compression: Oodle.
+== peak RSS of one CookBody process
+2026-09-04 18:45:22.569 UnrealEditor-Cmd[46728:371731] [UE4] Shutdown handler: initialize.
+       49.23 real        23.94 user         4.84 sys
+          2440609792  maximum resident set size
+          1916587824  peak memory footprint
+== memory/cpu totals: 68719476736 bytes RAM, 10 cores

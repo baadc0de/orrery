@@ -1,0 +1,28 @@
+[18:06:34] start fit cook; uptime: 18:06  up  5:30, 1 user, load averages: 21.88 22.01 21.12
+[18:06:58] seed=1001 body=11 out=s1 wall=23.829886000 real 23.47 1
+[18:07:23] seed=1001 body=12 out=s1 wall=25.018166000 real 24.89 1
+[18:07:48] seed=1001 body=13 out=s1 wall=25.007555000 real 24.74 1
+[18:08:15] seed=1001 body=14 out=s1 wall=26.550417000 real 26.36 1
+[18:08:43] seed=1001 body=15 out=s1 wall=28.020627000 real 27.84 1
+[18:09:12] seed=1001 body=16 out=s1 wall=29.332423000 real 29.20 1
+[18:09:30] seed=1001 body=17 out=s1 wall=17.518686000 real 17.37 1
+[18:09:47] seed=1001 body=18 out=s1 wall=16.748332000 real 16.62 1
+[18:10:04] seed=2002 body=11 out=s2 wall=17.118851000 real 17.07 1
+[18:10:21] seed=2002 body=12 out=s2 wall=17.689360000 real 17.57 1
+[18:10:39] seed=2002 body=13 out=s2 wall=17.615770000 real 17.41 1
+[18:10:57] seed=2002 body=14 out=s2 wall=18.030456000 real 17.91 1
+[18:11:17] seed=2002 body=15 out=s2 wall=20.037519000 real 19.96 1
+[18:11:40] seed=2002 body=16 out=s2 wall=22.624587000 real 22.52 1
+[18:12:04] seed=2002 body=17 out=s2 wall=23.946958000 real 23.89 1
+[18:12:30] seed=2002 body=18 out=s2 wall=25.579171000 real 25.44 1
+[18:12:30] sequential done; starting 4 concurrent
+[18:13:07] seed=1001 body=22 out=par4 wall=36.849384000 real 36.70 1
+[18:13:07] seed=1001 body=23 out=par4 wall=37.460183000 real 36.70 1
+[18:13:08] seed=1001 body=21 out=par4 wall=38.290296000 real 36.70 1
+[18:13:09] seed=1001 body=24 out=par4 wall=38.836071000 real 36.70 1
+[18:13:09] par4 wall total=38.925083000
+[18:13:09] starting 2 concurrent
+[18:13:46] seed=1001 body=31 out=par2 wall=37.269236000 real 36.95 1
+[18:13:46] seed=1001 body=32 out=par2 wall=37.264176000 real 36.95 1
+[18:13:46] par2 wall total=37.317679000
+[18:13:46] ALL DONE
