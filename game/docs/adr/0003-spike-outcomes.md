@@ -15,7 +15,7 @@ This decision is normative for the *Mothership* game project. See the [game ADR 
 
 ## Not settled
 
-- The Windows #920 measurement, still owed for Orrery D53 acceptance.
+- The Windows #920 sidecar measurement landed (#1076); a Windows measurement of the chosen in-process configuration is still owed. Applying #920's bands is the owner's call.
 - Room-to-room transitions inside the mothership and surface landing were not reached by #1072.
 - Cooked (as opposed to editor-saved) Unreal package sizes; #1071 judges they do not move the verdict.
 - Regions per body, the season-size tuning variable.

@@ -14,7 +14,7 @@ This decision is normative for the *Mothership* game project. See the [game ADR 
 
 ## Rejected
 
-- **Out-of-process sidecar** over `orrery_ipc`: kept as the fallback if in-process latency or crash containment proves unacceptable; not the primary path.
+- **Out-of-process sidecar** over `orrery_ipc`: kept as the fallback if in-process latency or crash containment proves unacceptable; not the primary path. Measured on Windows at N=24 (#1076): 136.6 µs p50 added, p99.9 of 1.03 ms with `timeBeginPeriod` raised and 14.8 ms without; the boundary, not the simulation, is the cost. If ever deployed, raising the timer resolution is an obligation.
 - **Runtime PCG on clients with hash comparison**: the server has no engine, and PCG determinism across GPUs and versions is unproven.
 - **Ruleset-generated terrain with Unreal decoration**: forgoes Mesh Terrain authoring and duplicates a terrain generator.
 - **Production-ready features only**: loses caves and overhangs (G4.6) and foliage density.
