@@ -50,3 +50,15 @@ Procured kits, greebles, PBR sets and decals live in the **private asset store**
 - **Decal sheet**: stencils, hull numbers, hazard stripes, crest placeholders.
 
 Prefer kits that ship `.blend` or FBX with separate PBR maps and real-world scale; avoid single-mesh "hero" models, which defeat kitbashing.
+
+## Ingest as run on 2026-09-04
+
+`ingest.py` writes the manifest (hashes, licence facts, todo flag while the licence text is missing); `ingest_parts.py` (Blender headless) adds the per-part inventory. Staged privately under `~/assets/` on the workstation until the bucket exists (G12.13):
+
+| kit | what it is | scale and topology | licence |
+|---|---|---|---|
+| `cgtrader/spaceship-kitbash-350-a` (model 4691024) | 27 group OBJs, ~6 `Detail_NNN` parts each, 3ds Max export | parts ~25 units across, 100k–300k tris each: subdivided high-poly, meant for baking, needs per-part decimation to a budget | CGTrader Custom, text to be saved |
+| `cgtrader/spaceship-kitbash-350-b` (model 4778522) | 24 group OBJs; no file identical to set A, so a second kit, not a duplicate | as above | CGTrader Custom, text to be saved |
+| `cgtrader/greeble-cables-pack1` | 42 cable parts on a display grid, one material | metre scale, 98k tris total | Royalty Free, text to be saved |
+| `cgtrader/combat-mech-2` (archive `blend.zip`) | one hero mech, 8 meshes, 670k tris, with HDRI and ground plane | reference, not kit parts | unknown, owner to confirm |
+| KIT OPS masterfolders (Arch, Bonus, KO-FreeMats, Mega300Tech-v5, SciFi) | 470 INSERT `.blend`s with thumbnails in 20 KPACKs: cutters, tech objects, controls, decals, screens, grids, 63 materials | KIT OPS INSERT convention | KIT OPS / Chipp Walters (Gumroad) |
