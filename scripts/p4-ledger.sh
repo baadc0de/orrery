@@ -739,6 +739,38 @@ self_test() {
   st_bind_refuses a_leg_that_overflowed_its_queue_banks_nothing \
     "$(st_fresh 50 '.binding.close = "queue_overflow"')"
 
+  # ── A rejoin inside one attempt (#1028) ───────────────────────────────────
+  #
+  # A volunteer closed their client and launched it again, so the host readmitted
+  # the same QUIC-authenticated key at the seat it held, against a second
+  # pre-minted invite id. Two signed intervals land on one slot, and the seat
+  # clash has to let both bank — a fix that assembles the attempt upstream and
+  # then dies here is not a fix. What the clause is *for* is unchanged and
+  # asserted immediately below: the seat stays closed to any other identity.
+  local rejoin_leg
+  rejoin_leg=$(st_derived 40 018f9000-0000-7000-8000-0000000000c1 30 41 \
+    x86_64-unknown-linux-gnu)
+  "$0" append "$rejoin_leg" >/dev/null 2>&1 \
+    || die 'self-test [a_rejoining_identity_banks_both_of_its_intervals]: the first leg was refused'
+  rejoin_leg=$(st_derived 40 018f9000-0000-7000-8000-0000000000c2 5 41 \
+    x86_64-unknown-linux-gnu)
+  "$0" append "$rejoin_leg" >/dev/null 2>&1 \
+    || die 'self-test [a_rejoining_identity_banks_both_of_its_intervals]: the second leg of one identity was refused on the seat it rejoined'
+  jq -es 'map(select(.slot == 40)) as $legs
+    | ($legs | length == 2)
+    and ($legs | map(.binding.node) | unique | length == 1)
+    and ($legs | map(.human_session_id) | unique | length == 2)
+    and ((($legs | map(.player_hours) | add) * 60 | round) == 35)' \
+    "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [a_rejoining_identity_banks_both_of_its_intervals]: the two legs did not bank as separate intervals on one seat'
+  st_bind_ok a_rejoining_identity_banks_both_of_its_intervals
+
+  # And the seat that a rejoin reopened is still closed to everybody else: a
+  # third row on that slot, signed by a key the seat never admitted, is a
+  # re-stamp and is refused exactly as it was before #1028.
+  st_bind_refuses another_identity_may_not_join_a_rejoined_seat \
+    "$(st_derived 40 018f9000-0000-7000-8000-0000000000c3 5 42 x86_64-unknown-linux-gnu)"
+
   # ── The non-constant denominator ──────────────────────────────────────────
   #
   # A human seated for part of an attempt played less than the attempt lasted.
@@ -1036,21 +1068,34 @@ validate_attempt_binding() {
 # refuses a *different* identity claiming a seat, or an interval, this attempt
 # has already banked — the same interval re-derived at another commit, or a row
 # re-stamped onto a seat another row is already bound to.
+#
+# The seat a human interval claims is `(slot, node)` — the slot the host bound
+# and the QUIC-authenticated identity it admitted there — rather than the slot
+# alone (#1028). Keying on the slot alone made a legitimate rejoin unbankable
+# here for the same reason it made the attempt unassemblable upstream: one
+# install readmitted at the seat it held, under a second pre-minted invite id,
+# banks two signed intervals on one slot. What the slot clause is *for* survives
+# untouched, because it is the one case a rejoin is not: a row re-stamped onto a
+# seat some **other** admitted identity already banked. A ledger line that
+# carries no node of its own — anything written before the binding travelled
+# into the line — is treated as a clash, because it cannot prove it is not one.
 refuse_a_second_claim_on_one_seat() {
-  local actor=$1 attempt_id=$2 slot=$3 session=$4
+  local actor=$1 attempt_id=$2 slot=$3 session=$4 node=$5
   [[ -n $attempt_id ]] || return 0
   [[ -r $LEDGER ]] || return 0
   local clash
   clash=$(jq -rs --arg attempt "$attempt_id" --arg actor "$actor" \
-                 --arg slot "$slot" --arg session "$session" '
+                 --arg slot "$slot" --arg session "$session" --arg node "$node" '
     [ .[] | select(.attempt_id == $attempt) ] as $rows
     | if $actor == "bot" then
         (if ([ $rows[] | select((.actor // "bot") == "bot") ] | length) > 0
          then "attempt \($attempt) has already banked its bot contribution"
          else "" end)
       else
-        (if ([ $rows[] | select((.slot | tostring) == $slot) ] | length) > 0
-         then "slot \($slot) of attempt \($attempt) already carries a banked interval"
+        (if ([ $rows[]
+               | select((.slot | tostring) == $slot)
+               | select($node == "" or (.binding.node // "") != $node) ] | length) > 0
+         then "slot \($slot) of attempt \($attempt) already carries a banked interval for another admitted identity"
          elif ([ $rows[] | select(.human_session_id == $session) ] | length) > 0
          then "session \($session) already banked an interval in attempt \($attempt)"
          else "" end)
@@ -1103,7 +1148,7 @@ cmd_append() {
     || die "refusing to bank: the run accumulated $hours player-hours"
 
   local commit key measurement_key pipeline seed target actor human_session_id
-  local attempt_id slot
+  local attempt_id slot bound_node
   commit=$(jq -r '.identity.commit // "unknown"' "$report")
   seed=$(jq -r '.identity.seed' "$report")
   target=$(jq -r '.identity.target' "$report")
@@ -1120,6 +1165,10 @@ cmd_append() {
   validate_session_record "$report" "$actor" "$human_session_id" "$target"
   attempt_id=$(jq -r '.identity.attempt_id // empty' "$report")
   slot=$(jq -r '.identity.slot // empty' "$report")
+  # `validate_attempt_binding` has already tied this to `.external[]` and to the
+  # signed `.session.measurement_node`, so by the time the seat clash is decided
+  # it is the admitted identity and not a free-text field.
+  bound_node=$(jq -r '.binding.node // empty' "$report")
   validate_attempt_binding "$report" "$actor" "$attempt_id"
   # The cross-check #576 asks for, and the one that would have caught the defect
   # this whole piece exists to repair: a human contribution's `player_hours` is
@@ -1162,7 +1211,8 @@ cmd_append() {
   fi
   # Held under the same lock as the append it guards: a second claim on one seat
   # decided outside the lock could still be written by a concurrent appender.
-  refuse_a_second_claim_on_one_seat "$actor" "$attempt_id" "$slot" "$human_session_id"
+  refuse_a_second_claim_on_one_seat "$actor" "$attempt_id" "$slot" "$human_session_id" \
+    "$bound_node"
 
   jq -c \
     --arg key "$key" \

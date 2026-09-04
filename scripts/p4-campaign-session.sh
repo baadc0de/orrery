@@ -75,8 +75,7 @@
 # `witness_anchored` — and **no `session_id`**. So on every report the host
 # writes today the host half of the id comparison is empty, and pretending
 # otherwise would make this check vacuous. What the host does record per seat is
-# the node it admitted, which the client signs into its own row; #579 also made
-# that node unique per seat, which is what lets it identify one seat. So:
+# the node it admitted, which the client signs into its own row. So:
 #
 #   * seated ids present  → host ids must equal the operator's ids, and each
 #     row binds to the seat holding its id;
@@ -84,6 +83,15 @@
 #     signed, and the operator's ids must equal the ids the client rows carry;
 #   * either way          → a seat that does seat an id must agree with the row
 #     that lands on it by node, or the two copies disagree and it is refused.
+#
+# **A node is not a seat (#1028).** #579 read the admitted node as unique per
+# seat, and it is not: the key is persistent per *install*, so a volunteer who
+# relaunches inside one attempt is readmitted under it at a second seat, against
+# a second pre-minted id — which is exactly what #1015's 45-second eviction hold
+# and #1002's next-launch upload retry tell them to do. The seat is therefore
+# `(node, session_id)`, and the projection onto `node` alone is allowed to
+# collide. When a report seats no ids the node is all there is, so a node it
+# admitted twice is genuinely ambiguous and still refused.
 #
 # A row whose id is not seated, or whose node this attempt admitted nowhere, is
 # refused; a seat no row claims contributes nothing; an id seated twice, or
@@ -262,29 +270,56 @@ assemble_preflight() {
     || die 'assemble: the host run was not witnessed; an unwitnessed hour banks nothing'
 }
 
-# Authenticity, not arithmetic, retained from #579 and generalized per seat. The
-# host records the remote identity that completed QUIC authentication at each
-# seat, and the client signs every client-owned row field with that same
-# persistent key. What #579 added, and what a per-attempt check would lose, is
-# **exactly once**: a report naming one node at two seats is an ambiguous seat
-# map, and a row bound into it is bound to nobody in particular. The signature
-# itself is verified per seat against the bound node inside the derivation, and
-# again by `p4-ledger.sh` before the row banks.
+# Authenticity, not arithmetic, retained from #579 and made precise per seat
+# (#1028). The host records the remote identity that completed QUIC
+# authentication at each seat, and the client signs every client-owned row field
+# with that same persistent key. What #579 added, and what a per-attempt check
+# would lose, is **exactly once**: a report that names one row's seat twice is an
+# ambiguous seat map, and a row bound into it is bound to nobody in particular.
+# The signature itself is verified per seat against the bound node inside the
+# derivation, and again by `p4-ledger.sh` before the row banks.
+#
+# The seat that must be named exactly once is `(node, session_id)`, not the node
+# alone. A persistent identity key belongs to an *install*, not to a seat: a
+# volunteer who closes the client and launches it again inside one attempt —
+# which #1015's 45-second eviction hold and #1002's next-launch upload retry both
+# invite them to do — is readmitted under that same key at a second seat, against
+# a second pre-minted session id. That is two signed intervals, not one
+# ambiguity, and the host's own report tells them apart: each exterior entry
+# carries the `session_id` it seated, and each client row names the session it
+# belongs to. Keying on the projection onto `node` refused the first honest
+# four-seat human attempt outright, costing three uninvolved seats their hours
+# along with the rejoining one.
+#
+# So the projection onto `node` alone is allowed to collide, and every refusal
+# either side of it is retained verbatim: a row signed by a key this attempt
+# admitted nowhere is still somebody else's hour, and a key the host seated
+# twice *under one session id* — or twice with no id to tell the two seats
+# apart — is still the ambiguous seat map #579 named.
 require_each_row_names_one_seat() {
-  local attempt=$1 records=$2 node seats
-  while read -r node; do
+  local attempt=$1 records=$2 node session seats
+  while IFS=$'\t' read -r node session; do
     [[ -n $node && $node != null ]] \
       || die 'assemble: a client row does not name its measurement node'
     seats=$(jq --arg node "$node" \
       '[(.exteriors // .external)[] | select(.node == $node)] | length' "$attempt")
     # Zero and several are different mistakes and get different names: a row
     # signed by a key this attempt never admitted is somebody else's hour, while
-    # a node listed at two seats is an ambiguous seat map.
+    # a seat this row cannot be told apart from is an ambiguous seat map.
     [[ $seats != 0 ]] \
       || die "assemble: the host report admitted no seat for the node a client row is signed by; that row is not seated in attempt"
-    [[ $seats == 1 ]] \
-      || die 'assemble: the host report does not name the authenticated external node exactly once'
-  done < <(jq -r '.measurement_node // "null"' "$records")
+    if [[ $seats != 1 ]]; then
+      # The key is seated more than once, which is what a rejoin looks like. It
+      # is unambiguous only if this row's own session id picks exactly one of
+      # those seats out; the same key seated twice under one id, or twice under
+      # none, still has no seat to offer this row in particular.
+      seats=$(jq --arg node "$node" --arg session "$session" \
+        '[(.exteriors // .external)[]
+          | select(.node == $node and .session_id == $session)] | length' "$attempt")
+      [[ $seats == 1 ]] \
+        || die 'assemble: the host report does not name the authenticated external node exactly once'
+    fi
+  done < <(jq -r '[.measurement_node // "null", .session_id // "null"] | @tsv' "$records")
 }
 
 # The operator's copy, checked against the host's, seat by seat. This is #476's
@@ -666,15 +701,62 @@ self_test() {
   st_refuses one_session_may_not_occupy_two_seats 'seated at two slots' \
     "$dir/two-seats-out" "$dir/two-seats.json" "$dir/records.jsonl" "$dir/two-seats-out"
 
-  # #579's clause, retained and now generalized to every row: the admitted node
-  # must name exactly one seat. A seat map listing one node twice is ambiguous,
-  # and a row bound into it is bound to nobody in particular. The two seats
-  # carry different session ids, so the seated-twice clause above cannot fire
-  # here and only the node stage can.
-  st_attempt "[$(st_exterior 4 "$sid_a" "$node_a" 55), $(st_exterior 5 "$sid_b" "$node_a" 55)]" \
-    > "$dir/two-nodes.json"
-  st_refuses the_host_must_name_each_rows_node_exactly_once 'exactly once' \
-    "$dir/two-nodes-out" "$dir/two-nodes.json" "$dir/records.jsonl" "$dir/two-nodes-out"
+  # #579's clause, retained and made precise (#1028): the seat a row names must
+  # be named exactly once, and the seat is `(node, session_id)`. Here one node
+  # holds two seats *under one session id*, so the row cannot say which of them
+  # it played — the ambiguity #579 named, in the only shape that is still one.
+  # The records file is that node's row alone, so nothing else can refuse first.
+  st_attempt "[$(st_exterior 4 "$sid_a" "$node_a" 55), $(st_exterior 5 "$sid_a" "$node_a" 55)]" \
+    > "$dir/two-seats-one-id.json"
+  st_refuses the_host_must_name_each_rows_seat_exactly_once 'exactly once' \
+    "$dir/two-seats-one-id-out" "$dir/two-seats-one-id.json" "$dir/row-a.json" \
+    "$dir/two-seats-one-id-out"
+
+  # The same key at two seats with **no** id on either to tell them apart. A
+  # host that seats no invite ids has only the node to offer, so a node it
+  # admitted twice binds this row to nobody in particular and is still refused.
+  jq 'del(.exteriors[].session_id)' \
+    <(st_attempt "[$(st_exterior 4 "$sid_a" "$node_a" 55), $(st_exterior 5 "$sid_b" "$node_a" 55)]") \
+    > "$dir/two-seats-no-id.json"
+  st_refuses a_node_seated_twice_with_no_session_id_is_still_ambiguous 'exactly once' \
+    "$dir/two-seats-no-id-out" "$dir/two-seats-no-id.json" "$dir/row-a.json" \
+    "$dir/two-seats-no-id-out"
+
+  # And the case the precise rule exists to admit (#1028): one volunteer closed
+  # their client and launched it again inside the attempt. Same install, so the
+  # same persistent key, and the host correctly admitted it at a second seat
+  # against a second pre-minted invite id. Two signed intervals, banked
+  # separately, and the projection onto `node` collides without ambiguity —
+  # each seat carries the session id its row names. Both legs land on slot 4,
+  # which is what the ledger's seat clash has to tolerate too.
+  st_row "$sid_c" 4 21 > "$dir/row-rejoin.json"
+  cat "$dir/row-a.json" "$dir/row-b.json" "$dir/row-rejoin.json" > "$dir/rejoin.jsonl"
+  st_attempt "[$(st_exterior 4 "$sid_a" "$node_a" 50), \
+               $(st_exterior 5 "$sid_b" "$node_b" 55), \
+               $(st_exterior 4 "$sid_c" "$node_a" 5)]" > "$dir/rejoin.json"
+  st_assemble rejoin "$dir/rejoin.json" "$dir/rejoin.jsonl" "$dir/rejoin-out" \
+    "$sid_a" "$sid_b" "$sid_c" \
+    || die "self-test [a_rejoining_player_assembles_as_two_signed_intervals]: an honest rejoin refused ('$(tr '\n' ' ' <"$dir/case/err")')"
+  jq -es --arg a "$sid_a" --arg c "$sid_c" --arg na "$node_a" '
+    (length == 4)
+    and (map(select(.identity.actor == "human")) | length == 3)
+    and (map(select(.binding.node == $na)) | length == 2)
+    and (map(select(.binding.node == $na)) | all(.binding.slot == 4))
+    and (map(select(.binding.session_id == $a)) | .[0].player_hours * 60 | round == 50)
+    and (map(select(.binding.session_id == $c)) | .[0].player_hours * 60 | round == 4)
+    and ((map(.player_hours) | add | . * 10000 | round) == 56000)
+  ' "$dir/rejoin-out"/*.json >/dev/null \
+    || die 'self-test [a_rejoining_player_assembles_as_two_signed_intervals]: the two legs did not assemble as separate signed intervals on one slot'
+  # Through the real ledger, because the seat clash there keys on the slot too:
+  # a fix that assembles and then dies at `append` is not a fix.
+  for input in "$dir/rejoin-out"/*.json; do
+    P4_LEDGER_FILE="$dir/rejoin-hours.jsonl" "$ROOT/scripts/p4-ledger.sh" append "$input" \
+      >/dev/null 2>&1 \
+      || die "self-test [a_rejoining_player_assembles_as_two_signed_intervals]: p4-ledger.sh refused $(basename "$input")"
+  done
+  [[ $(awk 'END { print NR }' "$dir/rejoin-hours.jsonl") == 4 ]] \
+    || die 'self-test [a_rejoining_player_assembles_as_two_signed_intervals]: four inputs did not bank four lines'
+  st_ok a_rejoining_player_assembles_as_two_signed_intervals
 
   # ── The per-seat two-copy reconciliation (#476) ───────────────────────────
   #
