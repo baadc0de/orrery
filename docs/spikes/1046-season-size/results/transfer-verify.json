@@ -1,0 +1,11 @@
+{
+ "verified": 8,
+ "of": 8,
+ "origin": "Mac bojans-max 192.168.0.155 python http.server (home LAN)",
+ "client": "Linux box 192.168.0.120 on wlan0 (WiFi), curl",
+ "transfer_lines": [
+  "s1-season.tar.zst bytes=31701709 seconds=1.105458 speed_Bps=28678169 http=200",
+  "s1.pak bytes=35915845 seconds=1.958623 speed_Bps=18337415 http=200",
+  "digests-s1.json bytes=3098 seconds=0.038994 speed_Bps=79492 http=200"
+ ]
+}

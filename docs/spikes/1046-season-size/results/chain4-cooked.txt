@@ -1,0 +1,122 @@
+[18:51:42] metal: Apple metal version 32023.864 (metalfe-32023.864)
+[18:52:30] cook body11-cold (/Game/Bodies/Body_11, Mac) rc=0 wall=47.492700000
+LogCook: Display: Cook by the book total time in tick 25.789054s total time 35.484421
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=10
+LogCookStats: Display:     FinishCacheShadersSec=1.354944
+[18:52:33]   cooked-body11-cold: 692398901 bytes in     1157 files; Game: 262713309; Engine: 169186140; Bodies: 6272041
+[18:52:49] cook body11-warm (/Game/Bodies/Body_11, Mac) rc=0 wall=15.087515000
+LogCook: Display: Cook by the book total time in tick 2.057946s total time 5.225718
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.150552
+[18:52:52]   cooked-body11-warm: 692398750 bytes in     1157 files; Game: 262713271; Engine: 169186140; Bodies: 6272041
+[18:53:08] cook body11-again (/Game/Bodies/Body_11, Mac) rc=0 wall=15.197549000
+LogCook: Display: Cook by the book total time in tick 2.073302s total time 5.257813
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.151037
+[18:53:12]   cooked-body11-again: 692398782 bytes in     1157 files; Game: 262713287; Engine: 169186140; Bodies: 6272041
+[18:53:14] determinism of cooked output, warm vs again: 4 differing files
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Content/ShaderArchive-OneBodyCook-SF_METAL_SM5-METAL_SM5.ushaderbytecode and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Content/ShaderArchive-OneBodyCook-SF_METAL_SM5-METAL_SM5.ushaderbytecode differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Content/ShaderArchive-OneBodyCook-SF_METAL_SM6-METAL_SM6.ushaderbytecode and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Content/ShaderArchive-OneBodyCook-SF_METAL_SM6-METAL_SM6.ushaderbytecode differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Content/ShaderTypeInfo-OneBodyCook-SF_METAL_SM5-METAL_SM5.stinfo and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Content/ShaderTypeInfo-OneBodyCook-SF_METAL_SM5-METAL_SM5.stinfo differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Content/ShaderTypeInfo-OneBodyCook-SF_METAL_SM6-METAL_SM6.stinfo and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Content/ShaderTypeInfo-OneBodyCook-SF_METAL_SM6-METAL_SM6.stinfo differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Metadata/CookMetadata.ucookmeta and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Metadata/CookMetadata.ucookmeta differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Metadata/ShaderLibrarySource/ShaderArchive-OneBodyCook-SF_METAL_SM5-METAL_SM5.ushaderbytecode and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Metadata/ShaderLibrarySource/ShaderArchive-OneBodyCook-SF_METAL_SM5-METAL_SM5.ushaderbytecode differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Metadata/ShaderLibrarySource/ShaderArchive-OneBodyCook-SF_METAL_SM6-METAL_SM6.ushaderbytecode and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Metadata/ShaderLibrarySource/ShaderArchive-OneBodyCook-SF_METAL_SM6-METAL_SM6.ushaderbytecode differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Metadata/ShaderLibrarySource/ShaderTypeInfo-OneBodyCook-SF_METAL_SM5-METAL_SM5.stinfo and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Metadata/ShaderLibrarySource/ShaderTypeInfo-OneBodyCook-SF_METAL_SM5-METAL_SM5.stinfo differ
+Files /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-warm/OneBodyCook/Metadata/ShaderLibrarySource/ShaderTypeInfo-OneBodyCook-SF_METAL_SM6-METAL_SM6.stinfo and /Users/baadc0de/Development/orrery-onebody/s1046/cooked-body11-again/OneBodyCook/Metadata/ShaderLibrarySource/ShaderTypeInfo-OneBodyCook-SF_METAL_SM6-METAL_SM6.stinfo differ
+[18:53:14]   ./OneBodyCook/Content/Bodies/Body_11.ubulk: 0 differing bytes
+[18:53:14]   ./OneBodyCook/Content/Bodies/Body_11.uexp: 0 differing bytes
+[18:53:14]   ./OneBodyCook/Content/Bodies/Body_11.umap: 0 differing bytes
+[18:53:30] cook same-a (/Game/Bodies/Body_2, Mac) rc=0 wall=15.559443000
+LogCook: Display: Cook by the book total time in tick 2.199330s total time 5.394427
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.156762
+[18:53:33]   cooked-same-a: 692405544 bytes in     1157 files; Game: 262720101; Engine: 169186140; Bodies: 6278903
+[18:53:50] cook same-b (/Game/Bodies/Body_2, Mac) rc=0 wall=15.775321000
+LogCook: Display: Cook by the book total time in tick 2.142197s total time 5.347902
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.153883
+[18:53:53]   cooked-same-b: 692405512 bytes in     1157 files; Game: 262720085; Engine: 169186140; Bodies: 6278903
+[18:53:54] editor-save nondeterminism after the cook (256a vs 256b): 5560 bytes differ in the editor saves
+[18:54:35] cook horror (/Game/Variant_Horror/Lvl_Horror, Mac) rc=1 wall=40.681015000
+LogCook: Display: Cook by the book total time in tick 26.139127s total time 29.309744
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.204591
+[18:54:38]   cooked-horror: 695792141 bytes in     1238 files; Game: 259990277; Engine: 172449804; Bodies: 
+[18:54:57] cook firstperson (/Game/FirstPerson/Lvl_FirstPerson, Mac) rc=1 wall=17.082558000
+LogCook: Display: Cook by the book total time in tick 3.293543s total time 6.815393
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.182474
+[18:55:00]   cooked-firstperson: 717914143 bytes in     1229 files; Game: 263044991; Engine: 188226669; Bodies: 
+[18:55:18] cook s1 (/Game/Bodies/Body_11+/Game/Bodies/Body_12+/Game/Bodies/Body_13+/Game/Bodies/Body_14+/Game/Bodies/Body_15+/Game/Bodies/Body_16+/Game/Bodies/Body_17+/Game/Bodies/Body_18, Mac) rc=0 wall=17.079997000
+LogCook: Display: Cook by the book total time in tick 3.244095s total time 6.555700
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.162625
+[18:55:22]   cooked-s1: 736296709 bytes in     1178 files; Game: 306600502; Engine: 169186140; Bodies: 50156620
+[18:55:40] cook s2 (/Game/Bodies/Body_11+/Game/Bodies/Body_12+/Game/Bodies/Body_13+/Game/Bodies/Body_14+/Game/Bodies/Body_15+/Game/Bodies/Body_16+/Game/Bodies/Body_17+/Game/Bodies/Body_18, Mac) rc=0 wall=16.699086000
+LogCook: Display: Cook by the book total time in tick 2.864847s total time 6.144890
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     FinishCacheShadersSec=0.160791
+[18:55:43]   cooked-s2: 736327323 bytes in     1178 files; Game: 306631036; Engine: 169186140; Bodies: 50187074
+[18:55:44] sizes and patches on cooked output
+-rw-r--r--@ 1 baadc0de  staff  50225152 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s1-bodies.tar
+-rw-r--r--@ 1 baadc0de  staff  19675401 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s1-bodies.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  50256384 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s2-bodies.tar
+-rw-r--r--@ 1 baadc0de  staff  19390041 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s2-bodies.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  22689119 Sep  4 18:56 /Users/baadc0de/Development/orrery-onebody/s1046/patch-cooked-s1-s2.xdelta3
+-rw-r--r--@ 1 baadc0de  staff  18476731 Sep  4 18:55 /Users/baadc0de/Development/orrery-onebody/s1046/patch-cooked-s1-s2.zstd.patch
+-rw-r--r--@ 1 baadc0de  staff  21099404 Sep  4 18:56 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s1.pak
+-rw-r--r--@ 1 baadc0de  staff  21038436 Sep  4 18:56 /Users/baadc0de/Development/orrery-onebody/s1046/cooked-s2.pak
+{'season': 's1', 'body': 11, 'files': {'ubulk': {'fs': 2124025, 'zstd19': 1294577}, 'uexp': {'fs': 4120897, 'zstd19': 1444343}, 'umap': {'fs': 27119, 'zstd19': 5399}}, 'total_fs': 6272041, 'total_zstd19': 2744319}
+{'season': 's1', 'body': 12, 'files': {'umap': {'fs': 27119, 'zstd19': 5392}, 'uexp': {'fs': 4121829, 'zstd19': 1413962}, 'ubulk': {'fs': 2137430, 'zstd19': 1287875}}, 'total_fs': 6286378, 'total_zstd19': 2707229}
+{'season': 's1', 'body': 13, 'files': {'umap': {'fs': 27119, 'zstd19': 5394}, 'uexp': {'fs': 4121843, 'zstd19': 1470998}, 'ubulk': {'fs': 2115050, 'zstd19': 1296022}}, 'total_fs': 6264012, 'total_zstd19': 2772414}
+{'season': 's1', 'body': 14, 'files': {'uexp': {'fs': 4125613, 'zstd19': 1481262}, 'umap': {'fs': 27119, 'zstd19': 5403}, 'ubulk': {'fs': 2117011, 'zstd19': 1295182}}, 'total_fs': 6269743, 'total_zstd19': 2781847}
+{'season': 's1', 'body': 15, 'files': {'uexp': {'fs': 4121653, 'zstd19': 1437871}, 'umap': {'fs': 27119, 'zstd19': 5395}, 'ubulk': {'fs': 2135910, 'zstd19': 1296968}}, 'total_fs': 6284682, 'total_zstd19': 2740234}
+{'season': 's1', 'body': 16, 'files': {'umap': {'fs': 27119, 'zstd19': 5394}, 'uexp': {'fs': 4122829, 'zstd19': 1467279}, 'ubulk': {'fs': 2106130, 'zstd19': 1280855}}, 'total_fs': 6256078, 'total_zstd19': 2753528}
+{'season': 's1', 'body': 17, 'files': {'ubulk': {'fs': 2099760, 'zstd19': 1267881}, 'umap': {'fs': 27119, 'zstd19': 5398}, 'uexp': {'fs': 4123605, 'zstd19': 1456922}}, 'total_fs': 6250484, 'total_zstd19': 2730201}
+{'season': 's1', 'body': 18, 'files': {'uexp': {'fs': 4124875, 'zstd19': 1443554}, 'ubulk': {'fs': 2121208, 'zstd19': 1284446}, 'umap': {'fs': 27119, 'zstd19': 5397}}, 'total_fs': 6273202, 'total_zstd19': 2733397}
+{'season': 's2', 'body': 11, 'files': {'ubulk': {'fs': 2110833, 'zstd19': 1285015}, 'uexp': {'fs': 4120501, 'zstd19': 1467965}, 'umap': {'fs': 27119, 'zstd19': 5398}}, 'total_fs': 6258453, 'total_zstd19': 2758378}
+{'season': 's2', 'body': 12, 'files': {'umap': {'fs': 27119, 'zstd19': 5402}, 'uexp': {'fs': 4118769, 'zstd19': 1439199}, 'ubulk': {'fs': 2119267, 'zstd19': 1278336}}, 'total_fs': 6265155, 'total_zstd19': 2722937}
+{'season': 's2', 'body': 13, 'files': {'umap': {'fs': 27119, 'zstd19': 5404}, 'uexp': {'fs': 4122261, 'zstd19': 1446991}, 'ubulk': {'fs': 2109988, 'zstd19': 1284766}}, 'total_fs': 6259368, 'total_zstd19': 2737161}
+{'season': 's2', 'body': 14, 'files': {'uexp': {'fs': 4124201, 'zstd19': 1460265}, 'umap': {'fs': 27119, 'zstd19': 5394}, 'ubulk': {'fs': 2153471, 'zstd19': 1299578}}, 'total_fs': 6304791, 'total_zstd19': 2765237}
+{'season': 's2', 'body': 15, 'files': {'uexp': {'fs': 4120609, 'zstd19': 1441388}, 'umap': {'fs': 27119, 'zstd19': 5393}, 'ubulk': {'fs': 2148733, 'zstd19': 1304340}}, 'total_fs': 6296461, 'total_zstd19': 2751121}
+{'season': 's2', 'body': 16, 'files': {'umap': {'fs': 27119, 'zstd19': 5397}, 'uexp': {'fs': 4118577, 'zstd19': 1448407}, 'ubulk': {'fs': 2131134, 'zstd19': 1284291}}, 'total_fs': 6276830, 'total_zstd19': 2738095}
+{'season': 's2', 'body': 17, 'files': {'ubulk': {'fs': 2127735, 'zstd19': 1290724}, 'umap': {'fs': 27119, 'zstd19': 5386}, 'uexp': {'fs': 4120933, 'zstd19': 1456750}}, 'total_fs': 6275787, 'total_zstd19': 2752860}
+{'season': 's2', 'body': 18, 'files': {'uexp': {'fs': 4120035, 'zstd19': 1443246}, 'ubulk': {'fs': 2103075, 'zstd19': 1271129}, 'umap': {'fs': 27119, 'zstd19': 5404}}, 'total_fs': 6250229, 'total_zstd19': 2719779}
+[18:56:45] CHAIN4 DONE
+/Users/baadc0de/Development/orrery-onebody/s1046/cook-s1.log:LogCook: Display: Cook by the book total time in tick 3.244095s total time 6.555700
+/Users/baadc0de/Development/orrery-onebody/s1046/cook-s2.log:LogCook: Display: Cook by the book total time in tick 2.864847s total time 6.144890
+LogShaderCompilers: Display: Compiling shader autogen file: ../../../../../../baadc0de/Development/orrery-onebody/OneBodyCook/Intermediate/ShaderAutogen/METAL_SM6/AutogenShaderHeaders.ush
+LogShaderCompilers: Display: Compiling shader autogen file: ../../../../../../baadc0de/Development/orrery-onebody/OneBodyCook/Intermediate/ShaderAutogen/METAL_SM5/AutogenShaderHeaders.ush
+LogCook: Display: Compiling global changed shaders for platform 'Mac'
+LogShaderCompilers: Display:                                FMeshPartition_DrawUVDomainPS (compiled    2 times, average 0.53 sec, max 1.02 sec, min 0.04 sec)
+LogShaderCompilers: Display:                                  FMeshPartition_BorderFillCS (compiled    2 times, average 0.52 sec, max 1.02 sec, min 0.02 sec)
+87
+       4
+[18:55:18] cook s1  rc=0 wall=17.079997000
+[18:55:40] cook s2  rc=0 wall=16.699086000
+"OneBodyCook/Content/Bodies/Body_11.ubulk" offset: 5406, size: 1311926 bytes, sha1: B60808
+"OneBodyCook/Content/Bodies/Body_11.uexp" offset: 1317917, size: 1315159 bytes, sha1: 5918
+"OneBodyCook/Content/Bodies/Body_11.umap" offset: 2634141, size: 5322 bytes, sha1: E585456
+Body_2.uexp zstd-patch-from: 1336 B; xdelta3: 774 B
+Body_2.umap zstd-patch-from: 46 B; xdelta3: 238 B
+horror cooked level+actors+prototyping: 701742 58
+firstperson cooked level+actors+prototyping: 459501 29

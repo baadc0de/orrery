@@ -1,0 +1,25 @@
+level-1.tri.collision raw=682360 zstd19=47024
+level-2.tri.collision raw=197408 zstd19=17316
+horror source assets tar raw=3052544 zstd19=483871
+firstperson source assets tar raw=1973248 zstd19=377795
+548	/Users/baadc0de/Development/orrery-onebody/OneBodyCook/Content/Variant_Horror
+492	/Users/baadc0de/Development/orrery-onebody/OneBodyCook/Content/__ExternalActors__/Variant_Horror
+588	/Users/baadc0de/Development/orrery-onebody/OneBodyCook/Content/LevelPrototyping/Meshes
+208	/Users/baadc0de/Development/orrery-onebody/OneBodyCook/Content/LevelPrototyping/Materials
+12	/Users/baadc0de/Development/orrery-onebody/OneBodyCook/Content/LevelPrototyping/Textures
+656	/Users/baadc0de/Development/orrery-onebody/OneBodyCook/Content/LevelPrototyping/Interactable/Door
+1264 /System/Library/CoreServices/Keychain Circle Notification.app/Contents/MacOS/Keychain Circle No
+1266 /System/Library/Frameworks/Security.framework/Versions/A/Resources/CloudKeychainProxy.bundle/Co
+1373 /usr/libexec/keychainsharingmessagingd
+1458 /System/Library/CoreServices/CrashReporterSupportHelper server-init
+19551 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --
+19553 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --
+19558 /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claud
+19561 /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claud
+19565 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --
+19566 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --
+19604 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --
+19605 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --
+20115 /Applications/Epic Games Launcher.app/Contents/UE/Engine/Binaries/Mac/EpicWebHelper --type=uti
+procs check done
+2.9G	/Users/baadc0de/Development/orrery-onebody/s1046

@@ -1,0 +1,74 @@
+{
+	"map": "/Game/Variant_Horror/Lvl_Horror",
+	"id": 1,
+	"engine": "5.8.2-56702186+++UE5+Release-5.8",
+	"actors": 87,
+	"static_mesh_components_with_collision": 97,
+	"flattened_instances": 97,
+	"lod0_tris": 22948,
+	"lod0_verts": 16922,
+	"simple_shapes": 97,
+	"complex_trimeshes": 97,
+	"no_collision_prims": 66,
+	"other_colliding_prims": 17,
+	"other_colliding_prim_classes": [
+		"BrushComponent",
+		"BoxComponent",
+		"StaticMeshComponent"
+	],
+	"meshes":
+	{
+		"/Game/LevelPrototyping/Meshes/SM_Cube.SM_Cube":
+		{
+			"instances": 32,
+			"lod0_tris": 12
+		},
+		"/Engine/BasicShapes/Cylinder.Cylinder":
+		{
+			"instances": 34,
+			"lod0_tris": 512
+		},
+		"/Game/LevelPrototyping/Meshes/SM_Ramp.SM_Ramp":
+		{
+			"instances": 4,
+			"lod0_tris": 8
+		},
+		"/Game/LevelPrototyping/Meshes/SM_Cylinder.SM_Cylinder":
+		{
+			"instances": 10,
+			"lod0_tris": 252
+		},
+		"/Game/LevelPrototyping/Interactable/Door/Meshes/SM_DoorFrame_Corner.SM_DoorFrame_Corner":
+		{
+			"instances": 8,
+			"lod0_tris": 252
+		},
+		"/Game/LevelPrototyping/Interactable/Door/Meshes/SM_Door.SM_Door":
+		{
+			"instances": 7,
+			"lod0_tris": 12
+		},
+		"/Game/LevelPrototyping/Meshes/SM_QuarterCylinder.SM_QuarterCylinder":
+		{
+			"instances": 2,
+			"lod0_tris": 252
+		}
+	},
+	"bounds":
+	{
+		"min_x_mm": -30000,
+		"min_y_mm": -20000,
+		"min_z_mm": -1000,
+		"max_x_mm": 0,
+		"max_y_mm": 10001,
+		"max_z_mm": 9500
+	},
+	"tri":
+	{
+		"path": "/Users/baadc0de/Development/orrery-onebody/s1046/interior/level-1.tri.collision",
+		"bytes": 682360,
+		"seconds": 0.0011944994330406189,
+		"ok": true
+	},
+	"load_s": 0.32214383408427238
+}

@@ -1,0 +1,46 @@
+== per-body file sizes (fs, zstd19)
+== season bundles (tar of umap + tri, raw; then zstd19)
+-rw-r--r--@ 1 baadc0de  staff   11920896 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-hf.tar
+-rw-r--r--@ 1 baadc0de  staff    5224268 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-hf.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  209582592 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-season.tar
+-rw-r--r--@ 1 baadc0de  staff   31701709 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-season.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  161323520 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-tri.tar
+-rw-r--r--@ 1 baadc0de  staff   18227356 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-tri.tar.zst
+-rw-r--r--@ 1 baadc0de  staff   48259072 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-umap.tar
+-rw-r--r--@ 1 baadc0de  staff   13508717 Sep  4 18:32 /Users/baadc0de/Development/orrery-onebody/s1046/s1-umap.tar.zst
+-rw-r--r--@ 1 baadc0de  staff   11925504 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-hf.tar
+-rw-r--r--@ 1 baadc0de  staff    5130332 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-hf.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  209367552 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-season.tar
+-rw-r--r--@ 1 baadc0de  staff   31456578 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-season.tar.zst
+-rw-r--r--@ 1 baadc0de  staff  161084928 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-tri.tar
+-rw-r--r--@ 1 baadc0de  staff   18479019 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-tri.tar.zst
+-rw-r--r--@ 1 baadc0de  staff   48282624 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-umap.tar
+-rw-r--r--@ 1 baadc0de  staff   13515436 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/s2-umap.tar.zst
+== patches between seasons (different seeds, same body ids): zstd --patch-from, xdelta3, bsdiff
+-rw-r--r--@ 1 baadc0de  staff  15760158 Sep  4 18:34 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2-umap.xdelta3
+-rw-r--r--@ 1 baadc0de  staff  13082360 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2-umap.zstd.patch
+-rw-r--r--@ 1 baadc0de  staff  31223295 Sep  4 18:35 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2-tri.xdelta3
+-rw-r--r--@ 1 baadc0de  staff  16888543 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2-tri.zstd.patch
+-rw-r--r--@ 1 baadc0de  staff  46772448 Sep  4 18:36 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2-season.xdelta3
+-rw-r--r--@ 1 baadc0de  staff  29574055 Sep  4 18:33 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2-season.zstd.patch
+-rw-r--r--@ 1 baadc0de  staff  15623645 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2-umap.bsdiff
+== the unchanged-body case: same seed cooked twice (spike 2's out-256a vs out-256b), umap
+    5560
+-rw-r--r--@ 1 baadc0de  staff  5565 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/patch-same-seed-umap.bsdiff
+-rw-r--r--@ 1 baadc0de  staff  4969 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/patch-same-seed-umap.xdelta3
+-rw-r--r--@ 1 baadc0de  staff  5088 Sep  4 17:48 /Users/baadc0de/Development/orrery-onebody/s1046/patch-same-seed-umap.zstd.patch
+tri collision byte-identical across the two cooks
+== UnrealPak containers (Oodle, default compression block) and UnrealPak -Diff
+-rw-r--r--@ 1 baadc0de  staff  209537485 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/s1-nocomp.pak
+-rw-r--r--@ 1 baadc0de  staff   35915845 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/s1.pak
+-rw-r--r--@ 1 baadc0de  staff  209322150 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/s2-nocomp.pak
+-rw-r--r--@ 1 baadc0de  staff   36024210 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/s2.pak
+LogPakFile: Display: Diff Source Pak Folder: /Users/baadc0de/Development/orrery-onebody/s1046 - 1 pak file(s)
+LogPakFile: Display: Diff Target Pak Folder: /Users/baadc0de/Development/orrery-onebody/s1046 - 1 pak file(s)
+-- zstd/xdelta over the Oodle paks (what a content-agnostic patcher sees if handed UE's container)
+-rw-r--r--@ 1 baadc0de  staff  29547475 Sep  4 18:39 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2.pak.xdelta3
+-rw-r--r--@ 1 baadc0de  staff  29130164 Sep  4 18:38 /Users/baadc0de/Development/orrery-onebody/s1046/patch-s1-s2.pak.zstd.patch
+-- zstd of the paks themselves (double compression)
+ 29550970
+ 31917305
+== SIZES DONE

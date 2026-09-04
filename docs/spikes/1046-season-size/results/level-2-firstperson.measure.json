@@ -1,0 +1,60 @@
+{
+	"map": "/Game/FirstPerson/Lvl_FirstPerson",
+	"id": 2,
+	"engine": "5.8.2-56702186+++UE5+Release-5.8",
+	"actors": 68,
+	"static_mesh_components_with_collision": 54,
+	"flattened_instances": 54,
+	"lod0_tris": 5724,
+	"lod0_verts": 5342,
+	"simple_shapes": 54,
+	"complex_trimeshes": 54,
+	"no_collision_prims": 15,
+	"other_colliding_prims": 0,
+	"other_colliding_prim_classes": [],
+	"meshes":
+	{
+		"/Game/LevelPrototyping/Meshes/SM_Cube.SM_Cube":
+		{
+			"instances": 20,
+			"lod0_tris": 12
+		},
+		"/Game/LevelPrototyping/Meshes/SM_QuarterCylinder.SM_QuarterCylinder":
+		{
+			"instances": 20,
+			"lod0_tris": 252
+		},
+		"/Engine/MapTemplates/SM_Template_Map_Floor.SM_Template_Map_Floor":
+		{
+			"instances": 1,
+			"lod0_tris": 96
+		},
+		"/Game/LevelPrototyping/Meshes/SM_Ramp.SM_Ramp":
+		{
+			"instances": 12,
+			"lod0_tris": 8
+		},
+		"/Game/LevelPrototyping/Meshes/SM_Cylinder.SM_Cylinder":
+		{
+			"instances": 1,
+			"lod0_tris": 252
+		}
+	},
+	"bounds":
+	{
+		"min_x_mm": -20000,
+		"min_y_mm": -20000,
+		"min_z_mm": -1000,
+		"max_x_mm": 20000,
+		"max_y_mm": 20000,
+		"max_z_mm": 4000
+	},
+	"tri":
+	{
+		"path": "/Users/baadc0de/Development/orrery-onebody/s1046/interior/level-2.tri.collision",
+		"bytes": 197408,
+		"seconds": 0.0005738772451877594,
+		"ok": true
+	},
+	"load_s": 0.13735049962997437
+}
