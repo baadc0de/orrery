@@ -217,21 +217,29 @@ fn main() {
         // Operator-declared impairment. Shown beside the measurement in the
         // F3 pane and compared against it by the banking row; never
         // substituted for what the link actually did.
-        let configured = ConfiguredImpairment {
-            loss_pct: flag_value(&args, "--expect-loss")
+        //
+        // `--expect-jitter-ms` names the *height* of the host's jitter spike,
+        // which is the one figure a campaign config carries. The percentile
+        // expectations are derived from it rather than echoed into both, since
+        // the host holds a tenth of datagrams for the full spike and the rest
+        // not at all: the median added delay is zero and only the p99 sees the
+        // spike (`ConfiguredImpairment::from_spike`, #1030). Echoing the scalar
+        // into both is what flagged every honest session of 2026-09-04.
+        let derived = ConfiguredImpairment::from_spike(
+            flag_value(&args, "--expect-loss")
                 .and_then(|value| value.parse::<f64>().ok())
                 .unwrap_or(0.0),
-            jitter_p50_ms: flag_value(&args, "--expect-jitter-ms")
+            flag_value(&args, "--expect-jitter-ms")
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0),
-            // The p99 expectation defaults to the p50 one: an operator who
-            // declared one jitter figure declared it for the profile, and a
-            // hardcoded zero here made the p99 half of the mismatch flag
-            // unfalsifiable (observed 0 == configured 0 on an idle link).
+        );
+        let configured = ConfiguredImpairment {
+            // An operator measuring a link the host model does not describe can
+            // still state the p99 outright.
             jitter_p99_ms: flag_value(&args, "--expect-jitter-p99-ms")
-                .or_else(|| flag_value(&args, "--expect-jitter-ms"))
                 .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0),
+                .unwrap_or(derived.jitter_p99_ms),
+            ..derived
         };
         skin = skin.with_campaign(CampaignConfig {
             host_node_hex: input.host_node,

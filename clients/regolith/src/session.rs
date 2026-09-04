@@ -26,6 +26,20 @@ pub enum Actor {
     Human,
 }
 
+/// The fraction of datagrams the host's impaired router holds back.
+///
+/// `Impairment::p4_profile_at_loss` in `gates/p1-swarm/src/router.rs` sets
+/// `jitter_rate: 0.10` beside `jitter_ticks: 6`, and `Router::schedule` there
+/// holds a packet for the *whole* six ticks or not at all — there is no draw
+/// inside the interval. The host's added delay is therefore a two-point
+/// distribution: zero with probability `1 - HOST_JITTER_SPIKE_RATE`, and one
+/// full spike otherwise.
+///
+/// A campaign's single `jitter_ms` names the height of that spike. It is not a
+/// median, and treating it as one is what made every honest session of
+/// 2026-09-04 report `impairment_mismatch` (#1030).
+pub const HOST_JITTER_SPIKE_RATE: f64 = 0.10;
+
 /// The impairment profile requested for a session, expressed for operators.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ConfiguredImpairment {
@@ -35,6 +49,37 @@ pub struct ConfiguredImpairment {
     pub jitter_p50_ms: u64,
     /// Expected p99 jitter in milliseconds.
     pub jitter_p99_ms: u64,
+}
+
+impl ConfiguredImpairment {
+    /// Derive the percentile expectations a campaign's single jitter figure
+    /// actually implies, given the host's spike model.
+    ///
+    /// At the shipped `HOST_JITTER_SPIKE_RATE` of 0.10 this reads p50 = 0 and
+    /// p99 = `spike_ms`: nine datagrams in ten are not held at all, so the
+    /// median added delay is zero and the spike only appears above the ninetieth
+    /// percentile. Sending `spike_ms` for *both*, as the coordinator did until
+    /// #1030, asserts something no distribution can satisfy.
+    #[must_use]
+    pub fn from_spike(loss_pct: f64, spike_ms: u64) -> Self {
+        Self {
+            loss_pct,
+            jitter_p50_ms: Self::spike_quantile(spike_ms, 0.50),
+            jitter_p99_ms: Self::spike_quantile(spike_ms, 0.99),
+        }
+    }
+
+    /// The `quantile`th quantile of the host's two-point added-delay
+    /// distribution: zero below the spike's mass, the spike's full height above
+    /// it.
+    #[must_use]
+    fn spike_quantile(spike_ms: u64, quantile: f64) -> u64 {
+        if quantile > 1.0 - HOST_JITTER_SPIKE_RATE {
+            spike_ms
+        } else {
+            0
+        }
+    }
 }
 
 /// Measurements taken from packets actually sent during this session.
@@ -58,7 +103,24 @@ const MIN_IMPAIRMENT_SAMPLES: u64 = 200;
 /// The width of the criterion's own 3-5% band (`gates/p1-swarm`'s `--loss`).
 const LOSS_TOLERANCE_PCT: f64 = 2.0;
 
-/// How far a measured jitter percentile may sit from the configured one.
+/// How far a measured jitter percentile may fall *below* the configured one
+/// before it is a disagreement rather than sampling noise.
+///
+/// One-sided, and that is the whole of #1030's fix. The figure this is compared
+/// against is not a target the measurement should straddle: the client's jitter
+/// is the deviation of downlink inter-arrival intervals over the *whole* path,
+/// which is the host's injected spike composed with the player's own internet.
+/// Delays add and never cancel, so an honest measurement can only sit at or
+/// above what the host injected. 151 ms of p99 against a 100 ms spike is a
+/// volunteer's link on top of the profile, not a claim that the profile was
+/// wrong.
+///
+/// The direction that *is* evidence is the shortfall. A seat that never
+/// received the profile reads its own link alone — 3% loss on a 20 Hz grid
+/// carries a p99 near 50 ms and nothing above it — which is a 50 ms shortfall
+/// against a 100 ms spike and still fires. Keeping the width at 40 ms is what
+/// leaves that detection intact; widening it until the p50 case stopped firing
+/// would have hidden the unapplied-profile case with it.
 const JITTER_TOLERANCE_MS: u64 = 40;
 
 impl ImpairmentMeasurement {
@@ -375,11 +437,24 @@ impl CampaignSession {
         // loss tolerance is the width of the criterion's own 3-5% band, so a
         // profile inside the band the gate accepts is not reported as a
         // mismatch against the band's floor.
+        //
+        // Loss is two-sided: a link cannot invent drops the host did not cause,
+        // and a rate far above the configured one is as much a disagreement as
+        // one far below. Jitter is one-sided, for the reason recorded at
+        // `JITTER_TOLERANCE_MS` — the measurement composes the injected spike
+        // with the player's own path, and only a *shortfall* says the profile
+        // did not arrive.
         let mismatch = self.measurement.sent >= MIN_IMPAIRMENT_SAMPLES
             && ((observed_loss_pct - self.configured.loss_pct).abs() > LOSS_TOLERANCE_PCT
-                || observed_jitter_p50_ms.abs_diff(self.configured.jitter_p50_ms)
+                || self
+                    .configured
+                    .jitter_p50_ms
+                    .saturating_sub(observed_jitter_p50_ms)
                     > JITTER_TOLERANCE_MS
-                || observed_jitter_p99_ms.abs_diff(self.configured.jitter_p99_ms)
+                || self
+                    .configured
+                    .jitter_p99_ms
+                    .saturating_sub(observed_jitter_p99_ms)
                     > JITTER_TOLERANCE_MS);
         SessionRecord {
             session_id: self.session_id.clone(),
@@ -435,6 +510,110 @@ mod tests {
                 jitter_p99_ms: 100,
             },
         )
+    }
+
+    /// A session under the campaign profile, replaying one real volunteer row.
+    ///
+    /// `01a06b05-52e9` (macOS, 12.4 minutes, 2026-09-04): observed loss 3.17%,
+    /// jitter p50 17 ms, p99 151 ms, against a campaign configured at 3% loss
+    /// and a 100 ms spike.
+    fn session_52e9() -> CampaignSession {
+        let mut session = CampaignSession::new(
+            "01a06b05-52e9-7cc8-afef-c3b87b00428c".into(),
+            "2026-09-04T12:00:00Z".into(),
+            Actor::Human,
+            ConfiguredImpairment::from_spike(3.0, 100),
+        );
+        // 400 samples: the sorted p50 index is 199 and the p99 index 395, so
+        // the first 200 fix the median at 17 ms and index 395 fixes the p99 at
+        // 151 ms. Thirteen drops in 400 is 3.25%, inside the loss band.
+        for index in 0..400 {
+            let jitter_ms = if index < 200 {
+                17
+            } else if index < 396 {
+                151
+            } else {
+                400
+            };
+            session.observe_transport(index < 13, jitter_ms);
+        }
+        session
+    }
+
+    fn finish(session: &CampaignSession) -> SessionRecord {
+        session.finish(
+            "2026-09-04T12:12:21Z".into(),
+            "aarch64-apple-darwin".into(),
+            "deadbeef".into(),
+            "pipeline".into(),
+        )
+    }
+
+    /// #1030. The coordinator sent one scalar as both percentiles and the
+    /// client compared both against it, so every honest session of 2026-09-04
+    /// banked with `impairment_mismatch: true` — the exact false positive P4's
+    /// exit condition (#240) counts.
+    ///
+    /// The host holds a tenth of datagrams for a full six ticks and the rest
+    /// not at all, so the median added delay is zero and the spike shows only
+    /// above the ninetieth percentile. A p50 of 17 ms and a p99 of 151 ms is
+    /// that model plus a real internet path, which is the only direction a
+    /// path can move it.
+    #[test]
+    fn a_jitter_percentile_above_the_configured_spike_is_the_players_link_not_a_mismatch() {
+        let configured = ConfiguredImpairment::from_spike(3.0, 100);
+        assert_eq!(
+            (configured.jitter_p50_ms, configured.jitter_p99_ms),
+            (0, 100),
+            "a 100 ms spike on a tenth of datagrams has a zero median"
+        );
+
+        let record = finish(&session_52e9());
+        assert_eq!(record.observed_jitter_p50_ms, 17);
+        assert_eq!(record.observed_jitter_p99_ms, 151);
+        assert!(
+            !record.impairment_mismatch,
+            "an honest volunteer session must not raise a discrepancy flag"
+        );
+
+        // The malformed comparison this replaces: one scalar as both
+        // percentiles, straddled rather than floored. A median of 17 ms cannot
+        // sit within 40 ms of 100, so it fired on every row ever recorded.
+        let malformed = ConfiguredImpairment {
+            loss_pct: 3.0,
+            jitter_p50_ms: 100,
+            jitter_p99_ms: 100,
+        };
+        assert!(
+            record
+                .observed_jitter_p50_ms
+                .abs_diff(malformed.jitter_p50_ms)
+                > JITTER_TOLERANCE_MS,
+            "the fixture must be one the old comparison flagged"
+        );
+    }
+
+    /// The flag still has to catch the case it exists for: a seat whose
+    /// profile never arrived. Its link alone carries no spike, so its p99 falls
+    /// the spike's full height short of the configured figure.
+    #[test]
+    fn a_link_that_never_received_the_spike_still_reports_a_mismatch() {
+        let mut session = CampaignSession::new(
+            "01a06b05-0000-7000-8000-000000000001".into(),
+            "2026-09-04T12:00:00Z".into(),
+            Actor::Human,
+            ConfiguredImpairment::from_spike(3.0, 100),
+        );
+        // Loss applied, jitter not: an unspiked path on a 20 Hz grid.
+        for index in 0..400 {
+            session.observe_transport(index < 13, 12);
+        }
+        let record = finish(&session);
+        assert_eq!(record.observed_jitter_p99_ms, 12);
+        assert!(
+            record.impairment_mismatch,
+            "an 88 ms shortfall against a 100 ms spike is the profile missing"
+        );
     }
 
     #[test]

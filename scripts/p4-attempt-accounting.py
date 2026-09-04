@@ -133,11 +133,17 @@ LINK_BAND_SIGMAS = 3.0
 # band collapses to zero width there — it would flag every clean session ever
 # recorded. Both bands are therefore absolute.
 #
-# Why 40 ms: the profile injects 100 ms into a tenth of the datagrams, and the
-# percentiles are taken over inter-arrival *deviations* on a 20 Hz send grid,
-# so a percentile can legitimately land a fraction of a send slot (50 ms) away
-# from the configured figure. 40 ms is under one slot and well under the 100 ms
-# the profile injects, so an unapplied delay (100 ms of gap) is still flagged.
+# Why 40 ms, and why it is one-sided (#1030): the profile injects 100 ms into a
+# tenth of the datagrams, and the percentiles are taken over inter-arrival
+# *deviations* on a 20 Hz send grid. The client measures the whole path — the
+# host's spike composed with the volunteer's own internet — and delays add
+# rather than cancel, so an honest figure can only sit at or *above* what was
+# injected. Comparing it as a target flagged all four sessions of 2026-09-04
+# (p50 17-29 ms, p99 150-898 ms) against a configured 100. Comparing it as a
+# floor keeps the only direction that is evidence: a seat that never received
+# the spike reads its own link alone, a shortfall of the spike's full height.
+# 40 ms is under one send slot (50 ms) and well under the 100 ms the profile
+# injects, so that unapplied-profile case is still flagged.
 IMPAIRMENT_LOSS_TOLERANCE_PCT = 2.0
 IMPAIRMENT_JITTER_TOLERANCE_MS = 40.0
 
@@ -507,21 +513,28 @@ def outside_impairment_band(row: dict[str, Any]) -> bool:
             ),
             IMPAIRMENT_LOSS_TOLERANCE_PCT,
         ),
+        # Jitter is a floor, not a target (#1030): the client's figure composes
+        # the host's injected spike with the player's own path, and delays add
+        # rather than cancel. Only a *shortfall* is evidence, so the gap is
+        # clamped at zero above the configured figure — exactly as
+        # `clients/regolith/src/session.rs` writes it with `saturating_sub`.
         (
-            abs(
-                impairment_number(
+            max(
+                0.0,
+                impairment_number(row, "jitter_p50_ms", configured.get("jitter_p50_ms"))
+                - impairment_number(
                     row, "observed_jitter_p50_ms", row.get("observed_jitter_p50_ms")
-                )
-                - impairment_number(row, "jitter_p50_ms", configured.get("jitter_p50_ms"))
+                ),
             ),
             IMPAIRMENT_JITTER_TOLERANCE_MS,
         ),
         (
-            abs(
-                impairment_number(
+            max(
+                0.0,
+                impairment_number(row, "jitter_p99_ms", configured.get("jitter_p99_ms"))
+                - impairment_number(
                     row, "observed_jitter_p99_ms", row.get("observed_jitter_p99_ms")
-                )
-                - impairment_number(row, "jitter_p99_ms", configured.get("jitter_p99_ms"))
+                ),
             ),
             IMPAIRMENT_JITTER_TOLERANCE_MS,
         ),
@@ -922,6 +935,7 @@ def fixture_row(
     secret_byte: int,
     observed: tuple[float, float, float] = (3, 100, 100),
     mismatch: bool = False,
+    configured: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A signed client row.
 
@@ -944,11 +958,8 @@ def fixture_row(
             "ruleset_version": 16,
             "pipeline_digest": "unavailable-client-side",
             "actor": "human",
-            "configured_impairment_profile": {
-                "loss_pct": 3,
-                "jitter_p50_ms": 100,
-                "jitter_p99_ms": 100,
-            },
+            "configured_impairment_profile": configured
+            or {"loss_pct": 3, "jitter_p50_ms": 100, "jitter_p99_ms": 100},
             "observed_loss_pct": observed[0],
             "observed_jitter_p50_ms": observed[1],
             "observed_jitter_p99_ms": observed[2],
@@ -1132,7 +1143,12 @@ def self_test() -> None:
                 f"self-test: {declaration} is {found.group(1)} in session.rs but {ours} here; "
                 "the recomputation would refuse rows the client called clean"
             )
-    for fragment in ("| fabs) > 2.0", "| fabs) > 40", "(200 / 20 / 60)"):
+    for fragment in (
+        "| fabs) > 2.0",
+        "($c.jitter_p50_ms - $s.observed_jitter_p50_ms) > 40",
+        "($c.jitter_p99_ms - $s.observed_jitter_p99_ms) > 40",
+        "(200 / 20 / 60)",
+    ):
         if fragment not in ledger:
             die(
                 f"self-test: p4-ledger.sh's append-time recomputation no longer carries "
@@ -1501,6 +1517,25 @@ def self_test() -> None:
             "fired while its observed impairment sits inside the tolerance band",
         )
         test.ok("a_flag_fired_inside_the_band_is_refused")
+
+        # -- #1030: the first real cohort ------------------------------------
+        #
+        # Session 01a06b05-52e9 (macOS, 2026-09-04) measured 3.17% loss with a
+        # jitter p50 of 17 ms and a p99 of 151 ms. The host holds a tenth of
+        # datagrams for the whole 100 ms spike and the rest not at all, so the
+        # advertised profile is p50 0 / p99 100 and the path the volunteer
+        # plays over adds on top of it. Every honest session of that day banked
+        # with the flag set; none may now.
+        volunteer = fixture_row(
+            SESSION_A,
+            50,
+            "x86_64-unknown-linux-gnu",
+            0x11,
+            observed=(3.17, 17, 151),
+            configured={"loss_pct": 3, "jitter_p50_ms": 0, "jitter_p99_ms": 100},
+        )
+        test.must_derive(cohort, [volunteer, row_b], "volunteer-session")
+        test.ok("a_jitter_percentile_above_the_spike_is_not_a_mismatch")
 
         # The band's own edge, on the side that must still be refused: 3.0
         # configured read as 0.9 is a 2.1 point gap, wider than the band.
