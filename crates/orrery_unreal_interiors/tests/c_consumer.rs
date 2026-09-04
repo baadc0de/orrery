@@ -128,6 +128,16 @@ fn build_staticlib(library_dir: &Path, profile: &str) -> Vec<String> {
             "the archive carries no symbol from `{absent}`"
         );
     }
+    // `-lc` comes back in `--print native-static-libs`, and on a cold hosted
+    // runner passing it to the C driver fails the link outright:
+    //
+    //     /usr/bin/ld: cannot find -lc: No such file or directory
+    //
+    // The driver supplies the C library itself, so naming it again buys
+    // nothing and costs the whole workspace test run on any box without a
+    // static libc. The remaining duplicates rustc emits are deliberate --
+    // link order matters for the rest -- so only `-lc` is removed.
+    let native: Vec<String> = native.into_iter().filter(|lib| lib != "-lc").collect();
     native
 }
 
