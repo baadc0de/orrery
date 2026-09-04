@@ -26,8 +26,8 @@ use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{AudienceChange, Bot, BotSpec, TICK_HZ};
 use crate::delta_stats::{DeltaStats, DeltaStatsReport};
 use crate::exterior::{
-    ActiveSeat, Frame, HearsayContact, HearsayContacts, HearsaySource, Lane, StartManifest,
-    UplinkAck, UplinkDatagram, UplinkOutcome,
+    unix_millis_now, ActiveSeat, Frame, HearsayContact, HearsayContacts, HearsaySource, Lane,
+    StartManifest, UplinkAck, UplinkDatagram, UplinkOutcome,
 };
 
 use crate::router::{Impairment, Router, RouterCounters};
@@ -693,19 +693,6 @@ pub struct RunIdentity {
     pub commit: &'static str,
 }
 
-/// Host wall clock in Unix milliseconds.
-///
-/// Called only on the exterior-seat path, and only when the caller asked for
-/// wall stamps: the swarm proper must stay a function of its seed, and an
-/// `--external-peer` run already is not one.
-fn unix_millis_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
 /// What the host observed about the external peer over one run (#385).
 #[derive(Debug, Clone, Serialize)]
 pub struct ExteriorReport {
@@ -726,14 +713,28 @@ pub struct ExteriorReport {
     /// what it is - work the host did for this seat - and use the wall
     /// bracket below for how long the seat was actually connected.
     pub connected_ticks: u64,
-    /// Host wall-clock milliseconds at which this seat was bound, present only
-    /// when the caller asked for wall stamps (`--stamp-wall-clock`).
+    /// Host wall-clock milliseconds at which this seat was accepted, present
+    /// only when the caller asked for wall stamps (`--stamp-wall-clock`).
     ///
-    /// The open end of the host's own record of the seat's connected span. It
-    /// is stamped when the host admits the seat, which is at or before the
-    /// moment the client starts counting its own play, so the bracket
-    /// *contains* the client's interval rather than sampling a subinterval of
-    /// it (#971).
+    /// The open end of the host's own record of the seat's connected span,
+    /// stamped in `bridge::PendingJoin::finish` immediately *before* the
+    /// `JoinReply::Accept` carrying this seat's `StartV1` is written, and
+    /// carried to the bind through `exterior::HostLink::accepted_at_unix_millis`.
+    ///
+    /// **Why there and not at the bind (#1037).** The client counts a tick only
+    /// from `JoinState::Joined`, which it can only reach by reading that
+    /// accept; the accept can only be read after it is written, and it is
+    /// written after this stamp is read. So
+    ///
+    /// > stamp ≤ accept written < accept read < client's first counted tick,
+    ///
+    /// and no client tick can precede this endpoint. Until #1037 the stamp was
+    /// taken where the simulation loop *bound* the seat — at construction for
+    /// the lobby cohort, or on the tick that drained the live-join channel —
+    /// which is downstream of the accept the client already acted on and
+    /// therefore ordered against nothing. Four real seats on 2026-09-04 missed
+    /// by −715 to +168 ms with no trend against span, and one of them opened
+    /// its bracket after the client's first tick.
     pub connected_since_unix_millis: Option<u64>,
     /// Host wall-clock milliseconds at which this seat stopped being connected.
     ///
@@ -744,6 +745,27 @@ pub struct ExteriorReport {
     /// run. Every one of those is at or after the seat's real close and never
     /// before it, by at most one tick. `None` exactly when
     /// [`Self::connected_since_unix_millis`] is.
+    ///
+    /// **Why that ordering holds, written down so it stays true (#1037).**
+    /// Both candidates are stamped from an *observation the client had already
+    /// made happen*, never from a prediction:
+    ///
+    /// * the down-link case (`ExteriorSlot::pump_uplink`) stamps on the first
+    ///   host tick that saw `HostLink::connected` false. That flag is set by
+    ///   `bridge::watch_connection` when the QUIC connection closed, which is
+    ///   at or after the client stopped driving it — so the stamp is late by up
+    ///   to one tick and never early;
+    /// * the report-time case (`ExteriorSlot::report`) stamps as the run's
+    ///   report is taken, which is after the last tick of the attempt and
+    ///   therefore after any tick the client could have counted against this
+    ///   host.
+    ///
+    /// The invariant a future change must preserve: **this endpoint may only be
+    /// stamped from an event the host has already observed, and never from one
+    /// it expects.** A stamp taken where the host *decides* to release a seat,
+    /// rather than where it observes the seat gone, would move the close end
+    /// earlier than the client's last tick and reintroduce exactly the
+    /// unordered-endpoint defect #1037 removed from the open end.
     pub connected_until_unix_millis: Option<u64>,
     /// Frames forwarded from the remote into the router.
     pub uplink_frames: u64,
@@ -1538,10 +1560,13 @@ pub struct ExteriorSlot {
     uplink_frames: u64,
     /// Host ticks during which the bridge reported this slot connected.
     connected_ticks: u64,
-    /// Host wall-clock milliseconds at which this seat was bound. `None` when
-    /// the caller did not ask for wall stamps, which is also what keeps a
-    /// seedless run seedless: nothing else in the swarm consults a clock.
-    seated_at_unix_millis: Option<u64>,
+    /// Host wall-clock milliseconds at which the host *accepted* this seat's
+    /// connection, carried in from `HostLink::accepted_at_unix_millis` rather
+    /// than read here (#1037): the bind is not ordered against the client, and
+    /// the accept is. `None` when the caller did not ask for wall stamps, which
+    /// is also what keeps a seedless run seedless: nothing else in the swarm
+    /// consults a clock.
+    accepted_at_unix_millis: Option<u64>,
     /// Host wall-clock milliseconds at the first tick this seat was observed
     /// no longer connected. Stays `None` for a seat released on its own
     /// goodbye and for one still connected when the clock stopped; both report
@@ -1720,9 +1745,9 @@ impl ExteriorSlot {
             node: self.node,
             connected,
             connected_ticks: self.connected_ticks,
-            connected_since_unix_millis: self.seated_at_unix_millis,
+            connected_since_unix_millis: self.accepted_at_unix_millis,
             connected_until_unix_millis: self
-                .seated_at_unix_millis
+                .accepted_at_unix_millis
                 .map(|_| self.released_at_unix_millis.unwrap_or_else(unix_millis_now)),
             uplink_frames: self.uplink_frames,
             uplink_delivered: self.uplink_delivered,
@@ -1841,7 +1866,7 @@ impl ExteriorSlot {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             self.connected_ticks += 1;
-        } else if self.seated_at_unix_millis.is_some() && self.released_at_unix_millis.is_none() {
+        } else if self.accepted_at_unix_millis.is_some() && self.released_at_unix_millis.is_none() {
             // The close end of the bracket, stamped at the first tick the host
             // saw the link down. Late by up to one tick, never early, so the
             // span it reports still contains the seat's real one (#971).
@@ -2188,6 +2213,10 @@ impl Swarm {
         let entity = PersistId::new(index as u64 + 1);
         self.index_of.insert(node, index);
         let goodbye_flag = link.goodbye.clone();
+        // Read before the link is moved into the slot. The open end of the
+        // bracket belongs to the accept, not to this bind: see
+        // `ExteriorReport::connected_since_unix_millis` (#1037).
+        let accepted_at = link.accepted_at_unix_millis;
         let witness_anchored = anchor.is_some();
         self.exteriors.insert(
             index,
@@ -2204,7 +2233,7 @@ impl Swarm {
                 link,
                 uplink_frames: 0,
                 connected_ticks: 0,
-                seated_at_unix_millis: self.config.started_at_unix_secs.map(|_| unix_millis_now()),
+                accepted_at_unix_millis: self.config.started_at_unix_secs.map(|_| accepted_at),
                 released_at_unix_millis: None,
                 uplink_delivered: 0,
                 uplink_dropped: 0,
@@ -6036,6 +6065,160 @@ mod tests {
         // island" — stated literally, so the population the criterion names has
         // to have a cruising slot to deal it to.
         assert_eq!(tampered_indices(8, 1), vec![0]);
+    }
+
+    /// #1037. The open end of a seat's wall bracket must be the instant the
+    /// host *accepted* the connection, not the instant its simulation loop got
+    /// round to binding the seat.
+    ///
+    /// The two are ordered differently against the client, and that is the
+    /// whole defect. The accept is upstream of everything the client does to
+    /// reach the state in which it counts a tick, so a stamp read before the
+    /// accept is written cannot follow the client's first counted tick. The
+    /// bind is downstream of an accept the client has already acted on, so a
+    /// stamp read there races the client and, on 2026-09-04, lost.
+    ///
+    /// Made deterministic by naming the accept stamp rather than waiting one
+    /// out: `link_pair_accepted_at` stands in for the bridge's read, and the
+    /// value chosen is far enough in the past that no clock this test could
+    /// run against would produce it. A bind-time stamp therefore cannot pass
+    /// by coincidence - it would report *now*, which is provably larger.
+    #[test]
+    fn the_bracket_opens_at_the_accept_and_not_at_the_bind() {
+        // 2025-06-15T14:13:20Z: a real millisecond, and unreachably past.
+        const ACCEPTED_AT: u64 = 1_750_000_000_000;
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 1,
+            started_at_unix_secs: Some(1_755_300_000),
+            ..SwarmConfig::default()
+        });
+        let (host_link, _remote_link) = crate::exterior::link_pair_accepted_at(ACCEPTED_AT);
+        swarm = swarm.with_external(crate::bot::bot_key(1).public(), None, host_link);
+        let report = swarm.exteriors.get(&1).expect("external slot").report();
+
+        assert_eq!(
+            report.connected_since_unix_millis,
+            Some(ACCEPTED_AT),
+            "the open end of the bracket is the accept stamp the link carried in, \
+             not a clock read at the bind",
+        );
+        assert!(
+            report.connected_since_unix_millis < Some(crate::exterior::unix_millis_now()),
+            "the accept precedes the bind, so it precedes every tick the client \
+             could have counted after reading that accept",
+        );
+        assert!(
+            report.connected_until_unix_millis >= report.connected_since_unix_millis,
+            "a bracket may not run backwards: {:?} to {:?}",
+            report.connected_since_unix_millis,
+            report.connected_until_unix_millis,
+        );
+    }
+
+    /// The same property on the other seat path (#1037): a peer that joins a
+    /// running attempt is bound on the tick the live-join channel drains, which
+    /// is up to a whole tick after the accept it was seated on - and each
+    /// joiner keeps *its own* accept, not the tick they happened to share.
+    #[test]
+    fn a_live_joiner_brackets_from_its_own_accept() {
+        const EARLY_ACCEPT: u64 = 1_750_000_000_000;
+        const LATE_ACCEPT: u64 = 1_750_000_004_500;
+
+        let (early_host, _early_remote) = crate::exterior::link_pair_accepted_at(EARLY_ACCEPT);
+        let (late_host, _late_remote) = crate::exterior::link_pair_accepted_at(LATE_ACCEPT);
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let membership = Arc::new(Mutex::new(LiveMembership {
+            attempt_id: "attempt-1037".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
+            tick: 0,
+            running: true,
+            path: None,
+        }));
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: 2,
+                started_at_unix_secs: Some(1_755_300_000),
+                ..SwarmConfig::default()
+            },
+            4,
+        )
+        .with_live_joins(joined_rx, membership, 4);
+        for (slot, session, link) in [
+            (2usize, "session-early", early_host),
+            (3usize, "session-late", late_host),
+        ] {
+            joined_tx
+                .send(JoinedExternal {
+                    slot,
+                    node: crate::bot::bot_key(slot).public(),
+                    session_id: session.to_owned(),
+                    anchor: None,
+                    link,
+                })
+                .expect("join reaches the standing swarm");
+        }
+
+        // Both seats bind on one tick, seconds of wall clock after either was
+        // accepted. A bind-time stamp would give them the same open end.
+        swarm.process_live_membership(600);
+
+        assert_eq!(
+            swarm.exteriors[&2].report().connected_since_unix_millis,
+            Some(EARLY_ACCEPT),
+        );
+        assert_eq!(
+            swarm.exteriors[&3].report().connected_since_unix_millis,
+            Some(LATE_ACCEPT),
+            "two seats bound on one tick keep the distinct accepts they arrived with",
+        );
+    }
+
+    /// The close end's ordering, stated as a test so the invariant written into
+    /// [`ExteriorReport::connected_until_unix_millis`] has something holding it
+    /// (#1037). The host may only stamp the close from an event it has already
+    /// observed - here, the first tick on which the link read as down - so the
+    /// close lands at or after the client's last tick and can only lengthen the
+    /// bracket, never shorten it.
+    #[test]
+    fn the_bracket_closes_only_on_an_observed_disconnect() {
+        const ACCEPTED_AT: u64 = 1_750_000_000_000;
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 1,
+            started_at_unix_secs: Some(1_755_300_000),
+            ..SwarmConfig::default()
+        });
+        let (host_link, remote_link) = crate::exterior::link_pair_accepted_at(ACCEPTED_AT);
+        swarm = swarm.with_external(crate::bot::bot_key(1).public(), None, host_link);
+        let router = &mut swarm.router;
+        let exterior = swarm.exteriors.get_mut(&1).expect("external slot");
+
+        exterior.pump_uplink(1, router);
+        assert_eq!(
+            exterior.released_at_unix_millis, None,
+            "a live link closes no bracket",
+        );
+
+        remote_link
+            .connected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        exterior.pump_uplink(2, router);
+        let closed = exterior
+            .released_at_unix_millis
+            .expect("the first tick that observed the link down closes the bracket");
+        assert!(
+            closed > ACCEPTED_AT,
+            "the observed close is after the accept it belongs to",
+        );
+        exterior.pump_uplink(3, router);
+        assert_eq!(
+            exterior.released_at_unix_millis,
+            Some(closed),
+            "the close is stamped once, at the first observation, and never moved",
+        );
     }
 
     #[test]
