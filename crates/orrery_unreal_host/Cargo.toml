@@ -1,0 +1,44 @@
+[package]
+name = "orrery_unreal_host"
+version = "0.1.0"
+edition = "2021"
+description = "Spike #1043 (engine-independent half): orrery_sim_host plus a headless Bevy App (MinimalPlugins, OrreryNetPlugin, OrreryPredictPlugin) as a staticlib behind a C ABI"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Research spike, not a shipping crate (#1042 rule 6). It lives on the spike
+# branch so `scripts/check.sh` covers it; nothing here merges. The `staticlib`
+# is the object an Unreal plugin's `.Build.cs` would link; the `rlib` is what
+# lets `cargo test` compile the crate's own tests against it.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+orrery_core = { path = "../orrery_core" }
+orrery_games = { path = "../orrery_games" }
+orrery_net = { path = "../orrery_net" }
+orrery_predict = { path = "../orrery_predict" }
+orrery_protocol = { path = "../orrery_protocol" }
+orrery_sim_host = { path = "../orrery_sim_host" }
+# The umbrella crate is declared directly rather than inherited: the workspace
+# entry carries bevy's default features (2d, 3d, ui, audio), and cargo ignores
+# `default-features = false` on an inherited dependency. A staticlib that
+# dragged wgpu and winit into the Unreal process would measure the wrong
+# object. `MinimalPlugins` is what the spike names, and it lives here.
+bevy = { version = "0.19", default-features = false, features = [
+    "std",
+    "multi_threaded",
+    "async_executor",
+] }
+bevy_app = { workspace = true }
+bevy_diagnostic = { version = "0.19", default-features = false }
+bevy_ecs = { workspace = true }
+bevy_state = { workspace = true }
+bevy_time = { workspace = true }
+# lightyear's `LocalTimeline` is read through the ABI so the C driver can hold
+# its own accumulator against lightyear's tick — the D8 unknown #1043 names.
+lightyear = { workspace = true }
+iroh = { workspace = true }
+
+[lints]
+workspace = true

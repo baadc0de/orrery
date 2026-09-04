@@ -8310,6 +8310,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_unreal_host"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_app",
+ "bevy_diagnostic",
+ "bevy_ecs",
+ "bevy_state",
+ "bevy_time",
+ "iroh",
+ "lightyear",
+ "orrery_core",
+ "orrery_games",
+ "orrery_net",
+ "orrery_predict",
+ "orrery_protocol",
+ "orrery_sim_host",
+]
+
+[[package]]
 name = "orrery_witness"
 version = "0.1.0"
 dependencies = [

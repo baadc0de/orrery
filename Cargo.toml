@@ -41,6 +41,11 @@ members = [
     # named in `core-gates.sh`'s `DECLARED_BEVY_FREE_CRATES` so that stays
     # mechanical.
     "crates/orrery_ipc_transport",
+    # Spike #1043's engine-independent half (research branch, never merged):
+    # `orrery_sim_host` plus a headless Bevy `App` as a `staticlib` behind a C
+    # ABI, with the C consumer that drives it. A member so `check.sh` covers
+    # it; nothing depends on it.
+    "crates/orrery_unreal_host",
 ]
 
 # The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /
