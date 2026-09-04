@@ -73,6 +73,21 @@ readonly MIN_COVERAGE=0.95
 # The criterion's injected impairment: 3–5% packet loss, 100 ms jitter spikes.
 readonly BAND_LO=0.03
 readonly BAND_HI=0.05
+# The shortest connected span that is a *measurement* rather than a
+# disconnection (#1053). The standing host handed joiners a `StartV1` for an
+# attempt whose run had already ended and dropped them about sixty
+# milliseconds later; every one of them wrote a well-formed, correctly signed
+# row with an honest `impairment_mismatch: false` — one second long. Nothing
+# here could tell that row from a good one, which is the worst property the
+# bug had: a worthless measurement banked quietly.
+#
+# One minute, because banking is denominated in player-hours accumulated a
+# minute at a time, and because the #1032 clock-disagreement allowance the
+# append path already grants is ~0.017 minutes — a floor an order of magnitude
+# above the slack it has to clear. A shorter session is not refused evidence,
+# it is evidence of a *failure to seat*, and it belongs in the issue that
+# names the failure rather than in the hours total.
+readonly MIN_MEASURED_MINUTES=1.0
 
 self_test() {
   # Structural half, in the house style: the haystack is the script *body*, not
@@ -115,6 +130,8 @@ self_test() {
     || die 'self-test: the bot|human dimension is gone; P4 cannot check its required mix'
   has 'validate_session_record' \
     || die 'self-test: campaign session rows are no longer validated before banking'
+  has 'MIN_MEASURED_MINUTES' \
+    || die 'self-test: the sub-threshold session floor is gone; a session dropped a second after StartV1 would bank a valid, worthless measurement (#1053)'
   has 'impairment_mismatch ==' \
     || die 'self-test: the mismatch flag is no longer checked against the row'\''s own numbers; a post-hoc edit of the measured impairment would bank'
   has 'verify-campaign-measurement.py' \
@@ -654,6 +671,22 @@ self_test() {
     || die "self-test [a_cohort_attempt_banks_one_input_per_actor]: expected three ledger inputs, got $(st_lines)"
   st_bind_ok a_cohort_attempt_banks_one_input_per_actor
 
+  # #1053. The row this refuses is the one two volunteers actually signed: a
+  # valid, correctly bound, honestly flagged 0.017-minute measurement, taken
+  # in the sixty milliseconds between adopting a `StartV1` for an attempt
+  # whose run had ended and the downlink closing. Everything about it is
+  # well-formed, which is exactly why the floor has to be a clause of its own.
+  st_bind_refuses a_sub_threshold_session_is_not_a_measurement \
+    "$(st_derived 6 018f9000-0000-7000-8000-0000000000d3 0.017 9 x86_64-unknown-linux-gnu)"
+  # And the floor is a floor, not a new minimum session length: one minute of
+  # honest play still banks.
+  local st_floor_ledger="$P4_LEDGER_FILE"
+  P4_LEDGER_FILE="$bind_dir/floor.jsonl"
+  "$0" append "$(st_derived 7 018f9000-0000-7000-8000-0000000000d4 1 10 x86_64-unknown-linux-gnu)" >/dev/null 2>&1 \
+    || die 'self-test [a_session_at_the_measurement_floor_still_banks]: a one-minute session was refused by the floor'
+  P4_LEDGER_FILE="$st_floor_ledger"
+  st_bind_ok a_session_at_the_measurement_floor_still_banks
+
   # 4 + 50/60 + 42/60 = 5.5333. The defect this repairs would have banked the
   # cohort total on each human row: 3 * 6.0 = 18 hours from one hour of play.
   local banked_total
@@ -1095,6 +1128,13 @@ validate_session_record() {
     end
   ' "$report" >/dev/null \
     || die 'refusing to bank: incomplete or inconsistent campaign session row'
+  # #1053, and deliberately its own clause with its own words: a row this
+  # short is not malformed, and calling it "inconsistent" would hide what
+  # actually happened to the volunteer. See MIN_MEASURED_MINUTES.
+  jq -e --argjson floor "$MIN_MEASURED_MINUTES" '
+    if .session? == null then true else .session.distinct_play_minutes >= $floor end
+  ' "$report" >/dev/null \
+    || die "refusing to bank: campaign session is below the ${MIN_MEASURED_MINUTES}-minute measurement floor; a session that ended seconds after StartV1 is a failure to seat, not a measurement (#1053)"
   if jq -e '.session? != null' "$report" >/dev/null; then
     local measurement_node
     measurement_node=$(jq -er '.session.measurement_node | select(type == "string" and length > 0)' "$report") \

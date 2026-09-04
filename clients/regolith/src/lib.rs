@@ -3054,6 +3054,11 @@ fn write_campaign_record_on_exit(
                     "campaign record for this session is already on disk; \
                      nothing further to write"
                 ),
+                campaign::RecordDisposition::PersistedBelowFloor => error!(
+                    "campaign record for this session is on disk and is below the \
+                     measurement floor: the host ended this attempt before anything \
+                     could be measured (#1053)"
+                ),
                 campaign::RecordDisposition::Lost => error!(
                     "campaign row was minted for this session but never reached \
                      durable storage: the minutes this session flew are not recorded"
@@ -3074,7 +3079,13 @@ fn write_campaign_record_on_exit(
     // #711 and #735 were careful about; a record that exists in one place
     // only, and that place the server, is not the volunteer's evidence.
     match runtime.record_disposition() {
-        campaign::RecordDisposition::Persisted => {
+        // A below-floor row uploads exactly like any other. It is still the
+        // volunteer's own evidence, it is still signed, and the service is
+        // where the failure it records has to become visible; `p4-ledger.sh`
+        // is the side that refuses to *bank* it (#1053). Withholding it would
+        // trade a quietly-banked non-measurement for a quietly-dropped one.
+        campaign::RecordDisposition::Persisted
+        | campaign::RecordDisposition::PersistedBelowFloor => {
             if let Some(upload) = &upload {
                 admission::upload_finished_session(
                     upload,
@@ -3368,8 +3379,9 @@ mod tests {
         assert!(banked.finish_record().is_some());
         assert_eq!(
             banked.record_disposition(),
-            campaign::RecordDisposition::Persisted,
-            "a row that reached disk says so"
+            campaign::RecordDisposition::PersistedBelowFloor,
+            "a row that reached disk says so -- and this fixture flies a handful of \
+             ticks, so it also says the span it recorded is not a measurement (#1053)"
         );
         assert!(record_path.exists());
 
