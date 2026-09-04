@@ -55,11 +55,18 @@
 # so that stays the operator's call. The one exception is the pair below:
 # when the install changes either of its two halves, the restart runs as
 # part of the same transaction, because deferring it is itself the outage.
+# That restart is then verified against the running process rather than
+# assumed (#1067): the installer compares what systemd says the service's
+# main process started at with the mtime of the admission.py it just
+# installed, and refuses to claim the host runs the new pair unless the
+# process is the younger of the two.
 #
 # The ORRERY_WEB_TIER_* variables exist only so --self-test can drive the
-# installer against throwaway roots; an operator run leaves them unset.
-# ORRERY_INVITE_BIN is the one variable an operator run must set (see the
-# pair section); --self-test sets it to a stand-in.
+# installer against throwaway roots; an operator run leaves them unset, and
+# they alone decide whether this run is a sandbox one. ORRERY_INVITE_BIN is
+# the one variable an operator run must set (see the pair section), so it is
+# emphatically NOT one of them: reading it as a sandbox marker silently
+# disarmed the restart on every real deploy, which is #1067 exactly.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -87,11 +94,33 @@ INVITE_DST=$BIN_DIR/orrery-invite
 # install the way an unfilled ORRERY_PLACEHOLDER refuses the config files.
 INVITE_SRC=${ORRERY_INVITE_BIN:-}
 
-# Any override means --self-test is driving: skip everything beyond the
-# plain file work -- no nginx, no systemctl, no root check.
+# Any ORRERY_WEB_TIER_* override means --self-test is driving: skip
+# everything beyond the plain file work -- no nginx, no root check.
+#
+# ORRERY_INVITE_BIN is deliberately absent from this list. It used to be in
+# it, and because an operator run is *required* to set it (see the pair
+# section), every operator run classified itself as a sandbox run and
+# skipped the very restart the pair transaction exists to perform -- while
+# still printing the line that says the host runs the new pair. That is
+# #1067: the host ran the new binary against the old in-memory script for
+# 33 minutes, and the installer said it had not. Anything added here must
+# be a variable an operator run never sets.
 SANDBOX=0
-if [[ -n ${ORRERY_WEB_TIER_SRC_DIR:-}${ORRERY_WEB_TIER_NGINX_SITES_DIR:-}${ORRERY_WEB_TIER_NGINX_SITES_ENABLED_DIR:-}${ORRERY_WEB_TIER_SYSTEMD_UNITS_DIR:-}${ORRERY_WEB_TIER_BIN_DIR:-}${ORRERY_INVITE_BIN:-} ]]; then
+if [[ -n ${ORRERY_WEB_TIER_SRC_DIR:-}${ORRERY_WEB_TIER_NGINX_SITES_DIR:-}${ORRERY_WEB_TIER_NGINX_SITES_ENABLED_DIR:-}${ORRERY_WEB_TIER_SYSTEMD_UNITS_DIR:-}${ORRERY_WEB_TIER_BIN_DIR:-}${ORRERY_WEB_TIER_SYSTEMCTL:-} ]]; then
     SANDBOX=1
+fi
+
+# The service half of the install. A sandbox run has no systemd, so it
+# normally does not touch the service at all -- but the restart and its
+# verification are the part of the pair transaction that #1067 broke, so
+# --self-test drives them through a stand-in systemctl instead of skipping
+# them. When ORRERY_WEB_TIER_SYSTEMCTL names one, the service lane runs
+# against that; an operator run leaves it unset and gets the real thing.
+SERVICE_NAME=orrery-admission.service
+SYSTEMCTL=${ORRERY_WEB_TIER_SYSTEMCTL:-systemctl}
+MANAGE_SERVICE=1
+if (( SANDBOX )) && [[ -z ${ORRERY_WEB_TIER_SYSTEMCTL:-} ]]; then
+    MANAGE_SERVICE=0
 fi
 
 die() { echo "deploy-web-tier: $*" >&2; exit 2; }
@@ -248,7 +277,7 @@ reload_nginx() {
 }
 
 reload_systemd() {
-    systemctl daemon-reload
+    "$SYSTEMCTL" daemon-reload
     note "systemd unit: daemon-reloaded"
 }
 
@@ -321,6 +350,45 @@ stage_file() {  # stage_file <src> <dst>
 commit_staged() {  # commit_staged <dst> <label>
     local dst=$1 label=$2
     mv -f "$dst.orrery-staged" "$dst" || die "$label: the rename into place failed after the pair's other half was installed; the host is half-swapped (#1049). Re-run this installer -- it detects the mixed pair and completes it."
+}
+
+# Epoch seconds at which the service's main process started, per systemd,
+# or empty when there is no such process (never started, dead, or the
+# property unavailable). ExecMainStartTimestampUSec is asked for rather
+# than the human-readable timestamp because it needs no locale, no
+# timezone, and no date(1) round-trip to compare against a file's mtime.
+service_main_start_epoch() {
+    local raw
+    raw=$("$SYSTEMCTL" show "$SERVICE_NAME" -p ExecMainStartTimestampUSec 2>/dev/null) || return 0
+    raw=${raw##*=}
+    raw=${raw//[[:space:]]/}
+    [[ $raw =~ ^[0-9]+$ ]] || return 0
+    (( raw > 0 )) || return 0
+    echo $(( raw / 1000000 ))
+}
+
+# Prove the *running service* is the pair that was just installed, not just
+# the files on disk (#1067). The service imported admission.py once at
+# start, so a process older than the script on disk is running code that no
+# longer exists there -- the dangerous cell, live, and the state the
+# installer's success line has no business describing as fixed.
+#
+# The comparison is the process's start time against the installed script's
+# mtime, both in whole epoch seconds. The restart happens after the
+# renames, so a genuinely restarted service starts at or after that mtime;
+# only a restart that did not happen puts the process before it.
+verify_service_runs_installed_pair() {
+    local started installed_at
+    installed_at=$(stat -c %Y "$ADMISSION_DST") \
+        || die "post-restart check: cannot stat $ADMISSION_DST to date the install; the pair is on disk but the running service is unverified -- restart orrery-admission and check 'systemctl status $SERVICE_NAME' by hand"
+    started=$(service_main_start_epoch)
+    if [[ -z $started ]]; then
+        die "post-restart check: $SERVICE_NAME reports no running main process after the restart. The new pair is on disk and the box office is DOWN -- admissions are failing now. Investigate with 'systemctl status $SERVICE_NAME' and 'journalctl -u $SERVICE_NAME -n 50'."
+    fi
+    if (( started < installed_at )); then
+        die "post-restart check: $SERVICE_NAME has been running since epoch $started, which predates the admission.py installed at epoch $installed_at -- the restart did not replace the process. The host is in the dangerous cell RIGHT NOW: the new orrery-invite is on disk while the service still runs the admission.py it imported at start, so every admission fails (#1067/#1049). Run 'systemctl restart $SERVICE_NAME' and re-run this installer."
+    fi
+    note "pair: verified the running service was replaced -- $SERVICE_NAME started at epoch $started, at or after the pair installed at epoch $installed_at"
 }
 
 install_pair() {  # install_pair <unit_changed>
@@ -445,8 +513,8 @@ install_pair() {  # install_pair <unit_changed>
     # execs the new binary and fails, so deferring the restart is itself
     # the outage (#1049). A restart after a daemon-reload also activates
     # the unit's new ExecStart when the unit changed in the same run.
-    if (( ! SANDBOX )); then
-        systemctl restart orrery-admission || die "the pair is installed but 'systemctl restart orrery-admission' failed: the box office is down or still running the old script against the new binary. Investigate with 'systemctl status orrery-admission' and restart it."
+    if (( MANAGE_SERVICE )); then
+        "$SYSTEMCTL" restart "$SERVICE_NAME" || die "the pair is installed but 'systemctl restart $SERVICE_NAME' failed: the box office is down or still running the old script against the new binary. Investigate with 'systemctl status $SERVICE_NAME' and restart it."
         if (( unit_changed )); then
             note "pair: orrery-admission restarted on the new script and binary; this also activated the unit's new ExecStart"
         else
@@ -459,6 +527,16 @@ install_pair() {  # install_pair <unit_changed>
     # renames did not report.
     invite_flag_awareness "$INVITE_DST" || die "post-install check failed: $INVITE_DST does not accept --assume-standing-good; the host is left in a mixed cell (#1049) and admissions will fail until it is fixed"
     script_passes_standing_flag "$ADMISSION_DST" || die "post-install check failed: $ADMISSION_DST does not pass --assume-standing-good; the host is left in a mixed cell (#1049) and admissions will fail until it is fixed"
+
+    # And close it on the running service, which the files cannot speak
+    # for: the success line below is a claim about what the host *runs*,
+    # and #1067 was that claim printed over an unrestarted process. Nothing
+    # says "the host now runs the new pair" until this has proved it.
+    if (( ! MANAGE_SERVICE )); then
+        note "pair: no systemd in this run, so the running service could not be verified; the files on disk are the only claim made"
+        return 0
+    fi
+    verify_service_runs_installed_pair
     note "pair: the host now runs the new pair -- both halves agree on --assume-standing-good"
 }
 
@@ -479,7 +557,7 @@ install_all() {
     local unit_changed=0
     if install_file "$UNIT_SRC" "$UNIT_DST" "systemd unit"; then
         unit_changed=1
-        (( SANDBOX )) || reload_systemd
+        if (( MANAGE_SERVICE )); then reload_systemd; fi
     fi
 
     install_pair "$unit_changed"
@@ -594,14 +672,24 @@ FAKE
     fi
 
     local site=$root/nginx/sites-available/campaigns unit=$root/systemd/orrery-admission.service link=$root/nginx/sites-enabled/campaigns
-    sandbox_install() {  # sandbox_install [invite-src] [bin-dir]
-        ORRERY_WEB_TIER_SRC_DIR=$filled \
-        ORRERY_WEB_TIER_NGINX_SITES_DIR=$root/nginx/sites-available \
-        ORRERY_WEB_TIER_NGINX_SITES_ENABLED_DIR=$root/nginx/sites-enabled \
-        ORRERY_WEB_TIER_SYSTEMD_UNITS_DIR=$root/systemd \
-        ORRERY_WEB_TIER_BIN_DIR=${2:-$root/opt-bin} \
-        ORRERY_INVITE_BIN=${1:-$fakes/invite-new} \
-        "$SELF"
+    # The third argument is the one addition #1067 needed: a stand-in
+    # systemctl. Without it the run has no service lane at all (the old
+    # behaviour, and what every arm above wants); with it the installer
+    # restarts and verifies through the stand-in, so the live path can be
+    # driven with no systemd, no root and no real service.
+    sandbox_install() {  # sandbox_install [invite-src] [bin-dir] [systemctl]
+        local -a envv=(
+            "ORRERY_WEB_TIER_SRC_DIR=$filled"
+            "ORRERY_WEB_TIER_NGINX_SITES_DIR=$root/nginx/sites-available"
+            "ORRERY_WEB_TIER_NGINX_SITES_ENABLED_DIR=$root/nginx/sites-enabled"
+            "ORRERY_WEB_TIER_SYSTEMD_UNITS_DIR=$root/systemd"
+            "ORRERY_WEB_TIER_BIN_DIR=${2:-$root/opt-bin}"
+            "ORRERY_INVITE_BIN=${1:-$fakes/invite-new}"
+        )
+        if [[ -n ${3:-} ]]; then
+            envv+=("ORRERY_WEB_TIER_SYSTEMCTL=$3")
+        fi
+        env -- "${envv[@]}" "$SELF"
     }
 
     local out status=0
@@ -799,6 +887,106 @@ FAKE
     "$oldpair/orrery-invite" session-token --help | grep -q "assume-standing-good" \
         || die "self-test: the upgrade did not install the supplied binary"
     note "self-test: an old/old host upgrades to the new pair in one transaction"
+
+    # ---- #1067: the pair installed over an ALREADY-RUNNING service --------
+    # Every arm above proves things about files. The live failure was not
+    # about files: the pair landed byte-perfect and the *process* went on
+    # running the admission.py it had imported 16 minutes earlier, against
+    # the new binary, while the installer printed its success line. Nothing
+    # above could see that, because nothing above has a service at all --
+    # the old/old arm installs onto a host where no process exists, so a
+    # restart that never happens is indistinguishable from one that did.
+    #
+    # These two arms give the sandbox a service. A stand-in systemctl keeps
+    # the running main process's start time in a state file, which is the
+    # single fact the installer's verification reads; `restart` moves it to
+    # now, `show` reports it. Seeding the file in the past is a service
+    # that started before the install, exactly as on the live host.
+    service_fake() {  # service_fake <path> <state-file> <restart-behaviour>
+        cat > "$1" <<FAKE
+#!/bin/sh
+# Stand-in systemctl for --self-test. State: the main process's start time
+# in epoch microseconds, the one fact verify_service_runs_installed_pair
+# reads back through 'show'.
+state=$2
+case "\$1" in
+    restart)
+        $3
+        ;;
+    show)
+        printf 'ExecMainStartTimestampUSec=%s\\n' "\$(cat "\$state" 2>/dev/null || echo 0)"
+        ;;
+esac
+exit 0
+FAKE
+        chmod 0755 "$1"
+    }
+
+    # (i) the restart works: the process is replaced, and only then does
+    #     the installer get to claim the host runs the new pair.
+    local live=$tmp/live-bin live_state=$tmp/live-state
+    mkdir -p "$live"
+    cp "$adm_old" "$live/admission.py"
+    cp "$fakes/invite-old" "$live/orrery-invite"
+    printf '%s000000\n' "$(( $(date +%s) - 3600 ))" > "$live_state"
+    service_fake "$fakes/systemctl-live" "$live_state" 'date +%s000000 > "$state"'
+    out=$(sandbox_install "$fakes/invite-new" "$live" "$fakes/systemctl-live" 2>&1) \
+        || die "self-test: installing the pair over a running service failed"
+    grep -q "verified the running service was replaced" <<<"$out" \
+        || die "self-test: the install over a running service did not verify the process was replaced"
+    grep -q "the host now runs the new pair" <<<"$out" \
+        || die "self-test: a verified install did not print the success line"
+    if (( $(cat "$live_state") / 1000000 < $(stat -c %Y "$live/admission.py") )); then
+        die "self-test: the stand-in service was not restarted after the install"
+    fi
+    note "self-test: installing the pair over a running service restarts it and verifies the process was replaced"
+
+    # (ii) #1067 itself: the restart silently does nothing, so the process
+    #      still predates the installed script. The installer must fail
+    #      loudly and must NOT print the success line -- a wrong success
+    #      message is worse than an error, because it is the one an
+    #      operator acts on.
+    local stale=$tmp/stale-bin stale_state=$tmp/stale-state
+    mkdir -p "$stale"
+    cp "$adm_old" "$stale/admission.py"
+    cp "$fakes/invite-old" "$stale/orrery-invite"
+    printf '%s000000\n' "$(( $(date +%s) - 3600 ))" > "$stale_state"
+    service_fake "$fakes/systemctl-stale" "$stale_state" ':'
+    status=0
+    out=$(sandbox_install "$fakes/invite-new" "$stale" "$fakes/systemctl-stale" 2>&1) || status=$?
+    if (( status == 0 )); then
+        die "self-test: a restart that did not replace the process was reported as a successful install (#1067)"
+    fi
+    grep -q "the restart did not replace the process" <<<"$out" \
+        || die "self-test: the un-restarted service was not named as the failure"
+    if grep -q "the host now runs the new pair" <<<"$out"; then
+        die "self-test: the installer claimed the host runs the new pair while the old process was still live (#1067)"
+    fi
+    note "self-test: a pair install whose service was not really restarted fails loudly and never claims success (#1067)"
+
+    # (iii) the root cause under the two arms above: ORRERY_INVITE_BIN is
+    #       required of every operator run, so reading it as a sandbox
+    #       marker disarmed the restart on every real deploy. Setting it
+    #       alone must leave the run a full one -- proved by the root check
+    #       biting, which only a non-sandbox run reaches. Skipped when the
+    #       gate itself runs as root, because there the next thing the
+    #       installer would do is write /etc/nginx.
+    if (( EUID != 0 )); then
+        status=0
+        out=$(env -u ORRERY_WEB_TIER_SRC_DIR -u ORRERY_WEB_TIER_NGINX_SITES_DIR \
+                  -u ORRERY_WEB_TIER_NGINX_SITES_ENABLED_DIR \
+                  -u ORRERY_WEB_TIER_SYSTEMD_UNITS_DIR -u ORRERY_WEB_TIER_BIN_DIR \
+                  -u ORRERY_WEB_TIER_SYSTEMCTL \
+                  -- "ORRERY_INVITE_BIN=$fakes/invite-new" "$SELF" 2>&1) || status=$?
+        if (( status == 0 )); then
+            die "self-test: an install with only ORRERY_INVITE_BIN set did not refuse"
+        fi
+        grep -q "run as root" <<<"$out" \
+            || die "self-test: ORRERY_INVITE_BIN alone still puts the installer in sandbox mode, which is #1067's root cause"
+        note "self-test: ORRERY_INVITE_BIN alone does not make a run a sandbox run (#1067)"
+    else
+        note "self-test: skipping the ORRERY_INVITE_BIN sandbox-marker arm -- it must not run as root"
+    fi
 
     # An unrunnable host binary is refused rather than classified old:
     # "old" leads to replacement, and replacing a binary the installer could
