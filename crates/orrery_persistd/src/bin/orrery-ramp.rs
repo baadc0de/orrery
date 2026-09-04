@@ -50,6 +50,11 @@
 //!
 //! # Read what the fleet would see, verified as a poller verifies it.
 //! orrery-ramp show --control strikes --operator-key 1@<public-key>
+//!
+//! # The incident history D32 open question 2 asks for: every posture change
+//! # the control ever had, oldest first, each carrying the envelope it was
+//! # written with.
+//! orrery-ramp history --control strikes --fdb-cluster-file /etc/orrery/fdb.cluster
 //! ```
 //!
 //! # The cohort subcommand: D32 clause (e)'s sampling path
@@ -137,7 +142,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use orrery_persistd::gateway::RampMeters;
 use orrery_persistd::intent::cohort::{CohortHalf, CohortMemberRow, FdbHonestCohortStore};
-use orrery_persistd::intent::posture::{self, SignedRampPosture};
+use orrery_persistd::intent::posture::{
+    self, PostureChange, PostureHistoryEntry, SignedRampPosture,
+};
 use orrery_persistd::intent::report::{
     assemble_from_durable, DurableControl, ProvenanceRefusal, TrafficClaim,
 };
@@ -214,6 +221,17 @@ enum Command {
         /// the same value a `persistd` would be given.
         #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
         operator_key: Vec<String>,
+    },
+    /// Show one control's durable posture-change history, oldest first.
+    ///
+    /// Every superseded row and every removal D32 open question 2's shadow
+    /// recorded, in commit order, each `set` carrying the envelope it was
+    /// written with. This is the incident history a promotion review reads:
+    /// who suspended what, when, and why.
+    History {
+        /// One of D32 clause (c)'s stable control names.
+        #[arg(long, value_name = "CONTROL")]
+        control: String,
     },
     /// Record, remove and inspect D32 clause (e)'s known-honest cohort.
     #[command(subcommand)]
@@ -526,6 +544,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Cohort(cohort) => run_cohort(cohort, &context).await?,
         Command::Window(window) => run_window(window, &context).await?,
+        Command::History { control } => {
+            let entries = store.history(&control).await?;
+            for line in history_lines(&control, &entries) {
+                println!("{line}");
+            }
+        }
         Command::Report { traffic, out, note } => {
             run_report(
                 traffic.into(),
@@ -538,6 +562,55 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The lines `history` renders for one control's recorded posture changes.
+///
+/// Split out from the handler so the shape is testable without a cluster.
+/// Every figure comes from the entries; nothing is re-derived here, for the
+/// reason [`window_lines`] gives. Entries arrive oldest first — the key's
+/// commit versionstamp is the order — and each `set` prints the envelope it
+/// carries, so a reviewer reads the row as it was written, signer and expiry
+/// included, rather than as this tool's summary of it.
+fn history_lines(control: &str, entries: &[PostureHistoryEntry]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "ramp/{control}: {} recorded posture change(s), oldest first",
+        entries.len()
+    )];
+    if entries.is_empty() {
+        lines.push("  (none recorded; every posture write and clear appends one)".to_owned());
+        return lines;
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let stamp: String = entry
+            .versionstamp
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let change = match &entry.row.change {
+            PostureChange::Set(row) => {
+                let signer = row.signer.as_ref().map_or_else(
+                    || "automation (unsigned)".to_owned(),
+                    std::string::ToString::to_string,
+                );
+                let expires = row
+                    .expires_at_ms
+                    .map_or_else(|| "never".to_owned(), |at| format!("at {at} ms"));
+                format!(
+                    "set {:?} (source={:?}, signed_by={signer}, expires={expires}) \
+                     reason={:?}",
+                    row.posture.mode, row.posture.source, row.posture.reason
+                )
+            }
+            PostureChange::Cleared => "cleared (startup default restored)".to_owned(),
+        };
+        lines.push(format!(
+            "  {}. vs={stamp} at={} ms: {change}",
+            index + 1,
+            entry.row.recorded_at_ms
+        ));
+    }
+    lines
 }
 
 /// The summary line `cohort show` leads with.
@@ -965,6 +1038,66 @@ mod tests {
         )
         .expect_err("RampPosture::reason documents a 256-byte writer bound");
         assert!(format!("{error}").contains("256"));
+    }
+
+    /// `history` renders the incident history a promotion review reads:
+    /// who suspended what, when, and why, in commit order, with the envelope
+    /// facts a reviewer would re-verify rather than take on trust.
+    #[test]
+    fn the_history_render_names_who_what_when_and_why() {
+        let set = PostureHistoryEntry {
+            versionstamp: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            row: orrery_persistd::intent::posture::PostureHistoryRow {
+                recorded_at_ms: 1_000,
+                change: PostureChange::Set(posture::sign_posture(
+                    STRIKES_CONTROL,
+                    RampPosture {
+                        mode: RampMode::Shadow,
+                        source: PostureSource::AutoSuspend,
+                        set_at_ms: 999,
+                        reason: "verdict-rate incident 4471".to_owned(),
+                        incident_id: Some([7; 16]),
+                    },
+                    Some(2_000),
+                    &key(),
+                )),
+            },
+        };
+        let cleared = PostureHistoryEntry {
+            versionstamp: [0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            row: orrery_persistd::intent::posture::PostureHistoryRow {
+                recorded_at_ms: 3_000,
+                change: PostureChange::Cleared,
+            },
+        };
+
+        let rendered = history_lines("strikes", &[set, cleared]).join("\n");
+        assert!(
+            rendered.contains("2 recorded posture change(s)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("set Shadow"), "{rendered}");
+        assert!(rendered.contains("source=AutoSuspend"), "{rendered}");
+        assert!(
+            rendered.contains("reason=\"verdict-rate incident 4471\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("expires=at 2000 ms"), "{rendered}");
+        assert!(
+            rendered.contains("signed_by="),
+            "the signer is on the line: {rendered}"
+        );
+        assert!(
+            rendered.contains("vs=00000000000000000001"),
+            "the versionstamp is the durable order and is shown: {rendered}"
+        );
+        assert!(rendered.contains("at=1000 ms"), "{rendered}");
+        assert!(rendered.contains("cleared"), "{rendered}");
+        assert!(rendered.contains("at=3000 ms"), "{rendered}");
+
+        let empty = history_lines("strikes", &[]).join("\n");
+        assert!(empty.contains("0 recorded posture change(s)"), "{empty}");
+        assert!(empty.contains("none recorded"), "{empty}");
     }
 
     /// The cohort subcommand parses, and its half argument maps onto D32

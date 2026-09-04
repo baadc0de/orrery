@@ -56,8 +56,9 @@ pub use autosuspend::{
 
 pub mod posture;
 pub use posture::{
-    admit, d32_default, is_de_hardening, posture_preimage, sign_posture, PostureRefusal,
-    PostureVerdict, SignedRampPosture, RAMP_POSTURE_SCHEMA, RAMP_POSTURE_V1_DOMAIN,
+    admit, d32_default, is_de_hardening, posture_preimage, sign_posture, PostureChange,
+    PostureHistoryEntry, PostureHistoryRow, PostureRefusal, PostureVerdict, SignedRampPosture,
+    RAMP_POSTURE_SCHEMA, RAMP_POSTURE_V1_DOMAIN,
 };
 
 pub mod ramp;
