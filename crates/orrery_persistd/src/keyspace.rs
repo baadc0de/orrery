@@ -639,6 +639,133 @@ pub fn ramp_window_range_end() -> Vec<u8> {
     b"vn".to_vec()
 }
 
+/// Key for one D32 open question 2 posture-change history row:
+/// `vh/{control}/{versionstamp}`, one append-only row per posture write or
+/// clear.
+///
+/// [`ramp_key`] holds a control's *current* posture and is overwritten by
+/// every write, so "who suspended what, when, why" — the incident history
+/// open question 2 argues for keeping — survived nowhere. This span is the
+/// shadow: one row per change, written in the same transaction that replaces
+/// or removes the live row, never updated and never swept by the code that
+/// writes it.
+///
+/// The rows share the registered `v` family and occupy their own `b"vh"`
+/// sub-span, per D32 clause (c)'s allocation rule. The profile match is the
+/// argument, exactly as it was for [`cohort_key`] and [`ramp_window_key`]:
+/// written rarely by the operator plane, read by measurement and review
+/// tooling, never on any hot path, retained for the whole promotion window.
+/// `b"vh"` sorts strictly between the `b"vc"` cohort span and the `b"vm"`
+/// window span, so all four sub-spans are disjoint by construction and no
+/// family byte is spent.
+///
+/// The layout is `b"vh"` ‖ `control` ‖ `0x00` ‖ `versionstamp:[u8;10]`. The
+/// `0x00` separator is load-bearing, not decoration: control names are
+/// variable-length, and a per-control scan that ended at the name's bytes
+/// alone would leak rows from any future control whose name extends another's
+/// (`strikes`, `strikes2`). Control names are stable ASCII words, so `0x00`
+/// terminates the name unambiguously and the scan's exclusive end is the
+/// separator incremented — see [`posture_history_range_end`].
+///
+/// The versionstamp placeholder carries ten zero bytes until the write
+/// substitutes the commit version with `MutationType::SetVersionstampedKey`
+/// and the parameter [`posture_history_versionstamped_key`] builds, so a
+/// control's history orders by commit and by nothing else — the property
+/// [`binding_history_key`] states, and for the same reason: `recorded_at_ms`
+/// in the value is the writer's clock, and it is evidence rather than an
+/// index.
+#[must_use]
+pub fn posture_history_key(control: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(3 + control.len() + 10);
+    key.extend_from_slice(b"vh");
+    key.extend_from_slice(control.as_bytes());
+    key.push(0x00);
+    key.extend_from_slice(&[0u8; 10]);
+    key
+}
+
+/// The [`posture_history_key`] in the exact form
+/// `MutationType::SetVersionstampedKey` wants it: the key followed by the
+/// placeholder offset as a little-endian `u32`.
+///
+/// The offset is computed rather than a named constant, because the control
+/// name is variable-length and a constant would be wrong for every control
+/// but one. Built here rather than at the call site for the reason
+/// [`binding_history_versionstamped_key`] gives: the offset and the
+/// placeholder are two halves of one fact, and a caller that hardcoded the
+/// length would keep compiling after the layout moved and would corrupt the
+/// key instead of the versionstamp.
+#[must_use]
+pub fn posture_history_versionstamped_key(control: &str) -> Vec<u8> {
+    let key = posture_history_key(control);
+    let offset = u32::try_from(key.len() - 10).unwrap_or(u32::MAX);
+    let mut param = key;
+    param.extend_from_slice(&offset.to_le_bytes());
+    param
+}
+
+/// First key of one control's contiguous history scan.
+#[must_use]
+pub fn posture_history_range_start(control: &str) -> Vec<u8> {
+    let mut start = Vec::with_capacity(3 + control.len());
+    start.extend_from_slice(b"vh");
+    start.extend_from_slice(control.as_bytes());
+    start.push(0x00);
+    start
+}
+
+/// Exclusive end of one control's contiguous history scan.
+///
+/// The scan start's separator byte incremented, not the name's last byte:
+/// ending at `name + 1` would leak a future control whose name extends this
+/// one's, and the leak would be silent — the extra rows decode fine and only
+/// the reviewer reading them would notice history that is not this control's.
+#[must_use]
+pub fn posture_history_range_end(control: &str) -> Vec<u8> {
+    let mut end = posture_history_range_start(control);
+    let last = end
+        .last_mut()
+        .expect("posture_history_range_start is never empty");
+    *last = 0x01;
+    end
+}
+
+/// Inclusive start of the whole posture-history sub-span.
+#[must_use]
+pub fn posture_history_span_start() -> Vec<u8> {
+    b"vh".to_vec()
+}
+
+/// Exclusive end of the whole posture-history sub-span.
+#[must_use]
+pub fn posture_history_span_end() -> Vec<u8> {
+    b"vi".to_vec()
+}
+
+/// Decode a `vh/…` key back into its `(control, versionstamp)` components.
+///
+/// The inverse of [`posture_history_key`] once FDB has substituted the
+/// versionstamp. Returns `None` for any key that does not begin `vh`, carry a
+/// non-empty control name, terminate it with exactly one `0x00`, and hold
+/// exactly ten bytes past the separator — the shape the substitution leaves
+/// behind, and nothing else.
+#[must_use]
+pub fn decode_posture_history_key(key: &[u8]) -> Option<(String, [u8; 10])> {
+    if key.len() < 3 || &key[..2] != b"vh" {
+        return None;
+    }
+    let separator = key[2..].iter().position(|byte| *byte == 0x00)? + 2;
+    if key.len() - separator - 1 != 10 {
+        return None;
+    }
+    let control = std::str::from_utf8(&key[2..separator]).ok()?;
+    if control.is_empty() {
+        return None;
+    }
+    let versionstamp: [u8; 10] = key[separator + 1..].try_into().ok()?;
+    Some((control.to_owned(), versionstamp))
+}
+
 // ---------------------------------------------------------------------------
 // Intent idempotency family: `intent/{intent_id}`
 // ---------------------------------------------------------------------------
@@ -3202,6 +3329,112 @@ mod tests {
         // side.
         assert!(ramp_window_range_start() <= ramp_window_key(""));
         assert!(ramp_window_key("") < ramp_window_range_end());
+    }
+
+    #[test]
+    fn posture_history_rows_are_a_fourth_disjoint_v_family_subspan() {
+        let key = posture_history_key("attestation_quorum");
+        assert_eq!(&key[..2], b"vh");
+        assert_eq!(&key[2..20], b"attestation_quorum");
+        assert_eq!(key[20], 0x00, "the name is terminated, not merely ended");
+        assert!(
+            key[22..].iter().all(|byte| *byte == 0),
+            "ten zero bytes of versionstamp placeholder"
+        );
+        assert!(content_version_key().as_slice() < posture_history_span_start().as_slice());
+        assert!(posture_history_span_start() <= key);
+        assert!(key < posture_history_span_end());
+        assert!(posture_history_span_end().as_slice() < [b'w'].as_slice());
+
+        // The four `v` sub-spans in allocation order, each strictly below the
+        // next, so a range read over any one of them never observes another's
+        // rows.
+        assert!(
+            cohort_range_end() <= posture_history_span_start(),
+            "cohort rows sort strictly before every `vh` history row"
+        );
+        assert!(
+            posture_history_span_end() <= ramp_window_range_start(),
+            "history rows sort strictly before every `vm` window row"
+        );
+        assert!(key.as_slice() > cohort_range_end().as_slice());
+        assert!(key.as_slice() < ramp_window_range_start().as_slice());
+        assert!(key < ramp_key("attestation_quorum"));
+
+        // The empty control name must still land inside the span.
+        assert!(posture_history_span_start() <= posture_history_key(""));
+        assert!(posture_history_key("") < posture_history_span_end());
+    }
+
+    #[test]
+    fn the_posture_history_param_carries_the_placeholder_offset_it_names() {
+        // "strikes" is the shortest control name in D32's inventory, so it is
+        // the one whose offset a hardcoded constant would get wrong.
+        for control in ["strikes", "attestation_quorum", "quarantine_validation"] {
+            let param = posture_history_versionstamped_key(control);
+            let key = posture_history_key(control);
+            assert_eq!(
+                param.len(),
+                key.len() + 4,
+                "the param is the key plus a little-endian u32 offset"
+            );
+            assert_eq!(&param[..key.len()], key.as_slice());
+            let offset = u32::from_le_bytes(param[key.len()..].try_into().expect("4 bytes"));
+            let placeholder_at = key.len() - 10;
+            assert_eq!(
+                offset as usize, placeholder_at,
+                "the named offset is where the ten placeholder bytes begin"
+            );
+            assert!(
+                key[placeholder_at..].iter().all(|byte| *byte == 0),
+                "the placeholder is ten zero bytes, ready for substitution"
+            );
+        }
+    }
+
+    #[test]
+    fn the_posture_history_scan_and_decode_survive_an_extending_control_name() {
+        // The failure the `0x00` separator exists to prevent: a control whose
+        // name extends another's ("strikes", "strikes2") would leak its rows
+        // into the shorter name's scan if the scan ended at the name's bytes.
+        assert!(
+            posture_history_range_end("strikes") <= posture_history_range_start("strikes2"),
+            "the scan ends at the separator, so no `strikes2` row sorts inside it"
+        );
+
+        // Round-trip a key the way FDB would leave it: placeholder replaced by
+        // a real versionstamp, control and separator untouched.
+        let mut substituted = posture_history_key("strikes");
+        substituted[2 + "strikes".len() + 1..].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let (control, versionstamp) =
+            decode_posture_history_key(&substituted).expect("a substituted key decodes");
+        assert_eq!(control, "strikes");
+        assert_eq!(versionstamp, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+        // And the strays a corrupted or foreign row could arrive as.
+        assert_eq!(decode_posture_history_key(b"va"), None, "wrong span");
+        assert_eq!(
+            decode_posture_history_key(&substituted[..substituted.len() - 1]),
+            None,
+            "a short versionstamp is not a history key"
+        );
+        assert_eq!(
+            decode_posture_history_key(&substituted[..substituted.len() - 11]),
+            None,
+            "no versionstamp at all is not a history key"
+        );
+        let mut nameless = posture_history_key("strikes");
+        nameless[2..2 + "strikes".len()].fill(0x00);
+        assert_eq!(
+            decode_posture_history_key(&nameless),
+            None,
+            "an empty control name decodes to nothing"
+        );
+        assert_eq!(
+            decode_posture_history_key(b"vh\xc3\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a"),
+            None,
+            "a control name that is not UTF-8 decodes to nothing"
+        );
     }
 
     // -----------------------------------------------------------------------

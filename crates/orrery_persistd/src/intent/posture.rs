@@ -162,6 +162,62 @@ pub struct SignedRampPosture {
     pub signature: Option<Signature>,
 }
 
+/// What changed about a control's posture, as D32 open question 2's history
+/// records it.
+///
+/// The history exists because [`RampPosture`]'s durable home — the
+/// `ramp/{control}` row — is *current state* and is overwritten by every
+/// write: "who suspended what, when, why" survived nowhere, so an incident
+/// review after the fact had the last row only. The open question's likely
+/// long-term answer is an append-only shadow in the journal archive; until
+/// that machinery has a posture-shaped event to carry, the shadow lives in
+/// the `vh/{control}` keyspace span ([`crate::keyspace::
+/// posture_history_key`]) and is appended by the same transaction that
+/// replaces or removes the live row, so the history cannot drift from the
+/// state it shadows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PostureChange {
+    /// A `set` write: the row exactly as it was written, envelope included —
+    /// posture, expiry, signer and signature — so a reviewer can re-run the
+    /// same verification a poller runs and see the entry was admissible as
+    /// written, rather than take the shadow's word for it.
+    Set(SignedRampPosture),
+    /// A `clear` write: the row was removed and the control reverted to its
+    /// startup default. Recorded rather than left implicit, because "the
+    /// incident ended" is itself a posture event an operator needs to find.
+    Cleared,
+}
+
+/// One posture-change history row, the value stored at
+/// `vh/{control}/{versionstamp}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostureHistoryRow {
+    /// The writer's clock at the change.
+    ///
+    /// Evidence, not an index — ordering within a control's span is the key's
+    /// commit versionstamp, the same split [`super::ramp::RampPosture`]'s
+    /// `set_at_ms` never had. Two entries written by clocks that disagree
+    /// still sort by when the cluster committed them, and the clock each
+    /// writer claimed travels in its row for the reviewer to judge.
+    pub recorded_at_ms: u64,
+    /// What the write did.
+    pub change: PostureChange,
+}
+
+/// One decoded history entry: the key's versionstamp beside the row it
+/// ordered.
+///
+/// The versionstamp is the durable ordering — the only "when" the cluster
+/// itself vouches for — so it travels with the row instead of being dropped
+/// at decode time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostureHistoryEntry {
+    /// The commit versionstamp FDB substituted into the key.
+    pub versionstamp: [u8; 10],
+    /// The recorded change.
+    pub row: PostureHistoryRow,
+}
+
 /// Why a poller refused a durable posture row.
 ///
 /// Every variant is a refusal to *apply a claimed mode*, never an error: a
@@ -509,6 +565,43 @@ mod tests {
         assert_eq!(
             admit(STRIKES_CONTROL, &row, &[operator.public()], 0),
             Ok(())
+        );
+    }
+
+    /// The history row round-trips through the storage encoding with the
+    /// envelope intact, and a clear decodes as a clear — a history that could
+    /// not distinguish "set" from "cleared" would shadow nothing.
+    #[test]
+    fn a_posture_history_row_round_trips_both_kinds_of_change() {
+        let set = PostureHistoryRow {
+            recorded_at_ms: 1_700_000_000_000,
+            change: PostureChange::Set(sign_posture(
+                STRIKES_CONTROL,
+                posture(RampMode::Shadow),
+                Some(1_700_000_003_600_000),
+                &key(2),
+            )),
+        };
+        let bytes = postcard::to_allocvec(&set).expect("encodable");
+        assert_eq!(
+            postcard::from_bytes::<PostureHistoryRow>(&bytes).expect("decodable"),
+            set,
+            "the envelope — signature, signer and expiry included — survives"
+        );
+
+        let cleared = PostureHistoryRow {
+            recorded_at_ms: 1_700_000_004_000_000,
+            change: PostureChange::Cleared,
+        };
+        let bytes = postcard::to_allocvec(&cleared).expect("encodable");
+        assert_eq!(
+            postcard::from_bytes::<PostureHistoryRow>(&bytes).expect("decodable"),
+            cleared
+        );
+        assert_ne!(
+            postcard::from_bytes::<PostureHistoryRow>(&bytes).expect("decodable"),
+            set,
+            "a clear and a set are different history entries"
         );
     }
 

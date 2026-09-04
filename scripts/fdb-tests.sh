@@ -309,6 +309,13 @@ REQUIRED_TARGETS=(
   # cluster's bytes do to a real poller, and the decision-to-effect number
   # #875 asks for is meaningless without one.
   ramp_posture_authenticated
+  # D32 open question 2's durable posture-change history. What these carry —
+  # that a recorded change outlives every handle that wrote it, that the span
+  # orders by commit version, and that one control's scan never leaks a
+  # row from a control whose name extends its own — is a claim about cluster
+  # bytes across processes, and a memory store has no process boundary to
+  # survive.
+  ramp_posture_history
 )
 
 # ── Assertions over a captured log ───────────────────────────────────────────

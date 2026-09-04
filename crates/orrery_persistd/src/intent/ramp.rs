@@ -124,6 +124,25 @@
 //! and writes a [`RampArtifact`]. It runs in an operator tool and not in the
 //! coordinator, which ADR-0031 clause (d) forbids from reading.
 //!
+//! # The posture changes themselves are history now
+//!
+//! D32 open question 2 asked what becomes of a superseded `ramp/{control}`
+//! row, and until now the answer was *nothing*: the row is current state and
+//! every write overwrites it, so "who suspended what, when, why" — the
+//! incident history the question argues for keeping — survived nowhere, and
+//! an incident review after the fact had the last row only. The durable
+//! posture-change history is the shadow: [`FdbRampPostureStore::write`] and
+//! [`FdbRampPostureStore::clear`] append a
+//! [`super::posture::PostureHistoryRow`] to the `vh/{control}` span in the
+//! same transaction that replaces or removes the live row, so a commit that
+//! changed the posture without recording the change is not a state the
+//! cluster can be in, and the history cannot be forgotten by any writer —
+//! there is no other writer seam. [`FdbRampPostureStore::history`] reads it
+//! back oldest-first and `orrery-ramp history` renders it for a promotion
+//! review. The journal archive remains the record's likely long-term home
+//! for this shadow; the span is the bounded form that makes the history
+//! durable before that machinery has a posture-shaped event to carry.
+//!
 //! # Regenerating the committed artifact
 //!
 //! ```sh
@@ -513,7 +532,8 @@ impl FdbRampPostureStore {
         )
     }
 
-    /// Write one already-signed posture row.
+    /// Write one already-signed posture row, and append the change to the
+    /// control's durable posture-change history in the same transaction.
     ///
     /// This takes a [`super::posture::SignedRampPosture`] and not a
     /// [`RampPosture`], and there is no overload that takes the latter: the
@@ -521,6 +541,17 @@ impl FdbRampPostureStore {
     /// is stated. Signing is [`super::posture::sign_posture`], which needs the
     /// operator secret this process does not hold — `persistd` links this
     /// method and can never call it usefully.
+    ///
+    /// The history append is what makes D32 open question 2's incident
+    /// history durable: `ramp/{control}` holds only *current* state and every
+    /// write overwrites it, so without the shadow, "who suspended what, when,
+    /// why" survived nowhere. Appending here — the one seam every posture
+    /// write goes through — means the history cannot be forgotten by a
+    /// writer, and a commit that replaced the row but failed to record the
+    /// change is not a state the cluster can be in. The append-only shadow
+    /// lives at [`crate::keyspace::posture_history_key`]; the journal archive
+    /// remains the record's likely long-term home, and this span does not
+    /// presume to have settled the question.
     ///
     /// # Errors
     ///
@@ -532,12 +563,29 @@ impl FdbRampPostureStore {
     ) -> Result<(), RampPostureError> {
         let value = super::posture::encode(row)
             .map_err(|error| RampPostureError(format!("encode ramp posture: {error}")))?;
+        let history = super::posture::PostureHistoryRow {
+            recorded_at_ms: wall_clock_ms(),
+            change: super::posture::PostureChange::Set(row.clone()),
+        };
+        let history = postcard::to_allocvec(&history)
+            .map_err(|error| RampPostureError(format!("encode posture history: {error}")))?;
         let db = std::sync::Arc::clone(&self.db);
         let key = crate::keyspace::ramp_key(control);
+        let history_key = crate::keyspace::posture_history_versionstamped_key(control);
         db.run(move |transaction, _| {
-            let (key, value) = (key.clone(), value.clone());
+            let (key, value, history_key, history) = (
+                key.clone(),
+                value.clone(),
+                history_key.clone(),
+                history.clone(),
+            );
             async move {
                 transaction.set(&key, &value);
+                transaction.atomic_op(
+                    &history_key,
+                    &history,
+                    foundationdb::options::MutationType::SetVersionstampedKey,
+                );
                 Ok(())
             }
         })
@@ -547,18 +595,37 @@ impl FdbRampPostureStore {
         })
     }
 
-    /// Remove one control's posture row, restoring the CLI startup default.
+    /// Remove one control's posture row, restoring the CLI startup default,
+    /// and append the removal to the control's durable posture-change
+    /// history in the same transaction.
+    ///
+    /// The removal is recorded rather than left implicit: "the incident ended"
+    /// is itself a posture event an operator reviewing the history needs to
+    /// find, and a `clear` that left no trace would read in the history as an
+    /// un-ended incident.
     ///
     /// # Errors
     ///
     /// A FoundationDB transaction failure.
     pub async fn clear(&self, control: &str) -> Result<(), RampPostureError> {
+        let history = super::posture::PostureHistoryRow {
+            recorded_at_ms: wall_clock_ms(),
+            change: super::posture::PostureChange::Cleared,
+        };
+        let history = postcard::to_allocvec(&history)
+            .map_err(|error| RampPostureError(format!("encode posture history: {error}")))?;
         let db = std::sync::Arc::clone(&self.db);
         let key = crate::keyspace::ramp_key(control);
+        let history_key = crate::keyspace::posture_history_versionstamped_key(control);
         db.run(move |transaction, _| {
-            let key = key.clone();
+            let (key, history_key, history) = (key.clone(), history_key.clone(), history.clone());
             async move {
                 transaction.clear(&key);
+                transaction.atomic_op(
+                    &history_key,
+                    &history,
+                    foundationdb::options::MutationType::SetVersionstampedKey,
+                );
                 Ok(())
             }
         })
@@ -567,7 +634,123 @@ impl FdbRampPostureStore {
             RampPostureError(format!("clear ramp posture transaction: {error}"))
         })
     }
+
+    /// One control's durable posture-change history, oldest first.
+    ///
+    /// The review view of D32 open question 2's shadow: every superseded row
+    /// and every removal, in commit order, each carrying the envelope it was
+    /// written with so a reviewer can re-verify it the way a poller would.
+    /// Ordering is the key's versionstamp — the only "when" the cluster
+    /// vouches for — and `recorded_at_ms` in each row is the writer's clock,
+    /// which is evidence about the writer and not a substitute for it.
+    ///
+    /// # Errors
+    ///
+    /// A FoundationDB transaction failure, or a row that does not decode.
+    pub async fn history(
+        &self,
+        control: &str,
+    ) -> Result<Vec<super::posture::PostureHistoryEntry>, RampPostureError> {
+        use futures::TryStreamExt;
+
+        let db = std::sync::Arc::clone(&self.db);
+        let start = crate::keyspace::posture_history_range_start(control);
+        let end = crate::keyspace::posture_history_range_end(control);
+        let rows: Vec<super::posture::PostureHistoryEntry> = db
+            .run(move |transaction, _| {
+                let (start, end) = (start.clone(), end.clone());
+                async move {
+                    let mut stream = transaction.get_ranges_keyvalues(
+                        foundationdb::RangeOption {
+                            begin: foundationdb::KeySelector::first_greater_or_equal(&start),
+                            end: foundationdb::KeySelector::first_greater_or_equal(&end),
+                            ..foundationdb::RangeOption::default()
+                        },
+                        false,
+                    );
+                    let mut entries = Vec::new();
+                    while let Some(kv) = stream
+                        .try_next()
+                        .await
+                        .map_err(history_err("scan history"))?
+                    {
+                        let (found_control, versionstamp) =
+                            crate::keyspace::decode_posture_history_key(kv.key()).ok_or_else(
+                                || {
+                                    history_err("decode history key")(
+                                        "a row inside the span does not decode to a history key",
+                                    )
+                                },
+                            )?;
+                        if found_control != control {
+                            return Err(history_err("decode history key")(
+                                "a row inside this control's scan names another control",
+                            ));
+                        }
+                        let row: super::posture::PostureHistoryRow =
+                            postcard::from_bytes(kv.value())
+                                .map_err(history_err("decode history row"))?;
+                        entries.push(super::posture::PostureHistoryEntry { versionstamp, row });
+                    }
+                    Ok(entries)
+                }
+            })
+            .await
+            .map_err(|error: foundationdb::FdbBindingError| {
+                RampPostureError(format!("read posture history transaction: {error}"))
+            })?;
+        Ok(rows)
+    }
 }
+
+/// The writer's wall clock, in Unix milliseconds.
+///
+/// Used where a change is *recorded* — the history row's `recorded_at_ms` —
+/// and never where one is ordered: ordering is the commit versionstamp, and
+/// this clock is evidence about the writer, not an index. Clamped the same
+/// way [`FdbRampPostureStore::read`] clamps its own read, for the same
+/// reason: a clock before the epoch or past `u64::MAX` records as a boundary
+/// value rather than failing the write that carries it.
+#[cfg(feature = "fdb")]
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Lift a step description into the mapper every `db.run` closure needs at
+/// each fallible step — the same shape `super::cohort::store_err` gives the
+/// cohort store, and for the same reason: a transaction's failure type is
+/// [`foundationdb::FdbBindingError`], and the step name survives only if the
+/// failure is wrapped on the way out.
+#[cfg(feature = "fdb")]
+fn history_err<E: std::fmt::Display>(
+    what: &'static str,
+) -> impl Fn(E) -> foundationdb::FdbBindingError {
+    move |error| {
+        foundationdb::FdbBindingError::new_custom_error(Box::new(PostureHistoryStepError(format!(
+            "{what}: {error}"
+        ))))
+    }
+}
+
+/// The error wrapper `new_custom_error` needs: a named step that failed
+/// inside a history transaction, carrying the underlying reason.
+#[cfg(feature = "fdb")]
+#[derive(Debug)]
+struct PostureHistoryStepError(String);
+
+#[cfg(feature = "fdb")]
+impl std::fmt::Display for PostureHistoryStepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "fdb")]
+impl std::error::Error for PostureHistoryStepError {}
 
 #[cfg(feature = "fdb")]
 #[async_trait::async_trait]

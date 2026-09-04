@@ -1,0 +1,21 @@
+# #864 (slice): D32 open question 2's durable posture-change history.
+#
+# Eight tests, of which three need the cluster and five execute in the same
+# invocation without one:
+#
+#   - tests/ramp_posture_history.rs, three, all cluster-gated — a recorded
+#     change surviving the store handle that wrote it (plus its clear
+#     tombstone), the span ordering by commit version with each row naming
+#     its signer and reason, and one control's scan never leaking a row from
+#     a control whose name extends its own;
+#   - three `keyspace` tests on the `vh` sub-span — layout and disjointness
+#     from the other three `v` sub-spans, the versionstamped param carrying
+#     the offset it names, and the separator-terminated scan and decoder
+#     surviving an extending control name;
+#   - one `posture` test — the history row's storage round-trip for both
+#     kinds of change, envelope included;
+#   - one `orrery-ramp` test — the `history` render naming who, what, when
+#     and why, and an empty history saying so.
+#
+# The floor rises by all eight: +8.
+8
