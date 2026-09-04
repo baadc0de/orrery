@@ -1,0 +1,151 @@
+{
+	"seed": "1",
+	"body": 1,
+	"engine": "5.8.2-56702186+++UE5+Release-5.8",
+	"platform": "Mac",
+	"size_m": 64,
+	"spacing_m": 1,
+	"density_per_m2": 0.019999999552965164,
+	"nanite": true,
+	"unreal_collision_simplified": false,
+	"noise":
+	{
+		"layer_0":
+		{
+			"intensity_cm": 1363.8403265472832,
+			"wavelength_cm": 7169.9336742712258,
+			"rotation_deg": 344.33008422296427,
+			"octaves": 5,
+			"mode": "Standard"
+		},
+		"layer_1":
+		{
+			"intensity_cm": 391.6445360911739,
+			"wavelength_cm": 1592.3119245683224,
+			"rotation_deg": 280.43281328821695,
+			"octaves": 3,
+			"mode": "Ridge"
+		}
+	},
+	"intermediate_verts": 4225,
+	"intermediate_tris": 8192,
+	"intermediate_hash_mm": "eea76475ba036384",
+	"export_saw_same_meshdata_pointer_as_static_mesh_and_collision": true,
+	"unreal_collision":
+	{
+		"component_0":
+		{
+			"verts": 4225,
+			"tris": 8192,
+			"hash_mm": "035e88ad02677cbf",
+			"vertices_compared": 4225,
+			"max_vertex_deviation_mm": 0.00058656571354731568,
+			"vertices_that_round_to_a_different_mm": 1,
+			"same_triangle_list_as_intermediate": true
+		}
+	},
+	"scatter":
+	{
+		"ism_0":
+		{
+			"mesh": "/Engine/BasicShapes/Cube.Cube",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 44,
+			"lod0_tris": 48,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 1,
+			"simple_spheres": 0,
+			"simple_convex": 0
+		},
+		"ism_1":
+		{
+			"mesh": "/Engine/BasicShapes/Cylinder.Cylinder",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 15,
+			"lod0_tris": 512,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 0,
+			"simple_spheres": 0,
+			"simple_convex": 1
+		},
+		"ism_2":
+		{
+			"mesh": "/Engine/BasicShapes/Cone.Cone",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 15,
+			"lod0_tris": 284,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 0,
+			"simple_spheres": 0,
+			"simple_convex": 4
+		},
+		"ism_3":
+		{
+			"mesh": "/Engine/BasicShapes/Sphere.Sphere",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 9,
+			"lod0_tris": 960,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 0,
+			"simple_spheres": 1,
+			"simple_convex": 0
+		}
+	},
+	"instances": 83,
+	"instance_tris": 22692,
+	"bounds":
+	{
+		"min_x_mm": -1108,
+		"min_y_mm": -1290,
+		"min_z_mm": -4746,
+		"max_x_mm": 64000,
+		"max_y_mm": 65753,
+		"max_z_mm": 13751
+	},
+	"timing":
+	{
+		"modifiers_to_meshdata_s": 0.002544209361076355,
+		"transformers_s": 0.31828374788165092,
+		"pcg_s": 0.015751376748085022,
+		"save_s": 0.019763622432947159,
+		"commandlet_main_s": 0.40748516470193863
+	},
+	"representations":
+	{
+		"tri":
+		{
+			"path": "/Users/baadc0de/Development/orrery-onebody/out/body-1.tri.collision",
+			"seconds": 0.0016486681997776031,
+			"bytes": 842040,
+			"ok": true
+		},
+		"heightfield":
+		{
+			"path": "/Users/baadc0de/Development/orrery-onebody/out/body-1.hf.collision",
+			"seconds": 0.016798917204141617,
+			"bytes": 88104,
+			"ok": true
+		},
+		"voxel":
+		{
+			"path": "/Users/baadc0de/Development/orrery-onebody/out/body-1.vox.collision",
+			"seconds": 0.022652916610240936,
+			"bytes": 172334,
+			"ok": true
+		}
+	},
+	"unreal":
+	{
+		"map": "/Users/baadc0de/Development/orrery-onebody/out/Body_1.umap",
+		"bytes": 622107,
+		"package": "/OneBodyOut/Body_1"
+	}
+}

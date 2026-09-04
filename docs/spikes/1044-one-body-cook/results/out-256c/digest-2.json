@@ -1,0 +1,48 @@
+{
+  "digest_blake3": "58456aca9babd4675d84acbcbc1f5a42454bc12554a1b4aed556335592edfd65",
+  "flip_check_passed": true,
+  "flip_one_byte": [
+    {
+      "byte_index": 3012283,
+      "changed": true,
+      "digest_after_flip": "8842ac2b17449ed458d60caa7ee6fb2228c6f51f1e95480b4df24c6e72c49c99",
+      "half": "Body_2.umap"
+    },
+    {
+      "byte_index": 9910952,
+      "changed": true,
+      "digest_after_flip": "8e756c5cbce0ec2bfc80f4040246550f3326e7c617e7ca7347564ee6b1aada12",
+      "half": "body-2.tri.collision"
+    },
+    {
+      "byte_index": 741784,
+      "changed": true,
+      "digest_after_flip": "449fccf0685bbf89225178837e5e04b2efabe32b453a24efa401e7558eae1508",
+      "half": "body-2.hf.collision"
+    },
+    {
+      "byte_index": 1368105,
+      "changed": true,
+      "digest_after_flip": "0029ebbbc93d7b63ffd79ce39de77f546b4120bf28913b9507fa2831b2584402",
+      "half": "body-2.vox.collision"
+    }
+  ],
+  "halves": {
+    "Body_2.umap": {
+      "blake3": "2db22712b0c3d95d63f3c25bcc449d151e72b5f77d21e24e33dc0ed980961cba",
+      "bytes": 6024567
+    },
+    "body-2.hf.collision": {
+      "blake3": "8038f5b1750ae0a8b5a13f9c4decd3310127f9f2ce9ab65170c87916a9d1f0ce",
+      "bytes": 1483568
+    },
+    "body-2.tri.collision": {
+      "blake3": "a0107446ddb769be1f60652bb86ffb7160040910ee4c542d89d82f2ba3746d56",
+      "bytes": 19821904
+    },
+    "body-2.vox.collision": {
+      "blake3": "3c366b8052ab22c7c4021224edd15f2ed6f6f612eb63def771732efeb9f883cb",
+      "bytes": 2736210
+    }
+  }
+}

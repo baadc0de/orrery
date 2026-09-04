@@ -1,0 +1,410 @@
+{
+  "label": "hf vs unreal complex=0",
+  "rays": 5000,
+  "ray_seed": 42,
+  "unreal_trace_complex": 0,
+  "both_hit": 995,
+  "both_miss": 3998,
+  "unreal_hit_rust_miss": 5,
+  "rust_hit_unreal_miss": 2,
+  "hit_miss_disagreements": 7,
+  "rate": [
+    {
+      "tau_mm": 10,
+      "agree": 4339,
+      "rate": 0.8678
+    },
+    {
+      "tau_mm": 50,
+      "agree": 4662,
+      "rate": 0.9324
+    },
+    {
+      "tau_mm": 250,
+      "agree": 4881,
+      "rate": 0.9762
+    },
+    {
+      "tau_mm": 1000,
+      "agree": 4967,
+      "rate": 0.9934
+    }
+  ],
+  "max_abs_delta_mm": 11469,
+  "p50_abs_delta_mm": 26,
+  "p99_abs_delta_mm": 2416,
+  "abs_delta_histogram": [
+    {
+      "upto_mm": 1,
+      "count": 40
+    },
+    {
+      "upto_mm": 2,
+      "count": 33
+    },
+    {
+      "upto_mm": 5,
+      "count": 79
+    },
+    {
+      "upto_mm": 10,
+      "count": 109
+    },
+    {
+      "upto_mm": 50,
+      "count": 323
+    },
+    {
+      "upto_mm": 250,
+      "count": 219
+    },
+    {
+      "upto_mm": 1000,
+      "count": 86
+    },
+    {
+      "upto_mm": 9223372036854775807,
+      "count": 26
+    },
+    {
+      "upto_mm": 0,
+      "count": 80
+    }
+  ],
+  "both_hit_different_actor": 55,
+  "unreal_hits_by_kind": {
+    "terrain": 862,
+    "instance": 138,
+    "other": 0
+  },
+  "rust_hits_by_kind": {
+    "terrain": 802,
+    "instance": 195,
+    "other": 0
+  },
+  "unreal_start_penetrating": 0,
+  "rust_start_penetrating": 3,
+  "origin_below_surface": 0,
+  "agreement_excluding_below_surface": [
+    {
+      "tau_mm": 10,
+      "agree": 4339,
+      "rate": 0.8678
+    },
+    {
+      "tau_mm": 50,
+      "agree": 4662,
+      "rate": 0.9324
+    },
+    {
+      "tau_mm": 250,
+      "agree": 4881,
+      "rate": 0.9762
+    },
+    {
+      "tau_mm": 1000,
+      "agree": 4967,
+      "rate": 0.9934
+    }
+  ],
+  "rays_with_any_hit": 1002,
+  "agreement_among_rays_with_any_hit": [
+    {
+      "tau_mm": 10,
+      "agree": 341,
+      "rate": 0.3403193612774451
+    },
+    {
+      "tau_mm": 50,
+      "agree": 664,
+      "rate": 0.6626746506986028
+    },
+    {
+      "tau_mm": 250,
+      "agree": 883,
+      "rate": 0.8812375249500998
+    },
+    {
+      "tau_mm": 1000,
+      "agree": 969,
+      "rate": 0.9670658682634731
+    }
+  ],
+  "worst": [
+    {
+      "ray": 703,
+      "unreal_mm": -1,
+      "rust_mm": 3631,
+      "delta_mm": 9223372036854775807,
+      "unreal_kind": 0,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "ruleset hit, unreal miss"
+    },
+    {
+      "ray": 2378,
+      "unreal_mm": 11225,
+      "rust_mm": -1,
+      "delta_mm": 9223372036854775807,
+      "unreal_kind": 1,
+      "rust_kind": 0,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "unreal hit, ruleset miss"
+    },
+    {
+      "ray": 2860,
+      "unreal_mm": 75913,
+      "rust_mm": -1,
+      "delta_mm": 9223372036854775807,
+      "unreal_kind": 1,
+      "rust_kind": 0,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "unreal hit, ruleset miss"
+    },
+    {
+      "ray": 3388,
+      "unreal_mm": -1,
+      "rust_mm": 0,
+      "delta_mm": 9223372036854775807,
+      "unreal_kind": 0,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "ruleset hit, unreal miss"
+    },
+    {
+      "ray": 4009,
+      "unreal_mm": 58628,
+      "rust_mm": -1,
+      "delta_mm": 9223372036854775807,
+      "unreal_kind": 1,
+      "rust_kind": 0,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "unreal hit, ruleset miss"
+    },
+    {
+      "ray": 4088,
+      "unreal_mm": 42,
+      "rust_mm": -1,
+      "delta_mm": 9223372036854775807,
+      "unreal_kind": 1,
+      "rust_kind": 0,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "unreal hit, ruleset miss"
+    },
+    {
+      "ray": 4596,
+      "unreal_mm": 208060,
+      "rust_mm": -1,
+      "delta_mm": 9223372036854775807,
+      "unreal_kind": 1,
+      "rust_kind": 0,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "unreal hit, ruleset miss"
+    },
+    {
+      "ray": 2157,
+      "unreal_mm": 196198,
+      "rust_mm": 184729,
+      "delta_mm": 11469,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 1824,
+      "unreal_mm": 27242,
+      "rust_mm": 16895,
+      "delta_mm": 10347,
+      "unreal_kind": 2,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "geometry mismatch (representation coarseness)"
+    },
+    {
+      "ray": 4119,
+      "unreal_mm": 117115,
+      "rust_mm": 111650,
+      "delta_mm": 5465,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 935,
+      "unreal_mm": 125255,
+      "rust_mm": 120350,
+      "delta_mm": 4905,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 1546,
+      "unreal_mm": 3498,
+      "rust_mm": 0,
+      "delta_mm": 3498,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 4815,
+      "unreal_mm": 177698,
+      "rust_mm": 174385,
+      "delta_mm": 3313,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 1874,
+      "unreal_mm": 63409,
+      "rust_mm": 60432,
+      "delta_mm": 2977,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 714,
+      "unreal_mm": 47925,
+      "rust_mm": 45129,
+      "delta_mm": 2796,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 1384,
+      "unreal_mm": 158940,
+      "rust_mm": 156464,
+      "delta_mm": 2476,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 894,
+      "unreal_mm": 148344,
+      "rust_mm": 145928,
+      "delta_mm": 2416,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 3372,
+      "unreal_mm": 33978,
+      "rust_mm": 36237,
+      "delta_mm": 2259,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 2552,
+      "unreal_mm": 82591,
+      "rust_mm": 80439,
+      "delta_mm": 2152,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 4273,
+      "unreal_mm": 214383,
+      "rust_mm": 212280,
+      "delta_mm": 2103,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 1456,
+      "unreal_mm": 96336,
+      "rust_mm": 94566,
+      "delta_mm": 1770,
+      "unreal_kind": 2,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "geometry mismatch (representation coarseness)"
+    },
+    {
+      "ray": 2857,
+      "unreal_mm": 211765,
+      "rust_mm": 210084,
+      "delta_mm": 1681,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 2290,
+      "unreal_mm": 153589,
+      "rust_mm": 151948,
+      "delta_mm": 1641,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 2444,
+      "unreal_mm": 86452,
+      "rust_mm": 84954,
+      "delta_mm": 1498,
+      "unreal_kind": 1,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "different actor answered"
+    },
+    {
+      "ray": 4558,
+      "unreal_mm": 248504,
+      "rust_mm": 247011,
+      "delta_mm": 1493,
+      "unreal_kind": 2,
+      "rust_kind": 2,
+      "unreal_penetrating": false,
+      "origin_below_surface": false,
+      "cause": "geometry mismatch (representation coarseness)"
+    }
+  ]
+}

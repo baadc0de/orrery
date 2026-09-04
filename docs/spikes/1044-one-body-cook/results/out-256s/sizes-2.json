@@ -1,0 +1,22 @@
+[
+  {
+    "bytes": 5824364,
+    "file": "Body_2.umap",
+    "zstd19_bytes": 2215097
+  },
+  {
+    "bytes": 19821904,
+    "file": "body-2.tri.collision",
+    "zstd19_bytes": 2281343
+  },
+  {
+    "bytes": 1483568,
+    "file": "body-2.hf.collision",
+    "zstd19_bytes": 595363
+  },
+  {
+    "bytes": 2736314,
+    "file": "body-2.vox.collision",
+    "zstd19_bytes": 129245
+  }
+]

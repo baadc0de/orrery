@@ -1,0 +1,13 @@
+{
+  "collision": "body-2.vox.collision",
+  "hits": 1018,
+  "instance_hits": 102,
+  "load_and_build_s": 0.027981459,
+  "out": "hits-2-rust-vox.bin",
+  "ray_seed": 42,
+  "rays": 5000,
+  "representation": "voxel",
+  "start_penetrating": 47,
+  "terrain_hits": 916,
+  "trace_s": 0.018378084
+}

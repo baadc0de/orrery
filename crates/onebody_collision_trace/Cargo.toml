@@ -1,0 +1,28 @@
+[package]
+name = "onebody_collision_trace"
+version = "0.1.0"
+edition = "2021"
+description = "Spike #1044: deterministic integer ray tests over the one-body cook's collision packages, the seeded ray generator, and the comparator against Unreal's line trace"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Research spike, not a shipping crate (#1042 rule 6). It lives on the spike
+# branch so `scripts/check.sh` covers it; nothing here merges. Throwaway, but
+# the hit tests obey D43's envelope: integer arithmetic only (i64/i128), no
+# float touches a hit decision or a distance, so the number it produces is
+# the same on every OS the client ships on.
+[[bin]]
+name = "collision-trace"
+path = "src/main.rs"
+
+[dependencies]
+# Seeded rays, as the issue asks (rand_chacha, seed recorded in the ray file).
+rand = "0.9"
+rand_chacha = "0.9"
+# The two-half digest.
+blake3 = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
