@@ -25,7 +25,7 @@ The engineering consequences listed under each section of the requirements docum
 
 - a **macro simulation service** and its materialise/fold contract with the 60 Hz layer (G4.20, G8);
 - **viewer-dependent replication** for hidden identity, decoys and unscouted trajectories (G7.8, G8.2, G9);
-- **mothership-scale interest management**, one grid at whole-server population (G4);
+- **a season-data distribution record** for cooked content (G10.4; ADR-0021 is link-time only) and **the ledger primitive** (G11.6);
 - **item-to-entity and entity-to-item transitions** under prediction for consumable vehicles, packed ships and captured structures (G4.15, G4.16, G4.21);
 - **ledger-equivalent macro and micro contract fulfilment** (G5).
 
