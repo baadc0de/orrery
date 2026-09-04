@@ -217,6 +217,28 @@ class Supervisor:
             return None
         return active["running"]
 
+    def window_closed(self, attempt_id: str) -> bool:
+        """Has this generation's run finished, whatever the child is still doing?
+
+        The host publishes `window_closed` the instant `swarm.run()` returns,
+        which is long before the process exits: the report tail prints and
+        serialises for as much as several seconds, and the live accept loop
+        is still bound the whole time.  Admission must stop advertising a
+        lobby at the *run's* boundary rather than the *process's*, or a
+        joiner is admitted to an attempt that can no longer measure anything
+        (#1053).
+
+        Unreadable is not closed: this only ever *shortens* a generation's
+        advertised life, so failing to read it must leave the existing
+        expiry clock in charge rather than tearing down a healthy lobby.
+        """
+        try:
+            active = json.loads((self.args.state / "active-seats.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (isinstance(active, dict) and active.get("attempt_id") == attempt_id
+                and active.get("window_closed") is True)
+
     def run(self) -> int:
         c = campaign(self.args.control, self.args.campaign)
         control_mtime = self.args.control.stat().st_mtime_ns
@@ -277,6 +299,15 @@ class Supervisor:
                     self.child.terminate()
                     continue
                 now = int(time.time())
+                if self.window_closed(attempt.name):
+                    # The run is over. Retract the lease before the child
+                    # finishes writing its report, so admission answers
+                    # `restarting` instead of offering a seat in a finished
+                    # attempt; the host refuses such a joiner by name anyway,
+                    # and this stops one being sent at all (#1053).
+                    (self.args.state / "attempt.json").unlink(missing_ok=True)
+                    time.sleep(0.1)
+                    continue
                 host_running = self.host_running(attempt.name)
                 if host_running is True and not running:
                     # The host, not process spawn or the first HTTP reservation,
@@ -440,6 +471,48 @@ class Tests(unittest.TestCase):
             }))
             self.assertTrue(Supervisor(args).host_running("attempt-7"),
                             "all players leaving must not turn a running child into an idle lobby")
+
+    def test_a_finished_run_retracts_the_lease_before_the_child_exits(self) -> None:
+        """#1053.  The child outlives its own run by the whole report tail.
+
+        The standing host handed two clients ninety seconds apart a `StartV1`
+        for an attempt whose run had ended, and both banked a valid signed
+        0.017-minute row.  Admission is only ever as current as `attempt.json`,
+        so the generation's lease has to be retracted when the *run* ends and
+        not when the process does.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = root / "state"
+            state.mkdir()
+            args = argparse.Namespace(control=root / "campaigns.conf", campaign="test",
+                                      swarm="/bin/true", issuer_key=root / "issuer.pub",
+                                      state=state, reservation_journal=root / "slots.json",
+                                      restart_delay=0, max_runs=1)
+            supervisor = Supervisor(args)
+            active = state / "active-seats.json"
+
+            self.assertFalse(supervisor.window_closed("attempt-1053"),
+                             "a host that has published nothing has not finished its run")
+            active.write_text(json.dumps({
+                "attempt_id": "attempt-1053", "active_slots": [5], "pending_slots": [],
+                "released_sessions": [], "running": True, "window_closed": False,
+                "window_ends_at": int(time.time()) + 900,
+            }))
+            self.assertFalse(supervisor.window_closed("attempt-1053"),
+                             "a live run keeps its lease")
+            active.write_text(json.dumps({
+                "attempt_id": "attempt-1053", "active_slots": [], "pending_slots": [],
+                "released_sessions": [], "running": False, "window_closed": True,
+                "window_ends_at": None,
+            }))
+            self.assertTrue(supervisor.window_closed("attempt-1053"),
+                            "a finished run must retract its lease while the child writes")
+            self.assertFalse(supervisor.window_closed("attempt-other"),
+                             "another generation's feed says nothing about this one")
+            active.write_text("{ not json")
+            self.assertFalse(supervisor.window_closed("attempt-1053"),
+                             "an unreadable feed must not tear down a healthy lobby")
 
     def test_failed_child_is_reaped_then_a_fresh_attempt_starts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

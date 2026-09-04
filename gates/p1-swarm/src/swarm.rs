@@ -92,6 +92,91 @@ impl SeatReclaim {
     }
 }
 
+/// The wall-clock life of one attempt's run, as the host itself knows it.
+///
+/// This exists because #1053: nothing on the host had an opinion about *when*
+/// an attempt stops being joinable. The live accept loop is spawned once the
+/// cohort forms and then runs for as long as the process does -- which is
+/// past the end of `swarm.run()`, through the whole report-writing tail. A
+/// joiner arriving in that tail was reserved a seat, handed a personalised
+/// `StartV1` for a run that no longer existed, and dropped when the send to
+/// the (already gone) swarm failed. From the client's side that is a valid
+/// adoption followed by `downlink stream ended` about sixty milliseconds
+/// later, and a perfectly well-formed one-second measurement.
+///
+/// The three states are the only ones a generation has, and making them an
+/// enum is what stops the invalid fourth: *running with no deadline*, which
+/// is what `running: bool` used to mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptWindow {
+    /// The cohort is still forming. No `StartV1` has been authored, so there
+    /// is nothing for a live joiner to join.
+    Forming,
+    /// The run is under way and ends at this Unix second.
+    Running { ends_at_s: u64 },
+    /// `swarm.run()` has returned. The process may still be alive writing its
+    /// report; nothing may be admitted to the attempt it just finished.
+    Closed,
+}
+
+impl AttemptWindow {
+    /// Open the window for `seconds` of run from `now`.
+    pub(crate) const fn opened_at(now_s: u64, seconds: u64) -> Self {
+        Self::Running {
+            ends_at_s: now_s.saturating_add(seconds),
+        }
+    }
+
+    /// Whether a live joiner may still be admitted to this attempt.
+    ///
+    /// The clock is checked as well as the state: a run whose configured
+    /// window has passed is not adoptable even before the host has noticed it
+    /// finished, which is the race the tail of `swarm.run()` used to lose.
+    pub(crate) const fn admits(self, now_s: u64) -> bool {
+        match self {
+            Self::Running { ends_at_s } => now_s < ends_at_s,
+            Self::Forming | Self::Closed => false,
+        }
+    }
+
+    /// The refusal a joiner is told by name, rather than being handed a
+    /// `StartV1` for an attempt that cannot measure anything.
+    pub(crate) fn refusal(self, now_s: u64) -> String {
+        match self {
+            Self::Forming => {
+                "attempt_not_started: this generation has not authored a StartV1 yet".to_owned()
+            }
+            Self::Running { ends_at_s } => format!(
+                "attempt_window_closed: this attempt ended at {ends_at_s} and it is now {now_s}"
+            ),
+            Self::Closed => {
+                "attempt_window_closed: this attempt has finished; the supervisor opens a fresh \
+                 lobby"
+                    .to_owned()
+            }
+        }
+    }
+
+    /// The `running` boolean the published feed has always carried, so the
+    /// supervisor's `host_running` reads exactly what it used to.
+    pub(crate) const fn is_running(self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    /// The published deadline, `null` while the cohort is still forming.
+    pub(crate) const fn ends_at_s(self) -> Option<u64> {
+        match self {
+            Self::Running { ends_at_s } => Some(ends_at_s),
+            Self::Forming | Self::Closed => None,
+        }
+    }
+
+    /// Whether the run this generation existed for is over.
+    pub(crate) const fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
+}
+
 /// Host-authored membership shared with admission and the live accept loop.
 pub(crate) struct LiveMembership {
     pub(crate) attempt_id: String,
@@ -118,7 +203,10 @@ pub(crate) struct LiveMembership {
     /// double-books it.
     pub(crate) released_sessions: BTreeMap<String, SeatReclaim>,
     pub(crate) tick: u64,
-    pub(crate) running: bool,
+    /// The generation's wall-clock life. Replaces the old `running: bool`:
+    /// the published feed still carries `running`, but the host now also
+    /// knows when the run ends and refuses a joiner past it (#1053).
+    pub(crate) window: AttemptWindow,
     pub(crate) path: Option<PathBuf>,
 }
 
@@ -144,7 +232,13 @@ impl LiveMembership {
                 .iter()
                 .filter_map(|(session, reclaim)| Some((session.clone(), reclaim.lost_at()?)))
                 .collect::<BTreeMap<_, _>>(),
-            "running": self.running,
+            "running": self.window.is_running(),
+            // Wired, not decorative: `scripts/p1-swarm-always-on.py` drops
+            // `attempt.json` the moment this turns true, so admission stops
+            // advertising a lobby for an attempt whose run is over while the
+            // child is still writing its report (#1053).
+            "window_closed": self.window.is_closed(),
+            "window_ends_at": self.window.ends_at_s(),
         }))?;
         let temporary = path.with_extension("tmp");
         let mut file = std::fs::File::create(&temporary)?;
@@ -4365,6 +4459,55 @@ mod tests {
         directory.join("active-seats.json")
     }
 
+    /// #1053. `scripts/p1-swarm-always-on.py` drops `attempt.json` -- and so
+    /// stops admission advertising a lobby -- the moment the feed says the
+    /// window is closed, so the flag has to actually be in the feed, and the
+    /// deadline beside it has to be the run's own.
+    #[test]
+    fn the_published_feed_carries_the_attempt_window() {
+        let path = feed_path("window");
+        let mut membership = LiveMembership {
+            attempt_id: "attempt-1053".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
+            tick: 0,
+            window: AttemptWindow::Forming,
+            path: Some(path.clone()),
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).expect("feed written"))
+                .expect("feed parses")
+        };
+
+        membership.publish().expect("publishing a forming lobby");
+        assert_eq!(read()["running"], serde_json::json!(false));
+        assert_eq!(read()["window_closed"], serde_json::json!(false));
+        assert_eq!(read()["window_ends_at"], serde_json::Value::Null);
+
+        membership.window = AttemptWindow::opened_at(1_757_000_000, 900);
+        membership.publish().expect("publishing a running attempt");
+        assert_eq!(
+            read()["running"],
+            serde_json::json!(true),
+            "the supervisor's `host_running` reads exactly the boolean it always did"
+        );
+        assert_eq!(read()["window_closed"], serde_json::json!(false));
+        assert_eq!(
+            read()["window_ends_at"],
+            serde_json::json!(1_757_000_900u64)
+        );
+
+        membership.window = AttemptWindow::Closed;
+        membership.publish().expect("publishing a finished attempt");
+        assert_eq!(
+            read()["window_closed"],
+            serde_json::json!(true),
+            "a finished run says so before this process gets around to exiting"
+        );
+        assert_eq!(read()["running"], serde_json::json!(false));
+    }
+
     #[test]
     fn the_published_feed_names_a_held_seat_until_it_binds_or_is_given_back() {
         // The #1016 half of the contract with `scripts/admission.py`. A seat
@@ -4381,7 +4524,7 @@ mod tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 0,
-            running: false,
+            window: AttemptWindow::Forming,
             path: Some(path.clone()),
         };
         let read = |path: &PathBuf| -> serde_json::Value {
@@ -4460,7 +4603,9 @@ mod tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 0,
-            running: true,
+            window: AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: Some(path.clone()),
         };
         membership
@@ -4527,7 +4672,9 @@ mod tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 0,
-            running: true,
+            window: AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: None,
         }));
         let mut swarm = Swarm::new_for_island(
@@ -4600,7 +4747,9 @@ mod tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 0,
-            running: true,
+            window: AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: None,
         }));
         let mut swarm = Swarm::new_for_island(
@@ -4688,7 +4837,9 @@ mod tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 0,
-            running: true,
+            window: AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: None,
         }));
         let mut swarm = Swarm::new_for_island(
@@ -4825,7 +4976,9 @@ mod tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 0,
-            running: true,
+            window: AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: None,
         }));
         let mut swarm = Swarm::new_for_island(
@@ -6134,7 +6287,9 @@ mod tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 0,
-            running: true,
+            window: AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: None,
         }));
         let mut swarm = Swarm::new_for_island(

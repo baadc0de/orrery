@@ -779,6 +779,12 @@ pub enum RecordDisposition {
     NothingMeasured,
     /// A row was minted, signed and appended to the record file.
     Persisted,
+    /// A row was minted, signed and appended — and is below the measurement
+    /// floor, so it is a record of a failure to seat rather than of play
+    /// (#1053). Named apart from [`Self::Persisted`] because the two used to
+    /// be indistinguishable: a session dropped a second after `StartV1`
+    /// produced a valid, signed, uploadable row and said nothing about it.
+    PersistedBelowFloor,
     /// A row was minted and signed but never reached durable storage.
     Lost,
 }
@@ -2083,6 +2089,29 @@ impl CampaignRuntime {
         // (#947). Nothing downstream can now lose what this call measured.
         self.record_disposition = match &self.record_path {
             Some(path) => match append_session_record(path, &record) {
+                Ok(()) if !record.is_measurement() => {
+                    // Loud, and to the volunteer rather than only to a log
+                    // file: this is the case where everything downstream is
+                    // valid and nothing downstream is worth anything (#1053).
+                    bevy::log::error!(
+                        "campaign session {} lasted {:.3} min, below the {} min measurement \
+                         floor: recorded to {} as evidence of a failed seating, not as play",
+                        record.session_id,
+                        record.distinct_play_minutes,
+                        crate::session::MIN_MEASURED_MINUTES,
+                        path.display()
+                    );
+                    eprintln!(
+                        "regolith: this campaign session lasted {:.3} minutes, which is below \
+                         the {} minute measurement floor. The host dropped you almost \
+                         immediately, so nothing was measured and nothing will bank. The row \
+                         was still written to {} — please send it with your report.",
+                        record.distinct_play_minutes,
+                        crate::session::MIN_MEASURED_MINUTES,
+                        path.display()
+                    );
+                    RecordDisposition::PersistedBelowFloor
+                }
                 Ok(()) => {
                     bevy::log::info!(
                         "campaign session {} recorded to {} ({} recorded min)",
@@ -2440,6 +2469,12 @@ impl Drop for CampaignRuntime {
         // and discarded it, silently, on both branches.
         let record = self.shutdown();
         match (record, self.record_disposition) {
+            (Some(record), RecordDisposition::PersistedBelowFloor) => bevy::log::error!(
+                "campaign session {} was torn down holding {:.3} min, below the measurement \
+                 floor: this attempt measured nothing",
+                record.session_id,
+                record.distinct_play_minutes
+            ),
             (Some(record), RecordDisposition::Persisted) => bevy::log::info!(
                 "campaign session {} banked {} minutes and was recorded during teardown",
                 record.session_id,

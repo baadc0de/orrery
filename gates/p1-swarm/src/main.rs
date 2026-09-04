@@ -711,6 +711,26 @@ fn decode_join_anchor(
         .transpose()
 }
 
+/// What the live-join path learned when it asked to hold a seat.
+///
+/// Named rather than an `Option`, because the two refusals are different
+/// facts and only one of them used to exist. #1053: a seat that is free in an
+/// attempt whose run is over is not a seat worth handing out, and answering
+/// "yes, held" for it is what let a joiner adopt a `StartV1` for a dead run.
+#[derive(Debug)]
+enum LiveJoinHold {
+    /// The window is open and this seat is now held for the joiner.
+    Held {
+        attempt_id: String,
+        tick: u64,
+        connected: Vec<ConnectedSeat>,
+    },
+    /// Another connection already holds or has bound this seat.
+    SeatTaken,
+    /// The attempt is not inside its run window. Nothing was held.
+    OutsideWindow { reason: String },
+}
+
 /// Hold the seat a live joiner asked for, or say it is already taken.
 ///
 /// The hold is published, so admission counts the seat taken for as long as
@@ -720,24 +740,34 @@ fn decode_join_anchor(
 fn reserve_live_join(
     live: &mut swarm::LiveMembership,
     slot: usize,
-) -> Result<Option<(String, u64, Vec<ConnectedSeat>)>> {
+    now_s: u64,
+) -> Result<LiveJoinHold> {
+    // The window is read under the same lock that takes the hold, so a run
+    // that ends between the two cannot leave a seat held for a joiner the
+    // next line would have refused.
+    if !live.window.admits(now_s) {
+        return Ok(LiveJoinHold::OutsideWindow {
+            reason: live.window.refusal(now_s),
+        });
+    }
     if !live
         .hold_pending(slot)
         .context("publish the held seat for a live join")?
     {
-        return Ok(None);
+        return Ok(LiveJoinHold::SeatTaken);
     }
-    Ok(Some((
-        live.attempt_id.clone(),
-        live.tick,
-        live.active
+    Ok(LiveJoinHold::Held {
+        attempt_id: live.attempt_id.clone(),
+        tick: live.tick,
+        connected: live
+            .active
             .iter()
             .map(|(slot, binding)| ConnectedSeat {
                 slot: *slot,
                 node: binding.node,
             })
             .collect(),
-    )))
+    })
 }
 
 /// Give back a seat held for a live join that will never bind.
@@ -1188,17 +1218,32 @@ async fn accept_live_join(
             .await;
         return Ok(());
     }
-    let snapshot = {
+    let hold = {
         let mut live = membership.lock().expect("membership lock");
-        reserve_live_join(&mut live, slot)?
+        reserve_live_join(&mut live, slot, unix_seconds())?
     };
-    let Some((attempt_id, tick, mut connected)) = snapshot else {
-        let _ = prepared
-            .refuse(format!(
-                "reservation_slot_occupied: slot {slot} is already bound"
-            ))
-            .await;
-        return Ok(());
+    let (attempt_id, tick, mut connected) = match hold {
+        LiveJoinHold::Held {
+            attempt_id,
+            tick,
+            connected,
+        } => (attempt_id, tick, connected),
+        LiveJoinHold::SeatTaken => {
+            let _ = prepared
+                .refuse(format!(
+                    "reservation_slot_occupied: slot {slot} is already bound"
+                ))
+                .await;
+            return Ok(());
+        }
+        // The refusal is the whole point of #1053: the joiner is told by name
+        // that there is nothing to join, instead of adopting a `StartV1` for
+        // a finished attempt and banking the second before its downlink dies.
+        LiveJoinHold::OutsideWindow { reason } => {
+            eprintln!("gates/p1-swarm: refused live join into seat {slot}: {reason}");
+            let _ = prepared.refuse(reason).await;
+            return Ok(());
+        }
     };
     connected.push(ConnectedSeat { slot, node });
     connected.sort_by_key(|seat| seat.slot);
@@ -1398,6 +1443,12 @@ fn main() -> Result<()> {
     .with_attempt_id(args.attempt_id.clone());
     let _endpoint_guard;
     let _runtime_guard;
+    // Kept past the run so the window can be closed the instant `run()`
+    // returns. The live accept loop outlives the swarm -- it is spawned on a
+    // runtime held for the whole of `main` -- so without this the report tail
+    // is a window in which every joiner is handed a `StartV1` for a run that
+    // has already ended (#1053).
+    let mut live_membership: Option<Arc<Mutex<swarm::LiveMembership>>> = None;
     if args.external_peer {
         // The host endpoint's identity is the hosting process's, not the
         // slot's: the slot key belongs to the dialler and is what accept()
@@ -1475,7 +1526,7 @@ fn main() -> Result<()> {
                     pending: BTreeSet::new(),
                     released_sessions: BTreeMap::new(),
                     tick: 0,
-                    running: false,
+                    window: swarm::AttemptWindow::Forming,
                     path: args.active_seats_file.clone(),
                 }))
             });
@@ -1641,7 +1692,11 @@ fn main() -> Result<()> {
             let live_joins = if let Some(membership) = membership {
                 {
                     let mut live = membership.lock().expect("membership lock");
-                    live.running = true;
+                    // The run's wall-clock life starts here, at the freeze,
+                    // and this is the only place that knows it. Everything
+                    // downstream -- the live accept loop's refusal, the
+                    // supervisor's `window_closed` read -- hangs off it.
+                    live.window = swarm::AttemptWindow::opened_at(unix_seconds(), config.seconds);
                     live.publish()
                         .context("publish the running membership boundary")?;
                 }
@@ -1695,11 +1750,28 @@ fn main() -> Result<()> {
             };
         }
         if let Some((receiver, membership)) = live_joins {
+            live_membership = Some(Arc::clone(&membership));
             swarm = swarm.with_live_joins(receiver, membership, island_seats);
         }
     }
 
     let report = swarm.run();
+
+    // The attempt is over the moment the swarm stops, whatever else this
+    // process still has to write. Closing the window here is what turns a
+    // late joiner from a silent one-second measurement into a named refusal,
+    // and republishing it is what tells the supervisor to stop advertising a
+    // lobby for a generation that has finished (#1053).
+    if let Some(membership) = &live_membership {
+        let mut live = membership.lock().expect("membership lock");
+        live.window = swarm::AttemptWindow::Closed;
+        if let Err(error) = live.publish() {
+            eprintln!(
+                "gates/p1-swarm: could not publish the closed attempt window: {error:#}; \
+                 admission may keep advertising this finished attempt until the child exits"
+            );
+        }
+    }
 
     // Mutation guard for A20 lane 1: parsing a pressure value without replacing
     // every bot's real resource must fail by name, not merely produce a
@@ -2216,6 +2288,71 @@ mod session_geometry_tests {
         }
     }
 
+    /// #1053. The standing `shakedown` host handed two clients, ninety
+    /// seconds apart, a `StartV1` for an attempt whose run window had passed,
+    /// then closed their downlink about sixty milliseconds later. Both banked
+    /// a valid, signed 0.017-minute row: a worthless measurement that was
+    /// indistinguishable from a good one.
+    ///
+    /// The seat was free, and "free" was the only question the live-join path
+    /// ever asked. It now asks whether the attempt is still inside its own
+    /// window first, and takes no hold when it is not -- a seat held for a
+    /// refused joiner would be an immortal seat.
+    #[test]
+    fn an_attempt_past_its_window_is_not_adoptable() {
+        let ends_at_s = 1_757_000_000;
+        let mut membership = swarm::LiveMembership {
+            attempt_id: "01a06bb4-f42b-7a9a-93ec-621fcafccb6f".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
+            tick: 18_000,
+            window: swarm::AttemptWindow::Running { ends_at_s },
+            path: None,
+        };
+
+        let inside = reserve_live_join(&mut membership, 5, ends_at_s - 1)
+            .expect("holding a seat inside the window");
+        assert!(
+            matches!(inside, LiveJoinHold::Held { .. }),
+            "a joiner inside the run window is still admitted, got {inside:?}"
+        );
+        membership.drop_pending(5).expect("giving the seat back");
+
+        // One hour thirty-eight minutes past the end, which is what the two
+        // clients in #1053 actually arrived at.
+        for (label, now_s) in [
+            ("on the closing second", ends_at_s),
+            ("1h38m past the end", ends_at_s + 5_880),
+        ] {
+            let refused = reserve_live_join(&mut membership, 5, now_s)
+                .expect("the window check itself never fails");
+            let LiveJoinHold::OutsideWindow { reason } = &refused else {
+                panic!("an attempt {label} must not be adoptable, got {refused:?}");
+            };
+            assert!(
+                reason.contains("attempt_window_closed"),
+                "the joiner is refused by name, got {reason}"
+            );
+            assert!(
+                membership.pending.is_empty(),
+                "a refused joiner {label} must leave no held seat behind"
+            );
+        }
+
+        // And once the swarm has stopped, nothing is adoptable at any clock.
+        membership.window = swarm::AttemptWindow::Closed;
+        assert!(
+            matches!(
+                reserve_live_join(&mut membership, 5, ends_at_s - 1)
+                    .expect("the window check itself never fails"),
+                LiveJoinHold::OutsideWindow { .. }
+            ),
+            "the report-writing tail after run() must admit nobody"
+        );
+        assert!(membership.pending.is_empty());
+    }
+
     #[test]
     fn a_live_bound_seat_is_recorded_so_the_next_joiner_inherits_it() {
         let mut membership = swarm::LiveMembership {
@@ -2224,7 +2361,9 @@ mod session_geometry_tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 240,
-            running: true,
+            window: swarm::AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: None,
         };
         record_live_binding(
@@ -2235,9 +2374,13 @@ mod session_geometry_tests {
         )
         .expect("live seat binding records");
 
-        let (_, _, inherited) = reserve_live_join(&mut membership, 6)
-            .expect("holding the slot publishes")
-            .expect("next live join reserves its slot");
+        let LiveJoinHold::Held {
+            connected: inherited,
+            ..
+        } = reserve_live_join(&mut membership, 6, 0).expect("holding the slot publishes")
+        else {
+            panic!("next live join reserves its slot");
+        };
         assert_eq!(
             inherited.iter().map(|seat| seat.slot).collect::<Vec<_>>(),
             vec![5],
@@ -2263,7 +2406,9 @@ mod session_geometry_tests {
             pending: BTreeSet::new(),
             released_sessions: BTreeMap::new(),
             tick: 240,
-            running: true,
+            window: swarm::AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
             path: None,
         };
         membership
@@ -2419,7 +2564,7 @@ mod start_join_tests {
                     pending: BTreeSet::new(),
                     released_sessions: BTreeMap::new(),
                     tick: 0,
-                    running: false,
+                    window: swarm::AttemptWindow::Forming,
                     // No feed file: `publish` is a no-op and the assertions
                     // read the in-memory bookkeeping the feed is written from.
                     path: None,

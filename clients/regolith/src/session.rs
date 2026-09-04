@@ -123,6 +123,21 @@ const LOSS_TOLERANCE_PCT: f64 = 2.0;
 /// would have hidden the unapplied-profile case with it.
 const JITTER_TOLERANCE_MS: u64 = 40;
 
+/// The shortest connected span this client will call a measurement.
+///
+/// #1053: the standing host handed joiners a `StartV1` for an attempt whose
+/// run had already ended and closed their downlink about sixty milliseconds
+/// later. Every one of them wrote a well-formed, correctly signed row with an
+/// honest `impairment_mismatch: false` — one second long. Nothing about that
+/// row said it was worthless, and a volunteer reading their own log had no way
+/// to tell it from the fifteen minutes they meant to play.
+///
+/// `MIN_MEASURED_MINUTES` in `scripts/p4-ledger.sh` is the same figure, and
+/// the ledger is the side that actually refuses. This copy exists so the
+/// person the failure happened to is told at the time, rather than finding
+/// out from a total that never moved.
+pub const MIN_MEASURED_MINUTES: f64 = 1.0;
+
 impl ImpairmentMeasurement {
     /// Record one observed transport outcome; this is not configuration echo.
     pub fn observe(&mut self, dropped: bool, jitter_ms: u64) {
@@ -233,6 +248,16 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// Whether this row measured enough to be one (#1053).
+    ///
+    /// A row below the floor is still written and still signed — it is the
+    /// only evidence that the seating failed, and discarding it would trade
+    /// one silent failure for another. What it must not do is look like play.
+    #[must_use]
+    pub fn is_measurement(&self) -> bool {
+        self.distinct_play_minutes >= MIN_MEASURED_MINUTES
+    }
+
     /// Bind every client-owned field in this row to the admitted transport key.
     pub fn sign(&mut self, key: &iroh_base::SecretKey) -> Result<(), serde_json::Error> {
         self.measurement_node = key.public().to_string();
@@ -751,6 +776,45 @@ mod tests {
         );
         assert_eq!(record.observed_loss_pct, 0.0);
         assert!(record.impairment_mismatch);
+    }
+
+    /// #1053. Two volunteers, on two platforms ninety seconds apart, adopted a
+    /// `StartV1` for an attempt whose run had ended and lost their downlink
+    /// about sixty milliseconds later. Both wrote a well-formed, correctly
+    /// signed row carrying an honest `impairment_mismatch: false` and banked
+    /// 0.017 minutes. Nothing in the row said it was worthless.
+    ///
+    /// The row still gets written and still gets uploaded — it is the only
+    /// evidence the seating failed. What it must no longer do is claim, by
+    /// saying nothing, to be play.
+    #[test]
+    fn a_session_dropped_seconds_after_start_is_not_a_measurement() {
+        let mut kicked = session();
+        // Thirty ticks is the second the #1053 clients actually flew.
+        for _ in 0..u64::from(orrery_core::TICK_HZ) {
+            kicked.observe_tick(PlayerActivity::Active);
+        }
+        let record = finish(&kicked);
+        assert!(
+            (record.distinct_play_minutes - 1.0 / 60.0).abs() < 1e-9,
+            "the fixture is the 0.017-minute row from the issue, got {}",
+            record.distinct_play_minutes
+        );
+        assert!(
+            !record.is_measurement(),
+            "a one-second session must not look like play"
+        );
+
+        let mut played = session();
+        for _ in 0..u64::from(orrery_core::TICK_HZ) * 60 {
+            played.observe_tick(PlayerActivity::Active);
+        }
+        let record = finish(&played);
+        assert_eq!(record.distinct_play_minutes, MIN_MEASURED_MINUTES);
+        assert!(
+            record.is_measurement(),
+            "the floor is a floor: a minute of honest play is still a measurement"
+        );
     }
 
     /// The overlay reads live progress off the same accumulator that banks.
