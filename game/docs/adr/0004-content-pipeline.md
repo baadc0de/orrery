@@ -11,7 +11,7 @@ This decision is normative for the *Mothership* game project. See the [game ADR 
 3. **Two human gates**: concept art, and final in-engine. All intermediate stages pass automated checks whose numbers come from the callout sheet.
 4. **glTF 2.0** between stages; USD for scene assembly later; Interchange on import.
 5. **UE5 skeleton** for humanoids; **Control Rig driven by mirror state** for mechs and ships.
-6. The Unreal stage runs through the editor's **MCP server**, with pipeline steps registered as custom tools.
+6. **Blender, driven over MCP, is the manipulation and assembly stage** (clean-up, remesh, kitbash with KIT OPS and similar plugins, assembly, UVs, LODs, checks, glTF export); Blender scripts and plugin versions are pipeline code and part of the record. Kit libraries are provenance inputs under the same licence rule. The Unreal stage runs through the editor's **MCP server**, with pipeline steps registered as custom tools.
 7. A **style bible** conditions the concept stage per faction; **licence is checked at generation time** and territory-restricted model licences are excluded.
 
 ## Rejected
