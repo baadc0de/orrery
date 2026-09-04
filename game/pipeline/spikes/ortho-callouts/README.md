@@ -44,3 +44,9 @@
 **Conclusions for G12.2a.** The local track is viable today for batch variation and re-derivation at negligible cost, and a Blender proxy is a cheap, fully reproducible way to state the camera. To make it a hard constraint, the next step is a proper depth/canny ControlNet for the chosen open model (or the base 4B with a control adapter), and a silhouette IoU check against the proxy's mask as the automated gate.
 
 **Operational.** ComfyUI is started with `~/ComfyUI/.venv/bin/python ~/ComfyUI/main.py --listen 127.0.0.1 --port 8188` and holds ~16 GB VRAM while idle; stop it before any latency measurement on this box. Generated PNGs and the proxy `.blend` stay out of the public repository (G12.12).
+
+## Image-to-3D (TRELLIS.2-4B): built, blocked on a licence gate
+
+The full TRELLIS.2 stack builds on this box in a user-local conda env (CUDA 12.4 toolkit + gcc 12, since the system has no nvcc and gcc 16): torch 2.6 cu124, flash-attn 2.7.3 (prebuilt; needs `TMPDIR` on the same filesystem as the pip cache), nvdiffrast, nvdiffrec (needs `-L<env>/lib/stubs` for `-lcuda`), CuMesh, FlexGEMM, o-voxel. Script: `~/trellis2-build.sh`; runner: `trellis_run.py`; Blender import-and-render: `blender_render.py` (tested on a stand-in).
+
+**Blocker:** the 4B pipeline conditions on **DINOv3** (`facebook/dinov3-vitl16-pretrain-lvd1689m`), a gated Hugging Face repo under Meta's DINOv3 licence. The model was trained on those features, so the ungated DINOv2 extractor in the code is not a drop-in. Needs the owner to accept the licence on Hugging Face and put a token on the machine (`hf auth login`). Note for G12.8: DINOv3's licence is a versioned input of every TRELLIS.2 artifact even though the encoder never ships.
