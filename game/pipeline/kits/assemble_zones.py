@@ -54,7 +54,8 @@ for z in Z["zones"]:
         ax = sb - sa; L = ax.length; ax.normalize(); tgt_dir = (B - A); D = tgt_dir.length; tgt_dir.normalize()
         up = Vector(z.get("up", [0, 0, 1])); s_cross = random.uniform(*z["scale"]); s_along = D / max(1e-6, L)
         # frame: local cable axis -> tgt_dir, local plane normal (+Z) -> up
-        R_local = Matrix((ax, up.cross(ax).normalized() if abs(up.dot(ax)) < 0.99 else Vector((1, 0, 0)), Vector((0, 0, 1)))).transposed().inverted()  # local basis with ax as X
+        lz = Vector((0, 0, 1)); ly = lz.cross(ax).normalized(); R_local = Matrix((ax, ly, lz)).transposed().inverted()  # orthonormal local basis: cable axis, side, mount normal
+        if abs(up.dot(tgt_dir)) > 0.95: up = Vector((0, 0, 1)) if abs(tgt_dir.z) < 0.9 else Vector((1, 0, 0))
         bx = tgt_dir; bz = (up - bx * up.dot(bx)).normalized(); by = bz.cross(bx); R_world = Matrix((bx, by, bz)).transposed()
         S = Matrix.Diagonal((s_along, s_cross, s_cross, 1.0))
         M = Matrix.Translation(A) @ R_world.to_4x4() @ S @ R_local.to_4x4() @ Matrix.Translation(-sa)
