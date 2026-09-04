@@ -3,4 +3,6 @@ out/proxy/*.png
 out/proxy/*.blend
 out/trellis/*.png
 out/trellis/*.glb
+out/retopo/*
+out/kitbash*/*
 viewer/*.glb

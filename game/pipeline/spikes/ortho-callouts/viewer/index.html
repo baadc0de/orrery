@@ -26,11 +26,11 @@ button[aria-pressed="true"]{color:var(--accent);border-color:var(--accent)}
   <h1>Escort E-07</h1>
   <div class="role">Light escort craft · mothership faction</div>
   <div id="stats">decoding mesh…</div>
-  <div class="ctl"><button id="turn" aria-pressed="false">Turntable</button><button id="wire" aria-pressed="false">Wireframe</button><button id="reset">Reset view</button><button id="swap" aria-pressed="false">Retopo 24.8k</button></div>
+  <div class="ctl"><button id="turn" aria-pressed="false">Turntable</button><button id="wire" aria-pressed="false">Wireframe</button><button id="reset">Reset view</button><button id="swap" aria-pressed="false">Retopo 24.8k</button><button id="kit" aria-pressed="false">Kitbash zones</button></div>
 </div>
 <div id="prov">
   <span>model <b>TRELLIS.2-4B</b> (MIT)</span><span>encoder <b>DINOv3 ViT-L/16</b> (Meta licence)</span><span>concept <b>Nano Banana Pro</b></span>
-  <span>seed <b>7</b></span><span>generate <b>86.7 s</b></span><span>high-poly <b>191,640 tris</b> · 4k texture · 18 MB &nbsp;|&nbsp; retopo <b>24,842 tris</b> · symmetrized · baked 2k colour + normal</span><span id="live">renderer: WebGL</span>
+  <span>seed <b>7</b></span><span>generate <b>86.7 s</b></span><span>TRELLIS.2 high-poly <b>191,640 tris</b> &nbsp;|&nbsp; retopo <b>24,842 tris</b> &nbsp;|&nbsp; kitbash <b>13 INSERTs</b> on a brief blockout, zone-driven, 112k tris</span><span id="live">renderer: WebGL</span>
 </div>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script type="module">
@@ -63,8 +63,10 @@ function loadModel(file, first) { loader.load(file, g => {
   const bar = document.getElementById('bar'); bar.style.transform = 'scaleX(1)'; setTimeout(() => bar.remove(), 500);
 }, x => { if (x.total) document.getElementById('bar').style.transform = `scaleX(${x.loaded/x.total})`; }, e => { document.getElementById('stats').textContent = 'Could not load the mesh: ' + e; }); }
 loadModel('escort.glb', true);
-let retopo = false;
-press('swap', () => { retopo = !retopo; if (models[retopo ? 'escort-retopo.glb' : 'escort.glb']) { scene.remove(model); model = models[retopo ? 'escort-retopo.glb' : 'escort.glb']; scene.add(model); } else loadModel(retopo ? 'escort-retopo.glb' : 'escort.glb', false); return retopo; });
+let retopo = false; let current = 'escort.glb';
+function show(file) { current = file; if (models[file]) { scene.remove(model); model = models[file]; scene.add(model); } else loadModel(file, false); }
+press('swap', () => { retopo = !retopo; document.getElementById('kit').setAttribute('aria-pressed', 'false'); show(retopo ? 'escort-retopo.glb' : 'escort.glb'); return retopo; });
+press('kit', () => { const on = current !== 'escort-kitbash.glb'; retopo = false; document.getElementById('swap').setAttribute('aria-pressed', 'false'); show(on ? 'escort-kitbash.glb' : 'escort.glb'); return on; });
 press('turn', () => turning = !turning);
 press('wire', () => { wire = !wire; model && model.traverse(o => { if (o.isMesh) o.material.wireframe = wire; }); return wire; });
 press('reset', () => { if (home) { camera.position.copy(home); controls.target.set(0,0,0); } });
