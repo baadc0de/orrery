@@ -606,14 +606,24 @@ FAKE
 
     local out status=0
 
-    # A fresh install of the tree as committed refuses: the placeholders are
-    # still there, and nothing may be written.
-    out=$(ORRERY_WEB_TIER_NGINX_SITES_DIR=$root/nginx/sites-available \
+    # An install whose source tree still carries a placeholder refuses, and
+    # nothing may be written. The tracked files were filled from the live host
+    # on 2026-09-04, so this arm plants its own marker in a copy rather than
+    # relying on the shipped files staying incomplete -- a tracked file that
+    # cannot install is a deploy blocked, not a safety property worth keeping.
+    local unfilled=$root/unfilled
+    mkdir -p "$unfilled"
+    cp "$SRC_DIR"/campaigns.nginx.conf "$SRC_DIR"/orrery-admission.service \
+       "$SRC_DIR"/admission.py "$unfilled"/ 2>/dev/null || true
+    sed -i 's/^Description=.*/Description=ORRERY_PLACEHOLDER_UNIT_DESCRIPTION/' \
+        "$unfilled/orrery-admission.service"
+    out=$(ORRERY_WEB_TIER_SRC_DIR=$unfilled \
+          ORRERY_WEB_TIER_NGINX_SITES_DIR=$root/nginx/sites-available \
           ORRERY_WEB_TIER_NGINX_SITES_ENABLED_DIR=$root/nginx/sites-enabled \
           ORRERY_WEB_TIER_SYSTEMD_UNITS_DIR=$root/systemd \
           "$SELF" 2>&1) || status=$?
     if (( status == 0 )); then
-        die "self-test: installing the unfilled tracked files should have refused"
+        die "self-test: installing a source tree with a placeholder should have refused"
     fi
     grep -q "ORRERY_PLACEHOLDER" <<<"$out" || die "self-test: the refusal does not name the placeholders"
     if [[ -e $site || -e $unit ]]; then

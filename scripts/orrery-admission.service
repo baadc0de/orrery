@@ -9,28 +9,29 @@
 # -- and a lost client_max_body_size in the nginx site fronting this origin
 # is silent again, which is exactly how #1002's 413s went unnoticed.
 #
-# What was recorded from the live host on 2026-09-03 is here verbatim: the
-# ExecStart line, and nothing else. The unit's scaffolding -- Description,
-# Type, the user it runs as, restart policy, WantedBy -- was not recorded,
-# and is left as an ORRERY_PLACEHOLDER marker rather than guessed: a unit
-# that looks right and boots the box office as the wrong user or type is
-# worse than one that refuses to install. scripts/deploy-web-tier.sh
-# refuses to install while any marker remains; fill them from the live host
-# (`systemctl cat orrery-admission.service`), commit, and deploy. Delete a
-# placeholder line outright if the live unit simply carries no such key.
+# The ExecStart line was recorded from the live host on 2026-09-03. The
+# unit's scaffolding -- Description, Type, the user it runs as, restart
+# policy, hardening keys and WantedBy -- was left as markers then and was
+# read off the live host (`systemctl cat orrery-admission.service`) and
+# filled on 2026-09-04, so this unit no longer refuses to install. If the
+# live unit changes, re-read it and update this file rather than
+# hand-editing the host.
 
 [Unit]
-Description=ORRERY_PLACEHOLDER_UNIT_DESCRIPTION
-# ORRERY_PLACEHOLDER_UNIT_EXTRAS: any other [Unit] keys the live unit
-# carries (After=, Wants=, ...) were not recorded. Replace this comment
-# with them.
+Description=Orrery campaign admission service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=ORRERY_PLACEHOLDER_SERVICE_TYPE
-# ORRERY_PLACEHOLDER_SERVICE_EXTRAS: User=/Group=, Restart=, Environment=
-# and any other [Service] keys the live unit carries were not recorded.
-# Replace this comment with them, keeping the ExecStart below verbatim.
+Type=simple
+User=orrery
+Group=orrery
 ExecStart=/usr/bin/python3 /opt/orrery/bin/admission.py --control /etc/orrery/campaigns.conf --state /var/lib/orrery-admission --invite /opt/orrery/bin/orrery-invite --issuer /var/lib/orrery-admission/issuer.cred --swarm /opt/orrery/bin/p1-swarm --ssh-key /var/lib/orrery-admission/campaign_ssh_key --listen 127.0.0.1:8080 --public-origin https://campaigns.distopik.com
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/var/lib/orrery-admission /var/tmp/orrery
 
 [Install]
-WantedBy=ORRERY_PLACEHOLDER_WANTED_BY
+WantedBy=multi-user.target
