@@ -58,12 +58,60 @@ use std::time::Duration;
 /// Simulated seconds, which for a run with a connected exterior is also wall
 /// clock. Long enough that each human seat's directed links carry more than
 /// the 1,000-packet floor #572 §6.1's binomial band needs to mean anything.
-const ATTEMPT_SECONDS: u64 = 60;
+///
+/// **Two minutes rather than one, and #1053 is why.** `BANKED_MINUTES` is now
+/// squeezed between a floor and a ceiling, and the ceiling is this constant.
+/// The lobby closes the moment it is full rather than sitting out
+/// `--lobby-seconds` (`main.rs`'s `while pending.len() < args.external_slots`),
+/// so both seats are accepted a beat before tick zero and a seat's whole
+/// bracket is the attempt itself: measured on this leg at `ATTEMPT_SECONDS =
+/// 60`, seat 4 bracketed **1.0035 min** and seat 5 **1.0034 min** — 0.2 s of
+/// room above the ledger's 1.0-minute floor, and less than the run-to-run
+/// metronome drift the same run printed (391 ms and 290 ms). At one minute the
+/// two bounds are not merely tight, they overlap inside the noise. Two minutes
+/// puts half a minute on each side of the claim, which is ~75× the observed
+/// drift and 30× the allowance `CLOCK_BOUNDARY_SLACK_MS` grants two clocks.
+/// It costs this leg one more wall minute on a gate whose witnessed hour
+/// already runs about ten.
+const ATTEMPT_SECONDS: u64 = 120;
 /// Bot seats. Slots `[0, 4)`; the human seats are 4 and 5.
 const BOTS: usize = 4;
-/// Minutes each stand-in row banks. Well under the seat's connected span, which
-/// is the ceiling the derivation holds it to.
-const BANKED_MINUTES: f64 = 0.5;
+/// Minutes each stand-in row banks, held between two bounds that must not be
+/// closed by narrowing either of them:
+///
+/// * **at least 1.0**, `p4-ledger.sh`'s `MIN_MEASURED_MINUTES` — a session that
+///   ended seconds after `StartV1` is a failure to seat and not a measurement
+///   (#1053). That floor is a safety guard on real volunteer hours; a fixture
+///   that arranged to sit under it, or that was handed a way around it, would
+///   stop exercising the clause that matters;
+/// * **at most the seat's connected span**, which the derivation clamps to
+///   (`p4-attempt-accounting.py`'s `WALL_BRACKET_BASIS` branch) and the ledger
+///   re-checks off the file. A row over the bracket does not fail — it *banks
+///   less*, silently, and the manifest assertions below would then be
+///   measuring the clamp instead of the seam.
+///
+/// See `ATTEMPT_SECONDS` for why the span is what it is.
+const BANKED_MINUTES: f64 = 1.5;
+
+/// `p4-ledger.sh`'s `MIN_MEASURED_MINUTES`, restated here so that a
+/// `BANKED_MINUTES` narrowed back under the floor fails to *compile* rather
+/// than failing two wall minutes into a nightly with the ledger's refusal —
+/// which is how #1053's floor landing was found, three legs downstream of the
+/// fixture that was actually wrong.
+const LEDGER_MIN_MEASURED_MINUTES: f64 = 1.0;
+const _: () = assert!(
+    BANKED_MINUTES >= LEDGER_MIN_MEASURED_MINUTES,
+    "BANKED_MINUTES is under p4-ledger.sh's MIN_MEASURED_MINUTES; the ledger will refuse it (#1053)"
+);
+/// The upper bound restated in the same place. A seat is connected for about
+/// `ATTEMPT_SECONDS`, and the derivation clamps a claim to that bracket
+/// *silently*, so an over-claim shows up as a manifest mismatch rather than as
+/// a refusal. Half a minute of margin is deliberate: the measured
+/// bracket-versus-nominal drift on this leg is a few hundred milliseconds.
+const _: () = assert!(
+    BANKED_MINUTES + 0.5 <= ATTEMPT_SECONDS as f64 / 60.0,
+    "BANKED_MINUTES leaves no margin under the seat's connected span; raise ATTEMPT_SECONDS"
+);
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_p1-swarm")
@@ -178,10 +226,21 @@ fn run_script(root: &Path, script: &str, args: &[&str], ledger: &Path) -> (bool,
 
 /// One client row, signed by the key the host admitted at `slot`.
 fn signed_row(root: &Path, session_id: &str, slot: usize, target: &str) -> String {
+    // The window the row says it played in, stated as the attempt's own length
+    // rather than left as a constant. Nothing downstream parses these two
+    // fields today — `p4-ledger.sh` asks only that they are non-empty strings —
+    // so a row claiming `BANKED_MINUTES` of play inside a window shorter than
+    // that would pass. It would also be false, and a fixture that is internally
+    // false is a trap set for whichever clause reads these fields next.
+    let wall_end = format!(
+        "2026-09-03T12:{:02}:{:02}Z",
+        ATTEMPT_SECONDS / 60,
+        ATTEMPT_SECONDS % 60
+    );
     let unsigned = serde_json::json!({
         "session_id": session_id,
         "wall_start": "2026-09-03T12:00:00Z",
-        "wall_end": "2026-09-03T12:01:00Z",
+        "wall_end": wall_end,
         "distinct_play_minutes": BANKED_MINUTES,
         "banked_minutes": BANKED_MINUTES,
         "platform_triple": target,
@@ -298,11 +357,14 @@ fn a_real_host_report_banks_human_and_bot_hours_through_the_real_ledger() {
             // `--external-slots 2` with every slot filled.
             "--external-slots",
             "2",
-            // Long enough for two Bevy processes to boot and complete their
-            // handshakes before the simulated clock starts. A short lobby seats
-            // both humans a third of the way into the attempt, which is a real
-            // partial seating and shrinks the connected span their rows are
-            // held under.
+            // A *timeout*, not a duration: the host's lobby loop exits the
+            // moment `pending.len() == args.external_slots`, so with both
+            // runners dialled this closes in about a second and the 45 is only
+            // the budget for two processes to boot and finish their handshakes. What it must
+            // not be is short enough to close on one seat — a lobby that times
+            // out mid-handshake seats a human partway into the attempt and
+            // shrinks the connected span its row is held under, which is the
+            // ceiling `BANKED_MINUTES` sits below.
             "--lobby-seconds",
             "45",
             "--seconds",
