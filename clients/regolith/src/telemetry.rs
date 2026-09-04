@@ -78,7 +78,7 @@ pub struct OverlayMetrics {
     /// Zero is the informative reading: it means the client stepped nothing,
     /// which is a session that is not joined, or one whose own order packet
     /// failed to decode and skipped its step (the path that also increments
-    /// `downlink_undecodable`). Before #1029 this said `2` in a joined
+    /// `own_orders_undecodable`). Before #1029 this said `2` in a joined
     /// campaign, which was the constructor's literal and wrong in both
     /// modes.
     pub prediction_set_size: u64,
@@ -128,7 +128,24 @@ pub struct OverlayMetrics {
     /// `scripts/p4-attempt-accounting.py` reads `banked_minutes` off these
     /// rows by name.
     pub uplink_shed: u64,
-    /// Replication packets that decoded to nothing this client recognises.
+    /// This client's own order packet failing to decode (#1034).
+    ///
+    /// Split from `downlink_undecodable`, which both sides used to feed and
+    /// which made the 2026-09-04 session's 28 740 uninterpretable. This
+    /// counter is the own side alone: a non-zero value means ticks whose
+    /// order packet did not decode, each a skipped step — a literal
+    /// one-tick freeze of this craft — with no downlink implication at all.
+    pub own_orders_undecodable: u64,
+    /// Received downlink traffic that decoded to nothing this client
+    /// recognises (#1034).
+    ///
+    /// The received side alone, since the split; the client's own packet has
+    /// [`Self::own_orders_undecodable`]. Read with care before calling it a
+    /// network failure: witness frames from the bot cohort ride the same
+    /// datagram lane as replication (`orrery_net`'s `send_peer_packets` puts
+    /// every `Channel::State` send on it) and land in the neither-replication
+    /// arm, so a healthy island's steady witness cadence is counted here
+    /// too. The bot cohort's own receive path exempts those frames.
     pub downlink_undecodable: u64,
     /// Ruleset deliveries for an entity this client could not route to.
     pub delivered_unroutable: u64,
@@ -159,6 +176,7 @@ impl OverlayMetrics {
             idle_minutes: 0.0,
             afk_capped: false,
             uplink_shed: 0,
+            own_orders_undecodable: 0,
             downlink_undecodable: 0,
             delivered_unroutable: 0,
             delivered_foreign: 0,
