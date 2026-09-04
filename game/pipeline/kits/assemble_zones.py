@@ -13,10 +13,12 @@ for kp in sorted(glob.glob(os.path.join(master, "*"))):
     feats = json.load(open(fp)); labels = json.load(open(lp)) if os.path.exists(lp) else {}
     for n, f in feats.items():
         L = labels.get(n, {}); lib.append({"name": n, "blend": os.path.join(kp, n + ".blend"), "tags": L.get("tags", [L.get("heuristic", "misc")]), "conf": L.get("confidence", 0.3),
-                                           "dims": f["dims"], "tris": f["tris"], "kit": f["kit"], "planar": f["planar_fraction"], "attach": f.get("attach", ["surface"]), "sockets": f.get("sockets")})
+                                           "dims": f["dims"], "tris": f["tris"], "kit": f["kit"], "planar": f["planar_fraction"], "below": f.get("below_plane", 0.0), "attach": f.get("attach", ["surface"]), "sockets": f.get("sockets")})
 print("library", len(lib), "inserts,", sum(1 for x in lib if x["conf"] >= 0.6), "with confident labels")
+FLAT = {"hull-panel", "plate", "hatch", "grille", "vent", "strip", "rib"}
 def pick(tags, used):
-    c = [x for x in lib if any(t in x["tags"] for t in tags) and x["conf"] >= 0.6 and x["name"] not in used]
+    flat = any(t in FLAT for t in tags)
+    c = [x for x in lib if any(t in x["tags"] for t in tags) and x["conf"] >= 0.6 and x["name"] not in used and (not flat or (x["planar"] >= 0.25 and x["below"] <= 0.15 * max(x["dims"])))]
     if not c: c = [x for x in lib if any(t in x["tags"] for t in tags) and x["name"] not in used]
     if not c: return None
     c.sort(key=lambda x: -x["conf"]); return random.choice(c[:max(3, len(c)//3)])
@@ -79,9 +81,20 @@ for z in Z["zones"]:
         s_fit = random.uniform(*z["scale"]) * min(slot / max(1e-6, e["dims"][0]), cross / max(1e-6, e["dims"][1]))
         # orient: insert +Z along face normal, insert +X along the zone axis
         R = Matrix((t, b, n)).transposed().to_4x4()
+        pos = pos + n * (e["below"] * s_fit)  # lift the part so its mount plane, not its deepest point, touches the face
         o.matrix_world = Matrix.Translation(pos) @ R @ Matrix.Scale(s_fit, 4); o.name = f"{z['name']}_{i}_{e['name']}"
         graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "tags": e["tags"], "pos": [round(v, 3) for v in pos], "normal": list(n), "scale": round(s_fit, 4)})
 print("placed", len(graph))
+# role materials so the render reads: blockout hull grey, kit parts by source, cables safety orange (brief palette)
+def mat(name, rgb):
+    m = bpy.data.materials.get(name) or bpy.data.materials.new(name); m.use_nodes = True
+    b = m.node_tree.nodes.get("Principled BSDF"); b.inputs["Base Color"].default_value = (*rgb, 1); b.inputs["Roughness"].default_value = 0.55; return m
+M = {"hull": mat("hull_grey", (0.54, 0.56, 0.58)), "cables": mat("safety_orange", (0.85, 0.47, 0.17)), "ship-a": mat("dark_panel", (0.17, 0.18, 0.20)), "ship-b": mat("warm_panel", (0.40, 0.41, 0.42)), "mech": mat("canopy_blue", (0.11, 0.25, 0.35))}
+for o in [o for o in bpy.data.objects if o.type == 'MESH']:
+    key = "hull" if o.name in blk else next((k for k in ("cables", "ship-a", "ship-b", "mech") if f"_{k}_" in o.name), "hull")
+    o.data.materials.clear(); o.data.materials.append(M[key])
+    for pgon in o.data.polygons: pgon.material_index = 0
+print("materials", {o.name[:24]: o.data.materials[0].name for o in bpy.data.objects if o.type == 'MESH'})
 mir = Z.get("mirror", "x"); parts = [o for o in bpy.data.objects if o.type == 'MESH']
 for o in parts:
     bbx = [(o.matrix_world @ Vector(c)).x for c in o.bound_box]
