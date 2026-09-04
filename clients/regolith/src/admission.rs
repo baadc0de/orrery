@@ -1292,6 +1292,17 @@ pub fn queue_finished_session(
     queue: &UploadQueue,
     record: &SessionRecord,
 ) -> Result<PendingUpload, String> {
+    // One of the three places a `proton-debug` build refuses (#1060). This is
+    // the only call that puts a row's bytes on disk under `uploads.json`, so
+    // returning before it means such a build has no evidence to send, this
+    // launch or any later one. See `crate::BANKABLE`.
+    //
+    // A `#[cfg]` on the statement rather than `if !crate::BANKABLE`: the
+    // constant folds, but the statement is still in the tree the shipped build
+    // lowers. Cfg-stripping means the ordinary build has no such statement at
+    // all, which is the difference between "optimized away" and "not there".
+    #[cfg(proton_debug)]
+    return Err(crate::NOT_BANKABLE_REASON.to_owned());
     // An unreadable stream costs the telemetry, not the row. The signed
     // record is the evidence; refusing to queue it because the JSONL beside
     // it could not be read is how a measured session goes missing, which is
@@ -1591,6 +1602,15 @@ fn post_upload(origin: &str, session_id: &str, body: &[u8]) -> Result<(), String
 /// The handle is returned so a test can wait for the sweep; the client drops
 /// it and lets the thread run alongside its first frames.
 pub fn retry_pending_uploads(telemetry_path: &Path, origin: &str) -> std::thread::JoinHandle<()> {
+    // The second refusal (#1060). `queue_finished_session` stops this build
+    // minting a row; this stops it posting one an *ordinary* build left behind
+    // in the same application-data directory, which is the way a Proton
+    // session could otherwise bank somebody else's evidence for them.
+    #[cfg(proton_debug)]
+    {
+        eprintln!("regolith: {}", crate::NOT_BANKABLE_REASON);
+        return std::thread::spawn(|| {});
+    }
     let state_path = upload_state_path(telemetry_path);
     let records_path = crate::campaign_record_path(telemetry_path);
     let origin = origin.to_owned();

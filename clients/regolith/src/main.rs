@@ -65,6 +65,18 @@ fn main() {
         return;
     }
     if has_flag(&args, "--build-info") {
+        // Packaging's first use of the binary, and therefore where a
+        // `proton-debug` build stops being packaged (#1060). `package-client.yml`
+        // runs `--build-info > stage/build-info.json` under `set -euo pipefail`,
+        // so this non-zero exit fails the staging step before an archive
+        // exists. A build that cannot bank must not be able to reach a
+        // volunteer either, and refusing to describe itself is how it says so.
+        #[cfg(proton_debug)]
+        {
+            eprintln!("{}", orrery_regolith_client::NOT_BANKABLE_REASON);
+            eprintln!("build-info is refused so this build cannot be packaged (#1060)");
+            std::process::exit(1);
+        }
         // This small, dependency-free JSON record is copied into every release
         // archive by package-client.yml.  The packaging step reads the binary,
         // rather than a second hand-maintained version constant, before it
