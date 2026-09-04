@@ -11,6 +11,9 @@ a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
 sys.path.insert(0, os.path.expanduser("~/TRELLIS.2"))
 import torch; from PIL import Image
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
+import trellis2.pipelines.rembg as _rembg
+# BRIA RMBG-2.0 is gated and non-commercial; we pass RGBA from u2net so the pipeline never calls it. Stub the loader.
+_rembg.BiRefNet = lambda **kw: None
 import o_voxel
 raw = open(a.image, "rb").read(); img = Image.open(a.image).convert("RGBA")
 if not a.no_rembg:
