@@ -1,0 +1,13 @@
+{
+  "collision": "body-2.hf.collision",
+  "hits": 1000,
+  "instance_hits": 194,
+  "load_and_build_s": 0.0033735,
+  "out": "hits-2-rust-hf.bin",
+  "ray_seed": 42,
+  "rays": 5000,
+  "representation": "heightfield+prisms",
+  "start_penetrating": 3,
+  "terrain_hits": 806,
+  "trace_s": 0.342848667
+}

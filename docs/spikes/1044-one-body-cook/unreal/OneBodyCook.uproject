@@ -1,0 +1,29 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "Spike #1044: one-body cook (Mesh Terrain + PCG) with a ruleset collision export from the same intermediate",
+	"Modules": [
+		{
+			"Name": "OneBodyCook",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine",
+				"UnrealEd",
+				"MeshPartition",
+				"MeshPartitionEditor",
+				"PCG"
+			]
+		}
+	],
+	"Plugins": [
+		{ "Name": "MeshPartition", "Enabled": true },
+		{ "Name": "MeshTerrainMode", "Enabled": true },
+		{ "Name": "PCG", "Enabled": true },
+		{ "Name": "GeometryScripting", "Enabled": true },
+		{ "Name": "GeometryProcessing", "Enabled": true },
+		{ "Name": "ModelingToolsEditorMode", "Enabled": true },
+		{ "Name": "ProceduralMeshComponent", "Enabled": true }
+	]
+}

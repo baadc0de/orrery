@@ -1,0 +1,13 @@
+{
+  "collision": "body-1.tri.collision",
+  "hits": 375,
+  "instance_hits": 42,
+  "load_and_build_s": 0.007466833,
+  "out": "hits-1-rust-tri.bin",
+  "ray_seed": 42,
+  "rays": 5000,
+  "representation": "tri",
+  "start_penetrating": 0,
+  "terrain_hits": 333,
+  "trace_s": 0.00560575
+}
