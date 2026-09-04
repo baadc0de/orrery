@@ -33,16 +33,23 @@
 //! re-scoring `ya` at poll time is that a watermark must never drift later than
 //! that instant — a late watermark kills tokens the account legitimately held.
 //!
-//! This reactor therefore calls exactly one store mutation,
-//! [`AccountStore::observe_cooldown`], with exactly the arguments
-//! `apply_dwell` passes it. That gives it three properties by construction:
+//! This reactor therefore calls only the two *monotone* store mutations,
+//! [`AccountStore::observe_cooldown`] and [`AccountStore::record_ban`], with
+//! exactly the arguments `apply_dwell` passes them. That gives it three
+//! properties by construction:
 //!
 //! - it can **create** an entry, stamped at the reactor's own read instant;
 //! - it can **restart** one only under the identical rule the mint path uses,
 //!   namely a live strike newer than the standing entry;
 //! - it can **never retract** one. It does not call
-//!   [`AccountStore::clear_cooldown_if`] and holds no release path at all.
-//!   Release stays where #884 put it: on the mint path, behind the dwell floor.
+//!   [`AccountStore::clear_cooldown_if`] or [`AccountStore::lift_ban_if`], and
+//!   holds no release path at all. Release stays where #884 put it: on the mint
+//!   path, behind the dwell floor.
+//!
+//! The ban row is recorded here and not only on the mint path for the reason
+//! this whole module exists: an account that crosses `B` and then stops logging
+//! in is exactly the case where the score has time to decay back under `B`
+//! before anything reads it, and the row is what survives that decay (#1059).
 //!
 //! One consequence is deliberate and worth stating plainly. With this reactor
 //! running, an account's `dc` entry is stamped at the *crossing* rather than at
@@ -275,9 +282,9 @@ where
                 }
                 StrikesEnforcement::Live => {
                     if refused {
-                        // The only mutation this reactor makes, with exactly
-                        // the arguments the mint path passes. It can create or
-                        // restart an entry; it has no path that retracts one.
+                        // The only mutations this reactor makes, with exactly
+                        // the arguments the mint path passes. Both create or
+                        // keep a row; neither has a path that retracts one.
                         if let Err(error) = self
                             .store
                             .observe_cooldown(
@@ -295,6 +302,27 @@ where
                                 "could not record a cooldown entry; leaving its notice queued"
                             );
                             continue;
+                        }
+                        if observation.level == StandingLevel::Banned {
+                            // D33 clause (e): a ban must outlive the decay of
+                            // the score that produced it, so the crossing is
+                            // what makes it durable — not the account's next
+                            // mint, which may be after the score has fallen
+                            // back under `B` (#1059).
+                            if let Err(error) = self
+                                .store
+                                .record_ban(notice.account, observation.now_ms)
+                                .await
+                            {
+                                outcome.evaluated -= 1;
+                                outcome.failed += 1;
+                                tracing::warn!(
+                                    account = notice.account.0,
+                                    %error,
+                                    "could not record a ban; leaving its notice queued"
+                                );
+                                continue;
+                            }
                         }
                         outcome.published += 1;
                     }
@@ -484,6 +512,70 @@ mod tests {
             queue.remaining().is_empty(),
             "an evaluated notice is drained"
         );
+    }
+
+    /// Three current major findings, which is what puts an account over `B`.
+    fn over_b(mode: StrikeMode) -> Vec<StrikeRow> {
+        vec![
+            strike(mode, FILED_AT_MS),
+            strike(mode, FILED_AT_MS),
+            strike(mode, FILED_AT_MS),
+        ]
+    }
+
+    /// The crossing is where a ban has to become durable, because the account
+    /// that never mints again is exactly the one whose score has time to decay
+    /// back under `B` before anything reads it (#1059).
+    #[tokio::test]
+    async fn a_filing_that_crosses_b_records_a_durable_ban() {
+        let store = store().await;
+        let queue = MemQueue::with([notice(ALICE)]);
+        let reactor = reactor(
+            Arc::clone(&store),
+            Arc::clone(&queue),
+            Rows::new([(ALICE, over_b(StrikeMode::Live))]),
+            FILED_AT_MS + 1_000,
+            StrikesEnforcement::Live,
+        );
+
+        let sweep = reactor.sweep().await.expect("sweep the queue");
+        assert_eq!((sweep.evaluated, sweep.published, sweep.cleared), (1, 1, 1));
+        assert_eq!(
+            store.ban_entry(ALICE).await.expect("read"),
+            Some(crate::BanEntry {
+                banned_at_ms: FILED_AT_MS + 1_000
+            }),
+            "a_filing_that_crosses_b_records_a_durable_ban"
+        );
+        assert!(
+            store.cooldown_entry(ALICE).await.expect("read").is_some(),
+            "and the `dc` entry the invalidation publisher reads is still written"
+        );
+    }
+
+    /// A shadow posture writes neither row. Stated separately from the cooldown
+    /// case because the ban is a second mutation on the same arm, and a control
+    /// that observes at `Shadow` is the defect #934 found.
+    #[tokio::test]
+    async fn a_shadow_posture_records_no_ban_either() {
+        let store = store().await;
+        let queue = MemQueue::with([notice(ALICE)]);
+        let reactor = reactor(
+            Arc::clone(&store),
+            Arc::clone(&queue),
+            Rows::new([(ALICE, over_b(StrikeMode::Live))]),
+            FILED_AT_MS + 1_000,
+            StrikesEnforcement::Shadow,
+        );
+
+        let sweep = reactor.sweep().await.expect("sweep");
+        assert_eq!((sweep.evaluated, sweep.would_publish), (1, 1));
+        assert_eq!(
+            store.ban_entry(ALICE).await.expect("read"),
+            None,
+            "a_shadow_posture_records_no_ban_either"
+        );
+        assert_eq!(queue.remaining(), vec![notice(ALICE)]);
     }
 
     /// D32 clause (b). `Off` must not read, evaluate, publish or drain — and

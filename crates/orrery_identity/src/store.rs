@@ -55,6 +55,32 @@ pub struct CooldownEntry {
     pub entered_at_ms: u64,
 }
 
+/// The identity-owned durable fact that an account is banned.
+///
+/// D33 clause (e) ends "ban never reverses by decay", and
+/// [`crate::standing::StandingThresholds::classify`] cannot express that on its
+/// own: it reports the band the *live score* is in right now, and the score
+/// decays. At clause (d)'s defaults an account banned at 9.0 falls back under
+/// `B` after 5.08 days, so without this row the worst sanction in the record
+/// would expire on the ordinary fourteen-day cooldown dwell (#1059).
+///
+/// This is derived durable state in exactly the sense [`CooldownEntry`] is —
+/// identity alone decides standing, and the value must survive an identity
+/// restart — and its FDB representation is the sibling `dn ‖ account` row in the
+/// same `d` family
+/// ([`orrery_persistd::keyspace::ban_entry_key`]).
+///
+/// Unlike a cooldown entry it is never *restarted*: a later strike on a banned
+/// account changes nothing, because there is no dwell counting down from it.
+/// It is removed only by [`AccountStore::lift_ban_if`], which is the seam an
+/// administrative reversal — D33 clause (e)'s "appealable only by human review
+/// of retained evidence" — attaches to when that surface is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BanEntry {
+    /// Wall-clock instant at which identity first observed `S >= B`.
+    pub banned_at_ms: u64,
+}
+
 /// One account's cooldown entry, as returned by a sweep of the whole family.
 ///
 /// A named pair rather than a bare tuple: this crosses a public trait
@@ -304,6 +330,50 @@ pub trait AccountStore: Send + Sync {
         expected: CooldownEntry,
     ) -> Result<bool, IdentityError>;
 
+    /// Record that this account is banned, and return the durable fact.
+    ///
+    /// Idempotent and **first-write-wins**: an existing row is returned
+    /// unchanged rather than re-stamped at `observed_at_ms`. A ban has no
+    /// dwell for a later observation to extend, so re-stamping would only
+    /// falsify the instant the sanction began — the one thing a human review of
+    /// retained evidence needs to read back.
+    ///
+    /// This does not replace the account's cooldown entry: a banned account is
+    /// also at or above `C`, and the `dc` row it already writes is what D33
+    /// clause (e)'s invalidation publisher reads.
+    async fn record_ban(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+    ) -> Result<BanEntry, IdentityError>;
+
+    /// Read the durable ban, if this account carries one.
+    ///
+    /// The mint path consults this *before* the score bands, which is what
+    /// makes a ban terminal against time: decay can move the band, and cannot
+    /// move this row.
+    async fn ban_entry(&self, account: AccountId) -> Result<Option<BanEntry>, IdentityError>;
+
+    /// Lift one ban only if it is still the ban the caller read.
+    ///
+    /// The same compare-and-clear discipline as [`Self::clear_cooldown_if`],
+    /// and for the mirror-image reason: a concurrent observation that recorded
+    /// a *different* ban must not be erased by a lift authorised against the
+    /// one it replaced. The boolean is false when the row is absent or is no
+    /// longer `expected`.
+    ///
+    /// Nothing on the admission path calls this, and nothing should: D33 clause
+    /// (e) leaves an administrative act — human review of retained evidence —
+    /// as the only thing that ends a ban, and that surface is not built
+    /// (`orrery_persistd::adjudication::uphold_appeal` has no production caller
+    /// either). This is the seam it attaches to, so that building it is wiring
+    /// rather than a redesign.
+    async fn lift_ban_if(
+        &self,
+        account: AccountId,
+        expected: BanEntry,
+    ) -> Result<bool, IdentityError>;
+
     /// Every account currently holding a cooldown entry.
     ///
     /// This is the read D33 clause (e)'s invalidation publisher is built on:
@@ -394,6 +464,26 @@ impl<T: AccountStore + ?Sized> AccountStore for std::sync::Arc<T> {
         account: AccountId,
     ) -> Result<Option<CooldownEntry>, IdentityError> {
         (**self).cooldown_entry(account).await
+    }
+
+    async fn record_ban(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+    ) -> Result<BanEntry, IdentityError> {
+        (**self).record_ban(account, observed_at_ms).await
+    }
+
+    async fn ban_entry(&self, account: AccountId) -> Result<Option<BanEntry>, IdentityError> {
+        (**self).ban_entry(account).await
+    }
+
+    async fn lift_ban_if(
+        &self,
+        account: AccountId,
+        expected: BanEntry,
+    ) -> Result<bool, IdentityError> {
+        (**self).lift_ban_if(account, expected).await
     }
 
     async fn cooldown_entries(&self) -> Result<Vec<CooldownRecord>, IdentityError> {
