@@ -1,0 +1,28 @@
+[package]
+name = "orrery_unreal_direct"
+version = "0.1.0"
+edition = "2021"
+description = "Spike #1052 (the non-App prong): orrery_sim_host over a real ruleset as a staticlib behind the existing C ABI, with no Bevy App, scheduler or task pool, driven by a C consumer that owns the prediction ring and rollback"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Research spike, not a shipping crate (#1042 rule 6). It lives on the spike
+# branch so `scripts/check.sh` covers it; nothing here merges. The `staticlib`
+# is the object an Unreal plugin's `.Build.cs` would link; the `rlib` is what
+# lets `cargo test` compile the crate's own tests against it.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# What is *not* here is the point of the prong: no `bevy_app`, no `bevy_time`,
+# no `lightyear`, no `iroh`, no tokio runtime. `bevy_ecs` arrives transitively
+# through `orrery_sim_host` (its `ecs` backend) and spawns nothing on its own;
+# `tests/c_consumer.rs` asserts the archive carries no symbol from any of the
+# absent crates, so the claim is checked rather than stated.
+[dependencies]
+orrery_core = { path = "../orrery_core" }
+orrery_games = { path = "../orrery_games" }
+orrery_protocol = { path = "../orrery_protocol" }
+orrery_sim_host = { path = "../orrery_sim_host" }
+
+[lints]
+workspace = true
