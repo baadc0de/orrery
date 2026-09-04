@@ -88,3 +88,16 @@ Five scripts, run in order, all headless:
 5. `blender_render.py` — stills.
 
 **Result:** the first assembly that reads as the concept's craft: silhouette from the hull, thrusters, pods, skids, spine detail in the right places. **Open:** a critique loop (render vs concept, adjust counts/scales), parts that straddle the centreline are not mirrored, part orientation within a zone is only axis-aligned, exposure in the still renderer, and materials/decals from the KIT OPS packs are not applied yet.
+
+## Critique loop, mirroring, density (2026-09-05, night)
+
+`critique.py` + `iterate.sh`: assemble → render → Gemini Pro judges hero/side/top against the concept per zone → up to 8 adjustments (scale, count, move, drop, add) applied to the program → parts re-chosen → repeat. Every critique is appended to `zones.json` as provenance. `assemble_hull.py` gained a bisected mirror for centreline parts, a triangle budget proportional to placed size (250–6000), palette materials by zone role, and an extruded "E-07" text decal per flank.
+
+**What the loop taught, in order:**
+1. *Undamped adjustments oscillate.* Round one doubled what round two halved; two drops per pass and a square-root damping on scale factors fixed the swing.
+2. *Material bugs read as design bugs to the critic.* A strength-6 emissive on every thruster-tagged part rendered as white-blue discs; the critic dropped good zones because of it. Emissive is now a faint glow on the main-thruster zone only.
+3. *Relative sizes cannot converge.* With sizes as fractions of a region slot, "make it 2× bigger" meant a different thing per zone and scores sat at 0.3–0.4 across four rounds. Restating the program in **metres** (the extractor reads the callout's dimensions; the assembler scales to `size_m`; the critic nudges metres) lifted the first critique to **0.75**, and its content changed from "everything is the wrong size" to configuration notes (two nose RCS, two rear skids, bigger wing-tip pods).
+4. *Part versus paint.* Stripes, hull numbers, crests and colour panels are paint in the concept; asking geometry to represent them fails every time. The program now classifies `kind` and paint zones go to the texture stage.
+5. *What remains is part choice.* The critic's last complaints were a spike chosen as a skid and a hinge block over the canopy: the visual chooser needs the zone's size and the concept crop of that feature, not the whole concept.
+
+Records: `out/concept2kit-v2/zones.iter*.json`, `zones.json` (with critiques), `choices.json`, `assembly.json`. Site: the "Kitbash zones" toggle shows the round-five result.
