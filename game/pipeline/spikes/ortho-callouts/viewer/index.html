@@ -52,16 +52,19 @@ let model, home, turning = false, wire = false, models = {};
 document.getElementById('bar').style.transform = 'scaleX(.5)';
 const press = (id, fn) => { const b = document.getElementById(id); b.onclick = () => { const v = fn(); if (v !== undefined) b.setAttribute('aria-pressed', v); }; };
 const loader = new GLTFLoader();
+function normalize(obj) {
+  const box = new THREE.Box3().setFromObject(obj), size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
+  const d = Math.max(size.x, size.y, size.z) || 1; obj.position.sub(c); obj.scale.setScalar(2 / d); obj.position.multiplyScalar(2 / d); return size;
+}
 function loadModel(file, first) { loader.load(file, g => {
   if (model) scene.remove(model);
-  model = g.scene; models[file] = model; scene.add(model); if (wire) model.traverse(o => { if (o.isMesh) o.material.wireframe = true; });
+  model = g.scene; const size = normalize(model); models[file] = model; scene.add(model);
+  if (wire) model.traverse(o => { if (o.isMesh) o.material.wireframe = true; });
+  document.getElementById('stats').innerHTML = `${file.replace('.glb','')} · bbox <b>${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)}</b> (source units)<br>drag to orbit · wheel to zoom · right-drag to pan`;
   if (!first) return;
-  const box = new THREE.Box3().setFromObject(model), size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
-  model.position.sub(c); const d = Math.max(size.x, size.y, size.z);
-  camera.position.set(d*1.4, d*0.75, d*1.6); controls.target.set(0,0,0); home = camera.position.clone();
-  document.getElementById('stats').innerHTML = `bbox <b>${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)}</b> (unitless, ~9 m long per brief)<br>drag to orbit · wheel to zoom · right-drag to pan`;
-  const bar = document.getElementById('bar'); bar.style.transform = 'scaleX(1)'; setTimeout(() => bar.remove(), 500);
-}, x => { if (x.total) document.getElementById('bar').style.transform = `scaleX(${x.loaded/x.total})`; }, e => { document.getElementById('stats').textContent = 'Could not load the mesh: ' + e; }); }
+  camera.position.set(2.8, 1.5, 3.2); controls.target.set(0,0,0); home = camera.position.clone();
+  const bar = document.getElementById('bar'); if (bar) { bar.style.transform = 'scaleX(1)'; setTimeout(() => bar.remove(), 500); }
+}, x => { const bar = document.getElementById('bar'); if (bar && x.total) bar.style.transform = `scaleX(${x.loaded/x.total})`; }, e => { document.getElementById('stats').textContent = 'Could not load the mesh: ' + e; }); }
 loadModel('escort.glb', true);
 let retopo = false; let current = 'escort.glb';
 function show(file) { current = file; if (models[file]) { scene.remove(model); model = models[file]; scene.add(model); } else loadModel(file, false); }
