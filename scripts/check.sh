@@ -333,6 +333,24 @@ lane_gates() {
     run scripts/terrain-substrate-gate.sh
     run scripts/terrain-substrate-gate.sh --self-test
 
+    # #1029: a telemetry field assigned once in its constructor and never
+    # again reports that literal in every row a volunteer ships back, and
+    # reads as a measurement. Six of `OverlayMetrics`' fields were in that
+    # state; one 2026-09-04 session's `rollbacks_per_minute: 0` was very
+    # nearly quoted as evidence that reconciliation was not the cause of a
+    # reported stall. The bare invocation scans the client's telemetry
+    # declaration against every production writer under `clients/regolith/src`
+    # (a few milliseconds, no build); its self-test runs the same scanner over
+    # fixtures where a field with no writer, one only a `#[cfg(test)]` module
+    # assigns, one only a bare `#[test]` fn assigns, one merely named in a
+    # comment and a format string, a constructor that sets everything and
+    # writes nothing, a stale exemption, and a telemetry file that parses to
+    # no struct at all must each fail by name — the last because a scanner
+    # that quietly finds nothing is the failure this gate would otherwise
+    # acquire.
+    run scripts/telemetry-liveness-gate.py
+    run scripts/telemetry-liveness-gate.py --self-test
+
     # The clause-link shape check, both halves. ADR-0046 shipped six
     # `[D43](f)`s — a reference-style id with the clause letter glued into
     # what Markdown parses as an inline link destination — after twenty of

@@ -531,6 +531,14 @@ impl DownlinkTracker {
 pub struct TickReport {
     /// Orders the shared pipeline emitted for this tick.
     pub intents: usize,
+    /// Entities this tick actually stepped: D8's predicted set, counted.
+    ///
+    /// One on a tick that stepped this client's craft, zero on a tick that
+    /// did not — not joined, no link, or an order packet that failed to
+    /// decode and skipped the step. The skin reports this to
+    /// `OverlayMetrics::prediction_set_size`, so a stepless tick is visible
+    /// in the JSONL rather than inferred from a constant (#1029).
+    pub predicted: usize,
     /// Events the local prediction step raised (tracers, shot feedback).
     pub events: Vec<Outcome>,
     /// Authoritative inputs delivered to this entity and consumed this tick.
@@ -1336,6 +1344,7 @@ impl CampaignRuntime {
         let mut intents = authored.orders.len();
         let mut report = TickReport {
             intents,
+            predicted: 0,
             events: Vec::new(),
             delivered: Vec::new(),
         };
@@ -1409,6 +1418,12 @@ impl CampaignRuntime {
                 .executor
                 .step_entity(self.entity, tick, &composed.orders)
             {
+                // The predicted set is whatever this tick stepped, and this
+                // is the only place a campaign tick steps anything: one
+                // entity, this client's own craft. Counted here rather than
+                // stated as a constant downstream, so a tick that stepped
+                // nothing reads as zero (#1029).
+                report.predicted += 1;
                 self.witness_log
                     .log_neighbor_frames(tick.0, &outcome.neighbor_frames);
                 self.witness_log.log_tick_hash(outcome.state_hash);
