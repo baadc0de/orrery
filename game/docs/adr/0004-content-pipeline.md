@@ -7,7 +7,7 @@ This decision is normative for the *Mothership* game project. See the [game ADR 
 ## Decision
 
 1. Meshes are produced by a staged, AI-driven pipeline: design document → concept art → callout sheets → model → detailing, texturing and skinning → animation → Unreal. Every stage emits an artifact with a complete provenance record (inputs, prompt, seed, model and version, tool path, licence, reviewer), under Orrery's asset-provenance guard (doc 15).
-2. Generators are **open-weight and local by default**, with **hosted services for hero assets**; the record says which.
+2. Generators are **open-weight and local by default**, with **hosted services for hero assets**; the record says which. **The concept stage is the exception**: hosted by default (Nano Banana for concept and turnarounds, GPT Image for callout sheets) because concept art never ships and reference conformance and iteration matter most there; the open-weight track (Flux.2 klein Apache-2.0 variants, Stable Diffusion with Civitai and in-house style-bible LoRAs) is its reproducible fallback and the source of control-map-constrained orthographics.
 3. **Two human gates**: concept art, and final in-engine. All intermediate stages pass automated checks whose numbers come from the callout sheet.
 4. **glTF 2.0** between stages; USD for scene assembly later; Interchange on import.
 5. **UE5 skeleton** for humanoids; **Control Rig driven by mirror state** for mechs and ships.
