@@ -27,5 +27,5 @@ This decision is normative for the *Mothership* game project. See the [game ADR 
 
 - A content-addressed artifact store and a provenance-chain extension to doc 15's guard.
 - Per-class budgets (triangles per LOD, texel density, texture sizes, collision primitives, bones) live in the callout sheet and are the checks' source of truth.
-- A private asset path for hero assets whose terms fail public redistribution; the season-data distribution record must allow it.
+- Procurement from **CGTrader and Fab** for kits, greebles, PBR sets and decals, each a licensed provenance input. Because marketplace licences permit use but not redistribution, the **private asset store is a first-class path** holding most procured and kit-derived content; the public repository holds pipeline code, provenance records and §1-clean assets only; the season-data distribution record must cover client and cook fetches from the private store.
 - Local generation is a leased, heavy GPU job on the shared box.
