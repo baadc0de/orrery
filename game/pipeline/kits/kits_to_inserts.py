@@ -23,7 +23,19 @@ def dominant_plane(obj):
         key = (round(n.x * 6), round(n.y * 6), round(n.z * 6))
         b = bins.setdefault(key, [0.0, Vector((0, 0, 0)), Vector((0, 0, 0))]); ar = f.calc_area(); b[0] += ar; b[1] += n * ar; b[2] += f.calc_center_median() * ar
     if not bins: bm.free(); return Vector((0, 0, -1)), Vector((0, 0, 0)), 0.0, 0.0
-    key = max(bins, key=lambda k: bins[k][0]); area, nsum, csum = bins[key]
+    # candidates: the largest normal clusters; score = planar area share * flatness (footprint extent / height above plane),
+    # so an elongated part mounts on its long flat side, not on its small end cap
+    size = max(obj.dimensions) or 1.0; verts = [v.co for v in bm.verts]
+    best = None
+    for key in sorted(bins, key=lambda k: -bins[k][0])[:8]:
+        area, nsum, csum = bins[key]; nn = nsum.normalized()
+        ds = [v.dot(nn) for v in verts]; height = (max(ds) - min(ds)) or 1e-6
+        # the plane must sit on the outside: most of the body on one side of it
+        cc = csum / area; side = sum(1 for v in verts if (v - cc).dot(nn) > 0.02 * size) / max(1, len(verts))
+        if side > 0.15: continue
+        score = (area / total) * (size / height)
+        if best is None or score > best[0]: best = (score, key)
+    key = best[1] if best else max(bins, key=lambda k: bins[k][0]); area, nsum, csum = bins[key]
     n = nsum.normalized(); c = csum / area
     # refine: faces within 8 degrees of n and within 1% of size of the plane
     size = max(obj.dimensions) or 1.0

@@ -52,7 +52,9 @@ for z in Z["zones"]:
         used.add(e["name"]); o = load_insert(e)
         pos = fc + t * ((i - (k - 1) / 2) * (span / max(1, k))) + (Vector((z.get("offset", [0, 0])[0], z.get("offset", [0, 0])[1], 0)) if "offset" in z else Vector((0, 0, 0)))
         # footprint fits the zone's cross extent times the scale range
-        cross = b.dot(ext) if abs(b.dot(ext)) > 1e-6 else span; s_fit = random.uniform(*z["scale"]) * min(abs(cross), span / max(1, k)) / max(1e-6, max(e["dims"][:2]))
+        cross = abs(b.dot(ext)) if abs(b.dot(ext)) > 1e-6 else span; slot = span / max(1, k)
+        # fit the insert's footprint (x along the zone axis, y across) into the slot on both axes, then apply the zone's scale range
+        s_fit = random.uniform(*z["scale"]) * min(slot / max(1e-6, e["dims"][0]), cross / max(1e-6, e["dims"][1]))
         # orient: insert +Z along face normal, insert +X along the zone axis
         R = Matrix((t, b, n)).transposed().to_4x4()
         o.matrix_world = Matrix.Translation(pos) @ R @ Matrix.Scale(s_fit, 4); o.name = f"{z['name']}_{i}_{e['name']}"
