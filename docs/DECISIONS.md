@@ -102,6 +102,38 @@ families, one clean prefix byte; D32 clause (c)'s arithmetic and allocation
 rule carry the same correction. The recovered byte is **not pre-spent** by
 any of them (D51 §(c)).
 
+D52 and D53 are **proposed, not accepted**, and are deliberately absent from
+the index above, which is the accepted set.
+[ADR-0052](adr/0052-client-platform-scope.md) proposes splitting R9's
+platform row into a client set (Windows first, Linux second, **macOS kept**)
+and a server set (Linux), leaving the native-only/no-WASM clause verbatim and
+leaving the determinism matrix and the P4 accumulation leg untouched. As first
+written it recommended dropping the macOS client asset; the owner reversed
+that on 2026-09-04 (macOS carries a substantial part of the testers, and
+0.281 of the 1.733 banked player-hours), and the record was revised the same
+day to record the decision as taken, with platform coverage derived from the
+ledger's banked rows rather than from a roster.
+[ADR-0053](adr/0053-unreal-client-host-scope.md) proposes scoping D4 — the
+Bevy client is one host, an Unreal client is another — and records which
+`orrery_sim_host` C ABI seams carry to such a host and which do not.
+
+Both are **the first Orrery records to cite the game project's `G` numbers**,
+which is the convention they establish: an Orrery change made to satisfy a
+`G`-numbered *Mothership* requirement is an Orrery ADR citing that number, not
+a game record reaching into this trail. Both cite
+[#1021](https://github.com/baadc0de/orrery/pull/1021), which **merged on
+2026-09-04**; their `game/docs/...` links are live. #1021 landed with **G11**
+(scale targets and stack boundaries, decided 2026-09-04) added after both
+records were written; D53 was revised the same day to read through G11 — its
+Context §6 records what G11 narrowed, and its clause (g) records that G11's
+first playable slice is D53's acceptance test, with the spikes under
+[#1042](https://github.com/baadc0de/orrery/issues/1042) as the evidence path.
+D52 was checked and is untouched by G11; its 2026-09-04 revision is about the
+owner's macOS decision, not G11. Neither amends any accepted record
+while Proposed: D52's amendment of D1's R9 row and of `00-overview.md` §2
+takes effect only on acceptance, and D53 amends no record's normative text at
+all.
+
 **Keyspace and at-rest allocation, 2026-09-03 (#947).**
 `content/version` gained a seventh field, `universe_seed_fingerprint`, and with
 it two allocations that are recorded here rather than by a new ADR, because
