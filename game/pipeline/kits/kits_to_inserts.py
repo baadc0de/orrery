@@ -90,10 +90,24 @@ for f in files:
         feats[o.name] = {"kit": kit_id, "part": pid, "file": os.path.relpath(f, kit), "src_tris": src_tris, "tris": sum(len(p.vertices) - 2 for p in o.data.polygons),
                          "dims": dims, "aspect": round(max(dims[:2]) / max(1e-6, min(dims[:2])), 2), "height_ratio": round(dims[2] / max(1e-6, max(dims[:2])), 3),
                          "planar_fraction": round(planar, 3), "normal_spread": nspread, "below_plane": round(-min(zs), 4)}
+        # attachment styles: every insert mounts on its plane; elongated parts also get end sockets (cables, pipes, struts)
+        write_set = {o}; feats[o.name]["attach"] = ["surface"]
+        if feats[o.name]["aspect"] >= 3.5:
+            ax = 0 if dims[0] >= dims[1] else 1; cos = [v.co for v in o.data.vertices]; lo_v = min(cos, key=lambda v: v[ax]); hi_v = max(cos, key=lambda v: v[ax])
+            slab = 0.04 * dims[ax]; ends = []
+            for sign, ref in ((-1, lo_v[ax]), (1, hi_v[ax])):
+                sel = [v for v in cos if abs(v[ax] - ref) <= slab]; c = sum(sel, Vector((0, 0, 0))) / len(sel)
+                d = Vector((0, 0, 0)); d[ax] = sign; ends.append((c, d))
+            for i, (c, d) in enumerate(ends):
+                e = bpy.data.objects.new(f"{o.name}.socket_{'ab'[i]}", None); e.empty_display_type = 'ARROWS'; e.empty_display_size = 0.05 * max(dims)
+                bpy.context.scene.collection.objects.link(e); e.parent = o; e.location = c; e.rotation_euler = d.to_track_quat('Y', 'Z').to_euler(); write_set.add(e)
+            feats[o.name]["attach"].append("sockets"); feats[o.name]["sockets"] = [[round(x, 4) for x in c] for c, _ in ends]; feats[o.name]["socket_axis"] = "xy"[ax]
         for x in bpy.data.objects:
             if x.type == 'MESH': x.hide_render = (x.name != o.name)
         thumbnail(o, os.path.join(out, o.name + ".png"))
-        bpy.data.libraries.write(os.path.join(out, o.name + ".blend"), {o}, fake_user=True, compress=True)
+        bpy.data.libraries.write(os.path.join(out, o.name + ".blend"), write_set, fake_user=True, compress=True)
+        for x in list(write_set):
+            if x.type == 'EMPTY': bpy.data.objects.remove(x, do_unlink=True)
         done += 1
     json.dump(feats, open(feat_path, "w"), indent=1); print("FILE", os.path.basename(f), "inserts so far", done, round(time.time() - t0), "s", flush=True)
 print("CONVERTED", done, "inserts to", out)

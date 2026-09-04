@@ -13,7 +13,7 @@ for kp in sorted(glob.glob(os.path.join(master, "*"))):
     feats = json.load(open(fp)); labels = json.load(open(lp)) if os.path.exists(lp) else {}
     for n, f in feats.items():
         L = labels.get(n, {}); lib.append({"name": n, "blend": os.path.join(kp, n + ".blend"), "tags": L.get("tags", [L.get("heuristic", "misc")]), "conf": L.get("confidence", 0.3),
-                                           "dims": f["dims"], "tris": f["tris"], "kit": f["kit"], "planar": f["planar_fraction"]})
+                                           "dims": f["dims"], "tris": f["tris"], "kit": f["kit"], "planar": f["planar_fraction"], "attach": f.get("attach", ["surface"]), "sockets": f.get("sockets")})
 print("library", len(lib), "inserts,", sum(1 for x in lib if x["conf"] >= 0.6), "with confident labels")
 def pick(tags, used):
     c = [x for x in lib if any(t in x["tags"] for t in tags) and x["conf"] >= 0.6 and x["name"] not in used]
@@ -23,6 +23,8 @@ def pick(tags, used):
 def load_insert(e):
     with bpy.data.libraries.load(e["blend"]) as (src, dst): dst.objects = list(src.objects)
     o = [x for x in dst.objects if x and x.type == 'MESH'][0]; sc.collection.objects.link(o)
+    for x in dst.objects:
+        if x and x.type == 'EMPTY': bpy.data.objects.remove(x, do_unlink=True)
     t = sum(len(p.vertices) - 2 for p in o.data.polygons)
     if t > budget:
         m = o.modifiers.new("dec", 'DECIMATE'); m.ratio = budget / t; bpy.context.view_layer.objects.active = o; bpy.ops.object.modifier_apply(modifier="dec")
@@ -39,7 +41,26 @@ for name, spec in Z["blockout"].items():
 FACE = {"top": Vector((0, 0, 1)), "bottom": Vector((0, 0, -1)), "side": Vector((1, 0, 0)), "front": Vector((0, 1, 0)), "back": Vector((0, -1, 0))}
 AX = {"x": Vector((1, 0, 0)), "y": Vector((0, 1, 0)), "z": Vector((0, 0, 1))}
 graph = []; used = set()
+def pick_sockets(tags, used):
+    c = [x for x in lib if "sockets" in x.get("attach", []) and any(t in x["tags"] for t in tags) and x["name"] not in used]
+    return random.choice(c) if c else None
 for z in Z["zones"]:
+    if z.get("type") == "connect":
+        # socket-to-socket: place socket_a at `from`, aim socket_b at `to`, stretch along the cable axis to span the distance
+        e = pick_sockets(z["tags"], used)
+        if not e: print("no socketed insert for zone", z["name"]); continue
+        used.add(e["name"]); o = load_insert(e)
+        A, B = Vector(z["from"]), Vector(z["to"]); sa, sb = Vector(e["sockets"][0]), Vector(e["sockets"][1])
+        ax = sb - sa; L = ax.length; ax.normalize(); tgt_dir = (B - A); D = tgt_dir.length; tgt_dir.normalize()
+        up = Vector(z.get("up", [0, 0, 1])); s_cross = random.uniform(*z["scale"]); s_along = D / max(1e-6, L)
+        # frame: local cable axis -> tgt_dir, local plane normal (+Z) -> up
+        R_local = Matrix((ax, up.cross(ax).normalized() if abs(up.dot(ax)) < 0.99 else Vector((1, 0, 0)), Vector((0, 0, 1)))).transposed().inverted()  # local basis with ax as X
+        bx = tgt_dir; bz = (up - bx * up.dot(bx)).normalized(); by = bz.cross(bx); R_world = Matrix((bx, by, bz)).transposed()
+        S = Matrix.Diagonal((s_along, s_cross, s_cross, 1.0))
+        M = Matrix.Translation(A) @ R_world.to_4x4() @ S @ R_local.to_4x4() @ Matrix.Translation(-sa)
+        o.matrix_world = M; o.name = f"{z['name']}_{e['name']}"
+        graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "tags": e["tags"], "from": z["from"], "to": z["to"], "scale_along": round(s_along, 3), "scale_cross": round(s_cross, 3), "attach": "sockets"})
+        continue
     tgt = blk[z["target"]]; n = FACE[z["face"]]; along = AX[z["along"]]
     bb = [tgt.matrix_world @ Vector(c) for c in tgt.bound_box]; mn = Vector(map(min, *bb)); mx = Vector(map(max, *bb)); ctr = (mn + mx) / 2; ext = mx - mn
     # face centre on the blockout surface; for "side" use the +x face (mirrored later)
