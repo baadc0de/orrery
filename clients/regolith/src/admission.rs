@@ -525,6 +525,19 @@ fn poll_worker(
             // call that mints it, so this session needs its path up front
             // (#947).
             runtime.set_record_path(crate::campaign_record_path(&settings.telemetry_path));
+            // And its upload destination, for the same reason one step on: the
+            // call that mints the row queues the upload, so no teardown path
+            // can persist evidence nothing will send (#1051). The session
+            // starts now, so its telemetry starts at the current end of the
+            // stream -- the same offset `JsonlTelemetry` took when it opened.
+            let telemetry_start = std::fs::metadata(&settings.telemetry_path)
+                .map(|telemetry| telemetry.len())
+                .unwrap_or_default();
+            runtime.set_upload_queue(UploadQueue::new(
+                settings.origin.clone(),
+                &settings.telemetry_path,
+                telemetry_start,
+            ));
             *session = ActiveSession::Campaign(Box::new(runtime));
             commands.insert_resource(UploadManager {
                 origin: settings.origin.clone(),
@@ -1211,6 +1224,251 @@ fn upload_state_path(telemetry_path: &Path) -> PathBuf {
         .join("uploads.json")
 }
 
+/// Where a finished row's evidence goes, fixed before the session ends.
+///
+/// The row and its upload used to be minted in two different places. The row
+/// is minted by [`crate::campaign::CampaignRuntime::finish_record`], which
+/// every teardown path reaches, including through `Drop` during a panic
+/// unwind (#947). The upload was attempted by a Bevy system in `Last`, which
+/// only two of them reach: an `AppExit`, and the link leaving
+/// `JoinState::Joined`. A macOS Cmd+Q raises `applicationWillTerminate:`,
+/// which tears the world down without running another `Last` -- so the row
+/// was minted, signed and persisted, and *nothing ever queued it*. Two
+/// volunteers' sessions had to be hand-carried off their machines (#1051).
+///
+/// So the queue is handed to the runtime before its first tick, and the same
+/// call that mints a row registers the upload for it. Whatever ends the
+/// process after that, the body is on disk and `uploads.json` names it as
+/// unacknowledged, which is all the next launch needs.
+#[derive(Clone, Debug)]
+pub struct UploadQueue {
+    origin: String,
+    state_path: PathBuf,
+    telemetry_path: PathBuf,
+    telemetry_start: u64,
+}
+
+impl UploadQueue {
+    /// Queue rows for `origin`, taking this session's telemetry from
+    /// `telemetry_start` -- see [`crate::telemetry::JsonlTelemetry::session_start`].
+    #[must_use]
+    pub fn new(origin: String, telemetry_path: &Path, telemetry_start: u64) -> Self {
+        Self {
+            origin,
+            state_path: upload_state_path(telemetry_path),
+            telemetry_path: telemetry_path.to_owned(),
+            telemetry_start,
+        }
+    }
+}
+
+/// One upload body that is on disk and that the service has not acknowledged.
+///
+/// A named row rather than a bare tuple: the retry loop carries a session id,
+/// an origin and a path, two of them `String`, and one transposition would
+/// post every volunteer's evidence to a URL built from a session id.
+#[derive(Clone, Debug)]
+pub struct PendingUpload {
+    session_id: String,
+    origin: String,
+    body_path: PathBuf,
+}
+
+impl PendingUpload {
+    /// The exact bytes queued for this session, for a log line a volunteer
+    /// can act on when the service never acknowledges them.
+    #[must_use]
+    pub fn body_path(&self) -> &Path {
+        &self.body_path
+    }
+}
+
+/// Write a finished row's exact upload body and register it as pending.
+///
+/// Registration happens *before* any POST, so a body that exists on disk is
+/// always named by `uploads.json`. Nothing here talks to the network: a
+/// queued upload is a promise the next launch can keep on its own.
+pub fn queue_finished_session(
+    queue: &UploadQueue,
+    record: &SessionRecord,
+) -> Result<PendingUpload, String> {
+    // An unreadable stream costs the telemetry, not the row. The signed
+    // record is the evidence; refusing to queue it because the JSONL beside
+    // it could not be read is how a measured session goes missing, which is
+    // the whole failure this function exists to end.
+    let telemetry = read_session_telemetry(&queue.telemetry_path, queue.telemetry_start)
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "regolith: cannot read telemetry {} ({error}); the row is queued without it",
+                queue.telemetry_path.display()
+            );
+            String::new()
+        });
+    let row =
+        serde_json::to_value(record).map_err(|error| format!("cannot serialize row: {error}"))?;
+    let upload = build_upload_body(vec![row], telemetry)?;
+    persist_and_register(&queue.state_path, &queue.origin, &upload)
+}
+
+/// Put the body on disk and name it in `uploads.json` as unacknowledged.
+fn persist_and_register(
+    state_path: &Path,
+    origin: &str,
+    upload: &UploadBody,
+) -> Result<PendingUpload, String> {
+    let directory = state_path.parent().unwrap_or_else(|| Path::new("."));
+    let body_path = directory.join(format!("upload-{}.json", upload.session_id));
+    durable_write(&body_path, &upload.body)
+        .map_err(|error| format!("cannot preserve {}: {error}", body_path.display()))?;
+    let mut state = read_upload_state(state_path);
+    let already_sent = state
+        .sessions
+        .get(&upload.session_id)
+        .is_some_and(|entry| entry.acknowledged);
+    // Never walk an acknowledgement back. A row can be queued twice -- once by
+    // the mint, once by the exit path that follows it -- and the second must
+    // not re-open a session the service has already taken.
+    if !already_sent {
+        state.sessions.insert(
+            upload.session_id.clone(),
+            UploadEntry {
+                origin: origin.to_owned(),
+                body_path: body_path.clone(),
+                acknowledged: false,
+            },
+        );
+        write_upload_state(state_path, &state)
+            .map_err(|error| format!("cannot write upload retry state: {error}"))?;
+    }
+    Ok(PendingUpload {
+        session_id: upload.session_id.clone(),
+        origin: origin.to_owned(),
+        body_path,
+    })
+}
+
+/// POST one queued body, and record the acknowledgement if it lands.
+///
+/// Returns whether this call is what delivered it. An entry the state file
+/// already calls acknowledged is not posted again.
+fn send_pending(state_path: &Path, pending: &PendingUpload) -> bool {
+    if read_upload_state(state_path)
+        .sessions
+        .get(&pending.session_id)
+        .is_some_and(|entry| entry.acknowledged)
+    {
+        return false;
+    }
+    let result = std::fs::read(&pending.body_path)
+        .map_err(|error| error.to_string())
+        .and_then(|body| post_upload(&pending.origin, &pending.session_id, &body));
+    match result {
+        Ok(()) => {
+            // Re-read rather than mutate a copy: the acknowledgement is
+            // written per session, so a process that dies mid-flush keeps
+            // every acknowledgement it had already earned.
+            let mut state = read_upload_state(state_path);
+            if let Some(entry) = state.sessions.get_mut(&pending.session_id) {
+                entry.acknowledged = true;
+            }
+            if let Err(error) = write_upload_state(state_path, &state) {
+                eprintln!(
+                    "regolith: campaign session {} uploaded but the acknowledgement could not be saved: {error}",
+                    pending.session_id
+                );
+            }
+            true
+        }
+        Err(error) => {
+            eprintln!(
+                "regolith: campaign session {} upload failed: {error}; it will retry next launch, and the volunteer can send {}",
+                pending.session_id,
+                pending.body_path.display()
+            );
+            false
+        }
+    }
+}
+
+/// Everything `uploads.json` still owes the service.
+fn pending_uploads(state: &UploadState) -> Vec<PendingUpload> {
+    state
+        .sessions
+        .iter()
+        .filter(|(_, entry)| !entry.acknowledged)
+        .map(|(session_id, entry)| PendingUpload {
+            session_id: session_id.clone(),
+            origin: entry.origin.clone(),
+            body_path: entry.body_path.clone(),
+        })
+        .collect()
+}
+
+/// Attempt every unacknowledged body, in this thread.
+fn flush_pending(state_path: &Path) {
+    for pending in pending_uploads(&read_upload_state(state_path)) {
+        if send_pending(state_path, &pending) {
+            eprintln!("regolith: campaign session {} uploaded", pending.session_id);
+        }
+    }
+}
+
+/// Queue every recorded row that no `uploads.json` entry accounts for.
+///
+/// This is the #1051 failure exactly: `campaign-records.jsonl` held a signed
+/// row for a session `uploads.json` had never heard of, because the only code
+/// that registered a pending upload lived in a schedule that teardown never
+/// ran. A row on disk with no entry beside it is evidence nobody is going to
+/// send, so the launch that finds it queues it.
+///
+/// The telemetry for such a row cannot be recovered: the JSONL stream carries
+/// no session id and is append-only across every session the binary played,
+/// so there is no honest way to say which bytes were that session's. The row
+/// is the signed evidence and goes up with empty telemetry rather than not at
+/// all -- and the line printed here says that is what happened.
+fn sweep_unregistered_records(state_path: &Path, records_path: &Path, origin: &str) {
+    let Ok(records) = std::fs::read_to_string(records_path) else {
+        return;
+    };
+    let state = read_upload_state(state_path);
+    let mut queued = std::collections::BTreeSet::new();
+    for line in records.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(session_id) = row
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session_id| !session_id.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if state.sessions.contains_key(&session_id) || !queued.insert(session_id.clone()) {
+            continue;
+        }
+        let upload = match build_upload_body(vec![row], String::new()) {
+            Ok(upload) => upload,
+            Err(error) => {
+                eprintln!("regolith: campaign session {session_id} cannot be queued: {error}");
+                continue;
+            }
+        };
+        match persist_and_register(state_path, origin, &upload) {
+            Ok(pending) => eprintln!(
+                "regolith: campaign session {session_id} was recorded and never queued for \
+                 upload; queued now as {} against {origin}, with empty telemetry because this \
+                 run cannot tell which rows of {} were that session's",
+                pending.body_path.display(),
+                records_path.display()
+            ),
+            Err(error) => eprintln!(
+                "regolith: campaign session {session_id} was recorded and cannot be queued: {error}"
+            ),
+        }
+    }
+}
+
 /// Persist an exact upload body, attempt it, and leave a visible retry artifact on failure.
 ///
 /// `telemetry_start` is the byte offset this session's rows begin at, from
@@ -1219,6 +1477,10 @@ fn upload_state_path(telemetry_path: &Path) -> PathBuf {
 /// spanning every session the binary ever played is not its evidence, and it
 /// grows without bound until the service refuses the body (#735). The player's
 /// own file is left whole.
+///
+/// The queueing half of this is normally already done by the mint (see
+/// [`UploadQueue`]); repeating it here is idempotent and costs one rewrite of
+/// identical bytes. What this adds is the immediate attempt.
 pub fn upload_finished_session(
     manager: &UploadManager,
     record: &SessionRecord,
@@ -1226,75 +1488,22 @@ pub fn upload_finished_session(
     telemetry_path: &Path,
     telemetry_start: u64,
 ) {
-    let telemetry = match read_session_telemetry(telemetry_path, telemetry_start) {
-        Ok(value) => value,
+    let queue = UploadQueue::new(manager.origin.clone(), telemetry_path, telemetry_start);
+    let pending = match queue_finished_session(&queue, record) {
+        Ok(pending) => pending,
         Err(error) => {
             error!(
-                "campaign upload not attempted: cannot read telemetry {}: {error}; records remain at {}",
-                telemetry_path.display(),
+                "campaign upload not attempted: {error}; records remain at {}",
                 record_path.display()
             );
             return;
         }
     };
-    let row = match serde_json::to_value(record) {
-        Ok(row) => row,
-        Err(error) => {
-            error!("campaign upload not attempted: cannot serialize row: {error}");
-            return;
-        }
-    };
-    let upload = match build_upload_body(vec![row], telemetry) {
-        Ok(upload) => upload,
-        Err(error) => {
-            error!("campaign upload not attempted: {error}");
-            return;
-        }
-    };
-    let directory = manager
-        .state_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let body_path = directory.join(format!("upload-{}.json", upload.session_id));
-    if let Err(error) = durable_write(&body_path, &upload.body) {
-        error!(
-            "campaign upload not attempted: cannot preserve {}: {error}; records remain at {}",
-            body_path.display(),
-            record_path.display()
-        );
-        return;
-    }
-    let mut state = read_upload_state(&manager.state_path);
-    state.sessions.insert(
-        upload.session_id.clone(),
-        UploadEntry {
-            origin: manager.origin.clone(),
-            body_path: body_path.clone(),
-            acknowledged: false,
-        },
-    );
-    if let Err(error) = write_upload_state(&manager.state_path, &state) {
-        error!(
-            "cannot write upload retry state: {error}; send {} to the operator",
-            body_path.display()
-        );
-        return;
-    }
-    match post_upload(&manager.origin, &upload.session_id, &upload.body) {
-        Ok(()) => {
-            if let Some(entry) = state.sessions.get_mut(&upload.session_id) {
-                entry.acknowledged = true;
-            }
-            if let Err(error) = write_upload_state(&manager.state_path, &state) {
-                error!("upload succeeded but acknowledgement state could not be saved: {error}");
-            } else {
-                info!("campaign session {} uploaded", upload.session_id);
-            }
-        }
-        Err(error) => error!(
-            "campaign upload failed: {error}; it will retry next launch, and the volunteer can send {}",
-            body_path.display()
-        ),
+    // This session's body only. Exit is not the moment to spend a 45-second
+    // request timeout on each older body as well; those are the next launch's
+    // job, and a quit does not wait to be finished with.
+    if send_pending(&manager.state_path, &pending) {
+        info!("campaign session {} uploaded", pending.session_id);
     }
 }
 
@@ -1366,48 +1575,29 @@ fn post_upload(origin: &str, session_id: &str, body: &[u8]) -> Result<(), String
     }
 }
 
-/// Retry exact, unacknowledged upload bodies from earlier runs in the background.
-pub fn retry_pending_uploads(telemetry_path: &Path) {
+/// Sweep and retry every unsent session's evidence, in the background.
+///
+/// Two things can be owed at launch. A body already queued and not
+/// acknowledged -- a failed POST, or a process that died between the mint and
+/// the send. And a row in `campaign-records.jsonl` that no entry names at
+/// all, which is what a teardown path with no upload trigger leaves behind
+/// (#1051). Both are swept here, and both are registered before anything is
+/// posted, so this call can itself be interrupted without losing ground.
+///
+/// `origin` is the service this launch would join through, and is the
+/// destination for a swept row: a record with no entry has no remembered
+/// origin, and the client has exactly one.
+///
+/// The handle is returned so a test can wait for the sweep; the client drops
+/// it and lets the thread run alongside its first frames.
+pub fn retry_pending_uploads(telemetry_path: &Path, origin: &str) -> std::thread::JoinHandle<()> {
     let state_path = upload_state_path(telemetry_path);
+    let records_path = crate::campaign_record_path(telemetry_path);
+    let origin = origin.to_owned();
     std::thread::spawn(move || {
-        let mut state = read_upload_state(&state_path);
-        let pending: Vec<_> = state
-            .sessions
-            .iter()
-            .filter(|(_, entry)| !entry.acknowledged)
-            .map(|(session, entry)| {
-                (
-                    session.clone(),
-                    entry.origin.clone(),
-                    entry.body_path.clone(),
-                )
-            })
-            .collect();
-        let mut changed = false;
-        for (session, origin, body_path) in pending {
-            let result = std::fs::read(&body_path)
-                .map_err(|error| error.to_string())
-                .and_then(|body| post_upload(&origin, &session, &body));
-            match result {
-                Ok(()) => {
-                    if let Some(entry) = state.sessions.get_mut(&session) {
-                        entry.acknowledged = true;
-                        changed = true;
-                    }
-                    eprintln!("campaign session {session} upload retry succeeded");
-                }
-                Err(error) => eprintln!(
-                    "campaign session {session} upload retry failed: {error}; send {} to the operator",
-                    body_path.display()
-                ),
-            }
-        }
-        if changed {
-            if let Err(error) = write_upload_state(&state_path, &state) {
-                eprintln!("cannot save upload acknowledgement state: {error}");
-            }
-        }
-    });
+        sweep_unregistered_records(&state_path, &records_path, &origin);
+        flush_pending(&state_path);
+    })
 }
 
 fn read_upload_state(path: &Path) -> UploadState {
@@ -1562,6 +1752,165 @@ mod tests {
             .expect("respond to client");
         });
         (format!("http://{address}/v1/campaigns/test/join"), received)
+    }
+
+    /// One-shot service that captures a single upload and answers `status`.
+    ///
+    /// Returns the origin, not a join URL: the upload path builds
+    /// `{origin}/v1/sessions/{id}/upload` itself, and the captured request
+    /// line is how a test sees which session was posted.
+    fn upload_test_server(status: &str) -> (String, Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test service");
+        let address = listener.local_addr().expect("test service address");
+        let (sent, received) = mpsc::channel();
+        let status = status.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let body_end = loop {
+                let count = stream.read(&mut buffer).expect("read client request");
+                assert_ne!(count, 0, "client closed request before its headers");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..body_end]).expect("ASCII headers");
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim())
+                    })
+                })
+                .expect("content length")
+                .parse::<usize>()
+                .expect("numeric content length");
+            while request.len() < body_end + length {
+                let count = stream.read(&mut buffer).expect("read client body");
+                assert_ne!(count, 0, "client closed request before its body");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            sent.send(request).expect("return captured request");
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("respond to client");
+        });
+        (format!("http://{address}"), received)
+    }
+
+    /// A minted row that `uploads.json` never heard of is sent on the next launch.
+    ///
+    /// This is #1051 in one assertion. Two macOS volunteers played, the
+    /// client measured and signed their sessions and appended them to
+    /// `campaign-records.jsonl`, and the rows were never uploaded and never
+    /// even *queued*: `uploads.json` held no entry for them, so the retry
+    /// that runs at every launch had nothing to retry and the evidence had to
+    /// be hand-carried. The trigger lived in a `Last` system that a macOS
+    /// Cmd+Q does not reach, while the row was minted in `Drop`, which every
+    /// teardown reaches -- so the two could diverge, and did.
+    ///
+    /// The fix makes the record the thing that is swept, not the queue entry:
+    /// a row on disk with nothing beside it is an upload owed.
+    #[test]
+    fn a_recorded_row_with_no_upload_entry_is_uploaded_on_the_next_launch() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"banked_minutes\":12.355}\n")
+            .expect("write telemetry stream");
+        let session_id = "01a06b05-52e9-7000-8000-00000000feed";
+        std::fs::write(
+            crate::campaign_record_path(&telemetry_path),
+            format!("{{\"session_id\":\"{session_id}\",\"banked_minutes\":12.355}}\n"),
+        )
+        .expect("write the minted row");
+        let state_path = upload_state_path(&telemetry_path);
+        assert!(
+            !state_path.exists(),
+            "the failing case is a row with no upload state beside it at all"
+        );
+
+        let (origin, received) = upload_test_server("204 No Content");
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the sweep thread finishes");
+
+        let request = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the swept row is posted");
+        let request = String::from_utf8(request).expect("UTF-8 request");
+        assert!(
+            request.starts_with(&format!("POST /v1/sessions/{session_id}/upload ")),
+            "the swept row must be posted as its own session: {request}"
+        );
+        assert!(
+            request.contains(&format!("\"session_id\":\"{session_id}\"")),
+            "the posted body must carry the recorded row verbatim: {request}"
+        );
+
+        let state = read_upload_state(&state_path);
+        let entry = state
+            .sessions
+            .get(session_id)
+            .expect("the swept row is now named by uploads.json");
+        assert!(
+            entry.acknowledged,
+            "a 204 means the service holds it; a second launch must not send it again"
+        );
+        assert!(
+            entry.body_path.exists(),
+            "the exact bytes posted stay on disk for the volunteer to hand over"
+        );
+    }
+
+    /// A queued body is named as pending before anything is posted.
+    ///
+    /// The ordering is the durability: a body written and posted before it is
+    /// registered is invisible to every later launch if the process dies in
+    /// between, which is the same divergence #1051 was opened for from the
+    /// other end.
+    #[test]
+    fn queueing_registers_the_pending_upload_without_touching_the_network() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        // A port nothing is listening on: a queue that reached the network
+        // would fail here rather than return.
+        let queue = UploadQueue::new("http://127.0.0.1:1".to_owned(), &telemetry_path, 0);
+        let record = crate::session::CampaignSession::new(
+            "01a06b05-f941-7000-8000-0000000000ff".to_owned(),
+            "2026-09-04T12:00:00Z".to_owned(),
+            crate::session::Actor::Human,
+            ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+        )
+        .finish(
+            "2026-09-04T12:04:11Z".to_owned(),
+            "aarch64-apple-darwin".to_owned(),
+            BUILD_REV.to_owned(),
+            "unavailable-client-side".to_owned(),
+        );
+        let pending = queue_finished_session(&queue, &record).expect("the row queues");
+        assert!(pending.body_path().exists(), "the body is on disk");
+        let state = read_upload_state(&upload_state_path(&telemetry_path));
+        let entry = state
+            .sessions
+            .get(&record.session_id)
+            .expect("the row is registered as pending before any POST");
+        assert!(
+            !entry.acknowledged,
+            "nothing has been posted, so nothing is acknowledged"
+        );
     }
 
     #[test]
