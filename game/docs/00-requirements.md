@@ -310,6 +310,31 @@ Decided with the owner on 2026-09-03; recorded as [game ADR-0002](adr/0002-clien
 - **Minimum client spec is a hardware-raytracing GPU** because Lumen is converging on the HWRT-only path at 60 Hz and MegaLights is built on ray-traced shadows. No baked-lighting fallback exists, so there is no low-end path; that is a deliberate floor, not an omission.
 - **Foliage and clutter are presentation** unless the ruleset says otherwise: Nanite Foliage instances have no canonical existence, so cover is a ruleset collision decision made at cook time, not a per-leaf fact.
 
+## G11 — Scale targets and stack boundaries
+
+Decided with the owner on 2026-09-04. These are the numbers and boundaries the technical specification works from.
+
+| # | Requirement | Source |
+|---|---|---|
+| G11 | **First playable slice: drop, fight, die, respawn.** Ship to one planet and back. **24 players, 12 per side.** No economy beyond loadouts, no seasons, one NPC faction at most. | owner decision |
+| G11.1 | **The mothership is a fixture**, planetoid-scale, and does not travel in-season. It is a space station in all but name. | owner decision |
+| G11.2 | **Mothership concurrency is not density.** Target **hundreds to thousands** of players aboard one mothership; room and corridor scale limits **about 100 visible** in normal circumstances. | owner decision |
+| G11.3 | **Engagements are dozens, and theatre-separated.** Mechs and infantry fight landside; ships and escorts fight in space; neither figures in the other's battle. **12 per side** is the expected size; **50 per side** is the upper bound for a very large battle. | owner decision |
+| G11.4 | **Authoring boundary.** Canonical rules are **Rust code only**. Presentation code and Blueprints live in Unreal. Data the rules need (collision, and whatever else the season fixes) crosses into Rust as **persisted seasonal configuration** (G10.4). | owner decision |
+| G11.5 | **Anti-cheat: witnessing only for the first slice**; EAC with EOS later. | owner decision |
+| G11.6 | **One ledger primitive, one write path.** Currency, standing, items, clone charges, contract escrow and organization pools are one attested value-ledger mechanism. | owner decision |
+| G11.7 | **Social stack is EOS**: voice, text, squads and the open-squad directory. Outside the simulation (G7 consequences). | owner decision |
+
+### Engineering consequences of G11
+
+- **The slice is a bounded Orrery target.** One planet grid, one ship grid, one mothership grid as spawn point, 24 peers, two nesting levels in play (avatar in mech; avatar in ship), clone printers on the ship, full loot. No macro service, no contracts, no seasons. Everything the slice needs exists on the Orrery trail today except the Unreal host (D53), the cook (G10.4) and the printer-respawn write; the slice is the acceptance test for those three.
+- **Visibility, not population, is the interest-management target.** G11.2 turns the mothership problem from "one grid at server population" into "one grid, viewer sees at most about 100": interest management is spatial, bounded by architecture (rooms, corridors, decks), and the hub is a **cell-partitioned static grid** where R6-class density holds per cell. Population is a persistence and matchmaking number, not a replication number. Sub-grids are the natural cut and the doc no longer needs the alternative.
+- **50 per side bounds the witness and bandwidth budget.** Two theatres, each with its own entity class, so the micro layer never carries mechs and ships in one engagement. Plan capacity (doc 14) for 100 players plus their consumable vehicles in one cell cluster, with 24 as the tested baseline.
+- **The rules are a Rust crate per game; Unreal never carries gameplay logic.** Blueprints may drive presentation from mirror state and send intent; they cannot produce a canonical fact. Season configuration is the one channel from the Unreal side into the rules, so it is a typed, digested, versioned artifact (ADR-0021) and the cook is its only producer.
+- **Witnessing-only anti-cheat sets the slice's trust scope**: rule violations are caught, input plausibility is not. That is acceptable for 24 invited testers and is the reason EAC is deferred, not a claim that witnessing suffices at scale. Viewer-dependent replication (G7.8) is the wallhack mitigation and should be in place before open access.
+- **The ledger primitive is an Orrery feature**, not a game one: an attested, escrow-capable, per-owner value store with one write path, of which currency, standing, inventory and clone charges are instances. It replaces several separately-described writes in G3, G5, G6 and G7 and should be specified once.
+- **EOS is a client-side dependency only.** Presence, lobbies and voice attach to the Unreal client; the Orrery peer identity and the EOS identity are linked by the game, and the server never depends on EOS.
+
 ## Open items
 
 Loose ends collected from the sections above.
