@@ -46,6 +46,7 @@ def pick(z, i, used):
     return random.choice(c) if c else None
 graph = []; used = set()
 for z in Z["zones"]:
+    if z.get("kind") == "paint": graph.append({"zone": z["name"], "kind": "paint", "region": z["region"], "note": "handed to texture stage"}); continue
     fs = region_faces(z["region"])
     if not fs: print("empty region", z["name"], z["region"]); continue
     c, n, t, b, ext = region_frame(fs)
@@ -59,7 +60,8 @@ for z in Z["zones"]:
         if abs(up.dot(d)) > 0.95: up = Vector((0, 0, 1))
         lz = Vector((0, 0, 1)); ly = lz.cross(ax).normalized(); R_local = Matrix((ax, ly, lz)).transposed().inverted()
         bz = (up - d * up.dot(d)).normalized(); by = bz.cross(d); R_world = Matrix((d, by, bz)).transposed()
-        s_cross = random.uniform(*z["scale"]) * 0.6; S = Matrix.Diagonal((D / max(1e-6, L), s_cross, s_cross, 1.0))
+        s_cross = z.get("thickness_m", 0.15) / max(1e-6, min(e["dims"][:2]))  # connect zones: size_m is the run length; thickness_m sets the cable cross-section
+        S = Matrix.Diagonal((D / max(1e-6, L), s_cross, s_cross, 1.0))
         o.matrix_world = Matrix.Translation(A) @ R_world.to_4x4() @ S @ R_local.to_4x4() @ Matrix.Translation(-sa); o.name = f"{z['name']}_{e['name']}"
         graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "from": z["region"], "to": z.get("region_to"), "attach": "sockets"}); continue
     k = max(1, z["count"]); span = (ext[1] if t.y != 0 else ext[0]) * 0.85; cross = (ext[0] if t.y != 0 else ext[1]) or span
@@ -69,15 +71,17 @@ for z in Z["zones"]:
         if not e: print("no part for", z["name"]); break
         used.add(e["name"]); o = load_insert(e)
         pos, nn = surface_at(c, n, t, (i - (k - 1) / 2) * (span / k)); tt = (t - nn * t.dot(nn)).normalized(); bb = nn.cross(tt)
-        slot = span / k; s_fit = random.uniform(*z["scale"]) * min(slot / max(1e-6, e["dims"][0]), cross / max(1e-6, e["dims"][1]))
-        cap = z.get("max_size_m", 2.5) / max(1e-6, max(e["dims"])); s_fit = min(s_fit, cap)  # no single part larger than max_size_m
+        slot = span / k
+        if z.get("size_m"): s_fit = z["size_m"] / max(1e-6, max(e["dims"]))  # absolute size from the program
+        else: s_fit = random.uniform(*z["scale"]) * min(slot / max(1e-6, e["dims"][0]), cross / max(1e-6, e["dims"][1]))
+        cap = z.get("max_size_m", 4.0) / max(1e-6, max(e["dims"])); s_fit = min(s_fit, cap)
         pos = pos + nn * (e["below"] * s_fit + 0.01)
         o.matrix_world = Matrix.Translation(pos) @ Matrix((tt, bb, nn)).transposed().to_4x4() @ Matrix.Scale(s_fit, 4); o.name = f"{z['name']}_{i}_{e['name']}"
         placed_m = max(e["dims"]) * s_fit; tb = int(max(250, min(budget, 1800 * placed_m ** 1.5)))  # triangle budget grows with placed size
         tr = sum(len(pg.vertices) - 2 for pg in o.data.polygons)
         if tr > tb:
             m = o.modifiers.new("lod", 'DECIMATE'); m.ratio = tb / tr; bpy.context.view_layer.objects.active = o; bpy.ops.object.modifier_apply(modifier="lod")
-        graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "region": z["region"], "pos": [round(v, 3) for v in pos], "scale": round(s_fit, 4), "attach": "surface"})
+        graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "region": z["region"], "pos": [round(v, 3) for v in pos], "scale": round(s_fit, 4), "placed_m": round(max(e["dims"]) * s_fit, 2), "attach": "surface"})
 print("placed", len(graph))
 def mat(name, rgb, rough=0.55, metal=0.0, emit=None, alpha=1.0):
     m = bpy.data.materials.get(name) or bpy.data.materials.new(name); m.use_nodes = True; bs = m.node_tree.nodes.get("Principled BSDF")

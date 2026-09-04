@@ -10,11 +10,12 @@ SCHEMA = {"type": "object", "properties": {"overall": {"type": "string"}, "score
 ap = argparse.ArgumentParser(); ap.add_argument("--project", required=True); ap.add_argument("--model", default="gemini-3.1-pro-preview"); ap.add_argument("--concept", required=True)
 ap.add_argument("--renders", nargs="+", required=True); ap.add_argument("--zones", required=True); ap.add_argument("--assembly", required=True); ap.add_argument("--atlas", required=True); ap.add_argument("--out", required=True); a = ap.parse_args()
 Z = json.load(open(a.zones)); A = json.load(open(a.assembly)); atlas = json.load(open(a.atlas))
-summary = [{"zone": z["name"], "type": z["type"], "region": z["region"], "tags": z["tags"], "count": z["count"], "scale": z["scale"], "feature": z.get("concept_feature", "")} for z in Z["zones"]]
+summary = [{"zone": z["name"], "type": z["type"], "kind": z.get("kind", "part"), "region": z["region"], "tags": z["tags"], "count": z["count"], "size_m": z.get("size_m"), "feature": z.get("concept_feature", "")} for z in Z["zones"]]
 placed = {p["zone"]: p for p in A["placements"]}
 prompt = f"""You are the art director reviewing an automated kitbash against its concept art. The first image is the CONCEPT. The following images are RENDERS of the current assembly (hero 3/4, side, top). Materials follow the brief palette: painted warm-grey hull, dark panels, safety-orange accents, blue emissive thrusters, aluminium fasteners; the hull number is a text decal on the flanks.
 Current design program (zones), one per feature: {json.dumps(summary)}
-Placements that actually happened (zone -> insert, scale): {json.dumps({k: {"insert": v["insert"], "scale": v.get("scale")} for k, v in placed.items()})}
+Placements that actually happened (zone -> insert, placed size in metres): {json.dumps({k: {"insert": v.get("insert"), "placed_m": v.get("placed_m")} for k, v in placed.items()})}
+Zones with kind "paint" are intentionally absent from the geometry (they will be painted later); do not ask for them as parts. The craft is 9 m long: judge sizes in metres, e.g. "thruster should be ~1.2 m, is 2.4 m".
 Hull regions available: {list(atlas["regions"].keys())}
 Judge each zone: is the feature present, at the right place, right size, right density compared to the concept? Then give adjustments: "scale" with scale_factor (0.5..2.0), "count" with count_delta, "move" with a new region, "drop", or "add" a missing feature (region, tags from the existing tag vocabulary, count). Be decisive and sparse: at most 8 adjustments, only where the render clearly disagrees with the concept. Give an overall 0..1 fidelity score and a two-sentence overall note."""
 parts = [{"text": prompt}, {"text": "CONCEPT:"}, img(a.concept)]
@@ -31,7 +32,8 @@ for adj in C["adjust"]:
     z = byname.get(adj["zone"]); act = adj["action"]
     if act == "scale" and z:
         f = max(0.5, min(2.0, adj.get("scale_factor", 1.0))) ** 0.5  # damped: half the requested change in log space, so passes converge instead of oscillating
-        z["scale"] = [round(max(0.15, min(1.5, v * f)), 3) for v in z["scale"]]
+        if z.get("size_m"): z["size_m"] = round(max(0.1, min(4.0, z["size_m"] * f)), 3)
+        else: z["scale"] = [round(max(0.15, min(1.5, v * f)), 3) for v in z["scale"]]
         if f > 1.0 and z["scale"][1] >= 1.2: z["max_size_m"] = round(min(3.5, z.get("max_size_m", 2.5) * f), 2)
         if f < 1.0 and z.get("max_size_m", 2.5) > 2.5: z["max_size_m"] = round(max(2.5, z["max_size_m"] * f), 2)
     elif act == "count" and z: z["count"] = max(0, z["count"] + adj.get("count_delta", 0))

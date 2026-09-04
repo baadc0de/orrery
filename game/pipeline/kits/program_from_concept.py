@@ -6,8 +6,9 @@ VOCAB = ["hull-panel","plate","strip","rib","frame","block","box","cylinder","pi
 SCHEMA = {"type": "object", "properties": {"asset": {"type": "string"}, "zones": {"type": "array", "items": {"type": "object", "properties": {
   "name": {"type": "string"}, "type": {"type": "string", "enum": ["surface", "connect"]}, "region": {"type": "string"}, "region_to": {"type": "string"},
   "tags": {"type": "array", "items": {"type": "string"}}, "count": {"type": "integer"}, "along": {"type": "string", "enum": ["x", "y"]},
-  "scale": {"type": "array", "items": {"type": "number"}}, "concept_feature": {"type": "string"}, "why": {"type": "string"}},
-  "required": ["name", "type", "region", "tags", "count", "scale", "concept_feature"]}}}, "required": ["asset", "zones"]}
+  "scale": {"type": "array", "items": {"type": "number"}}, "size_m": {"type": "number"}, "kind": {"type": "string", "enum": ["part", "paint"]},
+  "concept_feature": {"type": "string"}, "why": {"type": "string"}},
+  "required": ["name", "type", "region", "tags", "count", "scale", "size_m", "kind", "concept_feature"]}}}, "required": ["asset", "zones"]}
 def token(): return subprocess.check_output(["gcloud", "auth", "print-access-token"], text=True).strip()
 def img(p): return {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(open(p, "rb").read()).decode()}}
 ap = argparse.ArgumentParser(); ap.add_argument("--project", required=True); ap.add_argument("--model", default="gemini-3.1-pro-preview"); ap.add_argument("--concept", required=True); ap.add_argument("--callout", required=True)
@@ -17,12 +18,13 @@ prompt = f"""You are the design-program author for a kitbash pipeline. Read the 
 The hull already exists as a coarse mesh. Kit parts are placed onto named REGIONS of that hull. Region names are side.long.lat with side in {atlas['vocabulary']['side']}, long in {atlas['vocabulary']['long']} (fore = nose end), lat in {atlas['vocabulary']['lat']} (inner = near the centreline). Regions that exist on this hull, largest first, with area in m2: {json.dumps(atlas['regions'])}. The hull is {atlas['dims_m']} m (x width, y length, z height); it is mirrored across x, so describe only the +x half and centreline; anything you place on a flank appears on both sides.
 Part tags must come from this vocabulary only: {', '.join(VOCAB)}.
 Zone types: "surface" places `count` parts on the region, laid along axis `along`, each scaled so its footprint is `scale` (min,max fraction) of the slot; "connect" stretches one elongated part (cable/conduit/pipe/strut) from `region` centroid to `region_to` centroid.
+For every zone give `size_m`: the real-world largest dimension in metres of ONE placed part, judged against the brief (9 m long, 6 m span, 2.5 m tall) and the callout sheet's dimensions; e.g. a main thruster nozzle ~1.2, an RCS block ~0.5, a wing panel ~1.5, a skid ~1.8, a vent ~0.6. Give `kind`: "part" for geometry that protrudes (thrusters, RCS, pylons, skids, vents, hatches, conduits, hinges), "paint" for anything that is a flat painted or decal feature in the concept (stripes, hull numbers, crests, colour panels); paint zones are handed to the texture stage and never become geometry.
 Write one zone per distinct feature you can see in the concept or read in the callout sheet: conduit runs, panel lines, vents, RCS clusters, hardpoints, pylons, skids, sensor masts, canopy frame, emissive housings, decals areas (as plate). Name the concept feature each zone reproduces and say why in one clause. 8 to 16 zones. Prefer fewer, larger parts over clutter; leave the canopy region itself empty.
 
 BRIEF:
 {open(a.brief).read()}"""
 body = {"contents": [{"role": "user", "parts": [{"text": prompt}, {"text": "CONCEPT ART:"}, img(a.concept), {"text": "CALLOUT SHEET:"}, img(a.callout)]}],
-        "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json", "responseSchema": SCHEMA, "maxOutputTokens": 8000}}
+        "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json", "responseSchema": SCHEMA, "maxOutputTokens": 24000}}
 url = f"https://aiplatform.googleapis.com/v1/projects/{a.project}/locations/global/publishers/google/models/{a.model}:generateContent"
 req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"})
 with urllib.request.urlopen(req, timeout=300) as r: resp = json.loads(r.read())
