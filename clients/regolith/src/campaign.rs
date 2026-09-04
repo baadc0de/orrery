@@ -760,6 +760,19 @@ pub struct CampaignRuntime {
     /// a row and dropped it on the floor (#947). Durability now belongs to
     /// the same call that mints it, so no later step can lose it.
     record_path: Option<PathBuf>,
+    /// Where the finished row's upload is queued the instant it is minted.
+    ///
+    /// The same argument as `record_path`, one step further along. Writing
+    /// the row durably was not enough: the *upload* was still triggered by a
+    /// Bevy system in `Last` that only an `AppExit` or a lost link reaches,
+    /// so a teardown that ran neither -- a macOS Cmd+Q, which goes straight
+    /// to `applicationWillTerminate:` and clears the world -- persisted a row
+    /// that nothing would ever send (#1051). Minting and queueing are now the
+    /// same act, and the queue survives the process.
+    ///
+    /// `None` for a fixture or an offline-minted row with no service behind
+    /// it; such a row is still on disk, and the next launch's sweep finds it.
+    upload_queue: Option<crate::admission::UploadQueue>,
     record_disposition: RecordDisposition,
 }
 
@@ -1045,6 +1058,7 @@ impl CampaignRuntime {
             hearsay: crate::hearsay::HearsayState::default(),
             record_written: false,
             record_path: None,
+            upload_queue: None,
             record_disposition: RecordDisposition::Unfinished,
             config,
             executor,
@@ -2089,37 +2103,77 @@ impl CampaignRuntime {
         // (#947). Nothing downstream can now lose what this call measured.
         self.record_disposition = match &self.record_path {
             Some(path) => match append_session_record(path, &record) {
-                Ok(()) if !record.is_measurement() => {
-                    // Loud, and to the volunteer rather than only to a log
-                    // file: this is the case where everything downstream is
-                    // valid and nothing downstream is worth anything (#1053).
-                    bevy::log::error!(
-                        "campaign session {} lasted {:.3} min, below the {} min measurement \
-                         floor: recorded to {} as evidence of a failed seating, not as play",
-                        record.session_id,
-                        record.distinct_play_minutes,
-                        crate::session::MIN_MEASURED_MINUTES,
-                        path.display()
-                    );
-                    eprintln!(
-                        "regolith: this campaign session lasted {:.3} minutes, which is below \
-                         the {} minute measurement floor. The host dropped you almost \
-                         immediately, so nothing was measured and nothing will bank. The row \
-                         was still written to {} — please send it with your report.",
-                        record.distinct_play_minutes,
-                        crate::session::MIN_MEASURED_MINUTES,
-                        path.display()
-                    );
-                    RecordDisposition::PersistedBelowFloor
-                }
                 Ok(()) => {
-                    bevy::log::info!(
-                        "campaign session {} recorded to {} ({} recorded min)",
-                        record.session_id,
-                        path.display(),
-                        record.banked_minutes
-                    );
-                    RecordDisposition::Persisted
+                    let disposition = if record.is_measurement() {
+                        bevy::log::info!(
+                            "campaign session {} recorded to {} ({} recorded min)",
+                            record.session_id,
+                            path.display(),
+                            record.banked_minutes
+                        );
+                        RecordDisposition::Persisted
+                    } else {
+                        // Loud, and to the volunteer rather than only to a log
+                        // file: this is the case where everything downstream is
+                        // valid and nothing downstream is worth anything (#1053).
+                        bevy::log::error!(
+                            "campaign session {} lasted {:.3} min, below the {} min measurement \
+                             floor: recorded to {} as evidence of a failed seating, not as play",
+                            record.session_id,
+                            record.distinct_play_minutes,
+                            crate::session::MIN_MEASURED_MINUTES,
+                            path.display()
+                        );
+                        eprintln!(
+                            "regolith: this campaign session lasted {:.3} minutes, which is below \
+                             the {} minute measurement floor. The host dropped you almost \
+                             immediately, so nothing was measured and nothing will bank. The row \
+                             was still written to {} — please send it with your report.",
+                            record.distinct_play_minutes,
+                            crate::session::MIN_MEASURED_MINUTES,
+                            path.display()
+                        );
+                        RecordDisposition::PersistedBelowFloor
+                    };
+                    // Queue the upload in the same breath as the row, and for
+                    // a below-floor row too. Every teardown path reaches this
+                    // call; only two of them reached the exit system that used
+                    // to be the sole trigger, and the rest left a signed row
+                    // nothing would send (#1051). Nothing here talks to the
+                    // network -- the body and its `uploads.json` entry are
+                    // written, and either this run's exit or the next launch
+                    // posts them.
+                    //
+                    // A sub-floor row is queued on the same terms as any
+                    // other: it is the volunteer's signed evidence that a
+                    // seating failed, and the service is where that has to
+                    // become visible. `p4-ledger.sh` is the side that refuses
+                    // to *bank* it (#1053). A client that quietly declined to
+                    // send it would be #1051 again, one disposition over.
+                    match &self.upload_queue {
+                        Some(queue) => {
+                            match crate::admission::queue_finished_session(queue, &record) {
+                                Ok(pending) => bevy::log::info!(
+                                    "campaign session {} queued for upload as {}",
+                                    record.session_id,
+                                    pending.body_path().display()
+                                ),
+                                Err(error) => bevy::log::error!(
+                                    "campaign session {} could not be queued for upload: {error}; \
+                                     the row is on disk at {} and the next launch will sweep it",
+                                    record.session_id,
+                                    path.display()
+                                ),
+                            }
+                        }
+                        None => bevy::log::warn!(
+                            "campaign session {} has no upload destination; the row is on disk \
+                             at {} and the next launch will sweep it",
+                            record.session_id,
+                            path.display()
+                        ),
+                    }
+                    disposition
                 }
                 Err(error) => {
                     bevy::log::error!(
@@ -2147,6 +2201,15 @@ impl CampaignRuntime {
             }
         };
         Some(record)
+    }
+
+    /// Name where this session's upload is queued, before any tick is flown.
+    ///
+    /// Called at session construction, beside [`Self::set_record_path`].
+    /// Without it a finished row is durable but unqueued, and only the next
+    /// launch's sweep of `campaign-records.jsonl` will send it (#1051).
+    pub fn set_upload_queue(&mut self, queue: crate::admission::UploadQueue) {
+        self.upload_queue = Some(queue);
     }
 
     /// Name the file finished rows are appended to, before any tick is flown.

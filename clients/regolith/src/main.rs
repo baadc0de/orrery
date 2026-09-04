@@ -172,8 +172,12 @@ fn main() {
         &args,
         std::env::var_os("ORRERY_TELEMETRY_JSONL"),
     );
-    retry_pending_uploads(&telemetry_path);
     let admission_url = resolve_admission_url(&args, std::env::var("ORRERY_ADMISSION_URL").ok());
+    // After the origin is resolved, because a row this sweep finds unqueued
+    // carries no origin of its own: it was recorded by a run whose upload was
+    // never registered at all (#1051), and the only service this client knows
+    // is the one it would join through now.
+    drop(retry_pending_uploads(&telemetry_path, &admission_url));
 
     let headless_config = headless_campaign.as_deref().map(|campaign_id| {
         let nickname = headless_nickname

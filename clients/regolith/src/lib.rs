@@ -732,6 +732,14 @@ impl Plugin for RegolithSkinPlugin {
         // handshake overlaps window startup instead of serialising behind it.
         // Before any session can measure a minute, make a panic say so (#947).
         install_campaign_panic_hook();
+        // The origin this session reports back to, resolved before the
+        // runtime is built so the row's upload destination is known at the
+        // same moment its record path is (#1051).
+        let origin = self
+            .campaign
+            .as_ref()
+            .and_then(|config| config.roster_url.as_deref())
+            .and_then(admission::origin_of_roster_url);
         let session = match &self.campaign {
             Some(config) => {
                 let mut runtime = campaign::CampaignRuntime::launch(config.clone(), SEED);
@@ -740,6 +748,19 @@ impl Plugin for RegolithSkinPlugin {
                 // sign one and drop it. The path must therefore be known
                 // before the first tick is flown, not at exit.
                 runtime.set_record_path(campaign_record_path(&self.telemetry_path));
+                // Same argument, one step on (#1051): the exit system that
+                // used to be the only thing that queued an upload is reached
+                // by an `AppExit` and by a lost link, and by no other
+                // teardown. A macOS Cmd+Q reaches neither. So the mint
+                // queues, and every path that can produce a row produces a
+                // pending upload with it.
+                if let Some(origin) = &origin {
+                    runtime.set_upload_queue(admission::UploadQueue::new(
+                        origin.clone(),
+                        &self.telemetry_path,
+                        sink.session_start(),
+                    ));
+                }
                 ActiveSession::Campaign(Box::new(runtime))
             }
             None => ActiveSession::Local(Box::<LocalSession>::default()),
@@ -751,12 +772,7 @@ impl Plugin for RegolithSkinPlugin {
         // session directories and not one uploaded record (#711). The origin
         // comes from the roster URL this session actually joined through, the
         // same single source the lobby path uses.
-        if let Some(origin) = self
-            .campaign
-            .as_ref()
-            .and_then(|config| config.roster_url.as_deref())
-            .and_then(admission::origin_of_roster_url)
-        {
+        if let Some(origin) = origin {
             app.insert_resource(admission::UploadManager::for_origin(
                 origin,
                 &self.telemetry_path,
@@ -3007,6 +3023,17 @@ pub(crate) fn campaign_record_path(session_record_path: &Path) -> PathBuf {
 /// [`CampaignRuntime::finish_record`] is idempotent and still refuses a
 /// session that reached no joined tick, so neither trigger can produce a
 /// second row or a zero-minute placeholder.
+///
+/// Those are the two moments this system runs in, and **they are not the two
+/// moments a session can end.** This system lives in `Last`, and a teardown
+/// that never runs another schedule never reaches it: `bevy_winit`'s
+/// `exiting` handler, which macOS reaches from `applicationWillTerminate:`
+/// through winit's `LoopExiting`, clears the world and runs no schedule at
+/// all. So this system is no longer where the upload is *decided*. The row's
+/// upload is queued by [`CampaignRuntime::finish_record`], durably and
+/// before any POST, and what is left here is the immediate attempt — a
+/// courtesy that saves a volunteer one relaunch, not the thing the evidence
+/// depends on (#1051).
 fn write_campaign_record_on_exit(
     mut exited: MessageReader<AppExit>,
     mut session: ResMut<ActiveSession>,
@@ -3083,21 +3110,34 @@ fn write_campaign_record_on_exit(
         // volunteer's own evidence, it is still signed, and the service is
         // where the failure it records has to become visible; `p4-ledger.sh`
         // is the side that refuses to *bank* it (#1053). Withholding it would
-        // trade a quietly-banked non-measurement for a quietly-dropped one.
+        // trade a quietly-banked non-measurement for a quietly-dropped one --
+        // which is the shape of #1051, so both dispositions queue and both
+        // send.
         campaign::RecordDisposition::Persisted
-        | campaign::RecordDisposition::PersistedBelowFloor => {
-            if let Some(upload) = &upload {
-                admission::upload_finished_session(
-                    upload,
-                    &record,
-                    &campaign_record_path(&metrics.session_record_path),
-                    &metrics.session_record_path,
-                    // Only this run's rows. The stream is append-only
-                    // across every session the binary played (#735).
-                    sink.session_start(),
-                );
-            }
-        }
+        | campaign::RecordDisposition::PersistedBelowFloor => match &upload {
+            Some(upload) => admission::upload_finished_session(
+                upload,
+                &record,
+                &campaign_record_path(&metrics.session_record_path),
+                &metrics.session_record_path,
+                // Only this run's rows. The stream is append-only
+                // across every session the binary played (#735).
+                sink.session_start(),
+            ),
+            // This arm used to be an `if let` with no `else`, and it is the
+            // one branch in this function that said nothing at all: a
+            // persisted row and no uploader is a session whose evidence stops
+            // at the volunteer's disk, and it read in a log exactly like a
+            // successful upload -- which is to say, like nothing (#1051). The
+            // row is still recoverable, because the next launch sweeps
+            // `campaign-records.jsonl` for rows `uploads.json` does not name.
+            None => error!(
+                "campaign session {} was recorded to {} and this run has no upload \
+                 destination for it; the next launch will send it",
+                record.session_id,
+                campaign_record_path(&metrics.session_record_path).display()
+            ),
+        },
         // `finish_record` has already logged the failure and told the player
         // on stderr; what matters here is that nothing is uploaded.
         disposition => {
@@ -3394,6 +3434,60 @@ mod tests {
             lost.record_disposition(),
             campaign::RecordDisposition::Lost,
             "a row minted with nowhere to go is the loss, and must be named one"
+        );
+    }
+
+    /// A row below the measurement floor is queued for upload like any other.
+    ///
+    /// The two defects meet here. #1053 added a disposition for a session the
+    /// host dropped before it could measure anything, and #1051 moved the
+    /// upload's queueing into the call that mints the row. A `match` arm that
+    /// queued only `Persisted` would leave a signed below-floor row on the
+    /// volunteer's disk with nothing to send it -- which is #1051 exactly,
+    /// one disposition over, and it would hide the very seating failure the
+    /// row was written to make visible. The ledger is what refuses to bank a
+    /// sub-floor row; the client's job is only to deliver it.
+    ///
+    /// Nothing here reaches the network: queueing writes the body and names
+    /// it in `uploads.json` as unacknowledged, and the send is a separate act.
+    #[test]
+    fn a_below_floor_row_is_queued_for_upload_by_the_call_that_mints_it() {
+        let temporary = tempfile::tempdir().expect("temporary client state");
+        let telemetry_path = temporary.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06327-329f-7443-a211-11f3dee18420";
+        let mut runtime =
+            campaign::CampaignRuntime::finished_for_test(banking_campaign_config(session_id), SEED);
+        runtime.set_record_path(campaign_record_path(&telemetry_path));
+        // A port nothing listens on: a queue that posted would fail, not pass.
+        runtime.set_upload_queue(admission::UploadQueue::new(
+            "http://127.0.0.1:1".to_owned(),
+            &telemetry_path,
+            0,
+        ));
+        assert!(runtime.finish_record().is_some());
+        assert_eq!(
+            runtime.record_disposition(),
+            campaign::RecordDisposition::PersistedBelowFloor,
+            "this fixture flies a handful of ticks, so it is below the floor (#1053)"
+        );
+
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(temporary.path().join("uploads.json"))
+                .expect("the mint wrote upload state beside the row"),
+        )
+        .expect("upload state is JSON");
+        let entry = &state["sessions"][session_id];
+        assert_eq!(
+            entry["acknowledged"], false,
+            "the row is queued and not yet sent; the send is the next step, not this one"
+        );
+        let body_path = entry["body_path"]
+            .as_str()
+            .expect("the queued entry names the exact bytes to post");
+        assert!(
+            std::path::Path::new(body_path).exists(),
+            "a below-floor row's upload body is on disk like any other's"
         );
     }
 
