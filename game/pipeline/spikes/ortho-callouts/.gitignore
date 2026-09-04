@@ -1,8 +1,7 @@
+out/**/*.png
+out/**/*.glb
+out/**/*.blend
+out/**/*.blend1
 out/*.png
-out/proxy/*.png
-out/proxy/*.blend
-out/trellis/*.png
-out/trellis/*.glb
-out/retopo/*
-out/kitbash*/*
+out/proxy/*
 viewer/*.glb
