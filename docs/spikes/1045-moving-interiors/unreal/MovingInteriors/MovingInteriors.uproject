@@ -1,0 +1,17 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "Spike #1045: moving interiors - an avatar inside a ship under way, the Unreal mirror in a per-grid local frame, undock and boarding without a loading screen, rollback across the frame change",
+	"Modules": [
+		{
+			"Name": "MovingInteriors",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [ "Engine" ]
+		}
+	],
+	"Plugins": [
+		{ "Name": "PythonScriptPlugin", "Enabled": true, "TargetAllowList": [ "Editor" ] }
+	]
+}

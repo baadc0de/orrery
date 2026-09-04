@@ -58,6 +58,11 @@ members = [
     # Unreal's line trace. A member so `check.sh` covers it; nothing depends
     # on it and it depends on nothing in the tree.
     "crates/onebody_collision_trace",
+    # Spike #1045 (research branch, never merged): a throwaway nested-frame
+    # ruleset on `orrery_sim_host` as a `staticlib`, the C consumer that rolls
+    # back across a frame change, and the header the Unreal plugin shares with
+    # it. A member so `check.sh` covers it; nothing depends on it.
+    "crates/orrery_unreal_interiors",
 ]
 
 # The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /

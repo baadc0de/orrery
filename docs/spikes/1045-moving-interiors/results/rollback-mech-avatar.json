@@ -1,0 +1,22 @@
+{
+  "schema": "orrery-interiors-rollback/1",
+  "scene": "mech", "ticks": 36000, "transitions": 4,
+  "loadavg_start": 8.47, "loadavg_end": 10.12,
+  "corrections": 4, "mismatch_window": 0, "mismatch_after": 0, "rollback": 4, "snap": 0, "restore_failed": 0, "replay_step_failed": 0, "events_reemitted_by_replay": 4, "lockstep_compared": 249, "lockstep_mismatch": 0,
+  "total_ns": {"p50": 34635, "p99": 39393, "max": 39393},
+  "by_transition": [
+    {"transition": "board_docked", "shape": "avatar", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 9, "residual_mm_max": 40, "total_ns_p50": 36438, "total_ns_p99": 36438},
+    {"transition": "undock", "shape": "avatar", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 9, "residual_mm_max": 40, "total_ns_p50": 25558, "total_ns_p99": 25558},
+    {"transition": "mount", "shape": "avatar", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 9, "residual_mm_max": 20, "total_ns_p50": 34635, "total_ns_p99": 34635},
+    {"transition": "dismount", "shape": "avatar", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 9, "residual_mm_max": 20, "total_ns_p50": 39393, "total_ns_p99": 39393}
+  ],
+  "by_depth": [
+    {"depth": 9, "n": 4, "mismatch_window": 0, "mismatch_after": 0, "total_ns_p50": 34635, "total_ns_p99": 39393, "total_ns_max": 39393}
+  ],
+  "corrections_detail": [
+    {"transition": "board_docked", "shape": "avatar", "tc": 250, "ta": 250, "now": 259, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 9, "residual_mm": 40, "frame_before": 2, "frame_after": 2, "restore_ns": 11832, "install_ns": 491, "replay_ns": 24115, "total_ns": 36438},
+    {"transition": "undock", "shape": "avatar", "tc": 300, "ta": 299, "now": 308, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 9, "residual_mm": 40, "frame_before": 2, "frame_after": 2, "restore_ns": 742, "install_ns": 180, "replay_ns": 24636, "total_ns": 25558},
+    {"transition": "mount", "shape": "avatar", "tc": 1550, "ta": 1548, "now": 1557, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 9, "residual_mm": 20, "frame_before": 3, "frame_after": 3, "restore_ns": 4799, "install_ns": 1082, "replay_ns": 28754, "total_ns": 34635},
+    {"transition": "dismount", "shape": "avatar", "tc": 35400, "ta": 35397, "now": 35406, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 9, "residual_mm": 20, "frame_before": 2, "frame_after": 2, "restore_ns": 10489, "install_ns": 822, "replay_ns": 28082, "total_ns": 39393}
+  ]
+}

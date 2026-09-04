@@ -1,0 +1,9 @@
+rollback scene=mech ticks=36000 transitions=4 corrections=300 mismatch_window=0 mismatch_after=0 rollback=300 snap=0 restore_failed=0 replay_step_failed=0 events_reemitted_by_replay=4 lockstep_compared=114 lockstep_mismatch=0 total_ns_p50=19436 total_ns_p99=21630 total_ns_max=22772 loadavg=0.68/0.68
+transition      shape        n  mis_w  mis_a    h_chg resid_mm     ns_p50     ns_p99
+board_docked    identity     1      0      0        0        0      20047      20047
+undock          identity     1      0      0        0        0      19937      19937
+mount           identity     1      0      0        0        0      19957      19957
+dismount        identity     1      0      0        0        0      19837      19837
+control         ship       296      0      0     2664        0      19426      21701
+depth     n  mis_w  mis_a     ns_p50     ns_p99     ns_max
+9       300      0      0      19436      21630      22772

@@ -1,0 +1,23 @@
+rollback scene=transitions ticks=14400 transitions=144 corrections=191 mismatch_window=0 mismatch_after=0 rollback=191 snap=0 restore_failed=0 replay_step_failed=0 events_reemitted_by_replay=144 lockstep_compared=114 lockstep_mismatch=0 total_ns_p50=19577 total_ns_p99=23324 total_ns_max=28393 loadavg=0.68/0.68
+transition      shape        n  mis_w  mis_a    h_chg resid_mm     ns_p50     ns_p99
+board_docked    identity     9      0      0        0        0      19626      20869
+board_docked    ship         7      0      0      105      451      19656      19927
+board_docked    avatar       8      0      0       72       81      19566      21921
+undock          identity     9      0      0        0        0      19706      20508
+undock          ship         7      0      0       63        0      19627      19817
+undock          avatar       8      0      0       72       40      19857      20959
+eva             identity     9      0      0        0        0      19627      20338
+eva             ship         7      0      0       91      493      19607      19867
+eva             avatar       8      0      0       72       40      19486      19817
+board_underway  identity     9      0      0        0        0      19576      21891
+board_underway  ship         8      0      0      120      488      19506      20177
+board_underway  avatar       7      0      0       63     1435      19396      20709
+dock            identity     9      0      0        0        0      19827      28393
+dock            ship         8      0      0       72        0      19847      21009
+dock            avatar       7      0      0       63       40      19737      19867
+disembark       identity     9      0      0        0        0      19596      20077
+disembark       ship         8      0      0      104      569      19457      20018
+disembark       avatar       7      0      0       63       39      19417      20037
+control         ship        47      0      0      423        0      19176      23324
+depth     n  mis_w  mis_a     ns_p50     ns_p99     ns_max
+9       191      0      0      19577      23324      28393

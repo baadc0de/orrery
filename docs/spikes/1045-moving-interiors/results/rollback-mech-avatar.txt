@@ -1,0 +1,8 @@
+rollback scene=mech ticks=36000 transitions=4 corrections=4 mismatch_window=0 mismatch_after=0 rollback=4 snap=0 restore_failed=0 replay_step_failed=0 events_reemitted_by_replay=4 lockstep_compared=249 lockstep_mismatch=0 total_ns_p50=34635 total_ns_p99=39393 total_ns_max=39393 loadavg=8.47/10.12
+transition      shape        n  mis_w  mis_a    h_chg resid_mm     ns_p50     ns_p99
+board_docked    avatar       1      0      0        9       40      36438      36438
+undock          avatar       1      0      0        9       40      25558      25558
+mount           avatar       1      0      0        9       20      34635      34635
+dismount        avatar       1      0      0        9       20      39393      39393
+depth     n  mis_w  mis_a     ns_p50     ns_p99     ns_max
+9         4      0      0      34635      39393      39393

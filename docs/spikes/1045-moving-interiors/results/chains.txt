@@ -1,0 +1,20 @@
+ship kind=1 frame=0 pos=(100000000,50000,0) vel=(0,0,0) yaw=0 roll=0 changes=1
+mech kind=2 frame=2 pos=(6000,0,0) vel=(0,0,0) yaw=0 roll=0 changes=0
+avatar kind=3 frame=2 pos=(0,4000,0) vel=(0,2400,0) yaw=1570796 roll=0 changes=1
+trace scene=rest ticks=36000 chain=2bd46da08e13a9ad tick_ns_p50=2244 tick_ns_p99=2434 tick_ns_max=25367 input_dropped=0 snapshot_failed=0
+ship kind=1 frame=0 pos=(129737267,50000,0) vel=(50000,0,0) yaw=0 roll=0 changes=1
+mech kind=2 frame=2 pos=(6000,0,0) vel=(0,0,0) yaw=0 roll=0 changes=0
+avatar kind=3 frame=2 pos=(0,4000,0) vel=(0,2400,0) yaw=1570796 roll=0 changes=1
+trace scene=straight ticks=36000 chain=306d7102aadfc342 tick_ns_p50=2214 tick_ns_p99=2344 tick_ns_max=15409 input_dropped=0 snapshot_failed=0
+ship kind=1 frame=0 pos=(397479767,50000,0) vel=(500000,0,0) yaw=0 roll=1640866 changes=1
+mech kind=2 frame=2 pos=(6000,0,0) vel=(0,0,0) yaw=0 roll=0 changes=0
+avatar kind=3 frame=2 pos=(0,4000,0) vel=(0,2400,0) yaw=1570796 roll=0 changes=1
+trace scene=roll ticks=36000 chain=c801ca8b27dce808 tick_ns_p50=2204 tick_ns_p99=3416 tick_ns_max=32541 input_dropped=0 snapshot_failed=0
+ship kind=1 frame=0 pos=(397479767,50000,0) vel=(500000,0,0) yaw=0 roll=1640866 changes=1
+mech kind=2 frame=2 pos=(6000,16980,0) vel=(0,1200,0) yaw=1570796 roll=0 changes=0
+avatar kind=3 frame=2 pos=(5000,29000,0) vel=(0,2400,0) yaw=1570796 roll=0 changes=3
+trace scene=mech ticks=36000 chain=dfcc3bb8ef11f50d tick_ns_p50=2164 tick_ns_p99=2284 tick_ns_max=16360 input_dropped=0 snapshot_failed=0
+ship kind=1 frame=1 pos=(3978408,50000,0) vel=(0,0,0) yaw=0 roll=0 changes=48
+mech kind=2 frame=2 pos=(6000,0,0) vel=(0,0,0) yaw=0 roll=0 changes=0
+avatar kind=3 frame=1 pos=(3978408,464320,0) vel=(0,-2400,0) yaw=4712388 roll=0 changes=96
+trace scene=transitions ticks=14400 chain=9f3277ab8bf0bb4d tick_ns_p50=2204 tick_ns_p99=2475 tick_ns_max=21460 input_dropped=0 snapshot_failed=0
