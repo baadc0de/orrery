@@ -115,12 +115,18 @@ Bevy client is one host, an Unreal client is another — and records which
 Both are **the first Orrery records to cite the game project's `G` numbers**,
 which is the convention they establish: an Orrery change made to satisfy a
 `G`-numbered *Mothership* requirement is an Orrery ADR citing that number, not
-a game record reaching into this trail. Both therefore cite
-[#1021](https://github.com/baadc0de/orrery/pull/1021), which is **open, not
-merged**; their `game/docs/...` links are dead until it lands, and **neither
-can be accepted before it does**. Neither amends any accepted record while
-Proposed: D52's amendment of D1's R9 row and of `00-overview.md` §2 takes
-effect only on acceptance, and D53 amends no record's normative text at all.
+a game record reaching into this trail. Both cite
+[#1021](https://github.com/baadc0de/orrery/pull/1021), which **merged on
+2026-09-04**; their `game/docs/...` links are live. #1021 landed with **G11**
+(scale targets and stack boundaries, decided 2026-09-04) added after both
+records were written; D53 was revised the same day to read through G11 — its
+Context §6 records what G11 narrowed, and its clause (g) records that G11's
+first playable slice is D53's acceptance test, with the spikes under
+[#1042](https://github.com/baadc0de/orrery/issues/1042) as the evidence path.
+D52 was checked and is untouched by G11. Neither amends any accepted record
+while Proposed: D52's amendment of D1's R9 row and of `00-overview.md` §2
+takes effect only on acceptance, and D53 amends no record's normative text at
+all.
 
 **Keyspace and at-rest allocation, 2026-09-03 (#947).**
 `content/version` gained a seventh field, `universe_seed_fingerprint`, and with

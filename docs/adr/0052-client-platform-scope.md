@@ -6,15 +6,16 @@ This record is non-normative until accepted. See the [ADR
 index](../DECISIONS.md) for precedence, scope, and the complete accepted
 decision set. Acceptance is reserved to the owner.
 
-> **This record cites a pull request that is not merged.** Its entire
-> requirement basis — [G10.5], [game ADR-0002] clause 4 — lives on the branch
-> `docs/game-design-requirements`, open as **[#1021]** at the time of writing.
-> **This record cannot be accepted before #1021 is**, because until then the
-> requirement on whose behalf it amends [D1] is a proposal in a trail that does
-> not yet exist on `main`. Every `game/docs/...` link below is dead until that
-> merge, deliberately: they are the citation, not a convenience. If #1021 lands
-> changed, re-read clause (a) against the merged G10.5 before accepting; if
-> #1021 is closed unmerged, this record is withdrawn rather than re-argued.
+> **Citation status, 2026-09-04.** This record was written against [#1021]
+> while it was open. #1021 merged on 2026-09-04 (`ee5d671`); every
+> `game/docs/...` link below is now live, and [G10.5]'s merged text is the
+> text clause (a) quotes, unchanged. #1021 also added **G11** (scale targets
+> and stack boundaries) after this record was written. G11 is re-read in
+> [D53]; it was checked against this record too and **touches nothing here** —
+> G11 fixes the slice's size and the Rust/Unreal authoring boundary, and this
+> record is about which platforms the client ships on. Its "24 invited testers"
+> does not answer the roster question in §"What this record could not
+> establish"; that stays open. Status stays Proposed.
 
 **Citation convention, established here.** *Mothership* is a separate project
 with its own decision trail under `game/docs/adr/`, co-located because Orrery
