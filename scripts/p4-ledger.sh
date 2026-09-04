@@ -109,6 +109,8 @@ self_test() {
     || die 'self-test: total no longer counts distinct measurements; a re-measurement would double its hours'
   has 'human_session_id' \
     || die 'self-test: the human session identity is gone; same-seed human hours would collapse'
+  has 'elif .identity.attempt_id then {attempt_id: .identity.attempt_id}' \
+    || die 'self-test: a campaign bot contribution no longer carries its attempt into the measurement key; every generation of a standing host would collapse into one distinct bot measurement and the human-mix denominator would stop growing with wall time'
   has 'actor' \
     || die 'self-test: the bot|human dimension is gone; P4 cannot check its required mix'
   has 'validate_session_record' \
@@ -603,7 +605,7 @@ self_test() {
   # The bot contribution: the cohort's `B * valid_attempt_seconds / 3600`, one
   # per attempt, binding no seat.
   st_bot_contribution() {
-    local out="$bind_dir/bot.json"
+    local out="$bind_dir/bot${1:+-$1}.json"
     jq -n --arg attempt "${1:-$st_attempt}" '{
       identity: {
         seed: 5,
@@ -885,6 +887,88 @@ self_test() {
   st_bind_refuses player_hours_must_equal_the_signed_interval \
     "$(st_derived 7 018f9000-0000-7000-8000-0000000000d4 30 12 x86_64-unknown-linux-gnu \
         '.player_hours = 6.0')"
+
+  # ── The banking unit is a seat interval, on both sides (#1048) ────────────
+  #
+  # A standing host runs generation after generation against the same seed,
+  # impairment and target, and each generation's bot seats occupy a **disjoint
+  # wall interval**. `run_key` already told the two apart, because it hashes
+  # the whole identity and the identity carries the attempt. `measurement_key`
+  # did not, so `total`'s `distinct` fold — which is what the ≥25% human-mix
+  # line is computed over — pinned the bot denominator at one generation's
+  # hours however long the campaign ran.
+  #
+  # These two fixtures are the mutation target for that clause. The first is
+  # what fails if the attempt is dropped from the bot measurement key; the
+  # second is what fails if it is added to the *provenance* key instead, or if
+  # the CI collapse it must preserve is broken.
+  local mix_dir="$dir/mix"
+  mkdir -p "$mix_dir"
+  local gen2=018f9000-0000-7000-8000-00000000d002
+  local bot_gen2
+  bot_gen2=$(st_bot_contribution "$gen2")
+  "$0" append "$bot_gen2" >/dev/null 2>&1 \
+    || die 'self-test [two_generations_are_two_bot_measurements]: a second generation was refused'
+  jq -es 'map(select(.actor == "bot"))
+          | (length == 2)
+          and ((map(.run_key) | unique | length) == 2)
+          and ((map(.measurement_key) | unique | length) == 2)' \
+    "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [two_generations_are_two_bot_measurements]: two generations of bots collapsed into one distinct measurement; the mix denominator stops growing with wall time'
+  # Both generations reach the distinct fold `total` prints, so the bot side of
+  # the mix is the two generations' hours and not one of them.
+  grep -q 'bot: 8 distinct hours = 4.0 + 4.0 (2 distinct measurement(s))' <<<"$("$0" total 2>&1)" \
+    || die "self-test [two_generations_are_two_bot_measurements]: the distinct fold did not carry both generations' bot hours ('$("$0" total 2>&1)')"
+  # And the direction is the one that matters: collapsing the two generations
+  # back into one measurement — what this ledger did before #1048 — reports a
+  # *higher* human mix off the same evidence, which is the floor being cleared
+  # by running longer rather than by anyone playing more.
+  jq -es "$JQ_PRELUDE"'
+    (distinct | map(.player_hours) | add) as $all
+    | (distinct | map(select(actor == "human") | .player_hours) | add) as $human
+    | (distinct | unique_by([(actor), .seed, .impairment, .target,
+                             (.human_session_id // null)])) as $collapsed
+    | ($collapsed | map(.player_hours) | add) as $collapsed_all
+    | ($human / $all) < ($human / $collapsed_all)
+  ' "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [two_generations_are_two_bot_measurements]: collapsing the generations did not raise the reported human mix; the fixture has stopped measuring the defect it names'
+  st_bind_ok two_generations_are_two_bot_measurements
+
+  # The restart case, stated as the ledger sees it. A host that dies and comes
+  # back mints a fresh `attempt_id` (`scripts/p1-swarm-always-on.py`,
+  # `mint_attempt_id` — a UUIDv7 materialised as a directory created without
+  # `exist_ok`, so a reused id raises rather than overwrites), so its next
+  # generation banks as its own interval. What must never happen is the *same*
+  # generation banking twice: a replayed report, a restored shard, or a
+  # re-derivation at another commit.
+  local before_restart
+  before_restart=$(st_lines)
+  "$0" append "$bot_gen2" >/dev/null 2>&1 \
+    || die 'self-test [a_restart_banks_no_second_copy_of_one_generation]: re-appending an identical report errored instead of deduping'
+  [[ $(st_lines) == "$before_restart" ]] \
+    || die 'self-test [a_restart_banks_no_second_copy_of_one_generation]: an identical replay of a generation banked a second time'
+  st_bind_refuses a_restart_banks_no_second_copy_of_one_generation \
+    "$(jq --arg a "$gen2" '.identity.commit = "3333333333333333333333333333333333333333"' \
+        "$bot_gen2" > "$mix_dir/bot-gen2-recommit.json"; echo "$mix_dir/bot-gen2-recommit.json")"
+
+  # And the collapse the key exists for is untouched: a leg with no attempt —
+  # every CI bot leg — is still one measurement however many times it is
+  # re-run, because a deterministic re-run of one seed re-measures one
+  # simulated hour rather than measuring a second one.
+  local no_attempt_a no_attempt_b
+  no_attempt_a=$(jq 'del(.identity.attempt_id) | del(.attempt)
+                     | .identity.commit = "4444444444444444444444444444444444444444"' \
+                   "$bot_gen2" > "$mix_dir/plain-a.json"; echo "$mix_dir/plain-a.json")
+  no_attempt_b=$(jq '.identity.commit = "5555555555555555555555555555555555555555"' \
+                   "$no_attempt_a" > "$mix_dir/plain-b.json"; echo "$mix_dir/plain-b.json")
+  P4_LEDGER_FILE="$mix_dir/plain.jsonl" "$0" append "$no_attempt_a" >/dev/null 2>&1 \
+    || die 'self-test [a_deterministic_rerun_is_still_one_measurement]: an attempt-less bot leg was refused'
+  P4_LEDGER_FILE="$mix_dir/plain.jsonl" "$0" append "$no_attempt_b" >/dev/null 2>&1 \
+    || die 'self-test [a_deterministic_rerun_is_still_one_measurement]: its re-run was refused'
+  jq -es '(length == 2) and ((map(.measurement_key) | unique | length) == 1)' \
+    "$mix_dir/plain.jsonl" >/dev/null \
+    || die 'self-test [a_deterministic_rerun_is_still_one_measurement]: two runs of one seed with no attempt stopped collapsing; a re-measurement would count as a second hour'
+  st_bind_ok a_deterministic_rerun_is_still_one_measurement
 
   # ── Retained: nothing above loosened the pre-cohort path ──────────────────
   #
@@ -1325,10 +1409,47 @@ cmd_append() {
   # simulated hour. A human session is deliberately an additional input: two
   # humans on the same seed are two pieces of false-positive evidence.
   # Canonicalize before hashing so JSON field order cannot alter the count.
+  #
+  # ── Why a *campaign* bot contribution also carries its attempt (#1048) ─────
+  #
+  # The collapse above is right for the thing it was written for: a nightly
+  # that re-runs one deterministic seed is re-measuring one simulated hour, and
+  # that is provenance rather than a second hour of evidence. It is wrong for a
+  # standing campaign, and the mix criterion is what it breaks.
+  #
+  # `cmd_total` computes "human mix" over `distinct`, i.e. over
+  # `measurement_key`. A bot contribution is `B * valid_attempt_seconds / 3600`
+  # for one generation of the standing host, and every generation runs the same
+  # seed, the same impairment and the same target — the supervisor passes no
+  # `--seed` (`scripts/p1-swarm-always-on.py`, `Supervisor.command`). So without
+  # the attempt in this key, *every* generation of the campaign collapses into
+  # one distinct bot measurement, while every human seat interval stays distinct
+  # because `human_session_id` is minted per interval.
+  #
+  # Measured on the 2026-09-04 evidence: a second generation of the same five
+  # bots banks its 1.25 provenance hours and adds **zero** distinct bot hours,
+  # so the reported mix stays 27% where the truth is 2.5 bot against 0.483
+  # human, i.e. 16% — under the floor. The denominator stops growing with wall
+  # time while the numerator keeps growing, so the ≥25% floor is cleared by
+  # running longer rather than by anyone playing more. That is the criterion
+  # measuring something other than what it says.
+  #
+  # Two generations are two *different wall intervals with different people in
+  # them*, never a re-run of one another; the attempt id is what says so. Legs
+  # that carry no `attempt_id` — every CI bot leg — are untouched and still
+  # collapse, so the reason the collapse exists is preserved exactly.
+  #
+  # Stated plainly, because it moves a number in the direction that needs
+  # saying out loud: this makes distinct bot hours **larger**, so the 25% floor
+  # becomes *harder* and the raw 500-hour figure rises faster with bot time. It
+  # adds no human hour and banks no interval that was not measured; it stops
+  # discarding bot-hours that were separately measured on disjoint wall time.
   measurement_key=$(jq -cS --arg pipeline "$pipeline" --arg actor "$actor" \
     '{pipeline: $pipeline, actor: $actor, seed: .identity.seed,
       impairment: .identity.impairment, target: .identity.target}
-     + (if $actor == "human" then {human_session_id: .identity.human_session_id} else {} end)' \
+     + (if $actor == "human" then {human_session_id: .identity.human_session_id}
+        elif .identity.attempt_id then {attempt_id: .identity.attempt_id}
+        else {} end)' \
     "$report" | sha256_hex | cut -c1-16)
 
   mkdir -p "$(dirname "$LEDGER")"
@@ -1409,7 +1530,8 @@ readonly JQ_PRELUDE='
   def banked: unique_by(.run_key);
   def measurement:
     (.measurement_key // ([.pipeline, (.actor // "bot"), .seed, .impairment,
-                          .target, (.human_session_id // null)] | tojson));
+                          .target, (.human_session_id // null),
+                          (.attempt_id // null)] | tojson));
   def actor: (.actor // "bot");
   def distinct: banked | unique_by(measurement);
   # serde emits 32.0 where the swarm accumulated exactly 32 hours, and jq keeps
