@@ -62,3 +62,17 @@ Prefer kits that ship `.blend` or FBX with separate PBR maps and real-world scal
 | `cgtrader/greeble-cables-pack1` | 42 cable parts on a display grid, one material | metre scale, 98k tris total | Royalty Free, text to be saved |
 | `cgtrader/combat-mech-2` (archive `blend.zip`) | one hero mech, 8 meshes, 670k tris, with HDRI and ground plane | reference, not kit parts | unknown, owner to confirm |
 | KIT OPS masterfolders (Arch, Bonus, KO-FreeMats, Mega300Tech-v5, SciFi) | 470 INSERT `.blend`s with thumbnails in 20 KPACKs: cutters, tech objects, controls, decals, screens, grids, 63 materials | KIT OPS INSERT convention | KIT OPS / Chipp Walters (Gumroad) |
+
+## Kitbash spike (2026-09-04, evening): bottom-up assembly by script
+
+Scripts, all Blender headless: `kits_to_inserts.py` (part → INSERT: dominant *flat-lying* plane, decimate, kitops props, thumbnail, features, end sockets for aspect ≥ 3.5), `label_inserts.py` (heuristic + Gemini flash-lite vision over thumbnails, stragglers flagged), `explode_blend.py` + `cluster_modules.py` (hero model → islands → proximity modules), `assemble.py` (random faces; the negative result) and `assemble_zones.py` + `zones.json` (the design program).
+
+**Library built:** cables 42 (16 socketed), ship-a 295, ship-b 316, mech 75 modules → **728 INSERTs** in `~/assets/kitops/Orrery_Masterfolder/`, registered in KIT OPS. Labelling cost: about 130 k input tokens per 100 parts on flash-lite, a few cents per kit.
+
+**Findings**
+- *Random placement on faces is noise; zones are structure.* The first pass (18 tag-matched INSERTs on random hull faces) produced clutter. With named zones (spine, flank panels, flank vents, nose RCS, wing ribs, wing pylon, fin crest, belly bay) and `connect` runs, every element lands where the callout sheet says. The zone file is the bridge from the callout sheet to geometry and is what the concept stage should emit next.
+- *Sockets fix cables.* A cable's largest flat area is its end cap, so surface mounting stood them upright. Choosing the plane the part lies flat on (area share × footprint/height) fixed mounting; end sockets plus `connect` zones make conduit runs span two anchors with the cross-section scaled separately from the length.
+- *Curved cables (U-shapes) have aspect < 3.5 and get no sockets yet*; socket detection should use the two ends of the medial curve, not the bbox extremes.
+- *The spaceship kits are dense.* Median part 75–94 k tris, decimated to 12 k for INSERTs, 6 k on placement; a real LOD pass per part (or baking to a low-poly proxy) is the next pipeline stage.
+- *The mech "kit" yields little.* 621 islands → 75 proximity modules, mostly pipes, brackets and nozzles; one launcher housing. Hero models are not kits.
+- *QuadriFlow (from the earlier spike) is not needed here*: kit parts arrive with their own topology; the budget problem is decimation, not retopology.
