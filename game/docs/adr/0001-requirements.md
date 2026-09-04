@@ -17,6 +17,7 @@ The full requirement text, with per-section engineering consequences, is [00-req
 | G7 | Every player in exactly one organization, training organization by default; one leader who kicks and passes leadership unilaterally; contract-only crews; NPC pilot fallback and discretionary whole-ship emergency teleport; full friendly fire; ad-hoc squads; identity reveal only on death; rivalry as friend-or-foe indicator; defection as strategy | G7.1–G7.12 |
 | G8 | Organized spacefaring NPC factions, deeper is meaner, active fleet tactics; fauna as hazard and harvest; clandestine missions; scripted encounters; handcrafted plus generated season quests (handcrafted set ends the season); clone charges as a resource; macro-only when unobserved; the mothership faction is one of many in mechanism, distinct in configuration | G8.1–G8.11 |
 | G11 | First slice is drop-fight-die-respawn at 24 players; mothership is a fixture with ~100 visible; engagements dozens per theatre, 50 per side max; Rust rules only; witnessing-only then EAC; one ledger primitive; EOS social | G11.1–G11.7 |
+| G12 | AI-driven content pipeline with provenance per stage, local open-weight generators, two human gates, glTF interchange, UE5 skeleton and Control Rig, MCP-driven Unreal stage | G12.1–G12.8 |
 | G9 | Seasons of 1–3 months wall-clock; real-time clock with accelerated day–night; teleport is the only time compression; flip-and-burn transit is a spatial anchor for intercept missions | G9.1–G9.4 |
 
 ## Consequences for Orrery

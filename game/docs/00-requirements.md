@@ -347,6 +347,32 @@ Decided with the owner on 2026-09-04. These are the numbers and boundaries the t
 - **The ledger primitive is an Orrery feature**, not a game one: an attested, escrow-capable, per-owner value store with one write path, of which currency, standing, inventory and clone charges are instances. It replaces several separately-described writes in G3, G5, G6 and G7 and should be specified once.
 - **EOS is a client-side dependency only.** Presence, lobbies and voice attach to the Unreal client; the Orrery peer identity and the EOS identity are linked by the game, and the server never depends on EOS.
 
+## G12 — AI-driven content pipeline
+
+Decided with the owner on 2026-09-04; recorded as [game ADR-0004](adr/0004-content-pipeline.md).
+
+| # | Requirement | Source |
+|---|---|---|
+| G12 | **Content is produced by an AI-driven pipeline** with the stages, for meshes: **design document → concept art → callout sheets → model → detailing, texturing and skinning → animation → Unreal**. | owner mandate |
+| G12.1 | **Every stage is an artifact with provenance.** Each artifact records its inputs (upstream artifact ids), prompt, seed, model and version, tool path (local or hosted), licence, and reviewer, in the same record and under the same guard as Orrery's asset provenance (doc 15). An artifact without a complete record does not advance. | derived from G12, doc 15 |
+| G12.2 | **Generators run open-weight and local by default; hosted services for hero assets.** Volume work uses open-weight models on the project's own GPUs (reproducible from seed and weights, licence known); hosted generators are allowed for hero pieces where quality justifies it, and the record says which path made the asset. | owner decision |
+| G12.3 | **Two human gates: concept art and final in-engine.** The look is approved before geometry is spent, and the asset is approved in Unreal. Every stage between passes **automated checks only** (triangle budget, manifold, scale, UV, texel density, LOD count, skin-weight sanity), so the pipeline runs unattended between the gates. | owner decision |
+| G12.4 | **glTF 2.0 is the interchange format between stages.** USD is reserved for scene assembly (levels, the mothership) later. Unreal ingests through Interchange. | owner decision |
+| G12.5 | **Rigs: the UE5 skeleton for humanoids; Control Rig for mechs and ships.** Avatars auto-rig to the UE5 Manny/Quinn skeleton so any text-to-motion or mocap clip retargets in-engine. Mechs and ships get procedural Control Rigs driven by mirror state, with no keyframed locomotion. | owner decision |
+| G12.6 | **The Unreal stage is agent-driven through the editor's MCP server** (Experimental in 5.8): import via Interchange, Nanite and collision settings, material instances, placement for review, all as MCP tools, with project-specific pipeline steps registered as custom tools. | derived from G12, G10 |
+| G12.7 | **Style consistency is an input, not a hope.** A style bible (references, palettes, silhouettes per faction, G8.11 configurations) conditions the concept stage, and concept art for a family is generated against the family's references so factions read as distinct. | derived from G12, G8.11 |
+| G12.8 | **Licence is checked at generation time.** Only models and services whose output terms permit redistribution in a public repository (doc 15 §1) may be used for committed assets; the generator's licence is part of the model version in the record. Territory-restricted licences are excluded. | derived from doc 15 |
+
+### Engineering consequences of G12
+
+- **The pipeline is a DAG of artifacts, not a script.** Each stage is a pure step from upstream artifacts plus parameters to a new artifact; re-running a step with the same record reproduces the artifact (for local generators bit-for-bit, for hosted ones best-effort with the response stored). The store is content-addressed, and the provenance guard from doc 15 is extended to cover generated artifacts and their chains.
+- **Automated checks are the quality floor and the budget.** Per asset class (avatar, weapon, mech, escort, ship, structure, prop) the callout sheet carries the numbers: triangle budget per LOD, texel density, texture set size, collision primitive count, bone count. The checks read those numbers from the sheet, so the sheet is the contract between design and generation.
+- **Generated meshes need a remesh pass before texturing.** Image-to-3D output is dense and triangulated; quad remeshing and polycount fitting to the sheet's budget is a fixed step, and the collision the ruleset uses (G10.4a) is derived from the fitted mesh, not the raw one.
+- **Animation is retargeting, not authoring, for humanoids.** With one skeleton, clips come from text-to-motion or video mocap and retarget in-engine; the pipeline stores clips against the skeleton, not against a character.
+- **Mechs and ships have no animation stage.** Their motion is mirror state driving Control Rig (G12.5), consistent with G10.3: the presentation never asserts a pose the ruleset did not produce.
+- **The GPU is shared with the editor and the spikes.** Local generation is a heavy job; it takes an agent-lane lease like the editor does, and never runs during latency measurement.
+- **Hero assets are the exception path**, and each carries the hosted service's terms in its record; if those terms fail doc 15 §1 the asset lives outside the public repository (a private asset store the client fetches), which the distribution record must allow for.
+
 ## Open items
 
 Loose ends collected from the sections above.
