@@ -29,7 +29,9 @@ use orrery_games::regolith::{campaign_rock_seeds, campaign_spawn_pose, in_firing
 use orrery_games::{Game, Regolith};
 use orrery_protocol::channels::encode_replication;
 use orrery_protocol::{CellId, ChainHash, NodeId, PersistId, StateClaim, Tick, WitnessMsg};
-use orrery_regolith_client::campaign::{CampaignConfig, CampaignRuntime, JoinState};
+use orrery_regolith_client::campaign::{
+    CampaignConfig, CampaignRuntime, JoinState, REORDER_WINDOW_SLOTS,
+};
 use orrery_regolith_client::combat::{LockBreak, ProjectileTracks, ShotCue, ShotFeedback};
 use orrery_regolith_client::intent::Controls;
 use orrery_regolith_client::net;
@@ -41,6 +43,11 @@ use orrery_regolith_client::telemetry::JsonlTelemetry;
 const CLIENT_SLOT: usize = 1;
 /// The virtual bot broadcasts every three ticks, like a bot at 20 Hz on a
 /// 60 Hz sim; its replication-tick field advances by this stride.
+///
+/// This is the client's own send-slot grid (`SEND_EVERY_TICKS`, `TICK_HZ /
+/// SEND_HZ`), so one broadcast here is exactly one send slot there — which is
+/// what lets the quiescent cut below count its settlement margin in
+/// broadcasts rather than in ticks.
 const STRIDE: u64 = 3;
 /// Deterministic uplink impairment: sequence ≡ 3 (mod 4) is dropped.
 const UPLINK_DROP_MOD: u64 = 4;
@@ -403,13 +410,22 @@ async fn pump(
             let cell = CellId::from_coords(bevy::math::IVec3::ONE, orrery_protocol::INTEREST_LEVEL)
                 .expect("representable cell");
             let mut broadcast_index = 0u64;
+            let mut last_skipped = 0u64;
+            let mut pending: Option<QuiesceRequest> = None;
             let mut interval = tokio::time::interval(Duration::from_millis(15));
             loop {
-                let request = tokio::select! {
-                    biased;
-                    request = quiesce.recv() => request,
-                    _ = interval.tick() => None,
-                };
+                // Once a cut is pending the sender keeps its cadence until the
+                // cut is legal; only a fresh round listens for a new request.
+                if pending.is_none() {
+                    pending = tokio::select! {
+                        biased;
+                        request = quiesce.recv() => request,
+                        _ = interval.tick() => None,
+                    };
+                } else {
+                    interval.tick().await;
+                }
+                let finishing = pending.is_some();
 
                 // A quiescent cut must end in a delivered broadcast: a trailing
                 // intentional skip is only measurable when a later arrival
@@ -422,7 +438,8 @@ async fn pump(
                         if broadcast_index.is_multiple_of(DOWNLINK_SKIP_EVERY) {
                             truth.downlink_skipped += 1;
                             truth.downlink_skipped_indices.push(broadcast_index);
-                            if request.is_none() {
+                            last_skipped = broadcast_index;
+                            if !finishing {
                                 break;
                             }
                             continue;
@@ -461,7 +478,19 @@ async fn pump(
                     break;
                 }
 
-                if let Some(request) = request {
+                // …and it must also be a point at which downlink conservation
+                // is actually promised. `DownlinkTracker` settles a gap only
+                // on a later arrival `REORDER_WINDOW_SLOTS` send slots past
+                // the gap's end, so a cut taken any sooner than that after the
+                // last skip leaves that skip's gap permanently open — the
+                // client's `missing` is then short by one and the ledger
+                // reconciliation below reads a deliberate settlement lag as a
+                // lost frame. Keep broadcasting until the terminal arrival is
+                // late enough to settle the last skip.
+                if broadcast_index < last_skipped + REORDER_WINDOW_SLOTS + 1 {
+                    continue;
+                }
+                if let Some(request) = pending.take() {
                     let _ = feed.send(FeedItem::Barrier {
                         terminal_index: broadcast_index,
                         flushed: request.flushed,
