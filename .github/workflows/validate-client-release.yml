@@ -1,0 +1,328 @@
+name: Validate a published Regolith client
+
+# Every campaign join the release pipeline performs lives here, and nowhere
+# else (#1062).
+#
+# Why it is a separate workflow. `package-client.yml` is a three-way matrix
+# that runs its legs in parallel, and each leg used to join the live
+# `shakedown` campaign: one client from the extracted archive on Windows and
+# macOS, and a three-client cohort on Linux. The campaign has three human
+# seats. Linux's cohort took all three, so the other two legs failed on join
+# and `playtest-2026-09-04` (196414c) never published — with three red legs
+# that said nothing whatsoever about the artifacts they built. A build must not
+# take a dependency on live, shared, scarce infrastructure, and a red release
+# leg must not mean "someone else had the seat".
+#
+# So: building and publishing is `package-client.yml`. Validating what was
+# published is this workflow, and it is **sequential by construction**.
+#
+#   * No matrix. Three jobs, named one per platform, chained with `needs:` so
+#     exactly one of them is ever running. A matrix here would be the same
+#     herd in a different shape.
+#   * A `concurrency` group with `cancel-in-progress: false`, so a nightly and
+#     a dispatch cannot overlap either.
+#   * A pin gate that runs first and can skip everything downstream. See the
+#     `validate-pin` job for what it decides and why a skip beats a failure.
+#
+# What it validates is the *published archive*, downloaded from the release,
+# not something rebuilt here. That is the file a volunteer gets.
+on:
+  schedule:
+    # 05:00 UTC, two hours after nightly.yml, so the two do not contend for the
+    # box or for the campaign.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Release tag to validate, e.g. playtest-2026-09-04. Leave empty to
+          take the newest published playtest-* release, which is what the
+          nightly does. Dispatch this against a release before handing its
+          link to a tester: publication no longer join-tests anything.
+        required: false
+        default: ""
+        type: string
+      campaign:
+        description: "Campaign id to join."
+        required: false
+        default: shakedown
+        type: string
+
+# Read-only. This workflow publishes nothing; it downloads release assets and
+# joins a campaign. It must never acquire `contents: write` — a validation run
+# that can alter a release is a release pipeline wearing a disguise.
+permissions:
+  contents: read
+
+# One validation run at a time, whatever started it. `cancel-in-progress:
+# false` because a run that is already seated in the campaign should finish and
+# free its seats rather than be killed halfway through a cohort.
+concurrency:
+  group: validate-client-release
+  cancel-in-progress: false
+
+env:
+  VALIDATE_CAMPAIGN: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign || 'shakedown' }}
+
+jobs:
+  # ── the pin gate ───────────────────────────────────────────────────────────
+  #
+  # This job decides whether joining is worth doing at all, and it answers with
+  # a *skip*, never a failure, whenever the answer is no. The reason is the
+  # whole point of the split: a red leg that means "the deployed campaign
+  # refuses this build by name" or "somebody is flying right now" is noise that
+  # looks exactly like a broken client. Noise that looks like a defect is worse
+  # than no leg at all.
+  #
+  # It skips when:
+  #
+  #   * the release has no Linux archive to read a revision out of;
+  #   * the campaign listing is unreachable, or names no such campaign;
+  #   * the campaign carries no `client_rev` pin — an unpinned campaign admits
+  #     any build, so a join here proves nothing about *this* release;
+  #   * the pin names a different revision than the one embedded in the
+  #     published archive (`build-info.json`'s `client_rev`). This is the
+  #     common case after a release: admission would refuse every join with
+  #     `client_rev_mismatch` (scripts/admission.py:662), so every leg would go
+  #     red for a reason that is a fact about the deployed campaign;
+  #   * the campaign is not `open`, or reports fewer than three free human
+  #     seats. The cohort below needs three, and `client-campaign-preflight.sh`
+  #     refuses to seat itself beside a live player anyway (#1008) — that
+  #     refusal is exit 2, a red leg, which is exactly what this pre-check
+  #     exists to avoid. It is a pre-check, not a lock: somebody can still join
+  #     between this job and the cohort, and then the live guard fires and the
+  #     leg is red. Nothing in a shared campaign can close that race; the check
+  #     only makes the common case quiet.
+  #
+  # The comparison is against the revision *baked into the published archive*,
+  # not the release's target commit. GitHub knows what a release points at; it
+  # does not know what is inside the asset, and admission matches on what is
+  # inside the asset.
+  validate-pin:
+    name: check the deployed pin names this release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+      reason: ${{ steps.decide.outputs.reason }}
+      release_tag: ${{ steps.decide.outputs.release_tag }}
+      client_rev: ${{ steps.decide.outputs.client_rev }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve the release, read its pin, and decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
+        run: |
+          set -uo pipefail
+          work="$RUNNER_TEMP/pin"
+          mkdir -p "$work"
+
+          # Every exit from this step goes through `verdict`, so a skip always
+          # carries a sentence a person can act on, in the log and in the job
+          # summary both.
+          verdict() { # proceed, reason...
+            local proceed=$1; shift
+            {
+              echo "proceed=$proceed"
+              echo "reason=$*"
+              echo "release_tag=${TAG:-}"
+              echo "client_rev=${ARCHIVE_REV:-}"
+            } >> "$GITHUB_OUTPUT"
+            if [ "$proceed" = true ]; then
+              echo "validate: proceeding — $*"
+              echo "### Validating \`${TAG:-}\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "validate: SKIPPING — $*"
+              echo "### Skipped: $*" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "$*" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          TAG="$REQUESTED_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --repo "$GH_REPO" --limit 50 --exclude-drafts \
+              --json tagName --jq '[.[] | select(.tagName | startswith("playtest-"))][0].tagName' \
+              2>"$work/list.err") || TAG=
+            if [ -z "$TAG" ] || [ "$TAG" = null ]; then
+              TAG=
+              verdict false "no published playtest-* release to validate ($(tr '\n' ' ' < "$work/list.err"))"
+            fi
+          fi
+
+          # The Linux archive is where the revision under test is read from;
+          # all three carry the same `build-info.json` because one commit built
+          # them. The per-platform jobs download their own.
+          if ! gh release download "$TAG" --repo "$GH_REPO" --dir "$work" \
+              --pattern 'orrery-regolith-x86_64-linux.tar.gz' 2>"$work/dl.err"; then
+            verdict false "release $TAG carries no orrery-regolith-x86_64-linux.tar.gz to read a revision from ($(tr '\n' ' ' < "$work/dl.err"))"
+          fi
+          tar -C "$work" -xzf "$work/orrery-regolith-x86_64-linux.tar.gz" build-info.json \
+            || verdict false "release $TAG's Linux archive has no build-info.json"
+
+          ARCHIVE_REV=$(jq -r '.client_rev // ""' "$work/build-info.json")
+          ORIGIN=$(jq -r '.admission_url // ""' "$work/build-info.json")
+          [ -n "$ARCHIVE_REV" ] || verdict false "release $TAG's build-info.json names no client_rev"
+          # The origin the shipped binary itself will contact, rather than a
+          # constant repeated here: the pin that matters is the one on the
+          # service this archive is baked to reach.
+          case "$ORIGIN" in
+            https://*) ;;
+            *) verdict false "release $TAG's build-info.json has no HTTPS admission_url (got '$ORIGIN')" ;;
+          esac
+
+          if ! curl --fail --silent --show-error --max-time 30 \
+              "$ORIGIN/v1/campaigns" -o "$work/campaigns.json" 2>"$work/curl.err"; then
+            verdict false "the campaign listing at $ORIGIN/v1/campaigns is unreachable ($(tr '\n' ' ' < "$work/curl.err")); nothing here is a claim about $TAG"
+          fi
+
+          entry=$(jq -c --arg id "$VALIDATE_CAMPAIGN" '[.[] | select(.id == $id)][0] // empty' \
+            "$work/campaigns.json")
+          [ -n "$entry" ] || verdict false "$ORIGIN serves no campaign named '$VALIDATE_CAMPAIGN'"
+
+          pin=$(jq -r '.client_rev // ""' <<<"$entry")
+          state=$(jq -r '.state // "unknown"' <<<"$entry")
+          slots=$(jq -r 'if .slots_free == null then "" else (.slots_free|tostring) end' <<<"$entry")
+
+          [ -n "$pin" ] || verdict false \
+            "campaign '$VALIDATE_CAMPAIGN' carries no client_rev pin, so it admits any build and a join proves nothing about $TAG"
+          [ "$pin" = "$ARCHIVE_REV" ] || verdict false \
+            "campaign '$VALIDATE_CAMPAIGN' is pinned to $pin, which is not $TAG's $ARCHIVE_REV — admission would refuse every join by name (client_rev_mismatch), so this says nothing about the build"
+
+          [ "$state" = open ] || verdict false \
+            "campaign '$VALIDATE_CAMPAIGN' is '$state', not open; the seats are not free and a failed join would be a fact about the campaign"
+          if [ -n "$slots" ] && [ "$slots" -lt 3 ]; then
+            verdict false "campaign '$VALIDATE_CAMPAIGN' reports $slots free human seat(s); the cohort needs three and would be a red leg meaning someone else had the seat"
+          fi
+
+          verdict true "campaign '$VALIDATE_CAMPAIGN' is open, pinned to $ARCHIVE_REV, and has ${slots:-unreported} free seat(s)"
+
+  # ── one platform at a time ─────────────────────────────────────────────────
+  #
+  # Windows, then macOS, then the Linux cohort. The chain is what makes this
+  # sequential: `needs:` is the only mechanism GitHub offers to say "not while
+  # that one is running", and a matrix would defeat it.
+  #
+  # `!cancelled()` rather than `success()` so a red platform still lets the
+  # next one run — the point of validating three platforms is learning about
+  # all three — while a skipped pin gate still stops everything.
+  #
+  # This is the #769 coverage, moved: "Windows and macOS have never join-tested
+  # the artifact they publish, which is how #769 reached a volunteer." They
+  # join-test it here now, against the archive that was actually published.
+  validate-windows:
+    name: join from the published Windows archive
+    needs: validate-pin
+    if: ${{ !cancelled() && needs.validate-pin.outputs.proceed == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download the published archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ needs.validate-pin.outputs.release_tag }}" --repo "$GH_REPO" \
+            --dir dist --pattern 'orrery-regolith-x86_64-windows.zip'
+      - name: Join the campaign with the extracted client
+        run: >-
+          scripts/package-artifact-smoke.sh
+          --archive dist/orrery-regolith-x86_64-windows.zip
+          --label x86_64-windows
+          --campaign "$VALIDATE_CAMPAIGN"
+          --join-timeout-secs 900
+
+  validate-macos:
+    name: join from the published macOS archive
+    # Both, so this cannot start while the Windows leg still holds a seat.
+    needs: [validate-pin, validate-windows]
+    if: ${{ !cancelled() && needs.validate-pin.outputs.proceed == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download the published archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ needs.validate-pin.outputs.release_tag }}" --repo "$GH_REPO" \
+            --dir dist --pattern 'orrery-regolith-aarch64-macos.tar.gz'
+      - name: Join the campaign with the extracted client
+        run: >-
+          scripts/package-artifact-smoke.sh
+          --archive dist/orrery-regolith-aarch64-macos.tar.gz
+          --label aarch64-macos
+          --campaign "$VALIDATE_CAMPAIGN"
+          --join-timeout-secs 900
+
+  # The three-client cohort. A one-client join proves a volunteer can get in;
+  # this proves the campaign behaves as a campaign — three distinct identities
+  # seated, all three iroh handshakes completed, each executor receiving both
+  # other nickname-bound replicated crafts, and a released seat reusable
+  # afterwards (#587, #601, #681).
+  #
+  # It stays on one platform on purpose: it asserts a property of the campaign,
+  # and three of them interleaved in one lobby is a different scenario from the
+  # one it claims to run. What is platform-specific about joining is covered by
+  # the two jobs above. It runs last because it is the longest and the
+  # hungriest — three of the campaign's three human seats.
+  validate-linux-cohort:
+    name: three-client cohort from the published Linux archive
+    needs: [validate-pin, validate-windows, validate-macos]
+    if: ${{ !cancelled() && needs.validate-pin.outputs.proceed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # The same runtime set `package-client.yml` installs: Bevy and winit
+      # dlopen the X11/xkb stack, so nothing here appears in `ldd`.
+      - name: Install Bevy's Linux runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            xvfb mesa-vulkan-drivers libxkbcommon-x11-0 libxcb-xkb1 libx11-xcb1 \
+            libxcb-randr0 libxcursor1 libxrandr2 libxi6 libxinerama1 libvulkan1
+
+      - name: Download the published archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ needs.validate-pin.outputs.release_tag }}" --repo "$GH_REPO" \
+            --dir dist --pattern 'orrery-regolith-x86_64-linux.tar.gz'
+
+      # Extract through the smoke script rather than by hand, so the cohort
+      # runs the binary an extraction produced and the manifest, launch and
+      # read-only stages are asserted about it first. No `--campaign`: the
+      # cohort below is this platform's join.
+      - name: Extract the published archive
+        run: >-
+          scripts/package-artifact-smoke.sh
+          --archive dist/orrery-regolith-x86_64-linux.tar.gz
+          --label x86_64-linux
+          --keep-extraction "$RUNNER_TEMP/extracted"
+
+      - name: Preflight three clients against the deployed campaign
+        run: >-
+          scripts/client-campaign-preflight.sh
+          --binary "$RUNNER_TEMP/extracted/orrery-regolith-x86_64-linux"
+          --campaign "$VALIDATE_CAMPAIGN"

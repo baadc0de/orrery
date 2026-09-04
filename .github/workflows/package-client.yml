@@ -7,17 +7,6 @@ on:
         description: "Tag to create or update with these client assets"
         required: true
         type: string
-      join_all_platforms:
-        description: >-
-          Join the deployed campaign: once per platform from that platform's
-          extracted archive, and once as the Linux three-client cohort. Leave
-          on for anything a volunteer will download. Turning it off skips
-          every campaign join for the case PLAYTEST.md warns about -- a tester
-          waiting while one platform is rebuilt -- and it costs exactly the
-          check that let a Windows join defect reach her (#769).
-        required: false
-        default: true
-        type: boolean
   push:
     tags:
       - "playtest-*"
@@ -61,9 +50,6 @@ jobs:
       # A fresh runner has no incremental artifacts to reuse, so they cost
       # build time and buy nothing.
       CARGO_INCREMENTAL: 0
-      # A tag push carries no inputs, and a release is exactly the run that
-      # must be join-tested everywhere, so an absent input means yes.
-      JOIN_ALL_PLATFORMS: ${{ github.event_name != 'workflow_dispatch' || inputs.join_all_platforms }}
     steps:
       - uses: actions/checkout@v7
 
@@ -243,41 +229,44 @@ jobs:
           set -euo pipefail
           archive="dist/orrery-regolith-${{ matrix.label }}."
           if [ "$RUNNER_OS" = Windows ]; then archive="${archive}zip"; else archive="${archive}tar.gz"; fi
-          # Windows and macOS have never join-tested the artifact they publish,
-          # which is how #769 reached a volunteer. They do it here, with one
-          # client; Linux's three-client cohort scenario runs in the next step,
-          # against the same extraction.
-          join=()
-          if [ "$RUNNER_OS" != Linux ] && [ "$JOIN_ALL_PLATFORMS" = true ]; then
-            join=(--campaign shakedown --join-timeout-secs 900)
-          fi
+          # This runs no `--campaign` join, deliberately: see the block below.
           scripts/package-artifact-smoke.sh \
             --archive "$archive" \
             --label ${{ matrix.label }} \
-            --keep-extraction "$RUNNER_TEMP/extracted" \
-            ${join[@]+"${join[@]}"}
+            --keep-extraction "$RUNNER_TEMP/extracted"
 
-      # A rendered launch is necessary but cannot prove a volunteer can enter
-      # the deployed world. The Linux candidate therefore exercises its own
-      # baked origin and joinability predicate, seats three distinct identities,
-      # completes all three iroh handshakes, and exits only after each executor
-      # has received both other nickname-bound replicated crafts. The campaign's
-      # client_rev pin must already target this build; a mismatch fails here
-      # before any archive is offered to testers.
+      # ── where the campaign joins went, and what that costs (#1062) ────────
       #
-      # The binary is the one the step above extracted from the archive, not
-      # `target/release`. The three-client cohort scenario stays on one platform
-      # on purpose: it asserts a property of the campaign — a frozen cohort, a
-      # released seat, mutual replication — and three matrix legs running it at
-      # once against one shakedown lobby would be three cohorts interleaved,
-      # which is a different scenario from the one it claims to run. What is
-      # platform-specific about joining is covered per platform above. (#774)
-      - name: Preflight three clients against the deployed campaign
-        if: runner.os == 'Linux' && env.JOIN_ALL_PLATFORMS == 'true'
-        run: >-
-          ../../scripts/client-campaign-preflight.sh
-          --binary "$RUNNER_TEMP/extracted/orrery-regolith-${{ matrix.label }}"
-          --campaign shakedown
+      # Two steps used to live here: a one-client join from the extracted
+      # archive on Windows and macOS, and a three-client cohort against the
+      # deployed campaign on Linux. Both are now in
+      # `.github/workflows/validate-client-release.yml`, which runs them
+      # nightly and on manual dispatch, one platform at a time.
+      #
+      # Why they left. This is a matrix of three jobs running at once, and each
+      # leg joined the same live `shakedown` campaign, which has three human
+      # seats. Linux's cohort alone took all three, so macOS and Windows failed
+      # on join. That is what stopped `playtest-2026-09-04` (196414c) from
+      # publishing: Linux green, macOS and Windows red, publish skipped, and
+      # nothing red said anything about the artifact. A build must not depend
+      # on live, shared, scarce infrastructure; a red release leg must not mean
+      # "someone else had the seat".
+      #
+      # **What this costs, stated rather than discovered.** The comments here
+      # used to read: "Windows and macOS have never join-tested the artifact
+      # they publish, which is how #769 reached a volunteer." That regression
+      # is still covered — by the validation workflow, not by this one — so
+      # between publishing a build and validating it there is now a window in
+      # which a published archive has not been join-tested on any platform. The
+      # nightly closes that window in the steady state. For a release someone
+      # intends to hand a tester, close it deliberately: dispatch
+      # `validate-client-release.yml` against the release tag, and read its
+      # result, before sending the link. The operator note "validating a
+      # release, and the window between" in `clients/regolith/PLAYTEST.md` says
+      # the same thing to the person handing out the build.
+      #
+      # Nothing below this line and nothing above it makes a network call to
+      # the campaign service. Keep it that way.
 
       - name: Upload release assets for publication
         uses: actions/upload-artifact@v7
