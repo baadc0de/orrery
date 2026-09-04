@@ -2945,6 +2945,14 @@ fn stream_metrics(
             // counter and neither can borrow the other's number.
             metrics.own_orders_undecodable = runtime.own_orders_undecodable();
             metrics.downlink_undecodable = runtime.downlink_undecodable();
+            // The delta-cause split (#1039): the four delta-application
+            // failures are diagnostics in their own right and ride the stream
+            // beside the unintelligible-byte count they used to disappear
+            // into.
+            metrics.deltas_without_keyframe = runtime.deltas_without_keyframe();
+            metrics.deltas_unanchored = runtime.deltas_unanchored();
+            metrics.delta_patch_failures = runtime.delta_patch_failures();
+            metrics.delta_bodies_undecodable = runtime.delta_bodies_undecodable();
             metrics.delivered_unroutable = runtime.delivered_unroutable();
             metrics.delivered_foreign = runtime.delivered_foreign();
             let configured = &runtime.config().configured;
@@ -3405,6 +3413,10 @@ mod tests {
             "uplink_shed",
             "own_orders_undecodable",
             "downlink_undecodable",
+            "deltas_without_keyframe",
+            "deltas_unanchored",
+            "delta_patch_failures",
+            "delta_bodies_undecodable",
             "delivered_unroutable",
             "delivered_foreign",
             "afk_capped",

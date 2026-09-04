@@ -674,14 +674,54 @@ pub struct CampaignRuntime {
     /// this client could not decode into anything it recognises (#1034).
     ///
     /// Split from the own-packet counter so a number here can only ever mean
-    /// "the downlink side failed". Note before acting on it: witness frames
-    /// from the bot cohort ride this same datagram lane (every `Channel::State`
-    /// send does, `orrery_net`'s `send_peer_packets`), land in the neither-
-    /// replication arm, and are counted here — routine traffic, not a decode
-    /// failure. The swarm bot's receive path does not count them (bot.rs,
-    /// `ReplicaDecodeError::NotReplication`); this client does, so a healthy
-    /// island still reports the witnesses' steady cadence here.
+    /// "the downlink side failed", and split again in #1039 from the four
+    /// delta-application failures, which moved to their own counters
+    /// ([`Self::deltas_without_keyframe`] and siblings). Witness records from
+    /// the bot cohort ride this same datagram lane (every `Channel::State`
+    /// send does, `orrery_net`'s `send_peer_packets`) and land in the
+    /// neither-replication arm; like the bot cohort's receiver
+    /// (`gates/p1-swarm/src/bot.rs`, the `ReplicaDecodeError::NotReplication`
+    /// arm) this client now exempts them by their sub-tag. A healthy island's
+    /// steady witness cadence — the dead-flat ~39/s that filled the
+    /// 2026-09-04 session's 28 740 — therefore no longer reports here at all.
     downlink_undecodable: u64,
+    /// Deltas that arrived for an entity this client holds no keyframe for.
+    ///
+    /// The client's form of the bot cohort's `deltas_without_any_keyframe`
+    /// (`gates/p1-swarm/src/bot.rs`). A delta applies only to the keyframe it
+    /// was patched against, so with no retained keyframe there is nothing to
+    /// apply it to and the frame is dropped — usually because the keyframe
+    /// carrying its anchor was lost and never repaired. A real diagnostic,
+    /// split from [`Self::downlink_undecodable`] in #1039: it is not
+    /// unintelligible bytes, and counting it there buried both readings.
+    deltas_without_keyframe: u64,
+    /// Deltas whose tick and keyframe age do not anchor them to the keyframe
+    /// this client retains.
+    ///
+    /// [`delta_is_anchored`] refused the frame: the keyframe the delta names
+    /// is not the one held — superseded by a newer one, already replaced by
+    /// an older one, or an age that underflows its tick. One coarse counter
+    /// where the bot cohort keeps three (`deltas_missing_newer_keyframe`,
+    /// `deltas_with_superseded_keyframe`, `deltas_with_invalid_reference`):
+    /// this client retains one keyframe per entity and checks once. Split
+    /// from [`Self::downlink_undecodable`] in #1039.
+    deltas_unanchored: u64,
+    /// Deltas whose skip/write patch did not apply to the retained keyframe.
+    ///
+    /// The bot cohort's `BadPatch`. The bytes parsed as a delta but describe
+    /// a program the retained keyframe cannot execute — malformation at the
+    /// source, or corruption the envelope check still accepted. Split from
+    /// [`Self::downlink_undecodable`] in #1039.
+    delta_patch_failures: u64,
+    /// Deltas whose patch applied but whose resulting body did not decode as
+    /// a [`RegolithState`].
+    ///
+    /// The bot cohort's `bad_body`: bytes the receiver's own codec refuses.
+    /// The patch applied, so sender and receiver agreed on the keyframe; the
+    /// produced body is still not a state this client accepts, which is a
+    /// codec-contract break rather than loss. Split from
+    /// [`Self::downlink_undecodable`] in #1039.
+    delta_bodies_undecodable: u64,
     /// This client's own authored order packet failing to decode (#1034).
     ///
     /// Formerly conflated with [`Self::downlink_undecodable`], which made a
@@ -981,6 +1021,10 @@ impl CampaignRuntime {
             downlink: DownlinkTracker::default(),
             downlink_arrivals: 0,
             downlink_undecodable: 0,
+            deltas_without_keyframe: 0,
+            deltas_unanchored: 0,
+            delta_patch_failures: 0,
+            delta_bodies_undecodable: 0,
             own_orders_undecodable: 0,
             delivered_unroutable: 0,
             delivered_foreign: 0,
@@ -1269,11 +1313,41 @@ impl CampaignRuntime {
     /// Received-traffic decode failures: downlink frames this client could
     /// not decode into anything it recognises.
     ///
-    /// Split from the own-packet failure in #1034; see the field note for
-    /// what a steady rate here currently includes.
+    /// Split from the own-packet failure in #1034, and from the four
+    /// delta-application failures in #1039; see the field note for what a
+    /// steady rate here can and can no longer include.
     #[must_use]
     pub fn downlink_undecodable(&self) -> u64 {
         self.downlink_undecodable
+    }
+
+    /// Deltas that arrived for an entity this client holds no keyframe for;
+    /// the split #1039 made so real diagnostics stay visible.
+    #[must_use]
+    pub fn deltas_without_keyframe(&self) -> u64 {
+        self.deltas_without_keyframe
+    }
+
+    /// Deltas whose tick and keyframe age do not anchor them to the retained
+    /// keyframe; the split #1039 made so real diagnostics stay visible.
+    #[must_use]
+    pub fn deltas_unanchored(&self) -> u64 {
+        self.deltas_unanchored
+    }
+
+    /// Deltas whose skip/write patch did not apply to the retained keyframe;
+    /// the split #1039 made so real diagnostics stay visible.
+    #[must_use]
+    pub fn delta_patch_failures(&self) -> u64 {
+        self.delta_patch_failures
+    }
+
+    /// Deltas whose patch applied but whose body did not decode as a
+    /// [`RegolithState`]; the split #1039 made so real diagnostics stay
+    /// visible.
+    #[must_use]
+    pub fn delta_bodies_undecodable(&self) -> u64 {
+        self.delta_bodies_undecodable
     }
 
     /// This client's own order packet failing to decode.
@@ -1598,9 +1672,13 @@ impl CampaignRuntime {
     /// Extracted from `advance`'s inbound loop so the counting rules are
     /// reachable by test without a live `CampaignLink` and a dial thread —
     /// the same seam [`delta_is_anchored`] was cut for. Every failure
-    /// counted here is a *received*-traffic failure and feeds
-    /// [`Self::downlink_undecodable`]; this client's own order packet is
-    /// counted by [`Self::count_own_packet_decode_failure`] instead (#1034).
+    /// counted here is a *received*-traffic failure: the four
+    /// delta-application causes feed their dedicated counters (the split
+    /// #1039 made, mirroring the bot cohort's four causes), and everything
+    /// else — bytes that are neither a keyframe, a delta nor a decodable
+    /// witness record — feeds [`Self::downlink_undecodable`]. This client's
+    /// own order packet is counted by
+    /// [`Self::count_own_packet_decode_failure`] instead (#1034).
     fn accept_frame(&mut self, frame: net::Frame, tick: Tick) {
         match frame.lane {
             Lane::Meta => match classify_meta(&frame.payload) {
@@ -1677,18 +1755,18 @@ impl CampaignRuntime {
                     None => match orrery_protocol::channels::decode_replication_delta(&inner) {
                         Some(delta) => {
                             let Some(keyframe) = self.replica_keyframes.get(&delta.entity) else {
-                                self.downlink_undecodable += 1;
+                                self.deltas_without_keyframe += 1;
                                 return;
                             };
                             if !delta_is_anchored(keyframe.at, delta.tick, delta.keyframe_age) {
-                                self.downlink_undecodable += 1;
+                                self.deltas_unanchored += 1;
                                 return;
                             }
                             let Some(encoded) = orrery_protocol::channels::apply_delta_patch(
                                 &keyframe.canonical,
                                 &delta.patch,
                             ) else {
-                                self.downlink_undecodable += 1;
+                                self.delta_patch_failures += 1;
                                 return;
                             };
                             let _cell = delta.cell.unwrap_or(keyframe.cell);
@@ -1713,14 +1791,28 @@ impl CampaignRuntime {
                                     self.campaign
                                         .observe_arrival(arrival.missing, arrival.deviation_ms);
                                 }
-                                Err(_) => self.downlink_undecodable += 1,
+                                Err(_) => self.delta_bodies_undecodable += 1,
                             }
                         }
                         None => {
-                            // Witness frames share this sub-tagged lane
-                            // upstream; neither is replication we can read.
-                            // Counted, so a silent empty world cannot hide.
-                            self.downlink_undecodable += 1;
+                            // Witness records share this lane and are
+                            // sub-tagged as such; recognising one is not a
+                            // decode failure. Counting them would make
+                            // `downlink_undecodable` — the guard that catches
+                            // a client receiving nothing it can read — fire
+                            // constantly and stop meaning anything, which is
+                            // what saturated it at ~39/s across the whole
+                            // 2026-09-04 session (#1039). The same exemption
+                            // the bot cohort's receiver makes (bot.rs, the
+                            // `ReplicaDecodeError::NotReplication` arm), by
+                            // the same sub-tag mechanism. The sub-tag routes,
+                            // the type check decides: a witness tag over
+                            // bytes no `WitnessMsg` accepts still counts.
+                            if orrery_protocol::channels::decode_witness::<WitnessMsg>(&inner)
+                                .is_none()
+                            {
+                                self.downlink_undecodable += 1;
+                            }
                         }
                     },
                 }
@@ -3738,9 +3830,11 @@ mod tests {
     /// that decode to nothing this client recognises, through the same
     /// method `advance`'s inbound loop calls. The first frame has no State
     /// outer tag at all; the second carries one but is neither a replication
-    /// keyframe nor a delta — the exact shape a bot cohort's witness frames
-    /// present on this lane, and the arm the 2026-09-04 session's steady
-    /// 39/s landed in. Only the downlink counter may move.
+    /// keyframe, nor a delta, nor a decodable witness record — the arm a
+    /// *witness-tagged but malformed* body lands in since #1039 exempted
+    /// well-formed witness records from it. The 2026-09-04 session's steady
+    /// 39/s used to land here too, before that exemption; only the downlink
+    /// counter may move.
     #[test]
     fn a_downlink_frame_that_decodes_to_nothing_counts_only_the_downlink_side() {
         let mut runtime = CampaignRuntime::launch(
@@ -3775,5 +3869,438 @@ mod tests {
             0,
             "a downlink failure must not borrow the own-packet counter"
         );
+    }
+
+    /// A remote craft the way `Game::spawn` mints it, for the delta-cause
+    /// and witness fixtures below.
+    fn remote_craft(entity: PersistId) -> RegolithState {
+        Regolith::honest().spawn(entity, 2)
+    }
+
+    /// The same craft one step further on, the way the wire fixtures below
+    /// produce a delta worth applying.
+    fn advanced_craft(state: &RegolithState) -> RegolithState {
+        let RegolithState::Craft(mut craft) = state.clone() else {
+            unreachable!("spawn mints a craft")
+        };
+        craft.pos.x += 1;
+        RegolithState::Craft(craft)
+    }
+
+    /// One received keyframe as the harness wire carries it: the sender's
+    /// replication envelope already opens with the inner `[TAG_STATE]`, then
+    /// the transport tag `receive_peer_packets` strips — and this client's
+    /// downlink delivers the bytes with that transport tag intact, so the
+    /// frame here is the double-tagged form #387 pinned.
+    fn keyframe_wire(state: &RegolithState, entity: PersistId, cell: CellId, at: u64) -> Bytes {
+        use orrery_protocol::channels::{encode_replication_compressed, tag, Channel};
+        Bytes::from(tag(
+            Channel::State,
+            &encode_replication_compressed(&(state.to_canonical(), cell, entity, at)),
+        ))
+    }
+
+    /// One received delta in the same double-tagged form, with the caller's
+    /// patch, age and tick — every knob a delta-cause fixture needs to move.
+    ///
+    /// Asserts the delta form itself: `encode_replication_delta` falls back
+    /// to an absolute keyframe whenever the delta would not be smaller, and
+    /// a fixture that silently exercised the keyframe arm would prove
+    /// nothing about the counters it names.
+    fn delta_wire(
+        current: &RegolithState,
+        entity: PersistId,
+        cell: CellId,
+        at: u64,
+        keyframe_age: u16,
+        patch: Vec<u8>,
+    ) -> Bytes {
+        use orrery_protocol::channels::{
+            encode_replication_delta, tag, untag, Channel, ReplicationDelta, TAG_REPLICATION_DELTA,
+        };
+        let delta = ReplicationDelta {
+            entity,
+            tick: at,
+            keyframe_age,
+            cell: None,
+            patch,
+        };
+        let wire = tag(
+            Channel::State,
+            &encode_replication_delta(&(current.to_canonical(), cell, entity, at), &delta),
+        );
+        let (_, inner) = untag(&wire).expect("the transport channel tag");
+        let (_, body) = untag(inner).expect("the replication channel tag");
+        assert_eq!(
+            body.first().copied(),
+            Some(TAG_REPLICATION_DELTA),
+            "the fixture must exercise the delta arm, not the keyframe fallback"
+        );
+        Bytes::from(wire)
+    }
+
+    /// Which delta-cause counter a fixture asserts to be moving.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum DeltaCause {
+        DeltasWithoutKeyframe,
+        DeltasUnanchored,
+        DeltaPatchFailures,
+        DeltaBodiesUndecodable,
+    }
+
+    use DeltaCause::*;
+
+    /// The four delta-cause counters at zero, each spelled out so a test
+    /// that means "nothing moved" cannot pass while one of the four quietly
+    /// did.
+    fn assert_no_delta_causes(runtime: &CampaignRuntime) {
+        for (name, count) in [
+            ("deltas_without_keyframe", runtime.deltas_without_keyframe()),
+            ("deltas_unanchored", runtime.deltas_unanchored()),
+            ("delta_patch_failures", runtime.delta_patch_failures()),
+            (
+                "delta_bodies_undecodable",
+                runtime.delta_bodies_undecodable(),
+            ),
+        ] {
+            assert_eq!(count, 0, "{name} moved where nothing should have");
+        }
+    }
+
+    /// Every delta-cause counter other than `cause` at zero. The named
+    /// cause's own count is asserted explicitly at its call site, so a
+    /// fixture cannot pass by asserting only the absence of the others.
+    fn assert_no_delta_causes_except(runtime: &CampaignRuntime, cause: DeltaCause) {
+        let checks = [
+            (
+                DeltaCause::DeltasWithoutKeyframe,
+                "deltas_without_keyframe",
+                runtime.deltas_without_keyframe(),
+            ),
+            (
+                DeltaCause::DeltasUnanchored,
+                "deltas_unanchored",
+                runtime.deltas_unanchored(),
+            ),
+            (
+                DeltaCause::DeltaPatchFailures,
+                "delta_patch_failures",
+                runtime.delta_patch_failures(),
+            ),
+            (
+                DeltaCause::DeltaBodiesUndecodable,
+                "delta_bodies_undecodable",
+                runtime.delta_bodies_undecodable(),
+            ),
+        ];
+        for (variant, name, count) in checks {
+            if variant == cause {
+                continue;
+            }
+            assert_eq!(count, 0, "{name} moved where only {cause:?} should have");
+        }
+    }
+
+    /// The whole healthy reading: no delta cause and no unintelligible
+    /// bytes.
+    fn assert_no_delta_causes_and_no_undecodable(runtime: &CampaignRuntime) {
+        assert_no_delta_causes(runtime);
+        assert_eq!(runtime.downlink_undecodable(), 0);
+    }
+
+    /// #1039, the exemption the bot cohort already had (`gates/p1-swarm/
+    /// src/bot.rs`, the `ReplicaDecodeError::NotReplication` arm): a witness
+    /// record on the lossy state lane is routine traffic, recognised by the
+    /// same sub-tag mechanism the bot uses — `decode_witness` — and counted
+    /// by nothing. A witness *tag* over bytes no `WitnessMsg` accepts still
+    /// counts, because the sub-tag routes and the type check decides.
+    ///
+    /// The frame bytes are the shape the wire actually delivers: the bot's
+    /// `encode_witness` payload is itself channel-tagged, and the transport
+    /// tag wraps it, so this client strips one tag and `decode_witness`
+    /// strips the second.
+    #[test]
+    fn a_witness_record_on_the_state_lane_is_exempt_and_counts_nowhere() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("witness-exemption"),
+            UniverseSeed([0xB5; 32]),
+        );
+        runtime.join_for_test();
+
+        let signer = iroh_base::SecretKey::from_bytes(&[0x71; 32]);
+        let claim = orrery_protocol::StateClaim {
+            entity: PersistId::new(9),
+            chain_epoch: 0,
+            tick: Tick::new(600),
+            input_head: orrery_protocol::ChainHash::EMPTY,
+            state_hash: [2; 32],
+            prev_claim: [0; 32],
+            ruleset: orrery_protocol::RulesetId {
+                version: 1,
+                digest: [1; 32],
+            },
+            sig: signer.sign(b"claim"),
+        };
+        let witness_payload = orrery_protocol::channels::encode_witness(&WitnessMsg::Claim(claim));
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: Bytes::from(orrery_protocol::channels::tag(
+                    orrery_protocol::channels::Channel::State,
+                    &witness_payload,
+                )),
+            },
+            Tick::new(1_000),
+        );
+        assert_no_delta_causes_and_no_undecodable(&runtime);
+
+        let mut tagged = vec![orrery_protocol::channels::TAG_WITNESS];
+        tagged.extend_from_slice(b"not postcard for any WitnessMsg");
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: Bytes::from(orrery_protocol::channels::tag(
+                    orrery_protocol::channels::Channel::State,
+                    &tagged,
+                )),
+            },
+            Tick::new(1_001),
+        );
+
+        assert_eq!(
+            runtime.downlink_undecodable(),
+            1,
+            "the exemption follows the bot's: a decodable witness record is \
+             exempt, witness-tagged garbage is still undecodable"
+        );
+        assert_no_delta_causes(&runtime);
+    }
+
+    /// #1039, delta cause 1: a delta for an entity no keyframe has arrived
+    /// for. Still counted — it says the keyframe carrying the anchor was
+    /// lost — but in its own counter, not `downlink_undecodable`.
+    #[test]
+    fn a_delta_without_a_retained_keyframe_counts_in_its_own_counter() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("delta-cause-without-keyframe"),
+            UniverseSeed([0xB6; 32]),
+        );
+        runtime.join_for_test();
+
+        let entity = PersistId::new(9);
+        let cell = CellId::from_bits(7).expect("a cell");
+        let state = remote_craft(entity);
+        let changed = advanced_craft(&state);
+        let patch = orrery_protocol::channels::encode_delta_patch(
+            &state.to_canonical(),
+            &changed.to_canonical(),
+        );
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: delta_wire(&changed, entity, cell, 45, 3, patch),
+            },
+            Tick::new(1_000),
+        );
+
+        assert_eq!(runtime.deltas_without_keyframe(), 1);
+        assert_eq!(
+            runtime.downlink_undecodable(),
+            0,
+            "a delta failure must not borrow the unintelligible-byte counter"
+        );
+        assert_no_delta_causes_except(&runtime, DeltasWithoutKeyframe);
+    }
+
+    /// #1039, delta cause 2: a delta whose tick and keyframe age do not
+    /// anchor it to the retained keyframe (`delta_is_anchored` refuses).
+    /// The bot cohort keeps three causes here; this client checks once and
+    /// counts once.
+    #[test]
+    fn a_delta_that_fails_its_anchor_check_counts_in_its_own_counter() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("delta-cause-unanchored"),
+            UniverseSeed([0xB7; 32]),
+        );
+        runtime.join_for_test();
+
+        let entity = PersistId::new(9);
+        let cell = CellId::from_bits(7).expect("a cell");
+        let state = remote_craft(entity);
+        let canonical = state.to_canonical();
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: keyframe_wire(&state, entity, cell, 42),
+            },
+            Tick::new(1_000),
+        );
+
+        let changed = advanced_craft(&state);
+        let patch =
+            orrery_protocol::channels::encode_delta_patch(&canonical, &changed.to_canonical());
+        // The keyframe is at 42; a delta at 45 naming an age of 4 references
+        // tick 41, which this client does not hold.
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: delta_wire(&changed, entity, cell, 45, 4, patch),
+            },
+            Tick::new(1_001),
+        );
+
+        assert_eq!(runtime.deltas_unanchored(), 1);
+        assert_eq!(
+            runtime.downlink_undecodable(),
+            0,
+            "a delta failure must not borrow the unintelligible-byte counter"
+        );
+        assert_no_delta_causes_except(&runtime, DeltasUnanchored);
+    }
+
+    /// #1039, delta cause 3: a delta whose patch does not apply. The bytes
+    /// parsed as a delta — the envelope is well-formed — but the skip/write
+    /// program is malformed, so `apply_delta_patch` refuses.
+    #[test]
+    fn a_delta_whose_patch_fails_to_apply_counts_in_its_own_counter() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("delta-cause-patch-failure"),
+            UniverseSeed([0xB8; 32]),
+        );
+        runtime.join_for_test();
+
+        let entity = PersistId::new(9);
+        let cell = CellId::from_bits(7).expect("a cell");
+        let state = remote_craft(entity);
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: keyframe_wire(&state, entity, cell, 42),
+            },
+            Tick::new(1_000),
+        );
+
+        let changed = advanced_craft(&state);
+        // 0xFF repeated is a varint that never terminates canonically: the
+        // envelope parses, the program does not.
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: delta_wire(&changed, entity, cell, 42, 0, vec![0xFF; 9]),
+            },
+            Tick::new(1_001),
+        );
+
+        assert_eq!(runtime.delta_patch_failures(), 1);
+        assert_eq!(
+            runtime.downlink_undecodable(),
+            0,
+            "a delta failure must not borrow the unintelligible-byte counter"
+        );
+        assert_no_delta_causes_except(&runtime, DeltaPatchFailures);
+    }
+
+    /// #1039, delta cause 4: a delta whose patch applies but whose produced
+    /// body is not a state this client's codec accepts. The bot cohort
+    /// counts this as `bad_body` — bytes the receiver's own codec refuses —
+    /// and the client keeps it visible under its own name.
+    #[test]
+    fn a_delta_whose_patched_body_does_not_decode_counts_in_its_own_counter() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("delta-cause-body-undecodable"),
+            UniverseSeed([0xB9; 32]),
+        );
+        runtime.join_for_test();
+
+        let entity = PersistId::new(9);
+        let cell = CellId::from_bits(7).expect("a cell");
+        let state = remote_craft(entity);
+        let canonical = state.to_canonical();
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: keyframe_wire(&state, entity, cell, 42),
+            },
+            Tick::new(1_000),
+        );
+
+        let changed = advanced_craft(&state);
+        // A well-formed program that rewrites the body to nothing: the patch
+        // applies, the empty result decodes as no `RegolithState`.
+        let patch = orrery_protocol::channels::encode_delta_patch(&canonical, b"");
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: delta_wire(&changed, entity, cell, 42, 0, patch),
+            },
+            Tick::new(1_001),
+        );
+
+        assert_eq!(runtime.delta_bodies_undecodable(), 1);
+        assert_eq!(
+            runtime.downlink_undecodable(),
+            0,
+            "a delta failure must not borrow the unintelligible-byte counter"
+        );
+        assert_no_delta_causes_except(&runtime, DeltaBodiesUndecodable);
+    }
+
+    /// The control the four cause tests imply: a well-formed keyframe and a
+    /// well-anchored delta still land, and no counter moves. The exemption
+    /// and the split must not swallow replication itself, and the delta
+    /// counters must not fire on the healthy cadence they were split away
+    /// from.
+    #[test]
+    fn a_well_formed_keyframe_and_delta_still_land_and_count_nowhere() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("delta-cause-control"),
+            UniverseSeed([0xBA; 32]),
+        );
+        runtime.join_for_test();
+
+        let entity = PersistId::new(9);
+        let cell = CellId::from_bits(7).expect("a cell");
+        let state = remote_craft(entity);
+        let canonical = state.to_canonical();
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: keyframe_wire(&state, entity, cell, 42),
+            },
+            Tick::new(1_000),
+        );
+        assert_eq!(
+            runtime.downlink_last_tick(2),
+            Some(42),
+            "the keyframe landed and was accounted"
+        );
+
+        let changed = advanced_craft(&state);
+        let patch =
+            orrery_protocol::channels::encode_delta_patch(&canonical, &changed.to_canonical());
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: delta_wire(&changed, entity, cell, 45, 3, patch),
+            },
+            Tick::new(1_001),
+        );
+        assert_eq!(
+            runtime.downlink_last_tick(2),
+            Some(45),
+            "the anchored delta landed and was accounted"
+        );
+        assert_no_delta_causes_and_no_undecodable(&runtime);
     }
 }

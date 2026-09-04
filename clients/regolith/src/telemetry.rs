@@ -140,13 +140,40 @@ pub struct OverlayMetrics {
     /// recognises (#1034).
     ///
     /// The received side alone, since the split; the client's own packet has
-    /// [`Self::own_orders_undecodable`]. Read with care before calling it a
-    /// network failure: witness frames from the bot cohort ride the same
-    /// datagram lane as replication (`orrery_net`'s `send_peer_packets` puts
-    /// every `Channel::State` send on it) and land in the neither-replication
-    /// arm, so a healthy island's steady witness cadence is counted here
-    /// too. The bot cohort's own receive path exempts those frames.
+    /// [`Self::own_orders_undecodable`]. Since #1039 it is the received side
+    /// of *unintelligible bytes* alone: witness frames from the bot cohort
+    /// ride the same datagram lane as replication (`orrery_net`'s
+    /// `send_peer_packets` puts every `Channel::State` send on it) but are
+    /// exempted by their sub-tag exactly as the bot cohort's receiver
+    /// exempts them, and the four delta-application failures moved to the
+    /// counters below. A healthy island reads zero here.
     pub downlink_undecodable: u64,
+    /// Deltas that arrived for an entity this client holds no keyframe for
+    /// (#1039).
+    ///
+    /// The delta-application failures were split out of
+    /// [`Self::downlink_undecodable`] so each stays a usable diagnostic:
+    /// this one usually means the keyframe carrying the delta's anchor was
+    /// lost and never repaired.
+    pub deltas_without_keyframe: u64,
+    /// Deltas whose tick and keyframe age do not anchor them to the keyframe
+    /// this client retains (#1039).
+    ///
+    /// The client's single coarse form of the bot cohort's three anchoring
+    /// causes: the keyframe the delta names is not the one held.
+    pub deltas_unanchored: u64,
+    /// Deltas whose skip/write patch did not apply to the retained keyframe
+    /// (#1039).
+    ///
+    /// The bytes parsed as a delta but describe a program the retained
+    /// keyframe cannot execute.
+    pub delta_patch_failures: u64,
+    /// Deltas whose patch applied but whose resulting body did not decode as
+    /// a state this client's codec accepts (#1039).
+    ///
+    /// A codec-contract break rather than loss: sender and receiver agreed
+    /// on the keyframe, and the produced body is still refused.
+    pub delta_bodies_undecodable: u64,
     /// Ruleset deliveries for an entity this client could not route to.
     pub delivered_unroutable: u64,
     /// Delivered inputs addressed to another authority and refused here.
@@ -178,6 +205,10 @@ impl OverlayMetrics {
             uplink_shed: 0,
             own_orders_undecodable: 0,
             downlink_undecodable: 0,
+            deltas_without_keyframe: 0,
+            deltas_unanchored: 0,
+            delta_patch_failures: 0,
+            delta_bodies_undecodable: 0,
             delivered_unroutable: 0,
             delivered_foreign: 0,
         }
