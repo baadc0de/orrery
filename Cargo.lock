@@ -8351,6 +8351,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_unreal_interiors"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "orrery_core",
+ "orrery_protocol",
+ "orrery_sim_host",
+]
+
+[[package]]
 name = "orrery_witness"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,22 @@
+{
+  "schema": "orrery-interiors-rollback/1",
+  "scene": "mech", "ticks": 36000, "transitions": 4,
+  "loadavg_start": 8.47, "loadavg_end": 8.47,
+  "corrections": 4, "mismatch_window": 0, "mismatch_after": 0, "rollback": 4, "snap": 0, "restore_failed": 0, "replay_step_failed": 0, "events_reemitted_by_replay": 4, "lockstep_compared": 249, "lockstep_mismatch": 0,
+  "total_ns": {"p50": 27001, "p99": 41717, "max": 41717},
+  "by_transition": [
+    {"transition": "board_docked", "shape": "ship", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 18, "residual_mm_max": 50, "total_ns_p50": 41017, "total_ns_p99": 41017},
+    {"transition": "undock", "shape": "ship", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 9, "residual_mm_max": 0, "total_ns_p50": 26951, "total_ns_p99": 26951},
+    {"transition": "mount", "shape": "ship", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 9, "residual_mm_max": 0, "total_ns_p50": 27001, "total_ns_p99": 27001},
+    {"transition": "dismount", "shape": "ship", "n": 1, "mismatch_window": 0, "mismatch_after": 0, "hashes_changed": 9, "residual_mm_max": 0, "total_ns_p50": 41717, "total_ns_p99": 41717}
+  ],
+  "by_depth": [
+    {"depth": 9, "n": 4, "mismatch_window": 0, "mismatch_after": 0, "total_ns_p50": 27001, "total_ns_p99": 41717, "total_ns_max": 41717}
+  ],
+  "corrections_detail": [
+    {"transition": "board_docked", "shape": "ship", "tc": 250, "ta": 250, "now": 259, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 18, "residual_mm": 50, "frame_before": 2, "frame_after": 2, "restore_ns": 13806, "install_ns": 581, "replay_ns": 26630, "total_ns": 41017},
+    {"transition": "undock", "shape": "ship", "tc": 300, "ta": 299, "now": 308, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 9, "residual_mm": 0, "frame_before": 2, "frame_after": 2, "restore_ns": 1173, "install_ns": 210, "replay_ns": 25568, "total_ns": 26951},
+    {"transition": "mount", "shape": "ship", "tc": 1550, "ta": 1548, "now": 1557, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 9, "residual_mm": 0, "frame_before": 3, "frame_after": 3, "restore_ns": 6212, "install_ns": 391, "replay_ns": 20398, "total_ns": 27001},
+    {"transition": "dismount", "shape": "ship", "tc": 35400, "ta": 35397, "now": 35406, "depth": 9, "plan": "rollback", "mismatch_window": 0, "mismatch_after": 0, "compared_after": 30, "hashes_changed": 9, "residual_mm": 0, "frame_before": 2, "frame_after": 2, "restore_ns": 12242, "install_ns": 1243, "replay_ns": 28232, "total_ns": 41717}
+  ]
+}

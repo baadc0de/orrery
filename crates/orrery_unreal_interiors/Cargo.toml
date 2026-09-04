@@ -1,0 +1,27 @@
+[package]
+name = "orrery_unreal_interiors"
+version = "0.1.0"
+edition = "2021"
+description = "Spike #1045 (moving interiors): a throwaway nested-frame ruleset — a mothership fixture, a ship under way, a mech and an avatar stepping in frame-local integer coordinates — hosted on orrery_sim_host as a staticlib behind the existing C ABI, for an Unreal mirror to walk and roll back across"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Research spike, not a shipping crate (#1042 rule 6). It lives on the spike
+# branch so `scripts/check.sh` covers it; nothing here merges, and nothing in
+# `orrery_games` is touched: the nested-frame rules are a throwaway ruleset of
+# this crate's own (#1045, "What the tree has, and does not have").
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# Built on spike #1052's non-App prong (`crates/orrery_unreal_direct`): the
+# generic `orrery_host_*` ABI, one factory, no Bevy `App`. The rollback
+# driver the Unreal side and the C consumer share is that prong's, lifted
+# into a header both can include.
+[dependencies]
+libm = "0.2"
+orrery_core = { path = "../orrery_core" }
+orrery_protocol = { path = "../orrery_protocol" }
+orrery_sim_host = { path = "../orrery_sim_host" }
+
+[lints]
+workspace = true

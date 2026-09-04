@@ -1,0 +1,15 @@
+{
+  "schema": "orrery-interiors-unreal/1",
+  "scene": "roll", "variant": "cmc_drive", "interior": "resident", "ticks": 36000,
+  "fixed_timestep": 1, "dt": 0.016667, "null_rhi": 1, "chain": "c801ca8b27dce808",
+  "drift_mm": {"direct": {"p50": 0.000000, "p99": 0.000000, "max": 0.000000}, "reproj": {"p50": 134252760.335425, "p99": 281246878.834063, "max": 284246759.061719}, "cmc": {"p50": 134252760.3316, "p99": 281246878.8347, "max": 284246759.0618}},
+  "cmc_assertions": 36000, "cmc_assertion_ticks": 36000, "cmc_assertions_vertical_only": 0, "cmc_assertions_horizontal": 36000, "cmc_assertions_with_based_movement": 1588,
+  "cmc_ticks": {"walking": 1888, "falling": 34112, "flying": 0, "other": 0, "base_ok": 1638},
+  "frame_ms": {"first": 334.602, "p50": 0.969, "p99": 1.317, "max": 17.692, "hitches": 4},
+  "host_us": {"p50": 7.4, "p99": 11.9, "max": 54.0},
+  "world_max_abs_cm": 39747976.700, "ulp_double_mm": 7.451e-08, "ulp_float_mm": 4.000e+01,
+  "transitions": [
+    {"kind": "board_docked", "tick": 250, "hitches": 0, "hitches_with_gc": 0, "hitches_with_spawn": 0, "max_frame_ms": 1.289, "transition_frame_ms": 0.191},
+    {"kind": "undock", "tick": 300, "hitches": 0, "hitches_with_gc": 0, "hitches_with_spawn": 0, "max_frame_ms": 1.289, "transition_frame_ms": 0.195}
+  ]
+}
