@@ -82,12 +82,12 @@ print("placed", len(graph))
 def mat(name, rgb, rough=0.55, metal=0.0, emit=None, alpha=1.0):
     m = bpy.data.materials.get(name) or bpy.data.materials.new(name); m.use_nodes = True; bs = m.node_tree.nodes.get("Principled BSDF")
     bs.inputs["Base Color"].default_value = (*rgb, 1); bs.inputs["Roughness"].default_value = rough; bs.inputs["Metallic"].default_value = metal
-    if emit: bs.inputs["Emission Color"].default_value = (*emit, 1); bs.inputs["Emission Strength"].default_value = 6.0
+    if emit: bs.inputs["Emission Color"].default_value = (*emit, 1); bs.inputs["Emission Strength"].default_value = 0.8
     if alpha < 1: bs.inputs["Alpha"].default_value = alpha; m.blend_method = 'BLEND'
     return m
 # brief palette: hull #8a8f94 warm grey painted steel, dark panels #2b2e33, safety orange #d9772b, emissive #7fd4ff, canopy #1c3f5a
 M = {"hull": mat("hull_paint", (0.25, 0.27, 0.29), 0.6), "dark": mat("dark_panel", (0.026, 0.028, 0.035), 0.5), "accent": mat("safety_orange", (0.70, 0.19, 0.025), 0.5),
-     "polymer": mat("rubber_polymer", (0.02, 0.02, 0.022), 0.85), "aluminium": mat("bare_aluminium", (0.6, 0.6, 0.6), 0.35, 1.0), "emissive": mat("thruster_glow", (0.05, 0.05, 0.06), 0.4, 0.0, (0.22, 0.65, 1.0)),
+     "polymer": mat("rubber_polymer", (0.02, 0.02, 0.022), 0.85), "aluminium": mat("bare_aluminium", (0.6, 0.6, 0.6), 0.35, 1.0), "emissive": mat("thruster_glow", (0.03, 0.03, 0.035), 0.45, 0.0, (0.22, 0.65, 1.0)),
      "glass": mat("canopy_tint", (0.012, 0.05, 0.1), 0.05, 0.0, None, 0.6)}
 ROLE = {"nozzle": "polymer", "thruster": "dark", "cable": "polymer", "conduit": "polymer", "pipe": "polymer", "hull-panel": "dark", "plate": "dark", "hatch": "dark", "vent": "dark", "grille": "dark",
         "landing-gear": "polymer", "strut": "aluminium", "bracket": "aluminium", "pylon": "dark", "gun": "dark", "launcher": "dark", "turret": "dark", "window": "glass"}
