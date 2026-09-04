@@ -400,9 +400,17 @@ and the two paths stay one code path:
   "account": 17,
   "nickname": "ada",
   "expires_in_s": 3600,
-  "configured": { "loss_pct": 3, "jitter_p50_ms": 100, "jitter_p99_ms": 100 }
+  "configured": { "loss_pct": 3, "jitter_p50_ms": 0, "jitter_p99_ms": 100 }
 }
 ```
+
+The `configured` block's schema is fixed; its two jitter figures are *derived*
+from the campaign's single `jitter_ms` rather than echoed into both (#1030).
+The host holds a tenth of datagrams for the whole spike and the rest not at all
+(`Impairment::p4_profile_at_loss`, `gates/p1-swarm/src/router.rs`), so a 100 ms
+campaign has a zero median added delay and sees its spike only above the
+ninetieth percentile. Sending 100 for both asserted a distribution nothing can
+satisfy, and flagged every honest session of the first real cohort.
 
 `slot` is the campaign's `peers` value — the external slot index the runbook
 already uses (`p4-campaign-session.sh:66-69`: `--peers 8 … --slot 8`).

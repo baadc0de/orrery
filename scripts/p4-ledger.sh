@@ -280,7 +280,11 @@ self_test() {
     die 'self-test: a row claiming a mismatch its own numbers refute banked'
   fi
   # And the honest direction still banks: a genuinely mismatching row that
-  # says so is flagged evidence, not a refusal.
+  # says so is flagged evidence, not a refusal. The mismatch is a jitter
+  # *shortfall* (#1030) — a p99 of 20 ms against a configured 100 is a seat
+  # whose spike never arrived, which is the direction that is evidence. A p99
+  # above the configured figure is the volunteer's own path adding to the
+  # profile and is no longer a disagreement.
   st_report 11 '.player_hours = 1 | .seconds = 3600 | .peers = 1
     | .session = {
         session_id: "018f8f4e-5c90-7abc-8123-000000000011",
@@ -289,7 +293,7 @@ self_test() {
         platform_triple: "x86_64-unknown-linux-gnu", client_rev: "self-test",
         ruleset_id: "52", ruleset_version: 2, pipeline_digest: "selftestpipeline",
         actor: "human", configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
-        observed_loss_pct: 3.4, observed_jitter_p50_ms: 96, observed_jitter_p99_ms: 210,
+        observed_loss_pct: 3.4, observed_jitter_p50_ms: 96, observed_jitter_p99_ms: 20,
         afk_seconds: 0, afk_capped: false, impairment_mismatch: true
       }
     | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000011"' human '018f8f4e-5c90-7abc-8123-000000000011' >/dev/null
@@ -314,6 +318,27 @@ self_test() {
     | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000012"' human '018f8f4e-5c90-7abc-8123-000000000012' >/dev/null
   "$0" append "$dir/r.json" >/dev/null 2>&1 \
     || die 'self-test: an honest measurement of a correctly-impaired link was refused'
+  # #1030: the first real cohort, banked. Session 01a06b05-52e9 (macOS,
+  # 2026-09-04) measured 3.17% loss with a jitter p50 of 17 ms and a p99 of
+  # 151 ms against a campaign configured at 3% loss and a 100 ms spike — the
+  # host holds a tenth of datagrams for the full spike and the rest not at all,
+  # so the advertised profile is p50 0 / p99 100 and the volunteer's own path
+  # adds on top of it. Its flag is correctly clear, and this row must bank.
+  st_report 14 '.player_hours = 1 | .seconds = 3600 | .peers = 1
+    | .session = {
+        session_id: "018f8f4e-5c90-7abc-8123-000000000014",
+        wall_start: "2026-08-23T12:00:00Z", wall_end: "2026-08-23T13:00:00Z",
+        distinct_play_minutes: 60, banked_minutes: 60,
+        platform_triple: "x86_64-unknown-linux-gnu", client_rev: "self-test",
+        ruleset_id: "52", ruleset_version: 2, pipeline_digest: "selftestpipeline",
+        actor: "human", configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 0, jitter_p99_ms: 100},
+        observed_loss_pct: 3.17, observed_jitter_p50_ms: 17, observed_jitter_p99_ms: 151,
+        afk_seconds: 0, afk_capped: false, impairment_mismatch: false
+      }
+    | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000014"' human '018f8f4e-5c90-7abc-8123-000000000014' >/dev/null
+  "$0" append "$dir/r.json" >/dev/null 2>&1 \
+    || die 'self-test: an honest volunteer session was refused as an impairment mismatch (#1030)'
+
   # And the band has not swallowed the property the flag exists to provide: a
   # seat that never received its impairment reads ~0 against a configured 3.0
   # and 100, and a clear flag over those numbers is still refused.
@@ -952,9 +977,13 @@ validate_session_record() {
     if .session? == null then true else
       .session as $s
       | $s.configured_impairment_profile as $c
+      # Loss straddles its configuration; jitter is a floor, not a target
+      # (#1030). The client measures the injected spike composed with the
+      # path the volunteer plays over, and delays add rather than cancel, so
+      # only a shortfall below the configured percentile is evidence.
       | ((((($s.observed_loss_pct - $c.loss_pct) | fabs) > 2.0)
-          or ((($s.observed_jitter_p50_ms - $c.jitter_p50_ms) | fabs) > 40)
-          or ((($s.observed_jitter_p99_ms - $c.jitter_p99_ms) | fabs) > 40)) as $outside
+          or (($c.jitter_p50_ms - $s.observed_jitter_p50_ms) > 40)
+          or (($c.jitter_p99_ms - $s.observed_jitter_p99_ms) > 40)) as $outside
         # The client suppresses the flag below 200 observed packets, which the
         # signed row does not carry; 200 packets is 200/20/60 minutes of play
         # at the 20 Hz send cadence, and below that a clear flag stands.

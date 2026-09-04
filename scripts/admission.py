@@ -202,6 +202,41 @@ class Refusal(Exception):
         self.status, self.error, self.detail, self.extra = status, error, detail, extra
 
 
+# ── The configured impairment profile (#1030) ────────────────────────────────
+#
+# A campaign config carries one jitter figure, and this file used to send it as
+# both `jitter_p50_ms` and `jitter_p99_ms`. No distribution satisfies that, so
+# every honest session recorded on 2026-09-04 banked with
+# `impairment_mismatch: true` — the exact false positive P4's exit condition
+# (#240) counts, arriving on the first real cohort.
+#
+# What the host actually applies: `Impairment::p4_profile_at_loss` in
+# `gates/p1-swarm/src/router.rs` sets `jitter_rate: 0.10` beside
+# `jitter_ticks: 6`, and `Router::schedule` there holds a datagram for the whole
+# six ticks (100 ms at 60 Hz) or not at all. The added delay is a two-point
+# distribution — zero for nine datagrams in ten, one full spike for the tenth —
+# so the campaign's `jitter_ms` is the *height of the spike*, not a median.
+#
+# Its quantiles follow directly: zero below the spike's mass, the spike's full
+# height above it. At a 0.10 rate that is p50 = 0 and p99 = jitter_ms. This
+# mirrors `ConfiguredImpairment::from_spike` in
+# `clients/regolith/src/session.rs`; `--self-test` holds this constant against
+# the router's, so the two cannot drift.
+#
+# The wire schema is untouched: the join answer still carries
+# `{loss_pct, jitter_p50_ms, jitter_p99_ms}`, and only the values change. No
+# client re-download.
+HOST_JITTER_SPIKE_RATE = 0.10
+
+
+def configured_impairment(c: "Campaign") -> dict[str, Any]:
+    """The impairment profile a joining client is told to expect."""
+    def quantile(q: float) -> int:
+        return c.jitter_ms if q > 1.0 - HOST_JITTER_SPIKE_RATE else 0
+    return {"loss_pct": c.loss_pct,
+            "jitter_p50_ms": quantile(0.50), "jitter_p99_ms": quantile(0.99)}
+
+
 @dataclass(frozen=True)
 class Campaign:
     ident: str; title: str; open: bool; host: str; peers: int; seconds: int
@@ -714,7 +749,7 @@ class Admission:
                 except (RuntimeError, KeyError, ValueError) as e:
                     logging.error("always-on host returned an unusable listening address: %s", e)
                     raise Refusal(503, "host_failed", "The always-on host is not ready — try again shortly.") from e
-                return {"join": {"host_node": host_node, "slot": slot, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "nickname": granted_nickname, "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
+                return {"join": {"host_node": host_node, "slot": slot, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "nickname": granted_nickname, "expires_in_s": 3600, "configured": configured_impairment(c)}
             try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 lock.close()
@@ -752,7 +787,7 @@ class Admission:
             reaper = threading.Thread(target=self._reap, args=(ident, c, sid, remote, session_dir, child), daemon=True)
             self.reapers.add(reaper)
             reaper.start()
-            return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "nickname": display_label(nickname), "expires_in_s": 3600, "configured": {"loss_pct": c.loss_pct, "jitter_p50_ms": c.jitter_ms, "jitter_p99_ms": c.jitter_ms}}
+            return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "nickname": display_label(nickname), "expires_in_s": 3600, "configured": configured_impairment(c)}
         finally:
             # The flock stays held by the child/reaper, not the request.  It is released there.
             if ident not in self.children:
@@ -1167,6 +1202,37 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual([seat["state"] for seat in self.service.roster("test")["roster"][4:]],
                          ["reserved", "reserved", "empty", "empty"],
                          "a prior generation must not assert present membership")
+
+    def test_the_join_answer_derives_both_jitter_percentiles_from_the_spike(self) -> None:
+        # #1030. The campaign config carries one `jitter_ms`, and this file used
+        # to send it as both percentiles. The host holds a tenth of datagrams
+        # for the whole spike and the rest not at all, so the median added delay
+        # is zero and only the p99 sees the spike. Sending 100 for both asserted
+        # something no distribution satisfies, and every honest session of
+        # 2026-09-04 banked with `impairment_mismatch: true`.
+        campaign = self.service.campaigns()[0]["test"]
+        self.assertEqual(campaign.jitter_ms, 100)
+        self.assertEqual(configured_impairment(campaign),
+                         {"loss_pct": 3, "jitter_p50_ms": 0, "jitter_p99_ms": 100})
+        # The wire schema is unchanged: same three keys, in the same block.
+        answer = self.service.join("test", self.request())
+        self.assertEqual(answer["configured"], configured_impairment(campaign))
+
+    def test_the_spike_rate_is_the_one_the_host_router_applies(self) -> None:
+        # A derived profile is only honest while it derives from what the host
+        # does. `gates/p1-swarm/src/router.rs` owns the number; if the profile
+        # there changes rate, this must move with it or the coordinator resumes
+        # advertising a distribution nobody applies.
+        router = (Path(__file__).parents[1] / "gates/p1-swarm/src/router.rs").read_text()
+        found = re.search(r"fn p4_profile_at_loss\(.*?jitter_rate: ([0-9.]+),", router, re.S)
+        self.assertIsNotNone(found, "cannot read the P4 profile's jitter_rate out of router.rs")
+        self.assertEqual(float(found.group(1)), HOST_JITTER_SPIKE_RATE,
+                         "the host's spike rate drifted from the advertised profile")
+        session_rs = (Path(__file__).parents[1] / "clients/regolith/src/session.rs").read_text()
+        mirrored = re.search(r"^pub const HOST_JITTER_SPIKE_RATE: f64 = ([0-9.]+);$", session_rs, re.M)
+        self.assertIsNotNone(mirrored, "cannot read HOST_JITTER_SPIKE_RATE out of session.rs")
+        self.assertEqual(float(mirrored.group(1)), HOST_JITTER_SPIKE_RATE,
+                         "the client derives its expectation from a different rate")
 
     def test_the_listing_and_the_roster_agree_on_which_seats_are_taken(self) -> None:
         # `slots_free` and the roster answered "is this seat taken" from

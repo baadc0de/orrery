@@ -310,9 +310,14 @@ at `n = 20` it reaches past 14% and would admit a leg that dropped nothing.
 
 This is deliberately *not* a requirement that observed loss equal exactly 3.000%,
 and it does not describe the 100 ms spike as both p50 and p99: the router injects
-a 100 ms delay into 10% of packets. The client-side `impairment_mismatch` flag
-keeps its existing exact-inequality meaning and is retained unchanged — an
-honestly flagged mismatching row is flagged evidence, not a refusal.
+a 100 ms delay into 10% of packets. The coordinator advertised it as both
+percentiles anyway until #1030, which flagged every honest session of the first
+real cohort; it now advertises the quantiles that two-point distribution
+actually has (p50 0, p99 100), and the jitter halves of the flag compare as a
+*floor* rather than a target — the measurement composes the injected spike with
+the path the volunteer plays over, and delays add rather than cancel, so only a
+shortfall is evidence. Loss remains two-sided. An honestly flagged mismatching
+row is flagged evidence, not a refusal.
 
 ## 7. Fixtures
 
