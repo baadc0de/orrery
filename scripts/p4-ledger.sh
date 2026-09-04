@@ -133,10 +133,16 @@ self_test() {
     || die 'self-test: the attempt binding is no longer checked; several humans in one attempt would be indistinguishable in the ledger'
   has 'refuse_a_second_claim_on_one_seat' \
     || die 'self-test: nothing refuses a second claim on one seat; one interval could be banked twice across appends'
-  has '.session.banked_minutes / 60' \
-    || die 'self-test: player_hours is no longer cross-checked against the signed interval; the attempt total could be copied onto a participant'
+  has '.binding.banked_minutes // .session.banked_minutes) / 60' \
+    || die 'self-test: player_hours is no longer cross-checked against the banked interval; the attempt total could be copied onto a participant'
+  has '$banked <= .session.banked_minutes' \
+    || die 'self-test: nothing holds the banked interval under the signed one; a clamp could invent play instead of discarding it'
   has 'connected_ticks * $per / 60' \
     || die 'self-test: the per-seat connected span is no longer recomputed; a human seated for part of an attempt could bank all of it'
+  has '$banked <= $connected + $slack' \
+    || die 'self-test: the banked interval is no longer held under the seat'\''s connected span'
+  has '(1000 + 100e-6 * ($connected * 60000)) / 60000' \
+    || die 'self-test: the #1032 clock-disagreement allowance is gone from the append path; an inflated claim would bank'
 
   # Functional half. The structural checks above cannot tell a clause that is
   # read from one that is read and ignored, and every case below costs
@@ -652,9 +658,10 @@ self_test() {
   banked_total=$(jq -rs 'map(.player_hours) | add | (. * 10000 | round) / 10000' "$P4_LEDGER_FILE")
   [[ $banked_total == 5.5333 ]] \
     || die "self-test [each_row_banks_its_own_interval_not_the_cohort_total]: banked $banked_total, not 5.5333"
-  jq -es 'map(select(.actor == "human")) | all(.player_hours == (.session.banked_minutes / 60))' \
+  jq -es 'map(select(.actor == "human"))
+          | all(.player_hours == ((.binding.banked_minutes // .session.banked_minutes) / 60))' \
     "$P4_LEDGER_FILE" >/dev/null \
-    || die 'self-test [each_row_banks_its_own_interval_not_the_cohort_total]: a human row did not bank its own signed interval'
+    || die 'self-test [each_row_banks_its_own_interval_not_the_cohort_total]: a human row did not bank its own interval'
   jq -es 'map(select(.actor == "human")) | all(.player_hours != 6.0)' "$P4_LEDGER_FILE" >/dev/null \
     || die 'self-test [each_row_banks_its_own_interval_not_the_cohort_total]: a human row banked the cohort total'
   st_bind_ok each_row_banks_its_own_interval_not_the_cohort_total
@@ -817,6 +824,62 @@ self_test() {
     "$P4_LEDGER_FILE" >/dev/null \
     || die 'self-test [a_partial_seat_banks_its_own_span]: a ten-minute seat did not bank ten minutes'
   st_bind_ok a_partial_seat_banks_its_own_span
+
+  # ── The clamp to the host's wall bracket (#1032) ──────────────────────────
+  #
+  # The real 2026-09-04 shape: a client whose own tick count claims 168 ms more
+  # than the host's bracket, which is two clocks disagreeing rather than an
+  # inflated hour. What banks is the bracket, and the sliver is visible in the
+  # row rather than absorbed by a tolerance.
+  local st_since=1750000000000 st_bracket
+  # 30 minutes of bracket, and a claim 168 ms past it.
+  st_bracket=$(( st_since + 30 * 60000 ))
+  local clamp_stamps=".binding.connected_since_unix_millis = $st_since
+      | .binding.connected_until_unix_millis = $st_bracket
+      | .binding.connected_ticks = (30 * 60 * 30)
+      | .binding.connected_minutes = 30"
+  local clamped
+  clamped=$(st_derived 9 018f9000-0000-7000-8000-0000000000e1 30.0028 51 \
+      x86_64-unknown-linux-gnu "$clamp_stamps
+      | .binding.claimed_minutes = 30.0028
+      | .binding.banked_minutes = 30
+      | .binding.clamped_minutes = 0.0028
+      | .binding.span_basis = \"host wall bracket\"
+      | .player_hours = 0.5")
+  "$0" append "$clamped" >/dev/null 2>&1 \
+    || die 'self-test [a_clamped_interval_banks_the_host_bracket]: a clamped honest interval was refused'
+  jq -es '
+    map(select(.slot == 9))
+    | length == 1
+      and (.[0].player_hours == 0.5)
+      and (.[0].binding.clamped_minutes > 0)' "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [a_clamped_interval_banks_the_host_bracket]: the bracket was not what banked'
+  st_bind_ok a_clamped_interval_banks_the_host_bracket
+
+  # A clamp only ever discards. A binding claiming to have banked *more* than
+  # the row its client signed is the inflation the clamp exists to prevent,
+  # wearing the clamp's own field.
+  st_bind_refuses a_clamp_may_not_bank_more_than_the_signed_interval \
+    "$(st_fresh 30 "$clamp_stamps
+      | .binding.banked_minutes = 40 | .player_hours = (40 / 60)")"
+
+  # And on the bracket basis the ceiling is exact: one millisecond past the
+  # host's own span is past it, because the derivation had a clamp available
+  # and did not use it. The old one-tick tolerance is gone from this path.
+  st_bind_refuses a_banked_interval_past_its_wall_bracket_is_refused \
+    "$(st_fresh 30.0028 "$clamp_stamps
+      | .binding.banked_minutes = 30.0000167
+      | .player_hours = (30.0000167 / 60)")"
+
+  # The allowance is a bound on two clocks disagreeing, not a discount. A claim
+  # a full minute past its bracket is refused even though the binding clamps it
+  # to something bankable: the *row* is what disagrees with itself.
+  st_bind_refuses a_claim_far_past_its_wall_bracket_is_refused \
+    "$(st_fresh 31 "$clamp_stamps
+      | .binding.claimed_minutes = 31
+      | .binding.banked_minutes = 30
+      | .binding.clamped_minutes = 1
+      | .player_hours = 0.5")"
 
   # ── The cross-check #576 asks for, on its own ─────────────────────────────
   st_bind_refuses player_hours_must_equal_the_signed_interval \
@@ -1068,8 +1131,6 @@ validate_attempt_binding() {
   # human seated for part of an attempt played less than the attempt lasted, so
   # the ceiling is *this seat's* connected span and never the attempt's length —
   # assuming presence for the whole attempt is exactly how a cohort over-counts.
-  # One tick of tolerance absorbs the boundary rounding between the client's
-  # wall clock and the host's tick clock, and nothing else.
   #
   # The span is the host's own wall bracket when the seat carries one (#971):
   # a tick count scaled at the *nominal* rate is not a duration, because the
@@ -1078,18 +1139,50 @@ validate_attempt_binding() {
   # however much it lagged. The tick basis stays as the fallback for a report
   # without stamps, and it is the conservative one — shorter for a lagging
   # host — so omitting the bracket refuses more readily, never less.
+  #
+  # Three numbers, not one, since #1032. What banks is
+  # `binding.banked_minutes`, and it is held under *both* ends at once:
+  #
+  #   banked <= connected      exactly, no tolerance at all on the bracket
+  #                            basis, because the derivation clamps to it
+  #   banked <= claimed        a clamp only ever discards; it never invents
+  #   claimed <= connected + allowance
+  #
+  # The allowance is `1000 ms + 100 ppm * span`, derived in full at
+  # `CLOCK_BOUNDARY_SLACK_MS` in `scripts/p4-attempt-accounting.py` — a bound
+  # on how far two independently-kept clocks with independently-detected
+  # endpoints may honestly disagree, not a number fitted to a session. It is
+  # the *claim* it bounds, never the banked figure: past it the row is
+  # evidence of a client disagreeing with itself rather than with a clock.
+  # `--self-test` holds the two copies together.
+  #
+  # `$slack` is zero only where the derivation actually clamped — a report that
+  # carries `binding.banked_minutes` *and* a wall bracket. An input derived
+  # before #1032 carries neither field nor clamp, so it keeps its original one
+  # tick of boundary rounding and stays bankable; on the tick fallback, which
+  # nothing clamps to because it understates the span, the allowance stands.
+  # `// .session.banked_minutes` is the same backwards compatibility on the
+  # value: without a clamp recorded, what banks is what was signed.
   jq -e '
     (.seconds / .ticks) as $per
     | .binding as $b
-    | (if ($b.connected_since_unix_millis | type == "number")
-          and ($b.connected_until_unix_millis | type == "number")
+    | (($b.connected_since_unix_millis | type == "number")
+       and ($b.connected_until_unix_millis | type == "number")) as $bracketed
+    | (if $bracketed
        then ($b.connected_until_unix_millis - $b.connected_since_unix_millis) / 60000
        else ($b.connected_ticks * $per / 60) end) as $connected
+    | ((1000 + 100e-6 * ($connected * 60000)) / 60000) as $allowance
+    | ($b.banked_minutes // .session.banked_minutes) as $banked
+    | (if ($b.banked_minutes | type == "number") and $bracketed then 0
+       elif $bracketed then $per / 60
+       else $allowance end) as $slack
     | $connected >= 0
       and (((.binding.connected_minutes // $connected) - $connected) | . * . < 1e-9)
-      and (.session.banked_minutes <= $connected + $per / 60)
+      and $banked <= .session.banked_minutes
+      and ($banked <= $connected + $slack)
+      and (.session.banked_minutes <= $connected + $allowance)
   ' "$report" >/dev/null \
-    || die "refusing to bank: slot $(jq -r '.binding.slot' "$report") banks $(jq -r '.session.banked_minutes' "$report") min, more than the seat's own connected span"
+    || die "refusing to bank: slot $(jq -r '.binding.slot' "$report") banks $(jq -r '.binding.banked_minutes // .session.banked_minutes' "$report") min, more than the seat's own connected span"
 }
 
 # One ledger input per actor contribution, and the ledger is the only place that
@@ -1201,15 +1294,24 @@ cmd_append() {
   validate_attempt_binding "$report" "$actor" "$attempt_id"
   # The cross-check #576 asks for, and the one that would have caught the defect
   # this whole piece exists to repair: a human contribution's `player_hours` is
-  # *its own signed interval*, `banked_minutes / 60`, never the attempt total
-  # copied onto a participant. A report whose two numbers disagree is banking a
-  # figure its signed row does not attest.
+  # *its own interval*, `banked_minutes / 60`, never the attempt total copied
+  # onto a participant. A report whose two numbers disagree is banking a figure
+  # its signed row does not attest.
+  #
+  # Since #1032 the banked interval may be the signed one clamped down to the
+  # host's wall bracket, so the equality is against `binding.banked_minutes`
+  # when the derivation recorded one — and `validate_attempt_binding` above has
+  # already refused any report where that figure exceeds either the signed
+  # interval or the seat's span. A clamp can only ever lower this number, so
+  # the property #576 named — a participant banks no more than it signed — is
+  # kept, not relaxed.
   jq -e '
     if .session? == null then true else
-      ((.player_hours - (.session.banked_minutes / 60)) | . * . < 1e-9)
+      ((.player_hours - ((.binding.banked_minutes // .session.banked_minutes) / 60))
+       | . * . < 1e-9)
     end
   ' "$report" >/dev/null \
-    || die "refusing to bank: player_hours $(jq -r '.player_hours' "$report") is not the signed interval $(jq -r '.session.banked_minutes' "$report") / 60"
+    || die "refusing to bank: player_hours $(jq -r '.player_hours' "$report") is not the banked interval $(jq -r '.binding.banked_minutes // .session.banked_minutes' "$report") / 60"
   # `run_key` is provenance for an individual run. It intentionally includes
   # commit, so an independently re-run report is retained for reproducibility.
   key=$(jq -cS '.identity' "$report" | sha256_hex | cut -c1-16)

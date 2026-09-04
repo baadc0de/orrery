@@ -797,11 +797,24 @@ self_test() {
   # ── The non-constant denominator ─────────────────────────────────────────
   #
   # A human seated for ten minutes of a sixty-minute attempt banks ten minutes,
-  # and may not bank fifty.
+  # and may not bank fifty. Since #1032 that refusal is seat-scoped: the
+  # operator cannot route around an attempt-wide one, because the pinned-id
+  # list must equal the ids in the volunteer's own signed records file, so one
+  # bad seat used to void every honest seat beside it. The refusal still fires,
+  # by name, on stderr — it just costs one seat instead of four.
   st_attempt "[$(st_exterior 4 "$sid_a" "$node_a" 10), $(st_exterior 5 "$sid_b" "$node_b" 55)]" \
     > "$dir/short.json"
-  st_refuses an_interval_may_not_exceed_its_seats_connected_span 'connected span' \
-    "$dir/short-out" "$dir/short.json" "$dir/records.jsonl" "$dir/short-out"
+  st_assemble short "$dir/short.json" "$dir/records.jsonl" "$dir/short-out" \
+    || die "self-test [an_inflated_interval_costs_only_its_own_seat]: the honest seats refused too ('$(tr '\n' ' ' <"$dir/case/err")')"
+  grep -q 'connected span' "$dir/case/err" \
+    || die "self-test [an_inflated_interval_costs_only_its_own_seat]: the refusal was not reported"
+  jq -es 'map(.identity.slot) | index(4) == null and (index(5) != null)' \
+    "$dir/short-out"/contribution-human-*.json >/dev/null \
+    || die 'self-test [an_inflated_interval_costs_only_its_own_seat]: the wrong seats assembled'
+  jq -e '(.refused_seats | length) == 1 and .refused_seats[0].slot == 4' \
+    "$dir/case/out" >/dev/null \
+    || die 'self-test [an_inflated_interval_costs_only_its_own_seat]: the manifest does not name the refused seat'
+  st_ok an_inflated_interval_costs_only_its_own_seat
 
   st_row "$sid_a" 8 21 > "$dir/row-short.json"
   cat "$dir/row-short.json" "$dir/row-b.json" > "$dir/short-records.jsonl"
@@ -865,10 +878,14 @@ json.dump(row,sys.stdout,separators=(",",":")); print()' > "$dir/unflagged.json"
   # asserts the output directory is empty; this one names the failure mode, with
   # a refusal that can only fire *after* the bot contribution would have been
   # written — the second human row of a two-human attempt.
-  st_row "$sid_b" 900 22 x86_64-pc-windows-msvc > "$dir/row-b-long.json"
-  cat "$dir/row-a.json" "$dir/row-b-long.json" > "$dir/late-refusal.jsonl"
-  st_refuses a_refusal_leaves_no_bot_contribution_behind 'connected span' \
-    "$dir/late-out" "$dir/attempt.json" "$dir/late-refusal.jsonl" "$dir/late-out"
+  #
+  # The refusal used to be the over-span one; #1032 made that seat-scoped, so
+  # this reaches for an attempt-fatal refusal that still fires in the same
+  # place: the *second* seat closed on its downlink backlog.
+  st_attempt "[$(st_exterior 4 "$sid_a" "$node_a" 55), $(st_exterior 5 "$sid_b" "$node_b" 55 queue_overflow)]" \
+    > "$dir/late-overflow.json"
+  st_refuses a_refusal_leaves_no_bot_contribution_behind 'does not bank' \
+    "$dir/late-out" "$dir/late-overflow.json" "$dir/records.jsonl" "$dir/late-out"
 
   # And a directory that already holds this attempt's inputs is refused rather
   # than merged into: assembling one attempt twice is how one interval banks
@@ -982,10 +999,18 @@ json.dump(row,sys.stdout,separators=(",",":")); print()' > "$dir/unflagged.json"
   # The host's own per-seat `connected_ticks` is the ceiling, and it is real now
   # rather than contract-shaped: 99,000 ticks at 30 tps is 55 minutes, so a row
   # claiming more than that is refused against a number the host measured.
+  # Seat-scoped since #1032: slot 5's row costs slot 5 its hours, and slot 4 —
+  # which claimed nothing it was not seated for — still assembles.
   st_row "$sid_b" 900 22 x86_64-pc-windows-msvc > "$dir/row-b-huge.json"
   cat "$dir/row-a.json" "$dir/row-b-huge.json" > "$dir/host-over.jsonl"
-  st_refuses the_hosts_own_connected_ticks_bound_the_interval 'connected span' \
-    "$dir/host-over-out" "$dir/host-shaped.json" "$dir/host-over.jsonl" "$dir/host-over-out"
+  st_assemble host-over "$dir/host-shaped.json" "$dir/host-over.jsonl" "$dir/host-over-out" \
+    || die "self-test [the_hosts_own_connected_ticks_bound_the_interval]: slot 4 was refused too ('$(tr '\n' ' ' <"$dir/case/err")')"
+  grep -q 'connected span' "$dir/case/err" \
+    || die "self-test [the_hosts_own_connected_ticks_bound_the_interval]: the refusal was not reported"
+  jq -es 'map(.identity.slot) | index(5) == null and (index(4) != null)' \
+    "$dir/host-over-out"/contribution-human-*.json >/dev/null \
+    || die 'self-test [the_hosts_own_connected_ticks_bound_the_interval]: the over-claiming seat assembled'
+  st_ok the_hosts_own_connected_ticks_bound_the_interval
 
   # ── The two clocks disagreeing, which is what a real host does (#971) ────
   #
@@ -1028,15 +1053,56 @@ json.dump(row,sys.stdout,separators=(",",":")); print()' > "$dir/unflagged.json"
   done
   st_ok a_lagging_hosts_wall_bracket_banks_what_its_tick_count_would_refuse
 
+  # ── The clamp, end to end (#1032) ───────────────────────────────────────
+  #
+  # The 2026-09-04 shape, at fixture scale: the same rows against a bracket
+  # 168 ms *shorter* than the interval they claim. Two clocks disagreeing by a
+  # fifth of a second over 55 minutes is not an inflated hour, and until #1032
+  # a one-tick tolerance made it one — attempt-wide. What banks now is the
+  # bracket, the discarded sliver is carried in the input rather than absorbed,
+  # and `p4-ledger.sh` accepts the result.
+  jq '.external = (.external | map(.connected_until_unix_millis = 1750003299832))' \
+    "$dir/host-lagging.json" > "$dir/host-skewed.json"
+  st_assemble skewed "$dir/host-skewed.json" "$dir/lagging.jsonl" "$dir/skewed-out" \
+    "$sid_a" "$sid_b" \
+    || die "self-test [a_clock_skewed_interval_banks_the_host_bracket]: refused ('$(tr '\n' ' ' <"$dir/case/err")')"
+  jq -es '
+    (map(select(.identity.actor == "human")) | length == 2)
+    and (map(select(.identity.actor == "human")
+             | .binding.clamped_minutes * 60000 | round) | unique == [168])
+    and (map(select(.identity.actor == "human")
+             | (.player_hours * 60) == .binding.banked_minutes) | all)
+    and (map(select(.identity.actor == "human")
+             | .binding.banked_minutes < .session.banked_minutes) | all)
+  ' "$dir/skewed-out"/*.json >/dev/null \
+    || die 'self-test [a_clock_skewed_interval_banks_the_host_bracket]: the sliver was not clamped and named'
+  for input in "$dir/skewed-out"/*.json; do
+    P4_LEDGER_FILE="$dir/skewed-hours.jsonl" "$ROOT/scripts/p4-ledger.sh" append "$input" >/dev/null 2>&1 \
+      || die "self-test [a_clock_skewed_interval_banks_the_host_bracket]: p4-ledger.sh refused $(basename "$input")"
+  done
+  st_ok a_clock_skewed_interval_banks_the_host_bracket
+
   # The control, and the proof that the bracket is what carried the case above
   # rather than a widened tolerance: strip the stamps off the same report and
   # the same rows, and the tick basis refuses it. That is the conservative
   # direction, so a report without a bracket is never the easier one to bank.
   jq 'del(.external[].connected_since_unix_millis, .external[].connected_until_unix_millis)' \
     "$dir/host-lagging.json" > "$dir/host-lagging-bare.json"
-  st_refuses the_tick_count_alone_still_refuses_the_same_lagging_attempt 'connected span' \
-    "$dir/lagging-bare-out" "$dir/host-lagging-bare.json" "$dir/lagging.jsonl" \
-    "$dir/lagging-bare-out"
+  #
+  # Both seats are 33 s past a tick count that understates their span by 1.1%,
+  # far outside the #1032 allowance, so both refuse — seat by seat now rather
+  # than attempt-wide, which is the same refusal reaching the same rows. Nothing
+  # human assembles, and the widened allowance rescued neither.
+  st_assemble lagging-bare "$dir/host-lagging-bare.json" "$dir/lagging.jsonl" \
+    "$dir/lagging-bare-out" \
+    || die "self-test [the_tick_count_alone_still_refuses_the_same_lagging_attempt]: the bot contribution refused too"
+  grep -q 'connected span' "$dir/case/err" \
+    || die "self-test [the_tick_count_alone_still_refuses_the_same_lagging_attempt]: the tick basis did not refuse"
+  [[ -z $(ls "$dir/lagging-bare-out"/contribution-human-*.json 2>/dev/null) ]] \
+    || die 'self-test [the_tick_count_alone_still_refuses_the_same_lagging_attempt]: a human interval assembled off the tick basis'
+  jq -e '(.refused_seats | length) == 2 and .human_hours == 0' "$dir/case/out" >/dev/null \
+    || die 'self-test [the_tick_count_alone_still_refuses_the_same_lagging_attempt]: the manifest banked human hours'
+  st_ok the_tick_count_alone_still_refuses_the_same_lagging_attempt
 
   # Half a bracket is not a bracket.
   jq 'del(.external[].connected_until_unix_millis)' "$dir/host-lagging.json" \
