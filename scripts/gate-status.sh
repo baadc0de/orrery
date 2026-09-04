@@ -877,6 +877,15 @@ gate_ci_determinism_verdict_evidence() { ev_none; }
 # surface, three standalone release builds, a binary-derived revision manifest,
 # archive-content assertions, packaged checksums, and release upload, but cannot
 # claim a runner produced a binary.
+#
+# Since #1062 it also guards an *absence*. The campaign joins this workflow used
+# to perform moved to `validate-client-release.yml`, because three parallel
+# matrix legs each joining a three-seat campaign is a build that fails for
+# reasons about somebody else's session. The two clauses below refuse a
+# `--campaign` argument and a `client-campaign-preflight.sh` invocation anywhere
+# in this workflow: putting either back re-couples publishing to live, scarce
+# infrastructure. The coverage they used to provide is asserted by the
+# `validate_*` trios further down, so the pair moves rather than disappears.
 gate_package_client_tier() { echo fast; }
 gate_package_client_prereq() { [[ -r "$ROOT/.github/workflows/package-client.yml" ]]; }
 gate_package_client_run() {
@@ -893,8 +902,8 @@ gate_package_client_run() {
     && grep -Fq 'ORRERY_BUILD_REV: ${{ github.sha }}' <<<"$source" \
     && grep -Fq ' --build-info > stage/build-info.json' <<<"$source" \
     && grep -Fq 'embedded client_rev' <<<"$source" \
-    && grep -Fq 'scripts/client-campaign-preflight.sh' <<<"$source" \
-    && grep -Fq -- '--campaign shakedown' <<<"$source" \
+    && ! grep -Fq 'scripts/client-campaign-preflight.sh' <<<"$source" \
+    && ! grep -Fq -- '--campaign' <<<"$source" \
     && grep -Fq 'cp clients/regolith/PLAYTEST.md stage/README.md' <<<"$source" \
     && grep -Fq 'test ! -e stage/assets' <<<"$source" \
     && grep -Fq 'tar -C stage -czf' <<<"$source" \
@@ -922,6 +931,97 @@ gate_publish_client_run() {
     && grep -Fq 'gh release upload "$RELEASE_TAG" dist/* --clobber' <<<"$source"
 }
 gate_publish_client_evidence() { ev_none; }
+
+# ── campaign validation of a published client (#1062) ────────────────────────
+#
+# `validate-client-release.yml` owns every campaign join in the release
+# pipeline. Like the package gates above, nothing here can claim a hosted
+# runner joined anything; these are manifest guards over the properties that
+# make the workflow safe to point at shared infrastructure.
+#
+# Three of those properties are structural and the fourth is the whole reason
+# the workflow exists:
+#
+#   1. It is sequential. `validate-windows` needs `validate-pin`,
+#      `validate-macos` needs the Windows job, and `validate-linux-cohort`
+#      needs both — so exactly one client is ever in the campaign. The clauses
+#      below assert that chain and refuse a `strategy:`/`matrix:` anywhere in
+#      the file, because a matrix would restore the fan-out this change was
+#      made to remove.
+#   2. It cannot race itself: a `concurrency` group with
+#      `cancel-in-progress: false`.
+#   3. It is read-only against the repository. A validation workflow that can
+#      write releases is a release pipeline in disguise.
+#   4. It gates on the deployed pin and *skips* rather than fails.
+#
+# The pin job carries the workflow-scope clauses because it is the one job
+# every other job needs; break the concurrency group or add a matrix and this
+# row goes red.
+gate_validate_pin_tier() { echo fast; }
+gate_validate_pin_prereq() { [[ -r "$ROOT/.github/workflows/validate-client-release.yml" ]]; }
+gate_validate_pin_run() {
+  local wf="${1:-$ROOT/.github/workflows/validate-client-release.yml}" source
+  source=$(sed '/^[[:space:]]*#/d' "$wf")
+  grep -Fq 'schedule:' <<<"$source" \
+    && grep -Fq 'workflow_dispatch:' <<<"$source" \
+    && grep -Fq 'release_tag:' <<<"$source" \
+    && ! grep -Eq '^[[:space:]]*pull_request:' <<<"$source" \
+    && grep -Fq 'contents: read' <<<"$source" \
+    && ! grep -Fq 'contents: write' <<<"$source" \
+    && grep -Fq 'group: validate-client-release' <<<"$source" \
+    && grep -Fq 'cancel-in-progress: false' <<<"$source" \
+    && ! grep -Eq '^[[:space:]]*(strategy|matrix):' <<<"$source" \
+    && grep -Fq '/v1/campaigns' <<<"$source" \
+    && grep -Fq 'build-info.json' <<<"$source" \
+    && grep -Fq 'verdict false' <<<"$source" \
+    && grep -Fq 'proceed=$proceed' <<<"$source"
+}
+gate_validate_pin_evidence() { ev_none; }
+
+# The two per-platform joins. This is #769's coverage — "Windows and macOS have
+# never join-tested the artifact they publish, which is how #769 reached a
+# volunteer" — in its new home, so each row asserts that its platform still
+# runs the artifact smoke with a campaign, against the published archive.
+gate_validate_windows_tier() { echo fast; }
+gate_validate_windows_prereq() { [[ -r "$ROOT/.github/workflows/validate-client-release.yml" ]]; }
+gate_validate_windows_run() {
+  local wf="${1:-$ROOT/.github/workflows/validate-client-release.yml}" source
+  source=$(sed '/^[[:space:]]*#/d' "$wf")
+  grep -Fq 'runs-on: windows-latest' <<<"$source" \
+    && grep -Fq 'needs: validate-pin' <<<"$source" \
+    && grep -Fq 'orrery-regolith-x86_64-windows.zip' <<<"$source" \
+    && grep -Fq 'scripts/package-artifact-smoke.sh' <<<"$source" \
+    && grep -Fq -- '--campaign "$VALIDATE_CAMPAIGN"' <<<"$source"
+}
+gate_validate_windows_evidence() { ev_none; }
+
+gate_validate_macos_tier() { echo fast; }
+gate_validate_macos_prereq() { [[ -r "$ROOT/.github/workflows/validate-client-release.yml" ]]; }
+gate_validate_macos_run() {
+  local wf="${1:-$ROOT/.github/workflows/validate-client-release.yml}" source
+  source=$(sed '/^[[:space:]]*#/d' "$wf")
+  grep -Fq 'runs-on: macos-latest' <<<"$source" \
+    && grep -Fq 'needs: [validate-pin, validate-windows]' <<<"$source" \
+    && grep -Fq 'orrery-regolith-aarch64-macos.tar.gz' <<<"$source" \
+    && grep -Fq -- '--label aarch64-macos' <<<"$source"
+}
+gate_validate_macos_evidence() { ev_none; }
+
+# The three-client cohort: the campaign property no single join can assert — a
+# frozen cohort, mutual replication, a released seat reusable afterwards. Its
+# `needs:` names both other platforms, which is what keeps three clients from
+# meeting a fourth.
+gate_validate_linux_cohort_tier() { echo fast; }
+gate_validate_linux_cohort_prereq() { [[ -r "$ROOT/.github/workflows/validate-client-release.yml" ]]; }
+gate_validate_linux_cohort_run() {
+  local wf="${1:-$ROOT/.github/workflows/validate-client-release.yml}" source
+  source=$(sed '/^[[:space:]]*#/d' "$wf")
+  grep -Fq 'needs: [validate-pin, validate-windows, validate-macos]' <<<"$source" \
+    && grep -Fq 'scripts/client-campaign-preflight.sh' <<<"$source" \
+    && grep -Fq -- '--keep-extraction "$RUNNER_TEMP/extracted"' <<<"$source" \
+    && grep -Fq 'orrery-regolith-x86_64-linux.tar.gz' <<<"$source"
+}
+gate_validate_linux_cohort_evidence() { ev_none; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting
@@ -1326,12 +1426,14 @@ self_test() {
     && die 'self-test: a broken package-client stamp stage also reported PASSED'
   rm -f "$dir/.github/workflows/package-client.yml"
 
-  # The release candidate must run the deployed-campaign proof, not merely
-  # carry a self-tested script that no workflow invokes. Break that guarded
-  # handoff and require the package job's named row to fail.
-  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  # The campaign proof must still be *run* by a workflow, not merely carried by
+  # a self-tested script nothing invokes — it just runs in a different one
+  # since #1062. Break that guarded handoff in the validation workflow and
+  # require the cohort job's named row to fail.
+  cp "$ROOT/.github/workflows/validate-client-release.yml" \
+    "$dir/.github/workflows/validate-client-release.yml"
   sed -i 's#scripts/client-campaign-preflight.sh#scripts/broken-client-campaign-preflight.sh#' \
-    "$dir/.github/workflows/package-client.yml"
+    "$dir/.github/workflows/validate-client-release.yml"
   local client_preflight_mutation client_preflight_status
   set +e
   GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/client-preflight-out" "$0" --fast \
@@ -1341,10 +1443,48 @@ self_test() {
   client_preflight_mutation=$(cat "$dir/client-preflight-mutation-report")
   [[ $client_preflight_status == 1 ]] \
     || die "self-test: a broken client campaign preflight exited $client_preflight_status rather than 1"
-  grep -qE '^  FAILED +package-client:package-client' <<<"$client_preflight_mutation" \
-    || die 'self-test: a broken client campaign preflight did not fail the package-client row'
-  grep -qE '^  PASSED +package-client:package-client' <<<"$client_preflight_mutation" \
+  grep -qE '^  FAILED +validate-client-release:validate-linux-cohort' <<<"$client_preflight_mutation" \
+    || die 'self-test: a broken client campaign preflight did not fail the cohort row'
+  grep -qE '^  PASSED +validate-client-release:validate-linux-cohort' <<<"$client_preflight_mutation" \
     && die 'self-test: a broken client campaign preflight also reported PASSED'
+  rm -f "$dir/.github/workflows/validate-client-release.yml"
+
+  # Sequentiality is the property that made the split worth making, and a
+  # matrix is how it would come back. Add one and the pin row — which carries
+  # the workflow-scope clauses — must go red.
+  cp "$ROOT/.github/workflows/validate-client-release.yml" \
+    "$dir/.github/workflows/validate-client-release.yml"
+  sed -i 's/^    runs-on: windows-latest$/    strategy:\n      matrix:\n        os: [windows-latest]\n    runs-on: windows-latest/' \
+    "$dir/.github/workflows/validate-client-release.yml"
+  local fanout_mutation fanout_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/fanout-out" "$0" --fast \
+    >"$dir/fanout-mutation-report" 2>&1
+  fanout_status=$?
+  set -e
+  fanout_mutation=$(cat "$dir/fanout-mutation-report")
+  [[ $fanout_status == 1 ]] \
+    || die "self-test: a matrix in the validation workflow exited $fanout_status rather than 1"
+  grep -qE '^  FAILED +validate-client-release:validate-pin' <<<"$fanout_mutation" \
+    || die 'self-test: a matrix in the validation workflow did not fail the pin row'
+  rm -f "$dir/.github/workflows/validate-client-release.yml"
+
+  # And the other direction: the packaging workflow must not grow a campaign
+  # join back. This is the absence clause, so the mutation *adds* something.
+  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  sed -i 's#^\( *\)--label \(.*\)$#\1--label \2 --campaign shakedown#' \
+    "$dir/.github/workflows/package-client.yml"
+  local recoupled_mutation recoupled_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/recoupled-out" "$0" --fast \
+    >"$dir/recoupled-mutation-report" 2>&1
+  recoupled_status=$?
+  set -e
+  recoupled_mutation=$(cat "$dir/recoupled-mutation-report")
+  [[ $recoupled_status == 1 ]] \
+    || die "self-test: a campaign join back in the packaging workflow exited $recoupled_status rather than 1"
+  grep -qE '^  FAILED +package-client:package-client' <<<"$recoupled_mutation" \
+    || die 'self-test: a campaign join back in the packaging workflow did not report FAILED'
   rm -f "$dir/.github/workflows/package-client.yml"
 
   # A release build must not re-resolve the standalone client's lockfile.

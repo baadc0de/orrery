@@ -48,7 +48,10 @@ mechanically replaceable.
 Regolith rules and executor — the first rendered Orrery target. It is built and
 published for x86_64 Windows, x86_64 Linux and aarch64 macOS by
 `.github/workflows/package-client.yml`, and it joins a deployed campaign
-service by name.
+service by name. That packaging workflow builds and publishes and nothing else;
+every campaign join is in `.github/workflows/validate-client-release.yml`,
+which runs nightly and on dispatch, one client at a time, and skips when the
+deployed revision pin does not name the build under test (#1062).
 
 A volunteer downloaded a release build and could not join it. Five distribution
 defects came out of that one session, all fixed: the client wrote to a path a

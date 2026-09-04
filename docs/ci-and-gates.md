@@ -264,9 +264,32 @@ doing the client work. Linux supplies Xvfb and forces X11 while removing
 `WAYLAND_DISPLAY`; Windows and macOS use the hosted runners' native display
 stacks.
 
-**All workflow jobs run on GitHub-hosted runners.** `ci.yml` and `nightly.yml`
-name `ubuntu-latest`, `windows-latest`, `macos-latest`, or a matrix value for
-one of those; neither names a self-hosted label. GitHub reports zero registered
+**Campaign joins are not in that workflow, and that is deliberate** (#1062).
+`package-client.yml` makes no network call to the campaign service: three
+matrix legs each joining a three-seat campaign meant the Linux cohort took
+every seat and the other two platforms failed on join, so a publish could be
+blocked by a fact about somebody else's session rather than about the archive.
+Every join now lives in `.github/workflows/validate-client-release.yml`, which
+runs nightly at 05:00 UTC and on manual dispatch against a release tag. It is
+sequential by construction — four jobs chained with `needs:`, no matrix, under
+a `concurrency` group with `cancel-in-progress: false` — and its first job
+reads the deployed campaign's `client_rev` from `GET /v1/campaigns` and
+**skips** the rest, with a stated reason, when that pin does not name the
+revision embedded in the published archive, when the campaign is not open, or
+when fewer than three human seats are free. Skipping, not failing: a red leg
+must mean the client is broken.
+
+The consequence, which `package-client.yml` states where the joins used to be
+and `clients/regolith/PLAYTEST.md` states to whoever hands out a build: between
+publishing and validating, no platform has join-tested the archive. #769
+reached a volunteer through exactly that gap. The nightly closes it in the
+steady state; the manual dispatch closes it for a specific release before
+someone gets the link.
+
+**All workflow jobs run on GitHub-hosted runners.** `ci.yml`, `nightly.yml`
+and `validate-client-release.yml` name `ubuntu-latest`, `windows-latest`,
+`macos-latest`, or a matrix value for one of those; none names a self-hosted
+label. GitHub reports zero registered
 runners for this repository. The workflow-level `RUSTC_WRAPPER: ""` is the
 safe default for an ephemeral runner; a job may install and configure its own
 cache within that run, but it must not rely on a persistent runner `target/`.
