@@ -46,6 +46,12 @@ members = [
     # ABI, with the C consumer that drives it. A member so `check.sh` covers
     # it; nothing depends on it.
     "crates/orrery_unreal_host",
+    # Spike #1052's non-App prong (research branch, never merged):
+    # `orrery_sim_host` over `orrery_games::Skirmish` as a `staticlib` behind
+    # the existing C ABI with no Bevy `App`, and the C consumer that owns the
+    # prediction ring and rollback. A member so `check.sh` covers it; nothing
+    # depends on it.
+    "crates/orrery_unreal_direct",
 ]
 
 # The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /

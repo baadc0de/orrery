@@ -8310,6 +8310,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_unreal_direct"
+version = "0.1.0"
+dependencies = [
+ "orrery_core",
+ "orrery_games",
+ "orrery_protocol",
+ "orrery_sim_host",
+]
+
+[[package]]
 name = "orrery_unreal_host"
 version = "0.1.0"
 dependencies = [
