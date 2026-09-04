@@ -443,6 +443,23 @@ pub struct HostLink {
     pub goodbye: Arc<std::sync::atomic::AtomicBool>,
     /// Set only by `Connection::closed()`, with iroh's close classification.
     pub transport_close: Arc<Mutex<Option<TransportCloseReason>>>,
+    /// Host wall clock, in Unix milliseconds, at the instant the host accepted
+    /// this connection into the run — read *before* `JoinReply::Accept` is
+    /// written to the peer (`bridge::PendingJoin::finish`).
+    ///
+    /// This is the open end of the seat's wall bracket, and it is taken here
+    /// rather than where the simulation loop later binds the seat because only
+    /// here is it *ordered* against the client. The client cannot count a tick
+    /// until it has read this accept, so a stamp taken before the accept is
+    /// written necessarily precedes the client's first counted tick, and the
+    /// bracket contains the client's interval by construction rather than by
+    /// convention (#1037; the unordered version is the race #1032/#1036
+    /// compensated for on the accounting side).
+    ///
+    /// Always taken; whether it is *reported* is
+    /// `SwarmConfig::started_at_unix_secs`'s decision, so the swarm proper
+    /// stays a function of its seed.
+    pub accepted_at_unix_millis: u64,
 }
 
 /// The remote-side mirror of [`HostLink`]: same queues, opposite directions.
@@ -483,6 +500,31 @@ pub const LINK_QUEUE_DEPTH: usize = 4_096;
 /// pumps in the binaries are the only code that needs tokio.
 #[must_use]
 pub fn link_pair() -> (HostLink, RemoteLink) {
+    link_pair_accepted_at(unix_millis_now())
+}
+
+/// Host wall clock in Unix milliseconds.
+///
+/// Lives here, beside the accept stamp it takes, because both ends of a seat's
+/// wall bracket read the same clock: this one at accept
+/// (`bridge::PendingJoin::finish`) and at close
+/// (`swarm::ExteriorSlot::pump_uplink`).
+#[must_use]
+pub fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// [`link_pair`] with the accept stamp named rather than read off the clock.
+///
+/// The seam a test needs to assert *where* the open end of the bracket comes
+/// from: a named stamp that survives into the report is one the binding tick
+/// did not overwrite (#1037).
+#[must_use]
+pub fn link_pair_accepted_at(accepted_at_unix_millis: u64) -> (HostLink, RemoteLink) {
     let (uplink_tx, uplink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
     let (downlink_tx, downlink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
     let (_, meta_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
@@ -497,6 +539,7 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
             connected: Arc::clone(&connected),
             goodbye: Arc::clone(&goodbye),
             transport_close,
+            accepted_at_unix_millis,
         },
         RemoteLink {
             downlink: std::sync::Mutex::new(downlink_rx),

@@ -402,6 +402,14 @@ impl PendingJoin {
         wants_anchor: bool,
     ) -> Result<(HostLink, Option<AnchorFrame>, NodeId, usize)> {
         let anchor_tick = manifest.as_ref().map_or(0, |start| start.tick);
+        // The open end of this seat's wall bracket, read *before* the accept
+        // goes out (#1037). Everything the client does to reach the state in
+        // which it counts a tick — `await_lobby_verdict`, `JoinState::Joined`,
+        // `CampaignSession::observe_tick` — is downstream of reading this
+        // message, so a stamp taken here cannot follow the client's first
+        // counted tick. Taken at the bind tick instead, as it was until now,
+        // it raced the client and lost by up to 715 ms in real volunteer data.
+        let accepted_at_unix_millis = crate::exterior::unix_millis_now();
         write_message(
             &mut self.send,
             &JoinReply::Accept {
@@ -479,6 +487,7 @@ impl PendingJoin {
                 connected,
                 goodbye,
                 transport_close,
+                accepted_at_unix_millis,
             },
             anchor,
             self.remote,
