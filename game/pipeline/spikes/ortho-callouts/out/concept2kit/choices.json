@@ -1,0 +1,151 @@
+{
+ "spine_conduits": {
+  "ranked": [
+   "cables_Greeble_Cables_Pack1.009",
+   "cables_Greeble_Cables_Pack1.039",
+   "cables_Greeble_Cables_Pack1.010",
+   "cables_Greeble_Cables_Pack1.035",
+   "cables_Greeble_Cables_Pack1.036",
+   "cables_Greeble_Cables_Pack1.040",
+   "cables_Greeble_Cables_Pack1.016",
+   "cables_Greeble_Cables_Pack1.025"
+  ],
+  "reason": "Candidate 1 perfectly matches the stepped conduit run and terminal box shape seen on the spine.",
+  "model": "gemini-3.5-flash"
+ },
+ "main_thrusters": {
+  "ranked": [
+   "ship-b_Detail_117",
+   "ship-b_Detail_155",
+   "ship-b_Detail_159",
+   "ship-b_Detail_264",
+   "ship-b_Detail_119",
+   "mech_module_024",
+   "mech_module_025",
+   "mech_module_026"
+  ],
+  "reason": "Candidate 2 matches the cylindrical, segmented, and paneled style of the concept's main thrusters perfectly.",
+  "model": "gemini-3.5-flash"
+ },
+ "wingtip_rcs": {
+  "ranked": [
+   "ship-b_Detail_119",
+   "ship-a_Detail_59",
+   "ship-b_Detail_177",
+   "ship-b_Detail_279",
+   "ship-a_Detail_146",
+   "ship-a_Detail_78",
+   "ship-b_Detail_13",
+   "ship-b_Detail_261"
+  ],
+  "reason": "Candidate 3 is the only cylindrical thruster matching the wingtip RCS clusters; others are blocky panels.",
+  "model": "gemini-3.5-flash"
+ },
+ "nose_rcs": {
+  "ranked": [
+   "ship-b_Detail_05",
+   "ship-a_Detail_268",
+   "ship-a_Detail_238",
+   "ship-a_Detail_263",
+   "ship-b_Detail_280",
+   "ship-a_Detail_55",
+   "ship-b_Detail_184",
+   "ship-b_Detail_122"
+  ],
+  "reason": "Candidate 4 best matches the blocky, paneled nose RCS cluster with its angular, utilitarian shape language.",
+  "model": "gemini-3.5-flash"
+ },
+ "ventral_gun_bay": {
+  "ranked": [
+   "ship-a_Detail_96",
+   "mech_module_018",
+   "mech_module_019"
+  ],
+  "reason": "Candidate 3 matches the long, low-profile rectangular hatch shape of the ventral gun bay perfectly.",
+  "model": "gemini-3.5-flash"
+ },
+ "under_wing_pylons": {
+  "ranked": [
+   "ship-a_Detail_222",
+   "ship-b_Detail_130",
+   "ship-b_Detail_138",
+   "ship-b_Detail_76",
+   "ship-b_Detail_154",
+   "mech_module_015",
+   "ship-a_Detail_213",
+   "ship-a_Detail_216"
+  ],
+  "reason": "Candidate 8 matches the long, low-profile under-wing pylon shape best; 4 and 6 are good bracket alternatives.",
+  "model": "gemini-3.5-flash"
+ },
+ "landing_skids_aft": {
+  "ranked": [
+   "mech_module_069",
+   "mech_module_055",
+   "mech_module_067",
+   "mech_module_065",
+   "ship-b_Detail_134",
+   "mech_module_010",
+   "ship-a_Detail_290",
+   "ship-b_Detail_54"
+  ],
+  "reason": "Candidate 4 best matches the curved, tubular skid shape; 7, 3, and 8 represent single strut elements.",
+  "model": "gemini-3.5-flash"
+ },
+ "dark_wing_panels": {
+  "ranked": [
+   "ship-b_Detail_246",
+   "ship-b_Detail_234",
+   "ship-b_Detail_98",
+   "ship-b_Detail_79",
+   "ship-b_Detail_271",
+   "ship-b_Detail_227",
+   "ship-b_Detail_226",
+   "ship-a_Detail_19"
+  ],
+  "reason": "Candidate 1 best matches the simple, rectangular, utilitarian paneling of the dark wing panels.",
+  "model": "gemini-3.5-flash"
+ },
+ "accent_stripe": {
+  "ranked": [
+   "ship-a_Detail_164",
+   "ship-b_Detail_210",
+   "ship-a_Detail_35",
+   "ship-b_Detail_99",
+   "ship-b_Detail_98",
+   "ship-a_Detail_25",
+   "ship-b_Detail_294",
+   "ship-a_Detail_20"
+  ],
+  "reason": "Candidate 2 is a perfect flat, elongated strip matching the simple orange accent stripe.",
+  "model": "gemini-3.5-flash"
+ },
+ "hull_number_decal": {
+  "ranked": [
+   "ship-b_Detail_293",
+   "ship-b_Detail_96",
+   "ship-b_Detail_92",
+   "ship-b_Detail_81",
+   "ship-a_Detail_26",
+   "ship-b_Detail_229",
+   "ship-a_Detail_85",
+   "ship-a_Detail_72"
+  ],
+  "reason": "Candidate 1 best matches the elongated, panelled plate shape language of the hull number decal zone.",
+  "model": "gemini-3.5-flash"
+ },
+ "wing_root_vents": {
+  "ranked": [
+   "ship-b_Detail_111",
+   "ship-a_Detail_87",
+   "ship-a_Detail_86",
+   "ship-b_Detail_175",
+   "mech_module_008",
+   "mech_module_009",
+   "mech_module_017",
+   "mech_module_019"
+  ],
+  "reason": "Candidate 6 best matches the angled, slatted vent design at the wing root with appropriate utilitarian style.",
+  "model": "gemini-3.5-flash"
+ }
+}
