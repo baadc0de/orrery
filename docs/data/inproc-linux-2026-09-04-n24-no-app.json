@@ -1,0 +1,70 @@
+{
+  "schema": "orrery-ipc-harness/1",
+  "role": "observer",
+  "platform": "linux",
+  "arch": "x86_64",
+  "clock": "CLOCK_MONOTONIC",
+  "transport": "inproc-staticlib-no-app",
+  "measured_quantity": "inproc_added",
+  "tcp_nodelay": false,
+  "time_begin_period": false,
+  "entities": 24,
+  "tick_hz": 60,
+  "warmup_ticks": 600,
+  "ticks": 36000,
+  "samples": 36000,
+  "duration_s": 599.983341581,
+  "loadavg_start": [0.25, 0.35, 3.25],
+  "loadavg_end": [0.82, 0.48, 1.90],
+  "phases_ns": {
+    "hop_in": {"n": 36000, "mean_ns": 133.606250, "min_ns": 40, "p50_ns": 130, "p99_ns": 341, "p99_9_ns": 381, "max_ns": 551},
+    "extract": {"n": 36000, "mean_ns": 17682.896861, "min_ns": 9177, "p50_ns": 16611, "p99_ns": 36378, "p99_9_ns": 41036, "max_ns": 258494},
+    "encode": {"n": 36000, "mean_ns": 3405.892944, "min_ns": 1813, "p50_ns": 3145, "p99_ns": 6933, "p99_9_ns": 7564, "max_ns": 26599},
+    "hop_out": {"n": 36000, "mean_ns": 27.142583, "min_ns": 10, "p50_ns": 20, "p99_ns": 60, "p99_9_ns": 61, "max_ns": 1062},
+    "decode_out": {"n": 36000, "mean_ns": 96.529222, "min_ns": 40, "p50_ns": 90, "p99_ns": 281, "p99_9_ns": 460, "max_ns": 14066},
+    "phase": {"n": 36000, "mean_ns": 155.548611, "min_ns": 70, "p50_ns": 140, "p99_ns": 361, "p99_9_ns": 531, "max_ns": 16701},
+    "phase_after_decode": {"n": 36000, "mean_ns": 59.019389, "min_ns": 30, "p50_ns": 50, "p99_ns": 120, "p99_9_ns": 220, "max_ns": 2635},
+    "ipc_added": {"n": 36000, "mean_ns": 21346.067861, "min_ns": 11161, "p50_ns": 20078, "p99_ns": 43702, "p99_9_ns": 49292, "max_ns": 263843}
+  },
+  "baselines_ns": {
+    "app_update": {"n": 36000, "mean_ns": 0.000000, "min_ns": 0, "p50_ns": 0, "p99_ns": 0, "p99_9_ns": 0, "max_ns": 0},
+    "remote_inputs": {"n": 36000, "mean_ns": 12044.033222, "min_ns": 6271, "p50_ns": 11080, "p99_ns": 24896, "p99_9_ns": 31329, "max_ns": 237474},
+    "drains": {"n": 36000, "mean_ns": 267.604028, "min_ns": 50, "p50_ns": 201, "p99_ns": 821, "p99_9_ns": 1222, "max_ns": 15749},
+    "frame_total": {"n": 36000, "mean_ns": 33775.690722, "min_ns": 17593, "p50_ns": 31739, "p99_ns": 69130, "p99_9_ns": 80440, "max_ns": 284342}
+  },
+  "drops": {
+    "input_dropped": 0,
+    "step_failed": 0,
+    "app_update_failed": 0,
+    "decode_failures": 0,
+    "tick_overruns": 0
+  },
+  "coexistence": {
+    "app_present": false,
+    "clock_mode": "none",
+    "cores_online": 32,
+    "threads_before_app": {"total": 1, "by_name": {"spike_consumer": 1}},
+    "threads_after_app_create": {"total": 1, "by_name": {"spike_consumer": 1}},
+    "threads_at_end": {"total": 1, "by_name": {"spike_consumer": 1}},
+    "idle_cpu_pct_without_app": 5.6646,
+    "idle_cpu_pct_with_app": 5.5467,
+    "idle_window_s": 3.0,
+    "hitches_over_16_7ms": {"app_update": 0, "host_path": 0, "frame": 0},
+    "events_routed": 1077,
+    "events_max_bytes_per_tick": 1334,
+    "mirror_checksum": "559bc9adf34b3397"
+  },
+  "timeline": {
+    "ticks_issued_by_c": 36600,
+    "host_next_tick": 36600,
+    "app_timeline": null
+  },
+  "notes": [
+    "ipc_added in this report is inproc_added (#1043): (t_decode - t0) with no hop; hop_in is the submit call (command decode + queue), extract is orrery_host_step, encode is orrery_host_collect_states, hop_out is one clock read, decode_out is the C-side decode of every record",
+    "phase is the apply cost, not a tick wait: in-process the mirror is applied in the frame that produced it, so #920's wait-for-next-tick is zero by construction",
+    "Linux staticlib plus C consumer on clang, informational: not the in-process Unreal number G10.2 turns on, and it settles neither G10.2 nor D52/D53 (Proposed)",
+    "the App and the host are not connected (D53 section 5): App::update is the net/prediction loop's per-frame cost on the game thread, measured beside the host path",
+    "toolchain: rustc 1.96.0, clang version 22.1.8, Linux 7.2.2-1-cachyos, commit 828f3c8",
+    "staticlib: liborrery_unreal_host.a, 193548532 bytes, native-static-libs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc"
+  ]
+}
