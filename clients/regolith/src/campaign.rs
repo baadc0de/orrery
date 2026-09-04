@@ -670,7 +670,26 @@ pub struct CampaignRuntime {
     settled_broadcast_recipients: BTreeSet<usize>,
     downlink: DownlinkTracker,
     downlink_arrivals: u64,
-    undecodable: u64,
+    /// Received-traffic decode failures: frames the downlink delivered that
+    /// this client could not decode into anything it recognises (#1034).
+    ///
+    /// Split from the own-packet counter so a number here can only ever mean
+    /// "the downlink side failed". Note before acting on it: witness frames
+    /// from the bot cohort ride this same datagram lane (every `Channel::State`
+    /// send does, `orrery_net`'s `send_peer_packets`), land in the neither-
+    /// replication arm, and are counted here — routine traffic, not a decode
+    /// failure. The swarm bot's receive path does not count them (bot.rs,
+    /// `ReplicaDecodeError::NotReplication`); this client does, so a healthy
+    /// island still reports the witnesses' steady cadence here.
+    downlink_undecodable: u64,
+    /// This client's own authored order packet failing to decode (#1034).
+    ///
+    /// Formerly conflated with [`Self::downlink_undecodable`], which made a
+    /// 28 740-count session uninterpretable: the two are different defects
+    /// with different fixes. The own packet failing to decode skips the
+    /// tick's step — a literal one-tick freeze of this craft — so this
+    /// counter is the one a turning-freeze report is checked against.
+    own_orders_undecodable: u64,
     delivered_unroutable: u64,
     delivered_foreign: u64,
     pending_delivered: Vec<DeliveredOrder>,
@@ -961,7 +980,8 @@ impl CampaignRuntime {
             settled_broadcast_recipients: BTreeSet::new(),
             downlink: DownlinkTracker::default(),
             downlink_arrivals: 0,
-            undecodable: 0,
+            downlink_undecodable: 0,
+            own_orders_undecodable: 0,
             delivered_unroutable: 0,
             delivered_foreign: 0,
             pending_delivered: Vec::new(),
@@ -1246,10 +1266,23 @@ impl CampaignRuntime {
         self.downlink.last_tick(sender)
     }
 
-    /// Replication packets that decoded to nothing this session recognises.
+    /// Received-traffic decode failures: downlink frames this client could
+    /// not decode into anything it recognises.
+    ///
+    /// Split from the own-packet failure in #1034; see the field note for
+    /// what a steady rate here currently includes.
     #[must_use]
-    pub fn undecodable(&self) -> u64 {
-        self.undecodable
+    pub fn downlink_undecodable(&self) -> u64 {
+        self.downlink_undecodable
+    }
+
+    /// This client's own order packet failing to decode.
+    ///
+    /// Zero is the healthy reading. Any non-zero count is ticks this client
+    /// skipped its own step on.
+    #[must_use]
+    pub fn own_orders_undecodable(&self) -> u64 {
+        self.own_orders_undecodable
     }
 
     /// Deliveries this ruleset produced for an entity this client cannot
@@ -1356,12 +1389,7 @@ impl CampaignRuntime {
         // the offline one, without taking the process down mid-session (#947).
         let decoded = decode_packet(&authored);
         if let Err(error) = &decoded {
-            self.undecodable += 1;
-            bevy::log::error!(
-                "campaign tick {}: this client's own order packet did not decode ({error}); \
-                 no step, no witness entry and no telemetry for this tick",
-                tick.0
-            );
+            self.count_own_packet_decode_failure(tick, error);
         }
         if let Ok(mut authored_orders) = decoded {
             if let Some(other) = self.executor.state(self.entity).and_then(|own| {
@@ -1527,162 +1555,7 @@ impl CampaignRuntime {
 
         // ── Inbound: replicated state, acks, liveness ─────────────────────
         for frame in link.drain_downlink() {
-            match frame.lane {
-                Lane::Meta => match classify_meta(&frame.payload) {
-                    MetaFrame::Ack(ack) => {
-                        // THE uplink measurement: the router's settled
-                        // decision, not a transport write.
-                        let dropped = ack.outcome == UplinkOutcome::Dropped;
-                        self.uplink_acks += 1;
-                        self.uplink_dropped += u64::from(dropped);
-                        self.campaign.observe_uplink_ack(dropped);
-                        settle_broadcast_ack(
-                            &mut self.pending_broadcast_recipients,
-                            &mut self.settled_broadcast_recipients,
-                            ack,
-                        );
-                    }
-                    MetaFrame::Hearsay(contacts) => self.hearsay.accept(contacts, tick.0),
-                    MetaFrame::Membership(manifest) => {
-                        if let Err(reason) = self.adopt_live_membership(&manifest) {
-                            bevy::log::error!("campaign: refusing live membership: {reason}");
-                            self.state = JoinState::Failed(reason);
-                        }
-                    }
-                    // Anything else on meta is not ours to interpret.
-                    MetaFrame::Ignored => {}
-                },
-                Lane::Datagram => {
-                    let now_ms = self.started_at.elapsed().as_secs_f64() * 1_000.0;
-                    // Strip the outer channel tag first (the harness wire is
-                    // double-tagged; see `encode_state_broadcast`), then read
-                    // the replication envelope from what remains.
-                    let inner = orrery_protocol::channels::untag(&frame.payload)
-                        .filter(|(channel, _)| {
-                            *channel == orrery_protocol::channels::Channel::State
-                        })
-                        .map(|(_, rest)| rest.to_vec());
-                    let Some(inner) = inner else {
-                        self.undecodable += 1;
-                        continue;
-                    };
-                    match decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(&inner) {
-                        Some((encoded, _cell, entity, at)) => {
-                            self.replica_keyframes.insert(
-                                entity,
-                                ReplicationKeyframe {
-                                    canonical: encoded.clone(),
-                                    cell: _cell,
-                                    at,
-                                },
-                            );
-                            match <RegolithState as CoreCodec>::decode(&encoded) {
-                                Ok(state) => {
-                                    if entity != self.entity {
-                                        let _ = refresh_replica(
-                                            &mut self.replica_freshness,
-                                            entity,
-                                            frame.peer,
-                                            tick.0,
-                                            at,
-                                        );
-                                    }
-                                    self.executor.insert(entity, state);
-                                    // The duel view follows the first remote
-                                    // craft that arrives, and stays with it.
-                                    if entity != self.entity && self.focus.is_none() {
-                                        self.focus = Some(entity);
-                                    }
-                                }
-                                Err(_) => self.undecodable += 1,
-                            }
-                            let arrival = self.downlink.record(frame.peer, at, now_ms);
-                            self.downlink_arrivals += 1;
-                            self.campaign
-                                .observe_arrival(arrival.missing, arrival.deviation_ms);
-                        }
-                        None => match orrery_protocol::channels::decode_replication_delta(&inner) {
-                            Some(delta) => {
-                                let Some(keyframe) = self.replica_keyframes.get(&delta.entity)
-                                else {
-                                    self.undecodable += 1;
-                                    continue;
-                                };
-                                if !delta_is_anchored(keyframe.at, delta.tick, delta.keyframe_age) {
-                                    self.undecodable += 1;
-                                    continue;
-                                }
-                                let Some(encoded) = orrery_protocol::channels::apply_delta_patch(
-                                    &keyframe.canonical,
-                                    &delta.patch,
-                                ) else {
-                                    self.undecodable += 1;
-                                    continue;
-                                };
-                                let _cell = delta.cell.unwrap_or(keyframe.cell);
-                                match <RegolithState as CoreCodec>::decode(&encoded) {
-                                    Ok(state) => {
-                                        if delta.entity != self.entity {
-                                            let _ = refresh_replica(
-                                                &mut self.replica_freshness,
-                                                delta.entity,
-                                                frame.peer,
-                                                tick.0,
-                                                delta.tick,
-                                            );
-                                        }
-                                        self.executor.insert(delta.entity, state);
-                                        if delta.entity != self.entity && self.focus.is_none() {
-                                            self.focus = Some(delta.entity);
-                                        }
-                                        let arrival =
-                                            self.downlink.record(frame.peer, delta.tick, now_ms);
-                                        self.downlink_arrivals += 1;
-                                        self.campaign
-                                            .observe_arrival(arrival.missing, arrival.deviation_ms);
-                                    }
-                                    Err(_) => self.undecodable += 1,
-                                }
-                            }
-                            None => {
-                                // Witness frames share this sub-tagged lane
-                                // upstream; neither is replication we can read.
-                                // Counted, so a silent empty world cannot hide.
-                                self.undecodable += 1;
-                            }
-                        },
-                    }
-                }
-                Lane::StreamShared => {
-                    // The peer stack contributes the outer Control tag and
-                    // the delivery envelope contributes the inner one, just
-                    // as replication is double-tagged on the state lane.
-                    let delivered = orrery_protocol::channels::untag(&frame.payload)
-                        .filter(|(channel, _)| {
-                            *channel == orrery_protocol::channels::Channel::Control
-                        })
-                        .and_then(|(_, inner)| decode_delivered_input(inner));
-                    match delivered {
-                        Some(delivered) => match accept_own_delivery(
-                            self.entity,
-                            delivered,
-                            &mut self.pending_delivered,
-                        ) {
-                            Ok(()) => {}
-                            Err(DeliveryRefusal::Foreign) => self.delivered_foreign += 1,
-                            Err(DeliveryRefusal::Malformed) => self.undecodable += 1,
-                        },
-                        None => {
-                            // Witness log frames and repairs also ride the
-                            // reliable lane. This client authors its own
-                            // stream but is not a watcher for other subjects.
-                        }
-                    }
-                }
-                Lane::StreamBulk => {
-                    // Bulk witness repairs are not consumed by this client.
-                }
-            }
+            self.accept_frame(frame, tick);
         }
 
         expire_stale_replicas(
@@ -1718,6 +1591,185 @@ impl CampaignRuntime {
         self.tick = Tick::new(tick.0.saturating_add(1));
         self.ticks_driven = self.ticks_driven.saturating_add(1);
         report
+    }
+
+    /// Accept one frame the downlink delivered, on the lane it arrived on.
+    ///
+    /// Extracted from `advance`'s inbound loop so the counting rules are
+    /// reachable by test without a live `CampaignLink` and a dial thread —
+    /// the same seam [`delta_is_anchored`] was cut for. Every failure
+    /// counted here is a *received*-traffic failure and feeds
+    /// [`Self::downlink_undecodable`]; this client's own order packet is
+    /// counted by [`Self::count_own_packet_decode_failure`] instead (#1034).
+    fn accept_frame(&mut self, frame: net::Frame, tick: Tick) {
+        match frame.lane {
+            Lane::Meta => match classify_meta(&frame.payload) {
+                MetaFrame::Ack(ack) => {
+                    // THE uplink measurement: the router's settled
+                    // decision, not a transport write.
+                    let dropped = ack.outcome == UplinkOutcome::Dropped;
+                    self.uplink_acks += 1;
+                    self.uplink_dropped += u64::from(dropped);
+                    self.campaign.observe_uplink_ack(dropped);
+                    settle_broadcast_ack(
+                        &mut self.pending_broadcast_recipients,
+                        &mut self.settled_broadcast_recipients,
+                        ack,
+                    );
+                }
+                MetaFrame::Hearsay(contacts) => self.hearsay.accept(contacts, tick.0),
+                MetaFrame::Membership(manifest) => {
+                    if let Err(reason) = self.adopt_live_membership(&manifest) {
+                        bevy::log::error!("campaign: refusing live membership: {reason}");
+                        self.state = JoinState::Failed(reason);
+                    }
+                }
+                // Anything else on meta is not ours to interpret.
+                MetaFrame::Ignored => {}
+            },
+            Lane::Datagram => {
+                let now_ms = self.started_at.elapsed().as_secs_f64() * 1_000.0;
+                // Strip the outer channel tag first (the harness wire is
+                // double-tagged; see `encode_state_broadcast`), then read
+                // the replication envelope from what remains.
+                let inner = orrery_protocol::channels::untag(&frame.payload)
+                    .filter(|(channel, _)| *channel == orrery_protocol::channels::Channel::State)
+                    .map(|(_, rest)| rest.to_vec());
+                let Some(inner) = inner else {
+                    self.downlink_undecodable += 1;
+                    return;
+                };
+                match decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(&inner) {
+                    Some((encoded, _cell, entity, at)) => {
+                        self.replica_keyframes.insert(
+                            entity,
+                            ReplicationKeyframe {
+                                canonical: encoded.clone(),
+                                cell: _cell,
+                                at,
+                            },
+                        );
+                        match <RegolithState as CoreCodec>::decode(&encoded) {
+                            Ok(state) => {
+                                if entity != self.entity {
+                                    let _ = refresh_replica(
+                                        &mut self.replica_freshness,
+                                        entity,
+                                        frame.peer,
+                                        tick.0,
+                                        at,
+                                    );
+                                }
+                                self.executor.insert(entity, state);
+                                // The duel view follows the first remote
+                                // craft that arrives, and stays with it.
+                                if entity != self.entity && self.focus.is_none() {
+                                    self.focus = Some(entity);
+                                }
+                            }
+                            Err(_) => self.downlink_undecodable += 1,
+                        }
+                        let arrival = self.downlink.record(frame.peer, at, now_ms);
+                        self.downlink_arrivals += 1;
+                        self.campaign
+                            .observe_arrival(arrival.missing, arrival.deviation_ms);
+                    }
+                    None => match orrery_protocol::channels::decode_replication_delta(&inner) {
+                        Some(delta) => {
+                            let Some(keyframe) = self.replica_keyframes.get(&delta.entity) else {
+                                self.downlink_undecodable += 1;
+                                return;
+                            };
+                            if !delta_is_anchored(keyframe.at, delta.tick, delta.keyframe_age) {
+                                self.downlink_undecodable += 1;
+                                return;
+                            }
+                            let Some(encoded) = orrery_protocol::channels::apply_delta_patch(
+                                &keyframe.canonical,
+                                &delta.patch,
+                            ) else {
+                                self.downlink_undecodable += 1;
+                                return;
+                            };
+                            let _cell = delta.cell.unwrap_or(keyframe.cell);
+                            match <RegolithState as CoreCodec>::decode(&encoded) {
+                                Ok(state) => {
+                                    if delta.entity != self.entity {
+                                        let _ = refresh_replica(
+                                            &mut self.replica_freshness,
+                                            delta.entity,
+                                            frame.peer,
+                                            tick.0,
+                                            delta.tick,
+                                        );
+                                    }
+                                    self.executor.insert(delta.entity, state);
+                                    if delta.entity != self.entity && self.focus.is_none() {
+                                        self.focus = Some(delta.entity);
+                                    }
+                                    let arrival =
+                                        self.downlink.record(frame.peer, delta.tick, now_ms);
+                                    self.downlink_arrivals += 1;
+                                    self.campaign
+                                        .observe_arrival(arrival.missing, arrival.deviation_ms);
+                                }
+                                Err(_) => self.downlink_undecodable += 1,
+                            }
+                        }
+                        None => {
+                            // Witness frames share this sub-tagged lane
+                            // upstream; neither is replication we can read.
+                            // Counted, so a silent empty world cannot hide.
+                            self.downlink_undecodable += 1;
+                        }
+                    },
+                }
+            }
+            Lane::StreamShared => {
+                // The peer stack contributes the outer Control tag and
+                // the delivery envelope contributes the inner one, just
+                // as replication is double-tagged on the state lane.
+                let delivered = orrery_protocol::channels::untag(&frame.payload)
+                    .filter(|(channel, _)| *channel == orrery_protocol::channels::Channel::Control)
+                    .and_then(|(_, inner)| decode_delivered_input(inner));
+                match delivered {
+                    Some(delivered) => match accept_own_delivery(
+                        self.entity,
+                        delivered,
+                        &mut self.pending_delivered,
+                    ) {
+                        Ok(()) => {}
+                        Err(DeliveryRefusal::Foreign) => self.delivered_foreign += 1,
+                        Err(DeliveryRefusal::Malformed) => self.downlink_undecodable += 1,
+                    },
+                    None => {
+                        // Witness log frames and repairs also ride the
+                        // reliable lane. This client authors its own
+                        // stream but is not a watcher for other subjects.
+                    }
+                }
+            }
+            Lane::StreamBulk => {
+                // Bulk witness repairs are not consumed by this client.
+            }
+        }
+    }
+
+    /// The own-packet half of the undecodable split (#1034).
+    ///
+    /// This client's authored order packet did not decode: no step, no
+    /// witness entry and no telemetry for this tick. Formerly this fed the
+    /// same counter the received-downlink failures fed, which is what made
+    /// the 2026-09-04 session's 28 740 uninterpretable — the own-packet
+    /// failure freezes this craft for a tick, the downlink failure ages a
+    /// replica, and neither number can audit the other.
+    fn count_own_packet_decode_failure(&mut self, tick: Tick, error: &orrery_core::CodecError) {
+        self.own_orders_undecodable += 1;
+        bevy::log::error!(
+            "campaign tick {}: this client's own order packet did not decode ({error}); \
+             no step, no witness entry and no telemetry for this tick",
+            tick.0
+        );
     }
 
     /// The geometric cell of this craft's current position.
@@ -3626,5 +3678,102 @@ mod tests {
     fn utc_stamps_render() {
         assert_eq!(utc_now_iso8601().len(), 20);
         assert!(utc_now_iso8601().ends_with('Z'));
+    }
+
+    /// A campaign config for the undecodable-split tests: a bogus host the
+    /// dial thread can fail against in its own time, since these tests never
+    /// poll it.
+    fn undecodable_test_config(session: &str) -> CampaignConfig {
+        CampaignConfig {
+            host_node_hex: "61a71521afb8e193d0d0fc248f85ed20bc78efa1120c83334579129b4171405b"
+                .to_owned(),
+            host_direct: None,
+            slot: 4,
+            own_label: None,
+            session_id: session.to_owned(),
+            session_token_hex: None,
+            wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
+            configured: ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+            transport_secret: iroh_base::SecretKey::from_bytes(&[0x49; 32]),
+            island_seats: Some(8),
+            roster_url: None,
+        }
+    }
+
+    /// #1034, the own side driven alone: a real order packet that really
+    /// fails to decode, through the same method `advance` calls. Only the
+    /// own counter may move — that the downlink counter stays at zero is
+    /// the property that lets a reader tell a frozen tick from a stale
+    /// replica.
+    #[test]
+    fn an_own_order_packet_that_fails_to_decode_counts_only_the_own_side() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("undecodable-split-own"),
+            UniverseSeed([0xB3; 32]),
+        );
+        runtime.join_for_test();
+
+        let packet = OrderPacket {
+            tick: 1_000_000,
+            entity: 1,
+            orders: vec![vec![0xFF, 0x00]],
+        };
+        let error =
+            decode_packet(&packet).expect_err("a garbage order vector cannot decode an Order");
+        runtime.count_own_packet_decode_failure(Tick::new(1_000_000), &error);
+
+        assert_eq!(runtime.own_orders_undecodable(), 1);
+        assert_eq!(
+            runtime.downlink_undecodable(),
+            0,
+            "an own-packet failure must not borrow the downlink counter"
+        );
+    }
+
+    /// #1034, the downlink side driven alone: frames the downlink delivered
+    /// that decode to nothing this client recognises, through the same
+    /// method `advance`'s inbound loop calls. The first frame has no State
+    /// outer tag at all; the second carries one but is neither a replication
+    /// keyframe nor a delta — the exact shape a bot cohort's witness frames
+    /// present on this lane, and the arm the 2026-09-04 session's steady
+    /// 39/s landed in. Only the downlink counter may move.
+    #[test]
+    fn a_downlink_frame_that_decodes_to_nothing_counts_only_the_downlink_side() {
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("undecodable-split-downlink"),
+            UniverseSeed([0xB4; 32]),
+        );
+        runtime.join_for_test();
+
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: Bytes::from_static(b"no channel tag at all"),
+            },
+            Tick::new(1_000),
+        );
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: Bytes::from(orrery_protocol::channels::tag(
+                    orrery_protocol::channels::Channel::State,
+                    b"neither replication nor a delta",
+                )),
+            },
+            Tick::new(1_001),
+        );
+
+        assert_eq!(runtime.downlink_undecodable(), 2);
+        assert_eq!(
+            runtime.own_orders_undecodable(),
+            0,
+            "a downlink failure must not borrow the own-packet counter"
+        );
     }
 }

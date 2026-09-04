@@ -2886,11 +2886,13 @@ fn refresh_f3_pane(
         if let ActiveSession::Campaign(runtime) = &*session {
             let accumulator = runtime.accumulator();
             text.push_str(&format!(
-                "\n{} | session {}\nuplink shed {} | downlink undecodable {} | afk capped {}",
+                "\n{} | session {}\nuplink shed {} | own orders undecodable {} | \
+                 downlink undecodable {} | afk capped {}",
                 runtime.summary_line(),
                 accumulator.session_id(),
                 runtime.uplink_shed(),
-                runtime.undecodable(),
+                runtime.own_orders_undecodable(),
+                runtime.downlink_undecodable(),
                 accumulator.progress().afk_capped,
             ));
         } else {
@@ -2938,7 +2940,11 @@ fn stream_metrics(
             // not just the F3 pane nobody opens (#947).
             metrics.afk_capped = progress.afk_capped;
             metrics.uplink_shed = runtime.uplink_shed();
-            metrics.downlink_undecodable = runtime.undecodable();
+            // The undecodable split (#1034): which side failed to decode is
+            // the whole question, so each field is fed from its own side's
+            // counter and neither can borrow the other's number.
+            metrics.own_orders_undecodable = runtime.own_orders_undecodable();
+            metrics.downlink_undecodable = runtime.downlink_undecodable();
             metrics.delivered_unroutable = runtime.delivered_unroutable();
             metrics.delivered_foreign = runtime.delivered_foreign();
             let configured = &runtime.config().configured;
@@ -3397,6 +3403,7 @@ mod tests {
         );
         for field in [
             "uplink_shed",
+            "own_orders_undecodable",
             "downlink_undecodable",
             "delivered_unroutable",
             "delivered_foreign",
