@@ -17,7 +17,13 @@ This script is the executable half of that contract. It reads one `AttemptReport
 plus the attempt's signed client rows and derives the ledger inputs:
 
     one bot contribution        player_hours = B * valid_attempt_seconds / 3600
-    one row per signed human    player_hours = banked_minutes / 60
+    one row per signed human    player_hours = min(banked_minutes, span) / 60
+
+where `span` is the host's own record of how long that seat was connected. The
+`min` is #1032: the two figures come from two independently-kept clocks, so the
+seat's span is the ceiling rather than a number the claim must match, and what
+banks is the smaller. `CLOCK_BOUNDARY_SLACK_MS` derives both the clamp and the
+allowance past which a claim is inflation rather than a clock.
 
 Every human row is bound to exactly one exterior `(attempt_id, slot, session_id,
 node)`, and no two rows may bind to the same one. That bijection is the property:
@@ -162,6 +168,109 @@ IMPAIRMENT_JITTER_TOLERANCE_MS = 40.0
 # while measuring nothing is not evidence of impairment either way.
 IMPAIRMENT_SUPPRESSION_SAMPLES = 200.0
 IMPAIRMENT_SUPPRESSION_MINUTES = IMPAIRMENT_SUPPRESSION_SAMPLES / 20 / 60
+
+# ── The span-overrun allowance, and why the interval is clamped (#1032) ──────
+#
+# The invariant is unchanged and not weakened: a banked interval may not exceed
+# the span its seat was connected. What #1032 found is that the *comparison*
+# was wrong, not the property. `banked_minutes` is a count of the client's own
+# fixed-step ticks divided by the nominal 60 Hz
+# (`clients/regolith/src/session.rs:404`, fed one tick at a time from
+# `clients/regolith/src/campaign.rs:1717`). The host's bracket is two
+# wall-clock stamps taken by the swarm's simulation loop
+# (`gates/p1-swarm/src/swarm.rs:2207` for the open end, `:1848` for the close).
+# Two clocks, four independently-detected endpoints, and until now one tick —
+# 16.7 ms — of tolerance between them.
+#
+# What the four signed rows of 2026-09-04 measure. `banked_ticks / 60` minus
+# the host's bracket, per seat:
+#
+#     slot 5   741.300 s claimed vs 741.132 s bracket   +168 ms   ( +227 ppm)
+#     slot 6   251.400 s claimed vs 252.115 s bracket   -715 ms   (-2836 ppm)
+#     slot 7   727.167 s claimed vs 727.233 s bracket    -66 ms   (  -91 ppm)
+#     slot 6    20.267 s claimed vs  20.325 s bracket    -58 ms   (-2870 ppm)
+#
+# Two things follow, and both matter.
+#
+# **It does not scale with the session.** Read as a rate the four disagree by
+# -2870 to +227 ppm, which is not one clock offset; read as a fixed quantity
+# they are 58-715 ms with no trend against spans running from 20 s to 12 min.
+# The disagreement is dominated by endpoint alignment, not by drift. So a
+# longer honest session is not more likely to fail — every session of every
+# length is a coin flip against a 16.7 ms tolerance, which is the worse
+# reading of the same fact.
+#
+# **The open endpoint is not ordered.** `connected_since_unix_millis` is
+# stamped where the swarm's tick loop binds the seat — at construction for the
+# initial cohort, or when it drains the live-join channel (`swarm.rs:2861`) —
+# while the client starts calling `observe_tick` when its own join completes on
+# the transport. Nothing in either program orders those two events, so the
+# claim in `ExteriorReport`'s own docs that the bracket "contains the client's
+# interval" holds by convention rather than by construction, and slot 5 is the
+# case where it did not hold. The close endpoint *is* ordered — the host stamps
+# at the first tick it saw the link down, or at report time, both at or after
+# the client's last tick — so it contributes nothing to an overrun.
+#
+# Hence two changes, and the first is what makes the second cheap.
+#
+# 1. **The interval is clamped to the bracket**, on the basis that is a
+#    measurement of it. A seat banks `min(claimed, bracket)`, so no banked
+#    interval exceeds its seat's connected span *at all* — exactly, with zero
+#    tolerance, where the old check permitted a full tick over. The discarded
+#    sliver is never silent: `binding.claimed_minutes`,
+#    `binding.banked_minutes` and `binding.clamped_minutes` carry it into every
+#    ledger input, the derivation string names it, the manifest totals it, and
+#    `note` prints it.
+#
+#    Deliberately *not* on the tick-count fallback. A tick count scaled at the
+#    nominal rate is a known **understatement** of the span — #971 measured the
+#    host's metronome at 55.3-59.8 Hz against a 60 Hz nominal — so clamping to
+#    it would discard whole percent of real play instead of a sliver. On that
+#    basis the ceiling stays what it always was: a refusal threshold, never a
+#    value.
+#
+# 2. **The threshold becomes an inflation detector rather than a value gate.**
+#    With the clamp in place the allowance no longer decides how much banks; it
+#    decides only whether a claim is two clocks disagreeing or a client lying.
+#    So it is derived to cover honest disagreement with margin rather than
+#    fitted to the tightest observation:
+#
+#        allowance(span) = CLOCK_BOUNDARY_SLACK_MS + CLOCK_RATE_PPM * span
+#
+#    * The fixed term bounds the endpoint race. The largest honest
+#      disagreement in real volunteer data is 715 ms, on a seat nobody
+#      questions, in the *safe* direction — the same unordered race pointed the
+#      other way. A race that produces 715 ms one way produces 715 ms the
+#      other, so ±715 ms is the measured noise floor of this system and 1000 ms
+#      is the round number above it. It is deliberately **not** derived from
+#      slot 5's 168 ms: fitting a bound to the one observation it must admit is
+#      how a tolerance stops being a bound.
+#    * The rate term covers frequency offset between the client's undisciplined
+#      monotonic tick source and the host's wall clock. Consumer crystals are
+#      specified at ±50 ppm; two independent parts give 100 ppm. The client's
+#      fixed-step accumulator carries its remainder rather than dropping it, so
+#      it cannot over-count against its *own* clock, and frequency offset is
+#      the only rate term left.
+#
+#    What the widening now fails to catch: a client inflating by under a second
+#    plus 100 ppm — 1.06 s on a twelve-minute seat, 1.36 s on an hour. That is
+#    3e-4 player-hours, and on the bracket basis the clamp discards it anyway,
+#    so the widening costs nothing in banked hours. It buys a quieter
+#    diagnosis and nothing else.
+#
+# 3. **A claim past the allowance costs its own seat and no other** (#1032's
+#    third option). The refusal was attempt-wide because it exits the
+#    derivation, and the operator cannot route around it: the pinned-id list
+#    must equal the client rows' ids, which are the volunteer's signed file. So
+#    one seat 168 ms out voided three honest seats' hours. An over-claiming
+#    seat now drops out of the derivation — loudly, into `note` and into the
+#    manifest's `refused_seats` — and the attempt assembles without it.
+CLOCK_BOUNDARY_SLACK_MS = 1000.0
+CLOCK_RATE_PPM = 100.0
+
+# The name `connected_span_minutes` returns for the bracket basis. The clamp is
+# conditioned on it, so the two must be the same string.
+WALL_BRACKET_BASIS = "host wall bracket"
 
 # A close reason that leaves the leg's evidence intact. `queue_overflow` does
 # not: the host counted downlink frames it could not deliver, so that human's
@@ -347,7 +456,7 @@ def connected_span_minutes(entry: dict[str, Any], per_tick: float) -> tuple[floa
                 f"slot {entry.get('slot')} reports a seat released at {until} before it was "
                 f"seated at {since}; a connected span cannot run backwards"
             )
-        return (until - since) / 60_000.0, "host wall bracket"
+        return (until - since) / 60_000.0, WALL_BRACKET_BASIS
     if since is not None or until is not None:
         refuse(
             f"slot {entry.get('slot')} stamps only one end of its connected span; a bracket "
@@ -355,6 +464,20 @@ def connected_span_minutes(entry: dict[str, Any], per_tick: float) -> tuple[floa
         )
     connected_ticks = entry.get("connected_ticks")
     return connected_ticks * per_tick / 60.0, "host tick count at the nominal rate"
+
+
+def span_overrun_allowance_minutes(connected_minutes: float) -> float:
+    """How far past its seat's span an honest claim may sit, in minutes.
+
+    A fixed endpoint term plus a rate term, both derived at
+    `CLOCK_BOUNDARY_SLACK_MS`:
+
+        allowance = 1000 ms + 100 ppm * span
+
+    Past this the claim is no longer two clocks disagreeing.
+    """
+    span_ms = max(connected_minutes, 0.0) * 60_000.0
+    return (CLOCK_BOUNDARY_SLACK_MS + CLOCK_RATE_PPM * 1e-6 * span_ms) / 60_000.0
 
 
 def seconds_per_tick(attempt: dict[str, Any]) -> float:
@@ -751,6 +874,8 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
     claimed_sessions: set[str] = set()
     bound_seats: set[tuple[int, Any]] = set()
     human_total = 0.0
+    total_clamped = 0.0
+    refused_seats: list[dict[str, Any]] = []
     for row in rows:
         session_id = row.get("session_id")
         if not isinstance(session_id, str) or not UUID_V7.match(session_id):
@@ -803,20 +928,54 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             refuse(f"the row for session {session_id} carries no banked_minutes")
         if not isinstance(distinct, (int, float)) or banked_minutes > distinct:
             refuse(f"the row for session {session_id} banks more than it played")
-        # The honest caveat, made a refusal rather than an assumption: a client's
-        # own claim about how long it played is bounded by the host's record of
-        # how long that seat was connected. A tolerance of one tick absorbs the
-        # boundary rounding between the two clocks and nothing else.
-        if banked_minutes > connected_minutes + per_tick / 60.0:
-            refuse(
+        # The honest caveat: a client's own claim about how long it played is
+        # bounded by the host's record of how long that seat was connected. The
+        # derivation of the allowance, of the clamp, and of why one bad seat no
+        # longer costs the whole attempt is at `CLOCK_BOUNDARY_SLACK_MS`.
+        allowance = span_overrun_allowance_minutes(connected_minutes)
+        if banked_minutes > connected_minutes + allowance:
+            # Seat-scoped, not attempt-scoped (#1032). A claim this far past its
+            # seat is not two clocks disagreeing, and it costs its own hours —
+            # but the honest seats beside it still assemble.
+            detail = (
                 f"session {session_id} banks {banked_minutes:g} min but slot {slot} was "
-                f"connected for {connected_minutes:.4f} min ({span_basis}); an interval cannot "
-                "exceed its seat's connected span"
+                f"connected for {connected_minutes:.4f} min ({span_basis}), "
+                f"{(banked_minutes - connected_minutes) * 60_000:.0f} ms past the "
+                f"{allowance * 60_000:.0f} ms two clocks may honestly disagree by; "
+                "an interval cannot exceed its seat's connected span"
             )
+            note(f"refusing slot {slot}: {detail}")
+            refused_seats.append(
+                {
+                    "slot": slot,
+                    "session_id": session_id,
+                    "claimed_minutes": float(banked_minutes),
+                    "connected_minutes": connected_minutes,
+                    "span_basis": span_basis,
+                    "allowance_minutes": allowance,
+                    "detail": detail,
+                }
+            )
+            continue
 
         platform = row.get("platform_triple")
         if not isinstance(platform, str) or not platform:
             refuse(f"the row for session {session_id} carries no platform_triple")
+
+        # The clamp, and only on the basis that is a measurement of the span.
+        # The tick fallback understates it, so clamping there would discard real
+        # play rather than a sliver.
+        claimed_minutes = float(banked_minutes)
+        if span_basis == WALL_BRACKET_BASIS:
+            banked_minutes = min(claimed_minutes, connected_minutes)
+        clamped_minutes = claimed_minutes - banked_minutes
+        if clamped_minutes > 0:
+            note(
+                f"slot {slot}: clamping session {session_id} from {claimed_minutes:g} min to "
+                f"the host's {connected_minutes:.4f} min bracket, discarding "
+                f"{clamped_minutes * 60_000:.0f} ms of claimed play"
+            )
+            total_clamped += clamped_minutes
 
         hours = banked_minutes / 60.0
         human_total += hours
@@ -858,12 +1017,25 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             "connected_since_unix_millis": entry.get("connected_since_unix_millis"),
             "connected_until_unix_millis": entry.get("connected_until_unix_millis"),
             "connected_minutes": connected_minutes,
+            # What the client signed, what banked, and the difference. The
+            # clamp is a discard of genuine play, so it is carried rather than
+            # merely applied: `p4-ledger.sh` banks `banked_minutes` and refuses
+            # a report whose three numbers do not agree, and an auditor reading
+            # a banked row can see the sliver without re-deriving it.
+            "claimed_minutes": claimed_minutes,
+            "banked_minutes": banked_minutes,
+            "clamped_minutes": clamped_minutes,
+            "span_basis": span_basis,
             "close": close,
         }
         report["contribution"] = {
             "actor": "human",
             "player_hours": hours,
-            "derivation": f"{banked_minutes:g} / 60",
+            "derivation": (
+                f"min({claimed_minutes:g}, {connected_minutes:.4f}) / 60"
+                if clamped_minutes > 0
+                else f"{banked_minutes:g} / 60"
+            ),
         }
         report["link_impairment"] = check_link_impairment(attempt, slot)
         pending.append((f"contribution-human-{slot}-{session_id}.json", report))
@@ -880,6 +1052,11 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         f"attempt {attempt_id}: {len(written)} ledger input(s), "
         f"{bot_hours:g} bot + {human_total:g} human = {total:g} player-hours"
     )
+    if total_clamped > 0 or refused_seats:
+        note(
+            f"attempt {attempt_id}: {total_clamped * 60_000:.0f} ms clamped to host brackets, "
+            f"{len(refused_seats)} seat(s) refused their own interval"
+        )
     print(
         json.dumps(
             {
@@ -890,6 +1067,11 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
                 "bot_hours": bot_hours,
                 "human_hours": human_total,
                 "attempt_total_hours": total,
+                # Both are the visibility half of #1032: an assembled attempt
+                # that discarded a sliver, or dropped a seat, says so in the
+                # manifest the operator keeps beside the inputs.
+                "clamped_minutes": total_clamped,
+                "refused_seats": refused_seats,
                 "inputs": [str(path) for path in written],
             },
             indent=2,
@@ -1033,10 +1215,26 @@ def fixture_attempt(
     }
 
 
+FIXTURE_SEATED_AT_MILLIS = 1750000000000
+
+
 def fixture_exterior(
-    slot: int, session_id: str, node: str, minutes: float, close: str = "goodbye"
+    slot: int,
+    session_id: str,
+    node: str,
+    minutes: float,
+    close: str = "goodbye",
+    bracket_minutes: float | None = None,
 ) -> dict[str, Any]:
-    return {
+    """One seat as the host reports it.
+
+    `bracket_minutes` stamps the host's wall bracket (#971), which is the basis
+    the derivation clamps to (#1032); without it the seat carries only its tick
+    count and the fallback basis applies. The two are deliberately separable in
+    a fixture: a real host's tick count and wall bracket disagree, and the
+    behaviour under test is exactly what happens when they do.
+    """
+    entry = {
         "slot": slot,
         "session_id": session_id,
         "node": node,
@@ -1044,6 +1242,12 @@ def fixture_exterior(
         "frames": {"uplink": 100000, "downlink": 400000, "downlink_dropped": 0},
         "close": close,
     }
+    if bracket_minutes is not None:
+        entry["connected_since_unix_millis"] = FIXTURE_SEATED_AT_MILLIS
+        entry["connected_until_unix_millis"] = FIXTURE_SEATED_AT_MILLIS + round(
+            bracket_minutes * 60_000
+        )
+    return entry
 
 
 class SelfTest:
@@ -1154,6 +1358,18 @@ def self_test() -> None:
                 f"self-test: p4-ledger.sh's append-time recomputation no longer carries "
                 f"{fragment!r}; its band drifted from this one"
             )
+
+    # #1032: the append path re-derives the same clock-disagreement allowance
+    # this file derived the ledger inputs under. Two copies of a bound that is
+    # allowed to disagree is a bound in name only.
+    allowance_jq = (
+        f"(({CLOCK_BOUNDARY_SLACK_MS:g} + {CLOCK_RATE_PPM:g}e-6 * ($connected * 60000)) / 60000)"
+    )
+    if allowance_jq not in ledger:
+        die(
+            f"self-test: p4-ledger.sh does not carry {allowance_jq}; the append path's "
+            "span allowance drifted from the one these inputs are derived under"
+        )
 
     os.environ["P4_PIPELINE_ID"] = "selftestpipeline"
     with tempfile.TemporaryDirectory() as raw:
@@ -1295,10 +1511,129 @@ def self_test() -> None:
                 fixture_exterior(5, SESSION_B, node_b, 50),
             ]
         )
-        test.must_refuse(
-            short_seat, [row_a, row_b], "over-span", "cannot exceed its seat's connected span"
+        # 50 minutes claimed against a 20-minute seat is inflation, not two
+        # clocks disagreeing, and it is still refused. What changed in #1032 is
+        # the blast radius: it costs slot 4 its own hours and leaves slot 5's
+        # honest interval standing, where before it voided the attempt.
+        manifest_short, emitted_short = test.must_derive(
+            short_seat, [row_a, row_b], "over-span"
         )
-        test.ok("interval_may_not_exceed_its_seats_connected_span")
+        refused = manifest_short["refused_seats"]
+        if len(refused) != 1 or refused[0]["slot"] != 4:
+            die(f"self-test [an_inflated_interval_is_refused]: refused {refused}")
+        if "cannot exceed its seat's connected span" not in refused[0]["detail"]:
+            die(f"self-test [an_inflated_interval_is_refused]: {refused[0]['detail']}")
+        if abs(manifest_short["human_hours"] - 42 / 60.0) > 1e-9:
+            die(
+                "self-test [an_inflated_interval_is_refused]: the inflated seat banked, or the "
+                f"honest one did not: {manifest_short['human_hours']}"
+            )
+        if {
+            report["binding"]["slot"]
+            for report in emitted_short
+            if report["identity"]["actor"] == "human"
+        } != {5}:
+            die("self-test [an_inflated_interval_is_refused]: the wrong seats assembled")
+        test.ok("an_inflated_interval_is_refused")
+        test.ok("an_inflated_interval_costs_its_own_seat_and_no_other")
+
+        # ── The two clocks, and the clamp between them (#1032) ──────────────
+        #
+        # The real 2026-09-04 shape: slot 5's client counted 168 ms more of its
+        # own ticks than the host's wall bracket held it seated. What banks is
+        # the bracket, the sliver is named in the input, and slot 4 — whose
+        # clocks happen to agree — is untouched.
+        clock_skew = fixture_attempt(
+            [
+                fixture_exterior(4, SESSION_A, node_a, 50, bracket_minutes=50),
+                fixture_exterior(5, SESSION_B, node_b, 42, bracket_minutes=41.9972),
+            ]
+        )
+        manifest_skew, emitted_skew = test.must_derive(
+            clock_skew, [row_a, row_b], "clock-skew"
+        )
+        if manifest_skew["refused_seats"]:
+            die("self-test [a_claim_past_its_bracket_by_a_clock_banks_the_bracket]: refused")
+        if abs(manifest_skew["human_hours"] - (50 + 41.9972) / 60.0) > 1e-9:
+            die(
+                "self-test [a_claim_past_its_bracket_by_a_clock_banks_the_bracket]: "
+                f"human hours {manifest_skew['human_hours']}"
+            )
+        if abs(manifest_skew["clamped_minutes"] - 0.0028) > 1e-9:
+            die(
+                "self-test [a_claim_past_its_bracket_by_a_clock_banks_the_bracket]: the manifest "
+                f"does not carry the discard: {manifest_skew['clamped_minutes']}"
+            )
+        clamped = next(
+            report
+            for report in emitted_skew
+            if report.get("binding", {}).get("slot") == 5
+        )
+        if (
+            abs(clamped["binding"]["banked_minutes"] - 41.9972) > 1e-9
+            or abs(clamped["binding"]["claimed_minutes"] - 42) > 1e-9
+            or abs(clamped["binding"]["clamped_minutes"] - 0.0028) > 1e-9
+            or abs(clamped["player_hours"] - 41.9972 / 60.0) > 1e-9
+        ):
+            die(
+                "self-test [a_claim_past_its_bracket_by_a_clock_banks_the_bracket]: "
+                f"binding {clamped['binding']}"
+            )
+        # The signed row is *not* rewritten. A clamp is the derivation's
+        # decision about what banks, never an edit of what the client attested —
+        # and an edit would fail the signature at the ledger anyway.
+        if abs(clamped["session"]["banked_minutes"] - 42) > 1e-9:
+            die(
+                "self-test [a_clamp_does_not_rewrite_the_signed_row]: the signed interval moved"
+            )
+        test.ok("a_claim_past_its_bracket_by_a_clock_banks_the_bracket")
+        test.ok("a_clamp_does_not_rewrite_the_signed_row")
+
+        # Past the allowance the clamp does not apply: a claim two minutes over
+        # its bracket is not a clock, and that seat drops out on its own.
+        inflated_bracket = fixture_attempt(
+            [
+                fixture_exterior(4, SESSION_A, node_a, 50, bracket_minutes=50),
+                fixture_exterior(5, SESSION_B, node_b, 42, bracket_minutes=40),
+            ]
+        )
+        manifest_inflated, _ = test.must_derive(
+            inflated_bracket, [row_a, row_b], "inflated-bracket"
+        )
+        if [entry["slot"] for entry in manifest_inflated["refused_seats"]] != [5]:
+            die(
+                "self-test [an_inflated_interval_is_not_clamped_into_bankability]: "
+                f"{manifest_inflated['refused_seats']}"
+            )
+        if abs(manifest_inflated["human_hours"] - 50 / 60.0) > 1e-9:
+            die(
+                "self-test [an_inflated_interval_is_not_clamped_into_bankability]: "
+                f"human hours {manifest_inflated['human_hours']}"
+            )
+        test.ok("an_inflated_interval_is_not_clamped_into_bankability")
+
+        # And the tick fallback is never clamped to. It understates the span by
+        # however far the host's metronome lagged (#971), so clamping there
+        # would discard real play rather than a sliver: a half-second over an
+        # unstamped seat banks in full.
+        unstamped = fixture_attempt(
+            [
+                fixture_exterior(4, SESSION_A, node_a, 55),
+                fixture_exterior(5, SESSION_B, node_b, 42 - 0.5 / 60),
+            ]
+        )
+        manifest_unstamped, _ = test.must_derive(unstamped, [row_a, row_b], "unstamped")
+        if manifest_unstamped["refused_seats"] or manifest_unstamped["clamped_minutes"] != 0:
+            die(
+                "self-test [a_tick_count_basis_is_never_clamped_to]: "
+                f"{manifest_unstamped['refused_seats']} {manifest_unstamped['clamped_minutes']}"
+            )
+        if abs(manifest_unstamped["human_hours"] - (50 + 42) / 60.0) > 1e-9:
+            die(
+                "self-test [a_tick_count_basis_is_never_clamped_to]: "
+                f"human hours {manifest_unstamped['human_hours']}"
+            )
+        test.ok("a_tick_count_basis_is_never_clamped_to")
 
         # A human seated for part of the attempt banks its part, and the bot
         # contribution is unaffected: that is what makes the denominator
