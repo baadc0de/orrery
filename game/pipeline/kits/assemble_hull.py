@@ -73,6 +73,10 @@ for z in Z["zones"]:
         cap = z.get("max_size_m", 2.5) / max(1e-6, max(e["dims"])); s_fit = min(s_fit, cap)  # no single part larger than max_size_m
         pos = pos + nn * (e["below"] * s_fit + 0.01)
         o.matrix_world = Matrix.Translation(pos) @ Matrix((tt, bb, nn)).transposed().to_4x4() @ Matrix.Scale(s_fit, 4); o.name = f"{z['name']}_{i}_{e['name']}"
+        placed_m = max(e["dims"]) * s_fit; tb = int(max(250, min(budget, 1800 * placed_m ** 1.5)))  # triangle budget grows with placed size
+        tr = sum(len(pg.vertices) - 2 for pg in o.data.polygons)
+        if tr > tb:
+            m = o.modifiers.new("lod", 'DECIMATE'); m.ratio = tb / tr; bpy.context.view_layer.objects.active = o; bpy.ops.object.modifier_apply(modifier="lod")
         graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "region": z["region"], "pos": [round(v, 3) for v in pos], "scale": round(s_fit, 4), "attach": "surface"})
 print("placed", len(graph))
 def mat(name, rgb):
@@ -83,8 +87,10 @@ for o in parts:
     key = "hull" if o.name == "hull" else next((kk for kk in ("cables", "ship-a", "ship-b", "mech") if f"_{kk}_" in o.name), "hull")
     o.data.materials.clear(); o.data.materials.append(M[key])
     for pg in o.data.polygons: pg.material_index = 0
-    if o.name != "hull" and min((o.matrix_world @ Vector(cn)).x for cn in o.bound_box) > -0.05:
-        m = o.modifiers.new("mir", 'MIRROR'); m.use_axis = (True, False, False); m.mirror_object = hull
+    if o.name != "hull":
+        xs = [(o.matrix_world @ Vector(cn)).x for cn in o.bound_box]
+        m = o.modifiers.new("mir", 'MIRROR'); m.use_axis = (True, False, False); m.mirror_object = hull; m.use_mirror_merge = True; m.merge_threshold = 0.002
+        if min(xs) < -0.05 and max(xs) > 0.05: m.use_bisect_axis = (True, False, False); m.use_bisect_flip_axis = (min(xs) + max(xs) < 0, False, False)  # straddles: keep one half, mirror it
 for o in parts:
     bpy.context.view_layer.objects.active = o
     for m in list(o.modifiers): bpy.ops.object.modifier_apply(modifier=m.name)
