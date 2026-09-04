@@ -162,6 +162,13 @@ pub struct OverlayOpen;
 struct MetricWindow {
     intents: u64,
     idle_ticks: u64,
+    /// Entities the most recent driven tick advanced by simulation.
+    ///
+    /// Assigned, never accumulated: `prediction_set_size` is a *current* set
+    /// size, so the last tick's count is the whole value. The window's other
+    /// counters sum over a second and are taken; this one is overwritten
+    /// every tick and read as-is (#1029).
+    predicted: u64,
 }
 
 /// Enables the live geometry capture used to compare rendered and adjudicated shots.
@@ -1016,7 +1023,7 @@ fn setup_scene(
         )],
     ));
     commands.spawn((
-        Text::new("intents/s 0 | rollbacks/min 0 | discrepancies 0"),
+        Text::new("intents/s 0 | predicted set 0"),
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(8.0),
@@ -1345,11 +1352,16 @@ fn drive_core(
             bot.extend(local.bot.bot_orders(tick));
             let mut delivered = BTreeMap::<PersistId, Vec<Order>>::new();
             let mut emitted = Vec::<Outcome>::new();
+            // Counted from the steps this loop makes, not from the length of
+            // the array it iterates: local practice advances both craft
+            // itself, and that is what the predicted set is here (#1029).
+            window.predicted = 0;
             for (entity, orders) in [(PLAYER, human), (OPPONENT, bot)] {
                 let outcome = local
                     .executor
                     .step_entity(entity, tick, &orders)
                     .expect("both craft installed");
+                window.predicted = window.predicted.saturating_add(1);
                 for event in &outcome.events {
                     if let Some((target, input)) = local.executor.ruleset().deliver(event) {
                         delivered.entry(target).or_default().push(input);
@@ -1393,6 +1405,7 @@ fn drive_core(
                 capture_client_geometry(runtime, &report.events);
             }
             window.intents = window.intents.saturating_add(report.intents as u64);
+            window.predicted = report.predicted as u64;
             observe_skin_effects(
                 &report.events,
                 &report.delivered,
@@ -2812,8 +2825,8 @@ fn refresh_session_banner(
 fn refresh_strip(metrics: Res<OverlayMetrics>, mut strip: Query<&mut Text, With<AlwaysOnStrip>>) {
     if let Ok(mut text) = strip.single_mut() {
         **text = format!(
-            "intents/s {} | rollbacks/min {} | discrepancies {}",
-            metrics.intents_per_second, metrics.rollbacks_per_minute, metrics.live_discrepancies
+            "intents/s {} | predicted set {}",
+            metrics.intents_per_second, metrics.prediction_set_size
         );
     }
 }
@@ -2841,9 +2854,8 @@ fn refresh_f3_pane(
             Display::None
         };
         **text = format!(
-            "adjudications {} | latency p50/p99 {}/{} ms\nprediction set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nattempt {:?} | cell {:?}\nbuild {}\nsession {}\nrecorded {:.1} min | idle {:.1} min",
-            metrics.adjudications_completed, metrics.adjudication_latency_p50_ms,
-            metrics.adjudication_latency_p99_ms, metrics.prediction_set_size,
+            "predicted set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nattempt {:?} | cell {:?}\nbuild {}\nsession {}\nrecorded {:.1} min | idle {:.1} min",
+            metrics.prediction_set_size,
             metrics.observed_loss_pct, metrics.configured_loss_pct,
             metrics.observed_jitter_p50_ms, metrics.observed_jitter_p99_ms,
             metrics.configured_jitter_ms, metrics.attempt_id, metrics.cell_id, BUILD_REV,
@@ -2894,6 +2906,9 @@ fn stream_metrics(
     session: Res<ActiveSession>,
 ) {
     metrics.intents_per_second = std::mem::take(&mut window.intents);
+    // Read, not taken: the predicted set is a level rather than a rate, and
+    // taking it would report zero on every row that landed between ticks.
+    metrics.prediction_set_size = window.predicted;
     metrics.session_scope =
         SessionPresentation::from_join_state(session.join_state()).session_scope();
     match &*session {

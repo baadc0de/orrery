@@ -26,23 +26,61 @@ pub enum SessionScope {
 }
 
 /// Values shown in the always-on strip and F3 pane.
+///
+/// **Every field here is assigned from a measurement on the live path, and
+/// `scripts/telemetry-liveness-gate.py` fails the build if one stops being**
+/// (`session_record_path` is the single declared exemption, and the gate
+/// carries the reason). That gate exists because six of these fields were set
+/// once in [`OverlayMetrics::new`] and never again: `rollbacks_per_minute`,
+/// `live_discrepancies`, `adjudications_completed`,
+/// `adjudication_latency_p50_ms`, `adjudication_latency_p99_ms` and
+/// `prediction_set_size`. A twelve-minute human session on 2026-09-04
+/// recorded `rollbacks_per_minute: 0` and `prediction_set_size: 2` — the
+/// constructor's literals, indistinguishable in the JSONL from a
+/// measurement, and read back as if they were one. A missing field is an
+/// obvious gap; a defaulted field is quoted as evidence (#1029).
+///
+/// Five of the six are gone rather than wired, because this client cannot
+/// produce them:
+///
+/// - **`rollbacks_per_minute`.** This client never rolls back. It is the sole
+///   authority over its own craft and steps it straight-line; replicated
+///   bodies are installed verbatim by `CampaignRuntime::advance` and no peer
+///   ever broadcasts state for an entity this client authors, so there is no
+///   correction to reconcile against and nothing to resimulate. Late
+///   deliveries are applied at their arrival tick and never back-dated (D46
+///   clause (d), docs/05 §2 case 3). `orrery_predict`'s rollback machinery is
+///   registered by `OrreryPredictPlugin` and, in this client, unfed:
+///   `ReconciliationMonitor` and `AuthorityCorrectionInbox` have no producer
+///   here. A field named for rollbacks must count rollbacks, and zero is the
+///   true count for a reason no counter would have shown.
+/// - **`live_discrepancies`, `adjudications_completed`,
+///   `adjudication_latency_p50_ms`, `adjudication_latency_p99_ms`.** This
+///   client authors its own witness stream and watches no other subject;
+///   discrepancy episodes are opened and adjudicated off this machine, and
+///   nothing in the wire format carries a verdict back to it. Surfacing them
+///   is a protocol addition, not a wiring job, and the campaign is pinned.
 #[derive(Debug, Clone, Resource, Serialize)]
 pub struct OverlayMetrics {
     /// Whether these values measure a live campaign or local-only play.
     pub session_scope: SessionScope,
     /// Input orders emitted during the last one-second window.
     pub intents_per_second: u64,
-    /// Rollbacks observed during the last minute.
-    pub rollbacks_per_minute: u64,
-    /// Currently live discrepancy episodes.
-    pub live_discrepancies: u64,
-    /// Completed adjudications.
-    pub adjudications_completed: u64,
-    /// Adjudication latency p50.
-    pub adjudication_latency_p50_ms: u64,
-    /// Adjudication latency p99.
-    pub adjudication_latency_p99_ms: u64,
-    /// Current prediction set size.
+    /// Entities this client advanced by simulation on its most recent tick.
+    ///
+    /// D8's predicted set (docs/05 §2), counted rather than assumed: how many
+    /// `Executor::step_entity` calls the last driven tick actually made. A
+    /// joined campaign steps exactly one — this craft — because every other
+    /// body in the executor is a replica installed verbatim from the wire and
+    /// nothing advances it locally. Local practice steps two, the player and
+    /// the bot.
+    ///
+    /// Zero is the informative reading: it means the client stepped nothing,
+    /// which is a session that is not joined, or one whose own order packet
+    /// failed to decode and skipped its step (the path that also increments
+    /// `downlink_undecodable`). Before #1029 this said `2` in a joined
+    /// campaign, which was the constructor's literal and wrong in both
+    /// modes.
     pub prediction_set_size: u64,
     /// Observed packet loss percentage.
     pub observed_loss_pct: f64,
@@ -105,12 +143,10 @@ impl OverlayMetrics {
         Self {
             session_scope: SessionScope::Local,
             intents_per_second: 0,
-            rollbacks_per_minute: 0,
-            live_discrepancies: 0,
-            adjudications_completed: 0,
-            adjudication_latency_p50_ms: 0,
-            adjudication_latency_p99_ms: 0,
-            prediction_set_size: 2,
+            // Nothing has been stepped yet, and this is the only reading of
+            // it a frame ever sees before `stream_metrics` overwrites it from
+            // the tick loop's own count.
+            prediction_set_size: 0,
             observed_loss_pct: 0.0,
             configured_loss_pct: 0.0,
             observed_jitter_p50_ms: 0,
@@ -317,11 +353,6 @@ mod tests {
         for field in [
             "session_scope",
             "intents_per_second",
-            "rollbacks_per_minute",
-            "live_discrepancies",
-            "adjudications_completed",
-            "adjudication_latency_p50_ms",
-            "adjudication_latency_p99_ms",
             "prediction_set_size",
             "observed_loss_pct",
             "configured_loss_pct",
