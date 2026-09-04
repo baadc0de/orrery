@@ -76,3 +76,15 @@ Scripts, all Blender headless: `kits_to_inserts.py` (part → INSERT: dominant *
 - *The spaceship kits are dense.* Median part 75–94 k tris, decimated to 12 k for INSERTs, 6 k on placement; a real LOD pass per part (or baking to a low-poly proxy) is the next pipeline stage.
 - *The mech "kit" yields little.* 621 islands → 75 proximity modules, mostly pipes, brackets and nozzles; one launcher housing. Hero models are not kits.
 - *QuadriFlow (from the earlier spike) is not needed here*: kit parts arrive with their own topology; the budget problem is decimation, not retopology.
+
+## Concept → kitbash (2026-09-05): the loop closes
+
+Five scripts, run in order, all headless:
+
+1. `hull_from_mesh.py` — coarsen the image-to-3D mesh into the **mount hull**: lateral axis chosen by mirror error (the escort is nearly square in plan, so extents lie), nose by cross-section, voxel remesh at size/170, decimate to ~14k tris with symmetry, symmetrize, scale to the brief's 9 m, strip textures. Every face gets a **region** `side.long.lat` (top/belly/flank/nose/tail × fore/mid/aft × inner/outer) stored as face attributes; `hull_atlas.json` lists regions by area.
+2. `program_from_concept.py` — Gemini Pro reads brief + concept + callout sheet and the atlas, emits **zones.json** against a schema: 14 zones for the escort (spine conduit run, twin thrusters, wing-tip and nose RCS, gun bay, pylons, skids fore/aft, dark wing panels, accent stripe, hull number, crest, canopy hinge, wing-root vents), each naming the concept feature it reproduces. All regions resolved on the hull first time.
+3. `choose_parts.py` — per zone, Gemini Flash ranks 8 candidate INSERT thumbnails against the concept (thinking off, 4k output budget; an image-generation model returns no text, and 300 tokens truncates). ~134k input tokens for 14 zones, with a one-line reason each.
+4. `assemble_hull.py` — resolve regions to faces, place along the region's principal axis with surface alignment, lift by mount depth, cap any single part at 2.5 m, connect runs between region centroids, role materials, mirror, join, `assembly.json` graph.
+5. `blender_render.py` — stills.
+
+**Result:** the first assembly that reads as the concept's craft: silhouette from the hull, thrusters, pods, skids, spine detail in the right places. **Open:** a critique loop (render vs concept, adjust counts/scales), parts that straddle the centreline are not mirrored, part orientation within a zone is only axis-aligned, exposure in the still renderer, and materials/decals from the KIT OPS packs are not applied yet.

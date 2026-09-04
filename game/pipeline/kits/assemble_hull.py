@@ -70,6 +70,7 @@ for z in Z["zones"]:
         used.add(e["name"]); o = load_insert(e)
         pos, nn = surface_at(c, n, t, (i - (k - 1) / 2) * (span / k)); tt = (t - nn * t.dot(nn)).normalized(); bb = nn.cross(tt)
         slot = span / k; s_fit = random.uniform(*z["scale"]) * min(slot / max(1e-6, e["dims"][0]), cross / max(1e-6, e["dims"][1]))
+        cap = z.get("max_size_m", 2.5) / max(1e-6, max(e["dims"])); s_fit = min(s_fit, cap)  # no single part larger than max_size_m
         pos = pos + nn * (e["below"] * s_fit + 0.01)
         o.matrix_world = Matrix.Translation(pos) @ Matrix((tt, bb, nn)).transposed().to_4x4() @ Matrix.Scale(s_fit, 4); o.name = f"{z['name']}_{i}_{e['name']}"
         graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "region": z["region"], "pos": [round(v, 3) for v in pos], "scale": round(s_fit, 4), "attach": "surface"})
