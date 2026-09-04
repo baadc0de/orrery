@@ -29,6 +29,38 @@ Every human row is bound to exactly one exterior `(attempt_id, slot, session_id,
 node)`, and no two rows may bind to the same one. That bijection is the property:
 a schema-shaped test proves nothing about it.
 
+**The unit is a seat interval (#1048).** One ledger input is one seat's
+occupancy of one slot over one wall interval, and that is true on both sides:
+
+    a human seat interval   (attempt_id, slot, human_session_id), bracket
+                            [connected_since, connected_until), banked when the
+                            seat is released — a departed seat keeps its own
+                            entry (`Swarm::departed_exteriors`), so one player
+                            leaving costs the others nothing
+    a bot seat interval     B of them, slots [0, B), each covering the
+                            generation's whole wall span, bundled into the one
+                            input above
+
+The attempt is therefore the *containing window*, not the unit. It is what a
+seat interval is contained in — by construction since #1040, because the
+bracket opens at connection accept — and what the attempt-wide evidence
+(witnessing, false positives, coverage, deferral balance, the per-leg
+impairment band) is measured over. Two consequences that are easy to get
+wrong:
+
+* a seat interval is judged by the evidence of the one generation containing
+  it, and by no rolling window: coverage is a ratio, the deferral balance is a
+  closure property and the impairment band needs `n >= 1000` packets on that
+  slot's links, and no report decomposes any of the three per sub-interval, so
+  a rolling window would have to invent numbers it cannot re-derive;
+* the *value* of the bot side is unchanged — `B * valid_attempt_seconds / 3600`
+  is already the length of B seat intervals — but its **identity** was not.
+  `p4-ledger.sh` folds the human-mix criterion over `measurement_key`, which
+  omitted the attempt, so every generation of a standing host collapsed into
+  one distinct bot measurement while every human visit stayed distinct. See the
+  `measurement_key` block in `p4-ledger.sh` for the arithmetic and the
+  direction it moves.
+
 `docs/plans/multi-human-attempt-accounting.md` is the normative statement; this
 file is what makes it fail when it is broken. It does not replace
 `scripts/p4-campaign-session.sh` — that single-human assembler and the ledger's
@@ -861,6 +893,19 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         "actor": "bot",
         "player_hours": bot_hours,
         "derivation": f"{bots} * {seconds:g} / 3600",
+        # The unit stated rather than implied (#1048). A bot contribution is B
+        # seat intervals, one per bot seat, each covering the generation's own
+        # wall span — bot seats are occupied for the whole generation by
+        # construction, which is why the attempt-wide figure is theirs to use
+        # and never a human's. `attempt_id` is what distinguishes this bundle
+        # of intervals from the next generation's identical-looking one, and
+        # `p4-ledger.sh` carries it into the measurement key for that reason.
+        "seat_intervals": {
+            "seats": bots,
+            "slots": [0, bots],
+            "seconds_each": seconds,
+            "attempt_id": attempt_id,
+        },
     }
     if bot_hours > 0:
         pending.append(("contribution-bot.json", bot_report))
@@ -1181,9 +1226,10 @@ def fixture_attempt(
     exteriors: list[dict[str, Any]],
     bots: int = 4,
     host_target: str = "x86_64-unknown-linux-gnu",
+    attempt_id: str = FIXTURE_ATTEMPT,
 ) -> dict[str, Any]:
     return {
-        "attempt_id": FIXTURE_ATTEMPT,
+        "attempt_id": attempt_id,
         "identity": {
             "seed": 5,
             "impairment": {
@@ -1765,6 +1811,144 @@ def self_test() -> None:
                 f"{len(again)} lines after a second append"
             )
         test.ok("reappending_an_attempt_banks_no_second_cohort_hours")
+
+        # ── The banking unit is a seat interval, on both sides (#1048) ───────
+        #
+        # A standing host runs generation after generation with no `--seed`
+        # (`scripts/p1-swarm-always-on.py`, `Supervisor.command`), so every
+        # generation's bot contribution carries the same seed, impairment and
+        # target. What tells two of them apart is the wall interval their bot
+        # seats occupied, and the only field that names it is `attempt_id`.
+        #
+        # Human seat intervals never had this problem: `human_session_id` is a
+        # coordinator-minted UUIDv7, one per admitted interval, so two visits
+        # by one person are already two measurements. The bot side is the half
+        # that was still attempt-shaped in name and generation-blind in fact.
+        #
+        # This fixture is the mutation target for that. It derives a second
+        # generation of the *same* cohort — same seed, same bots, same host,
+        # fresh attempt — and banks it into the same ledger. Both halves are
+        # needed: the hours must double, and the mix must fall, because a
+        # denominator that stops growing with wall time is the criterion
+        # measuring something other than what it says.
+        second_generation = "018f9000-0000-7000-8000-00000000a002"
+        session_d = "018f9000-0000-7000-8000-0000000000d4"
+        row_d = fixture_row(session_d, 50, "x86_64-unknown-linux-gnu", 0x44)
+        node_d = row_d["measurement_node"]
+        generation_two = fixture_attempt(
+            [fixture_exterior(4, session_d, node_d, 55)],
+            attempt_id=second_generation,
+        )
+        test.must_derive(generation_two, [row_d], "second-generation")
+        for path in sorted((directory / "second-generation" / "out").iterdir()):
+            appended = subprocess.run(
+                [str(ROOT / "scripts" / "p4-ledger.sh"), "append", str(path)],
+                capture_output=True,
+                check=False,
+                text=True,
+                env=env,
+            )
+            if appended.returncode != 0:
+                die(
+                    "self-test [two_generations_bank_two_bot_intervals]: "
+                    f"{path.name} was refused: {appended.stderr.strip()}"
+                )
+        lines = [json.loads(line) for line in ledger_file.read_text().splitlines()]
+        bot_lines = [line for line in lines if line["actor"] == "bot"]
+        if len(bot_lines) != 2:
+            die(
+                "self-test [two_generations_bank_two_bot_intervals]: "
+                f"{len(bot_lines)} bot contributions for two generations"
+            )
+        if len({line["run_key"] for line in bot_lines}) != 2:
+            die(
+                "self-test [two_generations_bank_two_bot_intervals]: two generations of bots "
+                "share a run key"
+            )
+        if len({line["measurement_key"] for line in bot_lines}) != 2:
+            die(
+                "self-test [two_generations_bank_two_bot_intervals]: two generations of bots "
+                "collapsed into one distinct measurement; the human-mix denominator would stop "
+                "growing with wall time and the floor would be cleared by running longer"
+            )
+        # 4 + 4 bot hours against 50/60 + 30/60 + 50/60 human. Collapsing the
+        # two generations would report 4 against the same human hours, i.e. a
+        # mix of 34% where the truth is 21% — below the floor.
+        distinct_bot = sum(line["player_hours"] for line in bot_lines)
+        if abs(distinct_bot - 8.0) > 1e-9:
+            die(
+                "self-test [two_generations_bank_two_bot_intervals]: the distinct bot side is "
+                f"{distinct_bot}, not the two generations' 8.0"
+            )
+        human_hours = sum(
+            line["player_hours"] for line in lines if line["actor"] == "human"
+        )
+        collapsed_mix = human_hours / (human_hours + distinct_bot / 2)
+        honest_mix = human_hours / (human_hours + distinct_bot)
+        if not honest_mix < collapsed_mix:
+            die(
+                "self-test [two_generations_bank_two_bot_intervals]: collapsing the generations "
+                "did not raise the reported mix; this fixture no longer measures its defect"
+            )
+        test.ok("two_generations_bank_two_bot_intervals")
+
+        # A host that dies and comes back mints a fresh `attempt_id`
+        # (`scripts/p1-swarm-always-on.py`, `mint_attempt_id`: a UUIDv7 whose
+        # 74 random bits are drawn from `secrets`, materialised as a directory
+        # created with `mkdir(mode=0o750)` and no `exist_ok`, so a repeated id
+        # raises rather than reuses). So a restart's generation is a new
+        # interval — and the *previous* generation's inputs, replayed from the
+        # directory the supervisor left behind, must add nothing.
+        before_replay = len(lines)
+        for path in sorted((directory / "second-generation" / "out").iterdir()):
+            subprocess.run(
+                [str(ROOT / "scripts" / "p4-ledger.sh"), "append", str(path)],
+                capture_output=True,
+                check=False,
+                text=True,
+                env=env,
+            )
+        after_replay = len(ledger_file.read_text().splitlines())
+        if after_replay != before_replay:
+            die(
+                "self-test [a_restart_does_not_double_bank_a_seat_interval]: replaying a "
+                f"generation's inputs after a restart banked {after_replay - before_replay} "
+                "more line(s)"
+            )
+        test.ok("a_restart_does_not_double_bank_a_seat_interval")
+
+        # And the interval itself, not merely the file: the same seat interval
+        # re-derived at another commit carries a different `run_key`, so the
+        # dedup above cannot see it. `refuse_a_second_claim_on_one_seat` is
+        # what must, and this is the accounting side of that fixture.
+        replayed = json.loads(
+            next(
+                p
+                for p in (directory / "second-generation" / "out").iterdir()
+                if session_d in p.name
+            ).read_text()
+        )
+        replayed["identity"]["commit"] = "6" * 40
+        replay_path = directory / "restart-replay.json"
+        replay_path.write_text(json.dumps(replayed))
+        refused_replay = subprocess.run(
+            [str(ROOT / "scripts" / "p4-ledger.sh"), "append", str(replay_path)],
+            capture_output=True,
+            check=False,
+            text=True,
+            env=env,
+        )
+        if refused_replay.returncode == 0:
+            die(
+                "self-test [one_seat_interval_may_not_bank_twice_across_a_restart]: a seat "
+                "interval re-derived at another commit banked a second time"
+            )
+        if len(ledger_file.read_text().splitlines()) != before_replay:
+            die(
+                "self-test [one_seat_interval_may_not_bank_twice_across_a_restart]: a refused "
+                "replay still touched the ledger"
+            )
+        test.ok("one_seat_interval_may_not_bank_twice_across_a_restart")
 
         # The cross-platform host/client row the ledger must keep refusing: a
         # Windows session stamped with the Linux host's triple. The mixed rule

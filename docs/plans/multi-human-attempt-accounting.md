@@ -125,7 +125,8 @@ ledger.
 ## 3. The contribution arithmetic
 
 One ledger input per actor. Not one per attempt, and never the attempt's total
-copied onto a participant.
+copied onto a participant. **§9 restates the unit these figures are lengths of:
+a seat interval, on both sides.**
 
 ```text
 bot contribution     player_hours = B * valid_attempt_seconds / 3600
@@ -266,9 +267,11 @@ the real `append`.
 
 Two consequences worth naming. `run_key` hashes the whole `identity`, and derived
 rows add `attempt_id` (and `slot`, for humans) to it, so two attempts keep
-distinct provenance lines. `measurement_key` does *not* read those fields, so two
-attempts of the same deterministic bot cohort still collapse to one measured
-bot-hour — deliberately, and unchanged.
+distinct provenance lines. `measurement_key` reads `human_session_id` for a
+human, so two visits by one person are two measurements; **and since #1048 it
+reads `attempt_id` for a bot contribution that carries one**. A bot leg with no
+attempt — every CI leg — still collapses, because a deterministic re-run of one
+seed re-measures one simulated hour. See §9.
 
 ### Added by this contract
 
@@ -321,9 +324,9 @@ row is flagged evidence, not a refusal.
 
 ## 7. Fixtures
 
-`scripts/p4-attempt-accounting.py --self-test` runs 34 named fixtures per commit
+`scripts/p4-attempt-accounting.py --self-test` runs 51 named fixtures per commit
 (29 at #572; #576 added five for the host's own array spelling and the
-node-bound seat).
+node-bound seat; #1048 added three for the seat-interval unit — see §9).
 The two failure modes this contract exists to prevent are named directly:
 
 **Duplicated cohort hours**
@@ -339,6 +342,19 @@ The two failure modes this contract exists to prevent are named directly:
   `p4-ledger.sh append` unmodified, and the banked hours must sum to the derived
   total with three distinct `run_key`s and three distinct `measurement_key`s.
 - `reappending_an_attempt_banks_no_second_cohort_hours`
+- `two_generations_bank_two_bot_intervals` — a second generation of the same
+  cohort must be a second *distinct* bot measurement, and collapsing the two
+  must be shown to raise the reported human mix. Both halves are needed: the
+  second is what fails when the fixture stops measuring §9.2's defect.
+- `a_restart_does_not_double_bank_a_seat_interval`
+- `one_seat_interval_may_not_bank_twice_across_a_restart` — the same interval
+  re-derived at another commit, where `run_key` dedup cannot see it.
+
+`scripts/p4-ledger.sh --self-test` carries the matching three at the append
+seam: `two_generations_are_two_bot_measurements`,
+`a_restart_banks_no_second_copy_of_one_generation`, and
+`a_deterministic_rerun_is_still_one_measurement`, the last being the collapse
+§9.2 must *preserve* for every attempt-less CI leg.
 
 **Cross-platform host/client rows**
 
@@ -379,3 +395,149 @@ per-leg impairment band, and the one-slot compatibility spelling.
   `link_impairment`, so reconciling which seat of which attempt an hour came
   from is an audit of the ledger rather than of a directory beside it.
 - It changes no ruleset. `REGOLITH_RULESET.version` is 16 and stays there.
+## 9. The unit is a seat interval (#1048)
+
+Added by #1048, which asked for continuous banking: players come and go against
+a world that is always running, so **the banking unit is a seat interval that
+banks on departure**, not an attempt that banks at its end.
+
+Most of that was already true, and this section says which part was not.
+
+### 9.1 What a ledger input is
+
+One input is one seat's occupancy of one slot over one wall interval.
+
+```text
+human seat interval   (attempt_id, slot, human_session_id)
+                      bracket [connected_since, connected_until)
+                      banks when the seat is released
+bot seat interval     B of them, slots [0, B), each covering the generation's
+                      own wall span; bundled into one input
+```
+
+The human half is §3 and §4 restated: a departed seat keeps its own entry
+(`Swarm::departed_exteriors`, `gates/p1-swarm/src/swarm.rs`), with its own
+bracket, its own close reason and its own `session_id`, so one player leaving
+mid-attempt costs the others nothing and a rejoin is a *second* interval on the
+same slot (#1028). The 2026-09-04 evidence exercises exactly that: slot 6 holds
+two intervals under two coordinator-issued ids and banks two rows.
+
+The attempt is therefore the **containing window**, not the unit. Since #1040
+the bracket opens at connection accept, so a seat's interval is contained in
+its bracket by construction, and the bracket in the generation.
+
+### 9.2 The bot contribution, and the criterion it was quietly bending
+
+`player_hours = B * valid_attempt_seconds / 3600` is unchanged as a *length*: it
+is already the length of B seat intervals, and bot seats are occupied for the
+whole generation by construction, which is what entitles them to the
+attempt-wide figure a human contribution may never use.
+
+What was wrong was its **identity**. `p4-ledger.sh`'s `total` folds the ≥25%
+human-mix line over `distinct`, i.e. over `measurement_key`, and that key read
+pipeline, actor, seed, impairment and target — not the attempt. A standing host
+passes no `--seed` (`scripts/p1-swarm-always-on.py`, `Supervisor.command`), so
+every generation is identical under that key and **all of them collapsed into
+one distinct bot measurement**, while every human visit stayed distinct under
+`human_session_id`.
+
+The consequence, measured against the 2026-09-04 ledger: a second generation of
+the same five bots banks its 1.25 provenance hours and adds *zero* distinct bot
+hours. The reported mix stays 27% where the truth is 2.5 bot against 0.483
+human — 16%, under the floor. The denominator stops growing with wall time
+while the numerator keeps growing, so **the floor is cleared by running longer
+rather than by anyone playing more**. That is live at `seconds = 900`, and
+raising `seconds` does not repair it; it only changes the constant.
+
+The property the mix needs is *chop-invariance*: cutting the same wall time into
+more generations must not change `human_hours / total_hours`. Human hours are
+chop-invariant already. Bot hours become so once the attempt is in the key.
+
+**Stated in the direction that needs saying out loud.** This makes distinct bot
+hours larger. The ≥25% floor becomes *harder*, and the raw 500-hour figure rises
+faster with bot time. It adds no human hour and banks no interval that was not
+measured; it stops discarding bot-hours that were separately measured over
+disjoint wall time. Whether the 500 should be a human-weighted figure is a
+separate decision this record does not make.
+
+### 9.3 `run_key` across a host restart
+
+`run_key` is `sha256(canonical identity)[:16]`, so a seat interval's provenance
+key is what its identity names.
+
+* **Human.** `(attempt_id, slot, human_session_id)`. `human_session_id` is the
+  coordinator-issued invite id, a UUIDv7 minted once per admitted interval, and
+  the ledger already refuses a human row without one. The host does not mint it,
+  so a host restart cannot reproduce it; two intervals minted in one millisecond
+  collide at 2⁻⁷⁴.
+* **Bot.** `attempt_id`. `scripts/p1-swarm-always-on.py`'s `mint_attempt_id` is
+  a UUIDv7 whose 74 random bits come from `secrets`, and the id is materialised
+  as a directory created with `mkdir(mode=0o750)` — **no `exist_ok`**, so a
+  repeated id raises rather than reuses. A restart mints a fresh one per child
+  spawn.
+
+Dedup is therefore two-layered and both layers are tested: `run_key` refuses an
+identical replay of a report, and `refuse_a_second_claim_on_one_seat` refuses
+the same seat or the same session re-derived at another commit, where the run
+key differs and the first layer cannot see it.
+
+### 9.4 Where the criterion is evaluated
+
+Per generation report, over that generation's own window — **and deliberately
+not over a rolling one**. The attempt-wide clauses are not additive over a
+sliding window: `observation_coverage` is a ratio over judged and shown ticks
+the report does not retain per interval, `deferral_ledger_balances` is a closure
+property of the whole run, `total_false_positives` is a count over the run, and
+§6.1's band needs `n ≥ 1000` packets on *that slot's* links, which the report
+only totals per run. A rolling window would have to re-derive all four from
+numbers no report decomposes. Since a seat interval is contained in exactly one
+generation, judging it by that generation's evidence is both well defined and
+the smallest window whose evidence exists.
+
+### 9.5 Host restart: open intervals close honestly and bank nothing
+
+An interval open when a host dies is **lost, deliberately**. Surviving it would
+mean attaching a seat's open bracket to a *later* generation's evidence, and
+that evidence — coverage, false positives, per-leg impairment — was measured by
+the process that died. A generation that exits without its tick budget writes
+`completed: false` and the derivation refuses every row of it, bot included; a
+generation that dies without writing a report banks nothing at all. Both are
+the under-counting direction, which is the recoverable one.
+
+The remaining exposure is therefore the *blast radius*: a generation is banked
+at its end, so a crash costs the intervals it contained. That is bounded by
+`seconds` and is the reason `seconds` cannot simply be raised to hours without
+also moving the emission point. Moving it is not done here — see §9.7.
+
+### 9.6 `impairment_mismatch`'s shakedown clause
+
+It still means what it meant, and the unit change does not touch it.
+`cmd_shakedown` samples *rows* carrying `session.shakedown.phase == "unbanked"`,
+and a row is a seat interval already; under continuous banking the sample is a
+set of seat intervals rather than a set of attempts, which is more
+representative rather than less. It never sampled an attempt, so there is
+nothing for "no attempt to sample" to break.
+
+What is worth recording beside it: all four signed rows of 2026-09-04 carry
+`impairment_mismatch: true`, so a shakedown sampled from that cohort would have
+FAILed the clause. That was #1030 — the coordinator advertised p50 = p99 =
+100 ms for a two-point distribution whose true p50 is 0, and the client compared
+its own measured jitter against it as a target rather than a floor. The
+advertisement and the comparison are both fixed; the clause is correct and is
+retained unchanged.
+
+### 9.7 What #1048 does not do, and what remains an owner decision
+
+* **A seat still banks when the generation ends, not the instant it departs.**
+  The interval is *recorded* on departure — that is `departed_exteriors` — but
+  it is *emitted* when the host writes its report, which is at process exit.
+  Making it bank on departure needs the host to write a report while still
+  running, and `Swarm::report` consumes `self` today. That is a host change, not
+  an accounting one, and it carries a second question this record will not
+  answer by implication: if a generation banks in pieces, an attempt-wide
+  refusal raised in a later piece can no longer void an earlier one that has
+  already banked. Every attempt-wide clause in §6 changes meaning at that point.
+* **`seconds` and `lobby_seconds` are untouched.** They are campaign config, and
+  the mix arithmetic above is now chop-invariant, so the length of a generation
+  is a blast-radius and latency decision rather than an accounting one.
+
