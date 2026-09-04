@@ -2503,6 +2503,19 @@ fn capture_replica_event(
 /// The record directory cannot be created, the file cannot be opened or
 /// appended to, or the flush to stable storage fails.
 pub fn append_session_record(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
+    // The third refusal a `proton-debug` build makes (#1060), and the one that
+    // closes the hole the other two leave. `queue_finished_session` and
+    // `retry_pending_uploads` stop *this* binary sending anything, but a row
+    // left in `campaign-records.jsonl` is swept and posted by whatever launches
+    // next — and the next launch is usually the ordinary client, sharing the
+    // same application-data directory. So the row is never written at all.
+    //
+    // #1053's rule that a below-floor row is still written is about a real
+    // session that measured badly. A Proton session ran against a patched
+    // `netdev` and is not a session anybody should reason from, so there is
+    // nothing here to preserve.
+    #[cfg(proton_debug)]
+    return Err(std::io::Error::other(crate::NOT_BANKABLE_REASON));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

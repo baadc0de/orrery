@@ -29,6 +29,49 @@ pub mod telemetry;
 /// Commit revision embedded in this client binary at build time.
 pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
 
+/// Whether this binary may produce campaign evidence.
+///
+/// False in exactly one build: the `proton-debug` one (#1060). That build
+/// exists so a Windows client can be run under Proton/Wine on a Linux
+/// developer box, which needs a `netdev` whose `GetIpNetEntry2` call is patched
+/// out -- a dependency Wine does not implement and aborts on. A patched
+/// dependency is not the build a volunteer downloaded, so a session it plays
+/// is not evidence of anything, and the honest thing for it to do is refuse to
+/// mint any.
+///
+/// The refusal is in the code rather than in a runbook because a comment cannot
+/// stop an upload. Three call sites carry it, each a `#[cfg(proton_debug)]`
+/// statement that is stripped from every other build:
+///
+/// * `campaign::append_session_record` -- the row is never written, so nothing
+///   is left behind for a later, ordinary launch to sweep and post.
+/// * `admission::queue_finished_session` -- no upload body, no `uploads.json`
+///   entry.
+/// * `admission::retry_pending_uploads` -- a `proton-debug` launch posts
+///   nothing another build queued.
+///
+/// A fourth is in `main`: `--build-info` exits non-zero, which fails
+/// `package-client.yml`'s staging step and so stops such a binary being
+/// packaged at all.
+///
+/// This constant is the readable name for that condition and what
+/// `bankable_by_default` asserts. It is deliberately *not* what the call sites
+/// branch on: `if !BANKABLE` folds at compile time, but the statement is still
+/// in the tree the ordinary build lowers. A `#[cfg]` is not, which is the
+/// difference between "optimized away" and "not there".
+///
+/// `proton_debug` is a bare `--cfg`, set through RUSTFLAGS by
+/// `scripts/proton-debug-build.sh` and declared in `build.rs`, rather than a
+/// cargo feature — so `Cargo.toml` and the lockfile `package-client.yml`
+/// builds `--locked` against are untouched. See `build.rs` for the
+/// measurements behind both choices, and for why byte-identity of the release
+/// binary is not the claim being made.
+pub const BANKABLE: bool = !cfg!(proton_debug);
+
+/// The refusal `BANKABLE == false` gives every caller that wanted a row.
+pub const NOT_BANKABLE_REASON: &str =
+    "proton-debug build: campaign evidence is refused, this binary is for debugging only";
+
 /// Public campaign-admission origin used by a no-argument volunteer launch.
 pub const DEFAULT_ADMISSION_URL: &str = "https://campaigns.distopik.com";
 
@@ -5336,6 +5379,23 @@ mod tests {
                 [(PersistId::new(2), Vec2::splat(40.0))].into_iter()
             ),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod bankable_tests {
+    #[test]
+    fn bankable_by_default() {
+        // An ordinary build banks; only a deliberate `--cfg proton_debug`
+        // does not. If that cfg ever becomes something a plain `cargo build`
+        // or `cargo test` picks up -- a stray `RUSTFLAGS`, a `[build]` entry
+        // in a committed cargo config -- this is the assertion that says so
+        // rather than a Proton binary quietly reaching a volunteer.
+        assert!(
+            super::BANKABLE,
+            "this build cannot bank -- it was compiled with `--cfg proton_debug`, \
+             which is a Proton/Wine debugging build and not shippable (#1060)"
         );
     }
 }
