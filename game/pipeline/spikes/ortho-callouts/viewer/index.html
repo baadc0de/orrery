@@ -26,11 +26,11 @@ button[aria-pressed="true"]{color:var(--accent);border-color:var(--accent)}
   <h1>Escort E-07</h1>
   <div class="role">Light escort craft · mothership faction</div>
   <div id="stats">decoding mesh…</div>
-  <div class="ctl"><button id="turn" aria-pressed="false">Turntable</button><button id="wire" aria-pressed="false">Wireframe</button><button id="reset">Reset view</button></div>
+  <div class="ctl"><button id="turn" aria-pressed="false">Turntable</button><button id="wire" aria-pressed="false">Wireframe</button><button id="reset">Reset view</button><button id="swap" aria-pressed="false">Retopo 24.8k</button></div>
 </div>
 <div id="prov">
   <span>model <b>TRELLIS.2-4B</b> (MIT)</span><span>encoder <b>DINOv3 ViT-L/16</b> (Meta licence)</span><span>concept <b>Nano Banana Pro</b></span>
-  <span>seed <b>7</b></span><span>generate <b>86.7 s</b></span><span>mesh <b>191,640 tris</b> · 4k texture · 18 MB</span><span id="live">renderer: WebGL</span>
+  <span>seed <b>7</b></span><span>generate <b>86.7 s</b></span><span>high-poly <b>191,640 tris</b> · 4k texture · 18 MB &nbsp;|&nbsp; retopo <b>24,842 tris</b> · symmetrized · baked 2k colour + normal</span><span id="live">renderer: WebGL</span>
 </div>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script type="module">
@@ -48,17 +48,23 @@ const camera = new THREE.PerspectiveCamera(42, innerWidth/innerHeight, 0.01, 100
 const controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
 const key = new THREE.DirectionalLight(0xfff2e0, 2.2); key.position.set(2,3,2); scene.add(key);
 const fill = new THREE.DirectionalLight(0xbfd4ff, 0.7); fill.position.set(-3,1,-1); scene.add(fill);
-let model, home, turning = false, wire = false;
+let model, home, turning = false, wire = false, models = {};
 document.getElementById('bar').style.transform = 'scaleX(.5)';
-new GLTFLoader().load('escort.glb', g => {
-  model = g.scene; scene.add(model);
+const press = (id, fn) => { const b = document.getElementById(id); b.onclick = () => { const v = fn(); if (v !== undefined) b.setAttribute('aria-pressed', v); }; };
+const loader = new GLTFLoader();
+function loadModel(file, first) { loader.load(file, g => {
+  if (model) scene.remove(model);
+  model = g.scene; models[file] = model; scene.add(model); if (wire) model.traverse(o => { if (o.isMesh) o.material.wireframe = true; });
+  if (!first) return;
   const box = new THREE.Box3().setFromObject(model), size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
   model.position.sub(c); const d = Math.max(size.x, size.y, size.z);
   camera.position.set(d*1.4, d*0.75, d*1.6); controls.target.set(0,0,0); home = camera.position.clone();
   document.getElementById('stats').innerHTML = `bbox <b>${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)}</b> (unitless, ~9 m long per brief)<br>drag to orbit · wheel to zoom · right-drag to pan`;
   const bar = document.getElementById('bar'); bar.style.transform = 'scaleX(1)'; setTimeout(() => bar.remove(), 500);
-}, x => { if (x.total) document.getElementById('bar').style.transform = `scaleX(${x.loaded/x.total})`; }, e => { document.getElementById('stats').textContent = 'Could not decode the mesh: ' + e; });
-const press = (id, fn) => { const b = document.getElementById(id); b.onclick = () => { const v = fn(); if (v !== undefined) b.setAttribute('aria-pressed', v); }; };
+}, x => { if (x.total) document.getElementById('bar').style.transform = `scaleX(${x.loaded/x.total})`; }, e => { document.getElementById('stats').textContent = 'Could not load the mesh: ' + e; }); }
+loadModel('escort.glb', true);
+let retopo = false;
+press('swap', () => { retopo = !retopo; if (models[retopo ? 'escort-retopo.glb' : 'escort.glb']) { scene.remove(model); model = models[retopo ? 'escort-retopo.glb' : 'escort.glb']; scene.add(model); } else loadModel(retopo ? 'escort-retopo.glb' : 'escort.glb', false); return retopo; });
 press('turn', () => turning = !turning);
 press('wire', () => { wire = !wire; model && model.traverse(o => { if (o.isMesh) o.material.wireframe = wire; }); return wire; });
 press('reset', () => { if (home) { camera.position.copy(home); controls.target.set(0,0,0); } });
