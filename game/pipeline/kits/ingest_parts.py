@@ -3,7 +3,7 @@
 import bpy, sys, os, json, glob
 a = sys.argv[sys.argv.index("--")+1:]; kit, pat = a[0], a[1]
 mp = os.path.join(kit, "manifest.json"); m = json.load(open(mp)); parts = []
-for f in sorted(glob.glob(os.path.join(kit, "extracted", pat), recursive=True)):
+for f in sorted(glob.glob(os.path.join(kit, pat if pat.startswith("source/") else os.path.join("extracted", pat)), recursive=True)):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     ext = f.rsplit(".", 1)[-1].lower()
     if ext == "obj": bpy.ops.wm.obj_import(filepath=f)
