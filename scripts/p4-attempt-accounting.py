@@ -197,14 +197,16 @@ def normalize_exteriors(attempt: dict[str, Any]) -> list[dict[str, Any]]:
     must name the same seats, or the accounting is being asked to choose between
     two accounts of the same attempt.
 
-    What the host does **not** yet emit is `session_id` per seat —
     `ExteriorReport` (`gates/p1-swarm/src/swarm.rs`, after #579) carries `index`,
     `node`, `connected_ticks`, the host wall bracket added by #971
     (`connected_since_unix_millis` / `connected_until_unix_millis`), the frame
-    counters, `said_goodbye`, `connected` and `witness_anchored`, and no invite
-    id. So `session_id` stays `None` for a host-emitted seat, and the seat's
-    identity comes from the node the host admitted there plus the operator's
-    pinned id; see `seat_for` in `derive`.
+    counters, `said_goodbye`, `connected` and `witness_anchored`. A host that
+    also stamps the invite id it seated makes `session_id` available per seat;
+    one that does not leaves it `None`, and the seat's identity is then the node
+    the host admitted there plus the operator's pinned id. Both paths are live,
+    and `seat_for` in `derive` is where they meet — the second is the weaker of
+    the two, because a node the host admitted at two seats has nothing left to
+    tell them apart with.
     """
 
     def one(entry: Any) -> dict[str, Any]:
@@ -591,15 +593,28 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
     # is a *signed* one — the client's row carries the same value under its
     # Ed25519 signature. A node that named two seats would make that binding
     # ambiguous, so it is refused here as well as in the assembler.
-    by_node: dict[str, dict[str, Any]] = {}
-    seen_slots: set[int] = set()
+    by_node: dict[str, list[dict[str, Any]]] = {}
+    seen_seats: set[tuple[int, Any]] = set()
     for entry in exteriors:
         slot = entry.get("slot")
         if not isinstance(slot, int):
             refuse("an exterior entry carries no slot")
-        if slot in seen_slots:
-            refuse(f"the attempt reports slot {slot} twice; a seat is occupied once per attempt")
-        seen_slots.add(slot)
+        # A seat is `(slot, session_id)`, not a slot (#1028). One volunteer who
+        # relaunches inside an attempt is readmitted at the slot they held,
+        # under a second pre-minted invite id, and the host reports that as two
+        # entries on one index. Two entries on one index with *no* id to tell
+        # them apart is still one seat reported twice, and still refused.
+        if (slot, entry.get("session_id")) in seen_seats:
+            if entry.get("session_id") is None:
+                refuse(
+                    f"the attempt reports slot {slot} twice with no session id to tell the "
+                    "two seats apart; a seat is occupied once per attempt"
+                )
+            refuse(
+                f"the attempt reports slot {slot} twice for session "
+                f"{entry.get('session_id')}; a seat is occupied once per attempt"
+            )
+        seen_seats.add((slot, entry.get("session_id")))
         if slot < bots:
             refuse(f"exterior slot {slot} overlaps the bot seats [0, {bots})")
         close = entry.get("close")
@@ -607,12 +622,21 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             refuse(f"slot {slot} reports an unknown close reason {close!r}")
         node = entry.get("node")
         if isinstance(node, str) and node:
-            if node in by_node:
+            # A node may be admitted at several seats — the same install
+            # rejoining — but only when every one of those seats carries its own
+            # invite id, which is what lets a signed row pick out which of them
+            # it belongs to. Seated twice with an id missing on either side, the
+            # binding is ambiguous and refused exactly as it was before #1028.
+            prior = by_node.get(node)
+            if prior is not None and (
+                entry.get("session_id") is None
+                or any(seat.get("session_id") is None for seat in prior)
+            ):
                 refuse(
-                    f"node {node} is seated at two slots in one attempt; a seat's admitted "
-                    "identity binds exactly one interval"
+                    f"node {node} is seated at two slots in one attempt with no session id to "
+                    "tell them apart; a seat's admitted identity binds exactly one interval"
                 )
-            by_node[node] = entry
+            by_node.setdefault(node, []).append(entry)
         session_id = entry.get("session_id")
         if session_id is None:
             continue
@@ -642,14 +666,25 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             return seated
         node = row.get("measurement_node")
         if isinstance(node, str) and node in by_node:
-            claimed = by_node[node].get("session_id")
+            seats = by_node[node]
+            if len(seats) != 1:
+                # Only reachable if the eager check above ever admits a node at
+                # several id-carrying seats none of which is this row's session,
+                # which `by_session` would already have bound. Named rather than
+                # silently taking the first: a row bound by position is bound to
+                # nobody in particular.
+                refuse(
+                    f"node {node} is seated at {len(seats)} slots and none of them is session "
+                    f"{session_id}; a row binds to one exterior or to none"
+                )
+            claimed = seats[0].get("session_id")
             if claimed is not None and claimed != session_id:
                 refuse(
-                    f"slot {by_node[node]['slot']} was pinned to session {claimed}, and the row "
+                    f"slot {seats[0]['slot']} was pinned to session {claimed}, and the row "
                     f"signed by that seat's node names {session_id}; the host's copy and the "
                     "client's copy of the session id disagree"
                 )
-            return by_node[node]
+            return seats[0]
         if by_session:
             refuse(
                 f"session {session_id} is not seated in attempt {attempt_id}; every row binds to "
@@ -701,7 +736,7 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
     # The per-slot connected span is what makes that auditable, and it is the
     # ceiling every interval is held under below.
     claimed_sessions: set[str] = set()
-    bound_slots: set[int] = set()
+    bound_seats: set[tuple[int, Any]] = set()
     human_total = 0.0
     for row in rows:
         session_id = row.get("session_id")
@@ -718,9 +753,17 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
 
         entry = seat_for(session_id, row)
         slot = entry["slot"]
-        if slot in bound_slots:
-            refuse(f"two rows bind to slot {slot}; one seat carries one interval per attempt")
-        bound_slots.add(slot)
+        # The seat, not the slot (#1028): a slot may hold two seats when one
+        # install rejoined, and each of those seats carries one interval. Two
+        # rows landing on the *same* seat is still one interval attributed
+        # twice — including the case where a host that seats no ids has a single
+        # entry for a node that two signed sessions both name.
+        if (slot, entry.get("session_id")) in bound_seats:
+            refuse(
+                f"two rows bind to slot {slot} seat {entry.get('session_id')}; one seat carries "
+                "one interval per attempt"
+            )
+        bound_seats.add((slot, entry.get("session_id")))
 
         node = entry.get("node")
         if not isinstance(node, str) or len(node) != 64:
@@ -1623,6 +1666,62 @@ def self_test() -> None:
         ambiguous["external"][1]["node"] = node_a
         test.must_refuse(ambiguous, [row_a, row_b], "node-twice", "seated at two slots")
         test.ok("a_node_seated_at_two_slots_is_refused")
+
+        # ── the rejoin, and the ambiguity that survives it (#1028) ──────────
+        #
+        # A persistent identity key belongs to an install, not to a seat. A
+        # volunteer who closes the client and launches it again inside one
+        # attempt is readmitted under that same key, at the slot they held,
+        # against a second pre-minted invite id — which is exactly what #1015's
+        # eviction hold invites them to do. Two seats, two signed intervals, and
+        # the projection onto `node` collides without being ambiguous: each seat
+        # carries the id its row names.
+        row_rejoin = fixture_row(SESSION_C, 5, "x86_64-unknown-linux-gnu", 0x11)
+        rejoin = fixture_attempt(
+            [
+                fixture_exterior(4, SESSION_A, node_a, 55),
+                fixture_exterior(5, SESSION_B, node_b, 50),
+                fixture_exterior(4, SESSION_C, node_a, 10),
+            ]
+        )
+        _, rejoined = test.must_derive(rejoin, [row_a, row_b, row_rejoin], "rejoin")
+        legs = sorted(
+            (report["binding"]["session_id"], report["binding"]["slot"], report["player_hours"])
+            for report in rejoined
+            if report["identity"]["actor"] == "human"
+            and report["binding"]["node"] == node_a
+        )
+        if legs != sorted([(SESSION_A, 4, 50 / 60.0), (SESSION_C, 4, 5 / 60.0)]):
+            die(f"self-test [a_rejoining_identity_binds_one_seat_per_interval]: legs {legs}")
+        if abs(sum(r["player_hours"] for r in rejoined) - (4.0 + (50 + 42 + 5) / 60.0)) > 1e-9:
+            die(
+                "self-test [a_rejoining_identity_binds_one_seat_per_interval]: the rejoin moved "
+                "the attempt total"
+            )
+        test.ok("a_rejoining_identity_binds_one_seat_per_interval")
+
+        # The same key at two seats under **one** invite id. Nothing tells the
+        # two apart, so a row naming that id is bound to nobody in particular —
+        # #579's ambiguity, in the shape that is still one after #1028.
+        one_id_twice = fixture_attempt(
+            [
+                fixture_exterior(4, SESSION_A, node_a, 55),
+                fixture_exterior(5, SESSION_A, node_a, 50),
+            ]
+        )
+        test.must_refuse(one_id_twice, [row_a], "one-id-twice", "seated at two slots")
+        test.ok("one_session_at_two_seats_is_refused_even_under_one_node")
+
+        # And one slot reported twice for one invite id is one seat reported
+        # twice, whatever key held it.
+        slot_twice = fixture_attempt(
+            [
+                fixture_exterior(4, SESSION_A, node_a, 55),
+                fixture_exterior(4, SESSION_A, node_a, 50),
+            ]
+        )
+        test.must_refuse(slot_twice, [row_a], "slot-twice", "reports slot 4 twice")
+        test.ok("one_slot_reported_twice_for_one_session_is_refused")
 
         # A row signed by a key this attempt admitted nowhere.
         stranger = fixture_row(SESSION_C, 30, "x86_64-unknown-linux-gnu", 0x33)
