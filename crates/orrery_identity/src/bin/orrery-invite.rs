@@ -57,6 +57,11 @@ enum Operation {
     /// shakedown hosting does not depend on that service being up. A token
     /// signed here is indistinguishable on the wire from one minted there,
     /// which is why the exemption is stated here rather than left implied.
+    ///
+    /// What #1014 changed is only that the attestation is now *stated*:
+    /// `--assume-standing-good` is mandatory, so the operator cannot reach
+    /// the constant without naming it. Nothing about the token moved; see
+    /// [`offline_standing`] for what the flag is acknowledging.
     SessionToken {
         /// Plain runtime credential from `orrery-issuer-key generate`/`load`;
         /// must be owner-readable only and outside every repository.
@@ -87,8 +92,61 @@ enum Operation {
         /// Pre-minted session ID included in `--join-file`.
         #[arg(long, env = "ORRERY_SESSION_ID")]
         session_id: Option<String>,
+        /// Required. Attest that this account's standing is `Good` on the
+        /// operator's own authority, because this path reads no ledger.
+        ///
+        /// It is not a formality: what it skips is the whole ladder. A
+        /// **quarantined** account is stamped `Good` and so skips D10's full
+        /// cluster-side write validation; a **cooled-down** or **banned**
+        /// account — which the served path refuses to mint for at all — is
+        /// handed a working token. See [`offline_standing`].
+        #[arg(long, env = "ORRERY_ASSUME_STANDING_GOOD")]
+        assume_standing_good: bool,
     },
 }
+
+/// The standing an offline mint may stamp, given the operator's attestation.
+///
+/// # What the flag acknowledges
+///
+/// There is no standing ledger on an offline laptop, so `Good` here is a
+/// claim the operator makes, not a value anything read. Refusing without
+/// `--assume-standing-good` is what stops it from being a *silent* claim
+/// (#1014); the behaviour with the flag is byte-identical to what this
+/// binary always did.
+///
+/// The reason the acknowledgement has to be explicit is that **nothing
+/// downstream re-derives it**. Both live enforcement points compare an
+/// invalidation watermark against the token's signed `issued_at_ms` —
+/// `StandingState::verdict` in `orrery_coordinator::server` for `Hello`, and
+/// `AccountStandings::pending` in `orrery_protocol::standing` for the
+/// gateway's admission and sweep — and both let the *token* win when it
+/// postdates the assertion. A token signed now postdates every assertion
+/// filed before now, by construction. So the value stamped here is the value
+/// the session runs on.
+///
+/// The one thing the constant does not buy is a witness seat: this path also
+/// stamps `on_probation: true`, and D28 clause (e)'s `eligible_pool` excludes
+/// a probationary session unconditionally.
+fn offline_standing(attested: bool) -> Result<SessionStanding, &'static str> {
+    if attested {
+        Ok(SessionStanding::Good)
+    } else {
+        Err(OFFLINE_STANDING_REFUSAL)
+    }
+}
+
+/// Why an unattested offline mint is refused, and the two ways forward.
+const OFFLINE_STANDING_REFUSAL: &str = concat!(
+    "refusing to mint: this offline path consults no standing ledger, and would ",
+    "stamp SessionStanding::Good without one. A quarantined account would skip ",
+    "D10 full cluster-side write validation; a cooled-down or banned account, ",
+    "which the served mint path refuses outright, would get a working token. ",
+    "Nothing downstream catches either: a freshly signed token postdates every ",
+    "invalidation watermark, so the token wins. Mint through the served path ",
+    "(orrery-identity) if the cluster is reachable, or pass ",
+    "--assume-standing-good to attest this account's standing yourself.",
+);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Arguments::parse().operation {
@@ -110,7 +168,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host_node,
             slot,
             session_id,
+            assume_standing_good,
         } => {
+            // Before the credential is even opened: a refusal must not be the
+            // thing an operator discovers after unlocking the issuer key.
+            let standing = offline_standing(assume_standing_good)?;
             let key = load_runtime_credential(&issuer_credential)?;
             let node = NodeId::from_str(&node)?;
             let keyring = IssuerKeyring::new(key);
@@ -119,7 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 node,
                 orrery_identity::SystemClock.now_ms(),
                 SessionTokenTtlMs(ttl_ms.min(MAX_SESSION_TOKEN_TTL_MS)),
-                SessionStanding::Good,
+                standing,
                 keyring.active_key_id(),
                 // A shakedown volunteer is inside D33 clause (d)'s probation
                 // window by construction; the closed direction is the truth.
@@ -180,7 +242,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex, write_join_file};
+    use super::{hex, offline_standing, write_join_file, OFFLINE_STANDING_REFUSAL};
     use orrery_identity::{generate_issuer_key, IssuerKeyring};
     use orrery_protocol::{
         AccountId, CampaignJoinFileV1, FixedTokenClock, IssuerKeyId, SessionStanding,
@@ -236,6 +298,67 @@ mod tests {
             ),
             Err(SessionTokenVerificationError::WrongNode),
             "the join file carries the same token; it cannot authorize another transport key"
+        );
+    }
+
+    /// #1014: the constant `Good` is still available, but only to an operator
+    /// who has said so. Without the flag the mint stops, and it stops with a
+    /// message naming each rung of the ladder it would otherwise have skipped
+    /// — because "standing was not checked" is exactly the sentence the
+    /// operator with a legitimate reason to be here would not otherwise read.
+    #[test]
+    fn an_unattested_offline_mint_is_refused_and_the_refusal_names_what_it_skips() {
+        let refusal = offline_standing(false).expect_err("no attestation, no token");
+        assert_eq!(refusal, OFFLINE_STANDING_REFUSAL);
+        for rung in ["quarantined", "cooled-down", "banned"] {
+            assert!(
+                refusal.contains(rung),
+                "the refusal must name the {rung} case it would have waved through"
+            );
+        }
+        assert!(
+            refusal.contains("--assume-standing-good"),
+            "a refusal that does not name its own escape hatch is a dead end"
+        );
+    }
+
+    /// The legitimate offline workflow is unchanged: with the attestation, the
+    /// path signs exactly the token it always signed, and a verifier holding
+    /// the issuer's published keys accepts it for the bound transport identity.
+    /// This is the shakedown-hosting case the subcommand exists for, and it
+    /// must keep working with no cluster in reach.
+    #[test]
+    fn an_attested_offline_mint_signs_the_same_token_it_always_did() {
+        let standing = offline_standing(true).expect("the attestation is the whole gate");
+        assert_eq!(standing, SessionStanding::Good);
+
+        let keyring = IssuerKeyring::new(generate_issuer_key(IssuerKeyId::new(11)));
+        let client_node = iroh_base::SecretKey::from_bytes(&[9; 32]).public();
+        let issued_at = UnixMillis::new(1_700_000_000_000);
+        let token = keyring
+            .sign(SessionTokenClaimsV1::new(
+                AccountId::new(4),
+                client_node,
+                issued_at,
+                SessionTokenTtlMs(60_000),
+                standing,
+                keyring.active_key_id(),
+                true,
+            ))
+            .expect("sign token");
+        let encoded = token.encode().expect("encode signed token");
+
+        let verifier = SessionTokenVerifier::new(
+            FixedTokenClock::new(UnixMillis::new(1_700_000_000_001)),
+            keyring.published_keys(),
+        );
+        let claims = verifier
+            .verify(&encoded, &client_node)
+            .expect("an offline-minted token still admits its volunteer");
+        assert_eq!(claims.standing, SessionStanding::Good);
+        assert!(
+            claims.on_probation,
+            "the offline path still forfeits witness eligibility (D28 clause (e))"
         );
     }
 }

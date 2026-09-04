@@ -52,8 +52,9 @@ than optimistically sufficient.
   parse (`invite.rs:271-276,438-444`). Labels must be nonempty single-line
   text without tabs (`invite.rs:425-427`).
 - **Signing.** `orrery-invite session-token --issuer-credential <path>
-  --account <n> --node <hex>` builds `SessionTokenClaimsV1::new(…)` with
-  `SessionStanding::Good`, `on_probation: true`, TTL capped at
+  --account <n> --node <hex> --assume-standing-good` builds
+  `SessionTokenClaimsV1::new(…)` with `SessionStanding::Good`,
+  `on_probation: true`, TTL capped at
   `MAX_SESSION_TOKEN_TTL_MS = 3_600_000` (`bin/orrery-invite.rs:85-108`;
   `crates/orrery_protocol/src/identity.rs:42,117-158`), signs it through
   `IssuerKeyring`, and prints `issuer_key_id=`, `issuer_public_key=`, and
@@ -363,7 +364,9 @@ The handler, in order (pseudocode; each refusal names its step):
 7  orrery-invite mint --ledger <campaign>/ledger.tsv --label <nickname>
       → account, session_id     (invite_code discarded; §6)  fail ⇒ 500
 8  orrery-invite session-token --issuer-credential issuer.cred
-      --account <account> --node <node>
+      --account <account> --node <node> --assume-standing-good
+      (mandatory since #1014; sound here because step 7 minted the
+       account seconds earlier, so it has no strike history to skip)
       → session_token, issuer_key_id, issuer_public_key       fail ⇒ 500
 9  append {when, campaign, nickname, account, session_id, node}
       to <campaign>/joins.jsonl                               fail ⇒ 500

@@ -89,7 +89,7 @@ The preferred campaign handoff is a join file created offline by the operator:
 orrery-invite session-token --issuer-credential issuer.cred --account 7 \
   --node "$(orrery-regolith --print-slot-key 3)" \
   --join-file volunteer.join.json --host-node <host-node> --slot 3 \
-  --session-id <pre-minted-uuidv7>
+  --session-id <pre-minted-uuidv7> --assume-standing-good
 orrery-regolith --join volunteer.join.json --host-direct <ip:port> --campaign-consent
 ```
 

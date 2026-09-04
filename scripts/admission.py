@@ -741,8 +741,14 @@ class Admission:
                         logging.info("campaign %s: reissued seat %s to the transport identity that "
                                      "lost it (session %s)", ident, slot, sid)
                 try:
+                    # `--assume-standing-good` is mandatory since #1014: the
+                    # offline mint reads no standing ledger, so it refuses
+                    # rather than assume. The attestation is sound here because
+                    # every account this service signs for is one it minted
+                    # into this campaign's own ledger, with no strike history
+                    # anywhere to skip.
                     signed = self.output([self.invite, "session-token", "--issuer-credential", str(self.issuer),
-                                          "--account", str(account), "--node", node])
+                                          "--account", str(account), "--node", node, "--assume-standing-good"])
                     session_dir = self.state / "sessions" / sid; session_dir.mkdir(parents=True, exist_ok=True)
                     listening = self._wait_always_on_listening(c, session_dir)
                     host_node, host_direct = self.dialable_listening(c, listening)
@@ -758,7 +764,9 @@ class Admission:
             try:
                 minted = self.output([self.invite, "mint", "--ledger", str(directory / "ledger.tsv"), "--label", nickname])
                 account, sid = minted["account"], minted["session_id"]
-                signed = self.output([self.invite, "session-token", "--issuer-credential", str(self.issuer), "--account", account, "--node", node])
+                # See the always-on path above for why the #1014 attestation
+                # holds: the account was minted one line earlier.
+                signed = self.output([self.invite, "session-token", "--issuer-credential", str(self.issuer), "--account", account, "--node", node, "--assume-standing-good"])
                 self.append_join(c, {"when": int(time.time()), "campaign": ident, "nickname": nickname, "account": int(account), "session_id": sid, "node": node})
             except (RuntimeError, KeyError, ValueError) as e:
                 logging.exception("admission subprocess/log failed: %s", e)

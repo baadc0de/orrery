@@ -369,6 +369,7 @@ Every non-excluded flag on every CLI binary outside the frozen trees falls back 
 | `orrery-invite` | `--host-node` | `ORRERY_HOST_NODE` |
 | `orrery-invite` | `--slot` | `ORRERY_SLOT` |
 | `orrery-invite` | `--session-id` | `ORRERY_SESSION_ID` |
+| `orrery-invite` | `--assume-standing-good` | `ORRERY_ASSUME_STANDING_GOOD` |
 | `orrery-issuer-key` | `--key-id` (generate) | `ORRERY_KEY_ID` |
 | `orrery-issuer-key` | `--output` (generate) | `ORRERY_ISSUER_KEY_GENERATE_OUTPUT` |
 | `orrery-issuer-key` | `--credential` (escrow) | `ORRERY_CREDENTIAL` |
