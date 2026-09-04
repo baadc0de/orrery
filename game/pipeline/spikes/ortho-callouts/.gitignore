@@ -3,3 +3,4 @@ out/proxy/*.png
 out/proxy/*.blend
 out/trellis/*.png
 out/trellis/*.glb
+viewer/*.glb
