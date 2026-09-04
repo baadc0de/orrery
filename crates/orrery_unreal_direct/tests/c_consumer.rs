@@ -101,6 +101,18 @@ fn build_staticlib(library_dir: &Path, profile: &str) -> Vec<String> {
     } else {
         native
     };
+    // `-lc` comes back in `--print native-static-libs`, and on a cold hosted
+    // runner passing it to the C driver fails the link outright:
+    //
+    //     /usr/bin/ld: cannot find -lc: No such file or directory
+    //
+    // The driver supplies the C library itself, so naming it again buys
+    // nothing and costs the whole workspace test run on any box without a
+    // static libc. Dropped here rather than in the fallback list, so the
+    // rustc-reported set and the fallback are filtered the same way. The
+    // remaining duplicates rustc emits are deliberate -- link order matters
+    // for the rest -- so only `-lc` is removed.
+    let native: Vec<String> = native.into_iter().filter(|lib| lib != "-lc").collect();
     eprintln!("native-static-libs: {}", native.join(" "));
 
     let symbols = Command::new("nm")
