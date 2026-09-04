@@ -282,7 +282,17 @@ pub struct Arrival {
 /// long past its end; a tick that lands inside it retracts one missing.
 /// Whatever is still missing when the window closes was dropped or never
 /// sent, not delayed.
-const REORDER_WINDOW_SLOTS: u64 = 2;
+///
+/// This is also the settlement horizon, and it is public because a harness
+/// cannot place an honest cut through the accounting without it. A gap only
+/// settles on a *later* arrival this far past its end
+/// ([`DownlinkTracker::record`]), so gaps opened by a stream's final arrivals
+/// stay open forever and are never scored. A fixture reconciling
+/// [`CampaignRuntime::downlink_accounting`] against a sender ledger must
+/// therefore stop the sender at least `REORDER_WINDOW_SLOTS + 1` delivered
+/// broadcasts after its last skipped one; a cut taken sooner reads the
+/// tracker's deliberate settlement lag as a lost frame.
+pub const REORDER_WINDOW_SLOTS: u64 = 2;
 
 /// How many recent advancing gaps (in send slots) define a sender's
 /// exhibited cadence. Dense replication advances one slot per datagram;
@@ -1207,6 +1217,12 @@ impl CampaignRuntime {
     /// The missing count is settled loss only — gaps that outlived the
     /// reorder window and matched the sender's cadence — so an arrival
     /// from moments ago may still be waiting out its window.
+    ///
+    /// Consequently `arrivals + missing` equals what the sender produced
+    /// only at a cut taken [`REORDER_WINDOW_SLOTS`] `+ 1` delivered
+    /// broadcasts past the sender's last missing one. Taken sooner it is
+    /// short by the trailing gaps still inside their window, which is this
+    /// accounting working as designed rather than loss.
     #[must_use]
     pub fn downlink_accounting(&self) -> (u64, u64) {
         (self.downlink_arrivals, self.downlink.total_missing())
@@ -2949,6 +2965,51 @@ mod tests {
         assert_eq!(tracker.total_missing(), 3);
         assert_eq!(tracker.unattributed_slots(), 0);
         assert_eq!(tracker.senders(), 1);
+    }
+
+    /// A gap opened by a stream's *final* arrivals never settles, so a cut
+    /// taken there under-reports loss by exactly those gaps. This is the
+    /// price of not scoring a merely-delayed packet, and it is the reason a
+    /// harness reconciling [`CampaignRuntime::downlink_accounting`] against a
+    /// sender ledger must stop the sender [`REORDER_WINDOW_SLOTS`] `+ 1`
+    /// delivered broadcasts past its last skipped one (#1024).
+    ///
+    /// Without the margin the fixture's conservation check reads this lag as
+    /// a lost frame; with it, the same check holds exactly.
+    #[test]
+    fn a_trailing_gap_settles_only_after_the_reorder_window_passes() {
+        let slot = SEND_EVERY_TICKS;
+        // Broadcasts on the send-slot grid, one skipped, then `margin` more.
+        // The skip is conserved only once the margin reaches the horizon.
+        let ledger = |margin: u64| {
+            let mut tracker = DownlinkTracker::default();
+            let mut arrivals = 0u64;
+            let mut deliver = |tracker: &mut DownlinkTracker, index: u64| {
+                let _ = tracker.record(0, index * slot, (index * 50) as f64);
+                arrivals += 1;
+            };
+            for index in 1..=6 {
+                deliver(&mut tracker, index);
+            }
+            // Broadcast 7 is skipped; 8.. are delivered.
+            for index in 8..8 + margin {
+                deliver(&mut tracker, index);
+            }
+            // Sender ledger: `7 + margin` broadcasts produced, one skipped.
+            (arrivals + tracker.total_missing(), 7 + margin)
+        };
+        // A cut one or two delivered broadcasts past the skip is short by it.
+        assert_eq!(ledger(1), (7, 8), "the skip is still inside its window");
+        assert_eq!(ledger(2), (8, 9), "still inside its window");
+        // One slot further — REORDER_WINDOW_SLOTS + 1 past the skip — and the
+        // gap settles, so arrivals plus loss equal what the sender produced.
+        for margin in REORDER_WINDOW_SLOTS + 1..=6 {
+            let (accounted, produced) = ledger(margin);
+            assert_eq!(
+                accounted, produced,
+                "conservation holds {margin} delivered broadcasts past the skip"
+            );
+        }
     }
 
     /// A gap wider than the reorder window matches no cadence the sender
