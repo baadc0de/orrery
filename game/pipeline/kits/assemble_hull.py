@@ -59,7 +59,7 @@ for z in Z["zones"]:
         if abs(up.dot(d)) > 0.95: up = Vector((0, 0, 1))
         lz = Vector((0, 0, 1)); ly = lz.cross(ax).normalized(); R_local = Matrix((ax, ly, lz)).transposed().inverted()
         bz = (up - d * up.dot(d)).normalized(); by = bz.cross(d); R_world = Matrix((d, by, bz)).transposed()
-        s_cross = random.uniform(*z["scale"]) * 0.35; S = Matrix.Diagonal((D / max(1e-6, L), s_cross, s_cross, 1.0))
+        s_cross = random.uniform(*z["scale"]) * 0.6; S = Matrix.Diagonal((D / max(1e-6, L), s_cross, s_cross, 1.0))
         o.matrix_world = Matrix.Translation(A) @ R_world.to_4x4() @ S @ R_local.to_4x4() @ Matrix.Translation(-sa); o.name = f"{z['name']}_{e['name']}"
         graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "from": z["region"], "to": z.get("region_to"), "attach": "sockets"}); continue
     k = max(1, z["count"]); span = (ext[1] if t.y != 0 else ext[0]) * 0.85; cross = (ext[0] if t.y != 0 else ext[1]) or span
@@ -79,13 +79,42 @@ for z in Z["zones"]:
             m = o.modifiers.new("lod", 'DECIMATE'); m.ratio = tb / tr; bpy.context.view_layer.objects.active = o; bpy.ops.object.modifier_apply(modifier="lod")
         graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "region": z["region"], "pos": [round(v, 3) for v in pos], "scale": round(s_fit, 4), "attach": "surface"})
 print("placed", len(graph))
-def mat(name, rgb):
-    m = bpy.data.materials.get(name) or bpy.data.materials.new(name); m.use_nodes = True; bs = m.node_tree.nodes.get("Principled BSDF"); bs.inputs["Base Color"].default_value = (*rgb, 1); bs.inputs["Roughness"].default_value = 0.55; return m
-M = {"hull": mat("hull_grey", (0.54, 0.56, 0.58)), "cables": mat("safety_orange", (0.85, 0.47, 0.17)), "ship-a": mat("dark_panel", (0.17, 0.18, 0.20)), "ship-b": mat("warm_panel", (0.40, 0.41, 0.42)), "mech": mat("canopy_blue", (0.11, 0.25, 0.35))}
+def mat(name, rgb, rough=0.55, metal=0.0, emit=None, alpha=1.0):
+    m = bpy.data.materials.get(name) or bpy.data.materials.new(name); m.use_nodes = True; bs = m.node_tree.nodes.get("Principled BSDF")
+    bs.inputs["Base Color"].default_value = (*rgb, 1); bs.inputs["Roughness"].default_value = rough; bs.inputs["Metallic"].default_value = metal
+    if emit: bs.inputs["Emission Color"].default_value = (*emit, 1); bs.inputs["Emission Strength"].default_value = 6.0
+    if alpha < 1: bs.inputs["Alpha"].default_value = alpha; m.blend_method = 'BLEND'
+    return m
+# brief palette: hull #8a8f94 warm grey painted steel, dark panels #2b2e33, safety orange #d9772b, emissive #7fd4ff, canopy #1c3f5a
+M = {"hull": mat("hull_paint", (0.25, 0.27, 0.29), 0.6), "dark": mat("dark_panel", (0.026, 0.028, 0.035), 0.5), "accent": mat("safety_orange", (0.70, 0.19, 0.025), 0.5),
+     "polymer": mat("rubber_polymer", (0.02, 0.02, 0.022), 0.85), "aluminium": mat("bare_aluminium", (0.6, 0.6, 0.6), 0.35, 1.0), "emissive": mat("thruster_glow", (0.05, 0.05, 0.06), 0.4, 0.0, (0.22, 0.65, 1.0)),
+     "glass": mat("canopy_tint", (0.012, 0.05, 0.1), 0.05, 0.0, None, 0.6)}
+ROLE = {"nozzle": "polymer", "thruster": "dark", "cable": "polymer", "conduit": "polymer", "pipe": "polymer", "hull-panel": "dark", "plate": "dark", "hatch": "dark", "vent": "dark", "grille": "dark",
+        "landing-gear": "polymer", "strut": "aluminium", "bracket": "aluminium", "pylon": "dark", "gun": "dark", "launcher": "dark", "turret": "dark", "window": "glass"}
+zone_role = {z["name"]: z.get("material") for z in Z["zones"]}; zone_tags = {z["name"]: z["tags"] for z in Z["zones"]}
+def role_for(o):
+    if o.name == "hull": return "hull"
+    zn = next((z for z in zone_role if o.name.startswith(z + "_")), None)
+    if zn and zone_role[zn] in M: return zone_role[zn]
+    if zn and "stripe" in zn: return "accent"
+    if zn and "main_thruster" in zn: return "emissive"
+    if zn and ("rcs" in zn or "nozzle" in zn): return "polymer"  # RCS blocks are dark mechanical, never a glowing part
+    for t in (zone_tags.get(zn) or []):
+        if t in ROLE: return ROLE[t]
+    return "dark"
+# hull-number decal: extruded text on each flank, fore, reading correctly on both sides (no mirror)
+def add_decal(text, x_sign):
+    fs = region_faces("flank.fore.outer"); c, n, t, b, ext = region_frame(fs); c = Vector((c.x * x_sign, c.y, c.z)); n = Vector((n.x * x_sign, n.y, n.z))
+    cu = bpy.data.curves.new("hullno", 'FONT'); cu.body = text; cu.extrude = 0.01; cu.size = 0.45; cu.align_x = 'CENTER'; cu.align_y = 'CENTER'
+    o = bpy.data.objects.new(f"decal_{text}_{'R' if x_sign > 0 else 'L'}", cu); sc.collection.objects.link(o)
+    fwd = Vector((0, 1, 0)); up = Vector((0, 0, 1)); right = fwd if x_sign > 0 else -fwd   # text runs nose-ward on both sides
+    o.matrix_world = Matrix.Translation(c + n * 0.02) @ Matrix((right, up, n)).transposed().to_4x4()
+    bpy.context.view_layer.objects.active = o; o.select_set(True); bpy.ops.object.convert(target='MESH'); o.data.materials.clear(); o.data.materials.append(M["aluminium"]); return o
+decals = [add_decal(Z.get("hull_number", "E-07"), 1), add_decal(Z.get("hull_number", "E-07"), -1)]
 parts = [o for o in bpy.data.objects if o.type == 'MESH']
 for o in parts:
-    key = "hull" if o.name == "hull" else next((kk for kk in ("cables", "ship-a", "ship-b", "mech") if f"_{kk}_" in o.name), "hull")
-    o.data.materials.clear(); o.data.materials.append(M[key])
+    if o.name.startswith("decal_"): continue
+    o.data.materials.clear(); o.data.materials.append(M[role_for(o)])
     for pg in o.data.polygons: pg.material_index = 0
     if o.name != "hull":
         xs = [(o.matrix_world @ Vector(cn)).x for cn in o.bound_box]

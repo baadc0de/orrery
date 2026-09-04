@@ -12,7 +12,7 @@ ap.add_argument("--renders", nargs="+", required=True); ap.add_argument("--zones
 Z = json.load(open(a.zones)); A = json.load(open(a.assembly)); atlas = json.load(open(a.atlas))
 summary = [{"zone": z["name"], "type": z["type"], "region": z["region"], "tags": z["tags"], "count": z["count"], "scale": z["scale"], "feature": z.get("concept_feature", "")} for z in Z["zones"]]
 placed = {p["zone"]: p for p in A["placements"]}
-prompt = f"""You are the art director reviewing an automated kitbash against its concept art. The first image is the CONCEPT. The following images are RENDERS of the current assembly (hero 3/4, side, top; untextured, grey hull with placed parts in darker grey, cables orange, mech parts blue).
+prompt = f"""You are the art director reviewing an automated kitbash against its concept art. The first image is the CONCEPT. The following images are RENDERS of the current assembly (hero 3/4, side, top). Materials follow the brief palette: painted warm-grey hull, dark panels, safety-orange accents, blue emissive thrusters, aluminium fasteners; the hull number is a text decal on the flanks.
 Current design program (zones), one per feature: {json.dumps(summary)}
 Placements that actually happened (zone -> insert, scale): {json.dumps({k: {"insert": v["insert"], "scale": v.get("scale")} for k, v in placed.items()})}
 Hull regions available: {list(atlas["regions"].keys())}
@@ -26,12 +26,17 @@ with urllib.request.urlopen(req, timeout=300) as r: resp = json.loads(r.read())
 txt = "".join(p.get("text", "") for p in resp["candidates"][0]["content"]["parts"]); C = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
 # apply
 Z2 = copy.deepcopy(Z); byname = {z["name"]: z for z in Z2["zones"]}
+drops = 0
 for adj in C["adjust"]:
     z = byname.get(adj["zone"]); act = adj["action"]
-    if act == "scale" and z: f = max(0.5, min(2.0, adj.get("scale_factor", 1.0))); z["scale"] = [round(min(1.5, v * f), 3) for v in z["scale"]]
+    if act == "scale" and z:
+        f = max(0.5, min(2.0, adj.get("scale_factor", 1.0))) ** 0.5  # damped: half the requested change in log space, so passes converge instead of oscillating
+        z["scale"] = [round(max(0.15, min(1.5, v * f)), 3) for v in z["scale"]]
+        if f > 1.0 and z["scale"][1] >= 1.2: z["max_size_m"] = round(min(3.5, z.get("max_size_m", 2.5) * f), 2)
+        if f < 1.0 and z.get("max_size_m", 2.5) > 2.5: z["max_size_m"] = round(max(2.5, z["max_size_m"] * f), 2)
     elif act == "count" and z: z["count"] = max(0, z["count"] + adj.get("count_delta", 0))
     elif act == "move" and z and adj.get("region") in atlas["regions"]: z["region"] = adj["region"]
-    elif act == "drop" and z: Z2["zones"] = [q for q in Z2["zones"] if q["name"] != z["name"]]
+    elif act == "drop" and z and drops < 2: Z2["zones"] = [q for q in Z2["zones"] if q["name"] != z["name"]]; drops += 1
     elif act == "add" and adj.get("region") in atlas["regions"] and adj.get("tags"):
         Z2["zones"].append({"name": adj["zone"], "type": "surface", "region": adj["region"], "tags": adj["tags"], "count": adj.get("count", 1), "along": "y", "scale": [0.5, 0.7], "concept_feature": adj.get("why", "")})
 Z2.setdefault("critiques", []).append({"score": C["score"], "overall": C["overall"], "adjust": C["adjust"], "model": resp.get("modelVersion", a.model), "renders": [os.path.basename(r) for r in a.renders], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})

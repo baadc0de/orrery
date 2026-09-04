@@ -35,6 +35,6 @@ def cam(name, dirv, ortho=False):
 cams = {"hero": cam("hero", (1.0, -1.3, 0.7)), "front": cam("front", (0, -1, 0), True), "side": cam("side", (-1, 0, 0), True), "top": cam("top", (0, 0, 1), True)}
 engines = [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]
 sc.render.engine = 'BLENDER_EEVEE' if 'BLENDER_EEVEE' in engines else 'BLENDER_EEVEE_NEXT'
-sc.render.resolution_x = sc.render.resolution_y = 1024; sc.render.image_settings.file_format = 'PNG'; sc.view_settings.view_transform = 'AgX' if 'AgX' in [i.identifier for i in bpy.types.ColorManagedViewSettings.bl_rna.properties['view_transform'].enum_items] else 'Filmic'
+sc.view_settings.exposure = 0.9; sc.render.resolution_x = sc.render.resolution_y = 1024; sc.render.image_settings.file_format = 'PNG'; sc.view_settings.view_transform = 'AgX' if 'AgX' in [i.identifier for i in bpy.types.ColorManagedViewSettings.bl_rna.properties['view_transform'].enum_items] else 'Filmic'
 for v in views:
     sc.camera = cams[v]; sc.render.filepath = os.path.join(out, f"render-{v}.png"); bpy.ops.render.render(write_still=True); print("rendered", v)
