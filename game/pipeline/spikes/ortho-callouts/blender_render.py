@@ -23,7 +23,7 @@ def light(name, loc, energy, kind='AREA', sz=None):
     if sz: l.size = sz
     o = bpy.data.objects.new(name, l); sc.collection.objects.link(o); o.location = ctr + mathutils.Vector(loc) * size
     d = ctr - o.location; o.rotation_euler = d.to_track_quat('-Z', 'Y').to_euler(); return o
-light("key", (1.2, -1.5, 1.6), 120 * size**2, sz=size); light("fill", (-1.8, -0.8, 0.8), 40 * size**2, sz=size*1.5); light("rim", (0.3, 1.8, 1.2), 90 * size**2, sz=size*0.6)
+light("key", (1.2, -1.5, 1.6), 45 * size**2, sz=size); light("fill", (-1.8, -0.8, 0.8), 15 * size**2, sz=size*1.5); light("rim", (0.3, 1.8, 1.2), 35 * size**2, sz=size*0.6)
 # cameras
 def cam(name, dirv, ortho=False):
     c = bpy.data.cameras.new(name); o = bpy.data.objects.new(name, c); sc.collection.objects.link(o)
