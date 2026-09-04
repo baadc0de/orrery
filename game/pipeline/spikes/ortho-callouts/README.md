@@ -30,3 +30,17 @@
         --brief brief-escort.md --out out --name escort-pro
     # resume from a saved concept, regenerate selected views and the sheet:
     python3 ortho_callouts.py ... --reuse-concept --views front,back
+
+## Local track (added later the same day): FLUX.2 klein 4B on ComfyUI, plus a Blender proxy depth map
+
+**Setup** (all on the box, no money): `uv` venv with torch 2.14 cu130, ComfyUI 0.34, `black-forest-labs/FLUX.2-klein-4B` via the Comfy-Org repack (Apache-2.0: diffusion model 7.7 GB, Qwen3-4B text encoder 8 GB, Flux2 VAE), TRELLIS.2-4B weights (MIT, 14 GB) and code cloned but not yet run, Blender 5.2.1 with the `blender-mcp` add-on enabled. Runner: `local_ortho.py` (ComfyUI API graph: UNETLoader → CLIPLoader `flux2` → ReferenceLatent(concept) [→ ReferenceLatent(depth)] → KSampler euler/simple, 4 steps, cfg 1 → SaveImage), provenance per output with the full graph and seed.
+
+**Numbers:** first view 8 s (model load), then **3 s per 1024² view** (5 s with the second reference). Deterministic from seed. VRAM: ~16 GB staged by ComfyUI's dynamic loader.
+
+**Concept-only (same prompts as hosted):** quality and design consistency are close to Nano Banana Pro (stripe, conduits, RCS pods, canopy all preserved; the `E-07` decal is the main loss). Camera semantics fail the same way: side is a true elevation, front and back come out as raised three-quarter views, top is tilted.
+
+**With a proxy depth map as a second reference** (`proxy_depth.py`: Blender builds a box-and-cylinder proxy from the brief's 9 × 6 × 2.5 m and renders 1024² orthographic depth from four cameras via an emission material, since Blender 5 has no `scene.node_tree`): **rear became a true rear elevation and top a true plan**; front improved but still leans into a raised three-quarter. So a reference latent carries camera intent partially; it is not a hard constraint the way a ControlNet is.
+
+**Conclusions for G12.2a.** The local track is viable today for batch variation and re-derivation at negligible cost, and a Blender proxy is a cheap, fully reproducible way to state the camera. To make it a hard constraint, the next step is a proper depth/canny ControlNet for the chosen open model (or the base 4B with a control adapter), and a silhouette IoU check against the proxy's mask as the automated gate.
+
+**Operational.** ComfyUI is started with `~/ComfyUI/.venv/bin/python ~/ComfyUI/main.py --listen 127.0.0.1 --port 8188` and holds ~16 GB VRAM while idle; stop it before any latency measurement on this box. Generated PNGs and the proxy `.blend` stay out of the public repository (G12.12).

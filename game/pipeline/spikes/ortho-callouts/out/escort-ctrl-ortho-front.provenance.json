@@ -1,0 +1,205 @@
+{
+  "stage": "ortho-front",
+  "track": "local",
+  "model": "black-forest-labs/FLUX.2-klein-4B via Comfy-Org repack",
+  "license": "apache-2.0",
+  "runner": "ComfyUI",
+  "graph": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "flux-2-klein-4b.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "2": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen_3_4b.safetensors",
+        "type": "flux2",
+        "device": "default"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "flux2-vae.safetensors"
+      }
+    },
+    "4": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "escort-pro-concept.png"
+      }
+    },
+    "5": {
+      "class_type": "ImageScaleToTotalPixels",
+      "inputs": {
+        "image": [
+          "4",
+          0
+        ],
+        "upscale_method": "lanczos",
+        "megapixels": 1.0,
+        "resolution_steps": 16
+      }
+    },
+    "6": {
+      "class_type": "VAEEncode",
+      "inputs": {
+        "pixels": [
+          "5",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "7": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "text": "Two reference images. Image 1 is the concept art of the object: copy its design, panels, decals, materials and colours exactly. Image 2 is a depth map (white = near, black = far, grey background) rendered from a strict orthographic camera in the exact view required; match its silhouette, proportions and camera angle EXACTLY and paint the object from image 1 into that silhouette. VIEW: FRONT ELEVATION: camera directly ahead of the nose at mid-height looking aft along the long axis; nose points at the viewer; wings are thin horizontal edges; the top surface is NOT visible. Flat mid-grey background, soft even lighting, no shadow, no text, no extra objects."
+      }
+    },
+    "8": {
+      "class_type": "ReferenceLatent",
+      "inputs": {
+        "conditioning": [
+          "7",
+          0
+        ],
+        "latent": [
+          "6",
+          0
+        ]
+      }
+    },
+    "9": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "text": ""
+      }
+    },
+    "10": {
+      "class_type": "EmptyFlux2LatentImage",
+      "inputs": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+      }
+    },
+    "11": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "positive": [
+          "23",
+          0
+        ],
+        "negative": [
+          "9",
+          0
+        ],
+        "latent_image": [
+          "10",
+          0
+        ],
+        "seed": 7,
+        "steps": 4,
+        "cfg": 1.0,
+        "sampler_name": "euler",
+        "scheduler": "simple",
+        "denoise": 1.0
+      }
+    },
+    "12": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "11",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "13": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "12",
+          0
+        ],
+        "filename_prefix": "escort-ctrl-ortho-front"
+      }
+    },
+    "20": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "escort-ctrl-depth-front.png"
+      }
+    },
+    "21": {
+      "class_type": "ImageScaleToTotalPixels",
+      "inputs": {
+        "image": [
+          "20",
+          0
+        ],
+        "upscale_method": "lanczos",
+        "megapixels": 1.0,
+        "resolution_steps": 16
+      }
+    },
+    "22": {
+      "class_type": "VAEEncode",
+      "inputs": {
+        "pixels": [
+          "21",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "23": {
+      "class_type": "ReferenceLatent",
+      "inputs": {
+        "conditioning": [
+          "8",
+          0
+        ],
+        "latent": [
+          "22",
+          0
+        ]
+      }
+    }
+  },
+  "seed": 7,
+  "steps": 4,
+  "cfg": 1.0,
+  "input_sha256": "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+  "control": "escort-ctrl-depth-front.png",
+  "output": "escort-ctrl-ortho-front.png",
+  "output_sha256": "57ed5dd0f1cae210c5b7d6a2d05c124f8b90c319ba7ad2e6c989d47d7c4453f2",
+  "seconds": 5.41,
+  "generated_at": "2026-09-04T19:36:04Z"
+}
