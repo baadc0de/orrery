@@ -456,6 +456,10 @@ def render_report(report: dict) -> str:
 
 
 def main() -> int:
+    # A redirected stdout takes the console codepage — cp1252 on Windows, which
+    # cannot encode →, ≤ or ≥ and dies after the measurement has run (#1025).
+    # Every render leaves here as UTF-8, whatever the stream it lands on.
+    sys.stdout.reconfigure(encoding="utf-8")
     args = sys.argv[1:]
     if args and args[0] == "--self-test":
         self_test()

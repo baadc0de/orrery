@@ -1558,7 +1558,15 @@ jobs:
             echo
             python3 scripts/ipc-report.py sidecar-ipc-n24-default-resolution.json
           } >> "$GITHUB_STEP_SUMMARY"
+      # `always()`: the samples are the evidence and the summary is the
+      # comfort. #1025 lost a whole ten-minute N=24 run because a render
+      # failure — cp1252 could not encode the report's arrow — aborted the
+      # job before this step executed. Whatever the render step above does,
+      # the report files leave the runner; the render stays a failed step,
+      # so the job still reads red. Same pattern as every other evidence
+      # upload in this file.
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: sidecar-ipc-windows
           path: |
