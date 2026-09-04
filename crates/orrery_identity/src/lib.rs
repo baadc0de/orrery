@@ -109,7 +109,9 @@ pub use standing::{
     score_rows, ComputedStanding, StandingLevel, StandingObservation, StandingScores,
     StandingThresholdError, StandingThresholds, StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
 };
-pub use store::{AccountStore, BindOutcome, CooldownEntry, CooldownRecord, IdentityError};
+pub use store::{
+    AccountStore, BanEntry, BindOutcome, CooldownEntry, CooldownRecord, IdentityError,
+};
 pub use window::{
     admit_binding_event, RateRefusal, BINDING_RATE_CAP_24H, BINDING_RATE_CAP_30D,
     BINDING_RATE_WINDOW_24H_MS, BINDING_RATE_WINDOW_30D_MS,

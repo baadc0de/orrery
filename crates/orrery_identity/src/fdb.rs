@@ -39,7 +39,9 @@
 //! it because a lock-guarded map probe genuinely is tier 2.
 
 use crate::filing::FilingNotice;
-use crate::store::{AccountStore, BindOutcome, CooldownEntry, CooldownRecord, IdentityError};
+use crate::store::{
+    AccountStore, BanEntry, BindOutcome, CooldownEntry, CooldownRecord, IdentityError,
+};
 use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
 use foundationdb::options::MutationType;
@@ -300,6 +302,34 @@ async fn read_cooldown_entry(
     })?;
     Ok(Some(CooldownEntry {
         entered_at_ms: u64::from_be_bytes(bytes),
+    }))
+}
+
+/// Key for D33 clause (e)'s terminal ban: `dn ‖ account:u64-be`.
+///
+/// A thin alias for [`keyspace::ban_entry_key`], for the reason
+/// [`cooldown_entry_key`] is one: the bytes live beside every other `d`-family
+/// builder, and this crate remains the family's sole writer.
+fn ban_entry_key(account: AccountId) -> [u8; 10] {
+    keyspace::ban_entry_key(account)
+}
+
+/// Read the fixed-width `dn` timestamp inside one transaction.
+async fn read_ban_entry(
+    trx: &foundationdb::RetryableTransaction,
+    account: AccountId,
+) -> Result<Option<BanEntry>, FdbBindingError> {
+    let key = ban_entry_key(account);
+    let Some(raw) = trx.get(&key, false).await? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 8] = raw.as_ref().try_into().map_err(|_| {
+        custom(IdentityError::Store(
+            "ban entry decode: expected 8 bytes".into(),
+        ))
+    })?;
+    Ok(Some(BanEntry {
+        banned_at_ms: u64::from_be_bytes(bytes),
     }))
 }
 
@@ -622,6 +652,66 @@ impl AccountStore for FdbAccountStore {
             .map_err(unwrap_binding_error)
     }
 
+    async fn record_ban(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+    ) -> Result<BanEntry, IdentityError> {
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                if read_account(&trx, account).await?.is_none() {
+                    return Err(custom(IdentityError::UnknownAccount(account)));
+                }
+                // Read-then-set inside the transaction, so the read is a
+                // conflict range and two concurrent observations cannot both
+                // decide they are the first. First write wins; the row is
+                // never re-stamped.
+                if let Some(existing) = read_ban_entry(&trx, account).await? {
+                    return Ok(existing);
+                }
+                let entry = BanEntry {
+                    banned_at_ms: observed_at_ms,
+                };
+                trx.set(&ban_entry_key(account), &entry.banned_at_ms.to_be_bytes());
+                Ok(entry)
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+
+    async fn ban_entry(&self, account: AccountId) -> Result<Option<BanEntry>, IdentityError> {
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                if read_account(&trx, account).await?.is_none() {
+                    return Err(custom(IdentityError::UnknownAccount(account)));
+                }
+                read_ban_entry(&trx, account).await
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+
+    async fn lift_ban_if(
+        &self,
+        account: AccountId,
+        expected: BanEntry,
+    ) -> Result<bool, IdentityError> {
+        self.db
+            .run(|trx, _maybe_committed| async move {
+                if read_account(&trx, account).await?.is_none() {
+                    return Err(custom(IdentityError::UnknownAccount(account)));
+                }
+                if read_ban_entry(&trx, account).await? == Some(expected) {
+                    trx.clear(&ban_entry_key(account));
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+
     async fn cooldown_entries(&self) -> Result<Vec<CooldownRecord>, IdentityError> {
         // A snapshot read. This is a reporting sweep, not an admission
         // decision: taking read conflict ranges over the entire family would
@@ -835,6 +925,10 @@ mod tests {
                     // cooldown would publish an invalidation for an account
                     // the next run believes it just created clean.
                     trx.clear(&cooldown_entry_key(account));
+                    // And D33's `dn` ban row, which unlike `dc` has no release
+                    // path at all: a leftover would refuse every later run's
+                    // mint on an account it believes it just created clean.
+                    trx.clear(&ban_entry_key(account));
                     for node in &nodes {
                         trx.clear(&keyspace::binding_key(node));
                         trx.clear_range(
@@ -1236,6 +1330,76 @@ mod tests {
                 mine(source.current().await.expect("publish")).is_empty(),
                 "a released account leaves the published set"
             );
+
+            wipe(&store, account, &[]).await;
+        }
+    );
+
+    // D33 clause (e)'s "ban never reverses by decay", against a real cluster.
+    // `MemAccountStore` proves the rule; this proves the `dn` row — its key
+    // layout, its bare big-endian value, and that it is a *different* row from
+    // the `dc` entry, which is the whole reason a released cooldown does not
+    // take the ban with it.
+    fdb_test!(
+        a_ban_row_is_durable_first_write_wins_and_lifts_only_on_a_match,
+        |store| async move {
+            let account = account(8);
+            wipe(&store, account, &[]).await;
+            store
+                .create_account(account, 1_000)
+                .await
+                .expect("create account");
+
+            assert_eq!(store.ban_entry(account).await.expect("read"), None);
+
+            let ban = store.record_ban(account, 7_000).await.expect("ban");
+            assert_eq!(
+                ban,
+                BanEntry {
+                    banned_at_ms: 7_000
+                }
+            );
+            assert_eq!(
+                store.ban_entry(account).await.expect("read"),
+                Some(ban),
+                "the row round-trips through the eight-byte big-endian value"
+            );
+
+            assert_eq!(
+                store.record_ban(account, 9_000).await.expect("re-observe"),
+                ban,
+                "first write wins: a later observation does not re-stamp the ban"
+            );
+
+            // Two rows, not one: releasing the cooldown leaves the ban.
+            store
+                .observe_cooldown(account, 7_000, None)
+                .await
+                .expect("also at or above C");
+            let entry = store
+                .cooldown_entry(account)
+                .await
+                .expect("read")
+                .expect("entry");
+            assert!(store
+                .clear_cooldown_if(account, entry)
+                .await
+                .expect("release"));
+            assert_eq!(
+                store.ban_entry(account).await.expect("read"),
+                Some(ban),
+                "a_ban_row_is_durable_first_write_wins_and_lifts_only_on_a_match"
+            );
+
+            assert!(
+                !store
+                    .lift_ban_if(account, BanEntry { banned_at_ms: 1 })
+                    .await
+                    .expect("lift"),
+                "compare-and-clear: a stale expectation clears nothing"
+            );
+            assert!(store.lift_ban_if(account, ban).await.expect("lift"));
+            assert_eq!(store.ban_entry(account).await.expect("read"), None);
 
             wipe(&store, account, &[]).await;
         }

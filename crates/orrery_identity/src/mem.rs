@@ -22,7 +22,9 @@
 //! `orrery_persistd::gateway::SnapshotBindingAuthority` from a store rather
 //! than from a table somebody typed.
 
-use crate::store::{AccountStore, BindOutcome, CooldownEntry, CooldownRecord, IdentityError};
+use crate::store::{
+    AccountStore, BanEntry, BindOutcome, CooldownEntry, CooldownRecord, IdentityError,
+};
 use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
 use orrery_persistd::gateway::BindingAuthority;
@@ -53,6 +55,11 @@ struct State {
     windows: HashMap<AccountId, Vec<u64>>,
     /// `dc ‖ account` — D33's identity-owned current cooldown entry.
     cooldowns: HashMap<AccountId, CooldownEntry>,
+    /// `dn ‖ account` — D33 clause (e)'s terminal ban. Deliberately a second
+    /// map rather than a flag on the cooldown entry: the two have different
+    /// lifetimes — the cooldown entry is cleared on release and this is not —
+    /// and the FDB backend keys them as two rows for the same reason.
+    bans: HashMap<AccountId, BanEntry>,
 }
 
 /// An in-process account store.
@@ -331,6 +338,48 @@ impl AccountStore for MemAccountStore {
         }
         if state.cooldowns.get(&account) == Some(&expected) {
             state.cooldowns.remove(&account);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn record_ban(
+        &self,
+        account: AccountId,
+        observed_at_ms: u64,
+    ) -> Result<BanEntry, IdentityError> {
+        let mut state = Self::lock(&self.state);
+        if !state.accounts.contains_key(&account) {
+            return Err(IdentityError::UnknownAccount(account));
+        }
+        // First write wins: a ban has no dwell for a later observation to
+        // extend, so a second observation must not move the instant a review
+        // will read back.
+        Ok(*state.bans.entry(account).or_insert(BanEntry {
+            banned_at_ms: observed_at_ms,
+        }))
+    }
+
+    async fn ban_entry(&self, account: AccountId) -> Result<Option<BanEntry>, IdentityError> {
+        let state = Self::lock(&self.state);
+        if !state.accounts.contains_key(&account) {
+            return Err(IdentityError::UnknownAccount(account));
+        }
+        Ok(state.bans.get(&account).copied())
+    }
+
+    async fn lift_ban_if(
+        &self,
+        account: AccountId,
+        expected: BanEntry,
+    ) -> Result<bool, IdentityError> {
+        let mut state = Self::lock(&self.state);
+        if !state.accounts.contains_key(&account) {
+            return Err(IdentityError::UnknownAccount(account));
+        }
+        if state.bans.get(&account) == Some(&expected) {
+            state.bans.remove(&account);
             Ok(true)
         } else {
             Ok(false)

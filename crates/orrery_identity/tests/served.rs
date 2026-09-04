@@ -311,20 +311,29 @@ fn major_strike(issued_at_ms: u64) -> StrikeRow {
 /// The test the issue exists for: the standing a served mint stamps — and the
 /// decision to mint at all — is read from the strike ledger at mint time.
 ///
-/// One connection, three phases of the same account's ledger:
+/// One connection, four phases of the same account's ledger:
 ///
 /// 1. no rows: the mint answers, and the token says `Good` because the scorer
 ///    *read* an empty ledger;
-/// 2. two live major findings: the served mint refuses `Cooldown`, by name —
-///    against a mint that stamps a constant `Good` (the defect #861 closes)
-///    this phase returns `Issued` and this test fails here;
-/// 3. decay plus the dwell floor: the same account, same connection, mints
+/// 2. one live major finding: the mint still issues, and the stamped claim has
+///    moved to `Quarantined`;
+/// 3. a second one: the served mint refuses `Cooldown`, by name — against a
+///    mint that stamps a constant `Good` (the defect #861 closes) this phase
+///    returns `Issued` and this test fails here;
+/// 4. decay plus the dwell floor: the same account, same connection, mints
 ///    again, and the token's standing claim has moved to what the ledger now
 ///    holds.
 ///
-/// Phase 2 also asserts the #934 half: the refused mint's durable dwell write
+/// Phase 3 also asserts the #934 half: the refused mint's durable dwell write
 /// is exactly what `StandingInvalidationSource` publishes, so the running
 /// service is what makes the coordinator's standing feed real.
+///
+/// Phase 4 is in two steps since #1059, because D33 clause (e) ends a cooldown
+/// on `S < Q` *and* the floor rather than on the floor alone: at one half-life
+/// the two findings have decayed to exactly `Q` and the account is still
+/// refused, and it is the next step that releases it. The `Quarantined` claim
+/// this phase used to assert is now phase 2's, where it belongs — an account
+/// carrying a durable cooldown entry no longer releases into that band.
 #[tokio::test]
 async fn the_served_mint_decision_follows_the_real_strike_ledger_not_a_constant() {
     let store = Arc::new(MemAccountStore::new());
@@ -364,9 +373,34 @@ async fn the_served_mint_decision_follows_the_real_strike_ledger_not_a_constant(
     .expect("verify");
     assert_eq!(claims.standing, SessionStanding::Good);
 
-    // Phase 2: findings arrive on the ledger; the next served mint reads them
-    // and refuses. No token exists for the account after this phase.
+    // Phase 2: one finding arrives. The mint still issues — and the claim it
+    // stamps moved with the ledger.
     rows.file(major_strike(scorer_now.load(Ordering::SeqCst)));
+    let reply = client
+        .login(ACCOUNT, None, PATIENCE)
+        .await
+        .expect("one-finding login answered");
+    let IdentityReply::Issued {
+        token: quarantined, ..
+    } = reply
+    else {
+        panic!("one major finding quarantines but still mints: {reply:?}");
+    };
+    let claims = verify(
+        &clock,
+        server.service().published_issuer_keys(),
+        &quarantined,
+        &client.node(),
+    )
+    .expect("verify");
+    assert_eq!(
+        claims.standing,
+        SessionStanding::Quarantined,
+        "the standing claim moved because the ledger moved — a constant could not have done that"
+    );
+
+    // Phase 3: a second finding; the next served mint reads them and refuses.
+    // No token exists for the account after this phase.
     rows.file(major_strike(scorer_now.load(Ordering::SeqCst)));
     assert_eq!(
         client
@@ -389,31 +423,52 @@ async fn the_served_mint_decision_follows_the_real_strike_ledger_not_a_constant(
         "the refused mint's dwell write is the #934 feed's data: the running service is its consumer half"
     );
 
-    // Phase 3: decay and the dwell floor pass; the ledger's answer changes and
-    // the stamped claim follows it.
+    // Phase 4: the dwell floor passes at one half-life, where the two findings
+    // have decayed to exactly `Q` — clause (e)'s other condition, `S < Q`, is
+    // not met yet, so the service still refuses.
     let day_ms = 24 * 60 * 60 * 1_000;
     scorer_now.store(14 * day_ms, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .login(ACCOUNT, None, PATIENCE)
+            .await
+            .expect("the request is answered"),
+        IdentityReply::Refused(IdentityRefusal::Cooldown(ACCOUNT)),
+        "the floor elapsed but the score is still at Q: clause (e) needs both"
+    );
+
+    // A day further and the score is genuinely below `Q`. Both conditions hold,
+    // the durable entry is cleared, and the mint answers again.
+    scorer_now.store(15 * day_ms, Ordering::SeqCst);
     let reply = client
         .login(ACCOUNT, None, PATIENCE)
         .await
         .expect("post-dwell login answered");
     let IdentityReply::Issued {
-        token: quarantined, ..
+        token: released, ..
     } = reply
     else {
-        panic!("dwell passed and the score decayed; the mint must answer: {reply:?}");
+        panic!("dwell passed and the score fell below Q; the mint must answer: {reply:?}");
     };
     let claims = verify(
         &clock,
         server.service().published_issuer_keys(),
-        &quarantined,
+        &released,
         &client.node(),
     )
     .expect("verify");
     assert_eq!(
         claims.standing,
-        SessionStanding::Quarantined,
-        "the standing claim moved because the ledger moved — a constant could not have done that"
+        SessionStanding::Good,
+        "release is into Good, not Quarantined: D33 clause (e) reverses a cooldown on S < Q"
+    );
+    assert!(
+        StandingInvalidationSource::new(Arc::clone(&store))
+            .current()
+            .await
+            .expect("read the dc family")
+            .is_empty(),
+        "and the released account leaves the invalidation feed"
     );
     server.shutdown().await;
 }

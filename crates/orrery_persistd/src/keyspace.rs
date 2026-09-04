@@ -1309,8 +1309,8 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 }
 
 // ---------------------------------------------------------------------------
-// Identity family: `id/{…}` — `da` accounts, `db` bindings, `dh` history,
-// `dw` binding-rate window
+// Identity family: `id/{…}` — `da` accounts, `db` bindings, `dc` cooldown
+// entries, `dh` history, `dn` bans, `dw` binding-rate window
 // ---------------------------------------------------------------------------
 //
 // D31's account subspace. One family byte, `b'd'`, spanning `[b"d", b"e")`,
@@ -1319,6 +1319,7 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 //   da ‖ account:u64 BE                       10 B  ->  AccountRow
 //   db ‖ node:[u8;32]                         34 B  ->  BindingRow
 //   dh ‖ node:[u8;32] ‖ versionstamp:[u8;10]  44 B  ->  BindingHistoryRow
+//   dn ‖ account:u64 BE                       10 B  ->  banned_at_ms:u64 BE (D33)
 //   dw ‖ account:u64 BE                       10 B  ->  postcard Vec<u64>,
 //                                                   ascending event stamps (D36)
 //
@@ -1654,6 +1655,56 @@ pub fn cooldown_range_start() -> Vec<u8> {
 #[must_use]
 pub fn cooldown_range_end() -> Vec<u8> {
     vec![b'd', b'd']
+}
+
+/// Key for D33's terminal ban row: `id/dn/{account_id}` -> `banned_at_ms:u64-be`.
+///
+/// `'d'`, then the sub-space discriminator `'n'`, then the 8-byte [`AccountId`]
+/// big-endian — deliberately the same ten bytes and the same bare eight-byte
+/// big-endian value as [`cooldown_entry_key`], because it is the same kind of
+/// fact recorded the same way, and a reader can decode either without linking
+/// the writer's types.
+///
+/// # Why a row at all
+///
+/// D33 clause (e) ends "ban never reverses by decay". `StandingLevel::Banned`
+/// is a *band the live score is currently in*, and the score decays: at the
+/// clause (d) defaults an account banned at 9.0 re-enters the cooldown band
+/// after 5.08 days and would release on the ordinary dwell. Without a durable
+/// row there is nothing for the mint path to consult that outlives the
+/// arithmetic, so the strongest sanction expires on a timer (#1059). This row
+/// is that fact: written the first time identity observes `S ≥ B`, never
+/// rewritten, and cleared only by an explicit administrative lift.
+///
+/// # Why `'n'` and not `'b'`
+///
+/// `'b'` is the binding sub-space and `'c'` is the cooldown entry, so the
+/// discriminator is `'n'` — "no return" — which keeps the family's
+/// `a < b < c < h < n < w` ordering disjoint by construction, exactly as the
+/// four original sub-spans and the ledger's `lb < le < li < lr` do.
+#[must_use]
+pub fn ban_entry_key(account: AccountId) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'd';
+    key[1] = b'n';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// The first key of the `id/dn/…` ban sub-space (D33 clause (e)).
+#[must_use]
+pub fn ban_range_start() -> Vec<u8> {
+    vec![b'd', b'n']
+}
+
+/// The exclusive end of the `id/dn/…` ban sub-space.
+///
+/// `b"do"` is one past `'n'` — house style for a sub-span end — and still
+/// inside the `d` family, so a sweep of the ban rows stops short of `dw` and
+/// can never reach another family.
+#[must_use]
+pub fn ban_range_end() -> Vec<u8> {
+    vec![b'd', b'o']
 }
 
 /// The first key of the `id/dh/…` binding-history sub-space.
@@ -3968,6 +4019,21 @@ mod tests {
             "the versionstamp is a zero placeholder until FDB substitutes it"
         );
 
+        let ban = ban_entry_key(AccountId::new(0x0102_0304_0506_0708));
+        assert_eq!(ban.len(), 10, "dn ‖ account:u64 BE (D33 (e))");
+        assert_eq!(&ban[..2], b"dn");
+        assert_eq!(
+            u64::from_be_bytes(ban[2..10].try_into().unwrap()),
+            0x0102_0304_0506_0708,
+            "the ban row is account-keyed and shares `dc`'s ten-byte shape"
+        );
+        assert_ne!(
+            ban,
+            cooldown_entry_key(AccountId::new(0x0102_0304_0506_0708)),
+            "a ban is a separate row from the cooldown entry, not the same one \
+             re-stamped: the cooldown entry is released and the ban is not"
+        );
+
         let window = binding_window_key(AccountId::new(0x0102_0304_0506_0708));
         assert_eq!(window.len(), 10, "dw ‖ account:u64 BE (D36 (a))");
         assert_eq!(&window[..2], b"dw");
@@ -3989,16 +4055,18 @@ mod tests {
             "an exclusive bound of [0x65] cannot include any key `e ‖ …`"
         );
 
-        // `a < b < h < w` makes the scans disjoint by construction, exactly
-        // as `lb < le < li < lr` does for the ledger.
+        // `a < b < c < h < n < w` makes the scans disjoint by construction,
+        // exactly as `lb < le < li < lr` does for the ledger.
         let spans = [
             (account_range_start(), account_range_end(), "da"),
             (binding_range_start(), binding_range_end(), "db"),
+            (cooldown_range_start(), cooldown_range_end(), "dc"),
             (
                 binding_history_range_start(),
                 binding_history_range_end(),
                 "dh",
             ),
+            (ban_range_start(), ban_range_end(), "dn"),
             (
                 binding_window_range_start(),
                 binding_window_range_end(),
@@ -4026,16 +4094,25 @@ mod tests {
         // push out of its own bound.
         let account = account_key(AccountId::new(u64::MAX)).to_vec();
         let binding = binding_key(&node(0xEE)).to_vec();
+        let cooldown = cooldown_entry_key(AccountId::new(u64::MAX)).to_vec();
         let history = binding_history_key(&node(0x00)).to_vec();
+        let ban = ban_entry_key(AccountId::new(u64::MAX)).to_vec();
         let window = binding_window_key(AccountId::new(u64::MAX)).to_vec();
         assert!(account_range_start() <= account && account < account_range_end());
         assert!(binding_range_start() <= binding && binding < binding_range_end());
+        assert!(cooldown_range_start() <= cooldown && cooldown < cooldown_range_end());
         assert!(binding_history_range_start() <= history && history < binding_history_range_end());
+        assert!(ban_range_start() <= ban && ban < ban_range_end());
         assert!(binding_window_range_start() <= window && window < binding_window_range_end());
         assert!(
-            account < binding && binding < history && history < window,
-            "da < db < dh < dw — the window sorts above every history key, \
-             so the `dh` retention sweep over [dh, di) cannot reach it (D36 (c))"
+            account < binding
+                && binding < cooldown
+                && cooldown < history
+                && history < ban
+                && ban < window,
+            "da < db < dc < dh < dn < dw — the window sorts above every history \
+             key, so the `dh` retention sweep over [dh, di) cannot reach it \
+             (D36 (c)), and the ban span sits between the two touching neither"
         );
     }
 
@@ -4435,6 +4512,11 @@ mod tests {
                             discriminator: b'h',
                             name: "id/dh binding-history",
                             sample: binding_history_key(&node(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'n',
+                            name: "id/dn terminal bans",
+                            sample: ban_entry_key(AccountId::new(1)).to_vec(),
                         },
                         SubKind {
                             discriminator: b'w',
