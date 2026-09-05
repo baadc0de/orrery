@@ -27,6 +27,11 @@ def extreme_filter(fs, side, band=0.35):
     if not fs: return fs
     ax, sg = EXTREME[side]; ref = max(f.center[ax] * sg for f in fs); keep = [f for f in fs if ref - f.center[ax] * sg <= band]
     return keep or fs
+def skin_hit(side, q):
+    """Exact skin point on `side` at plan position q (x, y for top/belly/nose/tail; y, z for flank): ray cast from outside along the side's axis."""
+    inv = hull.matrix_world.inverted(); ax, sg = EXTREME[side]; o_far = Vector(q); o_far[ax] = 30.0 * sg
+    dirv = Vector([(-sg if i == ax else 0) for i in range(3)]); hit, loc, nrm, _ = hull.ray_cast(inv @ o_far, (inv.to_3x3() @ dirv).normalized())
+    return (hull.matrix_world @ loc, (hull.matrix_world.to_3x3() @ nrm).normalized()) if hit else (None, None)
 def anchor_faces(region, anchor, k=40):
     # anchor placement: [x, y] fractions of the hull half-extents (-1..1; +x starboard, +y nose) on the region's side; flank anchors are [y, z].
     sd = region.split(".")[0]; si = SIDES.index(sd); S = hull.data.attributes["region_side"].data
@@ -65,7 +70,7 @@ def prim_object(z, e_dims_out):
             r = bmesh.ops.create_cube(bm, size=1.0); bmesh.ops.scale(bm, vec=(0.5 * w, 0.5 * w, h), verts=r["verts"]); bmesh.ops.translate(bm, vec=(0, yy, h / 2), verts=r["verts"])
         dims = (w, L, h + th)
     elif kind == "nozzle":   # engine: outer cylinder with a recessed inner cone, axis along +z = the mount normal (a tail face points aft).
-        r = L / 2; ln = z.get("length_m", 1.0 * L); sink = z.get("sink", 0.55)   # most of the length sits inside the pod lump; only the lip and the glowing cone show
+        r = L / 2; ln = z.get("length_m", 1.0 * L); sink = z.get("sink", 0.7)   # most of the length sits inside the pod lump; only the lip and the glowing cone show
         bmesh.ops.create_cone(bm, cap_ends=False, segments=24, radius1=r * 0.92, radius2=r, depth=ln)
         inner = bmesh.ops.create_cone(bm, cap_ends=True, segments=24, radius1=r * 0.35, radius2=r * 0.82, depth=ln * 0.9)
         ring = bmesh.ops.create_cone(bm, cap_ends=False, segments=24, radius1=r * 0.92, radius2=r * 0.82, depth=0.02); bmesh.ops.translate(bm, vec=(0, 0, ln * 0.49), verts=ring["verts"])
@@ -152,6 +157,11 @@ for z in Z["zones"]:
             if not e: print("no part for", z["name"]); break
             used.add(e["name"]); o = load_insert(e)
         pos, nn = surface_at(c, n, t, (i - (k - 1) / 2) * (span / k), fs, across)
+        if z.get("anchor") and k == 1:   # anchored single (or +x member of a pair): hit the skin exactly at the anchor, not at a face-centroid average
+            sd0 = z["region"].split(".")[0]; q = Vector((0, z["anchor"][0] * HY, z["anchor"][1] * HZ)) if sd0 == "flank" else Vector((z["anchor"][0] * HX, z["anchor"][1] * HY, 0))
+            if sd0 == "flank": q.x = HX
+            p2, n2 = skin_hit(sd0, q)
+            if p2 is not None: pos, nn = p2, n2
         if z.get("prim"):   # primitives are authored along +y with +z off the skin: keep them axis-true instead of following the coarse patch frame
             sd = z["region"].split(".")[0]
             if z["prim"] == "nozzle" and sd in ("tail", "nose"): nn = Vector((0, -1 if sd == "tail" else 1, 0))
@@ -209,9 +219,9 @@ for o in parts:
     if o.get("two_mat"):   # primitives with an outer and an inner material keep their face indices
         o.data.materials.clear()
         for rn in o["two_mat"].split(","): o.data.materials.append(M[rn])
-        continue
-    o.data.materials.clear(); o.data.materials.append(M[role_for(o)])
-    for pg in o.data.polygons: pg.material_index = 0
+    else:
+        o.data.materials.clear(); o.data.materials.append(M[role_for(o)])
+        for pg in o.data.polygons: pg.material_index = 0
     if o.name != "hull" and not o.get("no_mirror"):
         xs = [(o.matrix_world @ Vector(cn)).x for cn in o.bound_box]
         m = o.modifiers.new("mir", 'MIRROR'); m.use_axis = (True, False, False); m.mirror_object = hull; m.use_mirror_merge = True; m.merge_threshold = 0.002

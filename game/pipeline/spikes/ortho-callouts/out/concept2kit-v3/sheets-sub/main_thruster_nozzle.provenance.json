@@ -1,0 +1,43 @@
+{
+  "stage": "subassembly-sheet",
+  "zone": "main_thruster_nozzle",
+  "feature": "Main thruster interiors",
+  "size_m": 1.061,
+  "prompt": "Image 1 is the concept painting of a 9 m spacecraft; image 2 is a crop around the feature. Isolate ONE subassembly of it: Main thruster interiors (nozzle, thruster), about 1.061 m across, one of 2 identical units. Draw a clean production callout sheet of ONLY that subassembly, with no hull around it: three views at identical scale on a flat light-grey background: front-left 3/4 view large on the left, side view and front view smaller on the right, each with a small view label. Keep the exact design language of the concept (utilitarian military spacecraft hardware: panelled, riveted, warm-grey painted steel with dark polymer panels and bare-aluminium fasteners, safety-orange only where the concept has it); show its mounting face where it meets the hull as a flat base. No other text, no dimensions, no people, no background scenery.",
+  "references": [
+    "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+    "697bbcc0b1e7090b8baba1e7fcc252258a3b7e4279c32da735b113b0121257ad"
+  ],
+  "concept": "escort-pro-concept.png",
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "LJ6baqqxNcHqmLAP-Y6mkAM",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 1316,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 2722,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 196
+      },
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 286
+  },
+  "output": "main_thruster_nozzle.png",
+  "output_sha256": "2a15f4b3cd7b6b01556a4a675f8a34c389cfaa9c2fce43efcbc9c820951d8288",
+  "model_text": "",
+  "generated_at": "2026-09-05T04:44:50Z"
+}

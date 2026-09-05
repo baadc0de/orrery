@@ -1,0 +1,163 @@
+{
+ "seed": 7,
+ "zones": "spikes/ortho-callouts/out/concept2kit-v3/zones.json",
+ "choices": "spikes/ortho-callouts/out/concept2kit-v3/choices.json",
+ "placements": [
+  {
+   "zone": "nose_rcs_cluster",
+   "insert": "prim:box",
+   "kit": "procedural",
+   "region": "nose.fore.outer",
+   "pos": [
+    0.711,
+    4.45,
+    -0.005
+   ],
+   "anchor": [
+    0.15,
+    0.95
+   ],
+   "scale": 1.0,
+   "placed_m": 0.8,
+   "attach": "surface"
+  },
+  {
+   "zone": "main_thruster_nozzle",
+   "insert": "prim:nozzle",
+   "kit": "procedural",
+   "region": "tail.aft.outer",
+   "pos": [
+    0.953,
+    -3.285,
+    0.0
+   ],
+   "anchor": [
+    0.2,
+    -0.85
+   ],
+   "scale": 1.0,
+   "placed_m": 0.89,
+   "attach": "surface"
+  },
+  {
+   "zone": "spine_conduits",
+   "insert": "prim:pipe_run",
+   "kit": "procedural",
+   "from": "top.fore.inner",
+   "to": "top.aft.inner",
+   "pos": [
+    0.0,
+    -0.695,
+    1.146
+   ],
+   "placed_m": 4.0,
+   "attach": "surface"
+  },
+  {
+   "zone": "accent_stripe",
+   "kind": "paint",
+   "region": "flank.fore.outer",
+   "note": "handed to texture stage"
+  },
+  {
+   "zone": "hull_number_decal",
+   "kind": "paint",
+   "region": "flank.fore.outer",
+   "note": "handed to texture stage"
+  },
+  {
+   "zone": "tail_crest_decal",
+   "kind": "paint",
+   "region": "top.aft.outer",
+   "note": "handed to texture stage"
+  },
+  {
+   "zone": "rear_landing_skid",
+   "insert": "prim:skid",
+   "kit": "procedural",
+   "region": "belly.aft.outer",
+   "pos": [
+    1.436,
+    -1.8,
+    -0.79
+   ],
+   "anchor": [
+    0.3,
+    -0.4
+   ],
+   "scale": 1.0,
+   "placed_m": 1.8,
+   "attach": "surface"
+  },
+  {
+   "zone": "under_wing_pylons",
+   "insert": "ship-a_Detail_49",
+   "kit": "cgtrader/spaceship-kitbash-350-a",
+   "region": "belly.aft.outer",
+   "pos": [
+    2.855,
+    -0.9,
+    -0.193
+   ],
+   "anchor": [
+    0.6,
+    -0.2
+   ],
+   "scale": 0.0874,
+   "placed_m": 1.23,
+   "attach": "surface"
+  },
+  {
+   "zone": "ventral_gun_bay",
+   "insert": "ship-b_Detail_241",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "belly.fore.outer",
+   "pos": [
+    0.0,
+    2.253,
+    -1.115
+   ],
+   "anchor": [
+    0.0,
+    0.5
+   ],
+   "scale": 0.0925,
+   "placed_m": 1.0,
+   "attach": "surface"
+  },
+  {
+   "zone": "dark_wing_panels",
+   "kind": "paint",
+   "region": "top.aft.outer",
+   "note": "handed to texture stage"
+  },
+  {
+   "zone": "front_landing_skid",
+   "insert": "prim:skid",
+   "kit": "procedural",
+   "region": "belly.fore.outer",
+   "pos": [
+    -0.0,
+    3.825,
+    -0.747
+   ],
+   "anchor": [
+    0.0,
+    0.85
+   ],
+   "scale": 1.0,
+   "placed_m": 1.5,
+   "attach": "surface"
+  }
+ ],
+ "tris": 24481,
+ "id_colors": {
+  "front_landing_skid": "red",
+  "main_thruster_nozzle": "green",
+  "nose_rcs_cluster": "blue",
+  "rear_landing_skid": "yellow",
+  "spine_conduits": "magenta",
+  "under_wing_pylons": "cyan",
+  "ventral_gun_bay": "orange"
+ }
+}

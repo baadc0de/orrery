@@ -1,0 +1,74 @@
+{
+ "nose_rcs_cluster": {
+  "ranked": [],
+  "note": "procedural box"
+ },
+ "main_thruster_nozzle": {
+  "ranked": [],
+  "note": "procedural nozzle"
+ },
+ "spine_conduits": {
+  "ranked": [],
+  "note": "procedural pipe_run"
+ },
+ "accent_stripe": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "hull_number_decal": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "tail_crest_decal": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "rear_landing_skid": {
+  "ranked": [],
+  "note": "procedural skid"
+ },
+ "under_wing_pylons": {
+  "ranked": [
+   "ship-a_Detail_49",
+   "ship-a_Detail_51",
+   "ship-a_Detail_31",
+   "ship-b_Detail_29",
+   "ship-a_Detail_240",
+   "ship-a_Detail_114",
+   "ship-a_Detail_82",
+   "ship-a_Detail_155"
+  ],
+  "reason": "Candidate 7 best matches the elongated, angular weapon pod silhouette and forward-slanted profile of the concept art.",
+  "shortlist_reason": "These parts feature the blocky, angular, and streamlined pod-like silhouettes matching the sleek weapon pylon design.",
+  "pool": 72,
+  "model": "gemini-3.5-flash",
+  "crop": true,
+  "ref": "sheet"
+ },
+ "ventral_gun_bay": {
+  "ranked": [
+   "ship-b_Detail_241",
+   "ship-b_Detail_239",
+   "ship-b_Detail_208",
+   "ship-b_Detail_107",
+   "ship-b_Detail_101",
+   "ship-a_Detail_84",
+   "ship-a_Detail_86",
+   "ship-b_Detail_187"
+  ],
+  "reason": "Candidate 2 best matches the flat, rectangular panel profile with clean utilitarian lines requested by the director.",
+  "shortlist_reason": "Flatter, rectangular panels and shallow boxes matching the art director's request for a low-profile ventral bay.",
+  "pool": 72,
+  "model": "gemini-3.5-flash",
+  "crop": true,
+  "ref": "sheet"
+ },
+ "dark_wing_panels": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "front_landing_skid": {
+  "ranked": [],
+  "note": "procedural skid"
+ }
+}
