@@ -1109,6 +1109,7 @@ mod tests {
     struct OffLatticeRuleset;
 
     impl Ruleset for OffLatticeRuleset {
+        const OVERFLOW_IS_CANONICAL: bool = false;
         type CoreState = OffLatticeState;
         type CoreInput = NoInputOrEvent;
         type CoreEvent = NoInputOrEvent;

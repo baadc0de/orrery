@@ -150,6 +150,7 @@ const WITHIN_TICK_VISIBILITY_OUTCOME_CHAIN: [u8; 32] = [
 struct WithinTickVisibility;
 
 impl Ruleset for WithinTickVisibility {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = RegolithState;
     type CoreInput = Order;
     type CoreEvent = Outcome;
@@ -202,6 +203,7 @@ const LOW_EMITTER: PersistId = PersistId::new(1);
 const HIGH_EMITTER: PersistId = PersistId::new(2);
 
 impl Ruleset for CollidingMaterializations {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = RegolithState;
     type CoreInput = Order;
     type CoreEvent = Outcome;

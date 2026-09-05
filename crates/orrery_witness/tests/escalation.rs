@@ -115,6 +115,7 @@ const RULESET: RulesetId = RulesetId {
 };
 
 impl Ruleset for Kinematic {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Body;
     type CoreInput = Move;
     type CoreEvent = Nothing;

@@ -304,6 +304,30 @@ pub trait Ruleset: Send + Sync + 'static {
     /// A deterministic outcome event.
     type CoreEvent: CoreCodec;
 
+    /// Whether integer overflow is part of this ruleset's canonical state.
+    ///
+    /// D43 clause (f)(3), as amended 2026-08-31 (#628): overflow-canonicity
+    /// is a **required per-ruleset declaration**, not a blanket requirement.
+    /// This constant deliberately has **no default** — a ruleset that states
+    /// neither `true` nor `false` fails to compile, so a game that does
+    /// economically meaningful arithmetic and declares nothing is
+    /// unrepresentable rather than merely undocumented.
+    ///
+    /// `true` obliges the ruleset to carry occurrence as a per-entity
+    /// discrete field of [`Ruleset::CoreState`], set during canonical stage
+    /// S2 at the point of occurrence and encoded by its [`CoreCodec`], so
+    /// that the bit is inside `bytes(e, t)` and therefore inside
+    /// `hash(e, t)`. A flag the hash never sees would let two hosts diverge —
+    /// one flagged, one not — while `hash(e, t)` still matches, and would
+    /// prove nothing precisely when it matters.
+    ///
+    /// `false` is a positive statement, not an omission: overflow is not part
+    /// of this ruleset's canonical state and therefore not part of its
+    /// adjudication surface. It does **not** relax clauses (f)(1) and (f)(2) —
+    /// canonical arithmetic still must not resolve overflow by panicking, and
+    /// still must behave identically across build profiles.
+    const OVERFLOW_IS_CANONICAL: bool;
+
     /// This build's version identity, pinned into every frame, claim and
     /// bundle.
     fn id(&self) -> RulesetId;

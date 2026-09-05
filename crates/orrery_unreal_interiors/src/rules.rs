@@ -481,6 +481,7 @@ impl CoreCodec for Happening {
 pub struct Interiors;
 
 impl Ruleset for Interiors {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Body;
     type CoreInput = Intent;
     type CoreEvent = Happening;

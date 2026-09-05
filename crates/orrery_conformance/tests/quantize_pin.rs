@@ -87,6 +87,7 @@ impl CoreCodec for Never {
 struct OffLattice;
 
 impl Ruleset for OffLattice {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Probe;
     type CoreInput = Never;
     type CoreEvent = Never;

@@ -115,6 +115,7 @@ impl CoreCodec for Spawn {
 struct Growing;
 
 impl Ruleset for Growing {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = State;
     type CoreInput = Input;
     type CoreEvent = Spawn;

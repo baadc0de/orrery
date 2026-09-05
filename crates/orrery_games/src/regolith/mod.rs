@@ -687,6 +687,7 @@ impl Regolith {
 }
 
 impl Ruleset for Regolith {
+    const OVERFLOW_IS_CANONICAL: bool = true;
     type CoreState = RegolithState;
     type CoreInput = Order;
     type CoreEvent = Outcome;

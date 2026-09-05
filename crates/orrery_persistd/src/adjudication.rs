@@ -1422,6 +1422,7 @@ mod tests {
         ($name:ident, $version:expr) => {
             struct $name;
             impl Ruleset for $name {
+                const OVERFLOW_IS_CANONICAL: bool = false;
                 type CoreState = Empty;
                 type CoreInput = Empty;
                 type CoreEvent = Empty;

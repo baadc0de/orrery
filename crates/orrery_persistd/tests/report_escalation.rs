@@ -105,6 +105,7 @@ const RETIRED_RULESET: RulesetId = RulesetId {
 struct Counting;
 
 impl Ruleset for Counting {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Tally;
     type CoreInput = Bump;
     type CoreEvent = Nothing;

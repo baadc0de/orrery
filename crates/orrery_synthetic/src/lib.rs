@@ -63,6 +63,7 @@ impl CoreCodec for SyntheticNever {
 pub struct Synthetic;
 
 impl Ruleset for Synthetic {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = SyntheticState;
     type CoreInput = SyntheticNever;
     type CoreEvent = SyntheticNever;

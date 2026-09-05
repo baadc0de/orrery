@@ -54,6 +54,7 @@ impl CoreCodec for NoEvent {
 struct GrowingRuleset;
 
 impl Ruleset for GrowingRuleset {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = GrowingState;
     type CoreInput = NoInput;
     type CoreEvent = NoEvent;

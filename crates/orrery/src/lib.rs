@@ -795,6 +795,7 @@ mod tests {
     struct FacadeRules;
 
     impl Ruleset for FacadeRules {
+        const OVERFLOW_IS_CANONICAL: bool = false;
         type CoreState = FacadeState;
         type CoreInput = FacadeNever;
         type CoreEvent = FacadeNever;

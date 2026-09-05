@@ -618,6 +618,7 @@ mod tests {
     }
 
     impl Ruleset for Walker {
+        const OVERFLOW_IS_CANONICAL: bool = false;
         type CoreState = WalkerState;
         type CoreInput = Never;
         type CoreEvent = Never;
