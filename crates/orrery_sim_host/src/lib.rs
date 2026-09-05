@@ -380,6 +380,9 @@ pub enum HostError {
     /// A snapshot was taken under a different [`RulesetId`] than the host
     /// runs.  Nothing was restored.
     SnapshotRulesetMismatch,
+    /// [`SimulationHost::seat_at`] was called after the host had input
+    /// queued, ran a tick, or held an emitted event.  The host is untouched.
+    HostAlreadyActive,
 }
 
 /// One entity's snapshotted canonical state, keyed by its stable id in a
@@ -903,6 +906,45 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
     #[must_use]
     pub const fn next_tick(&self) -> Tick {
         self.next_tick
+    }
+
+    /// Move an unstepped host's clock to `tick`.
+    ///
+    /// A host fixes its first tick at construction, but a joining client
+    /// does not learn the join tick until its session start message lands,
+    /// which is after [`Self::new`] built the host to hold the population a
+    /// signed anchor was computed over. This re-seats the clock in place
+    /// instead of asking the caller to rebuild the host and reinstall
+    /// everything it held to reach the same state.
+    ///
+    /// That equivalence is also this call's limit: it is sound only while
+    /// the host is exactly what construction left it, so that moving the
+    /// clock is the only difference from building it at `tick` to begin
+    /// with. Once anything has been queued, stepped, or emitted, the two
+    /// paths diverge — a rebuild would drop that activity, and re-seating in
+    /// place would silently relabel the tick it happened on — so this
+    /// refuses instead of choosing between them.
+    ///
+    /// Installed state is unaffected either way: entities installed before
+    /// seating stay installed, each under the observation tick it already
+    /// carries.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::HostAlreadyActive`] if any input is queued
+    /// ([`Self::submit_command_bytes`], [`Self::submit_input`], or
+    /// [`Self::submit_delivered_input`]), a tick has run
+    /// ([`Self::step`] or [`Self::step_predicted`]), or an event has been
+    /// emitted. The host is untouched.
+    pub fn seat_at(&mut self, tick: Tick) -> Result<(), HostError> {
+        if !self.pending_inputs.is_empty()
+            || self.stepped_at.is_some()
+            || !self.emitted_events.is_empty()
+        {
+            return Err(HostError::HostAlreadyActive);
+        }
+        self.next_tick = tick;
+        Ok(())
     }
 
     /// Install canonical state under its stable id.

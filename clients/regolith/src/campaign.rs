@@ -661,9 +661,6 @@ pub struct CampaignRuntime {
     /// left in this driver is input authoring, replication ingest, the wire
     /// and the witness log.
     host: SimulationHost<Regolith, RegolithAdapter>,
-    /// The seed the host was built with, so its clock can be re-seated at the
-    /// tick the lobby admitted this client on. See [`Self::seat_host_at`].
-    seed: UniverseSeed,
     pipeline: IntentPipeline,
     witness_log: InputLogProducer,
     entity: PersistId,
@@ -1017,7 +1014,6 @@ impl CampaignRuntime {
         let mut this = Self::assemble(
             config,
             host,
-            seed,
             pipeline,
             witness_log,
             entity,
@@ -1036,7 +1032,6 @@ impl CampaignRuntime {
     fn assemble(
         config: CampaignConfig,
         host: SimulationHost<Regolith, RegolithAdapter>,
-        seed: UniverseSeed,
         pipeline: IntentPipeline,
         witness_log: InputLogProducer,
         entity: PersistId,
@@ -1086,7 +1081,6 @@ impl CampaignRuntime {
             record_disposition: RecordDisposition::Unfinished,
             config,
             host,
-            seed,
             pipeline,
             witness_log,
             entity,
@@ -1100,24 +1094,16 @@ impl CampaignRuntime {
     ///
     /// The host fixes its first tick at construction and this client does not
     /// learn the join tick until `StartV1` lands, long after `launch` built
-    /// the host to hold the spawn pose the anchor claim was signed over. A
-    /// host that has never stepped is entirely described by its population,
-    /// so re-seating is: build a host at the join tick and re-install what the
-    /// old one held, byte-identically. Nothing is queued or emitted before the
-    /// join — `advance` returns early until the state is `Joined` — so there
-    /// is nothing else to carry across.
+    /// the host to hold the spawn pose the anchor claim was signed over.
+    /// Nothing is queued, stepped or emitted before the join — `advance`
+    /// returns early until the state is `Joined` — so [`SimulationHost::seat_at`]
+    /// always succeeds here; a refusal would mean this driver stepped or
+    /// queued something before the join tick was known, which is itself a
+    /// bug worth panicking on rather than silently rebuilding around.
     fn seat_host_at(&mut self, first_tick: Tick) {
-        let mut seated = new_host(self.seed, first_tick);
-        for entity in self.host.backend().entities().copied().collect::<Vec<_>>() {
-            let observed = self
-                .host
-                .observed_tick(entity)
-                .unwrap_or_else(|| Tick::new(0));
-            if let Some(state) = self.host.backend().state(entity) {
-                seated.install_state_observed(entity, state.clone(), observed);
-            }
-        }
-        self.host = seated;
+        self.host
+            .seat_at(first_tick)
+            .expect("nothing is queued, stepped or emitted before Joined");
     }
 
     /// Take the dial thread's result, if it has landed yet.
