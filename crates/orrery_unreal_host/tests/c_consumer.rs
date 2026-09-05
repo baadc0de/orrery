@@ -3,8 +3,11 @@
 //! As `crates/orrery_sim_host/tests/c_consumer.rs`, with the lesson D53 §"What
 //! this record could not establish" item 3 records applied: this file is
 //! Linux-only by `cfg`, so on any other target it compiles to nothing rather
-//! than failing on `nm`, `.a` naming and a Unix-only C program. The Windows
-//! half of #1043's C-consumer proof needs a Windows host and is not here.
+//! than failing on `nm` and `.a` naming. The C consumer itself is no longer
+//! Unix-only — #1084 ported it to Windows for the nightly `inproc-ipc-windows`
+//! measurement — but this file's build and symbol assertions are, and the
+//! Windows build/link path is proven by `spike-windows.sh` running on a
+//! Windows runner rather than by a `cargo test` that has never had one.
 //!
 //! The profile defaults to `debug` so `cargo test --workspace` pays one crate's
 //! debug build, not a release build of the whole net/predict graph; the

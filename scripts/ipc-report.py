@@ -3,10 +3,18 @@
 
 Reads the observer report `orrery-ipc-bench observer --report ...` writes
 (`schema: orrery-ipc-harness/1`) and prints the phase table, the two
-baselines, and — only for a Windows report — the verdict the issue's bands
-define. A report from any other platform is informational: the bands are
-defined at N = 24 **on Windows**, and a Linux number cannot take the
-sidecar-versus-embedded decision.
+baselines, and — only for a Windows report of the sidecar path — the verdict
+the issue's bands define. Two reports are refused a verdict:
+
+  * one from any other platform, which is informational: the bands are
+    defined at N = 24 **on Windows**, and a Linux number cannot take the
+    sidecar-versus-embedded decision;
+  * one whose `measured_quantity` is not `ipc_added` — the in-process
+    harnesses (#1043, #1052, #1084) reuse this schema and the `ipc_added`
+    key so their number plots against the sidecar's, but they measure the
+    *other* half of the comparison, and a Windows in-process report handed
+    to `classify` would print `SIDECAR STANDS` off a path with no sidecar
+    in it.
 
     python3 scripts/ipc-report.py REPORT.json [SCALING.json]
 
@@ -51,6 +59,12 @@ STANDS = "SIDECAR STANDS"
 OVERTURNED = "SIDECAR OVERTURNED"
 OWNERS_CALL = "OWNER'S CALL"
 INFORMATIONAL = "INFORMATIONAL ONLY — the bands are defined for WINDOWS (#920); this report cannot take the decision"
+NOT_THE_SIDECAR = "NOT A SIDECAR MEASUREMENT — #920's bands are defined on the sidecar's `ipc_added`; this report measures the in-process path and cannot take the decision either way"
+
+# The quantity #920's bands are defined on. A report that measures something
+# else says so in `measured_quantity` (#1043 writes `inproc_added`), and a
+# report that omits the field predates it and is a sidecar report.
+BAND_QUANTITY = "ipc_added"
 
 
 def load_report(path: str) -> dict:
@@ -120,9 +134,23 @@ def input_spawn_drops(report: dict) -> int:
     )
 
 
+def measures_the_sidecar(report: dict) -> bool:
+    """Whether this report measures the quantity #920's bands are drawn on.
+
+    The bands compare a *sidecar* against embedding. An in-process report
+    (#1043, #1052, #1084) reuses the same schema and the same `ipc_added` key
+    so the two numbers render on one graph — which is the point — but it is
+    the other half of the comparison, not a candidate for the verdict.
+    Without this check a Windows in-process report would print `SIDECAR
+    STANDS` off a number the sidecar never paid: the whole path being
+    measured is the one that has no sidecar in it."""
+    return report.get("measured_quantity", BAND_QUANTITY) == BAND_QUANTITY
+
+
 def classify(report: dict) -> str:
-    """The #920 verdict for a Windows report. Not consulted for other
-    platforms, whose reports are informational by definition."""
+    """The #920 verdict for a Windows sidecar report. Not consulted for other
+    platforms, whose reports are informational by definition, nor for a report
+    that measures something other than the sidecar path."""
     phases = report["phases_ns"]
     ipc = phases["ipc_added"]
     p99_us = ipc["p99_ns"] / 1000
@@ -149,7 +177,8 @@ def render(report_path: str, scaling_path: str | None) -> str:
     lines: list[str] = []
 
     platform = report.get("platform", "?")
-    lines.append(f"# Sidecar IPC measurement — {report_path}")
+    kind = "Sidecar IPC" if measures_the_sidecar(report) else "In-process"
+    lines.append(f"# {kind} measurement — {report_path}")
     lines.append(
         f"platform {platform} / {report.get('arch', '?')}, "
         f"clock {report.get('clock', '?')}, transport {report.get('transport', '?')}, "
@@ -201,7 +230,20 @@ def render(report_path: str, scaling_path: str | None) -> str:
     lines.append("")
 
     lines.append("## Verdict")
-    if platform != "windows":
+    ipc_added = phases["ipc_added"]
+    if not measures_the_sidecar(report):
+        lines.append(f"**{NOT_THE_SIDECAR}**")
+        lines.append(
+            f"`{report.get('measured_quantity')}` p50 "
+            f"{ipc_added['p50_ns'] / 1000:.1f} µs, "
+            f"p99 {ipc_added['p99_ns'] / 1000:.1f} µs, "
+            f"p99.9 {ipc_added['p99_9_ns'] / 1000:.1f} µs on {platform}, transport "
+            f"{report.get('transport', '?')} — emitted under the `ipc_added` key so it plots "
+            "against #920's sidecar number, and reported beside it, never as it."
+        )
+        if platform != "windows":
+            lines.append(f"It is also **{INFORMATIONAL}**")
+    elif platform != "windows":
         lines.append(f"**{INFORMATIONAL}**")
         lines.append(
             f"`ipc_added` p50 {phases['ipc_added']['p50_ns'] / 1000:.1f} µs, "
@@ -390,6 +432,38 @@ def self_test() -> None:
     assert "INFORMATIONAL" in linux_text, "a Linux report must be marked informational"
     assert STANDS not in linux_text, "a Linux report must not print the stands verdict"
     assert "WINDOWS" in linux_text, "the platform caveat must be stated"
+
+    # The trap #1084 walks into: an in-process report taken ON WINDOWS, whose
+    # numbers are well inside the stands band. `classify` would call it a
+    # sidecar stand; the renderer must refuse it, because nothing in that
+    # measurement crossed a process boundary.
+    inproc_windows = make_report(platform="windows", p50_us=20, p99_us=44, p999_us=50)
+    inproc_windows["measured_quantity"] = "inproc_added"
+    inproc_windows["transport"] = "inproc-staticlib+app"
+    assert classify(inproc_windows) == STANDS, (
+        "the fixture must be one the bands would otherwise wave through, or "
+        "this test proves nothing"
+    )
+    assert not measures_the_sidecar(inproc_windows), "an inproc report is not a sidecar report"
+    inproc_text = render_report(inproc_windows)
+    assert STANDS not in inproc_text, "an in-process report must never print the stands verdict"
+    assert OVERTURNED not in inproc_text, "nor the overturned one"
+    assert "NOT A SIDECAR MEASUREMENT" in inproc_text, "it must say why it has no verdict"
+
+    # The same report on Linux carries both caveats, not one.
+    inproc_linux = make_report(platform="linux", p50_us=20, p99_us=44, p999_us=50)
+    inproc_linux["measured_quantity"] = "inproc_added"
+    inproc_linux_text = render_report(inproc_linux)
+    assert "NOT A SIDECAR MEASUREMENT" in inproc_linux_text, "the transport caveat"
+    assert "INFORMATIONAL" in inproc_linux_text, "and the platform caveat"
+
+    # A report with no `measured_quantity` predates the field and is the
+    # sidecar's: the verdict must still be reachable, or this guard would have
+    # silently retired #920's own decision.
+    assert measures_the_sidecar(make_report()), "a report without the field is a sidecar report"
+    assert STANDS in render_report(
+        make_report(p50_us=40, p99_us=700, p999_us=3_000)
+    ), "a Windows sidecar report must still take the verdict"
 
     # A report without the phase column is refused: the phase separation is
     # load-bearing, and its absence is how the tick wait sneaks back in.

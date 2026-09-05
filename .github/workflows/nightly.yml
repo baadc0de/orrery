@@ -1566,3 +1566,134 @@ jobs:
             sidecar-ipc-n24-time-period.json
             sidecar-ipc-n24-default-resolution.json
           if-no-files-found: error
+
+  # #1084: the other half of the same comparison, on the same platform.
+  #
+  # `sidecar-ipc-windows` above gives #920 the SIDECAR path on Windows —
+  # `ipc_added` p50 136.6 µs, p99 395.1 µs, p99.9 1,030.2 µs with the timer
+  # resolution raised (docs/data/sidecar-ipc-windows-2026-09-04-n24.json).
+  # What did not exist until this job is the IN-PROCESS number on Windows.
+  # #1042's spikes measured it at p50 20.1 µs (#1069) but on LINUX, and every
+  # one of those reports says so in its own verdict section: the bands are
+  # defined at N = 24 on WINDOWS, so a Linux number cannot take the decision.
+  #
+  # Which prong, and why. This builds `orrery_unreal_host` — D53's **`App`
+  # prong**: a full headless `bevy_app::App` beside the ABI handle — not
+  # `orrery_unreal_direct`, the non-`App` prong (#1052). GD3's chosen
+  # configuration is "App prong, pool-capped, driver-connected", which is on
+  # this side of D53's fork; measuring the prong the owner declined would
+  # produce a Windows number for a shape nobody intends to ship.
+  #
+  # What this number is NOT, stated here as plainly as in the reports:
+  #
+  #   * not GD3's configuration. Nothing here caps a task pool, and nothing
+  #     connects the prediction driver — D53 §5 records that the driver does
+  #     not exist. The `App` sits BESIDE the host handle. That third shape is
+  #     measured by neither spike and the game trail records its numbers as
+  #     owed by the slice.
+  #   * not the in-process Unreal number G10.2 turns on. No UE process, no UE
+  #     task graph, no displayed frame (#744 D.1 stays unproven).
+  #   * not a verdict on #920's bands. Those are defined on the SIDECAR's
+  #     `ipc_added`; `scripts/ipc-report.py` refuses a stand/overturn reading
+  #     on a report whose `measured_quantity` is `inproc_added`, which is what
+  #     this consumer writes. Without that refusal a Windows in-process report
+  #     would print `SIDECAR STANDS` off a path containing no sidecar.
+  #
+  # The reports are uploaded as an artifact and land in `docs/data/` beside
+  # the existing ones by hand, under the names the script already writes:
+  # this workflow has `contents: read` and commits nothing.
+  inproc-ipc-windows:
+    name: inproc-ipc (windows, N=24, App prong)
+    runs-on: windows-latest
+    # Much longer than the sidecar leg's 30, and for one reason: that harness
+    # is Bevy-free, while this staticlib pulls bevy, lightyear and iroh, and a
+    # cold release build of that graph on a hosted Windows runner is the bulk
+    # of the wall clock. The measurement itself is 10 + 10 + 2 minutes.
+    timeout-minutes: 90
+    defaults:
+      run:
+        # Git Bash, like every other Windows leg here.
+        shell: bash
+    permissions:
+      contents: read
+    env:
+      # Defence in depth for the failure that cost the sidecar leg two days:
+      # a redirected stdout on Windows takes the console codepage, cp1252
+      # cannot encode the µ/→/≤/≥ the render prints, and the exception lands
+      # AFTER the measurement has run. `scripts/ipc-report.py` reconfigures
+      # its own stdout to UTF-8 since #1027; this makes the interpreter's
+      # default agree, so nothing the script did not reconfigure can reopen
+      # the same hole.
+      PYTHONUTF8: "1"
+      # `spike-windows.sh` exports this too, and it must hold for anything the
+      # job runs directly: `CARGO_TERM_COLOR: always` in this workflow's `env`
+      # (line 144) leaks an ANSI reset into rustc's `native-static-libs` note,
+      # so the parsed link line ends in a library name carrying an escape and
+      # the C driver reports a library it cannot find — which is untrue, and
+      # sends the reader after link flags that are correct (#1077, #1080).
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out with LF line endings
+        run: git config --global core.autocrlf input
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      # The registry only, not `target`. A release build of this graph is
+      # several GB of build output and would not survive the repository's
+      # cache budget; the crate downloads are what is actually worth keeping.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: inproc-ipc-windows-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: inproc-ipc-windows-
+      # One script, so the measurement CI takes and the measurement a person
+      # takes by hand cannot drift apart. It builds the staticlib, reads the
+      # link line from rustc rather than assuming it, links the C consumer
+      # with clang (the LLVM the runner image ships, targeting MSVC), and runs
+      # the three benches. It refuses to run on anything but a Windows kernel:
+      # a Wine or Proton host would stamp `platform: windows` on a Linux
+      # measurement, which is the banking lie #1084 names for the P4 ledger.
+      # The date label is fixed once, here, and reused by the render step: a
+      # run that starts before midnight UTC and renders after it would
+      # otherwise look for reports under a date nothing wrote.
+      - name: Build, link and measure
+        run: |
+          set -euo pipefail
+          date_label=$(date -u +%F)
+          echo "REPORT_DATE=$date_label" >> "$GITHUB_ENV"
+          mkdir -p reports
+          ORRERY_SPIKE_OUT_DIR=reports \
+            ./crates/orrery_unreal_host/spike-windows.sh "$date_label"
+      - name: Render the reports into the summary
+        run: |
+          set -euo pipefail
+          base="reports/inproc-windows-$REPORT_DATE-n24"
+          {
+            echo '# In-process predicted-tick latency (windows, N = 24, App prong)'
+            echo
+            echo 'The App prong of D53 fork, reported BESIDE #920 sidecar verdict and'
+            echo 'never as it. Not GD3 pool-capped, driver-connected configuration.'
+            echo
+            python3 scripts/ipc-report.py "$base-time-period.json"
+            echo
+            echo '## Control: the host alone, no App (timeBeginPeriod raised)'
+            echo
+            python3 scripts/ipc-report.py "$base-no-app-time-period.json"
+            echo
+            echo '## Timer-granularity reference (default resolution)'
+            echo
+            python3 scripts/ipc-report.py "$base-default-resolution.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # `always()`, for the same reason the sidecar leg above carries it: the
+      # samples are the evidence and the summary is the comfort. Twenty-two
+      # minutes of measurement must not be hostage to the prettiest step of
+      # the job. A failed render stays a failed step, so the job reads red.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: inproc-ipc-windows
+          path: reports/*.json
+          if-no-files-found: error
