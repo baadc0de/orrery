@@ -5,7 +5,7 @@ program with a new chooser seed, so a bad critic verdict cannot drag the assembl
 usage: iterate.py <out_dir> [--passes N] [--project P] [--concept PNG]"""
 import argparse, json, os, shutil, subprocess, sys, time
 K = os.path.dirname(os.path.abspath(__file__)); S = os.path.join(K, "..", "spikes", "ortho-callouts"); M = os.path.expanduser("~/assets/kitops/Orrery_Masterfolder")
-ap = argparse.ArgumentParser(); ap.add_argument("out"); ap.add_argument("--passes", type=int, default=3); ap.add_argument("--project", required=True); ap.add_argument("--concept", default=os.path.join(S, "out", "escort-pro-concept.png"))
+ap = argparse.ArgumentParser(); ap.add_argument("out"); ap.add_argument("--passes", type=int, default=3); ap.add_argument("--project", default=os.environ.get("VERTEX_PROJECT"), help="Vertex project; env VERTEX_PROJECT"); ap.add_argument("--concept", default=os.path.join(S, "out", "escort-pro-concept.png"))
 ap.add_argument("--tolerance", type=float, default=1.0); ap.add_argument("--budget", type=int, default=6000); ap.add_argument("--views", default="hero,side,top,belly"); a = ap.parse_args()
 O = os.path.abspath(a.out); best_dir = os.path.join(O, "best"); os.makedirs(best_dir, exist_ok=True); views = a.views.split(",")
 def sh(cmd, quiet=True, **kw):
