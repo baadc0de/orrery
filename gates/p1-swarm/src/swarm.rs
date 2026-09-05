@@ -3136,10 +3136,6 @@ impl Swarm {
             }
         }
 
-        // Drain anything the jitter model is still holding. A packet due after
-        // the last tick is an artefact of stopping the clock mid-flight, not a
-        // link that fails to deliver — but a link that is *still* holding work
-        // after the drain is the latter, which is why the clause survives.
         if std::env::var_os("P1_SWARM_PHASES").is_some() {
             let names = [
                 "step",
@@ -3156,7 +3152,21 @@ impl Swarm {
                 );
             }
         }
-        let _ = self.deliver_due_all(ticks + u64::from(self.config.impairment.jitter_ticks) + 1);
+        // Drain anything the impairment model is still holding. A packet due
+        // after the last tick is an artefact of stopping the clock mid-flight,
+        // not a link that fails to deliver — but a link that is *still* holding
+        // work after the drain is the latter, which is why the clause survives.
+        //
+        // The horizon is the model's own worst case for one packet
+        // (`Router::max_delivery_delay_ticks`), not the jitter width it used to
+        // be: a stream message is charged a round trip per lost segment as well
+        // as the jitter spike, so one offered in the last ticks of a run could
+        // be due past a jitter-width horizon and be left stranded by the drain
+        // rather than by the link (#1080). `ticks - 1` is the last tick anything
+        // was offered on, so everything the model accepted is due by the end of
+        // one worst case measured from there.
+        let horizon = (ticks + self.router.max_delivery_delay_ticks()).saturating_sub(1);
+        let _ = self.deliver_due_all(horizon);
         self.report(ticks, late_join)
     }
 
@@ -6985,6 +6995,39 @@ mod tests {
         assert!(
             saw_far_departure,
             "the test must still exercise a genuine AOI departure after interaction range"
+        );
+    }
+
+    /// #1080: the nightly P4 accumulation leg failed "the link drains" on two
+    /// platforms at once with two packets in flight, and this is the run that
+    /// reproduces it in five simulated seconds.
+    ///
+    /// The parameters are the accumulation leg's own, minus the hour: the
+    /// witnessed, impaired pipeline at a point of the criterion's 3-5% band,
+    /// on a seed whose last ticks offer a stream message unlucky enough to be
+    /// charged a retransmission. Before the fix, `run()` drained to the jitter
+    /// width and left that message in flight; the criterion then reported a
+    /// link that fails to deliver, when what failed was the drain.
+    ///
+    /// Two platforms failing byte-identically is the tell that this is a
+    /// function of the seed and not a flake: the harness is a pure function of
+    /// its parameters, so the same (seed, loss) strands the same packets
+    /// everywhere. That is also why this test can be a unit test at all.
+    #[test]
+    fn a_retransmitted_stream_message_in_the_last_ticks_does_not_strand() {
+        let report = Swarm::new(SwarmConfig {
+            peers: 8,
+            seconds: 5,
+            impairment: crate::router::Impairment::p4_profile_at_loss(0.05),
+            seed: 12,
+            witnessing: true,
+            ..SwarmConfig::default()
+        })
+        .run();
+        assert_eq!(
+            report.stranded_in_flight, 0,
+            "the run ended with the link still holding work; the drain horizon \
+             must cover everything the impairment model scheduled",
         );
     }
 

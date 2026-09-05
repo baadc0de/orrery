@@ -549,6 +549,34 @@ impl Router {
         out
     }
 
+    /// The longest a packet accepted on one tick can be held before it is due,
+    /// under this impairment.
+    ///
+    /// This is the horizon a run has to drain to before "still in flight" means
+    /// anything. A datagram is only ever held for the jitter spike, and that is
+    /// the number the final drain used to use — but a stream message is not a
+    /// datagram: [`Self::accept_stream`] charges it a round trip per lost
+    /// segment on top of its own one-tick delivery, and may charge the jitter
+    /// spike as well. A message offered in the last few ticks of a run and
+    /// unlucky on both draws is therefore due *after* a jitter-width horizon,
+    /// and stopping the clock there strands it — which reads as the link
+    /// failing to deliver when it is the drain that stopped early (#1080).
+    ///
+    /// Head-of-line blocking on a `Shared` stream is deliberately not in this
+    /// number. That is a queue behind an earlier message, not a delay this
+    /// model imposed on the packet itself: a link still holding work that far
+    /// past its own worst case is a backlog, and the clause exists to say so.
+    #[must_use]
+    pub fn max_delivery_delay_ticks(&self) -> u64 {
+        let jitter = u64::from(self.impairment.jitter_ticks);
+        // `accept_stream`: `tick + 1`, plus a round trip per retransmission of
+        // the worst segment, plus the jitter spike.
+        let stream =
+            1 + u64::from(MAX_RETRANSMITS) * u64::from(self.impairment.retransmit_ticks) + jitter;
+        // `schedule`: a delayed datagram is due `tick + jitter_ticks`.
+        stream.max(jitter)
+    }
+
     /// Packets still in flight — a run must not end with the link holding work.
     #[must_use]
     pub fn in_flight(&self) -> usize {
@@ -680,6 +708,78 @@ mod tests {
         assert!(router.deliver_due(5).is_empty(), "still held");
         assert_eq!(router.deliver_due(6).len(), 1, "arrives on time, late");
         assert_eq!(router.counters.dropped, 0);
+    }
+
+    #[test]
+    fn the_drain_horizon_covers_a_retransmitted_stream_message() {
+        // #1080. The final drain used to run to the jitter width, which is the
+        // worst a *datagram* can be held for. A stream message is charged a
+        // round trip per lost segment on top of its own tick and may take the
+        // jitter spike as well, so at the end of a run one of those is due past
+        // a jitter-width horizon and the drain leaves it in flight — which the
+        // criterion reads as the link failing to deliver.
+        let impairment = Impairment {
+            // Every segment draw fails, so the model charges its ceiling of
+            // retransmissions: the worst case this horizon has to cover.
+            loss: 1.0,
+            jitter_ticks: 6,
+            jitter_rate: 1.0,
+            retransmit_ticks: 3,
+        };
+        let mut router = Router::new(impairment, 11);
+        let last_tick = 1_799;
+        router.accept_stream(
+            last_tick,
+            node(1),
+            0,
+            StreamMode::Bulk,
+            Bytes::from_static(b"a control message offered on the run's last tick"),
+        );
+
+        let jitter_only_horizon = last_tick + u64::from(impairment.jitter_ticks) + 1;
+        assert_eq!(
+            router.deliver_due(jitter_only_horizon).len(),
+            0,
+            "the pre-#1080 horizon is the bug: this message is not due yet"
+        );
+        assert_eq!(
+            router.in_flight(),
+            1,
+            "and the drain would have stranded it"
+        );
+
+        let horizon = last_tick + router.max_delivery_delay_ticks();
+        assert_eq!(
+            router.deliver_due(horizon).len(),
+            1,
+            "the model's own worst case covers everything the model scheduled"
+        );
+        assert_eq!(router.in_flight(), 0);
+    }
+
+    #[test]
+    fn no_accepted_packet_is_ever_due_past_the_drain_horizon() {
+        // The general form of the clause above, over the impairment the
+        // nightly legs actually run and both lanes the swarm actually uses.
+        // Head-of-line blocking is deliberately excluded — a `Shared` message
+        // queued behind another is a backlog, and "the link drains" exists to
+        // catch that.
+        for loss in [0.03, 0.04, 0.05] {
+            let impairment = Impairment::p4_profile_at_loss(loss);
+            let mut router = Router::new(impairment, 5);
+            let horizon_delay = router.max_delivery_delay_ticks();
+            for tick in 0..2_000 {
+                router.accept(tick, node(1), 0, packet());
+                router.accept_stream(tick, node(2), 0, StreamMode::Bulk, packet());
+                let _ = router.deliver_due(tick + horizon_delay);
+                assert_eq!(
+                    router.in_flight(),
+                    0,
+                    "at {loss} loss a packet offered on tick {tick} was still \
+                     held {horizon_delay} ticks later",
+                );
+            }
+        }
     }
 
     #[test]
