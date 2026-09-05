@@ -28,7 +28,10 @@ def critique(i):
             "--zones", f"{O}/zones.json", "--assembly", f"{O}/assembly.json", "--atlas", f"{O}/hull_atlas.json", "--out", f"{O}/zones.next.json"])
     for l in r.stdout.splitlines(): print("   ", l)
     if r.returncode: print(r.stderr[-1200:]); return None
-    Z = json.load(open(f"{O}/zones.next.json")); return Z["critiques"][-1]["score"]
+    Z = json.load(open(f"{O}/zones.next.json")); c = Z["critiques"][-1]; pz = [p for p in c.get("per_zone", []) if p.get("verdict")]
+    good = sum(1 for p in pz if p["verdict"] == "good") / len(pz) if pz else c["score"]
+    eff = round(0.5 * c["score"] + 0.5 * good, 3); c["score_eff"] = eff; json.dump(Z, open(f"{O}/zones.next.json", "w"), indent=1)
+    print(f"    score_eff {eff} (critic {c['score']}, good zones {good:.2f})"); return eff
 def snapshot(tag):
     for f in ["zones.json", "choices.json", "assembly.json"] + [f"render-{v}.png" for v in views]:
         if os.path.exists(f"{O}/{f}"): shutil.copy(f"{O}/{f}", f"{O}/{tag}-{f}")

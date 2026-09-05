@@ -10,7 +10,7 @@ SCHEMA = {"type": "object", "properties": {"overall": {"type": "string"}, "score
   "zone": {"type": "string"}, "present": {"type": "boolean"}, "verdict": {"type": "string", "enum": ["good", "wrong_part", "wrong_size", "wrong_place", "wrong_orientation", "missing"]}}, "required": ["zone", "present", "verdict"]}},
   "adjust": {"type": "array", "items": {"type": "object", "properties": {
   "zone": {"type": "string"}, "action": {"type": "string", "enum": ["keep", "scale", "count", "move", "rotate", "replace", "drop", "add"]}, "scale_factor": {"type": "number"}, "count_delta": {"type": "integer"},
-  "yaw_deg": {"type": "integer"}, "region": {"type": "string"}, "anchor": {"type": "array", "items": {"type": "number"}}, "tags": {"type": "array", "items": {"type": "string"}}, "count": {"type": "integer"}, "size_m": {"type": "number"}, "prim": {"type": "string", "enum": ["skid", "nozzle", "box", "pipe_run"]}, "why": {"type": "string"}}, "required": ["zone", "action", "why"]}}}, "required": ["overall", "score", "per_zone", "adjust"]}
+  "yaw_deg": {"type": "integer"}, "region": {"type": "string"}, "anchor": {"type": "array", "items": {"type": "number"}}, "tags": {"type": "array", "items": {"type": "string"}}, "count": {"type": "integer"}, "size_m": {"type": "number"}, "prim": {"type": "string", "enum": ["skid", "nozzle", "box", "pipe_run"]}, "carve": {"type": "boolean"}, "why": {"type": "string"}}, "required": ["zone", "action", "why"]}}}, "required": ["overall", "score", "per_zone", "adjust"]}
 ap = argparse.ArgumentParser(); ap.add_argument("--project", required=True); ap.add_argument("--model", default="gemini-3.1-pro-preview"); ap.add_argument("--concept", required=True)
 ap.add_argument("--renders", nargs="+", required=True); ap.add_argument("--id-renders", nargs="*", default=[]); ap.add_argument("--zones", required=True); ap.add_argument("--assembly", required=True); ap.add_argument("--atlas", required=True); ap.add_argument("--out", required=True); a = ap.parse_args()
 Z = json.load(open(a.zones)); A = json.load(open(a.assembly)); atlas = json.load(open(a.atlas)); legend = A.get("id_colors", {})
@@ -31,7 +31,8 @@ Then give adjustments, at most 8, only where the render clearly disagrees with t
 - "replace" when the part's shape is wrong: say in why what silhouette the chooser should look for instead (this text is handed to the part chooser).
 - "scale" with scale_factor 0.5..2.0 (or an absolute size_m) when the shape is right but the size is off.
 - "rotate" with yaw_deg (90, 180, 270) when the part is right but spun on the hull.
-- "move" with an "anchor" [x, y] (preferred; use the top/belly renders as the map) and/or a new region; "count" with count_delta; "drop" only when the feature should not exist at all; "add" for a missing feature (region, tags, count, size_m).
+- "move" with an "anchor" [x, y] (preferred; use the top/belly renders as the map) and/or a new region; "count" with count_delta; "drop" only when the feature should not exist at all; "add" for a missing feature (region, tags, count, size_m, and ALWAYS an anchor).
+- "carve": true on a replace/scale/move when the hull's own lump under this zone should be cut away so the part replaces it instead of sitting on top of it.
 PRIMITIVES: the library has no landing skids and no long straight piping. When the same silhouette has been requested before and the library keeps failing, request a procedural stand-in instead: set "prim" on a replace or add: "skid" (ski bar with struts, size_m = length), "nozzle" (engine cylinder with recessed cone, size_m = diameter), "box" (bevelled box, size_m = length), "pipe_run" (count parallel pipes following the skin, size_m = run length, on connect zones or an anchored zone). A zone with a prim keeps it until you replace it without one.
 Prefer replace over drop. Give an overall 0..1 fidelity score (1 = a modeller would accept it as a blockout of the concept) and a two-sentence overall note."""
 parts = [{"text": prompt}, {"text": "CONCEPT:"}, img(a.concept)]
@@ -47,6 +48,7 @@ Z2 = copy.deepcopy(Z); byname = {z["name"]: z for z in Z2["zones"]}
 drops = 0
 for adj in C["adjust"]:
     z = byname.get(adj["zone"]); act = adj["action"]
+    if z and adj.get("carve") is not None: z["carve"] = bool(adj["carve"])
     if act == "scale" and z:
         if adj.get("size_m") and z.get("size_m"): f = (adj["size_m"] / z["size_m"]) ** 0.5
         else: f = max(0.5, min(2.0, adj.get("scale_factor", 1.0))) ** 0.5  # damped: half the requested change in log space, so passes converge instead of oscillating

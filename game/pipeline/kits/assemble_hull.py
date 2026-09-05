@@ -6,6 +6,10 @@ from mathutils import Vector, Matrix
 a = sys.argv[sys.argv.index("--")+1:]; master, hullf, zpath, cpath, out = a[0], a[1], a[2], a[3], os.path.abspath(a[4]); seed = int(a[5]) if len(a) > 5 else 7; budget = int(a[6]) if len(a) > 6 else 6000
 random.seed(seed); os.makedirs(out, exist_ok=True); Z = json.load(open(zpath)); C = json.load(open(cpath)) if cpath != "-" and os.path.exists(cpath) else {}
 bpy.ops.wm.open_mainfile(filepath=os.path.abspath(hullf), load_ui=False); sc = bpy.context.scene; hull = bpy.data.objects["hull"]
+# the voxel-remeshed hull has slits and pinholes that render as dark vents; close them (bounded so a real opening like an intake stays)
+_bm = bmesh.new(); _bm.from_mesh(hull.data); _open = [e for e in _bm.edges if e.is_boundary]
+if _open: bmesh.ops.holes_fill(_bm, edges=_open, sides=24)
+_bm.to_mesh(hull.data); _bm.free(); hull.data.update()
 SIDES = ["top", "belly", "flank", "nose", "tail"]; LONGS = ["fore", "mid", "aft"]; LATS = ["inner", "outer"]
 lib = {}
 for kp in sorted(glob.glob(os.path.join(master, "*"))):
@@ -168,6 +172,28 @@ for z in Z["zones"]:
             ty = Vector((0, 1, 0)); t = ty if abs(ty.dot(nn)) < 0.9 else Vector((0, 0, 1))
         tt = (t - nn * t.dot(nn)).normalized(); bb = nn.cross(tt)
         slot = span / k
+        carve = z.get("carve", z.get("prim") in ("skid", "box"))
+        if carve:
+            # is the mount point on a lump? median skin height on a ring around it, against the mount point
+            sd0 = z["region"].split(".")[0]; fx = e["dims"][0] * (z.get("size_m", 1.0) / max(1e-6, max(e["dims"])) if not z.get("prim") else 1.0); fy = e["dims"][1] * (z.get("size_m", 1.0) / max(1e-6, max(e["dims"])) if not z.get("prim") else 1.0)
+            R = 1.2 * max(fx, fy, 0.3); offs = []
+            for j in range(12):
+                ang = 2 * math.pi * j / 12; q = pos + tt * (R * math.cos(ang)) + bb * (R * math.sin(ang)); hp, _ = skin_hit(sd0, q)
+                if hp is not None: offs.append((hp - pos).dot(nn))
+            offs.sort(); base = offs[len(offs) // 2] if offs else 0.0
+            lump_ok = len(offs) >= 9 and -0.08 > base >= -(0.5 * max(fx, fy) + 0.15) and sd0 not in ("nose", "tail")   # a lump is part-sized; a taper (nose, tail) is not a lump
+            if lump_ok:   # ring sits lower than the mount point: a lump. Drop to base level and cut the lump above it.
+                pos = pos + nn * base
+                cut = bpy.data.objects.new(f"cut_{z['name']}_{i}", bpy.data.meshes.new("cut")); sc.collection.objects.link(cut); cbm = bmesh.new(); bmesh.ops.create_cube(cbm, size=1.0); cbm.to_mesh(cut.data); cbm.free()
+                cut.matrix_world = Matrix.Translation(pos + nn * 1.5) @ Matrix((tt, bb, nn)).transposed().to_4x4() @ Matrix.Diagonal((fx * 1.15, fy * 1.15, 3.0, 1.0))
+                cut2 = cut.copy(); cut2.data = cut.data.copy(); sc.collection.objects.link(cut2); cut2.matrix_world = Matrix.Diagonal((-1, 1, 1, 1)) @ cut.matrix_world   # both sides; the part itself is mirrored later
+                for c2 in (cut, cut2):
+                    md = hull.modifiers.new("carve", 'BOOLEAN'); md.operation = 'DIFFERENCE'; md.object = c2; md.solver = 'EXACT'
+                    bpy.context.view_layer.objects.active = hull; bpy.ops.object.modifier_apply(modifier=md.name)
+                for c2 in (cut, cut2): bpy.data.objects.remove(c2, do_unlink=True)
+                graph.append({"zone": z["name"], "carved": True, "depth_m": round(-base, 3)})
+                if z.get("prim") == "skid":   # the lump was the concept's skid: the ski hangs where the lump's surface was, not in the recess
+                    bpy.data.objects.remove(o, do_unlink=True); z["drop_m"] = round(-base + 0.05, 3); dims = [1, 1, 1]; o = prim_object(z, dims); e = {"name": "prim:skid", "dims": dims, "below": 0.0, "kit": "procedural"}
         if z.get("prim"): s_fit = 1.0
         elif z.get("size_m"): s_fit = z["size_m"] / max(1e-6, max(e["dims"]))  # absolute size from the program
         else: s_fit = random.uniform(*z["scale"]) * min(slot / max(1e-6, e["dims"][0]), cross / max(1e-6, e["dims"][1]))

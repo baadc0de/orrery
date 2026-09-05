@@ -27,7 +27,7 @@ for kp in sorted(glob.glob(os.path.join(a.master, "*"))):
     if not os.path.exists(fp): continue
     F = json.load(open(fp)); L = json.load(open(lp)) if os.path.exists(lp) else {}
     for n, f in F.items():
-        l = L.get(n, {}); lib.append({"name": n, "png": os.path.join(kp, n + ".png"), "tags": l.get("tags", []), "note": l.get("note", ""), "conf": l.get("confidence", 0), "planar": f["planar_fraction"], "below": f.get("below_plane", 0), "dims": f["dims"], "attach": f.get("attach", ["surface"])})
+        l = L.get(n, {}); lib.append({"name": n, "png": os.path.join(kp, n + ".png"), "tags": l.get("tags", []), "note": l.get("note", ""), "zone": l.get("zone"), "conf": l.get("confidence", 0), "planar": f["planar_fraction"], "below": f.get("below_plane", 0), "dims": f["dims"], "attach": f.get("attach", ["surface"])})
 # 1. locate every zone's feature in the concept once (Gemini box convention: [ymin, xmin, ymax, xmax] in 0..1000)
 crops = {}
 boxes_path = os.path.splitext(a.out)[0] + ".boxes.json"
@@ -77,7 +77,7 @@ for z in Z["zones"]:
     flat = any(t in FLAT for t in z["tags"]); need_sock = z["type"] == "connect"; excl = set(z.get("exclude", []))
     tags = set(z["tags"]); wide = tags | {n for t in tags for n in NEIGH.get(t, [])}
     words = {w.strip(".,;:()\"'").lower() for w in z.get("hint", "").split()} - STOP if z.get("hint") else set(); words = {w for w in words if len(w) > 3}
-    ok = lambda x: x["name"] not in used and x["name"] not in excl and (not need_sock or "sockets" in x["attach"])
+    ok = lambda x: x["name"] not in used and x["name"] not in excl and (not need_sock or "sockets" in x["attach"]) and (not x.get("zone") or x["zone"] == z["name"])
     base = [x for x in lib if ok(x) and tags & set(x["tags"])]
     if z.get("hint") or len(base) < 24: base += [x for x in lib if ok(x) and x not in base and (wide & set(x["tags"]) or any(w in x["note"].lower() for w in words))]
     if not base: base = [x for x in lib if ok(x)]   # exclusions exhausted the tag pool: open the whole library
