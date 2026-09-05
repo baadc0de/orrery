@@ -480,7 +480,7 @@ mod tests {
         let mut local = crate::LocalSession::default();
         // 24 m inside the block's high face, wherever that face now is.
         for (entity, x) in [(inland, 0.0), (at_edge, (2.0 * EDGE - 24.0) as f64)] {
-            local.executor.insert(
+            local.host.install_state(
                 entity,
                 orrery_games::regolith::state::RegolithState::Rock(Rock::spawned(
                     RockTier::Large,
