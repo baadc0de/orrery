@@ -59,8 +59,17 @@ fn build_staticlib(library_dir: &Path, profile: &str) -> Vec<String> {
         args.push("--release");
     }
     args.extend(["--", "--print", "native-static-libs"]);
+    // The link line is *parsed* out of this stderr, so it must not be
+    // decorated. The workflows set `CARGO_TERM_COLOR: always`
+    // (`.github/workflows/nightly.yml:144`), which survives the pipe: rustc
+    // then ends its `native-static-libs` note with a reset, the last token
+    // parses as `-lc\x1b[0m`, and the C driver is asked for a library whose
+    // name carries an escape -- reported as the invisible
+    // `/usr/bin/ld: cannot find -lc: No such file or directory`. Forced off
+    // here, as `scripts/fdb-tests.sh:508` does for the same reason.
     let output = Command::new(&cargo)
         .args(&args)
+        .env("CARGO_TERM_COLOR", "never")
         .output()
         .expect("run cargo rustc for the staticlib");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -128,16 +137,6 @@ fn build_staticlib(library_dir: &Path, profile: &str) -> Vec<String> {
             "the archive carries no symbol from `{absent}`"
         );
     }
-    // `-lc` comes back in `--print native-static-libs`, and on a cold hosted
-    // runner passing it to the C driver fails the link outright:
-    //
-    //     /usr/bin/ld: cannot find -lc: No such file or directory
-    //
-    // The driver supplies the C library itself, so naming it again buys
-    // nothing and costs the whole workspace test run on any box without a
-    // static libc. The remaining duplicates rustc emits are deliberate --
-    // link order matters for the rest -- so only `-lc` is removed.
-    let native: Vec<String> = native.into_iter().filter(|lib| lib != "-lc").collect();
     native
 }
 
