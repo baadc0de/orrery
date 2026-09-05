@@ -2931,6 +2931,37 @@ async fn pushed_lease(connection: &lanes::GatewayLanes, within: Duration) -> Opt
     }
 }
 
+/// Read an authority counter once the registrar has finished the push a test
+/// just watched land, and report what it settled on.
+///
+/// These counters are deliberately recorded *after* the message is on the
+/// wire, because until `notify` reports it delivered there is nothing to
+/// count: `hand_to` only knows a reassignment happened in its
+/// `LeaseClaimCompletion::Granted` arm once the push succeeded
+/// (`gateway.rs`), and `record_divest_requested` sits behind the same
+/// `delivered` check. So a test that takes the message off its own socket is
+/// by construction racing the registrar task's next line, and on a loaded
+/// runner it wins — this is the nightly `fdb-gated tests` failure, and it
+/// reproduces on any commit by running the gateway suite eight-up.
+///
+/// Polling weakens nothing. The caller still asserts the exact count; it just
+/// reads it after the increment it is entitled to, instead of before.
+async fn settled_authority_count(
+    server: &GatewayServer,
+    want: u64,
+    read: impl Fn(&orrery_persistd::AuthoritySnapshot) -> u64,
+    within: Duration,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let seen = read(&server.authority_metrics().snapshot());
+        if seen >= want || tokio::time::Instant::now() >= deadline {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// A two-peer authority fixture: one seeded entity, both peers authenticated
 /// with coordinator interest covering its cell.
 struct HandoffFixture {
@@ -3072,7 +3103,13 @@ fn disconnected_holder_lease_is_reassigned_to_an_interested_peer() {
         assert!(successor_lease_id > lease_id);
         assert_eq!(prev_holder, Some(node(1)));
         assert_eq!(
-            fixture.server.authority_metrics().snapshot().reassigned,
+            settled_authority_count(
+                &fixture.server,
+                1,
+                |snapshot| snapshot.reassigned,
+                Duration::from_secs(5)
+            )
+            .await,
             1,
             "the reassignment is counted"
         );
@@ -4130,7 +4167,16 @@ fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
         assert_eq!(claim_id, orrery_protocol::ClaimId::REGISTRAR);
         assert!(successor_lease_id > lease_id);
         assert_eq!(prev_holder, Some(node(1)));
-        assert_eq!(server.authority_metrics().snapshot().reassigned, 1);
+        assert_eq!(
+            settled_authority_count(
+                &server,
+                1,
+                |snapshot| snapshot.reassigned,
+                Duration::from_secs(5)
+            )
+            .await,
+            1
+        );
 
         server.shutdown().await;
     });
@@ -4305,11 +4351,13 @@ fn a_strong_claim_asks_the_holder_to_divest_instead_of_refusing_the_claimant() {
             }
         );
         assert_eq!(
-            fixture
-                .server
-                .authority_metrics()
-                .snapshot()
-                .divest_requested,
+            settled_authority_count(
+                &fixture.server,
+                1,
+                |snapshot| snapshot.divest_requested,
+                Duration::from_secs(5)
+            )
+            .await,
             1
         );
 
