@@ -7148,6 +7148,7 @@ dependencies = [
  "orrery_games",
  "orrery_predict",
  "orrery_protocol",
+ "orrery_sim_host",
  "rand_core 0.9.5",
  "reqwest",
  "serde",
@@ -7165,6 +7166,15 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "toml",
+]
+
+[[package]]
+name = "orrery_sim_host"
+version = "0.1.0"
+dependencies = [
+ "bevy_ecs",
+ "orrery_core",
+ "orrery_protocol",
 ]
 
 [[package]]

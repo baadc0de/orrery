@@ -130,6 +130,7 @@ use orrery_games::{
     Game, Regolith,
 };
 use orrery_protocol::{CellId, PersistId, Tick, UniverseSeed};
+use orrery_sim_host::{Delivery, RulesetAdapter, SimulationHost, SimulationHostConfig, TickCount};
 use telemetry::{JsonlTelemetry, OverlayMetrics, SessionScope};
 
 const PLAYER: PersistId = PersistId::new(1);
@@ -407,26 +408,46 @@ fn capture_zoom_extreme_frames(
 /// ([`campaign::CampaignRuntime`]) to have run.
 #[derive(Resource)]
 pub struct LocalSession {
-    /// The in-process executor holding both seats of the offline duel.
-    pub executor: Executor<Regolith>,
+    /// The kernel-owned fixed-step host holding both seats of the offline duel.
+    ///
+    /// The host owns the clock, the sealed input buffer, the tick-boundary
+    /// population and the delivery routing that this client used to step by
+    /// hand (A18 S6.a). What is left here is input authoring and presentation.
+    pub host: SimulationHost<Regolith, RegolithAdapter>,
     human: IntentPipeline,
     bot: IntentPipeline,
-    pending: BTreeMap<PersistId, Vec<Order>>,
-    tick: Tick,
+}
+
+/// Routes Regolith's own outcome deliveries back into the host's input buffer.
+///
+/// The rule is `Regolith::deliver`, unchanged and not re-stated here: this is
+/// only the shape adaptation between the ruleset's `(recipient, order)` pair
+/// and the host's named [`Delivery`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegolithAdapter;
+
+impl RulesetAdapter<Regolith> for RegolithAdapter {
+    fn deliver(&self, event: &Outcome) -> Option<Delivery<Order>> {
+        Regolith::honest()
+            .deliver(event)
+            .map(|(recipient, order)| Delivery::new(recipient, order))
+    }
 }
 
 impl Default for LocalSession {
     fn default() -> Self {
         let game = Regolith::honest();
-        let mut executor = Executor::new(game, SEED);
-        executor.insert(PLAYER, game.spawn(PLAYER, 0));
-        executor.insert(OPPONENT, game.spawn(OPPONENT, 1));
+        let mut host = SimulationHost::new(
+            SimulationHostConfig::new(SEED).starting_at(Tick::new(1_000_000)),
+            game,
+            RegolithAdapter,
+        );
+        host.install_state(PLAYER, game.spawn(PLAYER, 0));
+        host.install_state(OPPONENT, game.spawn(OPPONENT, 1));
         Self {
-            executor,
+            host,
             human: IntentPipeline::new(SEED, PLAYER, 0, vec![OPPONENT]),
             bot: IntentPipeline::new(SEED, OPPONENT, 1, vec![PLAYER]),
-            pending: BTreeMap::new(),
-            tick: Tick::new(1_000_000),
         }
     }
 }
@@ -452,7 +473,7 @@ impl ActiveSession {
     #[must_use]
     pub fn executor(&self) -> &Executor<Regolith> {
         match self {
-            Self::Local(local) => &local.executor,
+            Self::Local(local) => local.host.backend(),
             Self::Campaign(runtime) => runtime.executor(),
         }
     }
@@ -1391,13 +1412,16 @@ fn drive_core(
     }
     match &mut *session {
         ActiveSession::Local(local) => {
-            let tick = local.tick;
+            // The host owns the clock; the driver reads it rather than
+            // keeping a second copy that could disagree with it.
+            let tick = local.host.next_tick();
             // One pipeline, one codec path: what the keyboard ships is what a
             // bot's pilot would have produced with these gates applied
             // (`human_full_controls_match_bot_order_bytes` pins it).
             let packet = local.human.human_packet(tick, controls);
-            let mut human = local.pending.remove(&PLAYER).unwrap_or_default();
-            human.extend(decode_packet(&packet).expect("the local codec produced valid orders"));
+            for order in decode_packet(&packet).expect("the local codec produced valid orders") {
+                local.host.submit_input(PLAYER, order);
+            }
             window.intents = window.intents.saturating_add(packet.orders.len() as u64);
             if let Err(error) = sink.append_orders(&packet, SessionScope::Local) {
                 error!("cannot append Regolith order packet: {error}");
@@ -1407,29 +1431,32 @@ fn drive_core(
             } else {
                 window.idle_ticks = 0;
             }
-            let mut bot = local.pending.remove(&OPPONENT).unwrap_or_default();
-            bot.extend(local.bot.bot_orders(tick));
-            let mut delivered = BTreeMap::<PersistId, Vec<Order>>::new();
-            let mut emitted = Vec::<Outcome>::new();
-            // Counted from the steps this loop makes, not from the length of
-            // the array it iterates: local practice advances both craft
-            // itself, and that is what the predicted set is here (#1029).
-            window.predicted = 0;
-            for (entity, orders) in [(PLAYER, human), (OPPONENT, bot)] {
-                let outcome = local
-                    .executor
-                    .step_entity(entity, tick, &orders)
-                    .expect("both craft installed");
-                window.predicted = window.predicted.saturating_add(1);
-                for event in &outcome.events {
-                    if let Some((target, input)) = local.executor.ruleset().deliver(event) {
-                        delivered.entry(target).or_default().push(input);
-                    }
-                }
-                emitted.extend(outcome.events.iter().cloned());
+            for order in local.bot.bot_orders(tick) {
+                local.host.submit_input(OPPONENT, order);
             }
-            local.pending = delivered;
-            local.tick = Tick::new(tick.0.saturating_add(1));
+            // A18 S6.a: the hand-rolled loop is gone, not tidied. Sealing this
+            // tick's queued input, stepping the tick-boundary population in
+            // ascending `PersistId` order, routing each emitted event through
+            // `RegolithAdapter` into the *next* tick's input, and advancing the
+            // clock are all one `SimulationHost::step` call now. Deliveries
+            // still land a tick later than the event that produced them,
+            // because the host seals before it steps (D43); that was the
+            // property the old `local.pending` swap was hand-maintaining.
+            let report = local.host.step(TickCount::new(1));
+            // Counted from the steps the host reports, not from a literal:
+            // local practice advances both craft itself, and that is what the
+            // predicted set is here (#1029).
+            window.predicted = report.state_hashes.len() as u64;
+            let emitted: Vec<Outcome> = local
+                .host
+                .events()
+                .iter()
+                .map(|emitted| emitted.event().clone())
+                .collect();
+            // This driver is the only consumer of the host's event buffer, and
+            // it consumes a tick's worth per tick: nothing may survive into the
+            // next tick's skin effects.
+            local.host.clear_events();
             observe_skin_effects(
                 &emitted,
                 &[],
@@ -3242,6 +3269,135 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::time::Duration;
 
+    /// A18 S6.a's own detector: the deleted loop, kept only here, against the
+    /// seam that replaced it.
+    ///
+    /// The convergence criterion for this stage is behavioural identity — the
+    /// point is deleting a duplicated loop, not changing what it does — and
+    /// identity is not something a reader can check by eye across
+    /// `step_entity` and `SimulationHost::step`. So the hand-rolled loop is
+    /// reproduced verbatim below over its own `Executor`, and the converged
+    /// driver is run beside it from the same seed, the same pipelines and the
+    /// same controls. Every tick both must agree on canonical state bytes for
+    /// both craft, on the emitted event vector *and its order*, and on the
+    /// size of the predicted set.
+    ///
+    /// Two properties this pins that are otherwise only arguable from reading:
+    ///
+    /// - **Neighbour reads.** `step_entity` twice in a row and one `step_tick`
+    ///   are equivalent only because neighbours are served from the tick-start
+    ///   snapshot (`crates/orrery_core/src/executor.rs:216` `fill_tick_start_slot`,
+    ///   idempotent per tick), so `OPPONENT` cannot observe `PLAYER`'s
+    ///   post-step state either way. If that ever stops being true the two
+    ///   columns diverge here.
+    /// - **Delivery latency.** The old code swapped `local.pending` after the
+    ///   loop, so a delivery landed on the tick *after* the event. The host
+    ///   seals before it steps, which is the same latency by a different
+    ///   mechanism. A one-tick shift in either direction moves the state
+    ///   bytes and is caught.
+    #[test]
+    fn the_converged_driver_reproduces_the_hand_rolled_local_loop_tick_for_tick() {
+        // ── The loop S6.a deleted, kept as the reference column ───────────
+        let game = Regolith::honest();
+        let mut executor = Executor::new(game, SEED);
+        executor.insert(PLAYER, game.spawn(PLAYER, 0));
+        executor.insert(OPPONENT, game.spawn(OPPONENT, 1));
+        let reference_human = IntentPipeline::new(SEED, PLAYER, 0, vec![OPPONENT]);
+        let reference_bot = IntentPipeline::new(SEED, OPPONENT, 1, vec![PLAYER]);
+        let mut pending = BTreeMap::<PersistId, Vec<Order>>::new();
+        let mut tick = Tick::new(1_000_000);
+
+        // ── The converged column ──────────────────────────────────────────
+        let mut local = LocalSession::default();
+
+        // Full stick: an idle run would step two craft that never fire and
+        // never collide, and would prove nothing about event ordering.
+        let controls = Controls {
+            right: true,
+            thrust: true,
+            fire: true,
+            ..Controls::default()
+        };
+        let mut events_seen = 0_usize;
+
+        for _ in 0..240 {
+            let packet = reference_human.human_packet(tick, controls);
+            let mut human = pending.remove(&PLAYER).unwrap_or_default();
+            human.extend(decode_packet(&packet).expect("the local codec produced valid orders"));
+            let mut bot = pending.remove(&OPPONENT).unwrap_or_default();
+            bot.extend(reference_bot.bot_orders(tick));
+            let mut delivered = BTreeMap::<PersistId, Vec<Order>>::new();
+            let mut emitted = Vec::<Outcome>::new();
+            let mut predicted = 0_u64;
+            for (entity, orders) in [(PLAYER, human), (OPPONENT, bot)] {
+                let outcome = executor
+                    .step_entity(entity, tick, &orders)
+                    .expect("both craft installed");
+                predicted = predicted.saturating_add(1);
+                for event in &outcome.events {
+                    if let Some((target, input)) = executor.ruleset().deliver(event) {
+                        delivered.entry(target).or_default().push(input);
+                    }
+                }
+                emitted.extend(outcome.events.iter().cloned());
+            }
+            pending = delivered;
+            tick = Tick::new(tick.0.saturating_add(1));
+
+            let host_tick = local.host.next_tick();
+            assert_eq!(
+                Tick::new(host_tick.0.saturating_add(1)),
+                tick,
+                "the host's clock must be the clock the driver used to keep"
+            );
+            let packet = local.human.human_packet(host_tick, controls);
+            for order in decode_packet(&packet).expect("the local codec produced valid orders") {
+                local.host.submit_input(PLAYER, order);
+            }
+            for order in local.bot.bot_orders(host_tick) {
+                local.host.submit_input(OPPONENT, order);
+            }
+            let report = local.host.step(TickCount::new(1));
+            let host_emitted: Vec<Outcome> = local
+                .host
+                .events()
+                .iter()
+                .map(|emitted| emitted.event().clone())
+                .collect();
+            local.host.clear_events();
+
+            assert_eq!(
+                report.state_hashes.len() as u64,
+                predicted,
+                "the predicted set at {host_tick:?} must be the set the loop stepped"
+            );
+            assert_eq!(
+                host_emitted, emitted,
+                "emitted events must match in value and order at {host_tick:?}"
+            );
+            events_seen = events_seen.saturating_add(emitted.len());
+            for entity in [PLAYER, OPPONENT] {
+                assert_eq!(
+                    local
+                        .host
+                        .backend()
+                        .state(entity)
+                        .map(orrery_core::CoreCodec::to_canonical),
+                    executor
+                        .state(entity)
+                        .map(orrery_core::CoreCodec::to_canonical),
+                    "canonical state for {entity:?} diverged at {host_tick:?}"
+                );
+            }
+        }
+
+        assert!(
+            events_seen > 0,
+            "240 ticks of full stick produced no events at all; the fixture, \
+             not the seam, is what this run tested"
+        );
+    }
+
     /// The composition and the campaign session a #942 regression drives.
     ///
     /// Deliberately the *real* `RegolithSkinPlugin`, not a hand-assembled
@@ -4196,7 +4352,7 @@ mod tests {
             (PersistId::new(52), RockTier::Small),
         ];
         for (index, (entity, tier)) in tiers.iter().enumerate() {
-            local.executor.insert(
+            local.host.install_state(
                 *entity,
                 RegolithState::Rock(Rock::spawned(
                     *tier,
@@ -4245,7 +4401,7 @@ mod tests {
             else {
                 unreachable!("the fixture session is local")
             };
-            local.executor.take_state(PersistId::new(51));
+            local.host.remove_state(PersistId::new(51));
         }
         app.update();
         let survivors: Vec<PersistId> = app
@@ -4351,7 +4507,7 @@ mod tests {
         let tiers = [RockTier::Large, RockTier::Medium, RockTier::Small];
         let mut local = LocalSession::default();
         for (index, tier) in tiers.iter().enumerate() {
-            local.executor.insert(
+            local.host.install_state(
                 PersistId::new(70 + index as u64),
                 RegolithState::Rock(Rock::spawned(
                     *tier,
@@ -4478,7 +4634,7 @@ mod tests {
         }
 
         let mut local = LocalSession::default();
-        local.executor.insert(
+        local.host.install_state(
             PersistId::new(80),
             RegolithState::Rock(Rock::spawned(
                 RockTier::Small,
@@ -5021,7 +5177,7 @@ mod tests {
     #[test]
     fn body_despawns_when_its_replicated_state_expires() {
         let mut local = LocalSession::default();
-        assert!(local.executor.take_state(OPPONENT).is_some());
+        assert!(local.host.remove_state(OPPONENT).is_some());
         let mut app = App::new();
         app.insert_resource(ActiveSession::Local(Box::new(local)))
             .add_systems(Update, sync_rendered_state);
@@ -5144,7 +5300,9 @@ mod tests {
             panic!("the remote state is a craft");
         };
         craft.archetype = Archetype::Interceptor;
-        local.executor.insert(remote, RegolithState::Craft(craft));
+        local
+            .host
+            .install_state(remote, RegolithState::Craft(craft));
 
         let mut app = App::new();
         app.add_plugins(AssetPlugin::default())

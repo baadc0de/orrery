@@ -506,9 +506,36 @@ impl<I> QueuedInput<I> {
     }
 }
 
-struct EmittedEvent {
+/// One event a stepped entity emitted, paired with the entity that emitted it.
+///
+/// The host holds emitted events in their own typed form and encodes them only
+/// when a caller asks for bytes ([`SimulationHost::peek_event_bytes`]). An
+/// in-process driver — a client that renders skin effects from the events its
+/// own tick produced — reads them through [`SimulationHost::events`] without a
+/// canonical round trip; a foreign consumer across the C ABI still gets exactly
+/// the same records, because the byte form is produced from these values by
+/// `CoreCodec::to_canonical`, which is what the host used to call eagerly.
+///
+/// This is a named pair rather than a bare tuple so the source is read by name
+/// at every call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedEvent<E> {
     source: PersistId,
-    canonical: Vec<u8>,
+    event: E,
+}
+
+impl<E> SourcedEvent<E> {
+    /// The entity whose step emitted this event.
+    #[must_use]
+    pub const fn source(&self) -> PersistId {
+        self.source
+    }
+
+    /// The event itself.
+    #[must_use]
+    pub const fn event(&self) -> &E {
+        &self.event
+    }
 }
 
 /// The kernel-owned fixed-step driver shared by headless and engine hosts.
@@ -521,7 +548,7 @@ pub struct SimulationHost<R: Ruleset, A: RulesetAdapter<R>, B = Executor<R>> {
     adapter: A,
     next_tick: Tick,
     pending_inputs: BTreeMap<PersistId, PendingInputs<R::CoreInput>>,
-    emitted_events: Vec<EmittedEvent>,
+    emitted_events: Vec<SourcedEvent<R::CoreEvent>>,
     /// The observation stamps of entities installed since the last executed
     /// tick — the stamp [`TickBackend::insert_observed`] takes and the kernel
     /// keeps but does not read back out.  The host mirrors it so a snapshot
@@ -585,6 +612,18 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
     #[must_use]
     pub fn into_backend(self) -> B {
         self.backend
+    }
+
+    /// Borrow the substrate for reads.
+    ///
+    /// A presentation driver renders from canonical state every frame while
+    /// stepping it once per tick, and it cannot consume the host to do so.
+    /// This is read-only by signature: there is no `backend_mut`, so the only
+    /// ways to change canonical state remain [`Self::install_state`],
+    /// [`Self::remove_state`], [`Self::restore`] and [`Self::step`].
+    #[must_use]
+    pub const fn backend(&self) -> &B {
+        &self.backend
     }
 
     /// The absolute tick that the next [`Self::step`] call will execute.
@@ -796,6 +835,18 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
         Ok(())
     }
 
+    /// Queue one typed input for `entity`, sealed by the next [`Self::step`].
+    ///
+    /// This is the in-process form of [`Self::submit_command_bytes`] and queues
+    /// into the same buffer, so a driver that already holds the input type does
+    /// not encode and re-decode it to reach the same place. Inputs an adapter
+    /// delivered during an earlier tick are already queued, and this appends
+    /// after them: deliveries precede player-authored orders within a tick,
+    /// which is D46 clause (d)'s ordering.
+    pub fn submit_input(&mut self, entity: PersistId, input: R::CoreInput) {
+        self.queue_input(QueuedInput::new(entity, input));
+    }
+
     /// Advance exactly `ticks` canonical ticks, and never read wall time.
     ///
     /// Inputs already queued at the call boundary are sealed for the first
@@ -828,9 +879,9 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
                     if let Some(delivery) = self.adapter.deliver(&event) {
                         self.queue_input(QueuedInput::new(delivery.recipient, delivery.input));
                     }
-                    self.emitted_events.push(EmittedEvent {
+                    self.emitted_events.push(SourcedEvent {
                         source: entity,
-                        canonical: event.to_canonical(),
+                        event,
                     });
                 }
             }
@@ -875,6 +926,18 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
         Ok(EventBuffer { bytes })
     }
 
+    /// Borrow the emitted events not yet drained, in emission order.
+    ///
+    /// Emission order is the canonical one [`Self::step`] establishes: tick
+    /// ascending, then `PersistId` ascending within a tick, then the ruleset's
+    /// own order within an entity. An in-process driver reads these directly;
+    /// [`Self::peek_event_bytes`] encodes these same values for a consumer
+    /// across the ABI.
+    #[must_use]
+    pub fn events(&self) -> &[SourcedEvent<R::CoreEvent>] {
+        &self.emitted_events
+    }
+
     /// Discard every emitted event not yet drained.
     pub fn clear_events(&mut self) {
         self.emitted_events.clear();
@@ -904,10 +967,10 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
     }
 }
 
-fn encode_event_records(events: &[EmittedEvent]) -> Result<Vec<u8>, HostError> {
+fn encode_event_records<E: CoreCodec>(events: &[SourcedEvent<E>]) -> Result<Vec<u8>, HostError> {
     let mut bytes = Vec::new();
     for event in events {
-        append_record(&mut bytes, event.source.0, &event.canonical)?;
+        append_record(&mut bytes, event.source.0, &event.event.to_canonical())?;
     }
     Ok(bytes)
 }
