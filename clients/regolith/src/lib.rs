@@ -3124,6 +3124,21 @@ fn write_campaign_record_on_exit(
                     "campaign record for this session is already on disk; \
                      nothing further to write"
                 ),
+                // Two opposite facts again, and #1048 is what separates them.
+                // A seat that banked increments as it flew closes with a tail
+                // shorter than one increment, and that tail being below the
+                // floor costs at most a minute of a session that is otherwise
+                // already on disk. A seat that banked *nothing* and is below
+                // the floor is #1053's failed seating.
+                campaign::RecordDisposition::PersistedBelowFloor
+                    if runtime.increments_banked() > 0 =>
+                {
+                    info!(
+                        "campaign session closed with a tail below the measurement floor; \
+                         its {} banked increment(s) are on disk and unaffected (#1048)",
+                        runtime.increments_banked()
+                    );
+                }
                 campaign::RecordDisposition::PersistedBelowFloor => error!(
                     "campaign record for this session is on disk and is below the \
                      measurement floor: the host ended this attempt before anything \
