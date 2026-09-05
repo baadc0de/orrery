@@ -32,7 +32,9 @@ use bevy_math::Vec3;
 use bevy_time::{Real, Time};
 use bytes::Bytes;
 
-use orrery_core::{state_hash, tick_rng, CoreCodec, Executor, InputLogProducer, QPos};
+#[cfg(test)]
+use orrery_core::Executor;
+use orrery_core::{state_hash, tick_rng, CoreCodec, InputLogProducer, QPos};
 use orrery_games::game::{Game, Tamper};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{Order, Outcome};
@@ -59,6 +61,10 @@ use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
 use orrery_protocol::{
     CellId, InterestCellCrossing, NodeId, PersistId, RecordSource, SeqPair, StateClaim, Tick,
     UniverseSeed, DEFAULT_CELL_EDGE_M,
+};
+use orrery_sim_host::{
+    Delivery, InputOrigin, PredictionSet, RulesetAdapter, SealedInput, SimulationHost,
+    SimulationHostConfig, TickCount, TickParticipant,
 };
 use orrery_spatial::hysteresis::GridPosition;
 use orrery_spatial::interest::{HighRate, InterestSelection, Proxy};
@@ -206,9 +212,16 @@ pub struct Bot {
     pub index: usize,
     /// The headless app running the real plugins.
     pub app: App,
-    /// The core executor holding this bot's own craft, under whichever build
-    /// this peer runs — tampered or not.
-    executor: Executor<Regolith>,
+    /// The kernel-owned fixed-step host holding this bot's own craft, the
+    /// extra authorities it hosts and the replicas it installs, under
+    /// whichever build this peer runs — tampered or not.
+    ///
+    /// A18 S6.c: the host owns the clock, the sealed input buffer with its
+    /// provenance, the named prediction set and the delivery-routing hook that
+    /// [`Bot::step_core`] used to keep its own copy of. What is left in this
+    /// driver is pilot authoring, replication ingest, the router and the
+    /// witness log.
+    host: SimulationHost<Regolith, BotAdapter>,
     /// A second executor running the *shipping* rules over the same logged
     /// orders, for a bot the harness modified.
     ///
@@ -220,7 +233,7 @@ pub struct Bot {
     /// `Tamper::SpeedMultiplier` is on an interceptor slot, see
     /// [`BotSpec::cheat`] — would satisfy every conviction clause by producing
     /// byte-identical state and never being reported at all.
-    honest_shadow: Option<Executor<Regolith>>,
+    honest_shadow: Option<SimulationHost<Regolith, BotAdapter>>,
     /// Prior-tick cross-entity inputs addressed to this authority, retained in
     /// reliable-stream arrival order for delivered-first composition.
     delivered_inbox: Vec<(PersistId, Order)>,
@@ -308,6 +321,14 @@ pub struct Bot {
     pub profile: Profile,
     /// The signed log this bot authors, when witnessing is on.
     pub chain: Option<InputLogProducer>,
+    /// What the last [`Self::step_core`] call stepped and emitted.
+    ///
+    /// Retained only for A18 S6.c's convergence detector
+    /// (`the_converged_bot_tick_reproduces_the_hand_rolled_loop`), which has
+    /// to compare the emitted event vector *and its order* against the loop
+    /// the seam replaced. Nothing in the harness reads it.
+    #[cfg(test)]
+    last_step: SteppedTick,
     /// Witness signals raised against island-mates, by kind.
     pub signals: SignalTally,
     /// The peers the harness modified, so a signal against one of them is not
@@ -866,11 +887,11 @@ impl Bot {
         let state = RegolithState::Craft(craft);
 
         let rules = cheat.map_or_else(Regolith::honest, Regolith::cheating);
-        let mut executor = Executor::new(rules, seed);
-        executor.insert(entity, state.clone());
+        let mut host = new_host(rules, seed, Tick::new(0));
+        host.install_state(entity, state.clone());
         let honest_shadow = cheat.map(|_| {
-            let mut shadow = Executor::new(Regolith::honest(), seed);
-            shadow.insert(entity, state);
+            let mut shadow = new_host(Regolith::honest(), seed, Tick::new(0));
+            shadow.install_state(entity, state);
             shadow
         });
         let mut app = App::new();
@@ -938,7 +959,7 @@ impl Bot {
             node,
             index,
             app,
-            executor,
+            host,
             honest_shadow,
             delivered_inbox: Vec::new(),
             hosted_inbox: BTreeMap::new(),
@@ -996,6 +1017,8 @@ impl Bot {
                     FRAME_TICKS,
                 )
             }),
+            #[cfg(test)]
+            last_step: SteppedTick::default(),
             signals: SignalTally::default(),
             tampered_subjects: Vec::new(),
             delta_stats: None,
@@ -1028,10 +1051,10 @@ impl Bot {
         let cell_edge_m = spec.cell_edge_m;
         let mut bot = Self::new(spec);
         let grid = grid_of(&craft.pos, cell_edge_m);
-        bot.executor
-            .insert(bot.entity, RegolithState::Craft(craft.clone()));
+        bot.host
+            .install_state(bot.entity, RegolithState::Craft(craft.clone()));
         if let Some(shadow) = &mut bot.honest_shadow {
-            shadow.insert(bot.entity, RegolithState::Craft(craft));
+            shadow.install_state(bot.entity, RegolithState::Craft(craft));
         }
         let world = bot.app.world_mut();
         let mut query = world.query_filtered::<(&mut GridPosition, &mut Cell), With<LocalPlayer>>();
@@ -1051,7 +1074,8 @@ impl Bot {
     /// This bot's authored craft.
     #[must_use]
     pub fn craft(&self) -> &Craft {
-        let RegolithState::Craft(craft) = self.executor.state(self.entity).expect("seeded") else {
+        let RegolithState::Craft(craft) = self.host.backend().state(self.entity).expect("seeded")
+        else {
             unreachable!("a swarm bot always authors a craft")
         };
         craft
@@ -1071,9 +1095,9 @@ impl Bot {
             !self.hosted.contains(&entity),
             "one peer cannot install an authority twice"
         );
-        self.executor.insert(entity, state.clone());
+        self.host.install_state(entity, state.clone());
         if let Some(shadow) = &mut self.honest_shadow {
-            shadow.insert(entity, state);
+            shadow.install_state(entity, state);
         }
         // The current producer cannot cut an empty-input frame. Autonomous
         // rocks would therefore accumulate tick hashes until their first mined
@@ -1151,6 +1175,13 @@ impl Bot {
     /// anything — see [`Bot::first_tampered_tick`].
     pub fn step_core(&mut self, tick: u64, cell_edge_m: f32) {
         let at = Tick::new(tick);
+        // The host owns the clock; this driver is handed the tick by its
+        // caller. Seating keeps the two the same value without giving the
+        // driver a second opinion about what tick it is: a host that has never
+        // stepped is entirely described by its population, so re-seating is
+        // rebuilding it at `at` and re-installing what it held, stamp for
+        // stamp. In a swarm run this happens once, at tick zero.
+        self.seat_hosts_at(at);
         let stale: Vec<_> = self
             .replica_seen_at
             .iter()
@@ -1161,16 +1192,16 @@ impl Bot {
         for entity in stale {
             self.replica_seen_at.remove(&entity);
             self.replica_authorities.remove(&entity);
-            self.executor.take_state(entity);
+            self.host.remove_state(entity);
             if let Some(shadow) = &mut self.honest_shadow {
-                shadow.take_state(entity);
+                shadow.remove_state(entity);
             }
         }
         // Freeze every authored inbox at the tick boundary. An event emitted by
         // the player authority below is delivered to a hosted rock on the next
-        // tick, even though both happen to share one process and executor.
+        // tick, even though both happen to share one process and host.
         let hosted_at_boundary: Vec<PersistId> = self.hosted.iter().copied().collect();
-        let mut hosted_delivered: BTreeMap<PersistId, Vec<(PersistId, Order)>> = hosted_at_boundary
+        let hosted_frozen: BTreeMap<PersistId, Vec<(PersistId, Order)>> = hosted_at_boundary
             .iter()
             .map(|entity| {
                 (
@@ -1181,17 +1212,14 @@ impl Bot {
             .collect();
         let mut rng = tick_rng(self.seed, self.entity, at);
         // D46 clause (d): deliveries from prior ticks precede this tick's
-        // pilot orders. This vector is also exactly what the witness logs.
+        // pilot orders. Submission order is what the host seals, so this
+        // vector is composed here and queued in exactly this order below.
         let delivered = core::mem::take(&mut self.delivered_inbox);
         let traced_delivered = self.audience_trace.then(|| delivered.clone());
         let mut orders: Vec<_> = delivered.iter().map(|(_, order)| order.clone()).collect();
         if std::env::var_os("ORRERY_GEOMETRY_CAPTURE").is_some() {
             self.capture_adjudication_geometry(tick, &orders);
         }
-        let mut sources: Vec<_> = delivered
-            .into_iter()
-            .map(|(from, _)| RecordSource::InboundEvent { from })
-            .collect();
         orders.reserve(4);
         // Where this bot's own pilot orders begin. `orders` already holds this
         // tick's *delivered* inbound orders (D46 clause (d) puts them first),
@@ -1206,15 +1234,17 @@ impl Bot {
             &mut rng,
             &mut orders,
         );
-        let collision_candidate = self.executor.state(self.entity).and_then(|own| {
+        let collision_candidate = self.host.backend().state(self.entity).and_then(|own| {
             collision_candidate(
                 self.entity,
                 own,
-                self.executor
+                self.host
+                    .backend()
                     .entities()
                     .filter(|candidate| **candidate != self.entity)
                     .filter_map(|candidate| {
-                        self.executor
+                        self.host
+                            .backend()
                             .state(*candidate)
                             .map(|state| (*candidate, state))
                     }),
@@ -1232,10 +1262,6 @@ impl Bot {
             // whether this nomination can apply either body's force.
             orders.push(Order::Collide { other });
         }
-        let authored = orders.len().saturating_sub(sources.len());
-        sources.extend((0..authored).map(|seq| RecordSource::OwnPlayer {
-            input_seq: (tick as u32).wrapping_mul(8).wrapping_add(seq as u32),
-        }));
         let speed = self.speed_mps();
         let profile = self.profile;
         let turn_urad = self.turn_urad;
@@ -1263,28 +1289,85 @@ impl Bot {
                 *yaw_urad = yaw_urad.signum() * turn_urad.abs();
             }
         }
-        // Log *before* executing, and log exactly what is about to be applied.
-        // A log written from what happened rather than what was asked would
-        // close the gap a cheat lives in by construction, and then the harness
-        // could not tell an honest bot from a careful one.
-        if let Some(chain) = &mut self.chain {
-            chain.log_inputs_with_sources(tick, &orders, &sources);
+
+        // ── A18 S6.c: one seam call, not a hand-rolled loop ───────────────
+        //
+        // The loop this replaced stepped the player craft, folded
+        // `ruleset().deliver` over its events by hand, stepped every hosted
+        // authority in a second loop and folded the same call again. All four
+        // of those are `step_predicted`: submission order is D46 clause (d),
+        // the prediction set is exactly the authorities this peer holds (so
+        // every replica it also holds stays frozen), and `BotTick::route`
+        // takes every delivery so the routing decision — own inbox, a hosted
+        // inbox, or the router — stays this driver's, made once below.
+        for ((from, _), order) in delivered.iter().zip(orders.iter()) {
+            self.host
+                .submit_delivered_input(self.entity, *from, order.clone());
         }
-        let outcome = self
-            .executor
-            .step_entity(self.entity, at, &orders)
-            .expect("entity present");
+        for order in &orders[authored_start..] {
+            self.host.submit_input(self.entity, order.clone());
+        }
+        for entity in &hosted_at_boundary {
+            for (from, order) in hosted_frozen.get(entity).into_iter().flatten() {
+                self.host
+                    .submit_delivered_input(*entity, *from, order.clone());
+            }
+        }
+        let prediction = PredictionSet::only(
+            core::iter::once(self.entity).chain(hosted_at_boundary.iter().copied()),
+        );
+        let mut participant = BotTick::new(self.entity, tick);
+        let report = self
+            .host
+            .step_predicted(TickCount::new(1), &prediction, &mut participant);
+
+        // Log *before* executing was the old loop's rule, and it is still what
+        // happens: `BotTick::sealed` runs at S0, after input became immutable
+        // and before any rule ran, and what it hands back is the applied
+        // vector with the provenance each input arrived under — not a second
+        // vector derived beside it. A log written from what happened rather
+        // than what was asked would close the gap a cheat lives in by
+        // construction, and then the harness could not tell an honest bot from
+        // a careful one.
+        if let Some(chain) = &mut self.chain {
+            chain.log_inputs_with_sources(tick, &participant.orders, &participant.sources);
+        }
+        let events: Vec<Outcome> = self
+            .host
+            .events()
+            .iter()
+            .filter(|emitted| emitted.source() == self.entity)
+            .map(|emitted| emitted.event().clone())
+            .collect();
+        #[cfg(test)]
+        {
+            self.last_step = SteppedTick {
+                predicted: report.state_hashes.len(),
+                events: self
+                    .host
+                    .events()
+                    .iter()
+                    .map(|emitted| EmittedEvent {
+                        source: emitted.source(),
+                        event: emitted.event().clone(),
+                    })
+                    .collect(),
+            };
+        }
+        // This driver is the only consumer of the host's event buffer and
+        // takes a tick's worth per tick: nothing may survive into the next.
+        self.host.clear_events();
         if self.audience_trace
             && (traced_delivered
                 .as_ref()
                 .is_some_and(|items| !items.is_empty())
-                || outcome
-                    .events
+                || events
                     .iter()
                     .any(|event| matches!(event, Outcome::Collision { .. })))
         {
             let traced_state = self
-                .executor
+                .host
+                .backend()
                 .state(self.entity)
                 .expect("entity remains present");
             let RegolithState::Craft(traced_craft) = traced_state else {
@@ -1295,88 +1378,112 @@ impl Bot {
                 self.index,
                 self.entity.0,
                 traced_delivered.unwrap_or_default(),
-                outcome.events,
+                events,
                 state_hash(traced_state),
                 traced_craft.pos,
                 traced_craft.vel,
             );
         }
         if let Some(chain) = &mut self.chain {
-            chain.log_neighbor_frames(tick, &outcome.neighbor_frames);
+            for stepped in &report.neighbor_frames {
+                if stepped.entity != self.entity {
+                    continue;
+                }
+                // The tick the reader was advanced on, from the report, so a
+                // record set can never be filed under a tick that did not
+                // produce it.
+                chain.log_neighbor_frames(stepped.tick.0, &stepped.frames);
+            }
         }
         if let Some(resolved_shots) = &mut self.resolved_shots {
             resolved_shots.extend(
-                outcome
-                    .events
+                events
                     .iter()
                     .filter(|event| matches!(event, Outcome::ShotResolved { .. }))
                     .cloned(),
             );
         }
-        for event in &outcome.events {
-            if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
-                if recipient == self.entity {
-                    self.delivered_inbox.push((self.entity, order));
-                } else if self.hosted.contains(&recipient) {
-                    self.hosted_inbox
-                        .entry(recipient)
-                        .or_default()
-                        .push((self.entity, order));
-                } else {
-                    self.delivered_outbox.push((self.entity, recipient, order));
-                }
+        // The routing decision the seam deliberately does not make. Applied in
+        // the order the tick produced them — the player craft's, then each
+        // hosted authority's in canonical id order — which is the order the
+        // two deleted loops appended in.
+        for routed in participant.routed {
+            let RoutedDelivery {
+                source,
+                recipient,
+                order,
+            } = routed;
+            if recipient == self.entity {
+                self.delivered_inbox.push((source, order));
+            } else if self.hosted.contains(&recipient) {
+                self.hosted_inbox
+                    .entry(recipient)
+                    .or_default()
+                    .push((source, order));
+            } else {
+                self.delivered_outbox.push((source, recipient, order));
             }
         }
+        let own_hash = report
+            .state_hashes
+            .iter()
+            .find(|hashed| hashed.entity == self.entity)
+            .map(|hashed| hashed.hash)
+            .expect("entity present");
         if let Some(shadow) = &mut self.honest_shadow {
-            let honest = shadow
-                .step_entity(self.entity, at, &orders)
+            // The dual-execution probe: the *shipping* rules over the same
+            // sealed vector, on their own host. Its prediction set is the
+            // player craft alone — the deleted loop stepped nothing else on
+            // the shadow either — and `ShadowTick` drops every delivery, so
+            // an honest event can never queue an input the modified column
+            // never saw.
+            for ((from, _), order) in delivered.iter().zip(orders.iter()) {
+                shadow.submit_delivered_input(self.entity, *from, order.clone());
+            }
+            for order in &orders[authored_start..] {
+                shadow.submit_input(self.entity, order.clone());
+            }
+            let honest = shadow.step_predicted(
+                TickCount::new(1),
+                &PredictionSet::just(self.entity),
+                &mut ShadowTick,
+            );
+            shadow.clear_events();
+            let honest_hash = honest
+                .state_hashes
+                .iter()
+                .find(|hashed| hashed.entity == self.entity)
+                .map(|hashed| hashed.hash)
                 .expect("entity present");
-            if self.first_tampered_tick.is_none() && honest.state_hash != outcome.state_hash {
+            if self.first_tampered_tick.is_none() && honest_hash != own_hash {
                 self.first_tampered_tick = Some(tick);
             }
         }
         if let Some(chain) = &mut self.chain {
-            chain.log_tick_hash(outcome.state_hash);
+            chain.log_tick_hash(own_hash);
         }
 
-        // Scenario content is canonical state, not decoration. Step every
-        // additional authority after the player craft from the population at
-        // this tick boundary; materialized children begin on the next tick,
-        // matching the reference scenario loop.
-        let mut materialized = Vec::new();
-        for entity in hosted_at_boundary {
-            let delivered = hosted_delivered.remove(&entity).unwrap_or_default();
-            let orders: Vec<Order> = delivered.iter().map(|(_, order)| order.clone()).collect();
-            let outcome = self
-                .executor
-                .step_entity(entity, at, &orders)
-                .expect("hosted campaign authority remains installed");
-            for event in &outcome.events {
-                if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
-                    if recipient == self.entity {
-                        self.delivered_inbox.push((entity, order));
-                    } else if self.hosted.contains(&recipient) {
-                        self.hosted_inbox
-                            .entry(recipient)
-                            .or_default()
-                            .push((entity, order));
-                    } else {
-                        self.delivered_outbox.push((entity, recipient, order));
-                    }
-                }
+        // Scenario content is canonical state, not decoration. Every
+        // additional authority in the prediction set stepped beside the player
+        // craft on this one tick; materialized children begin on the next one,
+        // matching the reference scenario loop. The old loop read
+        // `TickOutcome::materialized` per hosted emitter and ignored the
+        // player craft's own; `StepReport::materialized` names the emitter, so
+        // that stays exactly what it was.
+        for born in &report.materialized {
+            if born.source == self.entity || self.authors(born.entity) {
+                continue;
             }
-            materialized.extend(outcome.materialized);
-            self.hosted_inbox.entry(entity).or_default();
+            let state = self
+                .host
+                .backend()
+                .state(born.entity)
+                .expect("materialization installed its canonical state")
+                .clone();
+            self.host_entity(born.entity, state);
         }
-        for entity in materialized {
-            if !self.authors(entity) {
-                let state = self
-                    .executor
-                    .state(entity)
-                    .expect("materialization installed its canonical state")
-                    .clone();
-                self.host_entity(entity, state);
-            }
+        for entity in hosted_at_boundary {
+            self.hosted_inbox.entry(entity).or_default();
         }
 
         let grid = grid_of(&self.craft().pos, cell_edge_m);
@@ -1386,6 +1493,39 @@ impl Bot {
             return;
         };
         position.0 = grid;
+    }
+
+    /// Re-seat both hosts' clocks on `at`, if they are not already there.
+    ///
+    /// [`Self::step_core`] is handed its tick by the harness around it, and a
+    /// host fixes its first tick at construction. A host that has never
+    /// stepped is entirely described by its population and its stamps, so
+    /// re-seating is: build a host at `at` and re-install what the old one
+    /// held, byte for byte and stamp for stamp. Nothing else can be in flight
+    /// — this driver submits, steps and drains its events inside one
+    /// `step_core` call, so no input is ever queued and no event ever left
+    /// undrained across one.
+    ///
+    /// In a swarm run this fires once, on tick zero. It exists because a test
+    /// may start a fresh bot at an arbitrary tick, which the executor this
+    /// replaced allowed because it had no clock of its own to disagree with.
+    fn seat_hosts_at(&mut self, at: Tick) {
+        if self.host.next_tick() == at {
+            debug_assert!(
+                self.honest_shadow
+                    .as_ref()
+                    .is_none_or(|shadow| shadow.next_tick() == at),
+                "the shadow's clock never parts company with the modified column's"
+            );
+            return;
+        }
+        let rules = self
+            .tamper
+            .map_or_else(Regolith::honest, Regolith::cheating);
+        self.host = reseat(&self.host, rules, self.seed, at);
+        if let Some(shadow) = &self.honest_shadow {
+            self.honest_shadow = Some(reseat(shadow, Regolith::honest(), self.seed, at));
+        }
     }
 
     fn capture_adjudication_geometry(&self, tick: u64, orders: &[Order]) {
@@ -1760,7 +1900,7 @@ impl Bot {
             .authored_entities()
             .into_iter()
             .map(|entity| {
-                let state = self.executor.state(entity).expect("authored entity");
+                let state = self.host.backend().state(entity).expect("authored entity");
                 let cell = authored_cell(entity, self.entity, state, player_cell, cell_edge_m);
                 let audience = membership
                     .peers
@@ -1775,7 +1915,7 @@ impl Bot {
             .authored_entities()
             .into_iter()
             .filter_map(|entity| {
-                let state = self.executor.state(entity)?.clone();
+                let state = self.host.backend().state(entity)?.clone();
                 let cell = authored_cell(entity, self.entity, &state, player_cell, cell_edge_m);
                 let audience = audiences.get(&entity)?.clone();
                 Some((entity, state, cell, audience))
@@ -2064,8 +2204,8 @@ impl Bot {
     #[cfg(test)]
     /// Replaces the authored craft with a captured live-state fixture.
     pub fn replace_craft_for_test(&mut self, craft: Craft) {
-        self.executor
-            .insert(self.entity, RegolithState::Craft(craft));
+        self.host
+            .install_state(self.entity, RegolithState::Craft(craft));
     }
 
     #[cfg(test)]
@@ -2170,13 +2310,17 @@ impl Bot {
                             );
                         }
                         self.replica_authorities.entry(entity).or_insert(from);
-                        self.executor.insert_observed(
+                        self.host.install_state_observed(
                             entity,
                             state.clone(),
                             Tick::new(replication.tick),
                         );
                         if let Some(shadow) = &mut self.honest_shadow {
-                            shadow.insert_observed(entity, state, Tick::new(replication.tick));
+                            shadow.install_state_observed(
+                                entity,
+                                state,
+                                Tick::new(replication.tick),
+                            );
                         }
                         self.replica_seen_at.insert(entity, self.tick);
                     }
@@ -2303,7 +2447,12 @@ impl Bot {
     /// as a cheat — which is exactly what this harness reported before the call
     /// moved ahead of `step_core`.
     pub fn publish_claim(&mut self, tick: u64) {
-        let state = self.executor.state(self.entity).expect("seeded").clone();
+        let state = self
+            .host
+            .backend()
+            .state(self.entity)
+            .expect("seeded")
+            .clone();
         let Some(chain) = &mut self.chain else {
             return;
         };
@@ -2461,7 +2610,11 @@ impl Bot {
     /// This bot's current core state, for seeding a watcher's anchor.
     #[must_use]
     pub fn state(&self) -> RegolithState {
-        self.executor.state(self.entity).expect("seeded").clone()
+        self.host
+            .backend()
+            .state(self.entity)
+            .expect("seeded")
+            .clone()
     }
 
     /// The entity this bot authors.
@@ -2683,6 +2836,205 @@ pub fn default_cell_edge_m() -> f32 {
 #[must_use]
 pub fn campaign_cell_edge_m() -> f32 {
     orrery_games::regolith::CAMPAIGN_CELL_EDGE_M as f32
+}
+
+/// Routes Regolith's own outcome deliveries through the host's adapter seam.
+///
+/// The rule is `Regolith::deliver`, unchanged and not re-stated here: this is
+/// only the shape adaptation between the ruleset's `(recipient, order)` pair
+/// and the host's named [`Delivery`]. It carries the *build this peer runs* —
+/// honest or tampered — because that is the ruleset the deleted loop called
+/// `self.executor.ruleset().deliver` on, and a modified authority that routed
+/// by the shipping rules would be a different peer than the one this harness
+/// hands out.
+#[derive(Debug, Clone, Copy)]
+struct BotAdapter(Regolith);
+
+impl RulesetAdapter<Regolith> for BotAdapter {
+    fn deliver(&self, event: &Outcome) -> Option<Delivery<Order>> {
+        Game::deliver(&self.0, event).map(|(recipient, order)| Delivery::new(recipient, order))
+    }
+}
+
+/// Build one of this bot's hosts on `rules`, at the tick it executes first.
+fn new_host(
+    rules: Regolith,
+    seed: UniverseSeed,
+    first_tick: Tick,
+) -> SimulationHost<Regolith, BotAdapter> {
+    SimulationHost::new(
+        SimulationHostConfig::new(seed).starting_at(first_tick),
+        rules,
+        BotAdapter(rules),
+    )
+}
+
+/// Copy `held`'s population, stamp for stamp, into a fresh host clocked at
+/// `first_tick`.
+///
+/// See [`Bot::seat_hosts_at`] for why a driver handed its tick from outside
+/// needs this at all.
+fn reseat(
+    held: &SimulationHost<Regolith, BotAdapter>,
+    rules: Regolith,
+    seed: UniverseSeed,
+    first_tick: Tick,
+) -> SimulationHost<Regolith, BotAdapter> {
+    let mut seated = new_host(rules, seed, first_tick);
+    for entity in held.backend().entities().copied().collect::<Vec<_>>() {
+        let observed = held.observed_tick(entity).unwrap_or_else(|| Tick::new(0));
+        if let Some(state) = held.backend().state(entity) {
+            seated.install_state_observed(entity, state.clone(), observed);
+        }
+    }
+    seated
+}
+
+/// One delivery this tick's step produced, addressed and waiting for a route.
+///
+/// A named record, not a `(PersistId, PersistId, Order)` triple: two of the
+/// three fields are entity ids, and a driver that swaps them credits the wrong
+/// author or delivers to the wrong authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedDelivery {
+    /// The authority whose emitted event produced this delivery.
+    source: PersistId,
+    /// The authority the ruleset addressed it to.
+    recipient: PersistId,
+    /// The order that authority is being asked to apply.
+    order: Order,
+}
+
+/// The source a witness record carries for one input the tick sealed.
+///
+/// The host knows only whether an input was handed to it, handed to it as
+/// something another authority already delivered, or produced by its own
+/// adapter; this harness's log speaks `RecordSource`. `authored_seq` counts
+/// only the pilot-authored inputs of this tick, which is what the composed
+/// vector's own numbering counted before the seam carried provenance.
+fn record_source(origin: InputOrigin, tick: u64, authored_seq: u32) -> RecordSource {
+    match origin {
+        InputOrigin::Inbound { from } => RecordSource::InboundEvent { from },
+        // A delivery this host's own adapter kept would name the entity whose
+        // event produced it. `BotTick` takes every delivery, so this peer never
+        // seals one; classifying it the same way as an arrival keeps the match
+        // total rather than silently defaulting.
+        InputOrigin::Delivered { source } => RecordSource::InboundEvent { from: source },
+        InputOrigin::Submitted => RecordSource::OwnPlayer {
+            // Five authored inputs are reachable when the four-order pilot row
+            // also nominates a collision. Eight leaves each tick a disjoint,
+            // power-of-two source-id range.
+            input_seq: (tick as u32).wrapping_mul(8).wrapping_add(authored_seq),
+        },
+    }
+}
+
+/// This bot's participation in one host tick.
+///
+/// The two halves [`Bot::step_core`] owns and the host does not: the witness
+/// column recorded at S0, and where each delivery goes. *Every* delivery is
+/// taken here and none is queued back into the host, because the three-way
+/// choice between this peer's own inbox, one of its hosted authorities' and
+/// the router is the harness's own and the seam deliberately does not make it.
+#[derive(Debug)]
+struct BotTick {
+    /// The entity whose sealed inputs the witness log records.
+    entity: PersistId,
+    /// The tick being sealed, for the authored-input sequence numbering.
+    tick: u64,
+    /// The sealed order vector for [`Self::entity`], in applied order.
+    orders: Vec<Order>,
+    /// Its provenance, one source per order, in the same total order.
+    sources: Vec<RecordSource>,
+    /// How many pilot-authored inputs have been classified this tick.
+    authored_seq: u32,
+    /// Deliveries taken for this driver to route.
+    routed: Vec<RoutedDelivery>,
+}
+
+impl BotTick {
+    fn new(entity: PersistId, tick: u64) -> Self {
+        Self {
+            entity,
+            tick,
+            orders: Vec::new(),
+            sources: Vec::new(),
+            authored_seq: 0,
+            routed: Vec::new(),
+        }
+    }
+}
+
+impl TickParticipant<Regolith> for BotTick {
+    fn sealed(&mut self, _tick: Tick, inputs: &[SealedInput<'_, Order>]) {
+        for sealed in inputs {
+            // The witness column is this peer's own authority's column. A
+            // hosted rock's inputs are sealed by the same tick and are not in
+            // it: `host_entity` explains why those entities are canonical and
+            // replicated but not independently witnessed.
+            if sealed.recipient() != self.entity {
+                continue;
+            }
+            let source = record_source(sealed.origin(), self.tick, self.authored_seq);
+            if matches!(sealed.origin(), InputOrigin::Submitted) {
+                self.authored_seq = self.authored_seq.saturating_add(1);
+            }
+            self.orders.push(sealed.input().clone());
+            self.sources.push(source);
+        }
+    }
+
+    fn route(&mut self, source: PersistId, delivery: Delivery<Order>) -> Option<Delivery<Order>> {
+        self.routed.push(RoutedDelivery {
+            source,
+            recipient: delivery.recipient(),
+            order: delivery.into_input(),
+        });
+        None
+    }
+}
+
+/// One event one authority emitted, kept in emission order.
+///
+/// A named record, not a `(PersistId, Outcome)` pair: the detector compares
+/// these for equality and a swapped emitter would compare equal to nothing.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmittedEvent {
+    /// The authority whose step emitted it.
+    source: PersistId,
+    /// The event itself.
+    event: Outcome,
+}
+
+/// What one `step_core` call stepped and emitted.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SteppedTick {
+    /// Entities the host reports it advanced: D8's predicted set, counted.
+    predicted: usize,
+    /// Every event the tick raised, across every stepped authority, in
+    /// emission order.
+    events: Vec<EmittedEvent>,
+}
+
+/// The honest shadow's participation: watch nothing, keep nothing.
+///
+/// The deleted loop passed the shadow's `TickOutcome` nowhere but its
+/// `state_hash`, so an event it emitted could never become an input. Dropping
+/// every delivery is that, stated: the shadow's sealed vector is exactly what
+/// [`Bot::step_core`] submits to it and never one order more.
+#[derive(Debug, Clone, Copy)]
+struct ShadowTick;
+
+impl TickParticipant<Regolith> for ShadowTick {
+    fn observes_seal(&self) -> bool {
+        false
+    }
+
+    fn route(&mut self, _source: PersistId, _delivery: Delivery<Order>) -> Option<Delivery<Order>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -3287,6 +3639,632 @@ mod tests {
             encode_delta_if_smaller(&absolute, &delta).is_none(),
             "the codec selected an absolute fallback; an off-phase sender must wait instead of bypassing the keyframe stagger"
         );
+    }
+
+    /// The loop A18 S6.c deleted from [`Bot::step_core`], kept verbatim here
+    /// and nowhere else.
+    ///
+    /// This is a *reference column*, not a second implementation: every line
+    /// below was in `step_core` before the conversion and is reproduced
+    /// unchanged over its own [`Executor`], down to the two `ruleset().deliver`
+    /// folds, the tick-boundary inbox freeze, the honest shadow's second
+    /// execution and the order in which the witness log is fed. The
+    /// convergence criterion for this stage is behavioural identity — the
+    /// point is deleting a duplicated loop, not changing what it does — and in
+    /// this crate a moved byte is a moved P4 golden, so the identity is
+    /// detected rather than argued.
+    struct ReferenceColumn {
+        executor: Executor<Regolith>,
+        honest_shadow: Option<Executor<Regolith>>,
+        chain: Option<InputLogProducer>,
+        delivered_inbox: Vec<(PersistId, Order)>,
+        hosted_inbox: BTreeMap<PersistId, Vec<(PersistId, Order)>>,
+        hosted: BTreeSet<PersistId>,
+        delivered_outbox: Vec<(PersistId, PersistId, Order)>,
+        replica_seen_at: BTreeMap<PersistId, u64>,
+        replica_authorities: BTreeMap<PersistId, NodeId>,
+        first_tampered_tick: Option<u64>,
+        resolved_shots: Option<Vec<Outcome>>,
+        entity: PersistId,
+        seed: UniverseSeed,
+        slot: u64,
+        profile: Profile,
+        turn_urad: i32,
+        accel_mmss: i32,
+        tamper: Option<Tamper>,
+        last_step: SteppedTick,
+    }
+
+    impl ReferenceColumn {
+        /// Start a reference column from the converged bot's own initial
+        /// population, so the two differ in nothing but which code steps them.
+        fn mirroring(bot: &Bot, index: usize) -> Self {
+            let rules = bot.tamper.map_or_else(Regolith::honest, Regolith::cheating);
+            let mut executor = Executor::new(rules, bot.seed);
+            let mut honest_shadow = bot
+                .tamper
+                .map(|_| Executor::new(Regolith::honest(), bot.seed));
+            for entity in bot.host.backend().entities().copied().collect::<Vec<_>>() {
+                let state = bot
+                    .host
+                    .backend()
+                    .state(entity)
+                    .expect("the population it just listed")
+                    .clone();
+                executor.insert(entity, state.clone());
+                if let Some(shadow) = &mut honest_shadow {
+                    shadow.insert(entity, state);
+                }
+            }
+            Self {
+                executor,
+                honest_shadow,
+                chain: bot.chain.is_some().then(|| {
+                    InputLogProducer::new(
+                        bot_key(index),
+                        bot.entity,
+                        REGOLITH_RULESET,
+                        0,
+                        CLAIM_EVERY,
+                        FRAME_TICKS,
+                    )
+                }),
+                delivered_inbox: Vec::new(),
+                hosted_inbox: bot.hosted_inbox.clone(),
+                hosted: bot.hosted.clone(),
+                delivered_outbox: Vec::new(),
+                replica_seen_at: BTreeMap::new(),
+                replica_authorities: BTreeMap::new(),
+                first_tampered_tick: None,
+                resolved_shots: bot.resolved_shots.clone(),
+                entity: bot.entity,
+                seed: bot.seed,
+                slot: bot.slot,
+                profile: bot.profile,
+                turn_urad: bot.turn_urad,
+                accel_mmss: bot.accel_mmss,
+                tamper: bot.tamper,
+                last_step: SteppedTick::default(),
+            }
+        }
+
+        fn craft(&self) -> &Craft {
+            let RegolithState::Craft(craft) = self.executor.state(self.entity).expect("seeded")
+            else {
+                unreachable!("a swarm bot always authors a craft")
+            };
+            craft
+        }
+
+        fn speed_mps(&self) -> f64 {
+            let (vx, vy, vz) = self.craft().vel.to_metres_per_sec();
+            libm::sqrt(vx * vx + vy * vy + vz * vz)
+        }
+
+        fn authors(&self, entity: PersistId) -> bool {
+            entity == self.entity || self.hosted.contains(&entity)
+        }
+
+        fn host_entity(&mut self, entity: PersistId, state: RegolithState) {
+            self.executor.insert(entity, state.clone());
+            if let Some(shadow) = &mut self.honest_shadow {
+                shadow.insert(entity, state);
+            }
+            self.hosted.insert(entity);
+            self.hosted_inbox.insert(entity, Vec::new());
+        }
+
+        // ── the deleted loop, verbatim ────────────────────────────────────
+        fn step_core(&mut self, tick: u64) {
+            let at = Tick::new(tick);
+            let stale: Vec<_> = self
+                .replica_seen_at
+                .iter()
+                .filter_map(|(entity, seen)| {
+                    (tick.saturating_sub(*seen) > REPLICA_TTL_TICKS).then_some(*entity)
+                })
+                .collect();
+            for entity in stale {
+                self.replica_seen_at.remove(&entity);
+                self.replica_authorities.remove(&entity);
+                self.executor.take_state(entity);
+                if let Some(shadow) = &mut self.honest_shadow {
+                    shadow.take_state(entity);
+                }
+            }
+            let hosted_at_boundary: Vec<PersistId> = self.hosted.iter().copied().collect();
+            let mut hosted_delivered: BTreeMap<PersistId, Vec<(PersistId, Order)>> =
+                hosted_at_boundary
+                    .iter()
+                    .map(|entity| {
+                        (
+                            *entity,
+                            self.hosted_inbox.remove(entity).unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+            let mut rng = tick_rng(self.seed, self.entity, at);
+            let delivered = core::mem::take(&mut self.delivered_inbox);
+            let mut orders: Vec<_> = delivered.iter().map(|(_, order)| order.clone()).collect();
+            let mut sources: Vec<_> = delivered
+                .into_iter()
+                .map(|(from, _)| RecordSource::InboundEvent { from })
+                .collect();
+            orders.reserve(4);
+            let authored_start = orders.len();
+            orrery_games::regolith::pilot::honest_orders(
+                self.entity,
+                self.slot,
+                at,
+                &mut rng,
+                &mut orders,
+            );
+            let collision_candidate = self.executor.state(self.entity).and_then(|own| {
+                collision_candidate(
+                    self.entity,
+                    own,
+                    self.executor
+                        .entities()
+                        .filter(|candidate| **candidate != self.entity)
+                        .filter_map(|candidate| {
+                            self.executor
+                                .state(*candidate)
+                                .map(|state| (*candidate, state))
+                        }),
+                )
+            });
+            if let Some(other) = collision_candidate {
+                orders.push(Order::Collide { other });
+            }
+            let authored = orders.len().saturating_sub(sources.len());
+            sources.extend((0..authored).map(|seq| RecordSource::OwnPlayer {
+                input_seq: (tick as u32).wrapping_mul(8).wrapping_add(seq as u32),
+            }));
+            let speed = self.speed_mps();
+            let profile = self.profile;
+            let turn_urad = self.turn_urad;
+            let full_accel = self.accel_mmss;
+            let speed_probe = self.tamper == Some(Tamper::SpeedMultiplier);
+            for order in orders.iter_mut().skip(authored_start) {
+                if let Order::Thrust {
+                    accel_mmss,
+                    yaw_urad,
+                    pitch_urad,
+                } = order
+                {
+                    *pitch_urad = 0;
+                    *accel_mmss = if speed_probe {
+                        full_accel
+                    } else {
+                        profile.accel_mmss(tick, speed, *accel_mmss, CRUISE_MPS)
+                    };
+                    *yaw_urad = yaw_urad.signum() * turn_urad.abs();
+                }
+            }
+            if let Some(chain) = &mut self.chain {
+                chain.log_inputs_with_sources(tick, &orders, &sources);
+            }
+            let mut emitted = Vec::new();
+            let mut predicted = 0_usize;
+            let outcome = self
+                .executor
+                .step_entity(self.entity, at, &orders)
+                .expect("entity present");
+            predicted += 1;
+            emitted.extend(outcome.events.iter().map(|event| EmittedEvent {
+                source: self.entity,
+                event: event.clone(),
+            }));
+            if let Some(chain) = &mut self.chain {
+                chain.log_neighbor_frames(tick, &outcome.neighbor_frames);
+            }
+            if let Some(resolved_shots) = &mut self.resolved_shots {
+                resolved_shots.extend(
+                    outcome
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event, Outcome::ShotResolved { .. }))
+                        .cloned(),
+                );
+            }
+            for event in &outcome.events {
+                if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
+                    if recipient == self.entity {
+                        self.delivered_inbox.push((self.entity, order));
+                    } else if self.hosted.contains(&recipient) {
+                        self.hosted_inbox
+                            .entry(recipient)
+                            .or_default()
+                            .push((self.entity, order));
+                    } else {
+                        self.delivered_outbox.push((self.entity, recipient, order));
+                    }
+                }
+            }
+            if let Some(shadow) = &mut self.honest_shadow {
+                let honest = shadow
+                    .step_entity(self.entity, at, &orders)
+                    .expect("entity present");
+                if self.first_tampered_tick.is_none() && honest.state_hash != outcome.state_hash {
+                    self.first_tampered_tick = Some(tick);
+                }
+            }
+            if let Some(chain) = &mut self.chain {
+                chain.log_tick_hash(outcome.state_hash);
+            }
+
+            let mut materialized = Vec::new();
+            for entity in hosted_at_boundary {
+                let delivered = hosted_delivered.remove(&entity).unwrap_or_default();
+                let orders: Vec<Order> = delivered.iter().map(|(_, order)| order.clone()).collect();
+                let outcome = self
+                    .executor
+                    .step_entity(entity, at, &orders)
+                    .expect("hosted campaign authority remains installed");
+                predicted += 1;
+                emitted.extend(outcome.events.iter().map(|event| EmittedEvent {
+                    source: entity,
+                    event: event.clone(),
+                }));
+                for event in &outcome.events {
+                    if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
+                        if recipient == self.entity {
+                            self.delivered_inbox.push((entity, order));
+                        } else if self.hosted.contains(&recipient) {
+                            self.hosted_inbox
+                                .entry(recipient)
+                                .or_default()
+                                .push((entity, order));
+                        } else {
+                            self.delivered_outbox.push((entity, recipient, order));
+                        }
+                    }
+                }
+                materialized.extend(outcome.materialized);
+                self.hosted_inbox.entry(entity).or_default();
+            }
+            for entity in materialized {
+                if !self.authors(entity) {
+                    let state = self
+                        .executor
+                        .state(entity)
+                        .expect("materialization installed its canonical state")
+                        .clone();
+                    self.host_entity(entity, state);
+                }
+            }
+            self.last_step = SteppedTick {
+                predicted,
+                events: emitted,
+            };
+        }
+    }
+
+    /// A18 S6.c's own detector: the loop [`Bot::step_core`] deleted, run beside
+    /// the seam call that replaced it.
+    ///
+    /// `gates/p1-swarm` is inside `PIPELINE_TREES` (`scripts/p4-ledger.sh`), so
+    /// a behaviour change here does not merely move a golden — it changes what
+    /// the P4 gate measures and would make every banked bot hour an hour of a
+    /// different pipeline. The bar is therefore identity, every tick, and this
+    /// is what checks it. Both columns run from the same seed and spec, over
+    /// the same hosted campaign rocks, the same injected deliveries, the same
+    /// replica refreshes and the same refresh *stop* (so the staleness sweep
+    /// fires in both), and each tick they must agree on:
+    ///
+    /// - the canonical bytes of **every** entity either column holds — the
+    ///   player craft, each hosted rock, each materialized child and the
+    ///   frozen replica;
+    /// - the predicted set's size;
+    /// - the emitted event vector, with its emitter, *and its order*;
+    /// - the `(author, recipient, order)` products handed to the router, in
+    ///   order, and the two authored inboxes those products did not go to;
+    /// - the witness column, compared as the signed frames it cuts — which
+    ///   folds the input records with their sources, the neighbour records
+    ///   with their observation stamps and read bytes, and the tick hashes.
+    ///
+    /// A control executor stepping only the player craft proves the freeze is
+    /// not vacuous: the replica the prediction set does not name never moves,
+    /// and the run asserts it really stepped, emitted, delivered, routed to
+    /// the wire, sealed a delivered input, materialized a child and cut a
+    /// frame.
+    fn bot_convergence_run(cheat: Option<Tamper>) {
+        const INDEX: usize = 3;
+        const TICKS: u64 = 400;
+        /// The ingest leg refreshes the replica on this cadence, until it
+        /// stops — after which the staleness sweep must fire in both columns.
+        const REFRESH_EVERY: u64 = 30;
+        const REFRESH_UNTIL: u64 = 200;
+        /// A remote authority delivers to this peer's craft on this cadence.
+        const DELIVER_EVERY: u64 = 17;
+        /// And to one of the rocks it hosts on this one, hard enough to split
+        /// it — which is what makes the materialization column non-vacuous.
+        const MINE_EVERY: u64 = 23;
+
+        let spec = BotSpec {
+            index: INDEX,
+            count: 8,
+            seed: UniverseSeed([0x6c; 32]),
+            cell_edge_m: default_cell_edge_m(),
+            witnessing: true,
+            cheat,
+            enforcing: true,
+        };
+        let mut bot = Bot::new(spec);
+        bot.enable_resolved_shot_capture();
+        let rocks: Vec<PersistId> = orrery_games::regolith::campaign_rock_seeds(spec.seed, 1)
+            .into_iter()
+            .map(|seeded| {
+                bot.host_entity(seeded.entity, RegolithState::Rock(seeded.rock));
+                seeded.entity
+            })
+            .collect();
+        let mut reference = ReferenceColumn::mirroring(&bot, INDEX);
+
+        // A neighbour placed inside the craft's collision radius and closing
+        // on it, with a velocity of its own. Both halves are load-bearing:
+        // Regolith reads a neighbour only to verify a claim its own input
+        // named, so without a live collision candidate the neighbour-frame
+        // column — the half of this conversion that was hardest to keep —
+        // would be empty on every tick and prove nothing; and a body at rest
+        // stays put whether the seam steps it or not, which would make the
+        // freeze assertion vacuous.
+        let remote = PersistId::new(97);
+        let remote_authority = bot_key(41).public();
+        let replica = {
+            let own = bot.craft().clone();
+            let RegolithState::Craft(mut craft) = Regolith::honest().spawn(remote, 1) else {
+                panic!("a spawned craft is a craft");
+            };
+            craft.pos = QPos {
+                x: own.pos.x + 1_000,
+                y: own.pos.y,
+                z: own.pos.z,
+            };
+            craft.vel = orrery_core::QVel {
+                x: -12_000,
+                y: -4_000,
+                z: 2_500,
+            };
+            RegolithState::Craft(craft)
+        };
+        let installed_replica = replica.to_canonical();
+
+        // The control: the same replica in an executor that is never asked to
+        // step it either, so "frozen" is compared against a body that *can*
+        // move rather than against a constant.
+        let mut control = Executor::new(Regolith::honest(), spec.seed);
+        control.insert(remote, replica.clone());
+
+        let mut steps = 0_usize;
+        let mut events_seen = 0_usize;
+        let mut wired = 0_usize;
+        let mut inboxed = 0_usize;
+        let mut frames_cut = 0_usize;
+        let mut materializations = 0_usize;
+        let mut neighbour_reads = 0_usize;
+        let mut expiries = 0_usize;
+
+        for tick in 0..TICKS {
+            // `apply_replicas`' ingest, as the receive seam leaves it: a
+            // decoded claim installed verbatim under its observation tick.
+            if tick <= REFRESH_UNTIL && tick.is_multiple_of(REFRESH_EVERY) {
+                bot.replica_authorities
+                    .entry(remote)
+                    .or_insert(remote_authority);
+                bot.host
+                    .install_state_observed(remote, replica.clone(), Tick::new(tick));
+                bot.replica_seen_at.insert(remote, tick);
+                reference
+                    .replica_authorities
+                    .entry(remote)
+                    .or_insert(remote_authority);
+                reference
+                    .executor
+                    .insert_observed(remote, replica.clone(), Tick::new(tick));
+                reference.replica_seen_at.insert(remote, tick);
+            }
+            // A remote authority's delivery, as `receive` leaves it.
+            if tick.is_multiple_of(DELIVER_EVERY) {
+                let order = Order::Lock { target: remote };
+                bot.delivered_inbox.push((remote, order.clone()));
+                reference.delivered_inbox.push((remote, order));
+            }
+            // And one addressed to a rock this peer hosts, which is the arm
+            // that steps a second authority and materializes its children.
+            if tick.is_multiple_of(MINE_EVERY) {
+                // From this peer's *own* craft, which is what the rules do
+                // when it fires at a rock it hosts: the rock's credit reply
+                // is then addressed back to an authority this peer holds, so
+                // the self-queue arm of the routing decision is exercised
+                // rather than argued.
+                let order = mining_damage(bot.entity, bot.craft());
+                bot.hosted_inbox
+                    .entry(rocks[0])
+                    .or_default()
+                    .push((bot.entity, order.clone()));
+                reference
+                    .hosted_inbox
+                    .entry(rocks[0])
+                    .or_default()
+                    .push((bot.entity, order));
+            }
+
+            let before = bot.host.backend().entities().count();
+            bot.publish_claim(tick);
+            let reference_claim = reference
+                .chain
+                .as_mut()
+                .zip(reference.executor.state(reference.entity).cloned())
+                .and_then(|(chain, state)| chain.cut_claim(tick, &state));
+            let _ = reference_claim;
+
+            bot.step_core(tick, spec.cell_edge_m);
+            reference.step_core(tick);
+
+            // ── the comparison, every tick ───────────────────────────────
+            assert_eq!(
+                bot.last_step.predicted, reference.last_step.predicted,
+                "the predicted set at tick {tick} must be the set the loop stepped"
+            );
+            assert_eq!(
+                bot.last_step.events, reference.last_step.events,
+                "emitted events must match in emitter, value and order at tick {tick}"
+            );
+            let converged_population: Vec<PersistId> =
+                bot.host.backend().entities().copied().collect();
+            let reference_population: Vec<PersistId> =
+                reference.executor.entities().copied().collect();
+            assert_eq!(
+                converged_population, reference_population,
+                "the two columns must hold the same population at tick {tick}"
+            );
+            for entity in &converged_population {
+                assert_eq!(
+                    bot.host.state_bytes(*entity),
+                    reference
+                        .executor
+                        .state(*entity)
+                        .map(CoreCodec::to_canonical),
+                    "canonical state for {entity:?} diverged at tick {tick}"
+                );
+            }
+            assert_eq!(
+                bot.hosted, reference.hosted,
+                "the set of authorities this peer holds must match at tick {tick}"
+            );
+            assert_eq!(
+                bot.hosted_inbox, reference.hosted_inbox,
+                "each hosted authority's inbox must match at tick {tick}"
+            );
+            assert_eq!(
+                bot.delivered_inbox, reference.delivered_inbox,
+                "this peer's own inbox must match at tick {tick}"
+            );
+            assert_eq!(
+                bot.delivered_outbox, reference.delivered_outbox,
+                "the products handed to the router must match in value and order at tick {tick}"
+            );
+            assert_eq!(
+                bot.first_tampered_tick, reference.first_tampered_tick,
+                "the honest shadow must first disagree on the same tick, at tick {tick}"
+            );
+            assert_eq!(
+                bot.resolved_shots, reference.resolved_shots,
+                "the captured shot verdicts must match at tick {tick}"
+            );
+            if bot.replica_seen_at.contains_key(&remote) {
+                assert_eq!(
+                    bot.host.state_bytes(remote),
+                    Some(installed_replica.clone()),
+                    "the replica outside the prediction set is frozen at tick {tick}: \
+                     byte-identical to what the ingest leg installed"
+                );
+            } else {
+                expiries = expiries.saturating_add(1);
+                assert_eq!(
+                    bot.host.state_bytes(remote),
+                    None,
+                    "an expired replica is gone from both columns at tick {tick}"
+                );
+            }
+            let converged_frame = bot.chain.as_mut().and_then(|chain| chain.cut_frame(tick));
+            let reference_frame = reference
+                .chain
+                .as_mut()
+                .and_then(|chain| chain.cut_frame(tick));
+            assert_eq!(
+                converged_frame.is_some(),
+                reference_frame.is_some(),
+                "both columns must cut a frame on the same tick, at tick {tick}"
+            );
+            if let (Some(converged), Some(reference_cut)) = (&converged_frame, &reference_frame) {
+                // The signed frame is the whole witness column for this
+                // window: its input records with their sources, its neighbour
+                // records with their observation stamps and read bytes, and
+                // the signature over the folded chain. Comparing its bytes
+                // compares all of that at once.
+                assert_eq!(
+                    serde_json::to_vec(&converged.frame).expect("a frame serializes"),
+                    serde_json::to_vec(&reference_cut.frame).expect("a frame serializes"),
+                    "the witness column must fold to the same signed frame at tick {tick}"
+                );
+                assert_eq!(converged.transitions, reference_cut.transitions);
+                assert_eq!(converged.tick_hashes, reference_cut.tick_hashes);
+                frames_cut = frames_cut.saturating_add(1);
+            }
+
+            steps = steps.saturating_add(bot.last_step.predicted);
+            events_seen = events_seen.saturating_add(bot.last_step.events.len());
+            wired = wired.saturating_add(bot.delivered_outbox.len());
+            inboxed = inboxed
+                .saturating_add(bot.delivered_inbox.len())
+                .saturating_add(bot.hosted_inbox.values().map(Vec::len).sum::<usize>());
+            materializations = materializations
+                .saturating_add(bot.host.backend().entities().count().saturating_sub(before));
+            neighbour_reads =
+                neighbour_reads.saturating_add(reference_frame.as_ref().map_or(0, |cut| {
+                    cut.frame
+                        .entities
+                        .iter()
+                        .flat_map(|slice| slice.records.iter())
+                        .filter(|record| {
+                            matches!(record.source, RecordSource::NeighborFrame { .. })
+                        })
+                        .count()
+                }));
+            let _ = bot.drain_delivered();
+            let _ = core::mem::take(&mut reference.delivered_outbox);
+            control.step_entity(remote, Tick::new(tick), &[]);
+        }
+
+        // ── non-vacuity: this run really did all of it ────────────────────
+        assert!(
+            steps >= TICKS as usize,
+            "the run must have stepped at least one authority per tick, not {steps}"
+        );
+        assert!(events_seen > 0, "the run emitted no events at all");
+        assert!(wired > 0, "the run handed nothing to the router");
+        assert!(inboxed > 0, "the run queued nothing into an authored inbox");
+        assert!(frames_cut > 0, "the run cut no witness frame");
+        assert!(materializations > 0, "the run materialized nothing");
+        assert!(neighbour_reads > 0, "the run's witness column is empty");
+        assert!(expiries > 0, "the staleness sweep never fired");
+        assert_ne!(
+            control.state(remote).map(CoreCodec::to_canonical),
+            Some(installed_replica),
+            "the freeze is not vacuous: the same replica, stepped, does move"
+        );
+    }
+
+    /// A `Damage` order large enough to break the smallest campaign rock,
+    /// shaped exactly as `Regolith::deliver` shapes one from `DamageDealt`.
+    fn mining_damage(from: PersistId, shooter: &Craft) -> Order {
+        Order::Damage {
+            amount: 100_000,
+            from,
+            from_pos: shooter.pos,
+            from_vel: shooter.vel,
+            from_yaw_urad: shooter.yaw_urad,
+            from_archetype: shooter.archetype,
+            from_weapon: shooter.weapon,
+            flight_ticks: None,
+        }
+    }
+
+    #[test]
+    fn the_converged_bot_tick_reproduces_the_hand_rolled_loop() {
+        bot_convergence_run(None);
+    }
+
+    /// The same detector on a modified build: the tampered rules step the
+    /// authority, the shipping rules step the shadow beside it, and both
+    /// columns must first disagree on the same tick.
+    #[test]
+    fn the_converged_bot_tick_reproduces_the_hand_rolled_loop_on_a_modified_build() {
+        for tamper in Tamper::ALL {
+            bot_convergence_run(Some(*tamper));
+        }
     }
 
     /// One tick of this harness's roam under `rules`, on `archetype`.

@@ -41,6 +41,10 @@ orrery_witness = { path = "../../crates/orrery_witness" }
 # criterion — ships its own cheats for the harness to field a modified client
 # with.
 orrery_games = { path = "../../crates/orrery_games" }
+# The A18 seam the bot driver steps through (#1104 S6.c): the fixed clock, the
+# sealed input buffer with provenance, the named prediction set and the
+# delivery-routing hook this harness used to keep its own copy of.
+orrery_sim_host = { path = "../../crates/orrery_sim_host" }
 
 # Versions mirror the root workspace's D14 pins exactly (a standalone
 # `[workspace]` cannot inherit `workspace.dependencies`).
