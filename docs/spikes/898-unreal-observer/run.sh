@@ -4,6 +4,13 @@
 #   run.sh build              cargo staticlib, then UnrealBuildTool
 #   run.sh map                author /Game/Maps/OrreryObserver headlessly
 #   run.sh observe [TICKS]    two sidecars + the Unreal observer, TICKS ticks
+#   run.sh paced [TICKS] [N] [HZ]
+#                             ONE sidecar carrying N predicted entities, and an
+#                             observer paced to HZ by sleeping to a deadline.
+#                             The comparable shape (#1106): N and the tick rate
+#                             match what examples/extract_cost.rs measures, so
+#                             the crossing figure sits beside #1100's rather
+#                             than beside a free-running poll of an idle link.
 #   run.sh kill [TICKS]       the same, then SIGKILL the *editor* mid-run and
 #                             check the sidecars' canonical run is untouched
 #
@@ -60,6 +67,27 @@ start_sidecars() {
     done
 }
 
+# One sidecar carrying a whole population, which is the shape #1100's
+# `extract_cost` harness measures: 24 predicted entities in one app, ids 1..24.
+# Two sidecars of 12 would be two extractions and two links, and would not be
+# the same measurement.
+start_population() {
+    local entities=$1 log="$out/sidecar-pop.log"
+    : >"$log"
+    "$root/target/release/orrery-sidecar" --serve 127.0.0.1:0 --seed 21 \
+        --entity 1 --entities "$entities" >"$log" 2>&1 &
+    sidecar_pids+=("$!")
+    local addr=""
+    for _ in $(seq 1 100); do
+        sleep 0.2
+        addr=$(grep -m1 -o 'serving ipc on .*' "$log" | cut -d' ' -f4)
+        [[ -n $addr ]] && break
+    done
+    [[ -n $addr ]] || { echo "the population sidecar never bound a port" >&2; exit 1; }
+    sidecar_addrs+=("$addr")
+    echo "sidecar entities=$entities pid=${sidecar_pids[-1]} addr=$addr"
+}
+
 stop_sidecars() {
     for pid in "${sidecar_pids[@]:-}"; do
         [[ -n $pid ]] && kill "$pid" 2>/dev/null
@@ -100,6 +128,26 @@ observe)
         -ObserverTicks="$ticks" -ObserverOut="$out" >"$out/observer.log" 2>&1
     echo "editor exit: $?"
     grep -E "spike 898" "$out/observer.log" | tail -20
+    stop_sidecars
+    ;;
+paced)
+    ticks="${2:-36000}"
+    entities="${3:-24}"
+    hz="${4:-60}"
+    echo "loadavg at start: $(cut -d' ' -f1-3 /proc/loadavg)"
+    start_population "$entities"
+    sleep 1
+    echo "== paced observer: $ticks ticks at $hz Hz, N=$entities, against ${sidecar_addrs[0]}"
+    env -u DISPLAY -u WAYLAND_DISPLAY "$editor" "$proj/OrreryObserver.uproject" \
+        /Game/Maps/OrreryObserver -game "$(rhi_args)" \
+        -unattended -nosplash -nopause -nosound -windowed -ResX=960 -ResY=540 \
+        -UseFixedTimeStep -FPS="$hz" -log -stdout -FullStdOutLogOutput \
+        -ObserverAddr="${sidecar_addrs[0]}" \
+        -ObserverTicks="$ticks" -ObserverHz="$hz" -ObserverOut="$out" \
+        >"$out/observer-paced.log" 2>&1
+    echo "editor exit: $?"
+    echo "loadavg at end:   $(cut -d' ' -f1-3 /proc/loadavg)"
+    grep -E "spike 898" "$out/observer-paced.log" | tail -25
     stop_sidecars
     ;;
 kill)

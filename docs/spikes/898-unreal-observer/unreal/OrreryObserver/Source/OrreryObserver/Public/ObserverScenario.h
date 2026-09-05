@@ -26,6 +26,17 @@ class UCapsuleComponent;
  *   -ObserverAddr=HOST:PORT      may be given twice; one link each
  *   -ObserverTicks=N             quit after N ticks (0 = run until killed)
  *   -ObserverOut=DIR             where the CSV and the summary are written
+ *   -ObserverHz=N                pace the tick to N Hz by sleeping to a
+ *                                deadline; 0 (the default) free-runs
+ *
+ * PACING, AND WHY IT CHANGES THE MEANING OF THE NUMBER (#1106). Free-running,
+ * this actor ticks thousands of times a second against a sidecar presenting
+ * at `PRESENTATION_HZ = 120`, so the large majority of samples are a poll that
+ * finds nothing new: the cost of *asking*. With `-ObserverHz=60` the tick
+ * sleeps to a real-time deadline outside the measured window, so a sample is
+ * one frame's worth of crossing at the frame rate a client would actually run,
+ * and `decoded_ticks` in the summary says how many samples had new messages
+ * behind them rather than leaving the reader to guess.
  */
 UCLASS()
 class ORRERYOBSERVER_API AObserverScenario : public AActor
@@ -57,6 +68,7 @@ private:
 	};
 
 	void Dial();
+	void PaceToDeadline();
 	void RenderLink(int32 LinkIndex);
 	FCapsule& CapsuleFor(int32 LinkIndex, uint64 PersistId, uint8 Timeline);
 	void WriteReport();
@@ -78,6 +90,58 @@ private:
 	 * pay for spawning the capsules, which happens once.
 	 */
 	TArray<double> TickNanos;
+
+	/**
+	 * The boundary half of the same samples: poll + copy-out only, with the
+	 * actor moves excluded.
+	 *
+	 * `TickNanos` minus this is Unreal's own cost of applying the frame, which
+	 * scales with N and has no counterpart in #1100's extractor figure. Two
+	 * `FPlatformTime::Seconds()` calls per link per tick land inside the outer
+	 * window to produce it; at tens of nanoseconds each against a window of
+	 * tens of microseconds that is below the resolution of anything reported.
+	 */
+	TArray<double> BoundaryNanos;
+
+	/** The pacing deadline for the next tick, in `FPlatformTime::Seconds()`. */
+	double NextDeadline = 0.0;
+
+	/** When the first paced tick ran, so the achieved rate can be reported. */
+	double PacedStart = 0.0;
+
+	/** When the last measured tick's window closed. */
+	double MeasuredEnd = 0.0;
+
+	/** The first tick counted towards the achieved rate. */
+	int32 PacedFrom = 0;
+
+	/** Target tick rate from `-ObserverHz=`; 0 free-runs, as before #1106. */
+	double ObserverHz = 0.0;
+
+	/**
+	 * Measured ticks on which at least one link had newly applied messages.
+	 *
+	 * The decode itself happens on `orrery_unreal_observer`'s own link thread,
+	 * not here — so this is not "ticks that decoded", it is "ticks whose
+	 * copy-out saw a set the decoder had just replaced". A crossing figure
+	 * whose samples are mostly *not* those is a figure about polling an idle
+	 * link, and #1105's was; this counter is what makes the difference
+	 * visible rather than assumed.
+	 */
+	int32 FreshTicks = 0;
+
+	/** Newly applied messages seen across all links this tick. */
+	uint32 AppliedThisTick = 0;
+
+	/**
+	 * Whether this tick also built CSV rows, which allocate and format inside
+	 * the timed window. Such a tick is excluded from the percentiles: it
+	 * measures the instrument as much as the crossing.
+	 */
+	bool bSampledCsvThisTick = false;
+
+	/** Seconds spent inside poll + copy-out this tick, across all links. */
+	double BoundaryThisTick = 0.0;
 
 	int32 RequestedTicks = 0;
 	int32 TicksRun = 0;

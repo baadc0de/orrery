@@ -4,3 +4,5 @@ Saved/
 DerivedDataCache/
 results/*.log
 results/*.csv
+results/**/*.log
+results/**/*.csv

@@ -2,6 +2,7 @@
 
 #include "Components/CapsuleComponent.h"
 #include "Engine/World.h"
+#include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Kismet/GameplayStatics.h"
 #include "Misc/CommandLine.h"
@@ -98,14 +99,15 @@ void AObserverScenario::BeginPlay()
 	}
 
 	FParse::Value(FCommandLine::Get(), TEXT("ObserverTicks="), RequestedTicks);
+	FParse::Value(FCommandLine::Get(), TEXT("ObserverHz="), ObserverHz);
 	if (!FParse::Value(FCommandLine::Get(), TEXT("ObserverOut="), OutDir))
 	{
 		OutDir = FPaths::ProjectSavedDir();
 	}
 
 	Dial();
-	UE_LOG(LogOrreryObserver, Display, TEXT("spike 898: observing %d sidecar(s), ticks=%d"),
-		Links.Num(), RequestedTicks);
+	UE_LOG(LogOrreryObserver, Display, TEXT("spike 898: observing %d sidecar(s), ticks=%d, hz=%.2f"),
+		Links.Num(), RequestedTicks, ObserverHz);
 }
 
 void AObserverScenario::Dial()
@@ -178,9 +180,15 @@ void AObserverScenario::RenderLink(int32 LinkIndex)
 		return;
 	}
 
+	// The boundary proper — poll and copy-out — timed inside the outer window
+	// so the two can be reported separately. Everything after `BoundaryClosed`
+	// is Unreal's own work (spawning nothing in steady state, moving N actors),
+	// and #1100's extractor figure has no counterpart to it.
+	const double BoundaryOpened = FPlatformTime::Seconds();
 	uint32 Applied = 0;
 	Link.LastStatus = orrery_observer_poll(Link.Handle, &Applied);
 	Link.Applied += Applied;
+	AppliedThisTick += Applied;
 	if (Link.LastStatus != ORRERY_OBSERVER_OK && Link.LastStatus != ORRERY_OBSERVER_LINK_CLOSED
 		&& Link.LastStatus != ORRERY_OBSERVER_LINK_FAILED)
 	{
@@ -206,6 +214,7 @@ void AObserverScenario::RenderLink(int32 LinkIndex)
 		Status = orrery_observer_snapshot(Link.Handle, Buffer.GetData(),
 			static_cast<uint32>(Buffer.Num()), &Required);
 	}
+	BoundaryThisTick += FPlatformTime::Seconds() - BoundaryOpened;
 	if (Status != ORRERY_OBSERVER_OK)
 	{
 		UE_LOG(LogOrreryObserver, Error, TEXT("spike 898: snapshot on %s returned %d"), *Link.Addr,
@@ -244,6 +253,11 @@ void AObserverScenario::RenderLink(int32 LinkIndex)
 
 		if (TicksRun % 30 == 0)
 		{
+			// This allocates and formats inside the timed window, so the tick
+			// it happens on is excluded from the percentiles below rather
+			// than reported as a crossing cost it is not (#1106). At N=24 it
+			// is 24 `Printf`s and was visibly the tail of the p99.
+			bSampledCsvThisTick = true;
 			Rows.Add(FString::Printf(TEXT("%d,%d,%llu,%s,%lld,%llu,%llu,%llu,%u,%u"), TicksRun,
 				LinkIndex, static_cast<unsigned long long>(Entity.persist_id),
 				Entity.timeline == ORRERY_OBSERVER_PREDICTED ? TEXT("predicted") : TEXT("interpolated"),
@@ -267,7 +281,11 @@ void AObserverScenario::Tick(float DeltaSeconds)
 	// The measured window is the whole crossing as the game thread pays for
 	// it: poll, copy-out, and the actor moves the copy-out produces. Not the
 	// engine's frame, and not the sidecar's tick — the part that exists
-	// because the simulation is in another process.
+	// because the simulation is in another process. The pacing sleep below is
+	// deliberately *outside* it: a paced run must not measure its own clock.
+	AppliedThisTick = 0;
+	bSampledCsvThisTick = false;
+	BoundaryThisTick = 0.0;
 	const double Started = FPlatformTime::Seconds();
 	for (int32 Index = 0; Index < Links.Num(); ++Index)
 	{
@@ -279,7 +297,21 @@ void AObserverScenario::Tick(float DeltaSeconds)
 	// included them would be describing startup, not the steady state.
 	if (TicksRun > WarmupTicks)
 	{
-		TickNanos.Add(Elapsed * 1e9);
+		if (PacedStart == 0.0)
+		{
+			PacedStart = Started;
+			PacedFrom = TicksRun;
+		}
+		MeasuredEnd = Started + Elapsed;
+		if (!bSampledCsvThisTick)
+		{
+			TickNanos.Add(Elapsed * 1e9);
+			BoundaryNanos.Add(BoundaryThisTick * 1e9);
+			if (AppliedThisTick > 0)
+			{
+				++FreshTicks;
+			}
+		}
 	}
 
 	if (RequestedTicks > 0 && TicksRun >= RequestedTicks)
@@ -287,6 +319,35 @@ void AObserverScenario::Tick(float DeltaSeconds)
 		WriteReport();
 		UE_LOG(LogOrreryObserver, Display, TEXT("spike 898: requested ticks reached, quitting"));
 		FPlatformMisc::RequestExit(false);
+		return;
+	}
+
+	PaceToDeadline();
+}
+
+void AObserverScenario::PaceToDeadline()
+{
+	if (ObserverHz <= 0.0)
+	{
+		return;
+	}
+
+	// An absolute, accumulated deadline rather than "sleep 1/Hz": a sleep that
+	// overshoots would otherwise push every later tick out by the overshoot and
+	// the run would silently pace at less than the rate it claims. A deadline
+	// already in the past is reset to now, so a long stall costs one late tick
+	// rather than a burst of catch-up ticks with no sleep between them.
+	const double Period = 1.0 / ObserverHz;
+	const double Now = FPlatformTime::Seconds();
+	if (NextDeadline == 0.0 || NextDeadline < Now)
+	{
+		NextDeadline = Now;
+	}
+	NextDeadline += Period;
+	const double Remaining = NextDeadline - FPlatformTime::Seconds();
+	if (Remaining > 0.0)
+	{
+		FPlatformProcess::SleepNoStats(static_cast<float>(Remaining));
 	}
 }
 
@@ -309,6 +370,7 @@ void AObserverScenario::WriteReport()
 	Summary.Add(FString::Printf(TEXT("interpolated_seen=%llu"), static_cast<unsigned long long>(InterpolatedSeen)));
 	Summary.Add(FString::Printf(TEXT("bracketed_seen=%llu"), static_cast<unsigned long long>(BracketedSeen)));
 	Summary.Add(FString::Printf(TEXT("capsules=%d"), Capsules.Num()));
+	Summary.Add(FString::Printf(TEXT("observer_hz=%.2f"), ObserverHz));
 
 	TArray<double> Sorted = TickNanos;
 	Sorted.Sort();
@@ -319,6 +381,29 @@ void AObserverScenario::WriteReport()
 	Summary.Add(FString::Printf(TEXT("crossing_ns_p999=%.0f"), PercentileOf(Sorted, 0.999)));
 	Summary.Add(FString::Printf(TEXT("crossing_ns_max=%.0f"),
 		Sorted.Num() > 0 ? Sorted.Last() : 0.0));
+	// The share of measured ticks that had a freshly applied set behind them.
+	// Without this a p50 can be the cost of polling an idle link and read like
+	// the cost of a frame — which is exactly what #1106 was filed about.
+	Summary.Add(FString::Printf(TEXT("fresh_ticks=%d of %d (%.1f%%)"), FreshTicks, Sorted.Num(),
+		Sorted.Num() > 0 ? 100.0 * static_cast<double>(FreshTicks) / static_cast<double>(Sorted.Num())
+						 : 0.0));
+	const double MeasuredWall = MeasuredEnd > PacedStart ? MeasuredEnd - PacedStart : 0.0;
+	const int32 PacedTicks = TicksRun - PacedFrom;
+	Summary.Add(FString::Printf(TEXT("measured_wall_s=%.3f over %d ticks"), MeasuredWall, PacedTicks));
+	Summary.Add(FString::Printf(TEXT("effective_hz=%.2f"),
+		MeasuredWall > 0.0 ? static_cast<double>(PacedTicks) / MeasuredWall : 0.0));
+	Summary.Add(FString::Printf(TEXT("csv_sampled_ticks_excluded=%d"), PacedTicks - Sorted.Num()));
+
+	// The same samples, split at the boundary: `boundary` is poll + copy-out
+	// across every link, `crossing` is that plus the actor moves it produces.
+	// Only the first has a counterpart on the Rust side of the seam.
+	TArray<double> Boundary = BoundaryNanos;
+	Boundary.Sort();
+	Summary.Add(FString::Printf(TEXT("boundary_ns_p50=%.0f"), PercentileOf(Boundary, 0.50)));
+	Summary.Add(FString::Printf(TEXT("boundary_ns_p99=%.0f"), PercentileOf(Boundary, 0.99)));
+	Summary.Add(FString::Printf(TEXT("boundary_ns_p999=%.0f"), PercentileOf(Boundary, 0.999)));
+	Summary.Add(FString::Printf(TEXT("boundary_ns_max=%.0f"),
+		Boundary.Num() > 0 ? Boundary.Last() : 0.0));
 	for (int32 Index = 0; Index < Links.Num(); ++Index)
 	{
 		Summary.Add(FString::Printf(TEXT("link%d=%s applied=%llu status=%d"), Index, *Links[Index].Addr,

@@ -118,8 +118,73 @@ applied only 542 messages over the run. Most ticks therefore measured the
 copy-out and the actor moves with no new message to decode. It is the cost of
 *asking*, at three entities — the right number for "what does an idle frame of
 this crossing cost the game thread", and the wrong number for "what does a
-frame's worth of decoding cost". A 60 Hz-paced N=24 run is named below as
-undone.
+frame's worth of decoding cost". [#1106] asked for the paced run instead; it
+is the next section, and it supersedes this one for every comparison.
+
+### The paced run at N=24 — [#1106]
+
+The number that sits beside [#1100]'s. **One** sidecar carrying 24 predicted
+entities — ids 1..24, which is exactly what `examples/extract_cost.rs` spawns
+(`PersistId::new(n + 1)` for `n` in `0..entities`) — and an observer that
+sleeps to a real-time 60 Hz deadline instead of spinning.
+
+| Conditions | |
+|---|---|
+| N | **24** predicted entities, one sidecar, one link |
+| Tick rate | **60 Hz**, paced; measured `effective_hz` **58.38** |
+| Pacing | the actor sleeps to an accumulated absolute deadline (`AObserverScenario::PaceToDeadline`), *outside* the timed window |
+| Presentation | `PRESENTATION_HZ = 120` (`crates/orrery_sidecar/src/lib.rs:75`) |
+| Transport | the real IPC socket, `orrery_unreal_observer`'s `staticlib` over the C ABI |
+| RHI | `-NullRHI`, `-unattended`, `DISPLAY` and `WAYLAND_DISPLAY` unset |
+| Samples | **34,742** (60 warmup ticks and 1,197 CSV-writing ticks excluded) |
+| loadavg | **0.10 at the start, 0.04 at the end**; the `unreal-editor` lease held, nothing else on the box |
+
+**Every sample bracketed a freshly applied set: `fresh_ticks` is 34,742 of
+34,742, 100.0 %.** The link applied 73,579 messages over 36,000 ticks — 2.04
+per tick, which is 120 Hz presentation read at 60 Hz, as intended. This is the
+thing #1105's figure could not say.
+
+| | boundary (poll + copy-out) | crossing (that, plus the 24 actor moves) |
+|---|---|---|
+| p50 | **521 ns** | **25,528 ns** |
+| p99 | 1,322 ns | 56,495 ns |
+| p99.9 | 2,244 ns | 87,183 ns |
+| max | 22,332 ns | 115,235 ns |
+
+**What each sample brackets, precisely.** The outer window is `Tick`'s call to
+`RenderLink` for every link: `orrery_observer_poll`, `orrery_observer_snapshot`
+into a pre-grown buffer, and one `SetActorLocationAndRotation` per record. The
+inner window is the first two of those. The pacing sleep is outside both.
+
+**The decode is not in either window, and this is the correction the paced run
+makes to the question as it was asked.** `orrery_observer_connect` spawns a
+link thread that owns the socket and the codec, and applies each batch into a
+mutex-guarded `ObserverView`
+(`crates/orrery_unreal_observer/src/lib.rs:217-234`); the game thread's poll
+reads one atomic (`:269`) and the copy-out takes the lock and copies the
+records out (`:310-352`). So no arrangement of this observer makes the game
+thread decode a batch — pacing makes each sample *stand for* a frame's worth
+of arrivals, which is what comparability needed, but the decode itself is paid
+concurrently on another core.
+
+**The seam is not what costs.** 521 ns of the 25,528 is the boundary; the
+other ~98 % is Unreal moving 24 actors. That is engine work with no
+counterpart in [#1100]'s extractor figure, and it is the term that scales with
+N here.
+
+### Reading the three numbers together
+
+| Where | What | p50 at N=24 |
+|---|---|---|
+| Sidecar, Rust | `export_ipc_frames`, the real extractor ([#1100]) | **3,426 ns** |
+| Unreal game thread | poll + copy-out — the boundary | **521 ns** |
+| Unreal game thread | + 24 `SetActorLocationAndRotation` | **25,528 ns** |
+
+Reproduce with `run.sh paced 36000 24 60`; banked at
+`results/paced-n24-2026-09-05.txt`.
+
+**Still not a Windows number.** Both figures above are Linux, and [#1101]
+stands.
 
 ### The archive
 
@@ -215,10 +280,13 @@ says no Windows report exists and one landed on 2026-09-04
 
 ## Deliberately not done
 
-- **A 60 Hz-paced observer run at N=24.** The cost figure above is an idle-ish
-  frame at three entities. The number that would sit beside #920's is a paced
-  run at the tested baseline population, and it needs the observer to sleep to
-  a deadline rather than free-run.
+- **An interpolated entity in the paced population.** The paced run is 24
+  predicted entities and no stand-in, which is what [#1100] measures;
+  `bracketed_seen` is therefore 0 there, and the bracket evidence stays the
+  36,000 samples of the free-running run above.
+- **Any per-N curve.** N=24 and N=3 are the two points taken. The ~98 % share
+  that is actor moves predicts the crossing scales with N and the boundary
+  barely does, but two points do not establish that and nothing here claims it.
 - **Any Windows measurement.** Neither box is Windows. The Linux figures are
   not substitutes and are not offered as any.
 - **A rendered frame.** Every run was `-NullRHI`. `RHI=offscreen` is wired in
@@ -237,6 +305,7 @@ says no Windows report exists and one landed on 2026-09-04
 docs/spikes/898-unreal-observer/run.sh build        # cargo staticlib, then UnrealBuildTool
 docs/spikes/898-unreal-observer/run.sh map          # author the map, headless
 docs/spikes/898-unreal-observer/run.sh observe 36000
+docs/spikes/898-unreal-observer/run.sh paced 36000 24 60   # the #1106 figure
 docs/spikes/898-unreal-observer/run.sh kill         # the A9 P-4 demonstration
 
 cargo test -p orrery_sidecar --test observer_kill   # the same property, every commit
@@ -255,5 +324,6 @@ target/release/orrery-observer --addr 127.0.0.1:PORT_A --addr 127.0.0.1:PORT_B -
 [#898]: https://github.com/baadc0de/orrery/issues/898
 [#1100]: https://github.com/baadc0de/orrery/pull/1100
 [#1101]: https://github.com/baadc0de/orrery/issues/1101
+[#1106]: https://github.com/baadc0de/orrery/issues/1106
 [A9]: ../../plans/a9-engine-boundaries.md
 [ADR-0053]: ../../adr/0053-unreal-client-host-scope.md

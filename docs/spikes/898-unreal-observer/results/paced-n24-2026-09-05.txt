@@ -1,0 +1,21 @@
+ticks=36000
+entities_seen=864000
+predicted_seen=864000
+interpolated_seen=0
+bracketed_seen=0
+capsules=24
+observer_hz=60.00
+crossing_samples=34742 (warmup 60 excluded)
+crossing_ns_p50=25528
+crossing_ns_p99=56495
+crossing_ns_p999=87183
+crossing_ns_max=115235
+fresh_ticks=34742 of 34742 (100.0%)
+measured_wall_s=615.648 over 35939 ticks
+effective_hz=58.38
+csv_sampled_ticks_excluded=1197
+boundary_ns_p50=521
+boundary_ns_p99=1322
+boundary_ns_p999=2244
+boundary_ns_max=22332
+link0=127.0.0.1:42299 applied=73579 status=0
