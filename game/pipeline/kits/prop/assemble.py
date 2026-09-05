@@ -45,17 +45,21 @@ def load(p):
 mat = bpy.data.materials.new("prop"); mat.use_nodes = True; bs = mat.node_tree.nodes.get("Principled BSDF"); bs.inputs["Base Color"].default_value = (0.25, 0.27, 0.29, 1); bs.inputs["Roughness"].default_value = 0.55
 dark = bpy.data.materials.new("dark"); dark.use_nodes = True; bs2 = dark.node_tree.nodes.get("Principled BSDF"); bs2.inputs["Base Color"].default_value = (0.03, 0.03, 0.035, 1)
 placed = []; objs = []
+sizes = {int(r["part"]): float(r["size_m"]) for r in B.get("part_sizes", [])}   # one size per part id for the whole build
 for i, it in enumerate(B["items"]):
     p = byid.get(int(it["part"]))
     if not p: print("unknown part", it); continue
-    o = load(p); canonical(o); d = max(o.dimensions) or 1.0; s = float(it["size_m"]) / d
-    if "along" in it: rot = orient(it["along"], it.get("spin_deg", 0), it.get("tilt_deg", 0))
-    else: rot = Euler([math.radians(v) for v in it.get("rot_deg", [0, 0, 0])[:3]], 'XYZ').to_matrix().to_4x4()
-    o.matrix_world = Matrix.Translation(Vector(it["pos_m"][:3])) @ rot @ Matrix.Scale(s, 4)
-    o.name = f"{i:02d}_{it['name']}"; o.data.materials.clear(); o.data.materials.append(dark if p["kind"] == "insert" and "bracket" in p["desc"] else mat); objs.append(o)
-    bpy.context.view_layer.update(); ws = [o.matrix_world @ Vector(c) for c in o.bound_box]
-    placed.append({"i": i, "name": it["name"], "part": p["id"], "part_name": p["name"], "pos_m": it["pos_m"], "along": it.get("along"), "spin_deg": it.get("spin_deg", 0), "tilt_deg": it.get("tilt_deg", 0), "size_m": it["size_m"],
-                   "bbox_min": [round(min(w[k] for w in ws), 3) for k in range(3)], "bbox_max": [round(max(w[k] for w in ws), 3) for k in range(3)]})
+    size = sizes.get(p["id"], it.get("size_m")) or 0.5; n = max(1, int(it.get("count", 1)))
+    rot = orient(it["along"], it.get("spin_deg", 0), it.get("tilt_deg", 0)) if "along" in it else Euler([math.radians(v) for v in it.get("rot_deg", [0, 0, 0])[:3]], 'XYZ').to_matrix().to_4x4()
+    run_axis = (rot @ Vector((0, 1, 0, 0))).to_3d().normalized()   # the run direction is the part's long axis after orientation (tilt included)
+    for k in range(n):
+        o = load(p); canonical(o); d = max(o.dimensions) or 1.0; s = size / d
+        ctr = Vector(it["pos_m"][:3]) + run_axis * ((k - (n - 1) / 2) * size)   # instances end to end, the run centred on pos_m
+        o.matrix_world = Matrix.Translation(ctr) @ rot @ Matrix.Scale(s, 4)
+        o.name = f"{i:02d}_{k}_{it['name']}"; o.data.materials.clear(); o.data.materials.append(dark if p["kind"] == "insert" and "bracket" in p["desc"] else mat); objs.append(o)
+        bpy.context.view_layer.update(); ws = [o.matrix_world @ Vector(c) for c in o.bound_box]
+        placed.append({"i": i, "k": k, "name": it["name"], "part": p["id"], "part_name": p["name"], "pos_m": [round(v, 3) for v in ctr], "run_pos_m": it["pos_m"], "count": n, "along": it.get("along"), "spin_deg": it.get("spin_deg", 0), "tilt_deg": it.get("tilt_deg", 0), "size_m": size,
+                       "bbox_min": [round(min(w[kk] for w in ws), 3) for kk in range(3)], "bbox_max": [round(max(w[kk] for w in ws), 3) for kk in range(3)]})
 for o in objs: o.select_set(True)
 if objs:
     bpy.context.view_layer.objects.active = objs[0]; bpy.ops.object.join(); prop = bpy.context.object; prop.name = B.get("prop", "prop").replace(" ", "_")
