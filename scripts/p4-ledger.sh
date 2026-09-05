@@ -162,6 +162,14 @@ self_test() {
     || die 'self-test: the banked interval is no longer held under the seat'\''s connected span'
   has '(1000 + 100e-6 * ($connected * 60000)) / 60000' \
     || die 'self-test: the #1032 clock-disagreement allowance is gone from the append path; an inflated claim would bank'
+  has 'select(.session.increment.until_tick > $span.since_tick)' \
+    || die 'self-test: the ledger no longer dedupes increments by their span; one seat could bank overlapping increments and the same minutes would be attributed twice (#1048)'
+  has 'select((.session.increment // null) == null) ] | length) > 0' \
+    || die 'self-test: an increment may again be banked beside a whole-seat row; a row written before #1048 covers the whole seat and nothing may be added to it'
+  has 'increments, more than the ' \
+    || die 'self-test: nothing holds the sum of a seat'"'"'s increments under its connected span; disjoint client-asserted spans alone would let one seat bank several times over (#1048)'
+  [[ $(grep -Fc -- '{increment: {since_tick: .session.increment.since_tick,' <<<"$body") == 2 ]] \
+    || die 'self-test: the increment span is no longer in both the run key and the measurement key; two increments of one seat carry an identical identity, so without it the second is skipped as an already-banked run and without it in the measurement key the two collapse into one distinct measurement (#1048)'
 
   # Functional half. The structural checks above cannot tell a clause that is
   # read from one that is read and ignored, and every case below costs
@@ -619,6 +627,66 @@ self_test() {
     fi
     echo "$out"
   }
+  # One increment of a seat (#1048). The host had the seat connected for
+  # `seat_minutes`; this row accounts for the half-open tick span
+  # `[since, until)` of it and banks `minutes`. The increment is put into the
+  # row *before* it is signed, because that is what a client signs — a fixture
+  # that bolted it on afterwards would be refused by the signature clause and
+  # would prove nothing about the dedupe.
+  st_increment() {
+    local slot=$1 session=$2 seat_minutes=$3 secret=$4 index=$5 since=$6 until=$7
+    local minutes=$8 extra=${9:-}
+    local out="$bind_dir/inc-$slot-$secret-$index.json"
+    jq -n --arg session "$session" --argjson minutes "$minutes" \
+      --argjson index "$index" --argjson since "$since" --argjson until "$until" '{
+      session_id: $session,
+      wall_start: "2026-08-27T12:00:00Z", wall_end: "2026-08-27T13:00:00Z",
+      distinct_play_minutes: $minutes, banked_minutes: $minutes,
+      increment: {index: $index, since_tick: $since, until_tick: $until,
+                  final_increment: false},
+      platform_triple: "x86_64-unknown-linux-gnu", client_rev: "self-test",
+      ruleset_id: "52", ruleset_version: 16, pipeline_digest: "selftestpipeline",
+      actor: "human",
+      configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
+      observed_loss_pct: 3, observed_jitter_p50_ms: 100, observed_jitter_p99_ms: 100,
+      afk_seconds: 0, afk_capped: false, impairment_mismatch: false
+    }' | python3 "$ROOT/scripts/sign-campaign-measurement-fixture.py" --secret-byte "$secret" \
+       > "$bind_dir/incrow-$slot-$secret-$index.json"
+    local node
+    node=$(jq -r .measurement_node "$bind_dir/incrow-$slot-$secret-$index.json")
+    jq -n --slurpfile row "$bind_dir/incrow-$slot-$secret-$index.json" \
+      --arg attempt "$st_attempt" --arg session "$session" --arg node "$node" \
+      --argjson slot "$slot" --argjson minutes "$minutes" \
+      --argjson seat "$seat_minutes" --argjson index "$index" '
+      ($row[0]) as $r
+      | {
+        identity: {
+          seed: 5,
+          impairment: { loss: 0.03, jitter_ticks: 6, jitter_rate: 0.1, retransmit_ticks: 3 },
+          target: "x86_64-unknown-linux-gnu",
+          commit: ("00000000000000000000000000000000000000" + (10 + $index | tostring)),
+          actor: "human", human_session_id: $session,
+          attempt_id: $attempt, slot: $slot
+        },
+        started_at_unix_secs: 1750000000,
+        peers: 4, bots: 4, seconds: 3600, ticks: 108000,
+        valid_attempt_seconds: 3600, completed: true,
+        player_hours: ($minutes / 60),
+        witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
+        deferral_ledger_balances: true, total_gaps: 164022, total_shed: 162,
+        session: $r,
+        external: [{ index: $slot, node: $node, connected_ticks: ($seat * 60 * 30), said_goodbye: true, connected: false }],
+        attempt: { attempt_id: $attempt, host_target: "x86_64-unknown-linux-gnu",
+                   bots: 4, valid_attempt_seconds: 3600 },
+        binding: { attempt_id: $attempt, slot: $slot, session_id: $session, node: $node,
+                   connected_ticks: ($seat * 60 * 30),
+                   connected_minutes: $seat, close: "goodbye" }
+      }' > "$out"
+    if [[ -n $extra ]]; then
+      jq "$extra" "$out" > "$out.next" && mv "$out.next" "$out"
+    fi
+    echo "$out"
+  }
   # The bot contribution: the cohort's `B * valid_attempt_seconds / 3600`, one
   # per attempt, binding no seat.
   st_bot_contribution() {
@@ -1003,6 +1071,82 @@ self_test() {
     || die 'self-test [a_deterministic_rerun_is_still_one_measurement]: two runs of one seed with no attempt stopped collapsing; a re-measurement would count as a second hour'
   st_bind_ok a_deterministic_rerun_is_still_one_measurement
 
+  # ── Continuous banking: increments of one seat (#1048) ────────────────────
+  #
+  # A seat banks while it is still flying, so one seat appends several rows and
+  # the ledger has to dedupe on the *span* each row covers rather than trust
+  # one row per session. Slot 60 is a fresh seat; both rows carry secret byte
+  # 60, so they are the same admitted node and therefore the same seat.
+  #
+  # Ticks here run at 30 Hz (`seconds 3600`, `ticks 108000`), so one minute is
+  # 1800 ticks.
+  local st_inc_sid=018f9000-0000-7000-8000-000000001048
+  local inc_a inc_b
+  inc_a=$(st_increment 60 "$st_inc_sid" 20 60 0 0 18000 10)
+  # The second increment on the *same* commit, deliberately: two increments of
+  # one seat carry an identical `.identity`, so this is the fixture that fails
+  # if the span leaves `run_key` — the second row would be skipped as an
+  # already-banked run and the seat would keep only its first increment.
+  inc_b=$(st_increment 60 "$st_inc_sid" 20 60 1 18000 36000 10 \
+    '.identity.commit = "0000000000000000000000000000000000000010"')
+  "$0" append "$inc_a" >/dev/null 2>&1 \
+    || die 'self-test [a_seat_banks_each_of_its_increments]: the first increment was refused'
+  "$0" append "$inc_b" >/dev/null 2>&1 \
+    || die 'self-test [a_seat_banks_each_of_its_increments]: the second increment of one seat was refused; a long session would still bank all-or-nothing at teardown'
+  # Both rows bank, both are *distinct measurements*, and they sum to the seat.
+  # The distinct fold is the load-bearing half: `cmd_total` sums `player_hours`
+  # over `unique_by(measurement)`, so two increments sharing a measurement key
+  # would silently bank only the first — a seat would keep its first five
+  # minutes and discard the rest of the hour.
+  jq -es --arg s "$st_inc_sid" '
+    map(select(.human_session_id == $s)) as $seat
+    | ($seat | length == 2)
+    and ($seat | map(.measurement_key) | unique | length == 2)
+    and ($seat | map(.binding.node) | unique | length == 1)
+    and ((($seat | map(.player_hours) | add) * 60 | round) == 20)' \
+    "$P4_LEDGER_FILE" >/dev/null \
+    || die 'self-test [a_seat_banks_each_of_its_increments]: the two increments did not bank as two distinct measurements summing to the seat'
+  st_bind_ok a_seat_banks_each_of_its_increments
+
+  # The dedupe itself. The same minutes re-derived at another commit — a
+  # re-uploaded increment, or a client that re-sent what it had already banked
+  # — must not be counted twice. `run_key` cannot see it, because the commit
+  # differs; the span is what does.
+  st_bind_refuses an_increment_that_repeats_a_banked_span_is_refused \
+    "$(st_increment 60 "$st_inc_sid" 20 60 5 0 18000 10)"
+  # And a partial overlap, which is the case a whole-row equality check would
+  # miss entirely.
+  st_bind_refuses an_increment_overlapping_a_banked_span_is_refused \
+    "$(st_increment 60 "$st_inc_sid" 20 60 6 9000 27000 10)"
+
+  # Disjointness alone is not enough: the spans are client-asserted, so a
+  # client could assert ten of them and bank ten times its seat. Each row here
+  # passes `validate_attempt_binding` on its own — 30 minutes claimed against a
+  # 40-minute seat — and it is the *sum* across appends that is impossible.
+  # Only the ledger can see that; a derived report cannot.
+  local st_sum_sid=018f9000-0000-7000-8000-000000001049
+  local sum_a
+  sum_a=$(st_increment 61 "$st_sum_sid" 40 61 0 0 54000 30)
+  "$0" append "$sum_a" >/dev/null 2>&1 \
+    || die 'self-test [increments_may_not_sum_past_their_seat]: the first increment was refused'
+  st_bind_refuses increments_may_not_sum_past_their_seat \
+    "$(st_increment 61 "$st_sum_sid" 40 61 1 54000 108000 30)"
+
+  # The floor, on the increment (#1048 answering #1055). The cadence is what
+  # keeps an honest increment above `MIN_MEASURED_MINUTES`; a row below it is
+  # not a measurement, and it must not become one by being added to a seat that
+  # has already banked. This is the arm that fails if the floor is ever moved
+  # off the row and onto the accumulated total.
+  st_bind_refuses an_increment_below_the_measurement_floor_is_refused \
+    "$(st_increment 60 "$st_inc_sid" 20 60 7 36000 36900 0.5)"
+
+  # Backwards compatibility, stated as a refusal: a row carrying no increment
+  # is the *whole* seat, which is what every row written before #1048 meant, so
+  # no increment may be banked beside it. Slot 4 banked such a row at the top
+  # of this block.
+  st_bind_refuses an_increment_may_not_be_added_to_a_whole_seat_row \
+    "$(st_increment 4 "$st_sid_a" 50 7 1 0 18000 10)"
+
   # ── Retained: nothing above loosened the pre-cohort path ──────────────────
   #
   # A swarm report that names no attempt still banks, and the whole functional
@@ -1125,16 +1269,38 @@ validate_session_record() {
       and ($s.measurement_payload | type == "string" and length > 0)
       and ($s.measurement_signature | type == "string" and length == 128)
       and (if $actor == "human" then $s.session_id == $session else true end)
+      # The seat increment (#1048). A row written before it is the whole seat
+      # and carries none; a row that carries one must carry a well-formed,
+      # non-empty, forward-running half-open span, because that span is what
+      # the dedupe below decides overlap on.
+      and (if $s.increment == null then true else
+             ($s.increment.index | type == "number" and . >= 0 and floor == .)
+             and ($s.increment.since_tick | type == "number" and . >= 0 and floor == .)
+             and ($s.increment.until_tick | type == "number" and floor == .)
+             and ($s.increment.until_tick > $s.increment.since_tick)
+             and ($s.increment.final_increment | type == "boolean")
+           end)
     end
   ' "$report" >/dev/null \
     || die 'refusing to bank: incomplete or inconsistent campaign session row'
   # #1053, and deliberately its own clause with its own words: a row this
   # short is not malformed, and calling it "inconsistent" would hide what
   # actually happened to the volunteer. See MIN_MEASURED_MINUTES.
+  #
+  # And it applies to the *increment*, which is the row, not to the seat's
+  # accumulated total (#1048). That is the deliberate half of the two the
+  # issue left open: the client's cadence
+  # (`INCREMENT_MINUTES` in clients/regolith/src/session.rs) is five times this
+  # floor, so an honest increment clears it on its own and this clause stays a
+  # per-row refusal decided on the row in front of it. A floor on the
+  # accumulated total would make a row's admissibility depend on which other
+  # rows had arrived, in what order, and whether their uploads landed — and
+  # would let five twelve-second increments of a seating that never happened
+  # accumulate their way past the number #1053 exists to enforce.
   jq -e --argjson floor "$MIN_MEASURED_MINUTES" '
     if .session? == null then true else .session.distinct_play_minutes >= $floor end
   ' "$report" >/dev/null \
-    || die "refusing to bank: campaign session is below the ${MIN_MEASURED_MINUTES}-minute measurement floor; a session that ended seconds after StartV1 is a failure to seat, not a measurement (#1053)"
+    || die "refusing to bank: campaign session is below the ${MIN_MEASURED_MINUTES}-minute measurement floor; a session that ended seconds after StartV1 is a failure to seat, not a measurement, and neither is an increment shorter than one (#1053, #1048)"
   if jq -e '.session? != null' "$report" >/dev/null; then
     local measurement_node
     measurement_node=$(jq -er '.session.measurement_node | select(type == "string" and length > 0)' "$report") \
@@ -1325,26 +1491,85 @@ validate_attempt_binding() {
 # seat some **other** admitted identity already banked. A ledger line that
 # carries no node of its own — anything written before the binding travelled
 # into the line — is treated as a clash, because it cannot prove it is not one.
+#
+# ── Increments of one seat (#1048) ───────────────────────────────────────────
+#
+# A seat banks while it is still flying, so one seat legitimately appends
+# several rows. The unit of attribution is therefore not "one row per session"
+# but **one row per seat increment**: `.session.increment` carries the
+# half-open span `[since_tick, until_tick)` of that seat's connected ticks the
+# row accounts for, and the spans of one seat partition it.
+#
+# What this function refuses is unchanged in substance and stated on the span
+# rather than on the session id:
+#
+#   * a row whose span **overlaps** one this seat already banked — the same
+#     minutes attributed twice, which is what "one row per session" used to
+#     prevent by construction;
+#   * a row for a seat whose banked rows do not all carry a span, or that does
+#     not carry one itself — a pre-#1048 row is the *whole* seat, so any second
+#     row beside it is a clash, exactly as before;
+#   * a seat whose increments **sum** past its own connected span. Spans are
+#     client-asserted integers, so disjointness alone is not enough: without
+#     this a client could assert ten disjoint spans and bank ten times its
+#     seat. This is the cross-append check `validate_attempt_binding` cannot
+#     make, because it sees one report and the ledger sees the file.
+#
+# The seat is `(node, session_id)` (#1031), never the node alone and never the
+# slot alone: one install readmitted at the seat it held banks two signed
+# intervals on one slot, and #1031 fixed exactly that.
 refuse_a_second_claim_on_one_seat() {
-  local actor=$1 attempt_id=$2 slot=$3 session=$4 node=$5
+  local actor=$1 attempt_id=$2 slot=$3 session=$4 node=$5 report=$6
   [[ -n $attempt_id ]] || return 0
   [[ -r $LEDGER ]] || return 0
   local clash
   clash=$(jq -rs --arg attempt "$attempt_id" --arg actor "$actor" \
-                 --arg slot "$slot" --arg session "$session" --arg node "$node" '
-    [ .[] | select(.attempt_id == $attempt) ] as $rows
+                 --arg slot "$slot" --arg session "$session" --arg node "$node" \
+                 --slurpfile incoming "$report" '
+    $incoming[0] as $new
+    | ($new.session.increment // null) as $span
+    | [ .[] | select(.attempt_id == $attempt) ] as $rows
     | if $actor == "bot" then
         (if ([ $rows[] | select((.actor // "bot") == "bot") ] | length) > 0
          then "attempt \($attempt) has already banked its bot contribution"
          else "" end)
       else
-        (if ([ $rows[]
-               | select((.slot | tostring) == $slot)
-               | select($node == "" or (.binding.node // "") != $node) ] | length) > 0
-         then "slot \($slot) of attempt \($attempt) already carries a banked interval for another admitted identity"
-         elif ([ $rows[] | select(.human_session_id == $session) ] | length) > 0
-         then "session \($session) already banked an interval in attempt \($attempt)"
-         else "" end)
+        # The rows this seat already banked: same session id *and* same
+        # admitted node. A row carrying neither cannot prove it is not this
+        # seat, so it is counted as one.
+        ([ $rows[]
+           | select(.human_session_id == $session)
+           | select($node == "" or (.binding.node // "") == $node) ]) as $seat
+        | (if ([ $rows[]
+                 | select((.slot | tostring) == $slot)
+                 | select($node == "" or (.binding.node // "") != $node) ] | length) > 0
+           then "slot \($slot) of attempt \($attempt) already carries a banked interval for another admitted identity"
+           elif ($seat | length) == 0 then ""
+           elif $span == null
+           then "session \($session) already banked an interval in attempt \($attempt)"
+           elif ([ $seat[] | select((.session.increment // null) == null) ] | length) > 0
+           then "session \($session) already banked a whole-seat interval in attempt \($attempt), which no increment can add to"
+           elif ([ $seat[]
+                   | select(.session.increment.since_tick < $span.until_tick)
+                   | select(.session.increment.until_tick > $span.since_tick) ] | length) > 0
+           then "increment [\($span.since_tick), \($span.until_tick)) of session \($session) overlaps one already banked in attempt \($attempt)"
+           else
+             # The ceiling of the seat itself, summed across appends.
+             # `binding` carries the clamped figure where the derivation
+             # recorded one and the signed interval otherwise — the same `//`
+             # the single-row clauses use.
+             (([ $seat[] | (.binding.banked_minutes // .session.banked_minutes) ] | add)
+              + ($new.binding.banked_minutes // $new.session.banked_minutes)) as $total
+             | $new.binding as $b
+             | (if (($b.connected_since_unix_millis | type == "number")
+                    and ($b.connected_until_unix_millis | type == "number"))
+                then ($b.connected_until_unix_millis - $b.connected_since_unix_millis) / 60000
+                else ($b.connected_ticks * ($new.seconds / $new.ticks) / 60) end) as $connected
+             | ((1000 + 100e-6 * ($connected * 60000)) / 60000) as $allowance
+             | (if $total > $connected + $allowance
+                then "session \($session) would bank \($total) min across \(($seat | length) + 1) increments, more than the \($connected) min slot \($slot) was connected for"
+                else "" end)
+           end)
       end
   ' "$LEDGER")
   [[ -z $clash ]] || die "refusing to bank: $clash; an interval is attributed exactly once"
@@ -1438,7 +1663,19 @@ cmd_append() {
     || die "refusing to bank: player_hours $(jq -r '.player_hours' "$report") is not the banked interval $(jq -r '.binding.banked_minutes // .session.banked_minutes' "$report") / 60"
   # `run_key` is provenance for an individual run. It intentionally includes
   # commit, so an independently re-run report is retained for reproducibility.
-  key=$(jq -cS '.identity' "$report" | sha256_hex | cut -c1-16)
+  #
+  # And the seat increment, where there is one (#1048). Two increments of one
+  # seat carry an *identical* `.identity` — same seed, impairment, target,
+  # actor, session id, attempt and slot — because they are the same person in
+  # the same seat of the same attempt. Without the span here the second
+  # increment is skipped as an already-banked run and a long session banks
+  # only its first five minutes. A row carrying no increment hashes exactly
+  # what it hashed before, so an archived ledger re-derives byte-identically.
+  key=$(jq -cS '.identity
+                + (if .session.increment then
+                     {increment: {since_tick: .session.increment.since_tick,
+                                  until_tick: .session.increment.until_tick}}
+                   else {} end)' "$report" | sha256_hex | cut -c1-16)
   pipeline=$(pipeline_id "$commit")
   if jq -e '.session? != null and .session.pipeline_digest != $pipeline' \
     --arg pipeline "$pipeline" "$report" >/dev/null; then
@@ -1484,11 +1721,29 @@ cmd_append() {
   # becomes *harder* and the raw 500-hour figure rises faster with bot time. It
   # adds no human hour and banks no interval that was not measured; it stops
   # discarding bot-hours that were separately measured on disjoint wall time.
+  #
+  # ── Why a human increment also carries its span (#1048) ───────────────────
+  #
+  # The same argument, on the human side. `cmd_total` sums `player_hours` over
+  # `unique_by(measurement)`, so two rows sharing a measurement key contribute
+  # once — whichever came first. A seat that banks in increments emits several
+  # rows under one `human_session_id`, and without the span in this key the
+  # seat would bank its *first five minutes* and discard the rest of the hour.
+  #
+  # The spans of one seat are disjoint (`refuse_a_second_claim_on_one_seat`
+  # refuses an overlap and holds their sum under the seat), so keying on the
+  # span adds no hour that was not measured: it stops discarding hours that
+  # were. A row carrying no increment is a whole seat and keeps exactly the
+  # key it had, so an archived ledger re-derives byte-identically.
   measurement_key=$(jq -cS --arg pipeline "$pipeline" --arg actor "$actor" \
     '{pipeline: $pipeline, actor: $actor, seed: .identity.seed,
       impairment: .identity.impairment, target: .identity.target}
      + (if $actor == "human" then {human_session_id: .identity.human_session_id}
         elif .identity.attempt_id then {attempt_id: .identity.attempt_id}
+        else {} end)
+     + (if .session.increment then
+          {increment: {since_tick: .session.increment.since_tick,
+                       until_tick: .session.increment.until_tick}}
         else {} end)' \
     "$report" | sha256_hex | cut -c1-16)
 
@@ -1504,7 +1759,7 @@ cmd_append() {
   # Held under the same lock as the append it guards: a second claim on one seat
   # decided outside the lock could still be written by a concurrent appender.
   refuse_a_second_claim_on_one_seat "$actor" "$attempt_id" "$slot" "$human_session_id" \
-    "$bound_node"
+    "$bound_node" "$report"
 
   jq -c \
     --arg key "$key" \

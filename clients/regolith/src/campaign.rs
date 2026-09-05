@@ -760,6 +760,8 @@ pub struct CampaignRuntime {
     /// a row and dropped it on the floor (#947). Durability now belongs to
     /// the same call that mints it, so no later step can lose it.
     record_path: Option<PathBuf>,
+    /// In-flight increments of this seat that reached disk (#1048).
+    increments_banked: u32,
     /// Where the finished row's upload is queued the instant it is minted.
     ///
     /// The same argument as `record_path`, one step further along. Writing
@@ -1058,6 +1060,7 @@ impl CampaignRuntime {
             hearsay: crate::hearsay::HearsayState::default(),
             record_written: false,
             record_path: None,
+            increments_banked: 0,
             upload_queue: None,
             record_disposition: RecordDisposition::Unfinished,
             config,
@@ -1684,6 +1687,9 @@ impl CampaignRuntime {
         self.campaign.observe_tick(player_activity(controls));
         self.tick = Tick::new(tick.0.saturating_add(1));
         self.ticks_driven = self.ticks_driven.saturating_add(1);
+        // Bank what has accumulated, while the seat is still flying (#1048).
+        // Below the cadence this is one comparison and nothing else.
+        self.bank_increment_if_due();
         report
     }
 
@@ -2096,22 +2102,95 @@ impl CampaignRuntime {
         record
             .sign(&self.config.transport_secret)
             .expect("SessionRecord signing payload serializes");
-        // Durable here, not in whatever runs next. `Drop` reaches this
-        // function during a panic unwind and during a window close that never
-        // produced an `AppExit`; both used to sign a row and discard it,
-        // because the only writer was a Bevy system reading the return value
-        // (#947). Nothing downstream can now lose what this call measured.
-        self.record_disposition = match &self.record_path {
-            Some(path) => match append_session_record(path, &record) {
+        self.record_disposition = self.persist_and_queue(&record);
+        Some(record)
+    }
+
+    /// Bank one increment of this seat if the cadence says one is due (#1048).
+    ///
+    /// Called once per driven tick. A seat that flies for an hour writes and
+    /// queues twelve rows on the way rather than one at teardown, so a crash,
+    /// a closed lid or a lost link costs the tail since the last increment
+    /// instead of the whole session — which is what two macOS testers actually
+    /// lost in #1051.
+    ///
+    /// This mints through the *same* call `finish_record` does, so an
+    /// increment is durable and queued in one breath exactly as a closing row
+    /// is (#1056): the property that a row and its upload cannot diverge is
+    /// inherited, not bypassed.
+    fn bank_increment_if_due(&mut self) {
+        if self.record_written || !self.campaign.increment_due() {
+            return;
+        }
+        let Some(mut record) = self.campaign.finish_increment(
+            utc_now_iso8601(),
+            platform_triple(),
+            crate::BUILD_REV.to_owned(),
+            "unavailable-client-side".to_owned(),
+            false,
+        ) else {
+            return;
+        };
+        record
+            .sign(&self.config.transport_secret)
+            .expect("SessionRecord signing payload serializes");
+        // Deliberately not written to `record_disposition`: that field reports
+        // how far the *seat's closing row* got, and an increment banked
+        // mid-flight must not make a seat whose final row was lost look
+        // persisted. `increments_banked` is the separate count.
+        let disposition = self.persist_and_queue(&record);
+        if disposition == RecordDisposition::Persisted {
+            self.increments_banked = self.increments_banked.saturating_add(1);
+        }
+    }
+
+    /// How many in-flight increments of this seat reached disk (#1048).
+    #[must_use]
+    pub fn increments_banked(&self) -> u32 {
+        self.increments_banked
+    }
+
+    /// Append one signed row and queue its upload, reporting how far it got.
+    ///
+    /// Durable here, not in whatever runs next. `Drop` reaches this function
+    /// during a panic unwind and during a window close that never produced an
+    /// `AppExit`; both used to sign a row and discard it, because the only
+    /// writer was a Bevy system reading the return value (#947). Nothing
+    /// downstream can now lose what this call measured.
+    fn persist_and_queue(&self, record: &SessionRecord) -> RecordDisposition {
+        // A closing row of a seat that already banked increments is the tail,
+        // and a tail below the floor is the ordinary case rather than a failed
+        // seating: the volunteer must not be told they lost the session.
+        let tail_of_banked_seat = record.increment.final_increment && self.increments_banked > 0;
+        match &self.record_path {
+            Some(path) => match append_session_record(path, record) {
                 Ok(()) => {
                     let disposition = if record.is_measurement() {
                         bevy::log::info!(
-                            "campaign session {} recorded to {} ({} recorded min)",
+                            "campaign session {} increment {} recorded to {} ({} recorded min)",
                             record.session_id,
+                            record.increment.index,
                             path.display(),
                             record.banked_minutes
                         );
                         RecordDisposition::Persisted
+                    } else if tail_of_banked_seat {
+                        // Not #1053's failure. The seat played, banked its
+                        // increments as it went, and this is the leftover
+                        // shorter than one increment. Saying "nothing was
+                        // measured" here would be a lie in the other
+                        // direction, and the volunteer would have no way to
+                        // tell it from the case that really did lose a
+                        // session.
+                        bevy::log::info!(
+                            "campaign session {} closed with a {:.3} min tail below the {} min \
+                             floor; the {} increment(s) already banked are unaffected",
+                            record.session_id,
+                            record.distinct_play_minutes,
+                            crate::session::MIN_MEASURED_MINUTES,
+                            self.increments_banked
+                        );
+                        RecordDisposition::PersistedBelowFloor
                     } else {
                         // Loud, and to the volunteer rather than only to a log
                         // file: this is the case where everything downstream is
@@ -2152,7 +2231,7 @@ impl CampaignRuntime {
                     // send it would be #1051 again, one disposition over.
                     match &self.upload_queue {
                         Some(queue) => {
-                            match crate::admission::queue_finished_session(queue, &record) {
+                            match crate::admission::queue_finished_session(queue, record) {
                                 Ok(pending) => bevy::log::info!(
                                     "campaign session {} queued for upload as {}",
                                     record.session_id,
@@ -2199,8 +2278,7 @@ impl CampaignRuntime {
                 );
                 RecordDisposition::Lost
             }
-        };
-        Some(record)
+        }
     }
 
     /// Name where this session's upload is queued, before any tick is flown.

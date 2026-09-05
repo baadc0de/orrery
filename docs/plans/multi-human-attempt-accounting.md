@@ -526,17 +526,94 @@ its own measured jitter against it as a target rather than a floor. The
 advertisement and the comparison are both fixed; the clause is correct and is
 retained unchanged.
 
-### 9.7 What #1048 does not do, and what remains an owner decision
+### 9.7 In-flight emission: the human seat banks in increments
 
-* **A seat still banks when the generation ends, not the instant it departs.**
-  The interval is *recorded* on departure — that is `departed_exteriors` — but
-  it is *emitted* when the host writes its report, which is at process exit.
-  Making it bank on departure needs the host to write a report while still
-  running, and `Swarm::report` consumes `self` today. That is a host change, not
-  an accounting one, and it carries a second question this record will not
-  answer by implication: if a generation banks in pieces, an attempt-wide
-  refusal raised in a later piece can no longer void an earlier one that has
-  already banked. Every attempt-wide clause in §6 changes meaning at that point.
+**Owner decision, 2026-09-05.** A seat emits periodically *while it is still
+flying* rather than only at teardown. A player who crashes, closes the lid or
+loses the link late in a session keeps everything they flew up to the last
+increment; #1051 showed the teardown path is exactly where things go wrong, and
+two macOS testers lost real hours to it.
+
+**The unit.** One row is one **seat increment**: `SeatIncrement { index,
+since_tick, until_tick, final_increment }` inside the signed row
+(`clients/regolith/src/session.rs`). `[since_tick, until_tick)` is a half-open
+span of that seat's connected ticks, in seat-relative tick numbers — integers,
+so overlap is decided exactly rather than by comparing two floats for a gap.
+The spans of one seat are disjoint and abut, so they partition it and their
+rows sum to it. Every number in a row — its minutes, its loss, its jitter
+percentiles — is measured over that span and over nothing else.
+
+A row carrying **no** increment is the whole seat, which is what every row
+written before #1048 meant, and it hashes into both keys exactly as it did, so
+an archived ledger re-derives byte-identically.
+
+**The cadence, and the floor (#1055's `MIN_MEASURED_MINUTES = 1.0`).** #1048
+left two ways open: emit above the floor, or apply the floor to the seat's
+accumulated total. **The cadence stays above the floor.** `INCREMENT_MINUTES`
+is 5.0 — five times the floor — and an increment is emitted only once that much
+connected time has accumulated since the last one.
+
+The reason is that the floor is a property of a *row*. `p4-ledger.sh` refuses
+one append at a time, and the ledger is append-only: a row already banked cannot
+be revisited when a later one arrives. A floor on an accumulated total would
+make a row's admissibility depend on which other rows had arrived, in what
+order, and whether their uploads landed at all — the three things #1051 showed a
+teardown gets wrong — and it would give #1053's sub-minute seating failure a way
+back in, since five twelve-second increments of a seating that never happened
+would accumulate past a total floor. So every increment is a measurement on its
+own terms and the refusal stays where it was.
+
+The cost is the tail: a seat's closing row covers only what is left since the
+last increment, and a tail under a minute does not bank. That is bounded by one
+minute per seat, against the whole session under the old behaviour.
+
+**Dedup, on the span.** `refuse_a_second_claim_on_one_seat` no longer trusts one
+row per session. For a seat — `(node, session_id)`, never the slot alone (#1031)
+— it refuses:
+
+* a row whose span **overlaps** one the seat already banked;
+* an increment beside a whole-seat row, or a whole-seat row beside increments;
+* a seat whose increments **sum** past its own connected span. Spans are
+  client-asserted, so disjointness alone would let one seat assert ten spans
+  inside its bracket and bank ten times over. This is the check only the ledger
+  can make, because it is the only place that sees across appends;
+  `p4-attempt-accounting.py` makes the same one inside a single assembly, where
+  a breach costs that seat and not the attempt (#1032's rule).
+
+Both `run_key` and `measurement_key` carry the span. Two increments of one seat
+have an *identical* `.identity` — same seed, impairment, target, actor, session
+id, attempt and slot — so without it in `run_key` the second is skipped as an
+already-banked run, and without it in `measurement_key` they collapse in the
+`distinct` fold and the seat banks its first five minutes and discards the rest.
+
+**A seat that ends normally versus one that crashes.** A normal close writes the
+tail as a final row (`final_increment: true`) beside the increments already
+banked; a crash, a killed process or a closed lid simply stops, and what is on
+disk and in `uploads.json` is every increment up to the last cadence boundary.
+The mint queues the upload in the same breath as the row it writes (#1056), so
+an increment inherits that property rather than bypassing it — `uploads.json` is
+keyed per increment, because keyed on the session id alone each increment
+overwrote the last one's entry and its file.
+
+**An increment never trips the over-claim clamp.** `p4-attempt-accounting.py`
+clamps a claim down to the host's wall bracket rather than refusing it, so a row
+over its seat banks less, silently. An increment claims a *fraction* of its
+seat's span, so it sits under that ceiling by construction; what it could do
+that a single row could not is exceed the seat in aggregate, which is the sum
+clause above and which refuses rather than clamps.
+
+### 9.8 What #1048 still does not do
+
+* **The bot contribution still banks at generation end.** The human half of the
+  unit is now continuous; `player_hours = B * valid_attempt_seconds / 3600` is
+  emitted when the host writes its report, because `Swarm::report` consumes
+  `self` today. §9.5's blast radius therefore still applies to bot hours and no
+  longer applies to human ones.
+* **An attempt-wide refusal cannot void a banked increment.** This is the cost
+  the decision accepts and it is real: a false positive raised at minute 14 used
+  to void minutes 0–13, and cannot now. Every attempt-wide clause in §6 is
+  therefore evaluated against the generation that contained the increment, and
+  an increment banked under a generation later found unwitnessed stays banked.
 * **`seconds` and `lobby_seconds` are untouched.** They are campaign config, and
   the mix arithmetic above is now chop-invariant, so the length of a generation
   is a blast-radius and latency decision rather than an accounting one.

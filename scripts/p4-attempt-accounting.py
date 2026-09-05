@@ -82,6 +82,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -610,6 +611,74 @@ def pipeline_id(commit: str) -> str:
     return sha256_hex(lines.encode())[:16]
 
 
+# ── Seat increments (#1048) ──────────────────────────────────────────────────
+#
+# A seat banks while it is still flying, so one seat legitimately signs several
+# rows and the unit of attribution is one row per **seat increment** rather than
+# one row per session. Each row carries the half-open span `[since_tick,
+# until_tick)` of its seat's connected ticks it accounts for; the spans of one
+# seat partition it, so summing them reconstructs the seat.
+#
+# A row carrying no increment is the whole seat — every row written before #1048
+# — and nothing may be added beside it.
+
+
+@dataclass(frozen=True)
+class SeatKey:
+    """The seat one row binds to: `(slot, session_id)`, never the slot alone.
+
+    A named row rather than a bare tuple. #1028: a slot may hold two seats when
+    one install rejoined, and each of those carries its own interval.
+    """
+
+    slot: int
+    session_id: Any
+
+
+@dataclass(frozen=True)
+class IncrementSpan:
+    """The half-open connected-tick span one row accounts for."""
+
+    since_tick: int
+    until_tick: int
+
+    def overlaps(self, other: "IncrementSpan") -> bool:
+        return self.since_tick < other.until_tick and self.until_tick > other.since_tick
+
+
+@dataclass
+class SeatClaims:
+    """What one seat has already claimed while this attempt is assembled."""
+
+    #: `None` for a whole-seat row, which admits no increment beside it.
+    spans: list[IncrementSpan] | None = field(default_factory=list)
+    #: Minutes already banked for this seat, summed across its increments.
+    banked_minutes: float = 0.0
+
+
+def increment_span_of(row: dict[str, Any], session_id: str) -> IncrementSpan | None:
+    """The increment a signed row claims, or `None` for a whole-seat row."""
+    increment = row.get("increment")
+    if increment is None:
+        return None
+    if not isinstance(increment, dict):
+        refuse(f"the row for session {session_id} carries a malformed seat increment")
+    since = increment.get("since_tick")
+    until = increment.get("until_tick")
+    for name, value in (("since_tick", since), ("until_tick", until)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            refuse(
+                f"the row for session {session_id} carries a seat increment whose {name} is "
+                "not a tick number"
+            )
+    if until <= since:
+        refuse(
+            f"the row for session {session_id} claims an empty or backwards seat increment "
+            f"[{since}, {until})"
+        )
+    return IncrementSpan(since_tick=since, until_tick=until)
+
+
 # ── The signed client rows ───────────────────────────────────────────────────
 
 
@@ -916,8 +985,12 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
     # constant, because a human seated for part of the attempt banks part of it.
     # The per-slot connected span is what makes that auditable, and it is the
     # ceiling every interval is held under below.
-    claimed_sessions: set[str] = set()
-    bound_seats: set[tuple[int, Any]] = set()
+    # Keyed by seat, and holding what that seat has already claimed, because
+    # since #1048 a seat may sign several rows. `claimed_sessions` maps a
+    # session id to the one seat that may carry it: a session id appearing at
+    # two different seats is still one interval attributed twice.
+    claimed_sessions: dict[str, SeatKey] = {}
+    seats: dict[SeatKey, SeatClaims] = {}
     human_total = 0.0
     total_clamped = 0.0
     refused_seats: list[dict[str, Any]] = []
@@ -925,28 +998,43 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
         session_id = row.get("session_id")
         if not isinstance(session_id, str) or not UUID_V7.match(session_id):
             refuse("a client row carries no UUIDv7 session_id")
-        if session_id in claimed_sessions:
-            refuse(
-                f"session {session_id} appears in two client rows for one attempt; an interval "
-                "is attributed exactly once"
-            )
-        claimed_sessions.add(session_id)
         if row.get("actor") != "human":
             refuse(f"the client row for {session_id} does not name a human actor")
 
         entry = seat_for(session_id, row)
         slot = entry["slot"]
         # The seat, not the slot (#1028): a slot may hold two seats when one
-        # install rejoined, and each of those seats carries one interval. Two
-        # rows landing on the *same* seat is still one interval attributed
-        # twice — including the case where a host that seats no ids has a single
-        # entry for a node that two signed sessions both name.
-        if (slot, entry.get("session_id")) in bound_seats:
+        # install rejoined, and each of those seats carries its own interval.
+        seat = SeatKey(slot=slot, session_id=entry.get("session_id"))
+        held = claimed_sessions.setdefault(session_id, seat)
+        if held != seat:
             refuse(
-                f"two rows bind to slot {slot} seat {entry.get('session_id')}; one seat carries "
-                "one interval per attempt"
+                f"session {session_id} appears at slot {held.slot} and at slot {slot}; an "
+                "interval is attributed exactly once"
             )
-        bound_seats.add((slot, entry.get("session_id")))
+        # Since #1048 a seat signs one row per increment, so what a second row
+        # on one seat must not do is *repeat minutes* — which is what the span
+        # decides. A row carrying no increment is the whole seat and admits
+        # nothing beside it, which is the pre-#1048 rule verbatim, including
+        # the case where a host that seats no ids has a single entry for a node
+        # that two signed sessions both name.
+        span = increment_span_of(row, session_id)
+        claims = seats.get(seat)
+        if claims is None:
+            claims = SeatClaims(spans=[] if span is not None else None)
+            seats[seat] = claims
+        elif claims.spans is None or span is None:
+            refuse(
+                f"two rows bind to slot {slot} seat {entry.get('session_id')} and one of them "
+                "covers the whole seat; a seat carries one whole interval, or increments that "
+                "partition it"
+            )
+        elif any(span.overlaps(banked) for banked in claims.spans):
+            refuse(
+                f"increment [{span.since_tick}, {span.until_tick}) of session {session_id} "
+                f"overlaps one already assembled for slot {slot}; an interval is attributed "
+                "exactly once"
+            )
 
         node = entry.get("node")
         if not isinstance(node, str) or len(node) != 64:
@@ -1022,6 +1110,42 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             )
             total_clamped += clamped_minutes
 
+        # The seat's own ceiling, summed across its increments (#1048). Each
+        # increment is held under the seat's connected span by the clamp above,
+        # which is right and is not enough: the spans are client-asserted, so
+        # ten disjoint increments each inside the seat would bank ten times the
+        # seat. `p4-ledger.sh` makes the same check across *appends*, which is
+        # the half this cannot see; this is the half that refuses inside one
+        # assembly, before a row is ever written.
+        #
+        # A refusal here costs this seat and not the attempt, which is #1032's
+        # rule: the honest seats beside it still assemble.
+        if span is not None:
+            claims.spans.append(span)
+        if claims.banked_minutes + banked_minutes > connected_minutes + allowance:
+            detail = (
+                f"session {session_id} banks {claims.banked_minutes + banked_minutes:g} min "
+                f"across {len(claims.spans) if claims.spans else 1} increment(s) but slot {slot} "
+                f"was connected for {connected_minutes:.4f} min ({span_basis}); the increments "
+                "of one seat cannot sum past the seat"
+            )
+            note(f"refusing slot {slot}: {detail}")
+            refused_seats.append(
+                {
+                    "slot": slot,
+                    "session_id": session_id,
+                    "claimed_minutes": float(claims.banked_minutes + banked_minutes),
+                    "connected_minutes": connected_minutes,
+                    "span_basis": span_basis,
+                    "allowance_minutes": allowance,
+                    "detail": detail,
+                }
+            )
+            if span is not None:
+                claims.spans.pop()
+            continue
+        claims.banked_minutes += banked_minutes
+
         hours = banked_minutes / 60.0
         human_total += hours
         report = dict(attempt)
@@ -1072,6 +1196,10 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             "clamped_minutes": clamped_minutes,
             "span_basis": span_basis,
             "close": close,
+            # The span this row accounts for, carried into the derived input so
+            # `p4-ledger.sh` can dedupe increments without reaching into the
+            # signed row. `None` for a whole-seat row.
+            "increment": row.get("increment"),
         }
         report["contribution"] = {
             "actor": "human",
@@ -1083,7 +1211,11 @@ def derive(attempt_path: Path, records_path: Path, out_dir: Path) -> list[Path]:
             ),
         }
         report["link_impairment"] = check_link_impairment(attempt, slot)
-        pending.append((f"contribution-human-{slot}-{session_id}.json", report))
+        # Per increment, not per session: two increments of one seat writing
+        # one filename would leave whichever came last, and the seat would bank
+        # a fraction of what it flew.
+        suffix = "" if span is None else f"-increment-{span.since_tick}"
+        pending.append((f"contribution-human-{slot}-{session_id}{suffix}.json", report))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -1163,6 +1295,7 @@ def fixture_row(
     observed: tuple[float, float, float] = (3, 100, 100),
     mismatch: bool = False,
     configured: dict[str, Any] | None = None,
+    increment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A signed client row.
 
@@ -1193,9 +1326,23 @@ def fixture_row(
             "afk_seconds": 0,
             "afk_capped": False,
             "impairment_mismatch": mismatch,
+            # Inside the signed payload, because that is where a client puts it
+            # (#1048). A fixture that bolted it on after signing would be
+            # refused by the signature stage and would prove nothing.
+            **({} if increment is None else {"increment": increment}),
         },
         secret_byte,
     )
+
+
+def fixture_increment(index: int, since_tick: int, until_tick: int) -> dict[str, Any]:
+    """One seat increment, as a client signs it."""
+    return {
+        "index": index,
+        "since_tick": since_tick,
+        "until_tick": until_tick,
+        "final_increment": False,
+    }
 
 
 def fixture_links(slots: list[int], bots: int) -> list[dict[str, Any]]:
@@ -1494,9 +1641,133 @@ def self_test() -> None:
             cohort,
             [row_a, row_a],
             "duplicate-row",
-            "appears in two client rows",
+            "a seat carries one whole interval",
         )
         test.ok("one_interval_may_not_be_banked_twice")
+
+        # ── Continuous banking: increments of one seat (#1048) ──────────────
+        #
+        # The seat at slot 4 was connected for 55 minutes and signed its play in
+        # two increments of 20 minutes rather than one row at teardown. Ticks
+        # run at 30 Hz in these fixtures, so a minute is 1800 ticks.
+        increment_a = fixture_row(
+            SESSION_A,
+            20,
+            "x86_64-unknown-linux-gnu",
+            0x11,
+            increment=fixture_increment(0, 0, 36000),
+        )
+        increment_b = fixture_row(
+            SESSION_A,
+            20,
+            "x86_64-unknown-linux-gnu",
+            0x11,
+            increment=fixture_increment(1, 36000, 72000),
+        )
+        manifest, emitted = test.must_derive(
+            cohort, [increment_a, increment_b, row_b], "seat-increments"
+        )
+        human = [report for report in emitted if report["identity"]["actor"] == "human"]
+        if len(human) != 3:
+            die(
+                "self-test [a_seat_derives_one_input_per_increment]: two increments and one "
+                f"whole seat derived {len(human)} human input(s)"
+            )
+        seat = [
+            report
+            for report in human
+            if report["binding"]["session_id"] == SESSION_A
+        ]
+        if len(seat) != 2:
+            die(
+                "self-test [a_seat_derives_one_input_per_increment]: the seat that banked in "
+                f"increments derived {len(seat)} input(s), so a long session still banks "
+                "all-or-nothing at teardown"
+            )
+        if sorted(report["binding"]["increment"]["index"] for report in seat) != [0, 1]:
+            die(
+                "self-test [a_seat_derives_one_input_per_increment]: the derived inputs lost "
+                "the span p4-ledger.sh dedupes on"
+            )
+        if abs(sum(report["player_hours"] for report in seat) - 40 / 60.0) > 1e-9:
+            die(
+                "self-test [a_seat_derives_one_input_per_increment]: the increments do not sum "
+                "to the 40 minutes the seat signed"
+            )
+        test.ok("a_seat_derives_one_input_per_increment")
+
+        # The dedupe. Two rows covering the same minutes are one interval
+        # attributed twice, whatever their indices say.
+        test.must_refuse(
+            cohort,
+            [
+                increment_a,
+                fixture_row(
+                    SESSION_A,
+                    20,
+                    "x86_64-unknown-linux-gnu",
+                    0x11,
+                    increment=fixture_increment(1, 18000, 54000),
+                ),
+                row_b,
+            ],
+            "overlapping-increment",
+            "overlaps one already assembled",
+        )
+        test.ok("an_overlapping_increment_is_refused")
+
+        # A whole-seat row is the whole seat. Nothing may be added beside it,
+        # in either order, which is what keeps every row written before #1048
+        # meaning exactly what it meant.
+        test.must_refuse(
+            cohort,
+            [row_a, increment_a, row_b],
+            "increment-beside-whole-seat",
+            "a seat carries one whole interval",
+        )
+        test.ok("an_increment_may_not_be_added_to_a_whole_seat_row")
+
+        # Disjointness is not enough. The spans are client-asserted, so a seat
+        # could sign ten of them each inside its own connected span; the sum is
+        # what is impossible. Each 30-minute increment here passes the per-row
+        # ceiling against a 55-minute seat on its own, and the second is the one
+        # that would take the seat to 60.
+        #
+        # It costs *that seat* and not the attempt, which is #1032's rule: the
+        # honest seat beside it still assembles.
+        manifest, emitted = test.must_derive(
+            cohort,
+            [
+                fixture_row(
+                    SESSION_A,
+                    30,
+                    "x86_64-unknown-linux-gnu",
+                    0x11,
+                    increment=fixture_increment(0, 0, 54000),
+                ),
+                fixture_row(
+                    SESSION_A,
+                    30,
+                    "x86_64-unknown-linux-gnu",
+                    0x11,
+                    increment=fixture_increment(1, 54000, 108000),
+                ),
+                row_b,
+            ],
+            "increments-past-their-seat",
+        )
+        refused = manifest["refused_seats"]
+        if len(refused) != 1 or "cannot sum past the seat" not in refused[0]["detail"]:
+            die(
+                "self-test [increments_may_not_sum_past_their_seat]: a seat banked more than it "
+                f"was connected for; refused_seats is {refused}"
+            )
+        if abs(manifest["human_hours"] - (30 + 42) / 60.0) > 1e-9:
+            die(
+                "self-test [increments_may_not_sum_past_their_seat]: the refusal did not stop at "
+                f"the offending increment; human_hours is {manifest['human_hours']}"
+            )
+        test.ok("increments_may_not_sum_past_their_seat")
 
         two_seats = fixture_attempt(
             [
@@ -1811,6 +2082,69 @@ def self_test() -> None:
                 f"{len(again)} lines after a second append"
             )
         test.ok("reappending_an_attempt_banks_no_second_cohort_hours")
+
+        # And the same end to end for a seat that banked in increments (#1048).
+        # The derivation and the ledger have to agree about the unit, or a
+        # long session assembles into two inputs and banks one of them: the
+        # `distinct` fold `cmd_total` sums over is keyed on `measurement_key`,
+        # so two increments sharing one would silently keep only the first.
+        increment_ledger = directory / "increment-hours.jsonl"
+        increment_env = dict(os.environ, P4_LEDGER_FILE=str(increment_ledger))
+        increment_case = directory / "seat-increments" / "out"
+        for path in sorted(increment_case.iterdir()):
+            appended = subprocess.run(
+                [str(ROOT / "scripts" / "p4-ledger.sh"), "append", str(path)],
+                capture_output=True,
+                check=False,
+                text=True,
+                env=increment_env,
+            )
+            if appended.returncode != 0:
+                die(
+                    "self-test [an_incremental_seat_banks_every_increment_through_the_ledger]: "
+                    f"{path.name} was refused: {appended.stderr.strip()}"
+                )
+        incremental = [
+            json.loads(line) for line in increment_ledger.read_text().splitlines()
+        ]
+        seat_lines = [
+            line for line in incremental if line.get("human_session_id") == SESSION_A
+        ]
+        if len(seat_lines) != 2:
+            die(
+                "self-test [an_incremental_seat_banks_every_increment_through_the_ledger]: the "
+                f"seat banked {len(seat_lines)} of its two increments"
+            )
+        if len({line["measurement_key"] for line in seat_lines}) != 2:
+            die(
+                "self-test [an_incremental_seat_banks_every_increment_through_the_ledger]: the "
+                "two increments share a measurement key, so the distinct fold keeps only the "
+                "first and the rest of the session is discarded"
+            )
+        if abs(sum(line["player_hours"] for line in seat_lines) - 40 / 60.0) > 1e-9:
+            die(
+                "self-test [an_incremental_seat_banks_every_increment_through_the_ledger]: the "
+                "banked increments do not sum to the 40 minutes the seat signed"
+            )
+        # Re-appending an increment banks nothing further: the span is what the
+        # ledger dedupes on, and it does so across appends.
+        repeat = subprocess.run(
+            [
+                str(ROOT / "scripts" / "p4-ledger.sh"),
+                "append",
+                str(sorted(increment_case.iterdir())[0]),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            env=increment_env,
+        )
+        if len(increment_ledger.read_text().splitlines()) != len(incremental):
+            die(
+                "self-test [an_incremental_seat_banks_every_increment_through_the_ledger]: a "
+                f"re-appended increment added a line ({repeat.stderr.strip()})"
+            )
+        test.ok("an_incremental_seat_banks_every_increment_through_the_ledger")
 
         # ── The banking unit is a seat interval, on both sides (#1048) ───────
         #

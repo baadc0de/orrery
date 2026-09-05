@@ -138,6 +138,60 @@ const JITTER_TOLERANCE_MS: u64 = 40;
 /// out from a total that never moved.
 pub const MIN_MEASURED_MINUTES: f64 = 1.0;
 
+/// Connected minutes a seat accumulates before it banks another increment.
+///
+/// # Why a cadence above the floor, and not a floor on the accumulated total
+///
+/// #1048 gives two ways for continuous banking to coexist with
+/// [`MIN_MEASURED_MINUTES`]: emit above the floor, or apply the floor to the
+/// seat's accumulated total rather than to each increment. This is the first.
+///
+/// The floor is a property of a *row*. `p4-ledger.sh` refuses a row on what
+/// that row says, one append at a time, and the ledger is append-only: a row
+/// already banked cannot be revisited when a later one arrives. Making the
+/// floor apply to an accumulated total would mean a row's admissibility
+/// depends on which other rows happen to have arrived, in what order, and
+/// whether their uploads landed at all — three things #1051 showed are exactly
+/// what a teardown gets wrong. It would also give the sub-minute seating
+/// failure #1053 was opened for a way back in: five twelve-second increments
+/// of a session that never seated would accumulate past a total floor.
+///
+/// So every increment is a measurement on its own terms, and the cadence is
+/// what guarantees it. Five minutes is five times the floor — far enough above
+/// it that a slow client, a paused metronome or a clock disagreement cannot
+/// push an increment under — and it bounds what a crash costs to the tail
+/// since the last increment rather than to the whole session.
+pub const INCREMENT_MINUTES: f64 = 5.0;
+
+/// Which part of its seat interval one row covers (#1048).
+///
+/// A seat is `(node, session_id)` (#1031) and a long seat banks in increments
+/// rather than all-or-nothing at teardown. `[since_tick, until_tick)` is the
+/// half-open span of that seat's connected ticks this row accounts for, in
+/// seat-relative tick numbers — integers, so the ledger decides overlap
+/// exactly instead of comparing two floats for a gap.
+///
+/// The spans of one seat partition its connected ticks: they are disjoint and
+/// they abut. Summing the rows of a seat therefore reconstructs the seat, and
+/// `p4-ledger.sh` refuses any second row whose span overlaps one already
+/// banked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SeatIncrement {
+    /// 0-based position of this increment within its seat interval.
+    pub index: u32,
+    /// Seat-relative connected tick this row starts at, inclusive.
+    pub since_tick: u64,
+    /// Seat-relative connected tick this row ends at, exclusive.
+    pub until_tick: u64,
+    /// Whether this row closes the seat interval.
+    ///
+    /// Not "the row was written at teardown": a seat whose link dies mid-flight
+    /// still writes a final row through `Drop`, and a seat whose process is
+    /// killed writes none at all. What this says is that the client believes
+    /// nothing further will be added to this seat.
+    pub final_increment: bool,
+}
+
 impl ImpairmentMeasurement {
     /// Record one observed transport outcome; this is not configuration echo.
     pub fn observe(&mut self, dropped: bool, jitter_ms: u64) {
@@ -177,22 +231,76 @@ impl ImpairmentMeasurement {
     }
 
     fn loss_pct(&self) -> f64 {
-        if self.sent == 0 {
-            0.0
-        } else {
-            self.dropped as f64 * 100.0 / self.sent as f64
-        }
+        self.loss_pct_since(&MeasurementMark::START)
     }
 
     fn percentile(&self, numerator: usize) -> u64 {
-        if self.jitter_ms.is_empty() {
+        self.percentile_since(&MeasurementMark::START, numerator)
+    }
+
+    /// Where the counters stand right now, so a later increment can report
+    /// what happened *after* this point rather than since the session began.
+    fn mark(&self) -> MeasurementMark {
+        MeasurementMark {
+            sent: self.sent,
+            dropped: self.dropped,
+            jitter_samples: self.jitter_ms.len(),
+        }
+    }
+
+    /// Loss over the outcomes observed since `mark`.
+    ///
+    /// The loss counters are additive, so an interval's rate is the difference
+    /// of two marks. An increment that reported the *cumulative* rate would be
+    /// asserting something about wall time it does not cover, and the ledger
+    /// recomputes `impairment_mismatch` from exactly these numbers.
+    fn loss_pct_since(&self, mark: &MeasurementMark) -> f64 {
+        let sent = self.sent.saturating_sub(mark.sent);
+        if sent == 0 {
+            0.0
+        } else {
+            self.dropped.saturating_sub(mark.dropped) as f64 * 100.0 / sent as f64
+        }
+    }
+
+    /// Jitter percentile over the samples pushed since `mark`.
+    fn percentile_since(&self, mark: &MeasurementMark, numerator: usize) -> u64 {
+        let samples = self.jitter_ms.get(mark.jitter_samples..).unwrap_or(&[]);
+        if samples.is_empty() {
             return 0;
         }
-        let mut values = self.jitter_ms.clone();
+        let mut values = samples.to_vec();
         values.sort_unstable();
         let index = (values.len() * numerator).div_ceil(100).saturating_sub(1);
         values[index]
     }
+
+    /// Observations recorded since `mark`, for the sample-count suppression
+    /// `finish` applies to `impairment_mismatch`.
+    fn sent_since(&self, mark: &MeasurementMark) -> u64 {
+        self.sent.saturating_sub(mark.sent)
+    }
+}
+
+/// Where [`ImpairmentMeasurement`]'s counters stood at an increment boundary.
+///
+/// A named row rather than a bare tuple: three counters of two different
+/// meanings, and transposing `sent` with `dropped` would report a loss rate of
+/// one hundred percent on a clean link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MeasurementMark {
+    sent: u64,
+    dropped: u64,
+    jitter_samples: usize,
+}
+
+impl MeasurementMark {
+    /// The mark a session opens at: nothing observed yet.
+    const START: Self = Self {
+        sent: 0,
+        dropped: 0,
+        jitter_samples: 0,
+    };
 }
 
 /// A finished session row, carried inside the P4 report and ledger line.
@@ -209,6 +317,14 @@ pub struct SessionRecord {
     pub distinct_play_minutes: f64,
     /// Minutes eligible to bank after the AFK rule is applied.
     pub banked_minutes: f64,
+    /// Which part of the seat interval this row accounts for (#1048).
+    ///
+    /// Every number above is scoped to this span, not to the seat: a row is a
+    /// measurement of `[since_tick, until_tick)` and of nothing else. A seat
+    /// short enough to bank in one go carries `index: 0`, `since_tick: 0` and
+    /// `final_increment: true`, which is the whole seat and is what every row
+    /// written before #1048 meant.
+    pub increment: SeatIncrement,
     /// Rust target triple for this client build.
     pub platform_triple: String,
     /// Client revision supplied by the campaign launcher.
@@ -323,7 +439,6 @@ pub enum PlayerActivity {
 #[derive(Debug)]
 pub struct CampaignSession {
     session_id: String,
-    wall_start: String,
     actor: Actor,
     configured: ConfiguredImpairment,
     measurement: ImpairmentMeasurement,
@@ -332,6 +447,22 @@ pub struct CampaignSession {
     idle_ticks: u64,
     idle_banked_ticks: u64,
     afk_capped: bool,
+    /// Connected ticks already covered by an emitted increment (#1048).
+    emitted_ticks: u64,
+    /// Bankable ticks already covered by an emitted increment.
+    emitted_banked_ticks: u64,
+    /// How many increments this seat has already emitted.
+    emitted_increments: u32,
+    /// Where the transport counters stood when the last increment closed.
+    emitted_mark: MeasurementMark,
+    /// UTC start of the span the next increment will cover.
+    ///
+    /// The seat's own start for the first increment, and the previous
+    /// increment's `wall_end` thereafter, so the rows of one seat abut on the
+    /// wall clock as well as on the tick axis. This replaces a separate
+    /// seat-wide `wall_start`: with every row scoped to its own span, the
+    /// seat's start is the first row's start and nothing else reads it.
+    increment_wall_start: String,
 }
 
 impl CampaignSession {
@@ -348,7 +479,7 @@ impl CampaignSession {
     ) -> Self {
         Self {
             session_id,
-            wall_start,
+            increment_wall_start: wall_start,
             actor,
             configured,
             measurement: ImpairmentMeasurement::default(),
@@ -357,6 +488,10 @@ impl CampaignSession {
             idle_ticks: 0,
             idle_banked_ticks: 0,
             afk_capped: false,
+            emitted_ticks: 0,
+            emitted_banked_ticks: 0,
+            emitted_increments: 0,
+            emitted_mark: MeasurementMark::START,
         }
     }
 
@@ -439,18 +574,84 @@ impl CampaignSession {
         &self.session_id
     }
 
+    /// Connected ticks not yet covered by an emitted increment.
+    #[must_use]
+    fn pending_ticks(&self) -> u64 {
+        self.connected_ticks.saturating_sub(self.emitted_ticks)
+    }
+
+    /// Whether enough has accumulated since the last increment to bank another.
+    ///
+    /// The cadence, and the whole reason a crash late in a long session no
+    /// longer costs the session: see [`INCREMENT_MINUTES`] for why this is a
+    /// cadence above [`MIN_MEASURED_MINUTES`] rather than a floor on the
+    /// accumulated total.
+    #[must_use]
+    pub fn increment_due(&self) -> bool {
+        self.pending_ticks() as f64 / (TICK_HZ as f64 * 60.0) >= INCREMENT_MINUTES
+    }
+
     /// Finish a row. The caller supplies coordinator-pinned build provenance.
+    ///
+    /// The seat's closing row: everything not already covered by an emitted
+    /// increment. On a seat that emitted none — anything shorter than
+    /// [`INCREMENT_MINUTES`] — that is the whole seat, which is what this
+    /// function has always returned.
     #[must_use]
     pub fn finish(
-        &self,
+        &mut self,
         wall_end: String,
         platform_triple: String,
         client_rev: String,
         pipeline_digest: String,
     ) -> SessionRecord {
-        let observed_loss_pct = self.measurement.loss_pct();
-        let observed_jitter_p50_ms = self.measurement.percentile(50);
-        let observed_jitter_p99_ms = self.measurement.percentile(99);
+        self.finish_increment(wall_end, platform_triple, client_rev, pipeline_digest, true)
+            .unwrap_or_else(|| {
+                unreachable!("a final increment is minted even when its span is empty")
+            })
+    }
+
+    /// Mint one increment of this seat interval and advance the mark (#1048).
+    ///
+    /// The row covers `[emitted_ticks, connected_ticks)` and *only* that span:
+    /// its minutes, its loss and its jitter percentiles are all measured over
+    /// the interval since the previous increment, so a row asserts nothing
+    /// about wall time it does not cover. The rows of one seat therefore sum
+    /// to the seat, and `p4-ledger.sh` banks each of them once.
+    ///
+    /// Returns `None` for a non-final increment with an empty span. A *final*
+    /// increment is always minted, even empty: it is the row that says the
+    /// seat is closed, and it is below the measurement floor, so `p4-ledger.sh`
+    /// keeps it as evidence and banks nothing for it.
+    #[must_use]
+    pub fn finish_increment(
+        &mut self,
+        wall_end: String,
+        platform_triple: String,
+        client_rev: String,
+        pipeline_digest: String,
+        final_increment: bool,
+    ) -> Option<SessionRecord> {
+        let span_ticks = self.pending_ticks();
+        if span_ticks == 0 && !final_increment {
+            return None;
+        }
+        let mark = self.emitted_mark;
+        let observed_loss_pct = self.measurement.loss_pct_since(&mark);
+        let observed_jitter_p50_ms = self.measurement.percentile_since(&mark, 50);
+        let observed_jitter_p99_ms = self.measurement.percentile_since(&mark, 99);
+        let banked_ticks = self.banked_ticks.saturating_sub(self.emitted_banked_ticks);
+        let increment = SeatIncrement {
+            index: self.emitted_increments,
+            since_tick: self.emitted_ticks,
+            until_tick: self.connected_ticks,
+            final_increment,
+        };
+        let wall_start = std::mem::replace(&mut self.increment_wall_start, wall_end.clone());
+        self.emitted_ticks = self.connected_ticks;
+        self.emitted_banked_ticks = self.banked_ticks;
+        self.emitted_increments = self.emitted_increments.saturating_add(1);
+        self.emitted_mark = self.measurement.mark();
         // A measured rate never lands exactly on its configured one, so an
         // exact comparison flagged every session ever recorded -- including a
         // seventeen-millisecond one whose 15.6% "loss" was four dropped
@@ -469,7 +670,7 @@ impl CampaignSession {
         // `JITTER_TOLERANCE_MS` — the measurement composes the injected spike
         // with the player's own path, and only a *shortfall* says the profile
         // did not arrive.
-        let mismatch = self.measurement.sent >= MIN_IMPAIRMENT_SAMPLES
+        let mismatch = self.measurement.sent_since(&mark) >= MIN_IMPAIRMENT_SAMPLES
             && ((observed_loss_pct - self.configured.loss_pct).abs() > LOSS_TOLERANCE_PCT
                 || self
                     .configured
@@ -481,12 +682,13 @@ impl CampaignSession {
                     .jitter_p99_ms
                     .saturating_sub(observed_jitter_p99_ms)
                     > JITTER_TOLERANCE_MS);
-        SessionRecord {
+        Some(SessionRecord {
             session_id: self.session_id.clone(),
-            wall_start: self.wall_start.clone(),
+            wall_start,
             wall_end,
-            distinct_play_minutes: self.connected_ticks as f64 / (TICK_HZ as f64 * 60.0),
-            banked_minutes: self.banked_ticks as f64 / (TICK_HZ as f64 * 60.0),
+            distinct_play_minutes: span_ticks as f64 / (TICK_HZ as f64 * 60.0),
+            banked_minutes: banked_ticks as f64 / (TICK_HZ as f64 * 60.0),
+            increment,
             platform_triple,
             client_rev,
             ruleset_id: hex::encode(REGOLITH_RULESET.digest),
@@ -503,7 +705,7 @@ impl CampaignSession {
             measurement_node: String::new(),
             measurement_payload: String::new(),
             measurement_signature: String::new(),
-        }
+        })
     }
 
     /// Append one completed row to the campaign JSONL stream.
@@ -565,13 +767,185 @@ mod tests {
         session
     }
 
-    fn finish(session: &CampaignSession) -> SessionRecord {
+    fn finish(session: &mut CampaignSession) -> SessionRecord {
         session.finish(
             "2026-09-04T12:12:21Z".into(),
             "aarch64-apple-darwin".into(),
             "deadbeef".into(),
             "pipeline".into(),
         )
+    }
+
+    /// A seat that flies `minutes` of active play, banking as the cadence
+    /// falls due, and then closes. Returns every row it wrote, in order.
+    fn fly_and_close(minutes: u64) -> Vec<SessionRecord> {
+        let mut session = CampaignSession::new(
+            "018f8f4e-5c90-7abc-8123-000000000048".into(),
+            "2026-09-05T12:00:00Z".into(),
+            Actor::Human,
+            ConfiguredImpairment::from_spike(3.0, 100),
+        );
+        let mut rows = Vec::new();
+        for tick in 0..minutes * 60 * u64::from(TICK_HZ) {
+            session.observe_tick(PlayerActivity::Active);
+            if session.increment_due() {
+                rows.push(
+                    session
+                        .finish_increment(
+                            format!("2026-09-05T12:00:{tick:02}Z"),
+                            "aarch64-apple-darwin".into(),
+                            "deadbeef".into(),
+                            "pipeline".into(),
+                            false,
+                        )
+                        .expect("a due increment covers a non-empty span"),
+                );
+            }
+        }
+        rows.push(finish(&mut session));
+        rows
+    }
+
+    /// #1048's banking unit. A seat's rows are disjoint, they abut, and they
+    /// sum to the seat — so the ledger can bank each of them once and the
+    /// total is what the volunteer actually flew.
+    #[test]
+    fn the_increments_of_one_seat_partition_it_and_sum_to_it() {
+        let rows = fly_and_close(17);
+        assert_eq!(
+            rows.len(),
+            4,
+            "17 minutes at a 5-minute cadence is 3 + a tail"
+        );
+
+        let mut expected_start = 0;
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.increment.index, index as u32);
+            assert_eq!(
+                row.increment.since_tick, expected_start,
+                "increment {index} does not begin where the previous one ended"
+            );
+            assert!(row.increment.until_tick > row.increment.since_tick);
+            assert_eq!(row.increment.final_increment, index == rows.len() - 1);
+            expected_start = row.increment.until_tick;
+        }
+        assert_eq!(expected_start, 17 * 60 * u64::from(TICK_HZ));
+
+        let banked: f64 = rows.iter().map(|row| row.banked_minutes).sum();
+        assert!(
+            (banked - 17.0).abs() < 1e-9,
+            "the seat's rows sum to {banked} minutes, not the 17 it flew"
+        );
+    }
+
+    /// The cadence decision (#1048): every increment clears the measurement
+    /// floor on its own, so `p4-ledger.sh` keeps refusing per row and #1053's
+    /// sub-minute seating failure has no way back in through an accumulated
+    /// total.
+    #[test]
+    fn every_banked_increment_is_a_measurement_on_its_own() {
+        assert!(
+            INCREMENT_MINUTES > MIN_MEASURED_MINUTES,
+            "the cadence must sit above the floor, or an increment is not a measurement"
+        );
+        let rows = fly_and_close(17);
+        for row in rows.iter().take(rows.len() - 1) {
+            assert!(
+                row.is_measurement(),
+                "increment {} banked {} min, below the floor",
+                row.increment.index,
+                row.distinct_play_minutes
+            );
+            assert!(row.distinct_play_minutes >= INCREMENT_MINUTES);
+        }
+    }
+
+    /// A crash mid-flight keeps everything already banked. This is the whole
+    /// point of #1048: two macOS testers lost real hours to a teardown that
+    /// never ran (#1051), and now a teardown that never runs costs the tail.
+    #[test]
+    fn a_seat_that_never_closes_keeps_the_increments_it_already_banked() {
+        let mut session = CampaignSession::new(
+            "018f8f4e-5c90-7abc-8123-000000000049".into(),
+            "2026-09-05T12:00:00Z".into(),
+            Actor::Human,
+            ConfiguredImpairment::from_spike(3.0, 100),
+        );
+        let mut banked = 0.0;
+        // Twelve minutes flown, then the process dies: no `finish` is ever
+        // reached, exactly as in a panic-free hard kill.
+        for _ in 0..12 * 60 * u64::from(TICK_HZ) {
+            session.observe_tick(PlayerActivity::Active);
+            if session.increment_due() {
+                banked += session
+                    .finish_increment(
+                        "2026-09-05T12:05:00Z".into(),
+                        "aarch64-apple-darwin".into(),
+                        "deadbeef".into(),
+                        "pipeline".into(),
+                        false,
+                    )
+                    .expect("a due increment covers a non-empty span")
+                    .banked_minutes;
+            }
+        }
+        assert!(
+            (banked - 10.0).abs() < 1e-9,
+            "a twelve-minute seat killed mid-flight banked {banked} min, not the two full \
+             increments it flew"
+        );
+    }
+
+    /// An increment measures its own span, not the session so far. A row that
+    /// reported cumulative loss would assert something about wall time it does
+    /// not cover, and `p4-ledger.sh` recomputes `impairment_mismatch` from
+    /// exactly these numbers.
+    #[test]
+    fn an_increments_impairment_is_measured_over_that_increment() {
+        let mut session = CampaignSession::new(
+            "018f8f4e-5c90-7abc-8123-000000000050".into(),
+            "2026-09-05T12:00:00Z".into(),
+            Actor::Human,
+            ConfiguredImpairment::from_spike(3.0, 100),
+        );
+        for _ in 0..6 * 60 * u64::from(TICK_HZ) {
+            session.observe_tick(PlayerActivity::Active);
+        }
+        // A clean first increment.
+        for _ in 0..400 {
+            session.observe_transport(false, 0);
+        }
+        let first = session
+            .finish_increment(
+                "2026-09-05T12:06:00Z".into(),
+                "aarch64-apple-darwin".into(),
+                "deadbeef".into(),
+                "pipeline".into(),
+                false,
+            )
+            .expect("a six-minute increment covers a non-empty span");
+        assert_eq!(first.observed_loss_pct, 0.0);
+
+        // A lossy second one. Cumulatively that is 200 drops in 800 packets,
+        // i.e. 25%; over the increment itself it is 50%, which is the number
+        // that describes the span the row covers.
+        for _ in 0..6 * 60 * u64::from(TICK_HZ) {
+            session.observe_tick(PlayerActivity::Active);
+        }
+        for index in 0..400 {
+            session.observe_transport(index % 2 == 0, 200);
+        }
+        let second = session
+            .finish_increment(
+                "2026-09-05T12:12:00Z".into(),
+                "aarch64-apple-darwin".into(),
+                "deadbeef".into(),
+                "pipeline".into(),
+                true,
+            )
+            .expect("the closing increment covers a non-empty span");
+        assert_eq!(second.observed_loss_pct, 50.0);
+        assert_eq!(second.observed_jitter_p50_ms, 200);
     }
 
     /// #1030. The coordinator sent one scalar as both percentiles and the
@@ -593,7 +967,7 @@ mod tests {
             "a 100 ms spike on a tenth of datagrams has a zero median"
         );
 
-        let record = finish(&session_52e9());
+        let record = finish(&mut session_52e9());
         assert_eq!(record.observed_jitter_p50_ms, 17);
         assert_eq!(record.observed_jitter_p99_ms, 151);
         assert!(
@@ -633,7 +1007,7 @@ mod tests {
         for index in 0..400 {
             session.observe_transport(index < 13, 12);
         }
-        let record = finish(&session);
+        let record = finish(&mut session);
         assert_eq!(record.observed_jitter_p99_ms, 12);
         assert!(
             record.impairment_mismatch,
@@ -794,7 +1168,7 @@ mod tests {
         for _ in 0..u64::from(orrery_core::TICK_HZ) {
             kicked.observe_tick(PlayerActivity::Active);
         }
-        let record = finish(&kicked);
+        let record = finish(&mut kicked);
         assert!(
             (record.distinct_play_minutes - 1.0 / 60.0).abs() < 1e-9,
             "the fixture is the 0.017-minute row from the issue, got {}",
@@ -809,7 +1183,7 @@ mod tests {
         for _ in 0..u64::from(orrery_core::TICK_HZ) * 60 {
             played.observe_tick(PlayerActivity::Active);
         }
-        let record = finish(&played);
+        let record = finish(&mut played);
         assert_eq!(record.distinct_play_minutes, MIN_MEASURED_MINUTES);
         assert!(
             record.is_measurement(),
@@ -894,6 +1268,7 @@ mod tests {
             "wall_end",
             "distinct_play_minutes",
             "banked_minutes",
+            "increment",
             "platform_triple",
             "client_rev",
             "ruleset_id",

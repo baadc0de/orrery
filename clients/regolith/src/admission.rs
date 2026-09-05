@@ -1205,6 +1205,12 @@ impl UploadManager {
     }
 }
 
+/// Every body this installation owes, keyed by [`upload_key`].
+///
+/// The map used to be keyed by session id, which was the same thing until a
+/// seat started banking in increments: a long session now owes several bodies
+/// under one session id, and keying on the id alone made each increment
+/// overwrite the last one's entry *and* its file (#1048).
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct UploadState {
     sessions: BTreeMap<String, UploadEntry>,
@@ -1215,6 +1221,37 @@ struct UploadEntry {
     origin: String,
     body_path: PathBuf,
     acknowledged: bool,
+    /// The session this body belongs to, which is what the POST path names.
+    ///
+    /// Defaulted for a state file written before #1048, whose keys *were*
+    /// session ids; [`pending_uploads`] falls back to the key there.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// What `uploads.json` files one body under.
+///
+/// The session id for a seat's first row — which for a seat too short to bank
+/// an increment is its only row, so a state file written before #1048 keeps
+/// exactly the keys it had — and the id plus the increment's index for every
+/// row after it.
+fn upload_key(session_id: &str, increment_index: u64) -> String {
+    if increment_index == 0 {
+        session_id.to_owned()
+    } else {
+        format!("{session_id}.increment-{increment_index}")
+    }
+}
+
+/// The increment index a signed row carries, or zero for a row without one.
+///
+/// A row written before #1048 has no `increment` object and is a whole seat,
+/// which is increment zero of a seat of one.
+fn increment_index_of(row: &serde_json::Value) -> u64 {
+    row.get("increment")
+        .and_then(|increment| increment.get("index"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn upload_state_path(telemetry_path: &Path) -> PathBuf {
@@ -1270,6 +1307,7 @@ impl UploadQueue {
 #[derive(Clone, Debug)]
 pub struct PendingUpload {
     session_id: String,
+    upload_key: String,
     origin: String,
     body_path: PathBuf,
 }
@@ -1328,24 +1366,25 @@ fn persist_and_register(
     upload: &UploadBody,
 ) -> Result<PendingUpload, String> {
     let directory = state_path.parent().unwrap_or_else(|| Path::new("."));
-    let body_path = directory.join(format!("upload-{}.json", upload.session_id));
+    let body_path = directory.join(format!("upload-{}.json", upload.upload_key));
     durable_write(&body_path, &upload.body)
         .map_err(|error| format!("cannot preserve {}: {error}", body_path.display()))?;
     let mut state = read_upload_state(state_path);
     let already_sent = state
         .sessions
-        .get(&upload.session_id)
+        .get(&upload.upload_key)
         .is_some_and(|entry| entry.acknowledged);
     // Never walk an acknowledgement back. A row can be queued twice -- once by
     // the mint, once by the exit path that follows it -- and the second must
     // not re-open a session the service has already taken.
     if !already_sent {
         state.sessions.insert(
-            upload.session_id.clone(),
+            upload.upload_key.clone(),
             UploadEntry {
                 origin: origin.to_owned(),
                 body_path: body_path.clone(),
                 acknowledged: false,
+                session_id: Some(upload.session_id.clone()),
             },
         );
         write_upload_state(state_path, &state)
@@ -1353,6 +1392,7 @@ fn persist_and_register(
     }
     Ok(PendingUpload {
         session_id: upload.session_id.clone(),
+        upload_key: upload.upload_key.clone(),
         origin: origin.to_owned(),
         body_path,
     })
@@ -1365,7 +1405,7 @@ fn persist_and_register(
 fn send_pending(state_path: &Path, pending: &PendingUpload) -> bool {
     if read_upload_state(state_path)
         .sessions
-        .get(&pending.session_id)
+        .get(&pending.upload_key)
         .is_some_and(|entry| entry.acknowledged)
     {
         return false;
@@ -1407,11 +1447,29 @@ fn pending_uploads(state: &UploadState) -> Vec<PendingUpload> {
         .sessions
         .iter()
         .filter(|(_, entry)| !entry.acknowledged)
-        .map(|(session_id, entry)| PendingUpload {
-            session_id: session_id.clone(),
+        .map(|(upload_key, entry)| PendingUpload {
+            session_id: entry
+                .session_id
+                .clone()
+                .unwrap_or_else(|| upload_key.clone()),
+            upload_key: upload_key.clone(),
             origin: entry.origin.clone(),
             body_path: entry.body_path.clone(),
         })
+        .collect()
+}
+
+/// Everything one session still owes, oldest increment first.
+///
+/// `uploads.json` is a `BTreeMap`, so its keys already sort a session's bodies
+/// into increment order: the bare session id (increment zero) sorts before
+/// `<id>.increment-1`, and the suffixed keys sort lexically among themselves.
+/// That is only a nicety — every body is independent evidence — but sending
+/// them in the order they were flown makes a partial upload readable.
+fn pending_uploads_for_session(state: &UploadState, session_id: &str) -> Vec<PendingUpload> {
+    pending_uploads(state)
+        .into_iter()
+        .filter(|pending| pending.session_id == session_id)
         .collect()
 }
 
@@ -1455,7 +1513,11 @@ fn sweep_unregistered_records(state_path: &Path, records_path: &Path, origin: &s
         else {
             continue;
         };
-        if state.sessions.contains_key(&session_id) || !queued.insert(session_id.clone()) {
+        // Per increment, not per session (#1048): a session's rows are several
+        // bodies, and a sweep that stopped at the session id would leave every
+        // increment after the first unqueued -- #1051 again, one row along.
+        let key = upload_key(&session_id, increment_index_of(&row));
+        if state.sessions.contains_key(&key) || !queued.insert(key) {
             continue;
         }
         let upload = match build_upload_body(vec![row], String::new()) {
@@ -1510,11 +1572,25 @@ pub fn upload_finished_session(
             return;
         }
     };
-    // This session's body only. Exit is not the moment to spend a 45-second
-    // request timeout on each older body as well; those are the next launch's
-    // job, and a quit does not wait to be finished with.
-    if send_pending(&manager.state_path, &pending) {
-        info!("campaign session {} uploaded", pending.session_id);
+    // This session's bodies only. Exit is not the moment to spend a 45-second
+    // request timeout on each *older* body as well; those are the next
+    // launch's job, and a quit does not wait to be finished with.
+    //
+    // Bodies, plural, since #1048. The tail this call just queued is one of
+    // several the seat owes: the increments banked while it was flying are on
+    // disk and named by `uploads.json`, and sending only the tail would leave
+    // most of a normally-exiting long session waiting for a launch that may
+    // not come. The set is bounded by this seat's own increments, and
+    // `send_pending` skips anything already acknowledged.
+    for owed in
+        pending_uploads_for_session(&read_upload_state(&manager.state_path), &pending.session_id)
+    {
+        if send_pending(&manager.state_path, &owed) {
+            info!(
+                "campaign session {} uploaded ({})",
+                owed.session_id, owed.upload_key
+            );
+        }
     }
 }
 
@@ -1537,6 +1613,7 @@ fn read_session_telemetry(path: &Path, start: u64) -> std::io::Result<String> {
 
 struct UploadBody {
     session_id: String,
+    upload_key: String,
     body: Vec<u8>,
 }
 
@@ -1556,6 +1633,15 @@ fn build_upload_body(
     {
         return Err("every upload row must name its own session id".to_owned());
     }
+    // Every row of one body is one increment of one seat, so the body's key is
+    // that increment's. `rows` is a single row on every path that reaches here.
+    let increment_index = rows.first().map_or(0, increment_index_of);
+    if rows
+        .iter()
+        .any(|row| increment_index_of(row) != increment_index)
+    {
+        return Err("every upload row must name its own seat increment".to_owned());
+    }
     let body = serde_json::to_vec(&serde_json::json!({
         "records": rows,
         "telemetry_jsonl": telemetry_jsonl,
@@ -1563,6 +1649,7 @@ fn build_upload_body(
     .map_err(|error| error.to_string())?;
     Ok(UploadBody {
         session_id: session_id.to_owned(),
+        upload_key: upload_key(session_id, increment_index),
         body,
     })
 }
@@ -1931,6 +2018,69 @@ mod tests {
             !entry.acknowledged,
             "nothing has been posted, so nothing is acknowledged"
         );
+    }
+
+    /// #1048. A seat that banks in increments owes several bodies under one
+    /// session id. Keyed on the id alone, each increment overwrote the last
+    /// one's `uploads.json` entry *and* its file on disk, so a crashed session
+    /// would have uploaded only whichever increment happened to be last —
+    /// which is #1051's loss with extra steps.
+    #[test]
+    fn each_increment_of_one_seat_queues_its_own_body() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let queue = UploadQueue::new("http://127.0.0.1:1".to_owned(), &telemetry_path, 0);
+        let mut session = crate::session::CampaignSession::new(
+            "01a06b05-f941-7000-8000-000000001048".to_owned(),
+            "2026-09-05T12:00:00Z".to_owned(),
+            crate::session::Actor::Human,
+            ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+        );
+        let mut bodies = Vec::new();
+        for index in 0..3 {
+            for _ in 0..6 * 60 * u64::from(orrery_core::TICK_HZ) {
+                session.observe_tick(crate::session::PlayerActivity::Active);
+            }
+            let record = session
+                .finish_increment(
+                    format!("2026-09-05T12:{:02}:00Z", (index + 1) * 6),
+                    "aarch64-apple-darwin".to_owned(),
+                    BUILD_REV.to_owned(),
+                    "unavailable-client-side".to_owned(),
+                    index == 2,
+                )
+                .expect("a six-minute increment covers a non-empty span");
+            let pending = queue_finished_session(&queue, &record).expect("the increment queues");
+            assert!(pending.body_path().exists(), "the body is on disk");
+            bodies.push(pending.body_path().to_owned());
+        }
+        assert_eq!(
+            bodies
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "three increments wrote fewer than three distinct bodies"
+        );
+        let state = read_upload_state(&upload_state_path(&telemetry_path));
+        assert_eq!(
+            state.sessions.len(),
+            3,
+            "uploads.json owes {} bodies for a seat that banked three increments",
+            state.sessions.len()
+        );
+        for entry in state.sessions.values() {
+            assert_eq!(
+                entry.session_id.as_deref(),
+                Some("01a06b05-f941-7000-8000-000000001048"),
+                "an entry lost the session id the POST path is built from"
+            );
+        }
     }
 
     #[test]
