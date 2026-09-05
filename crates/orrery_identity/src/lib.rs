@@ -106,8 +106,9 @@ pub use service::{
     UnavailableStanding, DEFAULT_SESSION_TOKEN_TTL_MS,
 };
 pub use standing::{
-    score_rows, ComputedStanding, StandingLevel, StandingObservation, StandingScores,
-    StandingThresholdError, StandingThresholds, StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
+    score_rows, ComputedStanding, ExonerationRescore, StandingLevel, StandingObservation,
+    StandingScores, StandingThresholdError, StandingThresholds, StaticStrikeRows,
+    DEFAULT_STANDING_THRESHOLDS,
 };
 pub use store::{
     AccountStore, BanEntry, BindOutcome, CooldownEntry, CooldownRecord, IdentityError,
