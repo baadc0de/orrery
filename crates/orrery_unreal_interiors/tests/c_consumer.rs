@@ -26,10 +26,24 @@ fn consumer() -> &'static Consumer {
             .parent()
             .and_then(Path::parent)
             .expect("crate has workspace parent");
-        let work_dir = env::temp_dir().join(format!(
-            "orrery-unreal-interiors-c-consumer-{}",
-            std::process::id()
-        ));
+        // Deliberately not `env::temp_dir()`: `/tmp` is a RAM-backed tmpfs on
+        // the usual hosts, and the ~250 MB of staticlib and linked executable
+        // built below is a poor fit for RAM. `CARGO_TARGET_TMPDIR` is cargo's
+        // own scratch directory for integration tests -- on the same disk as
+        // `target/`, and removed by `cargo clean`.
+        //
+        // The name is fixed rather than PID-stamped, and the directory is wiped
+        // on the way in. `CONSUMER` above is a `static`, so it is never dropped
+        // and a `tempfile::TempDir` guard parked beside the executable would
+        // never run its cleanup; a PID-stamped path leaks one directory per run
+        // -- #1087 found 95 of them, 9.4 GB, until `cc` failed with
+        // `No space left on device` in a test that asserts nothing about
+        // linking. One directory per crate, reused each run, cannot accumulate.
+        let work_dir =
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("orrery-unreal-interiors-c-consumer");
+        if work_dir.exists() {
+            fs::remove_dir_all(&work_dir).expect("clear the previous C consumer directory");
+        }
         fs::create_dir_all(&work_dir).expect("create C consumer directory");
 
         let profile =
