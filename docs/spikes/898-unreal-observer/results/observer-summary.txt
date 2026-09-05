@@ -1,0 +1,13 @@
+ticks=36000
+entities_seen=108000
+predicted_seen=72000
+interpolated_seen=36000
+bracketed_seen=36000
+capsules=3
+crossing_samples=35940 (warmup 60 excluded)
+crossing_ns_p50=1323
+crossing_ns_p99=5069
+crossing_ns_p999=7825
+crossing_ns_max=45385
+link0=127.0.0.1:44005 applied=542 status=0
+link1=127.0.0.1:35083 applied=542 status=0

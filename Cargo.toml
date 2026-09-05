@@ -52,6 +52,13 @@ members = [
     # prediction ring and rollback. A member so `check.sh` covers it; nothing
     # depends on it.
     "crates/orrery_unreal_direct",
+    # The engine side of the sidecar IPC crossing behind a C ABI (#898 step 3):
+    # the staticlib an Unreal module links to render a serving sidecar's
+    # presentation frames, with the C consumer that drives it. Bevy-free, and
+    # its own `tests/c_consumer.rs` proves that with `nm` over the built
+    # archive — `core-gates.sh` discovers `lib` crates and cannot see a
+    # `staticlib` one.
+    "crates/orrery_unreal_observer",
     # Spike #1044's ruleset half (research branch, never merged): the
     # deterministic integer ray test over each collision representation the
     # one-body cook exports, the ray generator, and the comparator against

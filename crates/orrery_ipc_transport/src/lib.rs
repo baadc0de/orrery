@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 pub mod bench;
+pub mod observer;
 
 use std::io::{self, Read, Write};
 

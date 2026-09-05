@@ -31,8 +31,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::BTreeMap;
+pub mod serve;
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use bevy::MinimalPlugins;
 use bevy_state::app::StatesPlugin;
@@ -54,6 +58,21 @@ use orrery_predict::{
 };
 use orrery_protocol::{LatticePoint, PersistId, QuantizedDir, UniverseSeed, WeaponRef};
 use orrery_synthetic::{Synthetic, SyntheticState};
+
+pub use serve::{IpcServer, OrreryIpcServePlugin, ServeStats};
+
+/// How often the sidecar presents, when it is driven by its own runner.
+///
+/// Not the canonical rate: the ruleset steps on Bevy's fixed timestep and is
+/// untouched by this. This is how often `Update` runs, and therefore how
+/// often the extractor produces a frames batch — presentation, which A9 §2.4
+/// and D53 clause (f) item 2 both keep firmly on the skin's side of the line.
+///
+/// Comfortably above the fixed rate so every canonical tick is presented at
+/// least once, and low enough that the link carries frames rather than a busy
+/// loop's output. A game that drives the app itself sets its own rate and
+/// this constant does not apply to it.
+pub const PRESENTATION_HZ: f64 = 120.0;
 
 /// The universe seed the sidecar's per-tick RNG is derived from.
 pub const SYNTHETIC_SEED: UniverseSeed = UniverseSeed([0x51; 32]);
@@ -255,8 +274,49 @@ pub fn step_synthetic_rules(
 /// `simulation_enabled` exists so an observer sidecar can be composed
 /// identically and assert nothing.
 pub fn sidecar(secret_key: iroh::SecretKey, simulation_enabled: bool) -> App {
+    build_sidecar(secret_key, simulation_enabled, None)
+}
+
+/// The same sidecar, additionally serving its extracted batches to one
+/// observer on an already-bound listener (#898 step 3).
+///
+/// The server is bound by the caller rather than here so its address is known
+/// before the app runs: a launcher has to print the port it took, and a test
+/// has to dial it. Serving changes nothing about the simulation — that is
+/// A9 P-4, and `tests/observer_kill.rs` is the proof rather than this
+/// sentence.
+pub fn sidecar_serving(
+    secret_key: iroh::SecretKey,
+    simulation_enabled: bool,
+    server: IpcServer,
+) -> App {
+    build_sidecar(secret_key, simulation_enabled, Some(server))
+}
+
+fn build_sidecar(
+    secret_key: iroh::SecretKey,
+    simulation_enabled: bool,
+    server: Option<IpcServer>,
+) -> App {
     let mut app = App::new();
-    app.add_plugins(MinimalPlugins);
+    // `MinimalPlugins`' schedule runner spins as fast as the machine allows.
+    // For an unobserved sidecar that is merely wasteful; for a serving one it
+    // is a defect the observer made visible. Extraction runs in `Update`, so
+    // the *presentation* rate is the frame rate, not the tick rate: measured
+    // free-running on this box, one sidecar emitted 1,725 batches/s at ~248 %
+    // CPU against a 64 Hz canonical tick — roughly 27 batches per tick, every
+    // one of them a complete extraction on the link.
+    //
+    // Capping the frame rate is the right lever rather than de-duplicating by
+    // tick, because consecutive batches at one tick are *not* redundant: an
+    // interpolated entity's alpha advances between them, and that motion is
+    // the whole reason the interpolated class is presented at frame rate at
+    // all. [`PRESENTATION_HZ`] says what the cap is and why.
+    app.add_plugins(
+        MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
+            1.0 / PRESENTATION_HZ,
+        ))),
+    );
     // `MinimalPlugins` does not install the state-transition schedule that
     // Lightyear initializes. `DefaultPlugins` would already include this.
     app.add_plugins(StatesPlugin);
@@ -287,11 +347,31 @@ pub fn sidecar(secret_key: iroh::SecretKey, simulation_enabled: bool) -> App {
         Interpolated,
         PredictedPosition,
     >::new());
+    // …and, when a listener was bound, the batches leave the process. The
+    // publisher is instantiated with the same three types as the extractor so
+    // it can be ordered after the exact system that writes what it reads.
+    if let Some(server) = server {
+        app.add_plugins(OrreryIpcServePlugin::<
+            Predicted,
+            Interpolated,
+            PredictedPosition,
+        >::new(server));
+    }
     app.track_reconciliation::<PredictedPosition>();
     app.insert_resource(SimulationEnabled(simulation_enabled));
     app.init_resource::<StepTrace>();
     app.add_systems(FixedUpdate, step_synthetic_rules);
     app.finish();
+    // …and `cleanup()`, which is not decoration. `ScheduleRunnerPlugin`'s
+    // runner re-runs `finish()` on any app whose plugin state is not
+    // `Cleaned`, and `RepliconSharedPlugin::finish` *removes* the
+    // `ProtocolHasher` it consumes (`vendor/bevy_replicon/src/shared.rs:124-127`),
+    // so a second pass panics on the `expect` there. Every test drives the app
+    // with `update()` and never met it; `orrery-sidecar` calls `run()` and met
+    // it on its first tick, which is the shipped binary failing at startup for
+    // as long as it has existed. Advancing to `Cleaned` here is what makes the
+    // runner skip the second pass.
+    app.cleanup();
     app
 }
 
@@ -325,6 +405,67 @@ pub fn spawn_predicted(app: &mut App, authority: iroh::PublicKey, persist_id: Pe
             ),
         ))
         .id()
+}
+
+/// Present a second entity through the **interpolated** class, so an observer
+/// has one capsule of each timeline to render (#898 step 3).
+///
+/// # What is real here and what is not — read this before citing it
+///
+/// Real: everything downstream of the snapshots. The entity carries
+/// lightyear's own `Interpolated` marker and a real `ConfirmedHistory`;
+/// `orrery_predict`'s basis-exporting pipeline samples that history at the
+/// interpolation timeline's clock and co-produces the presented value with
+/// the `RenderedInterpBasis` that produced it; the extractor frames that pair
+/// and nothing else. The bracket an observer receives is a genuine bracket
+/// and the alpha a genuine alpha.
+///
+/// **Not real: the peer.** The snapshots are written by [`feed_stand_in`]
+/// below, on this process's own clock, rather than delivered by replication
+/// from another node. So this proves the *presentation and extraction* path
+/// for the interpolated class end to end; it does **not** prove that a
+/// replicated peer produces an `Interpolated` copy over the facade's link.
+/// Nothing in the tree proves that yet, and a demo built on this must not be
+/// described as two peers.
+pub fn spawn_stand_in_remote(app: &mut App, persist_id: PersistId) -> Entity {
+    app.add_systems(FixedUpdate, feed_stand_in);
+    app.world_mut()
+        .spawn((
+            Interpolated,
+            PredictedPosition::default(),
+            PersistIdentity(persist_id),
+            lightyear::prelude::ConfirmedHistory::<PredictedPosition>::default(),
+        ))
+        .id()
+}
+
+/// How far ahead of the interpolation clock the stand-in keeps a snapshot.
+///
+/// The interpolated timeline runs behind the local one; a bracket must exist
+/// on both sides of it or the pipeline has nothing to interpolate between and
+/// exports no basis. Six ticks is a tenth of a second at 60 Hz.
+const STAND_IN_LEAD: u32 = 6;
+
+/// Keep a bracket ahead of the interpolation clock for every stand-in entity.
+///
+/// The value is a plain ramp on the lattice's x axis. It is not produced by
+/// `Synthetic::step`, and deliberately so: this is a stand-in for snapshots
+/// that would have arrived over a link, and dressing it as canonical output
+/// would be the lie [`spawn_stand_in_remote`]'s docs are written to prevent.
+fn feed_stand_in(
+    timeline: Res<LocalTimeline>,
+    mut entities: Query<&mut lightyear::prelude::ConfirmedHistory<PredictedPosition>>,
+) {
+    let now = timeline.tick();
+    let ahead = lightyear::core::tick::Tick(now.0.wrapping_add(STAND_IN_LEAD));
+    for mut history in &mut entities {
+        history.insert_explicit(
+            ahead,
+            lightyear::core::history_buffer::HistoryState::Updated(PredictedPosition(i64::from(
+                ahead.0,
+            ))),
+        );
+    }
 }
 
 /// A deterministic secret key, so a sidecar's node id is reproducible across
