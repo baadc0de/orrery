@@ -55,7 +55,9 @@ for i, it in enumerate(B["items"]):
     for k in range(n):
         o = load(p); canonical(o); d = max(o.dimensions) or 1.0; s = size / d
         ctr = Vector(it["pos_m"][:3]) + run_axis * ((k - (n - 1) / 2) * size)   # instances end to end, the run centred on pos_m
-        o.matrix_world = Matrix.Translation(ctr) @ rot @ Matrix.Scale(s, 4)
+        odd = (k + (1 if it.get("flip_first") else 0)) % 2 == 1   # polar parts: every second instance end for end, so like ends meet; flip_first chooses which end faces out
+        flip = Matrix.Rotation(math.pi, 4, 'Z') if (it.get("alternate_ends") and odd) else Matrix.Identity(4)
+        o.matrix_world = Matrix.Translation(ctr) @ rot @ flip @ Matrix.Scale(s, 4)
         o.name = f"{i:02d}_{k}_{it['name']}"; o.data.materials.clear(); o.data.materials.append(dark if p["kind"] == "insert" and "bracket" in p["desc"] else mat); objs.append(o)
         bpy.context.view_layer.update(); ws = [o.matrix_world @ Vector(c) for c in o.bound_box]
         placed.append({"i": i, "k": k, "name": it["name"], "part": p["id"], "part_name": p["name"], "pos_m": [round(v, 3) for v in ctr], "run_pos_m": it["pos_m"], "count": n, "along": it.get("along"), "spin_deg": it.get("spin_deg", 0), "tilt_deg": it.get("tilt_deg", 0), "size_m": size,

@@ -94,14 +94,15 @@
    "pos_m": [
     -0.9,
     -0.14,
-    0.25
+    0.33
    ],
    "along": "z",
    "count": 1,
    "spin_deg": 180,
    "why": "Decorative housing on the lower left post",
    "locked": [
-    "pos_m"
+    "pos_m",
+    "spin_deg"
    ]
   },
   {
@@ -110,14 +111,15 @@
    "pos_m": [
     0.9,
     -0.14,
-    0.25
+    0.33
    ],
    "along": "z",
    "count": 1,
-   "spin_deg": 180.0,
+   "spin_deg": 180,
    "why": "Decorative housing on the lower right post",
    "locked": [
-    "pos_m"
+    "pos_m",
+    "spin_deg"
    ]
   },
   {
@@ -271,35 +273,49 @@
    "name": "diagonal_brace_left",
    "part": 1,
    "pos_m": [
-    -0.4,
+    -0.39,
     0.0,
-    0.34
+    0.355
    ],
    "along": "x",
    "count": 2,
-   "spin_deg": 90.0,
-   "tilt_deg": -151.9,
+   "spin_deg": 0,
+   "tilt_deg": 17.8,
    "why": "Diagonal brace pipe from bottom left to center bracket",
    "locked": [
-    "count"
-   ]
+    "alternate_ends",
+    "count",
+    "flip_first",
+    "pos_m",
+    "spin_deg",
+    "tilt_deg"
+   ],
+   "alternate_ends": true,
+   "flip_first": true
   },
   {
    "name": "diagonal_brace_right",
    "part": 1,
    "pos_m": [
-    0.4,
+    0.39,
     0.0,
-    0.34
+    0.355
    ],
    "along": "x",
    "count": 2,
-   "spin_deg": 90.0,
-   "tilt_deg": -28.1,
+   "spin_deg": 180,
+   "tilt_deg": -17.8,
    "why": "Diagonal brace pipe from bottom right to center bracket",
    "locked": [
-    "count"
-   ]
+    "alternate_ends",
+    "count",
+    "flip_first",
+    "pos_m",
+    "spin_deg",
+    "tilt_deg"
+   ],
+   "alternate_ends": true,
+   "flip_first": true
   },
   {
    "name": "left_mid_rail_post_bracket",
@@ -1052,6 +1068,15 @@
     "(6) housings clip into the post: align their back to the post front",
     "(4) base plates run front-back, not left-right",
     "(5) brackets joining (9) to (3) missing on both sides"
+   ]
+  },
+  {
+   "by": "owner",
+   "at": "2026-09-05",
+   "notes": [
+    "(1) is polar: bracket end on flat surfaces, plain end meets an inverted (1); flip the upper piece of each V leg",
+    "V legs attach to the TOP of the (3) kick plate and end at the BOTTOM of the centre (5)",
+    "(6) left one mangled and sunk; both too low, they sit immediately below the (9) line"
    ]
   }
  ]
