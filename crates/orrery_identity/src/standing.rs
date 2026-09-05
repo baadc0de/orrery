@@ -229,6 +229,117 @@ pub struct StandingScores {
     pub shadow_milli: i64,
 }
 
+/// What one ledger row is, once every [`StrikeKind::Appeal`] has been paired
+/// with the finding it reverses.
+///
+/// The roles are a property of the row *set*, not of any row on its own: the
+/// same appeal row is [`Self::Compensates`] beside its original and
+/// [`Self::Orphaned`] without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRole {
+    /// A row that scores on its own terms: any finding no appeal reverses.
+    Standing,
+    /// A positive finding an upheld appeal reverses. It still scores — the
+    /// appeal beside it is what cancels it.
+    Reversed,
+    /// An appeal, carrying the index of the finding it compensates.
+    Compensates(usize),
+    /// An appeal with no finding in this ledger to compensate: its original
+    /// has aged out of D33's 90-day retention, or was never read.
+    Orphaned,
+}
+
+/// Every row's [`RowRole`], in row order.
+///
+/// The pairing identity is `(evidence digest, negated weight, mode)`, which is
+/// exactly what `uphold_appeal` copies onto the compensating row
+/// (`crates/orrery_persistd/src/adjudication.rs:821-830`), and the same
+/// `(digest, Appeal)` identity the ledger deduplicates appeals on
+/// (`adjudication.rs:831-834`). Each appeal consumes at most one original, so
+/// two appeals over one evidence digest — which that deduplication already
+/// refuses — could not reverse a single finding twice here either.
+///
+/// One resolver serves both readers of the pair: [`score_rows`], which scores
+/// the appeal from the original's instant, and [`ExonerationRescore`], which
+/// removes both. They must agree on what a pair *is*, so neither may grow its
+/// own copy of this matching.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AppealPairings {
+    roles: Vec<RowRole>,
+}
+
+impl AppealPairings {
+    /// Match every appeal in `rows` to the finding it reverses.
+    fn resolve(rows: &[StrikeRow]) -> Self {
+        let mut roles = vec![RowRole::Standing; rows.len()];
+        for (appeal_index, appeal) in rows.iter().enumerate() {
+            if appeal.kind != StrikeKind::Appeal {
+                continue;
+            }
+            let matched = rows
+                .iter()
+                .enumerate()
+                .find(|(index, original)| {
+                    roles[*index] == RowRole::Standing
+                        && original.kind != StrikeKind::Appeal
+                        && original.weight_milli > 0
+                        && original.mode == appeal.mode
+                        && original.evidence_ref.digest == appeal.evidence_ref.digest
+                        && appeal.weight_milli.checked_neg() == Some(original.weight_milli)
+                })
+                .map(|(index, _)| index);
+            roles[appeal_index] = match matched {
+                Some(index) => {
+                    roles[index] = RowRole::Reversed;
+                    RowRole::Compensates(index)
+                }
+                None => RowRole::Orphaned,
+            };
+        }
+        Self { roles }
+    }
+
+    /// The role of the row at `index`.
+    fn role(&self, index: usize) -> RowRole {
+        self.roles.get(index).copied().unwrap_or(RowRole::Standing)
+    }
+}
+
+/// The instant a row's decay is measured from at `now_ms`, or `None` when the
+/// row does not score at all.
+///
+/// This is where #1091 is fixed. An appeal is not a finding of its own: it is
+/// a statement that one particular finding should never have been scored. So
+/// it decays from **the original's** `issued_at_ms`, not from its own, and its
+/// magnitude at every instant is exactly the magnitude of the row it reverses.
+/// Scoring it from its own instant made an exoneration worth less the longer
+/// review took — an appeal upheld 14 days after a 3.0 major netted only −1.5
+/// points, masking half a finding instead of cancelling one — and the delay is
+/// the reviewer's, not the appellant's.
+///
+/// Backdating the decay does **not** backdate the appeal's effect: it scores
+/// nothing before its own `issued_at_ms`, so the account's history is not
+/// rewritten, only its present. And it scores only while the original does,
+/// which is what keeps an appeal that outlives its original's 90-day retention
+/// from leaving a bare negative row that would offset unrelated findings.
+fn decay_from_ms(
+    rows: &[StrikeRow],
+    pairings: &AppealPairings,
+    index: usize,
+    now_ms: u64,
+) -> Option<u64> {
+    let row = rows.get(index)?;
+    let scores_now = |row: &StrikeRow| row.issued_at_ms <= now_ms && row.expires_at_ms > now_ms;
+    match pairings.role(index) {
+        RowRole::Standing | RowRole::Reversed => scores_now(row).then_some(row.issued_at_ms),
+        RowRole::Compensates(original_index) => {
+            let original = rows.get(original_index)?;
+            (row.issued_at_ms <= now_ms && scores_now(original)).then_some(original.issued_at_ms)
+        }
+        RowRole::Orphaned => None,
+    }
+}
+
 /// Evaluate D33's decay at `now_ms`, without mutating any row.
 ///
 /// Positive findings round upward, while negative appeal facts round downward.
@@ -237,15 +348,19 @@ pub struct StandingScores {
 /// `ceil` rule on a negative fraction would make an upheld appeal *smaller in
 /// magnitude* and therefore round against the appellant, so its direction is
 /// intentionally the opposite. Keep this sign-aware rule: changing both arms
-/// to `ceil` would reintroduce that ledger bias.
+/// to `ceil` would reintroduce that ledger bias. Since #1091 the two arms also
+/// make a pair cancel to the milli-point: the appeal decays from the original's
+/// instant, so its raw value is the exact negation of the original's and
+/// `floor(-y) == -ceil(y)`.
 #[must_use]
 pub fn score_rows(rows: &[StrikeRow], now_ms: u64) -> StandingScores {
+    let pairings = AppealPairings::resolve(rows);
     let mut scores = StandingScores::default();
-    for row in rows {
-        if row.issued_at_ms > now_ms || row.expires_at_ms <= now_ms {
+    for (index, row) in rows.iter().enumerate() {
+        let Some(decay_from) = decay_from_ms(rows, &pairings, index, now_ms) else {
             continue;
-        }
-        let age_ms = now_ms - row.issued_at_ms;
+        };
+        let age_ms = now_ms - decay_from;
         let exponent = -(age_ms as f64) / (STRIKE_HALF_LIFE_MS as f64);
         let raw = f64::from(row.weight_milli) * exponent.exp2();
         let contribution = if raw.is_sign_negative() {
@@ -288,49 +403,30 @@ impl ExonerationRescore {
     /// Pair each [`StrikeKind::Appeal`] row with the positive finding it
     /// compensates, and drop both.
     ///
-    /// The pairing identity is `(evidence digest, negated weight, mode)`,
-    /// which is exactly what `uphold_appeal` copies onto the compensating row
-    /// (`crates/orrery_persistd/src/adjudication.rs:821-830`), and the same
-    /// `(digest, Appeal)` identity the ledger deduplicates appeals on
-    /// (`adjudication.rs:831-834`). Each appeal consumes at most one original,
-    /// so two appeals over one evidence digest — which that deduplication
-    /// already refuses — could not reverse a single finding twice here either.
+    /// The pairing is [`AppealPairings`], shared with [`score_rows`] so the
+    /// live path and this reconstruction cannot disagree about what a pair is.
     ///
     /// Unmatched appeals are dropped too: an appeal is a compensating fact
     /// about a finding, never a finding of its own, and leaving one in would
     /// let its negative weight lower the reconstructed entry score.
     #[must_use]
     pub fn from_rows(rows: &[StrikeRow]) -> Self {
-        let mut reversed = vec![false; rows.len()];
+        let pairings = AppealPairings::resolve(rows);
         let mut live_reversals = 0;
-        for appeal in rows.iter().filter(|row| row.kind == StrikeKind::Appeal) {
-            let mut matched = None;
-            for (index, original) in rows.iter().enumerate() {
-                if reversed[index] || original.kind == StrikeKind::Appeal {
-                    continue;
+        let mut remaining = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            match pairings.role(index) {
+                // `resolve` gives every appeal row a role of its own, so a
+                // `Standing` row here is always a finding.
+                RowRole::Standing => remaining.push(row.clone()),
+                RowRole::Reversed => {
+                    if row.mode == StrikeMode::Live {
+                        live_reversals += 1;
+                    }
                 }
-                if original.weight_milli > 0
-                    && original.mode == appeal.mode
-                    && original.evidence_ref.digest == appeal.evidence_ref.digest
-                    && appeal.weight_milli.checked_neg() == Some(original.weight_milli)
-                {
-                    matched = Some(index);
-                    break;
-                }
-            }
-            if let Some(index) = matched {
-                reversed[index] = true;
-                if rows[index].mode == StrikeMode::Live {
-                    live_reversals += 1;
-                }
+                RowRole::Compensates(_) | RowRole::Orphaned => {}
             }
         }
-        let remaining = rows
-            .iter()
-            .enumerate()
-            .filter(|(index, row)| !reversed[*index] && row.kind != StrikeKind::Appeal)
-            .map(|(_, row)| row.clone())
-            .collect();
         Self {
             remaining,
             live_reversals,
@@ -791,18 +887,154 @@ mod tests {
         );
     }
 
+    /// The compensating row `uphold_appeal` writes
+    /// (`crates/orrery_persistd/src/adjudication.rs:821-830`).
+    fn appeal_of(appealed: &StrikeRow, issued_at_ms: u64) -> StrikeRow {
+        StrikeRow {
+            issued_at_ms,
+            weight_milli: -appealed.weight_milli,
+            kind: StrikeKind::Appeal,
+            evidence_ref: appealed.evidence_ref.clone(),
+            ruleset: appealed.ruleset,
+            mode: appealed.mode,
+            expires_at_ms: issued_at_ms.saturating_add(STRIKE_RETENTION_MS),
+        }
+    }
+
     #[test]
     fn negative_appeal_contributions_round_away_from_zero_not_against_the_appellant() {
-        let mut appeal = row(0, StrikeMode::Live);
-        appeal.kind = StrikeKind::Appeal;
-        appeal.weight_milli = -1_001;
-        // At one half-life this is -500.5, so ceil would produce -500 and
-        // silently leave 1 milli-point of the reversed finding behind.
-        assert_eq!(score_rows(&[appeal], 14 * DAY_MS).live_milli, -501);
+        let mut finding = row(0, StrikeMode::Live);
+        finding.weight_milli = 1_001;
+        let appeal = appeal_of(&finding, DAY_MS);
 
-        let mut fractional = row(0, StrikeMode::Live);
-        fractional.kind = StrikeKind::Appeal;
-        fractional.weight_milli = -1_001;
-        assert_eq!(score_rows(&[fractional], 7 * DAY_MS).live_milli, -708);
+        // At one half-life the finding is +500.5, rounded up to 501. The
+        // appeal is -500.5: `floor` gives -501 and cancels it exactly, while
+        // `ceil` would give -500 and silently leave 1 milli-point of the
+        // reversed finding behind.
+        assert_eq!(
+            score_rows(std::slice::from_ref(&finding), 14 * DAY_MS).live_milli,
+            501
+        );
+        assert_eq!(
+            score_rows(&[finding.clone(), appeal.clone()], 14 * DAY_MS).live_milli,
+            0,
+            "the appeal contributed exactly -501"
+        );
+
+        // And at a fraction of a half-life, where neither side is exact.
+        assert_eq!(
+            score_rows(std::slice::from_ref(&finding), 7 * DAY_MS).live_milli,
+            708
+        );
+        assert_eq!(score_rows(&[finding, appeal], 7 * DAY_MS).live_milli, 0);
+    }
+
+    /// #1091. An appeal decays from the instant of the finding it reverses,
+    /// not from its own, so a slow review does not shrink the exoneration.
+    #[test]
+    fn a_late_upheld_appeal_cancels_its_finding_in_full() {
+        let finding = row(0, StrikeMode::Live);
+        let appeal = appeal_of(&finding, 14 * DAY_MS);
+        let pair = [finding.clone(), appeal];
+
+        // The moment it is upheld, one half-life after the 3.0 major was
+        // filed. Before #1091 the finding stood at +1500 and the appeal at
+        // -3000, netting -1500: half a major masked rather than one cancelled.
+        assert_eq!(
+            score_rows(std::slice::from_ref(&finding), 14 * DAY_MS).live_milli,
+            1_500
+        );
+        assert_eq!(score_rows(&pair, 14 * DAY_MS).live_milli, 0);
+
+        // And it stays cancelled: the pair nets zero at every later read,
+        // where before #1091 it left a decaying negative credit behind.
+        for now_ms in [14 * DAY_MS + 1, 20 * DAY_MS, 30 * DAY_MS, 89 * DAY_MS] {
+            assert_eq!(
+                score_rows(&pair, now_ms).live_milli,
+                0,
+                "the pair nets zero at {now_ms} ms"
+            );
+        }
+
+        // A negative credit is not merely wasteful, it is spendable: before
+        // #1091 this pair carried -679 at day 30 (+680 and -1359) and that
+        // credit was subtracted from an unrelated second major.
+        let mut unrelated = row(30 * DAY_MS, StrikeMode::Live);
+        unrelated.evidence_ref.digest = [0xAB; 32];
+        assert_eq!(
+            score_rows(&[finding, pair[1].clone(), unrelated], 30 * DAY_MS).live_milli,
+            i64::from(MAJOR_STRIKE_WEIGHT_MILLI),
+            "the fresh major is scored at its full weight, not discounted by an old exoneration"
+        );
+    }
+
+    /// The backdated decay is not a backdated effect: the ledger's past is
+    /// unchanged, only its present.
+    #[test]
+    fn an_appeal_scores_nothing_before_the_instant_it_was_upheld() {
+        let finding = row(0, StrikeMode::Live);
+        let pair = [finding.clone(), appeal_of(&finding, 14 * DAY_MS)];
+        assert_eq!(
+            score_rows(&pair, 7 * DAY_MS).live_milli,
+            score_rows(std::slice::from_ref(&finding), 7 * DAY_MS).live_milli,
+            "a week in, the appeal does not exist yet"
+        );
+        assert_eq!(score_rows(&pair, 14 * DAY_MS - 1).live_milli, 1_501);
+    }
+
+    /// #1091's second question. An appeal outlives its original: it is stamped
+    /// with a fresh 90-day retention at the instant it is upheld, so it is
+    /// still readable after the finding it reverses has aged out. It must not
+    /// then stand as a bare negative row.
+    #[test]
+    fn an_appeal_that_outlives_its_original_credits_nothing() {
+        let finding = row(0, StrikeMode::Live);
+        let appeal = appeal_of(&finding, 80 * DAY_MS);
+        assert!(finding.expires_at_ms < appeal.expires_at_ms);
+
+        // Day 95: the finding aged out five days ago, the appeal has ten days
+        // of retention left. It scores nothing rather than -1490.
+        let now_ms = 95 * DAY_MS;
+        assert!(finding.expires_at_ms <= now_ms && appeal.expires_at_ms > now_ms);
+        assert_eq!(
+            score_rows(&[finding.clone(), appeal.clone()], now_ms).live_milli,
+            0
+        );
+
+        // Nor may it offset an unrelated finding filed in the meantime.
+        let mut unrelated = row(94 * DAY_MS, StrikeMode::Live);
+        unrelated.evidence_ref.digest = [0xCD; 32];
+        assert_eq!(
+            score_rows(&[finding, appeal.clone(), unrelated], now_ms).live_milli,
+            2_856
+        );
+
+        // The same holds for an appeal whose original is simply absent from
+        // the span — retention pruning, or a short read.
+        assert_eq!(score_rows(&[appeal], 81 * DAY_MS).live_milli, 0);
+    }
+
+    /// #1091's first question. The asymmetry was in `score_rows`, which sums
+    /// shadow rows into `shadow_milli` by the same arithmetic, so a shadow
+    /// pair had it too. Pairing is mode-aware, so the same fix covers it —
+    /// and a shadow pair still contributes nothing to the live score.
+    #[test]
+    fn a_late_shadow_appeal_cancels_its_shadow_finding_in_full() {
+        let finding = row(0, StrikeMode::Shadow);
+        let appeal = appeal_of(&finding, 14 * DAY_MS);
+        let scores = score_rows(&[finding.clone(), appeal.clone()], 30 * DAY_MS);
+        assert_eq!(scores.shadow_milli, 0, "before #1091 this was -679");
+        assert_eq!(scores.live_milli, 0);
+
+        // A shadow appeal does not reach across modes to cancel a live
+        // finding carrying the same evidence digest.
+        let mut live = finding.clone();
+        live.mode = StrikeMode::Live;
+        let crossed = score_rows(&[live, appeal], 30 * DAY_MS);
+        assert_eq!(
+            crossed.live_milli,
+            score_rows(&[row(0, StrikeMode::Live)], 30 * DAY_MS).live_milli,
+            "the live finding stands: its appeal is a shadow row and pairs with neither"
+        );
     }
 }
