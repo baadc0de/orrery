@@ -1,10 +1,10 @@
-# blender -b --python assemble.py -- <build.json> <out_dir>
+# blender -b --python assemble.py -- <build.json> <out_dir> [nojoin]   (nojoin: keep one object per placed instance, for inspection)
 # Free-space kitbash of a build list: each item is a palette part (library INSERT or primitive) scaled so its longest dimension is
 # size_m, rotated by rot_deg (XYZ Euler), centred at pos_m. Ground plane at z=0 for the render. Writes assembly.glb/.blend and
 # assembly.json (what was placed, with each item's world bbox for the critic).
 import bpy, bmesh, sys, os, json, math
 from mathutils import Vector, Matrix, Euler
-a = sys.argv[sys.argv.index("--")+1:]; B = json.load(open(a[0])); out = os.path.abspath(a[1]); os.makedirs(out, exist_ok=True)
+a = sys.argv[sys.argv.index("--")+1:]; B = json.load(open(a[0])); out = os.path.abspath(a[1]); os.makedirs(out, exist_ok=True); nojoin = len(a) > 2 and a[2] == "nojoin"
 P = json.load(open(os.path.join(B["palette"], "palette.json"))); byid = {p["id"]: p for p in P["parts"]}
 bpy.ops.wm.read_homefile(use_empty=True); sc = bpy.context.scene
 def prim_mesh(kind):
@@ -63,9 +63,13 @@ for i, it in enumerate(B["items"]):
         placed.append({"i": i, "k": k, "name": it["name"], "part": p["id"], "part_name": p["name"], "pos_m": [round(v, 3) for v in ctr], "run_pos_m": it["pos_m"], "count": n, "along": it.get("along"), "spin_deg": it.get("spin_deg", 0), "tilt_deg": it.get("tilt_deg", 0), "size_m": size,
                        "bbox_min": [round(min(w[kk] for w in ws), 3) for kk in range(3)], "bbox_max": [round(max(w[kk] for w in ws), 3) for kk in range(3)]})
 for o in objs: o.select_set(True)
-if objs:
+if objs and not nojoin:
     bpy.context.view_layer.objects.active = objs[0]; bpy.ops.object.join(); prop = bpy.context.object; prop.name = B.get("prop", "prop").replace(" ", "_")
     tris = sum(len(pg.vertices) - 2 for pg in prop.data.polygons)
+elif objs:
+    coll = bpy.data.collections.new(B.get("prop", "prop").replace(" ", "_")); sc.collection.children.link(coll)
+    for o in objs: sc.collection.objects.unlink(o); coll.objects.link(o)
+    tris = sum(len(pg.vertices) - 2 for o in objs for pg in o.data.polygons)
 else: tris = 0
 json.dump({"prop": B.get("prop"), "placed": placed, "tris": tris}, open(os.path.join(out, "assembly.json"), "w"), indent=1)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(out, "assembly.blend"), compress=True); bpy.ops.export_scene.gltf(filepath=os.path.join(out, "assembly.glb"), export_format='GLB')
