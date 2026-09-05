@@ -30,7 +30,7 @@ button[aria-pressed="true"]{color:var(--accent);border-color:var(--accent)}
 </div>
 <div id="prov">
   <span>model <b>TRELLIS.2-4B</b> (MIT)</span><span>encoder <b>DINOv3 ViT-L/16</b> (Meta licence)</span><span>concept <b>Nano Banana Pro</b></span>
-  <span>seed <b>7</b></span><span>generate <b>86.7 s</b></span><span>TRELLIS.2 high-poly <b>191,640 tris</b> &nbsp;|&nbsp; retopo <b>24,842 tris</b> &nbsp;|&nbsp; kitbash <b>11 placements, 24k tris</b>: coarse hull, program in metres with anchors, parts chosen against subassembly sheets, procedural skids/nozzles/pipes, critic loop best 0.75</span><span id="live">renderer: WebGL</span>
+  <span>seed <b>7</b></span><span>generate <b>86.7 s</b></span><span>TRELLIS.2 high-poly <b>191,640 tris</b> &nbsp;|&nbsp; retopo <b>24,842 tris</b> &nbsp;|&nbsp; kitbash <b>13 placements, 31k tris</b>: coarse hull, program in metres with anchors, parts chosen against subassembly sheets, procedural skids/nozzles/pipes, critic loop best 0.75</span><span id="live">renderer: WebGL</span>
 </div>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script type="module">
@@ -69,7 +69,7 @@ loadModel('escort.glb', true);
 let retopo = false; let current = 'escort.glb';
 function show(file) { current = file; if (models[file]) { scene.remove(model); model = models[file]; scene.add(model); } else loadModel(file, false); }
 press('swap', () => { retopo = !retopo; document.getElementById('kit').setAttribute('aria-pressed', 'false'); show(retopo ? 'escort-retopo.glb' : 'escort.glb'); return retopo; });
-press('kit', () => { const on = current !== 'escort-kitbash-v3.glb'; retopo = false; document.getElementById('swap').setAttribute('aria-pressed', 'false'); show(on ? 'escort-kitbash-v3.glb' : 'escort.glb'); return on; });
+press('kit', () => { const on = current !== 'escort-kitbash-v4.glb'; retopo = false; document.getElementById('swap').setAttribute('aria-pressed', 'false'); show(on ? 'escort-kitbash-v4.glb' : 'escort.glb'); return on; });
 press('turn', () => turning = !turning);
 press('wire', () => { wire = !wire; model && model.traverse(o => { if (o.isMesh) o.material.wireframe = wire; }); return wire; });
 press('reset', () => { if (home) { camera.position.copy(home); controls.target.set(0,0,0); } });

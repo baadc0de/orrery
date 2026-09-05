@@ -26,8 +26,8 @@
    ],
    "prim": "box",
    "anchor": [
-    0.15,
-    0.95
+    0.4,
+    0.85
    ]
   },
   {
@@ -51,8 +51,8 @@
    "hint": "The nozzles are spiky and angled incorrectly; use a clean cylindrical nozzle pointing straight back.",
    "prim": "nozzle",
    "anchor": [
-    0.2,
-    -0.85
+    0.25,
+    -1.0
    ]
   },
   {
@@ -157,7 +157,7 @@
    "concept_feature": "Landing skids",
    "along": "y",
    "why": "Rear retractable landing skids.",
-   "hint": "The library part is too complex and mechanical; use a procedural ski bar for the landing skids.",
+   "hint": "The rear landing skids failed to place geometry; use a procedural skid to ensure they appear.",
    "prim": "skid",
    "yaw_deg": 90,
    "anchor": [
@@ -266,6 +266,48 @@
     "prim:skid"
    ],
    "yaw_deg": 90
+  },
+  {
+   "name": "wingtip_pods",
+   "type": "surface",
+   "kind": "part",
+   "region": "flank.mid.outer",
+   "tags": [
+    "cylinder",
+    "thruster"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.5,
+    0.7
+   ],
+   "size_m": 1.0,
+   "anchor": null,
+   "prim": null,
+   "concept_feature": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+   "hint": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing."
+  },
+  {
+   "name": "wingtip_pods",
+   "type": "surface",
+   "kind": "part",
+   "region": "flank.mid.outer",
+   "tags": [
+    "cylinder",
+    "thruster"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.5,
+    0.7
+   ],
+   "size_m": 1.0,
+   "anchor": null,
+   "prim": null,
+   "concept_feature": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+   "hint": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing."
   }
  ],
  "mirror": "x",
@@ -1242,6 +1284,110 @@
     "render-belly-id.png"
    ],
    "at": "2026-09-05T05:00:54Z"
+  },
+  {
+   "score": 0.65,
+   "overall": "The blockout captures the main shapes and proportions well, but several key details are misplaced or missing. The RCS clusters and main nozzles need repositioning, the rear landing skids failed to generate, and the prominent wingtip pods are absent.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": false,
+     "verdict": "missing"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "front_landing_skid",
+     "present": true,
+     "verdict": "good"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "move",
+     "why": "The RCS clusters should be smaller and located on the sides of the nose, rather than sticking out of the very front.",
+     "anchor": [
+      0.4,
+      0.85
+     ],
+     "scale_factor": 0.5
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "move",
+     "why": "The nozzles need to be moved to the aft face of the engine pods so they sit inside the cowlings, rather than underneath them.",
+     "anchor": [
+      0.25,
+      -1.0
+     ],
+     "scale_factor": 1.5
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "replace",
+     "why": "The rear landing skids failed to place geometry; use a procedural skid to ensure they appear.",
+     "prim": "skid"
+    },
+    {
+     "zone": "wingtip_pods",
+     "action": "add",
+     "why": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+     "region": "flank.mid.outer",
+     "tags": [
+      "cylinder",
+      "thruster"
+     ],
+     "yaw_deg": 0
+    },
+    {
+     "zone": "wingtip_pods",
+     "action": "add",
+     "why": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+     "region": "flank.mid.outer",
+     "tags": [
+      "cylinder",
+      "thruster"
+     ],
+     "yaw_deg": 0
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T05:22:26Z",
+   "score_eff": 0.611
   }
  ]
 }

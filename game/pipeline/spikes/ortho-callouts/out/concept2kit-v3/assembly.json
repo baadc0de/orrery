@@ -9,13 +9,13 @@
    "kit": "procedural",
    "region": "nose.fore.outer",
    "pos": [
-    0.711,
-    4.45,
-    -0.005
+    1.907,
+    0.849,
+    -0.009
    ],
    "anchor": [
-    0.15,
-    0.95
+    0.4,
+    0.85
    ],
    "scale": 1.0,
    "placed_m": 0.8,
@@ -27,13 +27,13 @@
    "kit": "procedural",
    "region": "tail.aft.outer",
    "pos": [
-    0.953,
-    -3.285,
+    1.191,
+    -4.5,
     0.0
    ],
    "anchor": [
-    0.2,
-    -0.85
+    0.25,
+    -1.0
    ],
    "scale": 1.0,
    "placed_m": 0.89,
@@ -109,19 +109,19 @@
   },
   {
    "zone": "ventral_gun_bay",
-   "insert": "ship-b_Detail_241",
+   "insert": "ship-b_Detail_108",
    "kit": "cgtrader/spaceship-kitbash-350-b",
    "region": "belly.fore.outer",
    "pos": [
-    0.0,
-    2.253,
-    -1.115
+    0.001,
+    2.258,
+    -1.129
    ],
    "anchor": [
     0.0,
     0.5
    ],
-   "scale": 0.0925,
+   "scale": 0.0678,
    "placed_m": 1.0,
    "attach": "surface"
   },
@@ -148,9 +148,39 @@
    "scale": 1.0,
    "placed_m": 1.5,
    "attach": "surface"
+  },
+  {
+   "zone": "wingtip_pods",
+   "insert": "ship-b_Detail_118",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "flank.mid.outer",
+   "pos": [
+    2.556,
+    -0.09,
+    -0.288
+   ],
+   "anchor": null,
+   "scale": 0.0463,
+   "placed_m": 1.0,
+   "attach": "surface"
+  },
+  {
+   "zone": "wingtip_pods",
+   "insert": "ship-b_Detail_126",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "flank.mid.outer",
+   "pos": [
+    2.209,
+    -0.089,
+    -0.297
+   ],
+   "anchor": null,
+   "scale": 0.0275,
+   "placed_m": 1.0,
+   "attach": "surface"
   }
  ],
- "tris": 24481,
+ "tris": 31473,
  "id_colors": {
   "front_landing_skid": "red",
   "main_thruster_nozzle": "green",
@@ -158,6 +188,7 @@
   "rear_landing_skid": "yellow",
   "spine_conduits": "magenta",
   "under_wing_pylons": "cyan",
-  "ventral_gun_bay": "orange"
+  "ventral_gun_bay": "orange",
+  "wingtip_pods": "purple"
  }
 }

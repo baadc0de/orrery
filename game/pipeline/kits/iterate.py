@@ -28,14 +28,16 @@ def critique(i):
             "--zones", f"{O}/zones.json", "--assembly", f"{O}/assembly.json", "--atlas", f"{O}/hull_atlas.json", "--out", f"{O}/zones.next.json"])
     for l in r.stdout.splitlines(): print("   ", l)
     if r.returncode: print(r.stderr[-1200:]); return None
-    Z = json.load(open(f"{O}/zones.next.json")); c = Z["critiques"][-1]; pz = [p for p in c.get("per_zone", []) if p.get("verdict")]
+    Z = json.load(open(f"{O}/zones.next.json")); c = Z["critiques"][-1]; paint = {z["name"] for z in Z["zones"] if z.get("kind") == "paint"}
+    pz = [p for p in c.get("per_zone", []) if p.get("verdict") and p["zone"] not in paint]   # paint zones are absent by design; "missing" there is not a defect
     good = sum(1 for p in pz if p["verdict"] == "good") / len(pz) if pz else c["score"]
     eff = round(0.5 * c["score"] + 0.5 * good, 3); c["score_eff"] = eff; json.dump(Z, open(f"{O}/zones.next.json", "w"), indent=1)
     print(f"    score_eff {eff} (critic {c['score']}, good zones {good:.2f})"); return eff
 def snapshot(tag):
     for f in ["zones.json", "choices.json", "assembly.json"] + [f"render-{v}.png" for v in views]:
         if os.path.exists(f"{O}/{f}"): shutil.copy(f"{O}/{f}", f"{O}/{tag}-{f}")
-best = json.load(open(f"{best_dir}/score.json"))["score"] if os.path.exists(f"{best_dir}/score.json") else -1.0
+bs = json.load(open(f"{best_dir}/score.json")) if os.path.exists(f"{best_dir}/score.json") else {}
+best = bs["score"] if bs.get("metric") == "eff" else -1.0   # a best recorded on the critic-only scale does not compete with blended scores
 hist = []; seed = 7
 if not os.path.exists(f"{O}/choices.json"): choose(seed)
 for i in range(1, a.passes + 1):
@@ -43,7 +45,7 @@ for i in range(1, a.passes + 1):
     if score is None: break
     hist.append(score); snapshot(f"pass{i}")
     if score >= best - 1e-9:
-        best = score; json.dump({"score": score, "pass": i, "seed": seed}, open(f"{best_dir}/score.json", "w"))
+        best = score; json.dump({"score": score, "pass": i, "seed": seed, "metric": "eff"}, open(f"{best_dir}/score.json", "w"))
         for f in ["zones.json", "choices.json", "assembly.json", "assembly.glb", "assembly.blend"] + [f"render-{v}.png" for v in views]: shutil.copy(f"{O}/{f}", f"{best_dir}/{f}")
         print(f"   best so far {score}")
     elif score < best - a.tolerance:   # off by default (tolerance 1.0): the critic's score is noisy by ~0.15 on an unchanged program, so reverting on it discards every adjustment

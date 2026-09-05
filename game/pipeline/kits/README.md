@@ -126,3 +126,16 @@ Best score 0.7 → 0.75 with `iterate.py` accepting every pass; then two structu
 - **Mount audition.** The dominant-plane rule mounts a generated skid by the ski's underside. `audition_mount.py` renders the part on a plate in its six bounding-box orientations and lets the vision model pick the one that sits like the sheet, then rewrites the INSERT (mount at z=0, features updated). It picked the bolt plate for the skid and the flat base for the block and nozzle. This applies to stragglers from purchased kits too.
 
 Open: the coarse hull still carries lumps for the features the parts reproduce (the critic drops duplicates, it cannot carve); primitives could take the subassembly sheet as a parameter source (strut count, ski length) instead of fixed ratios; a generated part labelled with a zone's tags leaks into neighbouring zones through neighbour-tag widening (the skid was offered for pylons).
+
+## More avenues (2026-09-05, afternoon)
+
+Six passes with four changes at once, scored on a blended metric (half the critic's number, half its own fraction of "good" part zones): 0.61, 0.63, 0.55, 0.45, 0.61, 0.56. The critic-only numbers were 0.65–0.75, the same band as before: **the loop has plateaued** at what the coarse hull and a noisy critic allow.
+
+- **Carving hull lumps** (`carve`, default for skid and box primitives, critic-settable): ring-median skin height around the mount point; a lump is part-sized, surrounded by a consistent base (interquartile spread under 0.15 m) and never on the nose or tail taper. Two failure modes were found the hard way: the nose taper read as a 1.6 m lump and the nose was chopped; a belly skid at the wing root saw the wing underside on half its ring and sank into a recess. After a carve the skid is rebuilt so the ski hangs where the lump surface was.
+- **Blended score.** The critic's number varies by 0.15 on an unchanged program; its per-zone verdicts are steadier but count paint zones as "missing" unless excluded. The driver now stores which metric its best snapshot used, because a 0.75 on the old scale silently blocked every update on the new one.
+- **Mirror-aware counts.** A count-2 zone on a flank region placed both copies along the wing (one at the nose) before the mirror doubled them; off-centre zones now place half the count.
+- **Generated parts stay with their zone.** The generated skid was offered for the pylons through neighbour-tag widening; a generated INSERT's label carries its zone and only that zone may pick it.
+- **Hull hole fill.** Boundary loops of the voxel-remeshed hull are filled before mounting; the dark slits the critic read as vents are mostly gone.
+- **Negative: corrective smoothing of the hull** melts it into a blob with holes and breaks the boolean. The hull quality has to come from upstream (a finer remesh or the retopo mesh), not from smoothing.
+
+What would move the score next, in order: a better mount hull (the retopo mesh, or the TRELLIS mesh at size/300 instead of size/170); a critic ensemble (two calls, verdicts intersected) to cut the noise; letting the critic see the subassembly sheets; primitives parameterised from the sheets.

@@ -74,7 +74,7 @@ def prim_object(z, e_dims_out):
             r = bmesh.ops.create_cube(bm, size=1.0); bmesh.ops.scale(bm, vec=(0.5 * w, 0.5 * w, h), verts=r["verts"]); bmesh.ops.translate(bm, vec=(0, yy, h / 2), verts=r["verts"])
         dims = (w, L, h + th)
     elif kind == "nozzle":   # engine: outer cylinder with a recessed inner cone, axis along +z = the mount normal (a tail face points aft).
-        r = L / 2; ln = z.get("length_m", 1.0 * L); sink = z.get("sink", 0.7)   # most of the length sits inside the pod lump; only the lip and the glowing cone show
+        r = L / 2; ln = z.get("length_m", 1.0 * L); sink = z.get("sink", 0.85)   # most of the length sits inside the pod lump; only the lip and the glowing cone show
         bmesh.ops.create_cone(bm, cap_ends=False, segments=24, radius1=r * 0.92, radius2=r, depth=ln)
         inner = bmesh.ops.create_cone(bm, cap_ends=True, segments=24, radius1=r * 0.35, radius2=r * 0.82, depth=ln * 0.9)
         ring = bmesh.ops.create_cone(bm, cap_ends=False, segments=24, radius1=r * 0.92, radius2=r * 0.82, depth=0.02); bmesh.ops.translate(bm, vec=(0, 0, ln * 0.49), verts=ring["verts"])
@@ -152,6 +152,8 @@ for z in Z["zones"]:
     straddles = not z["region"].startswith("flank") and min(f.center.x for f in fs) < -0.05 and max(f.center.x for f in fs) > 0.05
     pair = straddles and k % 2 == 0 and not z.get("anchor"); across = Vector((ext[0] * 0.3, 0, 0)) if pair else None
     if z.get("anchor") and k % 2 == 0 and not z["region"].startswith("flank"): pair = True; across = None   # anchored pairs: the anchor is the +x member, the mirror makes the other
+    if z["region"].startswith("flank") or (z.get("anchor") and abs(z["anchor"][0]) > 0.05 and not z["region"].startswith("flank")):
+        if k % 2 == 0 and not pair: pair = True; across = None   # off-centre zones are mirrored: place half the count, the mirror supplies the rest
     if pair: k //= 2
     for i in range(k):
         if z.get("prim"):
@@ -180,8 +182,9 @@ for z in Z["zones"]:
             for j in range(12):
                 ang = 2 * math.pi * j / 12; q = pos + tt * (R * math.cos(ang)) + bb * (R * math.sin(ang)); hp, _ = skin_hit(sd0, q)
                 if hp is not None: offs.append((hp - pos).dot(nn))
-            offs.sort(); base = offs[len(offs) // 2] if offs else 0.0
-            lump_ok = len(offs) >= 9 and -0.08 > base >= -(0.5 * max(fx, fy) + 0.15) and sd0 not in ("nose", "tail")   # a lump is part-sized; a taper (nose, tail) is not a lump
+            offs.sort(); base = offs[len(offs) // 2] if offs else 0.0; spread = (offs[(3 * len(offs)) // 4] - offs[len(offs) // 4]) if len(offs) >= 4 else 9.0
+            # a lump is part-sized and surrounded by a consistent base (a skid at the wing root sees the belly on one side and the wing underside on the other: not a lump)
+            lump_ok = len(offs) >= 9 and -0.08 > base >= -(0.5 * max(fx, fy) + 0.15) and spread < 0.15 and sd0 not in ("nose", "tail")
             if lump_ok:   # ring sits lower than the mount point: a lump. Drop to base level and cut the lump above it.
                 pos = pos + nn * base
                 cut = bpy.data.objects.new(f"cut_{z['name']}_{i}", bpy.data.meshes.new("cut")); sc.collection.objects.link(cut); cbm = bmesh.new(); bmesh.ops.create_cube(cbm, size=1.0); cbm.to_mesh(cut.data); cbm.free()
