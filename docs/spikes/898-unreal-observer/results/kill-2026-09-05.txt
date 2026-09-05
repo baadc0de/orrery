@@ -1,0 +1,9 @@
+sidecar seed=21 pid=2704182 addr=127.0.0.1:43875
+sidecar seed=22 pid=2704255 addr=127.0.0.1:34805
+== observer (to be killed) against 127.0.0.1:43875 127.0.0.1:34805
+before the kill: sidecar ticks 415 and 404
+== SIGKILL 2704330
+editor is gone: yes
+after the kill:  sidecar ticks 600 and 589
+PASS: sidecar A advanced 415 -> 600 with its observer dead
+PASS: sidecar B advanced 404 -> 589 with its observer dead

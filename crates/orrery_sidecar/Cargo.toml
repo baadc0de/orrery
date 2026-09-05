@@ -16,6 +16,14 @@ license = "MIT OR Apache-2.0"
 name = "orrery-sidecar"
 path = "src/main.rs"
 
+# The engine side of the crossing, with the drawing left out (#898 step 3).
+# A binary rather than an example for the reason `tests/observer_kill.rs`
+# needs: A9 P-4 is a claim about killing a *process*, so the test has to have
+# one to kill, and `CARGO_BIN_EXE_` gives it one on every commit.
+[[bin]]
+name = "orrery-observer"
+path = "src/bin/orrery-observer.rs"
+
 [dependencies]
 orrery = { path = "../orrery" }
 orrery_authority = { path = "../orrery_authority" }
@@ -24,6 +32,10 @@ orrery_core = { path = "../orrery_core" }
 # the game projects its presented component onto `QuantizedTransform`, so the
 # schema type is named in production, not just by the transport's tests.
 orrery_ipc = { path = "../orrery_ipc" }
+# The framing and the observer-side link the shipped sidecar serves onto
+# (#898 step 3). Bevy-free, so the serve module is the only place the two
+# vocabularies meet.
+orrery_ipc_transport = { path = "../orrery_ipc_transport" }
 orrery_net = { path = "../orrery_net" }
 orrery_predict = { path = "../orrery_predict" }
 orrery_protocol = { path = "../orrery_protocol" }

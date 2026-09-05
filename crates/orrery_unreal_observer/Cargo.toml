@@ -1,0 +1,41 @@
+[package]
+name = "orrery_unreal_observer"
+version = "0.1.0"
+edition = "2021"
+description = "The engine side of the sidecar IPC crossing behind a C ABI: the staticlib an Unreal module links to render a sidecar's presentation frames (#898 step 3)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The `staticlib` is the object `MovingInteriors.Build.cs`'s pattern links
+# (`PublicAdditionalLibraries` + `PublicIncludePaths`); the `rlib` is what lets
+# this crate's own tests compile against it.
+#
+# It exists so the observer's rules — overwrite semantics, membership from the
+# complete extraction, identity by `PersistId` and never by an engine handle —
+# are implemented once, in Rust, rather than once per engine in C++. What
+# crosses the ABI is a flat array of plain-old-data records; what does not
+# cross is any decision.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The link, the framing and the view. Bevy-free, which is what keeps this
+# crate Bevy-free too — D53 clause (f) item 4.
+#
+# `core-gates.sh`'s `DECLARED_BEVY_FREE_CRATES` cannot name this crate: it
+# discovers workspace crates whose target kind includes `lib`, and this one is
+# `staticlib` + `rlib`. What enforces the boundary instead is stronger than a
+# `cargo tree` scan — `tests/c_consumer.rs` runs `nm` over the built archive
+# and fails on any symbol from `bevy_ecs`, `bevy_app`, `lightyear`, `iroh`,
+# `tokio` or `aeronet`. That checks the object an engine actually links, not
+# the manifest that was meant to produce it.
+orrery_ipc_transport = { path = "../orrery_ipc_transport" }
+orrery_protocol = { path = "../orrery_protocol" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The tests build real batches to serve to the observer; only the tests need
+# the codec by name, because the shipped path decodes inside the transport.
+orrery_ipc = { path = "../orrery_ipc" }

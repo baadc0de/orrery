@@ -8273,6 +8273,7 @@ dependencies = [
  "orrery_authority",
  "orrery_core",
  "orrery_ipc",
+ "orrery_ipc_transport",
  "orrery_net",
  "orrery_predict",
  "orrery_protocol",
@@ -8358,6 +8359,15 @@ dependencies = [
  "orrery_core",
  "orrery_protocol",
  "orrery_sim_host",
+]
+
+[[package]]
+name = "orrery_unreal_observer"
+version = "0.1.0"
+dependencies = [
+ "orrery_ipc",
+ "orrery_ipc_transport",
+ "orrery_protocol",
 ]
 
 [[package]]

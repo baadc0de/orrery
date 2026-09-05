@@ -1,0 +1,6 @@
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+results/*.log
+results/*.csv
