@@ -12,13 +12,13 @@ SCHEMA = {"type": "object", "properties": {"overall": {"type": "string"}, "score
 ap = argparse.ArgumentParser(); ap.add_argument("--project", default=os.environ.get("VERTEX_PROJECT")); ap.add_argument("--model", default="gemini-3.1-pro-preview"); ap.add_argument("--build", required=True)
 ap.add_argument("--assembly", required=True); ap.add_argument("--renders", nargs="+", required=True); ap.add_argument("--out", required=True); a = ap.parse_args()
 B = json.load(open(a.build)); A = json.load(open(a.assembly)); P = json.load(open(os.path.join(B["palette"], "palette.json"))); parts_txt = "; ".join(f"{p['id']} = {p['desc']}" for p in P["parts"])
-items = [{"i": p["i"], "k": p.get("k", 0), "name": p["name"], "part": p["part"], "count": p.get("count", 1), "pos_m": p["pos_m"], "along": p["along"], "spin_deg": p.get("spin_deg", 0), "tilt_deg": p.get("tilt_deg", 0), "size_m": p["size_m"], "bbox": [p["bbox_min"], p["bbox_max"]]} for p in A["placed"]]
+items = [{"i": p["i"], "k": p.get("k", 0), "name": p["name"], "part": p["part"], "count": p.get("count", 1), "pos_m": p["pos_m"], "along": p["along"], "spin_deg": p.get("spin_deg", 0), "tilt_deg": p.get("tilt_deg", 0), "size_m": p["size_m"], "locked": next((it.get("locked", []) for k, it in enumerate(B["items"]) if k == p["i"]), []), "bbox": [p["bbox_min"], p["bbox_max"]]} for p in A["placed"]]
 sizes = {int(r["part"]): r["size_m"] for r in B.get("part_sizes", [])}
 prompt = f"""You are the art director checking a kitbash reconstruction of a CONCEPT that was itself built from a numbered palette: {parts_txt}.
 Image CONCEPT is the target (with palette numbers as callouts). Images RENDER-* show the reconstruction (hero 3/4, front, side). Frame: x along the prop (left-right in the front view), y depth, z up, ground z=0.
 Part sizes (one size per palette part for the whole build, never stretched; a longer span is a run of several instances): {json.dumps(sizes)}.
 Build list as placed (i = item index, k = instance within a run of count; pos_m = centre; along = world axis of the part's longest dimension; spin_deg = rotation about that axis, 0 = flattest face up; tilt_deg = tilt in the xz plane; bbox = world min/max): {json.dumps(items)}
-Judge every item against the concept (per_item verdict), then give at most 8 adjustments, by item index i: move (give pos_m = the NEW absolute centre of the run in metres, different from the current one; or delta_m), spin (absolute spin_deg), tilt (absolute tilt_deg), count (instances in the run), scale (absolute size_m for that PART, changes every instance of it), swap (new palette part), remove (an item not in the concept), add (name, part, pos_m, along, count for something the concept has and the build lacks).
+Items may carry "locked" fields that a human reviewer has verified; do not propose changes to those fields. Judge every item against the concept (per_item verdict), then give at most 8 adjustments, by item index i: move (give pos_m = the NEW absolute centre of the run in metres, different from the current one; or delta_m), spin (absolute spin_deg), tilt (absolute tilt_deg), count (instances in the run), scale (absolute size_m for that PART, changes every instance of it), swap (new palette part), remove (an item not in the concept), add (name, part, pos_m, along, count for something the concept has and the build lacks).
 Be geometric: use the bboxes to see what touches what. Give a 0..1 score for how well the reconstruction matches the concept and a two-sentence note."""
 parts = [{"text": prompt}, {"text": "CONCEPT:"}, img(B["concept"])]
 for r in a.renders: parts += [{"text": f"RENDER-{os.path.basename(r)}:"}, img(r)]
@@ -46,7 +46,9 @@ for adj in C["adjust"]:
         if adj.get("size_m") and not any(int(r["part"]) == adj["part"] for r in B2.get("part_sizes", [])): B2.setdefault("part_sizes", []).append({"part": adj["part"], "size_m": adj["size_m"]})
         continue
     if i is None or not (0 <= i < len(its)): continue
-    it = its[i]
+    it = its[i]; L = set(it.get("locked", []))   # fields verified by a human are not the critic's to change
+    field = {"move": "pos_m", "spin": "spin_deg", "tilt": "tilt_deg", "count": "count", "swap": "part", "remove": "part"}.get(act)
+    if field in L or (act == "scale" and int(it["part"]) in B.get("locked_part_sizes", [])): print(f"  ({act} on item {i} refused: locked by human critique)"); continue
     if act == "move":
         if adj.get("delta_m") and any(abs(v) > 1e-6 for v in adj["delta_m"][:3]): it["pos_m"] = [round(p + d, 3) for p, d in zip(it["pos_m"], adj["delta_m"][:3] + [0, 0, 0])]
         elif adj.get("pos_m") and [round(v, 3) for v in adj["pos_m"][:3]] != [round(v, 3) for v in it["pos_m"][:3]]: it["pos_m"] = [round(v, 3) for v in adj["pos_m"][:3]]
