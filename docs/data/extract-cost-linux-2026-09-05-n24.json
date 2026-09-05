@@ -1,0 +1,27 @@
+{
+  "schema": "orrery-extract-cost/1",
+  "what": "orrery::ipc::export_ipc_frames on the shipped orrery_sidecar app",
+  "entities": 24,
+  "ticks": 36000,
+  "warmup": 600,
+  "loadavg_start": "0.19 10.67 33.76",
+  "loadavg_end": "0.17 10.50 33.58",
+  "extract_ns": {
+    "n": 36000,
+    "mean_ns": 3610.2544166666667,
+    "min_ns": 3146,
+    "p50_ns": 3426,
+    "p99_ns": 6462,
+    "p99_9_ns": 8315,
+    "max_ns": 13526
+  },
+  "empty_baseline_ns": {
+    "n": 36000,
+    "mean_ns": 40.24155555555556,
+    "min_ns": 30,
+    "p50_ns": 40,
+    "p99_ns": 100,
+    "p99_9_ns": 131,
+    "max_ns": 5570
+  }
+}
