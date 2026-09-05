@@ -62,11 +62,16 @@ use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::{
     campaign_spawn_pose, collision_candidate, CAMPAIGN_CELL_EDGE_M, REGOLITH_RULESET,
 };
-use orrery_games::{Game, Regolith};
+use orrery_games::Regolith;
 use orrery_protocol::channels::{decode_delivered_input, decode_replication};
 use orrery_protocol::UniverseSeed;
 use orrery_protocol::{
     cell_id_from_metres, CellId, FrameHead, PersistId, RecordSource, Tick, WitnessMsg,
+};
+
+use orrery_sim_host::{
+    Delivery, HostRoutedTick, InputOrigin, PredictionSet, SealedInput, SimulationHost,
+    SimulationHostConfig, TickCount, TickParticipant,
 };
 
 use crate::intent::{decode_packet, encode_orders, Controls, IntentPipeline, OrderPacket};
@@ -75,6 +80,7 @@ use crate::net::{
     UplinkOutcome,
 };
 use crate::session::{Actor, CampaignSession, ConfiguredImpairment, PlayerActivity, SessionRecord};
+use crate::RegolithAdapter;
 
 /// Broadcasts per second the harness runs (`send_hz`), mirrored so the
 /// client's state cadence matches what a bot's `broadcast_state` does.
@@ -647,7 +653,17 @@ pub struct CampaignRuntime {
     /// manifest, which is every host until #574 lands.
     start: Option<crate::lobby::AcceptedStart>,
 
-    executor: Executor<Regolith>,
+    /// The kernel-owned fixed-step host holding this client's craft and the
+    /// replicas it installs of remote craft.
+    ///
+    /// The host owns the clock, the sealed input buffer and the delivery
+    /// routing hook that `advance` used to step by hand (A18 S6.b). What is
+    /// left in this driver is input authoring, replication ingest, the wire
+    /// and the witness log.
+    host: SimulationHost<Regolith, RegolithAdapter>,
+    /// The seed the host was built with, so its clock can be re-seated at the
+    /// tick the lobby admitted this client on. See [`Self::seat_host_at`].
+    seed: UniverseSeed,
     pipeline: IntentPipeline,
     witness_log: InputLogProducer,
     entity: PersistId,
@@ -865,15 +881,14 @@ impl CampaignRuntime {
     /// poll [`Self::poll_join`] until the state leaves [`JoinState::Dialing`].
     #[must_use]
     pub fn launch(config: CampaignConfig, seed: UniverseSeed) -> Self {
-        let game = Regolith::honest();
-        let mut executor = Executor::new(game, seed);
+        let mut host = new_host(seed, Tick::new(0));
         let entity = PersistId::new(config.slot as u64 + 1);
         // The exterior is the last participant in the host's crowd. Its
         // signed join snapshot must use the same campaign pose as the host's
         // headless peers; the compact scenario ring is a different world and
         // leaves every host-owned target kilometres outside weapon reach.
         let (pos, yaw_urad) = campaign_spawn_pose(config.slot, usize::from(config.island_seats()));
-        executor.insert(
+        host.install_state(
             entity,
             RegolithState::Craft(Craft::spawned(
                 Archetype::for_slot(config.slot as u64),
@@ -890,7 +905,11 @@ impl CampaignRuntime {
             CLAIM_EVERY_TICKS,
             WITNESS_FRAME_TICKS,
         );
-        let anchor_state = executor.state(entity).expect("spawn inserted").clone();
+        let anchor_state = host
+            .backend()
+            .state(entity)
+            .expect("spawn inserted")
+            .clone();
         let campaign = CampaignSession::new(
             config.session_id.clone(),
             config.wall_start_utc.clone(),
@@ -997,7 +1016,8 @@ impl CampaignRuntime {
 
         let mut this = Self::assemble(
             config,
-            executor,
+            host,
+            seed,
             pipeline,
             witness_log,
             entity,
@@ -1015,7 +1035,8 @@ impl CampaignRuntime {
     #[allow(clippy::too_many_arguments)]
     fn assemble(
         config: CampaignConfig,
-        executor: Executor<Regolith>,
+        host: SimulationHost<Regolith, RegolithAdapter>,
+        seed: UniverseSeed,
         pipeline: IntentPipeline,
         witness_log: InputLogProducer,
         entity: PersistId,
@@ -1064,7 +1085,8 @@ impl CampaignRuntime {
             upload_queue: None,
             record_disposition: RecordDisposition::Unfinished,
             config,
-            executor,
+            host,
+            seed,
             pipeline,
             witness_log,
             entity,
@@ -1072,6 +1094,30 @@ impl CampaignRuntime {
             pending_join,
             start: None,
         }
+    }
+
+    /// Re-seat the host's clock on the tick the lobby admitted this client.
+    ///
+    /// The host fixes its first tick at construction and this client does not
+    /// learn the join tick until `StartV1` lands, long after `launch` built
+    /// the host to hold the spawn pose the anchor claim was signed over. A
+    /// host that has never stepped is entirely described by its population,
+    /// so re-seating is: build a host at the join tick and re-install what the
+    /// old one held, byte-identically. Nothing is queued or emitted before the
+    /// join — `advance` returns early until the state is `Joined` — so there
+    /// is nothing else to carry across.
+    fn seat_host_at(&mut self, first_tick: Tick) {
+        let mut seated = new_host(self.seed, first_tick);
+        for entity in self.host.backend().entities().copied().collect::<Vec<_>>() {
+            let observed = self
+                .host
+                .observed_tick(entity)
+                .unwrap_or_else(|| Tick::new(0));
+            if let Some(state) = self.host.backend().state(entity) {
+                seated.install_state_observed(entity, state.clone(), observed);
+            }
+        }
+        self.host = seated;
     }
 
     /// Take the dial thread's result, if it has landed yet.
@@ -1102,6 +1148,7 @@ impl CampaignRuntime {
                 }
                 let join_tick = start.as_ref().map_or(0, |start| start.tick);
                 self.tick = Tick::new(join_tick);
+                self.seat_host_at(Tick::new(join_tick));
                 self.witness_log = InputLogProducer::new(
                     self.config.transport_secret.clone(),
                     self.entity,
@@ -1111,7 +1158,8 @@ impl CampaignRuntime {
                     WITNESS_FRAME_TICKS,
                 );
                 let state = self
-                    .executor
+                    .host
+                    .backend()
                     .state(self.entity)
                     .expect("joining entity remains installed")
                     .clone();
@@ -1260,7 +1308,7 @@ impl CampaignRuntime {
     /// Read-only executor access for rendering and combat views.
     #[must_use]
     pub fn executor(&self) -> &Executor<Regolith> {
-        &self.executor
+        self.host.backend()
     }
 
     /// The campaign accumulator this session feeds.
@@ -1459,13 +1507,20 @@ impl CampaignRuntime {
         if !matches!(self.state, JoinState::Joined) {
             return TickReport::default();
         }
-        let tick = self.tick;
+        // The host owns the clock. `self.tick` is the driver's mirror of it,
+        // seated together at the join and advanced together at the end of
+        // every driven tick; reading the host here means the tick the witness
+        // column and the telemetry name is the tick the step executed under,
+        // and cannot become a second opinion.
+        let tick = self.host.next_tick();
+        debug_assert_eq!(tick, self.tick, "the host's clock is the driver's clock");
 
         // The existing headless producer's order is load-bearing: a claim at
         // T commits to pre-step state, while T's inputs and resulting hash land
         // in the frame cut after the step.
         let claim = self
-            .executor
+            .host
+            .backend()
             .state(self.entity)
             .and_then(|state| self.witness_log.cut_claim(tick.0, state));
 
@@ -1489,15 +1544,17 @@ impl CampaignRuntime {
             self.count_own_packet_decode_failure(tick, error);
         }
         if let Ok(mut authored_orders) = decoded {
-            if let Some(other) = self.executor.state(self.entity).and_then(|own| {
+            if let Some(other) = self.host.backend().state(self.entity).and_then(|own| {
                 collision_candidate(
                     self.entity,
                     own,
-                    self.executor
+                    self.host
+                        .backend()
                         .entities()
                         .filter(|candidate| **candidate != self.entity)
                         .filter_map(|candidate| {
-                            self.executor
+                            self.host
+                                .backend()
                                 .state(*candidate)
                                 .map(|state| (*candidate, state))
                         }),
@@ -1511,10 +1568,8 @@ impl CampaignRuntime {
             // and precede this tick's player-authored orders. Record the
             // composed vector, not merely the keyboard half: replay and the
             // witness must execute the exact same order the authority did.
-            let composed =
-                compose_delivered_first(&mut self.pending_delivered, authored_orders, tick.0);
-            report.delivered = composed.delivered;
-            for delivered in &report.delivered {
+            let composed = compose_delivered_first(&mut self.pending_delivered, authored_orders);
+            for delivered in &composed.delivered {
                 if let Order::CollisionResolved { from, velocity } = delivered.order {
                     if let Err(error) = sink.append_collision_resolved(
                         tick.0,
@@ -1537,31 +1592,41 @@ impl CampaignRuntime {
             {
                 bevy::log::error!("cannot append Regolith order packet: {error}");
             }
-            self.witness_log
-                .log_inputs_with_sources(tick.0, &composed.orders, &composed.sources);
-            if let Some(outcome) = self
-                .executor
-                .step_entity(self.entity, tick, &composed.orders)
-            {
-                // The predicted set is whatever this tick stepped, and this
-                // is the only place a campaign tick steps anything: one
-                // entity, this client's own craft. Counted here rather than
-                // stated as a constant downstream, so a tick that stepped
-                // nothing reads as zero (#1029).
-                report.predicted += 1;
-                self.witness_log
-                    .log_neighbor_frames(tick.0, &outcome.neighbor_frames);
-                self.witness_log.log_tick_hash(outcome.state_hash);
-                report.events.extend(outcome.events.iter().cloned());
-                let deliveries: Vec<_> = outcome
-                    .events
-                    .iter()
-                    .filter_map(|event| self.executor.ruleset().deliver(event))
-                    .collect();
-                for (recipient, order) in deliveries {
-                    self.route_delivered_input(&link, recipient, order);
-                }
+            // A18 S6.b: the hand-rolled loop is gone, not tidied. Sealing
+            // this tick's input in D46 clause (d) order, stepping exactly one
+            // entity while every replica this client holds stays frozen,
+            // reporting the neighbour reads the witness log folds, and
+            // handing each adapter delivery to this driver instead of
+            // queueing it locally are all one `step_predicted` call now.
+            let stepped = step_own_craft(
+                &mut self.host,
+                &mut self.witness_log,
+                self.entity,
+                &composed,
+            );
+            // The predicted set is whatever the host reports this tick
+            // stepped, counted rather than stated as a constant, so a tick
+            // that stepped nothing reads as zero (#1029).
+            report.predicted = report.predicted.saturating_add(stepped.predicted);
+            report.events.extend(stepped.events);
+            // Every delivery leaves by the same route it always did: over the
+            // wire to the authority that owns the recipient. The host queues
+            // none of them, because the participant takes all of them.
+            for routed in stepped.routed {
+                self.route_delivered_input(&link, routed.recipient, routed.order);
             }
+            report.delivered = composed.delivered;
+        } else {
+            // An order packet this client could not decode skipped the step
+            // and nothing else, and the clock kept moving. The host says that
+            // in one call: a set that names nobody steps nobody and advances
+            // the tick, so the driver's clock and the host's cannot part
+            // company over a decode failure.
+            self.host.step_predicted(
+                TickCount::new(1),
+                &PredictionSet::only(std::iter::empty()),
+                &mut HostRoutedTick,
+            );
         }
         let authored = self.witness_log.cut_frame(tick.0);
 
@@ -1604,7 +1669,7 @@ impl CampaignRuntime {
             let cell = self.committed_cell();
             self.latest_cell = Some(cell);
             let payload = encode_state_broadcast(
-                &self.executor,
+                self.host.backend(),
                 self.entity,
                 cell,
                 tick.0 + 1,
@@ -1656,7 +1721,7 @@ impl CampaignRuntime {
         }
 
         expire_stale_replicas(
-            &mut self.executor,
+            &mut self.host,
             self.entity,
             tick.0,
             &mut self.replica_freshness,
@@ -1764,7 +1829,7 @@ impl CampaignRuntime {
                                         at,
                                     );
                                 }
-                                self.executor.insert(entity, state);
+                                self.host.install_state(entity, state);
                                 // The duel view follows the first remote
                                 // craft that arrives, and stays with it.
                                 if entity != self.entity && self.focus.is_none() {
@@ -1807,7 +1872,7 @@ impl CampaignRuntime {
                                             delta.tick,
                                         );
                                     }
-                                    self.executor.insert(delta.entity, state);
+                                    self.host.install_state(delta.entity, state);
                                     if delta.entity != self.entity && self.focus.is_none() {
                                         self.focus = Some(delta.entity);
                                     }
@@ -1897,7 +1962,7 @@ impl CampaignRuntime {
     /// exactly the amount hysteresis exists to prevent. Accepted this slice:
     /// interest gating degrades gracefully and #387 owns the fix.
     fn committed_cell(&self) -> CellId {
-        let metres = match self.executor.state(self.entity) {
+        let metres = match self.host.backend().state(self.entity) {
             Some(RegolithState::Craft(craft)) => {
                 let (x, y, z) = craft.pos.to_metres();
                 DVec3::new(x, y, z)
@@ -1993,7 +2058,7 @@ impl CampaignRuntime {
             for slot in departed {
                 let entity = PersistId::new(slot as u64 + 1);
                 if entity != self.entity {
-                    self.executor.take_state(entity);
+                    self.host.remove_state(entity);
                 }
                 self.replica_freshness.remove(&entity);
                 self.replica_keyframes.remove(&entity);
@@ -2354,7 +2419,7 @@ impl CampaignRuntime {
     /// and "the client draws the peer the test happened to point at".
     #[cfg(test)]
     pub(crate) fn install_replica_for_test(&mut self, entity: PersistId, state: RegolithState) {
-        self.executor.insert(entity, state);
+        self.host.install_state(entity, state);
         if entity != self.entity && self.focus.is_none() {
             self.focus = Some(entity);
         }
@@ -2391,7 +2456,7 @@ impl CampaignRuntime {
 }
 
 fn expire_stale_replicas(
-    executor: &mut Executor<Regolith>,
+    host: &mut SimulationHost<Regolith, RegolithAdapter>,
     own: PersistId,
     tick: u64,
     freshness: &mut BTreeMap<PersistId, ReplicaFreshness>,
@@ -2419,7 +2484,7 @@ fn expire_stale_replicas(
             None,
         );
         if entity != own {
-            executor.take_state(entity);
+            host.remove_state(entity);
         }
         if *focus == Some(entity) {
             *focus = None;
@@ -2657,7 +2722,6 @@ enum DeliveryRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposedInputs {
     orders: Vec<Order>,
-    sources: Vec<RecordSource>,
     delivered: Vec<DeliveredOrder>,
 }
 
@@ -2667,28 +2731,179 @@ struct ComposedInputs {
 fn compose_delivered_first(
     pending: &mut Vec<DeliveredOrder>,
     authored: Vec<Order>,
-    tick: u64,
 ) -> ComposedInputs {
     let delivered = core::mem::take(pending);
     let mut orders = Vec::with_capacity(delivered.len() + authored.len());
-    let mut sources = Vec::with_capacity(orders.capacity());
     for input in &delivered {
         orders.push(input.order.clone());
-        sources.push(RecordSource::InboundEvent { from: input.from });
     }
-    for (seq, order) in authored.into_iter().enumerate() {
-        orders.push(order);
-        sources.push(RecordSource::OwnPlayer {
+    orders.extend(authored);
+    ComposedInputs { orders, delivered }
+}
+
+/// The source a witness record carries for one input the tick sealed.
+///
+/// The host knows only whether an input was handed to it, handed to it as
+/// something another authority already delivered, or produced by its own
+/// adapter; this driver's log speaks `RecordSource`. `authored_seq` counts
+/// only the player-authored inputs of this tick, which is what the composed
+/// vector's own numbering counted before the seam carried provenance.
+fn record_source(origin: InputOrigin, tick: u64, authored_seq: u32) -> RecordSource {
+    match origin {
+        InputOrigin::Inbound { from } => RecordSource::InboundEvent { from },
+        // A delivery this host's own adapter kept would name the entity whose
+        // event produced it. `CampaignTick` takes every delivery, so this
+        // client never sees one; classifying it the same way as a wire
+        // arrival keeps the match total rather than silently defaulting.
+        InputOrigin::Delivered { source } => RecordSource::InboundEvent { from: source },
+        InputOrigin::Submitted => RecordSource::OwnPlayer {
             // Five authored inputs are reachable when the four-order pilot row
             // also nominates a collision. Eight leaves each tick a disjoint,
             // power-of-two source-id range.
-            input_seq: (tick as u32).wrapping_mul(8).wrapping_add(seq as u32),
-        });
+            input_seq: (tick as u32).wrapping_mul(8).wrapping_add(authored_seq),
+        },
     }
-    ComposedInputs {
-        orders,
-        sources,
-        delivered,
+}
+
+/// One delivery this tick's step produced, addressed and waiting for its wire.
+///
+/// A named record, not a `(PersistId, Order)` pair: `advance` hands each of
+/// these to [`CampaignRuntime::route_delivered_input`], and a swapped pair
+/// would send a real order to the wrong authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedDelivery {
+    /// The authority the ruleset addressed this delivery to.
+    recipient: PersistId,
+    /// The order that authority is being asked to apply.
+    order: Order,
+}
+
+/// What one converged campaign tick produced for the driver around it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SteppedTick {
+    /// Entities the host reports it advanced: D8's predicted set, counted.
+    predicted: usize,
+    /// Events this client's own step raised, in emission order.
+    events: Vec<Outcome>,
+    /// Deliveries the participant took off the host, in emission order.
+    routed: Vec<RoutedDelivery>,
+}
+
+/// This client's participation in one host tick.
+///
+/// The two halves `advance` owns and the host does not: the witness column it
+/// records at S0, and the wire every delivery leaves on. A joined client is
+/// the authority for its own craft alone, so *every* delivery is taken here
+/// and none is queued back into this host — the authority that owns the
+/// recipient decides whether it becomes input there.
+#[derive(Debug, Default)]
+struct CampaignTick {
+    /// The sealed order vector, in the order the tick applies it.
+    orders: Vec<Order>,
+    /// Its provenance, one source per order, in the same total order.
+    sources: Vec<RecordSource>,
+    /// How many player-authored inputs have been classified this tick.
+    authored_seq: u32,
+    /// Deliveries taken for the wire.
+    routed: Vec<RoutedDelivery>,
+}
+
+impl TickParticipant<Regolith> for CampaignTick {
+    fn sealed(&mut self, tick: Tick, inputs: &[SealedInput<'_, Order>]) {
+        for sealed in inputs {
+            let source = record_source(sealed.origin(), tick.0, self.authored_seq);
+            if matches!(sealed.origin(), InputOrigin::Submitted) {
+                self.authored_seq = self.authored_seq.saturating_add(1);
+            }
+            self.orders.push(sealed.input().clone());
+            self.sources.push(source);
+        }
+    }
+
+    fn route(&mut self, _source: PersistId, delivery: Delivery<Order>) -> Option<Delivery<Order>> {
+        self.routed.push(RoutedDelivery {
+            recipient: delivery.recipient(),
+            order: delivery.into_input(),
+        });
+        None
+    }
+}
+
+/// Build the host this client drives, at the tick it will execute first.
+fn new_host(seed: UniverseSeed, first_tick: Tick) -> SimulationHost<Regolith, RegolithAdapter> {
+    SimulationHost::new(
+        SimulationHostConfig::new(seed).starting_at(first_tick),
+        Regolith::honest(),
+        RegolithAdapter,
+    )
+}
+
+/// Step this client's own craft through the host, and record what the tick
+/// sealed, what it read and what it produced.
+///
+/// Extracted from `advance` for the reason [`delta_is_anchored`] was: the
+/// branch around it needs a live `CampaignLink` and a dial thread, and the
+/// convergence this function *is* has to be checkable against the loop it
+/// replaced (`the_converged_campaign_tick_reproduces_the_hand_rolled_loop`).
+///
+/// Three properties are the host's, not this driver's, and are the whole
+/// reason the loop could go:
+///
+/// - **The replicas stay frozen.** [`PredictionSet::just`] names one entity;
+///   everything else keeps its canonical bytes *and* its observation stamp,
+///   which is what `replica_age_ticks` answers with.
+/// - **The witness column is the sealed vector.** It is read back from the
+///   tick that applied it, in applied order, with the provenance each input
+///   arrived under, rather than re-derived beside it.
+/// - **The wire is the only route.** [`CampaignTick::route`] takes every
+///   delivery, so nothing this step emits can become this host's own input.
+fn step_own_craft(
+    host: &mut SimulationHost<Regolith, RegolithAdapter>,
+    witness_log: &mut InputLogProducer,
+    entity: PersistId,
+    composed: &ComposedInputs,
+) -> SteppedTick {
+    let tick = host.next_tick();
+    // D46 clause (d) is submission order and nothing else: what another
+    // authority delivered is queued before the orders the player authored,
+    // and the host seals a recipient's queue in the order it was queued.
+    for delivered in &composed.delivered {
+        host.submit_delivered_input(entity, delivered.from, delivered.order.clone());
+    }
+    for order in &composed.orders[composed.delivered.len()..] {
+        host.submit_input(entity, order.clone());
+    }
+
+    let mut participant = CampaignTick::default();
+    let report = host.step_predicted(
+        TickCount::new(1),
+        &PredictionSet::just(entity),
+        &mut participant,
+    );
+
+    witness_log.log_inputs_with_sources(tick.0, &participant.orders, &participant.sources);
+    for stepped in &report.neighbor_frames {
+        // The tick the reader was advanced on, from the report, so a record
+        // set can never be filed under a tick that did not produce it.
+        witness_log.log_neighbor_frames(stepped.tick.0, &stepped.frames);
+    }
+    for hashed in &report.state_hashes {
+        witness_log.log_tick_hash(hashed.hash);
+    }
+
+    let events = host
+        .events()
+        .iter()
+        .map(|emitted| emitted.event().clone())
+        .collect();
+    // This driver is the only consumer of the host's event buffer and takes a
+    // tick's worth per tick: nothing may survive into the next tick's skin.
+    host.clear_events();
+
+    SteppedTick {
+        predicted: report.state_hashes.len(),
+        events,
+        routed: participant.routed,
     }
 }
 
@@ -2859,6 +3074,7 @@ fn platform_triple() -> String {
 
 #[cfg(test)]
 mod tests {
+    use orrery_games::Game;
     /// #947 defect 2: the accumulator was asked the wrong question.
     ///
     /// `observe_tick` was fed `authored.orders.len()`, and
@@ -3225,11 +3441,8 @@ mod tests {
                 class: LockClass::Ship,
             },
         }];
-        let composed = compose_delivered_first(
-            &mut delivered,
-            vec![Order::Lock { target }, Order::Fire],
-            11,
-        );
+        let composed =
+            compose_delivered_first(&mut delivered, vec![Order::Lock { target }, Order::Fire]);
         assert_eq!(
             composed.orders,
             [
@@ -3242,15 +3455,372 @@ mod tests {
             ],
             "D46 fixes prior-tick deliveries before this tick's authored orders"
         );
-        assert!(matches!(
-            composed.sources.as_slice(),
-            [
-                RecordSource::InboundEvent { from: source },
-                RecordSource::OwnPlayer { .. },
-                RecordSource::OwnPlayer { .. },
-            ] if *source == from
-        ));
         assert!(delivered.is_empty(), "each delivery is consumed once");
+    }
+
+    /// How the ingest leg stamps a replica it installs.
+    ///
+    /// The two cases are not a preference: `advance`'s keyframe and delta arms
+    /// both call the unstamped install (`self.host.install_state(entity,
+    /// state)`, the exact shape `Executor::insert` had), so a shipped replica
+    /// is observed at tick zero and every read of it is past Regolith's
+    /// 60-tick staleness bound. The stamped case is the same run with the
+    /// refresh tick carried, and it is here to show what the seam does with a
+    /// stamp when there is one: carries it, unchanged, into the record the
+    /// witness log folds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ReplicaStamp {
+        /// Installed verbatim with no observation tick, as this client ships.
+        AsShipped,
+        /// Installed carrying the tick the authority observed it at.
+        AtRefresh,
+    }
+
+    /// A18 S6.b's own detector: the loop `advance` deleted, kept only here,
+    /// run beside the seam that replaced it.
+    ///
+    /// The convergence criterion for this stage is behavioural identity — the
+    /// point is deleting a duplicated loop, not changing what it does — and
+    /// this driver is the one that could not converge naively: it holds
+    /// replicas of remote craft, feeds a witness log the P4 gate verifies, and
+    /// routes every delivery over a wire. So the deleted loop is reproduced
+    /// verbatim below over its own [`Executor`], and [`step_own_craft`] runs
+    /// beside it from the same seed, the same pipeline, the same injected
+    /// deliveries and the same replica refreshes. Every tick both columns must
+    /// agree on:
+    ///
+    /// - the canonical bytes of **both** craft — the predicted one, and the
+    ///   replica, which must still equal the bytes the ingest leg installed;
+    /// - the predicted set's size;
+    /// - the emitted event vector *and its order*;
+    /// - the deliveries handed to the wire, in order;
+    /// - the witness column, compared as the signed frames it cuts, which
+    ///   folds the input records with their sources, the neighbour records
+    ///   with their observation stamps and read bytes, and the tick hashes.
+    ///
+    /// A control host stepping the whole population proves the freeze is not
+    /// vacuous: the same replica, given the same ticks, does move.
+    fn campaign_convergence_run(stamp: ReplicaStamp) {
+        const FIRST_TICK: u64 = 4_000;
+        const TICKS: u64 = 400;
+        /// The ingest leg refreshes the replica on this cadence.
+        const REFRESH_EVERY: u64 = 30;
+        /// A remote authority delivers on this one.
+        const DELIVER_EVERY: u64 = 17;
+
+        let game = Regolith::honest();
+        let seed = UniverseSeed([0x5b; 32]);
+        let own = PersistId::new(1);
+        let remote = PersistId::new(2);
+        let secret = iroh_base::SecretKey::from_bytes(&[0x5b; 32]);
+
+        // A replica placed inside this craft's collision radius and closing on
+        // it, with a velocity of its own.
+        //
+        // Both halves are load-bearing. Regolith reads a neighbour only to
+        // verify a claim its own input named (`visibility::verify_claims`), so
+        // without a live collision candidate this run would step, emit and
+        // deliver while reading nothing, and the neighbour-frame column — the
+        // half of this conversion that was hardest to keep — would be empty on
+        // every tick and prove nothing. The velocity is what makes the freeze
+        // assertion mean something: a body at rest stays put whether the seam
+        // steps it or not.
+        let own_spawn = game.spawn(own, 0);
+        let RegolithState::Craft(own_craft) = &own_spawn else {
+            panic!("a spawned craft is a craft");
+        };
+        let replica = {
+            let RegolithState::Craft(mut craft) = game.spawn(remote, 2) else {
+                panic!("a spawned craft is a craft");
+            };
+            craft.pos = orrery_core::QPos {
+                x: own_craft.pos.x + 1_000,
+                y: own_craft.pos.y,
+                z: own_craft.pos.z,
+            };
+            craft.vel = orrery_core::QVel {
+                x: -12_000,
+                y: -4_000,
+                z: 2_500,
+            };
+            RegolithState::Craft(craft)
+        };
+        let installed_replica = replica.to_canonical();
+
+        let producer = || {
+            InputLogProducer::new(
+                secret.clone(),
+                own,
+                REGOLITH_RULESET,
+                FIRST_TICK,
+                CLAIM_EVERY_TICKS,
+                WITNESS_FRAME_TICKS,
+            )
+        };
+
+        // ── The column S6.b deleted, kept verbatim ────────────────────────
+        let mut executor = Executor::new(game, seed);
+        executor.insert(own, game.spawn(own, 0));
+        executor.insert(remote, replica.clone());
+        let mut reference_log = producer();
+        let mut reference_pending: Vec<DeliveredOrder> = Vec::new();
+        let reference_pipeline = IntentPipeline::new(seed, own, 0, vec![remote]);
+
+        // ── The converged column ──────────────────────────────────────────
+        let mut host = new_host(seed, Tick::new(FIRST_TICK));
+        host.install_state(own, game.spawn(own, 0));
+        host.install_state(remote, replica.clone());
+        let mut converged_log = producer();
+        let mut converged_pending: Vec<DeliveredOrder> = Vec::new();
+        let pipeline = IntentPipeline::new(seed, own, 0, vec![remote]);
+
+        // ── The control: the same population, stepped whole ───────────────
+        let mut whole_population = new_host(seed, Tick::new(FIRST_TICK));
+        whole_population.install_state(own, game.spawn(own, 0));
+        whole_population.install_state(remote, replica.clone());
+
+        let controls = Controls {
+            right: true,
+            thrust: true,
+            fire: true,
+            ..Controls::default()
+        };
+        let mut steps = 0_usize;
+        let mut events_seen = 0_usize;
+        let mut wired = 0_usize;
+        let mut frames_cut = 0_usize;
+        let mut sealed_deliveries = 0_usize;
+        let mut fresh_reads = 0_usize;
+        let mut stale_reads = 0_usize;
+
+        for offset in 0..TICKS {
+            let tick = Tick::new(FIRST_TICK + offset);
+
+            // `advance`'s ingest leg: a decoded claim installed verbatim.
+            // Installing is the only way a replica's bytes ever change.
+            if offset.is_multiple_of(REFRESH_EVERY) {
+                match stamp {
+                    ReplicaStamp::AsShipped => {
+                        executor.insert(remote, replica.clone());
+                        host.install_state(remote, replica.clone());
+                    }
+                    ReplicaStamp::AtRefresh => {
+                        executor.insert_observed(remote, replica.clone(), tick);
+                        host.install_state_observed(remote, replica.clone(), tick);
+                    }
+                }
+            }
+            // A remote authority's delivery, as `accept_own_delivery` leaves
+            // it: in this client's pending vector, addressed to its craft.
+            if offset.is_multiple_of(DELIVER_EVERY) {
+                let arrived = DeliveredOrder {
+                    from: remote,
+                    recipient: own,
+                    order: Order::LockConfirmed {
+                        target: remote,
+                        class: LockClass::Ship,
+                    },
+                };
+                reference_pending.push(arrived.clone());
+                converged_pending.push(arrived);
+            }
+
+            // ── Reference: the hand-rolled loop, verbatim ─────────────────
+            let mut authored = decode_packet(&reference_pipeline.human_packet(tick, controls))
+                .expect("the local codec produced valid orders");
+            if let Some(other) = collision_candidate(
+                own,
+                executor.state(own).expect("own craft installed"),
+                executor
+                    .entities()
+                    .filter(|candidate| **candidate != own)
+                    .filter_map(|candidate| executor.state(*candidate).map(|s| (*candidate, s))),
+            ) {
+                authored.push(Order::Collide { other });
+            }
+            let reference_delivered = core::mem::take(&mut reference_pending);
+            let mut reference_orders =
+                Vec::with_capacity(reference_delivered.len() + authored.len());
+            let mut reference_sources = Vec::with_capacity(reference_orders.capacity());
+            for input in &reference_delivered {
+                reference_orders.push(input.order.clone());
+                reference_sources.push(RecordSource::InboundEvent { from: input.from });
+            }
+            for (seq, order) in authored.into_iter().enumerate() {
+                reference_orders.push(order);
+                reference_sources.push(RecordSource::OwnPlayer {
+                    input_seq: (tick.0 as u32).wrapping_mul(8).wrapping_add(seq as u32),
+                });
+            }
+            sealed_deliveries = sealed_deliveries.saturating_add(reference_delivered.len());
+            reference_log.log_inputs_with_sources(tick.0, &reference_orders, &reference_sources);
+            let mut reference_predicted = 0_usize;
+            let mut reference_events = Vec::<Outcome>::new();
+            let mut reference_wire = Vec::<RoutedDelivery>::new();
+            let mut reference_frames = Vec::new();
+            if let Some(outcome) = executor.step_entity(own, tick, &reference_orders) {
+                reference_predicted += 1;
+                reference_log.log_neighbor_frames(tick.0, &outcome.neighbor_frames);
+                reference_log.log_tick_hash(outcome.state_hash);
+                reference_events.extend(outcome.events.iter().cloned());
+                let deliveries: Vec<_> = outcome
+                    .events
+                    .iter()
+                    .filter_map(|event| executor.ruleset().deliver(event))
+                    .collect();
+                for (recipient, order) in deliveries {
+                    reference_wire.push(RoutedDelivery { recipient, order });
+                }
+                reference_frames.clone_from(&outcome.neighbor_frames);
+            }
+
+            // ── Converged: one call ──────────────────────────────────────
+            let mut converged_authored = decode_packet(&pipeline.human_packet(tick, controls))
+                .expect("the local codec produced valid orders");
+            if let Some(other) = collision_candidate(
+                own,
+                host.backend().state(own).expect("own craft installed"),
+                host.backend()
+                    .entities()
+                    .filter(|candidate| **candidate != own)
+                    .filter_map(|candidate| {
+                        host.backend().state(*candidate).map(|s| (*candidate, s))
+                    }),
+            ) {
+                converged_authored.push(Order::Collide { other });
+            }
+            let composed = compose_delivered_first(&mut converged_pending, converged_authored);
+            assert_eq!(
+                host.next_tick(),
+                tick,
+                "the host's clock is the clock the driver used to keep"
+            );
+            let stepped = step_own_craft(&mut host, &mut converged_log, own, &composed);
+            whole_population.step(TickCount::new(1));
+
+            // ── The comparison, every tick ───────────────────────────────
+            assert_eq!(
+                stepped.predicted, reference_predicted,
+                "the predicted set at {tick:?} must be the set the loop stepped"
+            );
+            assert_eq!(
+                stepped.events, reference_events,
+                "emitted events must match in value and order at {tick:?}"
+            );
+            assert_eq!(
+                stepped.routed, reference_wire,
+                "the deliveries handed to the wire must match in value and order at {tick:?}"
+            );
+            for entity in [own, remote] {
+                assert_eq!(
+                    host.state_bytes(entity),
+                    executor.state(entity).map(CoreCodec::to_canonical),
+                    "canonical state for {entity:?} diverged at {tick:?}"
+                );
+            }
+            assert_eq!(
+                host.state_bytes(remote),
+                Some(installed_replica.clone()),
+                "the replica outside the prediction set is frozen at {tick:?}: byte-identical \
+                 to what the ingest leg installed"
+            );
+            assert_eq!(
+                reference_log.cut_claim(tick.0, &replica),
+                converged_log.cut_claim(tick.0, &replica),
+                "the claim chain must agree at {tick:?}"
+            );
+            let reference_frame = reference_log.cut_frame(tick.0);
+            let converged_frame = converged_log.cut_frame(tick.0);
+            assert_eq!(
+                reference_frame.is_some(),
+                converged_frame.is_some(),
+                "both columns must cut a frame on the same tick, at {tick:?}"
+            );
+            if let (Some(reference), Some(converged)) = (&reference_frame, &converged_frame) {
+                // The signed frame is the whole witness column for this
+                // window: its input records with their sources, its neighbour
+                // records with their observation stamps and read bytes, and
+                // the signature over the folded chain. Comparing its bytes
+                // compares all of that at once.
+                assert_eq!(
+                    serde_json::to_vec(&reference.frame).expect("a frame serializes"),
+                    serde_json::to_vec(&converged.frame).expect("a frame serializes"),
+                    "the witness column must fold to the same signed frame at {tick:?}"
+                );
+                assert_eq!(reference.transitions, converged.transitions);
+                assert_eq!(reference.tick_hashes, converged.tick_hashes);
+            }
+            frames_cut = frames_cut.saturating_add(usize::from(reference_frame.is_some()));
+
+            for frame in &reference_frames {
+                if frame.neighbor != remote {
+                    continue;
+                }
+                match stamp {
+                    ReplicaStamp::AsShipped => {
+                        assert_eq!(
+                            frame.observed_tick, tick,
+                            "an unstamped replica is past the staleness bound, so its record \
+                             names the reading tick"
+                        );
+                        assert_eq!(frame.state, None);
+                        stale_reads = stale_reads.saturating_add(1);
+                    }
+                    ReplicaStamp::AtRefresh => {
+                        let refresh = Tick::new(FIRST_TICK + offset - offset % REFRESH_EVERY);
+                        assert_eq!(
+                            frame.observed_tick, refresh,
+                            "the record carries the tick the reader actually held the replica \
+                             at — the refresh stamp, not the reading tick"
+                        );
+                        assert_eq!(frame.state, Some(installed_replica.clone()));
+                        fresh_reads = fresh_reads.saturating_add(1);
+                    }
+                }
+            }
+
+            steps = steps.saturating_add(stepped.predicted);
+            events_seen = events_seen.saturating_add(stepped.events.len());
+            wired = wired.saturating_add(stepped.routed.len());
+        }
+
+        // ── Non-vacuity: this run really did all of it ────────────────────
+        assert_eq!(
+            steps, TICKS as usize,
+            "every tick must have stepped this client's craft"
+        );
+        assert!(
+            events_seen > 0,
+            "{TICKS} ticks of full stick produced no events at all; the fixture, not the \
+             seam, is what this run tested"
+        );
+        assert!(wired > 0, "no delivery ever reached the wire");
+        assert!(frames_cut > 0, "the witness log cut no frame to compare");
+        assert!(sealed_deliveries > 0, "no delivered input was ever sealed");
+        match stamp {
+            ReplicaStamp::AsShipped => assert!(stale_reads > 0, "the replica was never read"),
+            ReplicaStamp::AtRefresh => assert!(fresh_reads > 0, "the replica was never read"),
+        }
+        assert_ne!(
+            whole_population.state_bytes(remote),
+            Some(installed_replica),
+            "non-vacuity: the whole-population step does advance that same replica by its own \
+             velocity, which is exactly the behaviour change converging `advance` would \
+             otherwise have made"
+        );
+    }
+
+    /// The client as it ships: an unstamped replica, frozen between refreshes.
+    #[test]
+    fn the_converged_campaign_tick_reproduces_the_hand_rolled_loop() {
+        campaign_convergence_run(ReplicaStamp::AsShipped);
+    }
+
+    /// The same detector with the replica carrying the tick its authority
+    /// observed it at, so each neighbour record is a real read.
+    #[test]
+    fn a_refreshed_replicas_stamp_survives_the_seam_into_the_witness_column() {
+        campaign_convergence_run(ReplicaStamp::AtRefresh);
     }
 
     #[test]
@@ -3617,12 +4187,12 @@ mod tests {
         // there is no live replica left to be stale.
         let game = Regolith::honest();
         let own = PersistId::new(9);
-        let mut executor = Executor::new(game, UniverseSeed([0x61; 32]));
-        executor.insert(own, game.spawn(own, 8));
-        executor.insert(remote, game.spawn(remote, 2));
+        let mut host = new_host(UniverseSeed([0x61; 32]), Tick::new(0));
+        host.install_state(own, game.spawn(own, 8));
+        host.install_state(remote, game.spawn(remote, 2));
         let mut focus = Some(remote);
         expire_stale_replicas(
-            &mut executor,
+            &mut host,
             own,
             install_tick + REPLICA_TTL_TICKS + 1,
             &mut freshness,
@@ -3640,9 +4210,9 @@ mod tests {
         let game = Regolith::honest();
         let own = PersistId::new(9);
         let remote = PersistId::new(3);
-        let mut executor = Executor::new(game, UniverseSeed([0x61; 32]));
-        executor.insert(own, game.spawn(own, 8));
-        executor.insert(remote, game.spawn(remote, 2));
+        let mut host = new_host(UniverseSeed([0x61; 32]), Tick::new(0));
+        host.install_state(own, game.spawn(own, 8));
+        host.install_state(remote, game.spawn(remote, 2));
         let mut freshness = BTreeMap::from([(
             remote,
             ReplicaFreshness {
@@ -3655,30 +4225,33 @@ mod tests {
         let mut focus = Some(remote);
 
         expire_stale_replicas(
-            &mut executor,
+            &mut host,
             own,
             10 + REPLICA_TTL_TICKS,
             &mut freshness,
             &mut focus,
         );
         assert!(
-            executor.state(remote).is_some(),
+            host.backend().state(remote).is_some(),
             "the legal one-hertz proxy grace remains drawable"
         );
 
         expire_stale_replicas(
-            &mut executor,
+            &mut host,
             own,
             11 + REPLICA_TTL_TICKS,
             &mut freshness,
             &mut focus,
         );
         assert!(
-            executor.state(remote).is_none(),
+            host.backend().state(remote).is_none(),
             "an out-of-interest replica must not freeze at its last position"
         );
         assert_eq!(focus, None, "the duel view must release the stale craft");
-        assert!(executor.state(own).is_some(), "own authority never expires");
+        assert!(
+            host.backend().state(own).is_some(),
+            "own authority never expires"
+        );
     }
 
     #[test]
@@ -3686,17 +4259,17 @@ mod tests {
         let game = Regolith::honest();
         let own = PersistId::new(9);
         let remote = PersistId::new(3);
-        let mut executor = Executor::new(game, UniverseSeed([0x62; 32]));
-        executor.insert(own, game.spawn(own, 8));
-        executor.insert(remote, game.spawn(remote, 2));
+        let mut host = new_host(UniverseSeed([0x62; 32]), Tick::new(0));
+        host.install_state(own, game.spawn(own, 8));
+        host.install_state(remote, game.spawn(remote, 2));
         let mut freshness = BTreeMap::new();
         let mut focus = Some(remote);
         let _ = refresh_replica(&mut freshness, remote, 2, 10, 10);
 
         for tick in [70, 130, 190] {
-            expire_stale_replicas(&mut executor, own, tick, &mut freshness, &mut focus);
+            expire_stale_replicas(&mut host, own, tick, &mut freshness, &mut focus);
             assert!(
-                executor.state(remote).is_some(),
+                host.backend().state(remote).is_some(),
                 "a replica refreshed at the ruleset's one-second allowance stays drawable"
             );
             let _ = refresh_replica(&mut freshness, remote, 2, tick, tick);
@@ -3708,9 +4281,9 @@ mod tests {
         let game = Regolith::honest();
         let own = PersistId::new(9);
         let materialised = PersistId::new(0xC524_1234_5678_9ABC);
-        let mut executor = Executor::new(game, UniverseSeed([0x63; 32]));
-        executor.insert(own, game.spawn(own, 8));
-        executor.insert(materialised, game.spawn(materialised, 2));
+        let mut host = new_host(UniverseSeed([0x63; 32]), Tick::new(0));
+        host.install_state(own, game.spawn(own, 8));
+        host.install_state(materialised, game.spawn(materialised, 2));
         let mut freshness = BTreeMap::new();
         let mut focus = Some(materialised);
 
@@ -3718,7 +4291,7 @@ mod tests {
         assert_eq!(replica_authority_slot(&freshness, materialised), Some(4));
 
         expire_stale_replicas(
-            &mut executor,
+            &mut host,
             own,
             11 + REPLICA_TTL_TICKS,
             &mut freshness,
