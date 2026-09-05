@@ -1,6 +1,10 @@
 // Spike #1044 — CookBody commandlet.
 //
-//   UnrealEditor-Cmd OneBodyCook.uproject -run=CookBody -seed=<u64> -body=<id> -out=<dir> [-size=256] [-spacing=1] [-density=0.03]
+//   UnrealEditor-Cmd OneBodyCook.uproject -run=CookBody -seed=<u64> -body=<id> -out=<dir> [-size=256] [-spacing=1] [-density=0.03] [-randomguids]
+//
+// The saved package is canonical by default (#1082): every GUID, hash and random seed Unreal would draw at
+// spawn, build or save time is rewritten from (seed, body) or the mesh content before the save, so two
+// saves of one seed cook to byte-identical .umap/.uexp. -randomguids restores the engine's behaviour.
 //
 // Path mirrored: UWorldPartitionMeshPartitionBuilder::Run (WorldPartitionMeshPartitionBuilder.cpp) —
 // modifiers -> FMeshData (ModifiersProcessed) -> PrepareCompiledSections -> MakeTransformerUnit ->
@@ -17,7 +21,12 @@
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "Components/BoxComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "StaticMeshComponentLODInfo.h"
+#include "WorldPartition/ActorInstanceGuids.h"
+#include "HAL/IConsoleManager.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Hash/CityHash.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "StaticMeshResources.h"
 #include "StaticMeshCompiler.h"
@@ -156,9 +165,11 @@ int32 UCookBodyCommandlet::Main(const FString& Params)
 	uint32 VoxEdgeMm = 500;
 	if (const FString* S = ParamVals.Find(TEXT("voxedge"))) { VoxEdgeMm = FCString::Atoi(**S); }
 	const bool bNoNanite = Switches.Contains(TEXT("nonanite"));
-	// -deterministicguids: derive every GUID the package carries (section BuildKey, actor GUIDs) from the
-	// seed instead of FGuid::NewGuid(), to find out whether the Unreal half can be byte-deterministic.
-	const bool bDeterministicGuids = Switches.Contains(TEXT("deterministicguids"));
+	// Canonical GUIDs (#1082, default on): every GUID, hash and random seed the saved package carries that
+	// Unreal would otherwise draw from FGuid::NewGuid() / FMath::Rand() is derived from (seed, body) or from
+	// the mesh content instead, so two editor saves of one seed cook to byte-identical packages. -randomguids
+	// restores the engine's behaviour (spike 2's -deterministicguids is accepted as a synonym for the default).
+	const bool bCanonicalGuids = !Switches.Contains(TEXT("randomguids"));
 	const bool bSimplifyCollision = Switches.Contains(TEXT("simplifycollision"));
 
 	IFileManager::Get().MakeDirectory(*OutDir, true);
@@ -327,7 +338,7 @@ int32 UCookBodyCommandlet::Main(const FString& Params)
 	FSeedStream GuidRng(Seed ^ 0x6f6e65626f6479ull ^ ((uint64)BodyId << 40));
 	auto SeededGuid = [&GuidRng]() { const uint64 A = GuidRng.Next(), B = GuidRng.Next(); return FGuid((uint32)(A >> 32), (uint32)A, (uint32)(B >> 32), (uint32)B); };
 	FCompiledSectionBuildInfo BuildInfo;
-	BuildInfo.BuildKey = bDeterministicGuids ? SeededGuid() : FGuid::NewGuid();
+	BuildInfo.BuildKey = bCanonicalGuids ? SeededGuid() : FGuid::NewGuid();
 	BuildInfo.BuildVariantName = Variant.Name;
 	BuildInfo.MegaMeshDefinitionPath = FTopLevelAssetPath(Definition);
 	BuildInfo.SetMegaMeshDefinition(Definition);
@@ -624,27 +635,142 @@ int32 UCookBodyCommandlet::Main(const FString& Params)
 	for (AActor* A : NoiseActors) { World->DestroyActor(A); }
 	World->DestroyActor(BaseActor);
 	World->SetFlags(RF_Public | RF_Standalone);
-	if (bDeterministicGuids)
+	TSharedRef<FJsonObject> CanonicalLog = MakeShared<FJsonObject>();
+	const double TCanon0 = FPlatformTime::Seconds();
+	if (bCanonicalGuids)
 	{
-		// Actors get FGuid::NewGuid() at spawn (AActor::ActorGuid); rewrite them from the seed in a stable order.
+		// Every spot below was measured (spike 4, #1046: 24 runs in the cooked .uexp, one in the .umap) and
+		// traced to an engine call that draws fresh randomness at spawn, build or save time. The order of the
+		// rewrite is by object path so that the seed stream hands the same value to the same object every run.
+		//
+		// A GUID that the engine uses as a DDC change indicator (UBodySetup::BodySetupGuid, BodySetup.cpp:822
+		// "We use the BodySetupGuid as a change indicator for DDC") is derived from the mesh content, not from
+		// the seed alone: two saves of one seed share it, and a code change that moves a vertex changes it.
+		const FGuid ContentKey = FGuid::NewDeterministicGuid(FString::Printf(TEXT("orrery/body/%llu/%u/%016llx/simplified=%d"), (unsigned long long)Seed, BodyId, (unsigned long long)IntermediateHash, bSimplifyCollision ? 1 : 0), Seed ^ ((uint64)BodyId << 32));
+		auto ContentGuid = [&ContentKey](const TCHAR* Kind, int32 Index) { return FGuid::Combine(ContentKey, FGuid::NewDeterministicGuid(FString::Printf(TEXT("%s/%d"), Kind, Index))); };
+
+		// 1. Actors: AActor::ActorGuid is FGuid::NewGuid() at spawn; ActorInstanceGuid feeds every static mesh
+		//    component's MapBuildDataId (StaticMeshComponent.cpp:3619-3627, FGuid::Combine with the actor's guid).
 		TArray<AActor*> Actors;
 		for (TActorIterator<AActor> It(World); It; ++It) { Actors.Add(*It); }
 		Actors.Sort([](const AActor& A, const AActor& B) { return A.GetPathName() < B.GetPathName(); });
-		int32 Rewritten = 0;
+		int32 ActorsRewritten = 0;
 		for (AActor* A : Actors)
 		{
 			if (FProperty* P = AActor::StaticClass()->FindPropertyByName(TEXT("ActorGuid")))
 			{
 				*P->ContainerPtrToValuePtr<FGuid>(A) = SeededGuid();
-				++Rewritten;
+				++ActorsRewritten;
 			}
 			if (FProperty* P = AActor::StaticClass()->FindPropertyByName(TEXT("ActorInstanceGuid")))
 			{
 				*P->ContainerPtrToValuePtr<FGuid>(A) = SeededGuid();
 			}
 		}
-		UE_LOG(LogCookBody, Display, TEXT("deterministic guids: rewrote %d actor guids from the seed"), Rewritten);
+
+		// 2. Static mesh components (the section's mesh and PCG's four ISMs): FStaticMeshComponentLODInfo's
+		//    OriginalMapBuildDataId is FGuid::NewGuid() the first time the component is saved
+		//    (UStaticMeshComponent::PreSave -> UpdateStaticLightingData -> CreateMapBuildDataId,
+		//    StaticMeshComponent.cpp:526-547 and :3664), and the cook writes both it and the derived
+		//    MapBuildDataId per LOD (operator<< for FStaticMeshComponentLODInfo, :3827 ff.). Doing PreSave's
+		//    creation step here first, then overwriting, leaves PreSave nothing to invent.
+		//    An ISM also carries InstancingRandomSeed, which PreSave replaces with FMath::Rand() whenever it is
+		//    0 or equal to the path-derived seed (InstancedStaticMesh.cpp:5846-5875); a seeded value that is
+		//    neither survives the save as is.
+		TArray<UStaticMeshComponent*> MeshComponents;
+		for (AActor* A : Actors)
+		{
+			TArray<UStaticMeshComponent*> Owned;
+			A->GetComponents<UStaticMeshComponent>(Owned);
+			MeshComponents.Append(Owned);
+		}
+		MeshComponents.Sort([](const UStaticMeshComponent& A, const UStaticMeshComponent& B) { return A.GetPathName() < B.GetPathName(); });
+		int32 LodGuidsRewritten = 0, IsmSeedsRewritten = 0;
+		static const auto AllowStaticLightingVar = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.AllowStaticLighting"));
+		const bool bAllowStaticLighting = (!AllowStaticLightingVar || AllowStaticLightingVar->GetValueOnGameThread() != 0);
+		for (UStaticMeshComponent* Smc : MeshComponents)
+		{
+			// UpdateStaticLightingData() and UpdateMapBuildDataId() are not exported from Engine, so the two are
+			// replayed here with the exported pieces (StaticMeshComponent.cpp:3593-3629).
+			if (bAllowStaticLighting && Smc->HasStaticLighting() && Smc->GetStaticMesh() && Smc->LODData.Num() != Smc->GetStaticMesh()->GetNumLODs())
+			{
+				Smc->SetLODDataCount(Smc->GetStaticMesh()->GetNumLODs(), Smc->LODData.Num());
+			}
+			const FGuid OwnerInstanceGuid = Smc->GetOwner() ? FActorInstanceGuid::GetActorInstanceGuid(*Smc->GetOwner()) : FGuid();
+			for (FStaticMeshComponentLODInfo& Lod : Smc->LODData)
+			{
+				Lod.OriginalMapBuildDataId = SeededGuid();
+				Lod.MapBuildDataId = FGuid::Combine(Lod.OriginalMapBuildDataId, OwnerInstanceGuid);
+				++LodGuidsRewritten;
+			}
+			if (UInstancedStaticMeshComponent* Ism = Cast<UInstancedStaticMeshComponent>(Smc))
+			{
+				TStringBuilder<256> PathBuilder;
+				Ism->GetPathName(nullptr, PathBuilder);
+				int32 PathSeed = (int32)CityHash32((const char*)PathBuilder.GetData(), PathBuilder.Len() * sizeof(decltype(PathBuilder)::ElementType));
+				if (PathSeed == 0) { PathSeed = 42; }
+				int32 InstancingSeed = 0;
+				while (InstancingSeed == 0 || InstancingSeed == PathSeed) { InstancingSeed = (int32)(GuidRng.Next() & 0x7fffffff); }
+				Ism->InstancingRandomSeed = InstancingSeed;
+				++IsmSeedsRewritten;
+			}
+		}
+
+		// 3. The section's static meshes: UStaticMesh::LightingGuid (SetLightingGuid() defaults to
+		//    FGuid::NewGuid(), StaticMesh.h:1486) and the mesh's UBodySetup::BodySetupGuid, renewed by
+		//    InvalidatePhysicsData() on every build (BodySetup.cpp:822).
+		int32 MeshesRewritten = 0, BodySetupsRewritten = 0;
+		{
+			TArray<UStaticMesh*> SectionMeshes = Section->GetStaticMeshes();
+			SectionMeshes.Sort([](const UStaticMesh& A, const UStaticMesh& B) { return A.GetPathName() < B.GetPathName(); });
+			for (UStaticMesh* SM : SectionMeshes)
+			{
+				if (!SM) { continue; }
+				SM->SetLightingGuid(SeededGuid());
+				++MeshesRewritten;
+				if (UBodySetup* BS = SM->GetBodySetup())
+				{
+					BS->BodySetupGuid = ContentGuid(TEXT("staticmesh-bodysetup"), MeshesRewritten - 1);
+					++BodySetupsRewritten;
+				}
+			}
+		}
+
+		// 4. The section's collision component: its body setup is NewObject + FGuid::NewGuid()
+		//    (MeshPartitionCollisionComponent.cpp:229, CreateBodySetupHelper).
+		{
+			TArray<UMeshPartitionCollisionComponent*> CollisionComponents;
+			Section->GetComponents<UMeshPartitionCollisionComponent>(CollisionComponents);
+			CollisionComponents.Sort([](const UMeshPartitionCollisionComponent& A, const UMeshPartitionCollisionComponent& B) { return A.GetPathName() < B.GetPathName(); });
+			int32 Idx = 0;
+			for (UMeshPartitionCollisionComponent* Col : CollisionComponents)
+			{
+				if (UBodySetup* BS = Col->GetBodySetup())
+				{
+					BS->BodySetupGuid = ContentGuid(TEXT("collision-bodysetup"), Idx);
+					++BodySetupsRewritten;
+				}
+				++Idx;
+			}
+		}
+
+		// 5. The level: ULevel::LevelBuildDataId is FGuid::NewGuid() in the constructor (Level.cpp:666).
+		World->PersistentLevel->LevelBuildDataId = SeededGuid();
+
+		// The package summary's saved hash (.umap offset 24-43 in spike 4's diff) is a hash of the saved
+		// bytes; once everything above is a function of (seed, body, content) it follows.
+		UE_LOG(LogCookBody, Display, TEXT("canonical guids: %d actors, %d LOD map-build ids on %d static mesh components, %d ISM instancing seeds, %d static meshes, %d body setups, 1 level build-data id rewritten from the seed / content"), ActorsRewritten, LodGuidsRewritten, MeshComponents.Num(), IsmSeedsRewritten, MeshesRewritten, BodySetupsRewritten);
+		CanonicalLog->SetNumberField(TEXT("actors"), ActorsRewritten);
+		CanonicalLog->SetNumberField(TEXT("static_mesh_components"), MeshComponents.Num());
+		CanonicalLog->SetNumberField(TEXT("lod_map_build_ids"), LodGuidsRewritten);
+		CanonicalLog->SetNumberField(TEXT("ism_instancing_seeds"), IsmSeedsRewritten);
+		CanonicalLog->SetNumberField(TEXT("static_meshes"), MeshesRewritten);
+		CanonicalLog->SetNumberField(TEXT("body_setups"), BodySetupsRewritten);
+		CanonicalLog->SetStringField(TEXT("content_key"), ContentKey.ToString());
 	}
+	const double TCanon1 = FPlatformTime::Seconds();
+	CanonicalLog->SetBoolField(TEXT("enabled"), bCanonicalGuids);
+	CanonicalLog->SetNumberField(TEXT("seconds"), TCanon1 - TCanon0);
 	const FString MapFilename = FPaths::ConvertRelativePathToFull(FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetMapPackageExtension()));
 	FSavePackageArgs SaveArgs;
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
@@ -666,6 +792,7 @@ int32 UCookBodyCommandlet::Main(const FString& Params)
 	Root->SetNumberField(TEXT("density_per_m2"), Density);
 	Root->SetBoolField(TEXT("nanite"), !bNoNanite);
 	Root->SetBoolField(TEXT("unreal_collision_simplified"), bSimplifyCollision);
+	Root->SetObjectField(TEXT("canonical_guids"), CanonicalLog);
 	Root->SetObjectField(TEXT("noise"), NoiseLog);
 	Root->SetNumberField(TEXT("intermediate_verts"), Intermediate.VertexCount());
 	Root->SetNumberField(TEXT("intermediate_tris"), Intermediate.TriangleCount());
