@@ -1,0 +1,150 @@
+{
+ "nose_rcs_cluster": {
+  "ranked": [
+   "ship-b_Detail_20",
+   "ship-a_Detail_257",
+   "ship-a_Detail_107",
+   "ship-b_Detail_287",
+   "ship-b_Detail_37",
+   "ship-b_Detail_181",
+   "ship-a_Detail_286",
+   "ship-a_Detail_212"
+  ],
+  "reason": "Candidate 5 best matches the blocky, paneled nose RCS cluster with its distinct thruster-like ports.",
+  "model": "gemini-3.5-flash"
+ },
+ "wingtip_rcs_cluster": {
+  "ranked": [
+   "ship-b_Detail_32",
+   "ship-b_Detail_115",
+   "ship-b_Detail_194",
+   "ship-b_Detail_302",
+   "ship-a_Detail_102",
+   "ship-b_Detail_07",
+   "ship-a_Detail_156",
+   "ship-a_Detail_223"
+  ],
+  "reason": "Candidate 7 features dual cylindrical thruster nozzles matching the wingtip RCS clusters perfectly.",
+  "model": "gemini-3.5-flash"
+ },
+ "main_thruster_nozzle": {
+  "ranked": [
+   "ship-b_Detail_117",
+   "ship-b_Detail_116",
+   "ship-b_Detail_119",
+   "ship-b_Detail_264",
+   "ship-b_Detail_56",
+   "mech_module_025",
+   "mech_module_020",
+   "mech_module_022"
+  ],
+  "reason": "Candidate 2 best matches the cylindrical, segmented, and paneled style of the main thruster nozzles.",
+  "model": "gemini-3.5-flash"
+ },
+ "spine_conduits": {
+  "ranked": [
+   "cables_Greeble_Cables_Pack1.008",
+   "cables_Greeble_Cables_Pack1",
+   "cables_Greeble_Cables_Pack1.040",
+   "cables_Greeble_Cables_Pack1.035",
+   "cables_Greeble_Cables_Pack1.036",
+   "cables_Greeble_Cables_Pack1.011",
+   "cables_Greeble_Cables_Pack1.029",
+   "cables_Greeble_Cables_Pack1.025"
+  ],
+  "reason": "Candidate 3 best matches the concept's parallel conduit runs emerging from blocky, utilitarian structural housings.",
+  "model": "gemini-3.5-flash"
+ },
+ "accent_stripe": {
+  "ranked": [
+   "ship-a_Detail_22",
+   "ship-a_Detail_40",
+   "ship-a_Detail_41",
+   "ship-b_Detail_310",
+   "ship-a_Detail_163",
+   "ship-a_Detail_71",
+   "ship-a_Detail_70",
+   "ship-a_Detail_69"
+  ],
+  "reason": "Candidate 6 is a clean, straight panel strip matching the orange accent stripe's shape and utilitarian style.",
+  "model": "gemini-3.5-flash"
+ },
+ "hull_number_decal": {
+  "ranked": [
+   "ship-b_Detail_213",
+   "ship-b_Detail_210",
+   "ship-b_Detail_209",
+   "ship-a_Detail_42",
+   "ship-b_Detail_294",
+   "mech_module_009",
+   "ship-a_Detail_21",
+   "ship-a_Detail_67"
+  ],
+  "reason": "Candidates 3 and 1 offer the best flat, elongated plate surfaces matching the hull stencil area.",
+  "model": "gemini-3.5-flash"
+ },
+ "tail_crest_decal": {
+  "ranked": [
+   "ship-b_Detail_235",
+   "ship-b_Detail_97",
+   "ship-b_Detail_168",
+   "ship-b_Detail_79",
+   "ship-b_Detail_294",
+   "ship-b_Detail_226",
+   "ship-a_Detail_164",
+   "ship-a_Detail_67"
+  ],
+  "reason": "Candidate 4 and 2 offer flat, paneled plates matching the tail crest decal area's utilitarian style.",
+  "model": "gemini-3.5-flash"
+ },
+ "front_landing_skid": {
+  "ranked": [
+   "ship-b_Detail_297",
+   "ship-a_Detail_61",
+   "ship-b_Detail_134",
+   "ship-a_Detail_222",
+   "ship-a_Detail_208",
+   "mech_module_046",
+   "mech_module_056",
+   "mech_module_067"
+  ],
+  "reason": "Candidate 4 best matches the flat, blocky, utilitarian landing skid shape language of the concept.",
+  "model": "gemini-3.5-flash"
+ },
+ "under_wing_pylons": {
+  "ranked": [
+   "ship-b_Detail_54",
+   "ship-a_Detail_290"
+  ],
+  "reason": "Both candidates are identical, perfectly matching the utilitarian, paneled style of the under-wing pylons.",
+  "model": "gemini-3.5-flash"
+ },
+ "ventral_gun_bay": {
+  "ranked": [
+   "ship-a_Detail_96",
+   "mech_module_019",
+   "ship-a_Detail_108",
+   "ship-a_Detail_75",
+   "ship-a_Detail_74",
+   "ship-b_Detail_171",
+   "ship-b_Detail_163",
+   "ship-b_Detail_35"
+  ],
+  "reason": "Candidate 4 matches the elongated, low-profile ventral gun bay shape and utilitarian paneling perfectly.",
+  "model": "gemini-3.5-flash"
+ },
+ "dark_wing_panels": {
+  "ranked": [
+   "ship-b_Detail_228",
+   "ship-b_Detail_231",
+   "ship-a_Detail_41",
+   "ship-b_Detail_98",
+   "ship-b_Detail_300",
+   "ship-a_Detail_23",
+   "ship-b_Detail_175",
+   "ship-b_Detail_253"
+  ],
+  "reason": "Candidates 5, 8, and 1 offer the best flat, angular panel shapes matching the dark wing panels.",
+  "model": "gemini-3.5-flash"
+ }
+}

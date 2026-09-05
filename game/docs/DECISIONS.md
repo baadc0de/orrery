@@ -10,6 +10,8 @@
 |---|---|---|
 | GD1 | [Game ADR-0001](adr/0001-requirements.md) | Settled game design requirements G1–G9 |
 | GD2 | [Game ADR-0002](adr/0002-client-engine.md) | Unreal 5.8 client, in-process Orrery, cooked season content (G10) |
+| GD3 | [Game ADR-0003](adr/0003-spike-outcomes.md) | Host prong, collision representation, playable surface, distribution, CMC, interiors (from spikes #1069–#1072) |
+| GD4 | [Game ADR-0004](adr/0004-content-pipeline.md) | AI-driven content pipeline: stages, provenance, gates, formats, rigs (G12) |
 
 ## Documents
 
