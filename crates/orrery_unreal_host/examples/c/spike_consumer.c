@@ -1,10 +1,17 @@
 /*
- * The C consumer of spike #1043's staticlib: links liborrery_unreal_host.a,
- * creates both handles, drives them from its own fixed-step loop, and
- * measures the predicted-tick latency the way #920's observer measures
- * ipc_added (crates/orrery_ipc_transport/src/bench.rs, observer_game and
- * phase_columns), writing a report in the orrery-ipc-harness/1 schema that
+ * The C consumer of spike #1043's staticlib: links liborrery_unreal_host.a
+ * (orrery_unreal_host.lib on windows-msvc), creates both handles, drives them
+ * from its own fixed-step loop, and measures the predicted-tick latency the
+ * way #920's observer measures ipc_added
+ * (crates/orrery_ipc_transport/src/bench.rs, observer_game and phase_columns),
+ * writing a report in the orrery-ipc-harness/1 schema that
  * scripts/ipc-report.py renders.
+ *
+ * Linux and Windows. The Windows leg is #1084: #920's bands are defined at
+ * N = 24 on Windows, so the in-process number has to be taken there too, and
+ * the nightly `inproc-ipc-windows` job takes it through spike-windows.sh.
+ * Every platform difference is behind `#ifdef _WIN32` below and tabulated in
+ * the crate README.
  *
  * Modes (argv[1]):
  *   bench      the measurement. Options:
@@ -14,6 +21,7 @@
  *                --clock manual|auto        who advances Bevy's clock (see header)
  *                --no-app                   control: the host alone, no App
  *                --idle-seconds S  (3)      length of each idle CPU window
+ *                --time-period              Windows only: timeBeginPeriod(1)
  *                --report PATH              write the JSON report
  *                --note TEXT                appended to the report's notes (repeatable)
  *   smoke      bench at 120 ticks, no warmup, no idle windows; prints one line
@@ -39,20 +47,38 @@
  * column collapses to the apply cost. It is recorded, not assumed.
  */
 
+#ifdef _WIN32
+/* GetThreadDescription is Windows 8+; the hosted runners are Server 2022. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#else
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#endif
 
 #include "orrery_unreal_host.h"
 
-#include <dirent.h>
 #include <inttypes.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+
+#include <tlhelp32.h>
+/* timeBeginPeriod lives in winmm, which rustc's `--print native-static-libs`
+ * does not list: nothing in the Rust half calls it. The link line adds winmm
+ * explicitly (`spike-windows.sh`). */
+#include <timeapi.h>
+#else
+#include <dirent.h>
+#include <pthread.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 
 #define TICK_HZ 60u
 #define HITCH_NS 16700000ull
@@ -60,8 +86,44 @@
 #define MAX_THREAD_NAMES 64
 #define COMM_LEN 32
 
+#ifdef _WIN32
+#define PLATFORM_NAME "windows"
+#define CLOCK_NAME "QueryPerformanceCounter"
+#else
+#define PLATFORM_NAME "linux"
+#define CLOCK_NAME "CLOCK_MONOTONIC"
+#endif
+
 /* ---- clock and pacing, matching orrery_ipc_transport ---------------------- */
 
+/* The two clocks orrery_ipc_transport::monotonic_now_ns reads
+ * (crates/orrery_ipc_transport/src/lib.rs:311-368), read here the same way:
+ * CLOCK_MONOTONIC on Unix, QueryPerformanceCounter on Windows. A failed clock
+ * read stops the measurement rather than silently zeroing a timestamp. */
+#ifdef _WIN32
+static uint64_t now_ns(void) {
+    static LONGLONG frequency = 0;
+    LARGE_INTEGER value;
+    if (frequency == 0) {
+        if (!QueryPerformanceFrequency(&value) || value.QuadPart <= 0) {
+            fprintf(stderr, "QueryPerformanceFrequency failed\n");
+            exit(2);
+        }
+        frequency = value.QuadPart;
+    }
+    if (!QueryPerformanceCounter(&value)) {
+        fprintf(stderr, "QueryPerformanceCounter failed\n");
+        exit(2);
+    }
+    /* QPC ticks are not nanoseconds. Rust scales through u128; the split
+     * below is the same value without a wide type, exact for every QPC
+     * reading: ticks = q*f + r with r < f, so ns = q*1e9 + (r*1e9)/f, and
+     * r*1e9 stays under 2^63 for any real frequency (f < 2^33). */
+    uint64_t ticks = (uint64_t)value.QuadPart;
+    uint64_t f = (uint64_t)frequency;
+    return (ticks / f) * 1000000000ull + ((ticks % f) * 1000000000ull) / f;
+}
+#else
 static uint64_t now_ns(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -70,9 +132,20 @@ static uint64_t now_ns(void) {
     }
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+#endif
 
 /* sleep_until_ns from crates/orrery_ipc_transport/src/lib.rs: sleep in ~1 ms
- * quanta, spin the last ~1.5 ms. Pacing never produces a timestamp. */
+ * quanta, spin the last ~1.5 ms. Pacing never produces a timestamp.
+ *
+ * On Windows the blocking wait is Sleep(), whose quantum is exactly what
+ * timeBeginPeriod(1) changes -- 15.6 ms by default, ~1 ms raised. That is
+ * #920 lie 1, and it is why this consumer is run both ways.
+ *
+ * Sleep() takes whole milliseconds, so the last sub-millisecond quantum
+ * becomes Sleep(0) -- a yield rather than a wait. The spin window is then up
+ * to ~1.5 ms rather than ~1.0 ms. It costs one core between ticks and it
+ * produces no timestamp, so it cannot enter a measured column; it is recorded
+ * here because it is a real difference from the Unix leg. */
 static void sleep_until_ns(uint64_t deadline) {
     for (;;) {
         uint64_t now = now_ns();
@@ -84,12 +157,46 @@ static void sleep_until_ns(uint64_t deadline) {
             continue;
         }
         uint64_t ns = remaining - 1000000ull;
+#ifdef _WIN32
+        Sleep((DWORD)(ns / 1000000ull));
+#else
         struct timespec ts;
         ts.tv_sec = (time_t)(ns / 1000000000ull);
         ts.tv_nsec = (long)(ns % 1000000000ull);
         nanosleep(&ts, NULL);
+#endif
     }
 }
+
+/* ---- timer resolution (#920 lie 1) --------------------------------------- */
+
+/* Raised for the whole process and released on the way out, as
+ * orrery_ipc_transport's TimerResolution guard does. The report's
+ * `time_begin_period` is what this returned, never the flag that asked. */
+#ifdef _WIN32
+static int timer_resolution_raised = 0;
+
+static int raise_timer_resolution(void) {
+    if (timeBeginPeriod(1) != TIMERR_NOERROR) {
+        return 0;
+    }
+    timer_resolution_raised = 1;
+    return 1;
+}
+
+/* Paired with the successful raise above, and a no-op otherwise: an unmatched
+ * timeEndPeriod would be a second process-wide edit nothing asked for. */
+static void release_timer_resolution(void) {
+    if (timer_resolution_raised) {
+        (void)timeEndPeriod(1);
+        timer_resolution_raised = 0;
+    }
+}
+#else
+/* There is no process-wide timer resolution to raise off Windows, so there is
+ * no function to leave unused under -Werror either. */
+#define release_timer_resolution() ((void)0)
+#endif
 
 /* ---- byte helpers ------------------------------------------------------- */
 
@@ -193,8 +300,65 @@ typedef struct thread_table {
     thread_name_count names[MAX_THREAD_NAMES];
 } thread_table;
 
+static void tally_thread(thread_table *table, const char *name) {
+    table->total += 1;
+    unsigned i;
+    for (i = 0; i < table->distinct; ++i) {
+        if (strcmp(table->names[i].name, name) == 0) {
+            table->names[i].count += 1;
+            return;
+        }
+    }
+    if (table->distinct < MAX_THREAD_NAMES) {
+        snprintf(table->names[i].name, COMM_LEN, "%s", name);
+        table->names[i].count = 1;
+        table->distinct += 1;
+    }
+}
+
 /* Read from the OS (#1043: "thread counts are read from the OS"), never from
- * either engine's own claim of what it started. */
+ * either engine's own claim of what it started.
+ *
+ * Windows has no /proc: the thread list comes from a Toolhelp snapshot
+ * filtered to this process, and the names from GetThreadDescription, which is
+ * the API Rust's std and Bevy's task pools set through SetThreadDescription.
+ * A thread whose description was never set reads as the empty string -- that
+ * is a fact about the thread, not a read failure, and it is recorded as one. */
+#ifdef _WIN32
+static void read_threads(thread_table *table) {
+    memset(table, 0, sizeof *table);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    THREADENTRY32 entry;
+    memset(&entry, 0, sizeof entry);
+    entry.dwSize = sizeof entry;
+    const DWORD self = GetCurrentProcessId();
+    if (Thread32First(snapshot, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID != self) {
+                continue;
+            }
+            char name[COMM_LEN] = {0};
+            HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+            if (thread != NULL) {
+                PWSTR wide = NULL;
+                if (SUCCEEDED(GetThreadDescription(thread, &wide)) && wide != NULL) {
+                    if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, name, (int)sizeof name, NULL,
+                                            NULL) == 0) {
+                        name[0] = '\0';
+                    }
+                    LocalFree(wide);
+                }
+                CloseHandle(thread);
+            }
+            tally_thread(table, name);
+        } while (Thread32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+}
+#else
 static void read_threads(thread_table *table) {
     memset(table, 0, sizeof *table);
     DIR *dir = opendir("/proc/self/task");
@@ -217,25 +381,19 @@ static void read_threads(thread_table *table) {
             name[strcspn(name, "\n")] = '\0';
         }
         fclose(comm);
-        table->total += 1;
-        unsigned i;
-        for (i = 0; i < table->distinct; ++i) {
-            if (strcmp(table->names[i].name, name) == 0) {
-                table->names[i].count += 1;
-                break;
-            }
-        }
-        if (i == table->distinct && table->distinct < MAX_THREAD_NAMES) {
-            snprintf(table->names[i].name, COMM_LEN, "%s", name);
-            table->names[i].count = 1;
-            table->distinct += 1;
-        }
+        tally_thread(table, name);
     }
     closedir(dir);
 }
+#endif
 
+/* Windows has no load average, so the three fields stay zero -- the same
+ * zeros #920's own Windows sidecar report carries
+ * (docs/data/sidecar-ipc-windows-2026-09-04-n24.json). They are an absence,
+ * not a measurement of an idle machine. */
 static void read_loadavg(double out[3]) {
     out[0] = out[1] = out[2] = 0.0;
+#ifndef _WIN32
     FILE *f = fopen("/proc/loadavg", "r");
     if (f == NULL) {
         return;
@@ -244,9 +402,23 @@ static void read_loadavg(double out[3]) {
         out[0] = out[1] = out[2] = 0.0;
     }
     fclose(f);
+#endif
 }
 
 static uint64_t cpu_time_ns(void) {
+#ifdef _WIN32
+    FILETIME creation, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel, &user)) {
+        return 0;
+    }
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    /* FILETIME counts 100 ns intervals. */
+    return (uint64_t)(k.QuadPart + u.QuadPart) * 100ull;
+#else
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
     uint64_t user = (uint64_t)usage.ru_utime.tv_sec * 1000000000ull +
@@ -254,6 +426,22 @@ static uint64_t cpu_time_ns(void) {
     uint64_t sys = (uint64_t)usage.ru_stime.tv_sec * 1000000000ull +
                    (uint64_t)usage.ru_stime.tv_usec * 1000ull;
     return user + sys;
+#endif
+}
+
+/* GetSystemInfo reports the calling thread's processor GROUP, so on a machine
+ * with more than 64 logical processors this undercounts. The hosted runners
+ * have four; a box that would trip it is not one this measurement runs on,
+ * and the number is context in the report rather than an input to any
+ * column. */
+static long cores_online(void) {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return (long)info.dwNumberOfProcessors;
+#else
+    return sysconf(_SC_NPROCESSORS_ONLN);
+#endif
 }
 
 /* Process CPU% over a paced idle window: the loop wakes at 60 Hz and does
@@ -367,6 +555,7 @@ typedef struct options {
     uint64_t warmup;
     uint32_t clock;
     int with_app;
+    int time_period;
     double idle_seconds;
     const char *report;
     const char *notes[MAX_NOTES];
@@ -739,16 +928,17 @@ static int run_bench(const options *opt, int smoke) {
         fprintf(f, "{\n");
         fprintf(f, "  \"schema\": \"orrery-ipc-harness/1\",\n");
         fprintf(f, "  \"role\": \"observer\",\n");
-        fprintf(f, "  \"platform\": \"linux\",\n");
+        fprintf(f, "  \"platform\": \"%s\",\n", PLATFORM_NAME);
         fprintf(f, "  \"arch\": \"x86_64\",\n");
-        fprintf(f, "  \"clock\": \"CLOCK_MONOTONIC\",\n");
+        fprintf(f, "  \"clock\": \"%s\",\n", CLOCK_NAME);
         fprintf(f, "  \"transport\": \"%s\",\n",
                 opt->with_app ? "inproc-staticlib+app" : "inproc-staticlib-no-app");
         fprintf(f, "  \"measured_quantity\": \"inproc_added\",\n");
         /* Schema fields the renderer prints. There is no socket, so nothing
-         * was set; and this is Linux, so no timer resolution was raised. */
+         * was set. `time_begin_period` is what raise_timer_resolution()
+         * actually returned, not what --time-period asked for. */
         fprintf(f, "  \"tcp_nodelay\": false,\n");
-        fprintf(f, "  \"time_begin_period\": false,\n");
+        fprintf(f, "  \"time_begin_period\": %s,\n", opt->time_period ? "true" : "false");
         fprintf(f, "  \"entities\": %u,\n", n);
         fprintf(f, "  \"tick_hz\": %u,\n", TICK_HZ);
         fprintf(f, "  \"warmup_ticks\": %" PRIu64 ",\n", opt->warmup);
@@ -787,7 +977,7 @@ static int run_bench(const options *opt, int smoke) {
         fprintf(f, "    \"clock_mode\": \"%s\",\n",
                 opt->with_app ? (opt->clock == ORRERY_APP_CLOCK_MANUAL ? "manual" : "automatic")
                               : "none");
-        fprintf(f, "    \"cores_online\": %ld,\n", sysconf(_SC_NPROCESSORS_ONLN));
+        fprintf(f, "    \"cores_online\": %ld,\n", cores_online());
         json_threads(f, "threads_before_app", &threads_before, 0);
         json_threads(f, "threads_after_app_create", &threads_after_app, 0);
         json_threads(f, "threads_at_end", &threads_end, 0);
@@ -832,10 +1022,22 @@ static int run_bench(const options *opt, int smoke) {
             "C-side decode of every record",
             "phase is the apply cost, not a tick wait: in-process the mirror is applied in the "
             "frame that produced it, so #920's wait-for-next-tick is zero by construction",
+#ifdef _WIN32
+            "Windows staticlib plus C consumer: the in-process half of #920's comparison on the "
+            "platform its bands are defined on. The bands themselves are the SIDECAR's and are "
+            "not applied here (scripts/ipc-report.py refuses a verdict on a non-sidecar "
+            "transport); this is not the in-process Unreal number G10.2 turns on -- nothing here "
+            "ran inside a UE process, beside UE's task graph, or drew a frame -- and it settles "
+            "neither G10.2 nor D52/D53 (Proposed)",
+#else
             "Linux staticlib plus C consumer on clang, informational: not the in-process Unreal "
             "number G10.2 turns on, and it settles neither G10.2 nor D52/D53 (Proposed)",
+#endif
             "the App and the host are not connected (D53 section 5): App::update is the "
             "net/prediction loop's per-frame cost on the game thread, measured beside the host path",
+            "the App prong of D53's fork (a full bevy_app::App beside the ABI handle). GD3's "
+            "chosen configuration -- App prong, pool-capped, driver-connected -- is a third shape "
+            "neither this spike nor #1052's non-App spike measures",
         };
         size_t fixed_count = sizeof fixed_notes / sizeof fixed_notes[0];
         for (size_t i = 0; i < fixed_count; ++i) {
@@ -911,13 +1113,45 @@ typedef struct hop_args {
     orrery_host_result results[3];
 } hop_args;
 
-static void *hop_thread(void *raw) {
-    hop_args *args = raw;
+static void hop_body(hop_args *args) {
     args->on_creating_thread = orrery_app_on_creating_thread(args->app);
     for (int i = 0; i < 3; ++i) {
         args->results[i] = orrery_app_update(args->app, args->dt_ns);
     }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI hop_thread(LPVOID raw) {
+    hop_body((hop_args *)raw);
+    return 0;
+}
+#else
+static void *hop_thread(void *raw) {
+    hop_body(raw);
     return NULL;
+}
+#endif
+
+/* Run `hop_body` on a thread that is not this one, and join it. */
+static int run_off_thread(hop_args *args) {
+#ifdef _WIN32
+    HANDLE thread = CreateThread(NULL, 0, hop_thread, args, 0, NULL);
+    if (thread == NULL) {
+        fprintf(stderr, "CreateThread failed\n");
+        return 0;
+    }
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    return 1;
+#else
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, hop_thread, args) != 0) {
+        fprintf(stderr, "pthread_create failed\n");
+        return 0;
+    }
+    pthread_join(thread, NULL);
+    return 1;
+#endif
 }
 
 static int run_threadhop(void) {
@@ -934,12 +1168,9 @@ static int run_threadhop(void) {
     memset(&args, 0, sizeof args);
     args.app = app;
     args.dt_ns = tl.fixed_step_ns;
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, hop_thread, &args) != 0) {
-        fprintf(stderr, "pthread_create failed\n");
+    if (!run_off_thread(&args)) {
         return 1;
     }
-    pthread_join(thread, NULL);
     orrery_host_result back = orrery_app_update(app, tl.fixed_step_ns);
     orrery_app_timeline end;
     orrery_host_result read = orrery_app_timeline_read(app, &end);
@@ -961,6 +1192,24 @@ static int parse_options(int argc, char **argv, options *opt) {
         if (strcmp(arg, "--no-app") == 0) {
             opt->with_app = 0;
             continue;
+        }
+        if (strcmp(arg, "--time-period") == 0) {
+#ifdef _WIN32
+            /* Raised here, before the first paced sleep, and reported as
+             * whatever the call returned. A refusal is not silently rewritten
+             * into a "default resolution" run: the flag asked for a condition
+             * the report would then misdescribe. */
+            if (!raise_timer_resolution()) {
+                fprintf(stderr, "timeBeginPeriod(1) was refused\n");
+                return 0;
+            }
+            opt->time_period = 1;
+            continue;
+#else
+            fprintf(stderr, "--time-period is Windows-only; there is no timer resolution to "
+                            "raise on this platform\n");
+            return 0;
+#endif
         }
         if (value == NULL) {
             fprintf(stderr, "%s needs a value\n", arg);
@@ -1017,12 +1266,24 @@ int main(int argc, char **argv) {
     opt.idle_seconds = 3.0;
 
     if (strcmp(argv[1], "bench") == 0) {
-        return parse_options(argc, argv, &opt) ? run_bench(&opt, 0) : 2;
+        if (!parse_options(argc, argv, &opt)) {
+            release_timer_resolution();
+            return 2;
+        }
+        int rc = run_bench(&opt, 0);
+        release_timer_resolution();
+        return rc;
     }
     if (strcmp(argv[1], "smoke") == 0) {
         opt.ticks = 120;
         opt.warmup = 0;
-        return parse_options(argc, argv, &opt) ? run_bench(&opt, 1) : 2;
+        if (!parse_options(argc, argv, &opt)) {
+            release_timer_resolution();
+            return 2;
+        }
+        int rc = run_bench(&opt, 1);
+        release_timer_resolution();
+        return rc;
     }
     if (strcmp(argv[1], "panic") == 0) {
         return run_panic();

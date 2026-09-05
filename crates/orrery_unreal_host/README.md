@@ -225,10 +225,71 @@ each attributed to the actor that produced it.
   an MSVC-built boundary. Proven here on Linux only.
 - What Bevy's 64 threads do beside Unreal's task graph on the same cores.
   Here they sat beside one C thread.
-- `inproc_added` versus `ipc_added` **on the same Windows box** — the
-  comparison #1043's third falsifier is about. The Windows sidecar leg is
-  still red in the nightly (#1043 Settles).
 - A frame on screen. No Unreal, no pixels.
+
+## The Windows leg (#1084)
+
+`inproc_added` versus `ipc_added` **on the same Windows box** — the
+comparison #1043's third falsifier is about, and the one the list above used
+to record as unestablished. The sidecar half landed first
+(`docs/data/sidecar-ipc-windows-2026-09-04-n24.json`, #1076: `ipc_added`
+p50 **136.6 µs**, p99 395.1 µs, p99.9 1,030.2 µs with `timeBeginPeriod`
+raised). The in-process half is `spike-windows.sh`, run nightly by
+`.github/workflows/nightly.yml`'s `inproc-ipc-windows` job.
+
+**Why this prong.** GD3's chosen configuration is "App prong, pool-capped,
+driver-connected", which is on **this** side of D53's fork. Measuring
+`orrery_unreal_direct` (#1052, the non-`App` prong) would put a Windows
+number on the shape the owner declined. It is *not* GD3's configuration
+either: nothing caps a task pool and nothing connects the prediction driver
+(D53 §5, and item 4 above) — a third shape **neither spike measures**, whose
+numbers the game trail records as owed by the slice.
+
+**What differs from `spike.sh`, and what does not.** The method is #920's
+`ipc_added` unchanged: N = 24, 60 Hz, 600 warmup, 36,000 samples, one input
+per tick, nearest-rank percentiles, real per-frame work, the same C consumer
+and the same columns. What necessarily differs:
+
+| | Linux (`spike.sh`) | Windows (`spike-windows.sh`) |
+|---|---|---|
+| clock | `CLOCK_MONOTONIC` | `QueryPerformanceCounter`, scaled to ns — the pair `orrery_ipc_transport::monotonic_now_ns` reads |
+| paced wait | `nanosleep` | `Sleep()`, whose quantum is what `timeBeginPeriod(1)` changes |
+| timer resolution | no such knob; `time_begin_period` is `false`, factually | measured **both ways**, as the sidecar job does: raised for the headline and the control, default for a 7,200-tick reference |
+| threads | `/proc/self/task/*/comm` | Toolhelp snapshot filtered to this process; names from `GetThreadDescription`, which is what Rust's std and Bevy's pools set. A thread whose description was never set reads as `""` |
+| load average | `/proc/loadavg` | none exists: three zeros, the same absence #920's own Windows sidecar report carries |
+| process CPU | `getrusage` | `GetProcessTimes`, kernel + user |
+| archive | `liborrery_unreal_host.a` | `orrery_unreal_host.lib` |
+| link line | `rustc --print native-static-libs`, with a documented Linux fallback | the same note, **no fallback** — the MSVC set is version-dependent and guessing it wrong produces link errors that read as source errors — plus `winmm.lib`, which rustc cannot list because nothing on the Rust side calls `timeBeginPeriod` |
+
+**Three reports**, into `docs/data/` (or `$ORRERY_SPIKE_OUT_DIR`):
+`inproc-windows-<date>-n24-time-period.json` (the headline, `App` prong,
+manual clock), `-no-app-time-period.json` (the control the Linux headline was
+taken on — #1069's `inproc-no-app`, p50 20.08 µs) and
+`-default-resolution.json` (the granularity reference). The nightly job
+uploads them as an artifact; nothing commits them, and a number that has not
+been committed here is not a number this repository claims.
+
+**It is still not a verdict.** #920's bands are defined on the *sidecar's*
+`ipc_added`. `scripts/ipc-report.py` refuses a stand/overturn reading for any
+report whose `measured_quantity` is not `ipc_added` — without that refusal a
+Windows in-process report would print `SIDECAR STANDS` off a path containing
+no sidecar. What this leg closes is the platform gap, not the decision.
+
+**A Windows report must come from a Windows kernel.** `spike-windows.sh`
+refuses to run unless `uname -s` says so. A Proton or Wine host reports
+`x86_64-pc-windows-msvc` while executing on Linux, and the C consumer stamps
+`platform` from the compiler's `_WIN32`, which cross-compilation alone
+satisfies; the host check is the part the stamp cannot make for itself.
+
+**Unverified from this box.** Nothing under `spike-windows.sh` has been
+executed on Windows from here: the build host has no Windows machine and no
+MSVC. What *was* checked locally is that the C consumer's Windows branch
+compiles clean under `-std=c11 -Wall -Wextra -Werror` with both
+`x86_64-w64-mingw32-gcc` and `clang --target=x86_64-w64-mingw32`. That proves
+the source, not the MSVC-ABI link, not `clang.exe` forwarding `*.lib`
+arguments to the linker, and not the runtime behaviour of the Toolhelp,
+`GetThreadDescription` or `timeBeginPeriod` calls. The first nightly run is
+the first real evidence.
 
 ## Reproduce
 
@@ -251,4 +312,12 @@ target/spike-1043/spike_consumer bench --entities 24 --ticks 36000 --warmup 600 
 python3 scripts/ipc-report.py out.json
 target/spike-1043/spike_consumer panic       # PANIC then POISONED then destroy OK
 target/spike-1043/spike_consumer threadhop   # update from a thread that did not create the App
+```
+
+On Windows (Git Bash, clang from the LLVM install, MSVC ABI) — the nightly
+`inproc-ipc-windows` job runs exactly this line and nothing else:
+
+```sh
+crates/orrery_unreal_host/spike-windows.sh            # date label defaults to today
+crates/orrery_unreal_host/spike-windows.sh 2026-09-05 600 120   # a dry run
 ```
