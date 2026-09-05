@@ -39,6 +39,17 @@ rules *in process*.
 > on parked-cell catch-up, and stands without this example. Recorded as an
 > addition so the original text stays readable; the normative text is
 > unchanged, which is the owner's to edit.
+>
+> **Citation refreshed, 2026-09-05 (#626 stage S0).** The correction's finding
+> stands — `validate_intent` is still absent, still only the two doc comments,
+> now at `crates/orrery_core/src/lib.rs:68` and
+> `crates/orrery_core/src/ruleset.rs:9`. Its `path:line` had already drifted:
+> the trait is `crates/orrery_core/src/ruleset.rs:294-412`, and its surface
+> gained an eleventh member, `OVERFLOW_IS_CANONICAL` (D43 (f)(3) as amended,
+> built in this stage), which is *undefaulted* — the only one besides the three
+> associated types, `id` and `step`. The line numbers are re-stated rather than
+> silently corrected in place, because a citation that is quietly rewritten
+> stops recording when it was true.
 
 The consequence a game team lives with is that **every `Ruleset` change is a
 persistd redeploy**, and the game repo owns the deployed artifact. The
