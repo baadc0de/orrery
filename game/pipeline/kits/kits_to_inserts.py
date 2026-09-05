@@ -62,6 +62,9 @@ for f in files:
     ext = f.rsplit(".", 1)[-1].lower()
     if ext == "obj": bpy.ops.wm.obj_import(filepath=f)
     elif ext == "fbx": bpy.ops.import_scene.fbx(filepath=f)
+    elif ext == "glb":
+        bpy.ops.import_scene.gltf(filepath=f); ms = [o for o in bpy.data.objects if o.type == 'MESH']
+        if len(ms) == 1: ms[0].name = os.path.basename(f)[:-4]   # one generated mesh per file: the INSERT takes the file's name
     elif ext == "blend":
         with bpy.data.libraries.load(f) as (src, dst): dst.objects = src.objects
         for o in dst.objects:

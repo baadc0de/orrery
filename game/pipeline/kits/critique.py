@@ -10,11 +10,11 @@ SCHEMA = {"type": "object", "properties": {"overall": {"type": "string"}, "score
   "zone": {"type": "string"}, "present": {"type": "boolean"}, "verdict": {"type": "string", "enum": ["good", "wrong_part", "wrong_size", "wrong_place", "wrong_orientation", "missing"]}}, "required": ["zone", "present", "verdict"]}},
   "adjust": {"type": "array", "items": {"type": "object", "properties": {
   "zone": {"type": "string"}, "action": {"type": "string", "enum": ["keep", "scale", "count", "move", "rotate", "replace", "drop", "add"]}, "scale_factor": {"type": "number"}, "count_delta": {"type": "integer"},
-  "yaw_deg": {"type": "integer"}, "region": {"type": "string"}, "anchor": {"type": "array", "items": {"type": "number"}}, "tags": {"type": "array", "items": {"type": "string"}}, "count": {"type": "integer"}, "size_m": {"type": "number"}, "why": {"type": "string"}}, "required": ["zone", "action", "why"]}}}, "required": ["overall", "score", "per_zone", "adjust"]}
+  "yaw_deg": {"type": "integer"}, "region": {"type": "string"}, "anchor": {"type": "array", "items": {"type": "number"}}, "tags": {"type": "array", "items": {"type": "string"}}, "count": {"type": "integer"}, "size_m": {"type": "number"}, "prim": {"type": "string", "enum": ["skid", "nozzle", "box", "pipe_run"]}, "why": {"type": "string"}}, "required": ["zone", "action", "why"]}}}, "required": ["overall", "score", "per_zone", "adjust"]}
 ap = argparse.ArgumentParser(); ap.add_argument("--project", required=True); ap.add_argument("--model", default="gemini-3.1-pro-preview"); ap.add_argument("--concept", required=True)
 ap.add_argument("--renders", nargs="+", required=True); ap.add_argument("--id-renders", nargs="*", default=[]); ap.add_argument("--zones", required=True); ap.add_argument("--assembly", required=True); ap.add_argument("--atlas", required=True); ap.add_argument("--out", required=True); a = ap.parse_args()
 Z = json.load(open(a.zones)); A = json.load(open(a.assembly)); atlas = json.load(open(a.atlas)); legend = A.get("id_colors", {})
-summary = [{"zone": z["name"], "type": z["type"], "kind": z.get("kind", "part"), "region": z["region"], "tags": z["tags"], "count": z["count"], "size_m": z.get("size_m"), "anchor": z.get("anchor"), "feature": z.get("concept_feature", ""), "id_colour": legend.get(z["name"])} for z in Z["zones"]]
+summary = [{"zone": z["name"], "type": z["type"], "kind": z.get("kind", "part"), "region": z["region"], "tags": z["tags"], "count": z["count"], "size_m": z.get("size_m"), "anchor": z.get("anchor"), "prim": z.get("prim"), "feature": z.get("concept_feature", ""), "id_colour": legend.get(z["name"])} for z in Z["zones"]]
 placed = {}
 for p in A["placements"]: placed.setdefault(p["zone"], {"insert": p.get("insert"), "placed_m": p.get("placed_m"), "pos_m": p.get("pos")})
 vocab = sorted({t for z in Z["zones"] for t in z["tags"]} | {"thruster", "nozzle", "cable", "pipe", "conduit", "hull-panel", "plate", "hatch", "vent", "grille", "landing-gear", "strut", "pylon", "gun", "box", "block", "cylinder", "greeble-cluster", "antenna", "bracket", "window", "fin"})
@@ -32,6 +32,7 @@ Then give adjustments, at most 8, only where the render clearly disagrees with t
 - "scale" with scale_factor 0.5..2.0 (or an absolute size_m) when the shape is right but the size is off.
 - "rotate" with yaw_deg (90, 180, 270) when the part is right but spun on the hull.
 - "move" with an "anchor" [x, y] (preferred; use the top/belly renders as the map) and/or a new region; "count" with count_delta; "drop" only when the feature should not exist at all; "add" for a missing feature (region, tags, count, size_m).
+PRIMITIVES: the library has no landing skids and no long straight piping. When the same silhouette has been requested before and the library keeps failing, request a procedural stand-in instead: set "prim" on a replace or add: "skid" (ski bar with struts, size_m = length), "nozzle" (engine cylinder with recessed cone, size_m = diameter), "box" (bevelled box, size_m = length), "pipe_run" (count parallel pipes following the skin, size_m = run length, on connect zones or an anchored zone). A zone with a prim keeps it until you replace it without one.
 Prefer replace over drop. Give an overall 0..1 fidelity score (1 = a modeller would accept it as a blockout of the concept) and a two-sentence overall note."""
 parts = [{"text": prompt}, {"text": "CONCEPT:"}, img(a.concept)]
 for r in a.renders: parts += [{"text": f"RENDER-{os.path.basename(r)}:"}, img(r)]
@@ -62,9 +63,12 @@ for adj in C["adjust"]:
         cur = placed.get(z["name"], {}).get("insert")
         if cur: z.setdefault("exclude", []); z["exclude"] = sorted(set(z["exclude"]) | {cur})
         z["hint"] = adj["why"]; z["rechoose"] = True
+        if adj.get("prim"): z["prim"] = adj["prim"]
+        else: z.pop("prim", None)
+        if adj.get("size_m"): z["size_m"] = round(float(adj["size_m"]), 3)
     elif act == "drop" and z and drops < 2: Z2["zones"] = [q for q in Z2["zones"] if q["name"] != z["name"]]; drops += 1
     elif act == "add" and adj.get("region") in atlas["regions"] and adj.get("tags") and adj["zone"] not in byname:
-        Z2["zones"].append({"name": adj["zone"], "type": "surface", "kind": "part", "region": adj["region"], "tags": adj["tags"], "count": max(1, adj.get("count") or 1), "along": "y", "scale": [0.5, 0.7], "size_m": adj.get("size_m", 1.0), "anchor": adj.get("anchor"), "concept_feature": adj.get("why", ""), "hint": adj.get("why", "")})
+        Z2["zones"].append({"name": adj["zone"], "type": "surface", "kind": "part", "region": adj["region"], "tags": adj["tags"], "count": max(1, adj.get("count") or 1), "along": "y", "scale": [0.5, 0.7], "size_m": adj.get("size_m", 1.0), "anchor": adj.get("anchor"), "prim": adj.get("prim"), "concept_feature": adj.get("why", ""), "hint": adj.get("why", "")})
 Z2.setdefault("critiques", []).append({"score": C["score"], "overall": C["overall"], "per_zone": C.get("per_zone", []), "adjust": C["adjust"], "model": resp.get("modelVersion", a.model), "renders": [os.path.basename(r) for r in a.renders + a.id_renders], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
 json.dump(Z2, open(a.out, "w"), indent=1)
 print(f"score {C['score']} | {C['overall']}")

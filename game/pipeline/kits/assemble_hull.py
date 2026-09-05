@@ -54,6 +54,58 @@ def load_insert(e):
     if tr > budget:
         m = o.modifiers.new("dec", 'DECIMATE'); m.ratio = budget / tr; bpy.context.view_layer.objects.active = o; bpy.ops.object.modifier_apply(modifier="dec")
     return o
+def prim_object(z, e_dims_out):
+    """Procedural stand-ins for shapes the library lacks. Built in the INSERT frame: mount plane z=0, length along +y, returns (object, dims)."""
+    kind = z["prim"]; L = z.get("size_m", 1.0); me = bpy.data.meshes.new(f"prim_{z['name']}"); bm = bmesh.new()
+    if kind == "skid":       # ski: struts stand off the hull (+z is away from the skin), a flat bar at their end, tip curled back toward the hull
+        w, th, h = 0.14 * L, 0.05 * L, z.get("drop_m", 0.30 * L)
+        bmesh.ops.create_cube(bm, size=1.0); bmesh.ops.scale(bm, vec=(w, L, th), verts=bm.verts); bmesh.ops.translate(bm, vec=(0, 0, h + th / 2), verts=bm.verts)
+        tip = [v for v in bm.verts if v.co.y > L * 0.49]; bmesh.ops.translate(bm, vec=(0, 0, -0.12 * L), verts=tip)
+        for yy in (-0.3 * L, 0.25 * L):
+            r = bmesh.ops.create_cube(bm, size=1.0); bmesh.ops.scale(bm, vec=(0.5 * w, 0.5 * w, h), verts=r["verts"]); bmesh.ops.translate(bm, vec=(0, yy, h / 2), verts=r["verts"])
+        dims = (w, L, h + th)
+    elif kind == "nozzle":   # engine: outer cylinder with a recessed inner cone, axis along +z = the mount normal (a tail face points aft).
+        r = L / 2; ln = z.get("length_m", 1.0 * L); sink = z.get("sink", 0.55)   # most of the length sits inside the pod lump; only the lip and the glowing cone show
+        bmesh.ops.create_cone(bm, cap_ends=False, segments=24, radius1=r * 0.92, radius2=r, depth=ln)
+        inner = bmesh.ops.create_cone(bm, cap_ends=True, segments=24, radius1=r * 0.35, radius2=r * 0.82, depth=ln * 0.9)
+        ring = bmesh.ops.create_cone(bm, cap_ends=False, segments=24, radius1=r * 0.92, radius2=r * 0.82, depth=0.02); bmesh.ops.translate(bm, vec=(0, 0, ln * 0.49), verts=ring["verts"])
+        inner_faces = {f for v in inner["verts"] for f in v.link_faces}
+        for f in bm.faces: f.material_index = 1 if f in inner_faces else 0
+        bmesh.ops.translate(bm, vec=(0, 0, ln / 2 - sink * ln), verts=bm.verts); dims = (2 * r, 2 * r, ln * (1 - sink))
+    elif kind == "box":
+        w, h = z.get("width_m", 0.6 * L), z.get("height_m", 0.3 * L)
+        bmesh.ops.create_cube(bm, size=1.0); bmesh.ops.scale(bm, vec=(w, L, h), verts=bm.verts); bmesh.ops.translate(bm, vec=(0, 0, h / 2), verts=bm.verts)
+        bmesh.ops.bevel(bm, geom=bm.verts[:] + bm.edges[:], offset=min(w, h) * 0.08, segments=2, affect='EDGES'); dims = (w, L, h)
+    else: raise ValueError(kind)
+    bm.to_mesh(me); bm.free(); o = bpy.data.objects.new(me.name, me); sc.collection.objects.link(o); e_dims_out[:] = dims
+    if kind == "nozzle": o["two_mat"] = "polymer,emissive"
+    return o
+def pipe_run(z, fs_from, fs_to):
+    """Parallel pipes following the hull skin between two regions (or along an anchored span): n tubes, radius thickness_m/2, spacing 2.4 r."""
+    n = max(2, z.get("count", 3)); r = z.get("thickness_m", 0.12) / 2; sd = z["region"].split(".")[0]
+    S = hull.data.attributes["region_side"].data; skin = extreme_filter([f for f in hull.data.polygons if S[f.index].value == SIDES.index(sd)], sd, 0.6)
+    A = region_frame(fs_from)[0]; B = region_frame(fs_to)[0] if fs_to is not None else A + Vector((0, -z.get("size_m", 4.0), 0))
+    if z.get("anchor"): A = Vector((z["anchor"][0] * HX, z["anchor"][1] * HY, A.z)); B = A + Vector((0, -z.get("size_m", 4.0), 0))
+    elif z.get("size_m"): B = Vector((A.x, A.y - z["size_m"], A.z))   # unanchored: a straight fore-to-aft run of size_m from the region centroid
+    if sd in ("top", "belly") and abs(A.x) < 0.6: A.x = B.x = 0.0   # spine runs sit on the centreline
+    objs = []
+    # each pipe: its own straight line in plan at a constant x offset, surface height by ray cast (no face-centre zigzag, no crossing)
+    inv = hull.matrix_world.inverted(); ax, sg = EXTREME[sd]; d = (B - A).normalized()
+    def skin_point(q):
+        o_far = q.copy(); o_far[ax] = 30.0 * sg; hit, loc, nrm, _ = hull.ray_cast(inv @ o_far, (inv.to_3x3() @ Vector([(-sg if i == ax else 0) for i in range(3)])).normalized())
+        return (hull.matrix_world @ loc, (hull.matrix_world.to_3x3() @ nrm).normalized()) if hit else (q, Vector([(sg if i == ax else 0) for i in range(3)]))
+    for k in range(n):
+        off = (k - (n - 1) / 2) * 3.4 * r; cu = bpy.data.curves.new(f"pipe_{z['name']}_{k}", 'CURVE'); cu.dimensions = '3D'; cu.bevel_depth = r; cu.bevel_resolution = 4; cu.fill_mode = 'FULL'
+        sp = cu.splines.new('POLY'); pts = []; side = d.cross(Vector([(sg if i == ax else 0) for i in range(3)])).normalized()
+        for i in range(25):
+            c0, n0 = skin_point(A.lerp(B, i / 24) + side * off); pts.append(c0 + n0 * (r + 0.01))
+        pts = [pts[0]] + [(pts[i - 1] + pts[i] * 2 + pts[i + 1]) / 4 for i in range(1, 24)] + [pts[-1]]
+        sp.points.add(len(pts) - 1)
+        for pnt, q in zip(sp.points, pts): pnt.co = (q.x, q.y, q.z, 1.0)
+        cu.use_fill_caps = True
+        o = bpy.data.objects.new(cu.name, cu); sc.collection.objects.link(o); bpy.context.view_layer.objects.active = o; o.select_set(True); bpy.ops.object.convert(target='MESH'); o.select_set(False)
+        o.name = f"{z['name']}_{k}_pipe"; o["no_mirror"] = True; objs.append(o)   # the run is symmetric by construction
+    return objs, A, B
 def pick(z, i, used):
     ranked = C.get(z["name"], {}).get("ranked", []); excl = set(z.get("exclude", []))  # critic "replace" verdicts exclude the rejected insert
     for nm in ranked:
@@ -66,6 +118,10 @@ for z in Z["zones"]:
     fs = anchor_faces(z["region"], z["anchor"]) if z.get("anchor") else region_faces_skin(z["region"])
     if not fs: print("empty region", z["name"], z["region"]); continue
     c, n, t, b, ext = region_frame(fs)
+    if z["type"] == "connect" and z.get("prim") == "pipe_run" or (z["type"] == "connect" and z.get("prim") is None and z.get("pipes_procedural")):
+        fs2 = region_faces(z["region_to"]) if z.get("region_to") else None
+        objs, A, B = pipe_run(z, fs, fs2)
+        graph.append({"zone": z["name"], "insert": "prim:pipe_run", "kit": "procedural", "from": z["region"], "to": z.get("region_to"), "pos": [round(v, 3) for v in (A + B) / 2], "placed_m": round((B - A).length, 2), "attach": "surface"}); continue
     if z["type"] == "connect":
         fs2 = region_faces(z.get("region_to", z["region"]));
         if not fs2: continue
@@ -89,12 +145,21 @@ for z in Z["zones"]:
     if z.get("anchor") and k % 2 == 0 and not z["region"].startswith("flank"): pair = True; across = None   # anchored pairs: the anchor is the +x member, the mirror makes the other
     if pair: k //= 2
     for i in range(k):
-        e = pick(z, i, used)
-        if not e: print("no part for", z["name"]); break
-        used.add(e["name"]); o = load_insert(e)
-        pos, nn = surface_at(c, n, t, (i - (k - 1) / 2) * (span / k), fs, across); tt = (t - nn * t.dot(nn)).normalized(); bb = nn.cross(tt)
+        if z.get("prim"):
+            dims = [1, 1, 1]; o = prim_object(z, dims); e = {"name": f"prim:{z['prim']}", "dims": dims, "below": 0.0, "kit": "procedural"}
+        else:
+            e = pick(z, i, used)
+            if not e: print("no part for", z["name"]); break
+            used.add(e["name"]); o = load_insert(e)
+        pos, nn = surface_at(c, n, t, (i - (k - 1) / 2) * (span / k), fs, across)
+        if z.get("prim"):   # primitives are authored along +y with +z off the skin: keep them axis-true instead of following the coarse patch frame
+            sd = z["region"].split(".")[0]
+            if z["prim"] == "nozzle" and sd in ("tail", "nose"): nn = Vector((0, -1 if sd == "tail" else 1, 0))
+            ty = Vector((0, 1, 0)); t = ty if abs(ty.dot(nn)) < 0.9 else Vector((0, 0, 1))
+        tt = (t - nn * t.dot(nn)).normalized(); bb = nn.cross(tt)
         slot = span / k
-        if z.get("size_m"): s_fit = z["size_m"] / max(1e-6, max(e["dims"]))  # absolute size from the program
+        if z.get("prim"): s_fit = 1.0
+        elif z.get("size_m"): s_fit = z["size_m"] / max(1e-6, max(e["dims"]))  # absolute size from the program
         else: s_fit = random.uniform(*z["scale"]) * min(slot / max(1e-6, e["dims"][0]), cross / max(1e-6, e["dims"][1]))
         cap = z.get("max_size_m", 4.0) / max(1e-6, max(e["dims"])); s_fit = min(s_fit, cap)
         pos = pos + nn * (e["below"] * s_fit + 0.01)
@@ -102,14 +167,14 @@ for z in Z["zones"]:
         o.matrix_world = Matrix.Translation(pos) @ Matrix((tt, bb, nn)).transposed().to_4x4() @ yaw @ Matrix.Scale(s_fit, 4); o.name = f"{z['name']}_{i}_{e['name']}"
         placed_m = max(e["dims"]) * s_fit; tb = int(max(250, min(budget, 1800 * placed_m ** 1.5)))  # triangle budget grows with placed size
         tr = sum(len(pg.vertices) - 2 for pg in o.data.polygons)
-        if tr > tb:
+        if tr > tb and not z.get("prim"):
             m = o.modifiers.new("lod", 'DECIMATE'); m.ratio = tb / tr; bpy.context.view_layer.objects.active = o; bpy.ops.object.modifier_apply(modifier="lod")
         graph.append({"zone": z["name"], "insert": e["name"], "kit": e["kit"], "region": z["region"], "pos": [round(v, 3) for v in pos], "anchor": z.get("anchor"), "scale": round(s_fit, 4), "placed_m": round(max(e["dims"]) * s_fit, 2), "attach": "surface"})
 print("placed", len(graph))
 def mat(name, rgb, rough=0.55, metal=0.0, emit=None, alpha=1.0):
     m = bpy.data.materials.get(name) or bpy.data.materials.new(name); m.use_nodes = True; bs = m.node_tree.nodes.get("Principled BSDF")
     bs.inputs["Base Color"].default_value = (*rgb, 1); bs.inputs["Roughness"].default_value = rough; bs.inputs["Metallic"].default_value = metal
-    if emit: bs.inputs["Emission Color"].default_value = (*emit, 1); bs.inputs["Emission Strength"].default_value = 0.8
+    if emit: bs.inputs["Emission Color"].default_value = (*emit, 1); bs.inputs["Emission Strength"].default_value = 0.25
     if alpha < 1: bs.inputs["Alpha"].default_value = alpha; m.blend_method = 'BLEND'
     return m
 # brief palette: hull #8a8f94 warm grey painted steel, dark panels #2b2e33, safety orange #d9772b, emissive #7fd4ff, canopy #1c3f5a
@@ -141,9 +206,13 @@ decals = [add_decal(Z.get("hull_number", "E-07"), 1), add_decal(Z.get("hull_numb
 parts = [o for o in bpy.data.objects if o.type == 'MESH']
 for o in parts:
     if o.name.startswith("decal_"): continue
+    if o.get("two_mat"):   # primitives with an outer and an inner material keep their face indices
+        o.data.materials.clear()
+        for rn in o["two_mat"].split(","): o.data.materials.append(M[rn])
+        continue
     o.data.materials.clear(); o.data.materials.append(M[role_for(o)])
     for pg in o.data.polygons: pg.material_index = 0
-    if o.name != "hull":
+    if o.name != "hull" and not o.get("no_mirror"):
         xs = [(o.matrix_world @ Vector(cn)).x for cn in o.bound_box]
         m = o.modifiers.new("mir", 'MIRROR'); m.use_axis = (True, False, False); m.mirror_object = hull; m.use_mirror_merge = True; m.merge_threshold = 0.002
         if min(xs) < -0.05 and max(xs) > 0.05: m.use_bisect_axis = (True, False, False); m.use_bisect_flip_axis = (min(xs) + max(xs) < 0, False, False)  # straddles: keep one half, mirror it
