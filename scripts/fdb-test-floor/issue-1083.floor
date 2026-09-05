@@ -1,0 +1,28 @@
+# #1083 / D33 clause (e): an upheld appeal voids a wrongful cooldown's dwell.
+#
+# Three `orrery_identity` library tests in `cooldown::tests`, all of which
+# execute in this invocation (`-p orrery_persistd -p orrery_seed -p
+# orrery_identity --features .../fdb`):
+#
+#   - `an_upheld_appeal_voids_a_wrongful_cooldowns_dwell` — two 3.0 findings
+#     enter cooldown at 6.0; one is reversed on day three; re-scored at the
+#     entry instant the survivor is 3.0, below `C`, so the clause (d) floor is
+#     void and the account is admitted eleven days early;
+#   - `an_earned_cooldown_keeps_its_floor_after_one_finding_is_reversed` — a
+#     decayed 0.961 finding plus two fresh 3.0 ones enter at 6.961; reversing
+#     the old one leaves 6.0 at the entry instant, at or above `C`, so the
+#     floor stands and the account is refused on day 30 even though its live
+#     score is already below `Q`. This is the case #884 exists for;
+#   - `an_entry_score_below_c_without_a_reversal_does_not_void_the_dwell` —
+#     the guard: no reversal, an empty ledger, and a shadow-only pair each
+#     leave the floor intact.
+#
+# **None of the three needs a cluster**, and that is not incidental: the rule
+# they cover is a pure function of the immutable `ya` rows and the durable
+# `dc` entry instant, both of which `MemAccountStore` and a static row source
+# model exactly. They are claimed here for the same reason every other
+# no-cluster entry in this list is — they run in this invocation and count the
+# same, and a floor that stops moving stops being a tripwire.
+#
+# The floor rises by those three: 538 -> 541.
+3

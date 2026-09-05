@@ -8,7 +8,7 @@
 use crate::store::IdentityError;
 use async_trait::async_trait;
 use orrery_persistd::adjudication::{
-    StrikeMode, StrikeRow, STRIKE_HALF_LIFE_MS, STRIKE_WEIGHT_TABLE_MILLI,
+    StrikeKind, StrikeMode, StrikeRow, STRIKE_HALF_LIFE_MS, STRIKE_WEIGHT_TABLE_MILLI,
 };
 use orrery_protocol::AccountId;
 use std::collections::HashMap;
@@ -261,6 +261,117 @@ pub fn score_rows(rows: &[StrikeRow], now_ms: u64) -> StandingScores {
     scores
 }
 
+/// The account's ledger with every reversed finding, and every appeal fact,
+/// removed — the rows that would have been there had the reversed findings
+/// never been filed.
+///
+/// This is the input to D33 clause (e)'s wrongful-cooldown test (#1083). The
+/// dwell floor introduced by #884 is blind to *why* a score fell:
+/// [`crate::cooldown`] compares `now` against the durable entry instant and
+/// nothing else, so an upheld appeal and fourteen days of decay are
+/// indistinguishable at that comparison. Telling them apart needs a second
+/// score taken **at the entry instant** over the rows an exoneration leaves
+/// standing. If those alone were already at or above `C`, the cooldown was
+/// earned by findings nobody reversed and its floor holds; if they were below
+/// `C`, the crossing was a consequence of the reversed finding and the floor
+/// is void.
+///
+/// Deliberately read-only, like the rest of this module: it derives a second
+/// view of the immutable `ya` rows and writes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExonerationRescore {
+    remaining: Vec<StrikeRow>,
+    live_reversals: usize,
+}
+
+impl ExonerationRescore {
+    /// Pair each [`StrikeKind::Appeal`] row with the positive finding it
+    /// compensates, and drop both.
+    ///
+    /// The pairing identity is `(evidence digest, negated weight, mode)`,
+    /// which is exactly what `uphold_appeal` copies onto the compensating row
+    /// (`crates/orrery_persistd/src/adjudication.rs:821-830`), and the same
+    /// `(digest, Appeal)` identity the ledger deduplicates appeals on
+    /// (`adjudication.rs:831-834`). Each appeal consumes at most one original,
+    /// so two appeals over one evidence digest — which that deduplication
+    /// already refuses — could not reverse a single finding twice here either.
+    ///
+    /// Unmatched appeals are dropped too: an appeal is a compensating fact
+    /// about a finding, never a finding of its own, and leaving one in would
+    /// let its negative weight lower the reconstructed entry score.
+    #[must_use]
+    pub fn from_rows(rows: &[StrikeRow]) -> Self {
+        let mut reversed = vec![false; rows.len()];
+        let mut live_reversals = 0;
+        for appeal in rows.iter().filter(|row| row.kind == StrikeKind::Appeal) {
+            let mut matched = None;
+            for (index, original) in rows.iter().enumerate() {
+                if reversed[index] || original.kind == StrikeKind::Appeal {
+                    continue;
+                }
+                if original.weight_milli > 0
+                    && original.mode == appeal.mode
+                    && original.evidence_ref.digest == appeal.evidence_ref.digest
+                    && appeal.weight_milli.checked_neg() == Some(original.weight_milli)
+                {
+                    matched = Some(index);
+                    break;
+                }
+            }
+            if let Some(index) = matched {
+                reversed[index] = true;
+                if rows[index].mode == StrikeMode::Live {
+                    live_reversals += 1;
+                }
+            }
+        }
+        let remaining = rows
+            .iter()
+            .enumerate()
+            .filter(|(index, row)| !reversed[*index] && row.kind != StrikeKind::Appeal)
+            .map(|(_, row)| row.clone())
+            .collect();
+        Self {
+            remaining,
+            live_reversals,
+        }
+    }
+
+    /// How many *live* findings upheld appeals reversed.
+    ///
+    /// A shadow pair never entered the enforcement score, so reversing one
+    /// cannot have caused a cooldown and does not count here.
+    #[must_use]
+    pub const fn live_reversals(&self) -> usize {
+        self.live_reversals
+    }
+
+    /// Score the surviving rows at an arbitrary instant.
+    ///
+    /// [`score_rows`] already skips a row whose `issued_at_ms` is after the
+    /// read instant, so scoring at a past instant reconstructs the ledger as
+    /// it stood then rather than as it stands now.
+    #[must_use]
+    pub fn score_at(&self, at_ms: u64) -> StandingScores {
+        score_rows(&self.remaining, at_ms)
+    }
+
+    /// Whether a cooldown entered at `entered_at_ms` was a consequence of a
+    /// reversed finding, and therefore carries no clause (d) minimum-cooldown
+    /// floor.
+    ///
+    /// Requires at least one reversed *live* finding, not merely a
+    /// reconstructed score below `C`. Without that guard a ledger holding no
+    /// appeals at all — or one whose rows have aged out of their 90-day
+    /// retention — would reconstruct an entry score of zero and void every
+    /// dwell, which is precisely the decay hole #884 closed.
+    #[must_use]
+    pub fn voids_dwell(&self, thresholds: StandingThresholds, entered_at_ms: u64) -> bool {
+        self.live_reversals > 0
+            && self.score_at(entered_at_ms).live_milli < thresholds.cooldown_milli
+    }
+}
+
 /// Read-only source of one account's `ya` values.
 #[async_trait]
 pub trait StrikeRowSource: Send + Sync {
@@ -303,7 +414,7 @@ pub struct ComputedStanding<R, C> {
 /// This is deliberately only the score and facts derived from the immutable
 /// rows. Applying the cooldown dwell policy, including its durable mutation,
 /// belongs to [`crate::CooldownStanding`], not this read-only module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandingObservation {
     /// The wall-clock instant at which the rows were scored.
     pub now_ms: u64,
@@ -316,6 +427,15 @@ pub struct StandingObservation {
     /// An appeal has a negative weight and cannot restart a cooldown. A row
     /// outside its live scoring interval cannot either.
     pub newest_live_strike_ms: Option<u64>,
+    /// The same rows with every reversed finding and every appeal removed,
+    /// carried so the dwell rule can re-score them at the durable entry
+    /// instant rather than at [`Self::now_ms`].
+    ///
+    /// It travels with the observation rather than being derived later: the
+    /// entry instant is only known after the `dc` row is read, which happens
+    /// in [`crate::cooldown`], and re-reading the ledger there would score the
+    /// two halves of one admission decision against two different snapshots.
+    pub exoneration: ExonerationRescore,
 }
 
 impl<R, C> ComputedStanding<R, C> {
@@ -366,6 +486,7 @@ impl<R, C> ComputedStanding<R, C> {
             scores,
             level: self.thresholds.classify(scores.live_milli),
             newest_live_strike_ms,
+            exoneration: ExonerationRescore::from_rows(&rows),
         })
     }
 
