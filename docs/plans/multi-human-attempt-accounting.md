@@ -608,7 +608,17 @@ clause above and which refuses rather than clamps.
   unit is now continuous; `player_hours = B * valid_attempt_seconds / 3600` is
   emitted when the host writes its report, because `Swarm::report` consumes
   `self` today. §9.5's blast radius therefore still applies to bot hours and no
-  longer applies to human ones.
+  longer applies to human ones. **This is now a decision rather than a gap
+  (#1092):** the exposure is accepted, because a bot generation is re-runnable
+  without a volunteer — `real_time` is on only while an external seat is
+  connected (`gates/p1-swarm/src/swarm.rs:3106`), so the campaign's own shape
+  re-runs in 19–22 wall seconds for its 1.25 bot player-hours — while the
+  alternative would bank prefixes of generations whose attempt-wide evidence
+  later failed, on the majority half of the flat 500. Measured exposure to
+  date: zero hours. See
+  [`docs/spikes/1092-bot-hour-exposure-decision.md`](../spikes/1092-bot-hour-exposure-decision.md)
+  for the numbers, the cost of the two alternatives, and the three conditions
+  that would reopen it.
 * **An attempt-wide refusal cannot void a banked increment.** This is the cost
   the decision accepts and it is real: a false positive raised at minute 14 used
   to void minutes 0–13, and cannot now. Every attempt-wide clause in §6 is
