@@ -26,9 +26,11 @@
 pub mod abi;
 pub mod ecs;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use orrery_core::{CoreCodec, Executor, Ruleset, SealedTickInputs, SteppedEntity, TickBackend};
+use orrery_core::{
+    CoreCodec, Executor, NeighborFrame, Ruleset, SealedTickInputs, SteppedEntity, TickBackend,
+};
 use orrery_protocol::{PersistId, RulesetId, Tick, UniverseSeed};
 
 const PERSIST_ID_BYTES: usize = size_of::<u64>();
@@ -122,6 +124,99 @@ impl<I> Delivery<I> {
     pub const fn new(recipient: PersistId, input: I) -> Self {
         Self { recipient, input }
     }
+
+    /// Who this delivery is addressed to.
+    #[must_use]
+    pub const fn recipient(&self) -> PersistId {
+        self.recipient
+    }
+
+    /// The input this delivery carries.
+    #[must_use]
+    pub const fn input(&self) -> &I {
+        &self.input
+    }
+
+    /// Consume the delivery and take its input.
+    ///
+    /// A driver that routes a delivery somewhere other than this host — over a
+    /// wire to a remote authority, say — needs the owned input to encode, and
+    /// read [`Self::recipient`] before this call to address it.
+    #[must_use]
+    pub fn into_input(self) -> I {
+        self.input
+    }
+}
+
+/// Where the host got one input that a tick sealed.
+///
+/// This is the host's half of what a witness log calls provenance. It is
+/// deliberately not `orrery_core::RecordSource`: the host knows only whether an
+/// input arrived from outside or was produced by its own adapter, and which
+/// entity's event produced it. A driver maps these onto its log's own source
+/// vocabulary, which is where the wire's `from` and a per-tick input sequence
+/// live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOrigin {
+    /// Handed to the host from outside, by [`SimulationHost::submit_input`] or
+    /// [`SimulationHost::submit_command_bytes`].
+    Submitted,
+    /// Handed to the host from outside as an input another authority already
+    /// delivered, by [`SimulationHost::submit_delivered_input`]. `from` is
+    /// whatever the caller named — on a client that is the wire envelope's
+    /// sender, which the host has no other way to know.
+    Inbound {
+        /// The authority the caller says produced this input.
+        from: PersistId,
+    },
+    /// Produced by this host's own [`RulesetAdapter`] from `source`'s event on
+    /// an earlier tick, and queued back into this host.
+    Delivered {
+        /// The entity whose emitted event the adapter turned into this input.
+        source: PersistId,
+    },
+}
+
+/// One input a tick sealed, borrowed with its recipient and its provenance.
+///
+/// A named record, not a positional triple: this is the value a witness log
+/// folds, and a log that mis-pairs an input with a source is a log that cannot
+/// be replayed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SealedInput<'a, I> {
+    recipient: PersistId,
+    input: &'a I,
+    origin: InputOrigin,
+}
+
+// Hand-written, so a borrowed view is `Copy` whatever the input type is: the
+// derives would demand `I: Copy` for a struct that only ever holds `&I`.
+impl<I> Clone for SealedInput<'_, I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<I> Copy for SealedInput<'_, I> {}
+
+impl<I> SealedInput<'_, I> {
+    /// The entity this input steps.
+    #[must_use]
+    pub const fn recipient(&self) -> PersistId {
+        self.recipient
+    }
+
+    /// The sealed input itself.
+    #[must_use]
+    pub const fn input(&self) -> &I {
+        self.input
+    }
+
+    /// Where the host got it.
+    #[must_use]
+    pub const fn origin(&self) -> InputOrigin {
+        self.origin
+    }
 }
 
 /// A routing adapter for rulesets whose emitted events have no next-tick
@@ -132,6 +227,139 @@ pub struct NoEventRouting;
 impl<R: Ruleset> RulesetAdapter<R> for NoEventRouting {
     fn deliver(&self, _event: &R::CoreEvent) -> Option<Delivery<R::CoreInput>> {
         None
+    }
+}
+
+/// Which of the host's entities one [`SimulationHost::step_predicted`] call
+/// advances.
+///
+/// [`SimulationHost::step`] advances the whole tick-boundary population, which
+/// is what an authority does and what a local practice session — where the
+/// client *is* the authority for every craft — wants. A client joined to a
+/// remote authority is in the opposite position: it predicts its own craft and
+/// holds replicas of everyone else's, and a replicated body is **frozen**
+/// between refreshes. Advancing a replica by its own velocity would state a
+/// position no authority ever claimed, so the predicted set has to be nameable.
+///
+/// A newtype over the set rather than a bare `&[PersistId]`, because the empty
+/// slice and "everything" are different instructions and a slice cannot tell
+/// them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredictionSet(Predicted);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Predicted {
+    Everything,
+    Only(BTreeSet<PersistId>),
+}
+
+impl PredictionSet {
+    /// Advance every entity installed at the tick boundary.
+    ///
+    /// This is exactly what [`SimulationHost::step`] does, and stepping with
+    /// it goes down the same `TickBackend::step_tick` path — including its
+    /// materialization-winner ordering.
+    #[must_use]
+    pub const fn everything() -> Self {
+        Self(Predicted::Everything)
+    }
+
+    /// Advance only the named entities, each in ascending [`PersistId`] order.
+    ///
+    /// A named entity the host does not hold is skipped, exactly as
+    /// `TickBackend::step_entity` returns `None` for it. Everything else keeps
+    /// the state and the observation stamp it had.
+    #[must_use]
+    pub fn only(entities: impl IntoIterator<Item = PersistId>) -> Self {
+        Self(Predicted::Only(entities.into_iter().collect()))
+    }
+
+    /// Advance exactly one entity: the campaign client's own craft.
+    #[must_use]
+    pub fn just(entity: PersistId) -> Self {
+        Self::only([entity])
+    }
+
+    /// Whether this set is [`Self::everything`] rather than a naming.
+    #[must_use]
+    pub const fn is_everything(&self) -> bool {
+        matches!(self.0, Predicted::Everything)
+    }
+
+    /// Whether `entity` steps under this set.
+    #[must_use]
+    pub fn contains(&self, entity: PersistId) -> bool {
+        match &self.0 {
+            Predicted::Everything => true,
+            Predicted::Only(named) => named.contains(&entity),
+        }
+    }
+}
+
+impl Default for PredictionSet {
+    fn default() -> Self {
+        Self::everything()
+    }
+}
+
+/// The caller's participation in a tick that [`SimulationHost::step_predicted`]
+/// executes.
+///
+/// Two hooks, both defaulted to the behaviour [`SimulationHost::step`] already
+/// has, so implementing neither is the existing host:
+///
+/// - [`Self::sealed`] hands over the tick's sealed order vector, with
+///   provenance, at S0 — after input became immutable and before any rule ran.
+///   That is the exact moment a witness log records inputs, and the host used
+///   to seal privately and never say what it sealed.
+/// - [`Self::route`] decides where one adapter delivery goes. Returning it
+///   queues it into this host's own next-tick input buffer, which is what
+///   `step` does. Returning `None` means the caller took it — a joined client
+///   routes it over the wire to the authority that owns the recipient, and
+///   that authority, not this host, decides whether it becomes input.
+///
+/// This is a borrowed per-call object on purpose. [`RulesetAdapter`] is
+/// `Send + Sync + 'static` and built at host construction, so it structurally
+/// cannot borrow a per-tick link; a participant passed by `&mut` can.
+pub trait TickParticipant<R: Ruleset> {
+    /// Whether [`Self::sealed`] should be called at all.
+    ///
+    /// The host assembles the borrowed provenance view only when this is true,
+    /// so a participant that does not watch the seal costs nothing per tick.
+    fn observes_seal(&self) -> bool {
+        true
+    }
+
+    /// Observe what became immutable input for `tick`.
+    ///
+    /// Entries are in the order the tick applies them: recipient ascending,
+    /// then queue order within a recipient — the same total order
+    /// `SealedTickInputs` hands the backend.
+    fn sealed(&mut self, tick: Tick, inputs: &[SealedInput<'_, R::CoreInput>]) {
+        let _ = (tick, inputs);
+    }
+
+    /// Route one delivery the adapter produced from `source`'s event.
+    ///
+    /// Return it to queue it into this host, or `None` to take it.
+    fn route(
+        &mut self,
+        source: PersistId,
+        delivery: Delivery<R::CoreInput>,
+    ) -> Option<Delivery<R::CoreInput>> {
+        let _ = source;
+        Some(delivery)
+    }
+}
+
+/// The participant [`SimulationHost::step`] uses: watch nothing, and let every
+/// adapter delivery become this host's own next-tick input.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostRoutedTick;
+
+impl<R: Ruleset> TickParticipant<R> for HostRoutedTick {
+    fn observes_seal(&self) -> bool {
+        false
     }
 }
 
@@ -424,6 +652,28 @@ pub struct StepReport {
     /// Hashes in canonical execution order: tick ascending, then `PersistId`
     /// ascending within a tick.
     pub state_hashes: Vec<StateHash>,
+    /// Neighbour reads each stepped entity actually performed, in the same
+    /// canonical execution order, and omitting the entities that read none.
+    ///
+    /// A witness log folds these as `RecordSource::NeighborFrame` records
+    /// immediately after the tick's input records, and replay verifies the
+    /// performed read sequence against them. They are what closes the
+    /// honest-replication-lag ambiguity, so the seam carries them rather than
+    /// letting a driver that steps through the host silently log fewer records
+    /// than the same driver stepping the executor directly.
+    pub neighbor_frames: Vec<SteppedNeighbors>,
+}
+
+/// The neighbour reads one entity performed on one executed tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteppedNeighbors {
+    /// The entity that performed the reads.
+    pub entity: PersistId,
+    /// The tick it was advanced on.
+    pub tick: Tick,
+    /// Its reads, in first-read order — `TickOutcome::neighbor_frames`
+    /// verbatim.
+    pub frames: Vec<NeighborFrame>,
 }
 
 /// A caller-owned contiguous event buffer.
@@ -480,12 +730,12 @@ impl OutputBuffer {
 }
 
 struct PendingInputs<I> {
-    inputs: Vec<I>,
+    inputs: Vec<HeldInput<I>>,
 }
 
 impl<I> PendingInputs<I> {
-    fn push(&mut self, input: I) {
-        self.inputs.push(input);
+    fn push(&mut self, input: I, origin: InputOrigin) {
+        self.inputs.push(HeldInput { input, origin });
     }
 }
 
@@ -495,14 +745,37 @@ impl<I> Default for PendingInputs<I> {
     }
 }
 
+/// One queued input and where the host got it.
+///
+/// A named record rather than a `(I, InputOrigin)` pair in the queue's vector:
+/// the provenance travels with the input to the seal, and nothing downstream
+/// has to remember which half of a pair is which.
+struct HeldInput<I> {
+    input: I,
+    origin: InputOrigin,
+}
+
 struct QueuedInput<I> {
     target: PersistId,
     input: I,
+    origin: InputOrigin,
 }
 
 impl<I> QueuedInput<I> {
     const fn new(target: PersistId, input: I) -> Self {
-        Self { target, input }
+        Self {
+            target,
+            input,
+            origin: InputOrigin::Submitted,
+        }
+    }
+
+    const fn with_origin(target: PersistId, input: I, origin: InputOrigin) -> Self {
+        Self {
+            target,
+            input,
+            origin,
+        }
     }
 }
 
@@ -711,7 +984,11 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
             .pending_inputs
             .iter()
             .map(|(recipient, pending)| {
-                let inputs = pending.inputs.iter().map(CoreCodec::to_canonical).collect();
+                let inputs = pending
+                    .inputs
+                    .iter()
+                    .map(|held| held.input.to_canonical())
+                    .collect();
                 (*recipient, inputs)
             })
             .collect();
@@ -784,8 +1061,16 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
         for (recipient, inputs) in &snapshot.queued_inputs {
             let mut pending = PendingInputs::default();
             for input in inputs {
-                pending
-                    .push(R::CoreInput::decode(input).map_err(|_| HostError::MalformedSnapshot)?);
+                // The snapshot byte format carries the queued inputs and not
+                // their provenance, and S0–S6 freezes that format. A restored
+                // input is therefore `Submitted`: it is one the caller handed
+                // this host, which is what a snapshot's queue is from the
+                // restored host's point of view. Provenance is a live-tick
+                // observation ([`TickParticipant::sealed`]), never persisted.
+                pending.push(
+                    R::CoreInput::decode(input).map_err(|_| HostError::MalformedSnapshot)?,
+                    InputOrigin::Submitted,
+                );
             }
             queued.insert(*recipient, pending);
         }
@@ -847,6 +1132,34 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
         self.queue_input(QueuedInput::new(entity, input));
     }
 
+    /// Queue one typed input that another authority already delivered.
+    ///
+    /// Identical to [`Self::submit_input`] in every way a tick can observe —
+    /// same buffer, same position in it, same sealing — and different only in
+    /// the provenance a [`TickParticipant::sealed`] hook reads back:
+    /// [`InputOrigin::Inbound`] carrying `from`. A joined client needs that
+    /// distinction because its witness log records a delivered order as
+    /// `RecordSource::InboundEvent { from }` and its own as
+    /// `RecordSource::OwnPlayer`, and `from` arrives on the wire envelope,
+    /// which this host never sees.
+    ///
+    /// Submission order is still what decides tick order, so a driver that
+    /// submits the deliveries it received before the orders the player
+    /// authored gets D46 clause (d)'s delivered-first vector without the host
+    /// re-sorting anything.
+    pub fn submit_delivered_input(
+        &mut self,
+        entity: PersistId,
+        from: PersistId,
+        input: R::CoreInput,
+    ) {
+        self.queue_input(QueuedInput::with_origin(
+            entity,
+            input,
+            InputOrigin::Inbound { from },
+        ));
+    }
+
     /// Advance exactly `ticks` canonical ticks, and never read wall time.
     ///
     /// Inputs already queued at the call boundary are sealed for the first
@@ -854,30 +1167,128 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
     /// so their adapter deliveries can become inputs no earlier than the next
     /// tick, as D43 requires.
     pub fn step(&mut self, ticks: TickCount) -> StepReport {
+        self.step_predicted(ticks, &PredictionSet::everything(), &mut HostRoutedTick)
+    }
+
+    /// Advance exactly `ticks` canonical ticks over a named prediction set,
+    /// with the caller participating in each tick.
+    ///
+    /// [`Self::step`] is this call with [`PredictionSet::everything`] and
+    /// [`HostRoutedTick`], and takes the identical path through the backend:
+    /// the everything case is still one `TickBackend::step_tick` per tick, so
+    /// its materialization-winner ordering and its bytes are the same values,
+    /// produced by the same code.
+    ///
+    /// Naming a subset changes only *which* entities the storage advances. Each
+    /// named entity steps through `TickBackend::step_entity` in ascending
+    /// [`PersistId`] order, on its own sealed input slice; an entity outside
+    /// the set is untouched, keeping both its canonical bytes and its
+    /// observation stamp. That is what lets a client predict its own craft
+    /// while the replicas it holds of remote craft stay frozen between
+    /// refreshes.
+    ///
+    /// Sealing, delivery timing and the clock are unchanged in both cases:
+    /// input queued at the call boundary is sealed for the first tick, and an
+    /// adapter delivery produced inside a tick can become input no earlier than
+    /// the next one (D43), whoever routes it.
+    pub fn step_predicted<P: TickParticipant<R> + ?Sized>(
+        &mut self,
+        ticks: TickCount,
+        prediction: &PredictionSet,
+        participant: &mut P,
+    ) -> StepReport {
         let first_tick = self.next_tick;
         let mut state_hashes = Vec::new();
+        let mut neighbor_frames = Vec::new();
 
         for _ in 0..ticks.get() {
             let tick = self.next_tick;
             // S0: all externally queued input becomes immutable for this tick.
             let queued = std::mem::take(&mut self.pending_inputs);
+            let observes_seal = participant.observes_seal();
             let mut sealed = SealedTickInputs::new();
+            // Recipients in ascending order and the flat provenance run beside
+            // them: together they re-address the sealed inputs, which
+            // `SealedTickInputs` deliberately owns without saying where they
+            // came from.
+            let mut recipients = Vec::new();
+            let mut origins = Vec::new();
             for (target, pending) in queued {
-                sealed.extend(target, pending.inputs);
+                if observes_seal {
+                    recipients.push(target);
+                }
+                for held in pending.inputs {
+                    if observes_seal {
+                        origins.push(held.origin);
+                    }
+                    sealed.push(target, held.input);
+                }
             }
-            // The backend snapshots its population at the tick boundary and
-            // steps it in canonical PersistId order.  Materializations happen
-            // inside a step but are not in that snapshot, so cannot step this
-            // tick.
-            for SteppedEntity { entity, outcome } in self.backend.step_tick(tick, &sealed) {
+            if observes_seal {
+                let mut origins = origins.iter();
+                let mut view = Vec::new();
+                for recipient in &recipients {
+                    for input in sealed.for_entity(*recipient) {
+                        let origin = origins.next().copied().unwrap_or(InputOrigin::Submitted);
+                        view.push(SealedInput {
+                            recipient: *recipient,
+                            input,
+                            origin,
+                        });
+                    }
+                }
+                participant.sealed(tick, &view);
+            }
+            let stepped = match &prediction.0 {
+                // The backend snapshots its population at the tick boundary
+                // and steps it in canonical PersistId order.  Materializations
+                // happen inside a step but are not in that snapshot, so cannot
+                // step this tick.
+                Predicted::Everything => self.backend.step_tick(tick, &sealed),
+                Predicted::Only(named) => {
+                    let mut stepped = Vec::new();
+                    for entity in self.backend.entities() {
+                        if !named.contains(&entity) {
+                            continue;
+                        }
+                        let Some(outcome) =
+                            self.backend
+                                .step_entity(entity, tick, sealed.for_entity(entity))
+                        else {
+                            continue;
+                        };
+                        stepped.push(SteppedEntity { entity, outcome });
+                    }
+                    stepped
+                }
+            };
+            let track_advanced = !prediction.is_everything();
+            let mut advanced = BTreeSet::new();
+            for SteppedEntity { entity, outcome } in stepped {
+                if track_advanced {
+                    advanced.insert(entity);
+                }
                 state_hashes.push(StateHash {
                     entity,
                     tick,
                     hash: outcome.state_hash,
                 });
+                if !outcome.neighbor_frames.is_empty() {
+                    neighbor_frames.push(SteppedNeighbors {
+                        entity,
+                        tick,
+                        frames: outcome.neighbor_frames,
+                    });
+                }
                 for event in outcome.events {
                     if let Some(delivery) = self.adapter.deliver(&event) {
-                        self.queue_input(QueuedInput::new(delivery.recipient, delivery.input));
+                        if let Some(delivery) = participant.route(entity, delivery) {
+                            self.queue_input(QueuedInput::with_origin(
+                                delivery.recipient,
+                                delivery.input,
+                                InputOrigin::Delivered { source: entity },
+                            ));
+                        }
                     }
                     self.emitted_events.push(SourcedEvent {
                         source: entity,
@@ -886,11 +1297,31 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
                 }
             }
             self.next_tick = Tick::new(self.next_tick.0.saturating_add(1));
-            // Every entity present at the boundary stepped and every
-            // materialization settled at T+1, on both backends; the mirror
-            // follows.  An entity installed since the last tick was stepped
-            // too, so its install stamp is superseded.
-            self.installed_at.clear();
+            if prediction.is_everything() {
+                // Every entity present at the boundary stepped and every
+                // materialization settled at T+1, on both backends; the mirror
+                // follows.  An entity installed since the last tick was stepped
+                // too, so its install stamp is superseded.
+                self.installed_at.clear();
+            } else {
+                // Only the advanced entities carry a T+1 stamp, so
+                // `stepped_at` alone can no longer answer for the rest. Pin
+                // every unadvanced entity to the stamp it already answers with
+                // before `stepped_at` moves past it — that is what keeps a
+                // frozen replica's age honest, which is the whole point of not
+                // stepping it.
+                let previous = self.stepped_at;
+                for entity in self.backend.entities() {
+                    if advanced.contains(&entity) {
+                        self.installed_at.remove(&entity);
+                    } else if let Some(previous) = previous {
+                        // `or_insert`, not `insert`: an entity carrying its own
+                        // install stamp already answers correctly and must keep
+                        // it.
+                        self.installed_at.entry(entity).or_insert(previous);
+                    }
+                }
+            }
             self.stepped_at = Some(self.next_tick);
         }
 
@@ -898,6 +1329,7 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
             first_tick,
             next_tick: self.next_tick,
             state_hashes,
+            neighbor_frames,
         }
     }
 
@@ -963,7 +1395,7 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
         self.pending_inputs
             .entry(queued.target)
             .or_default()
-            .push(queued.input);
+            .push(queued.input, queued.origin);
     }
 }
 
