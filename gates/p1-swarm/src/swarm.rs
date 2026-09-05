@@ -1025,7 +1025,10 @@ pub struct SwarmReport {
     pub witnessing: bool,
     /// What each external peer did, ordered by swarm slot (#385, #571).
     pub external: Vec<ExteriorReport>,
-    /// Player-hours accumulated: peers times simulated seconds.
+    /// Player-hours accumulated: peers times `valid_attempt_seconds`, i.e. the
+    /// seconds the attempt actually ran rather than the seconds it was
+    /// configured for (#1098) — a short attempt reports fewer hours than its
+    /// budget.
     ///
     /// **Not the figure the campaign ledger banks.** It is one number for the
     /// whole cohort, and #576 replaced it for accounting purposes with one
@@ -3800,7 +3803,7 @@ impl Swarm {
                 external.sort_by_key(|seat| seat.index);
                 external
             },
-            player_hours: self.total_peers() as f64 * self.config.seconds as f64 / 3_600.0,
+            player_hours: self.total_peers() as f64 * valid_attempt_seconds as f64 / 3_600.0,
             attempt_id,
             bots,
             valid_attempt_seconds,
@@ -7195,6 +7198,42 @@ mod tests {
             "a send refused over the lane's size limit must be visible in the report row"
         );
         assert_eq!(report.total_oversized_sends, 1);
+    }
+
+    /// #1098: a short attempt must report fewer hours than its configured
+    /// budget. `formed_pair` runs at the default `seconds: 3_600`, but this
+    /// report is taken after stepping only 60 ticks (one simulated second at
+    /// `TICK_HZ == 60`), so `completed` is false and the budget the attempt
+    /// was asked for (3_600 s, i.e. 2 peers * 3_600 / 3_600 = 2.0 player-hours)
+    /// must not appear in `player_hours` — a completed run would agree with
+    /// the budget either way, which is exactly what let this bug hide.
+    #[test]
+    fn a_short_attempt_reports_fewer_hours_than_its_budget() {
+        let mut swarm = formed_pair();
+        ticks(&mut swarm, 60);
+        let report = swarm.report(60, None);
+
+        assert!(
+            !report.completed,
+            "60 of 3_600 * TICK_HZ ticks is a short attempt"
+        );
+        assert_eq!(
+            report.valid_attempt_seconds, 1,
+            "60 ticks at TICK_HZ == 60 is one actual second"
+        );
+
+        let budget_hours = 2.0 * 3_600.0 / 3_600.0;
+        let actual_hours = 2.0 * report.valid_attempt_seconds as f64 / 3_600.0;
+        assert!(
+            (report.player_hours - actual_hours).abs() < 1e-9,
+            "player_hours must be derived from valid_attempt_seconds ({actual_hours}), got {}",
+            report.player_hours
+        );
+        assert!(
+            report.player_hours < budget_hours,
+            "a short attempt's player_hours ({}) must be fewer than its budget's ({budget_hours})",
+            report.player_hours
+        );
     }
 
     #[test]
