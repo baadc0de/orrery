@@ -14,7 +14,9 @@ heightfield/voxel grids).
 ## What runs
 
 * `unreal/` — a UE 5.8 editor module with two commandlets.
-  * `CookBody -seed=<u64> -body=<id> -out=<dir> [-size=256 -spacing=1 -density=0.03 -hfcell=500 -voxedge=500 -nonanite -simplifycollision -deterministicguids]`
+  * `CookBody -seed=<u64> -body=<id> -out=<dir> [-size=256 -spacing=1 -density=0.03 -hfcell=500 -voxedge=500 -nonanite -simplifycollision -randomguids]`
+    (canonical GUIDs are the default since #1082; `-randomguids` restores the engine's, and the
+    old `-deterministicguids` is a synonym for the default)
     builds one Mesh Terrain body (a 256 m base plane at 1 m spacing plus two
     seed-driven fBM noise modifiers) through the Mesh Partition editor
     pipeline, runs PCG scatter at cook time, saves `Body_<id>.umap` and writes
@@ -153,7 +155,7 @@ Two cooks of seed 1 on this machine (`out-256a`, `out-256b`): the three
 collision packages are byte-identical (blake3 equal), the **`.umap` is not**:
 5560 bytes differ in 195 runs, mostly 32-byte hashes/GUID strings — the
 package summary hash at offset 519 and PCG node/pin GUIDs inside the saved
-graph. Seeding the actor GUIDs (`-deterministicguids`, `out-256c/d`) removes 246
+graph. Seeding the actor GUIDs (spike-time `-deterministicguids`, `out-256c/d`; finished and made the default by #1082, see `docs/spikes/1082-canonical-guids/`) removes 246
 bytes and leaves 5314. So: the *content* the cook produces is a function of
 the seed (the same 1972 instances, the same triangles, the same collision
 packages), but Unreal's package bytes carry authoring-time GUIDs and a save

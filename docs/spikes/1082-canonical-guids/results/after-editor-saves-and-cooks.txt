@@ -1,0 +1,51 @@
+cookbody-linux.sh: line 13: 1413483 Segmentation fault         (core dumped) env -u WAYLAND_DISPLAY -u DISPLAY "$UE/Engine/Binaries/Linux/UnrealEditor-Cmd" "$PROJ/OneBodyCook.uproject" -run=CookBody $ARGS -out="$OUT" -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoLogTimes > "$LOG" 2>&1
+exit: 139 wall: 15.2 s log: /home/baadc0de/Development/orrery-onebody/out-e/cook-1788632346.log
+LogCookBody: Display: CookBody seed=1 body=2 out=/home/baadc0de/Development/orrery-onebody/out-e size=256m spacing=1.00m density=0.030/m2 nanite=1
+LogCookBody: Display: intermediate FMeshData: 66049 verts, 131072 tris in 0.02s
+LogCookBody: Display: transformers (StaticMesh+Nanite, Collision, OrreryExport) in 0.26s + 0.00s async static mesh/Nanite build
+LogCookBody: Display: section static mesh MeshPartitionStaticMesh_0: nanite=1, LODs=1, LOD0 tris=26213
+LogCookBody: Display: PCG pins: input.out=[In,] output.in=[Out,] rayhit.in=[Execution Dependency,Overrides,ShapeType,BoxHalfExtent,SphereRadius,CapsuleRadius,CapsuleHalfHeight,ShapeRotation,bOverrideDefaultParams,RayOrigin,RayDirection,RayLength,bIgnoreBackfaceHits,bGetImpact,bGetImpactPoint,bGetImpactNormal,bGetReflection,bGetDistance,bGetLocalImpactPoint,bGetReferenceToRenderMaterial,bGetReferenceToStaticMesh,bGetFaceIndex,bGetUVCoords,bGetElementIndex,bGetSectionIndex,bApplyMetadataFromLandscape,bUseRenderMaterialIndex,RenderMaterialIndex,bGetRenderMaterialIndex,UVChannel,bIgnorePCGHits,bIgnoreSelfHits,CollisionChannel,bTraceComplex,ActorTagFilter,ActorTagsList,ActorClassFilter,ActorClass,ActorFilterFromInput,ActorFilterInputSource,SelectLandscapeHits,bGetReferenceToActorHit,bGetReferenceToPhysicalMaterial,] rayhit.out=[Out,] sampler.in=[Surface,Bounding Shape,Execution Dependency,Overrides,PointsPerSquaredMeter,PointExtents,Looseness,bUnbounded,bApplyDensityToPoints,PointSteepness,bKeepZeroDensityPoints,Seed,] spawner.in=[In,Execution Dependency,Overrides,TargetActor,bAllowMergeDifferentDataInSameInstancedComponents,Seed,]
+LogCookBody: Display: PCG placed 1972 instances (591692 triangles) in 0.19s
+LogCookBody: Display: canonical guids: 11 actors, 6 LOD map-build ids on 8 static mesh components, 4 ISM instancing seeds, 1 static meshes, 2 body setups, 1 level build-data id rewritten from the seed / content
+LogCookBody: Display: saved /home/baadc0de/Development/orrery-onebody/out-e/Body_2.umap: ok (6024567 bytes) in 0.07s
+Ensure condition failed: !bInitialized [File:./Runtime/Engine/Private/Subsystems/WorldSubsystem.cpp] [Line: 118] 
+cookbody-linux.sh: line 13: 1422227 Segmentation fault         (core dumped) env -u WAYLAND_DISPLAY -u DISPLAY "$UE/Engine/Binaries/Linux/UnrealEditor-Cmd" "$PROJ/OneBodyCook.uproject" -run=CookBody $ARGS -out="$OUT" -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoLogTimes > "$LOG" 2>&1
+exit: 139 wall: 20.8 s log: /home/baadc0de/Development/orrery-onebody/out-f/cook-1788632361.log
+LogCookBody: Display: CookBody seed=1 body=2 out=/home/baadc0de/Development/orrery-onebody/out-f size=256m spacing=1.00m density=0.030/m2 nanite=1
+LogCookBody: Display: intermediate FMeshData: 66049 verts, 131072 tris in 0.02s
+LogCookBody: Display: transformers (StaticMesh+Nanite, Collision, OrreryExport) in 0.26s + 0.00s async static mesh/Nanite build
+LogCookBody: Display: section static mesh MeshPartitionStaticMesh_0: nanite=1, LODs=1, LOD0 tris=26213
+LogCookBody: Display: PCG pins: input.out=[In,] output.in=[Out,] rayhit.in=[Execution Dependency,Overrides,ShapeType,BoxHalfExtent,SphereRadius,CapsuleRadius,CapsuleHalfHeight,ShapeRotation,bOverrideDefaultParams,RayOrigin,RayDirection,RayLength,bIgnoreBackfaceHits,bGetImpact,bGetImpactPoint,bGetImpactNormal,bGetReflection,bGetDistance,bGetLocalImpactPoint,bGetReferenceToRenderMaterial,bGetReferenceToStaticMesh,bGetFaceIndex,bGetUVCoords,bGetElementIndex,bGetSectionIndex,bApplyMetadataFromLandscape,bUseRenderMaterialIndex,RenderMaterialIndex,bGetRenderMaterialIndex,UVChannel,bIgnorePCGHits,bIgnoreSelfHits,CollisionChannel,bTraceComplex,ActorTagFilter,ActorTagsList,ActorClassFilter,ActorClass,ActorFilterFromInput,ActorFilterInputSource,SelectLandscapeHits,bGetReferenceToActorHit,bGetReferenceToPhysicalMaterial,] rayhit.out=[Out,] sampler.in=[Surface,Bounding Shape,Execution Dependency,Overrides,PointsPerSquaredMeter,PointExtents,Looseness,bUnbounded,bApplyDensityToPoints,PointSteepness,bKeepZeroDensityPoints,Seed,] spawner.in=[In,Execution Dependency,Overrides,TargetActor,bAllowMergeDifferentDataInSameInstancedComponents,Seed,]
+LogCookBody: Display: PCG placed 1972 instances (591692 triangles) in 0.18s
+LogCookBody: Display: canonical guids: 11 actors, 6 LOD map-build ids on 8 static mesh components, 4 ISM instancing seeds, 1 static meshes, 2 body setups, 1 level build-data id rewritten from the seed / content
+LogCookBody: Display: saved /home/baadc0de/Development/orrery-onebody/out-f/Body_2.umap: ok (6024567 bytes) in 0.04s
+Ensure condition failed: !bInitialized [File:./Runtime/Engine/Private/Subsystems/WorldSubsystem.cpp] [Line: 118] 
+--- editor-save diff out-e/out-f
+== Body_2.umap: 6024567 / 6024567 bytes, sha1 DIFFER (afb7f678fdef / eb757ee2b8cc), 3859 differing bytes in 569 runs
+== body-2.hf.collision: 1483568 / 1483568 bytes, sha1 EQUAL (a35f09b76724 / a35f09b76724), 0 differing bytes in 0 runs
+== body-2.tri.collision: 19821904 / 19821904 bytes, sha1 EQUAL (2e56de7293cf / 2e56de7293cf), 0 differing bytes in 0 runs
+== body-2.vox.collision: 2736210 / 2736210 bytes, sha1 EQUAL (79bc2c2fa529 / 79bc2c2fa529), 0 differing bytes in 0 runs
+cook canon-e (Body_2, Linux) rc=0 wall=6.0 s
+LogCook: Display: Cooked packages 0 Packages Remain 449 Total 449
+LogCook: Display: Cooked packages 505 Packages Remain 0 Total 505
+LogCook: Display: Cook by the book total time in tick 1.144011s total time 2.462741
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+total 4016
+-rw-r--r-- 1 baadc0de baadc0de 4082109 Sep  5 20:19 Body_2.uexp
+-rw-r--r-- 1 baadc0de baadc0de   27073 Sep  5 20:19 Body_2.umap
+cook canon-f (Body_2, Linux) rc=0 wall=5.9 s
+LogCook: Display: Cooked packages 0 Packages Remain 449 Total 449
+LogCook: Display: Cooked packages 505 Packages Remain 0 Total 505
+LogCook: Display: Cook by the book total time in tick 1.100653s total time 2.392426
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+total 4016
+-rw-r--r-- 1 baadc0de baadc0de 4082109 Sep  5 20:19 Body_2.uexp
+-rw-r--r-- 1 baadc0de baadc0de   27073 Sep  5 20:19 Body_2.umap
+--- cooked diff canon-e vs canon-f
+== Body_2.uexp: 4082109 / 4082109 bytes, sha1 EQUAL (cdf0740a95b8 / cdf0740a95b8), 0 differing bytes in 0 runs
+== Body_2.umap: 27073 / 27073 bytes, sha1 EQUAL (a1e5e4422626 / a1e5e4422626), 0 differing bytes in 0 runs
+diff exit: 0

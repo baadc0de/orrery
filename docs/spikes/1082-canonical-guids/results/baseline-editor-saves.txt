@@ -1,0 +1,78 @@
+cookbody-linux.sh: line 13: 1409859 Segmentation fault         (core dumped) env -u WAYLAND_DISPLAY -u DISPLAY "$UE/Engine/Binaries/Linux/UnrealEditor-Cmd" "$PROJ/OneBodyCook.uproject" -run=CookBody $ARGS -out="$OUT" -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoLogTimes > "$LOG" 2>&1
+cookbody-linux.sh: line 17: bc: command not found
+exit: 139 wall:  s log: /home/baadc0de/Development/orrery-onebody/out-a/cook-1788631843.log
+LogCookBody: Display: CookBody seed=1 body=2 out=/home/baadc0de/Development/orrery-onebody/out-a size=256m spacing=1.00m density=0.030/m2 nanite=1
+LogCookBody: Display: intermediate FMeshData: 66049 verts, 131072 tris in 0.02s
+LogCookBody: Display: transformers (StaticMesh+Nanite, Collision, OrreryExport) in 0.26s + 0.88s async static mesh/Nanite build
+LogCookBody: Display: section static mesh MeshPartitionStaticMesh_0: nanite=1, LODs=1, LOD0 tris=26213
+LogCookBody: Display: PCG pins: input.out=[In,] output.in=[Out,] rayhit.in=[Execution Dependency,Overrides,ShapeType,BoxHalfExtent,SphereRadius,CapsuleRadius,CapsuleHalfHeight,ShapeRotation,bOverrideDefaultParams,RayOrigin,RayDirection,RayLength,bIgnoreBackfaceHits,bGetImpact,bGetImpactPoint,bGetImpactNormal,bGetReflection,bGetDistance,bGetLocalImpactPoint,bGetReferenceToRenderMaterial,bGetReferenceToStaticMesh,bGetFaceIndex,bGetUVCoords,bGetElementIndex,bGetSectionIndex,bApplyMetadataFromLandscape,bUseRenderMaterialIndex,RenderMaterialIndex,bGetRenderMaterialIndex,UVChannel,bIgnorePCGHits,bIgnoreSelfHits,CollisionChannel,bTraceComplex,ActorTagFilter,ActorTagsList,ActorClassFilter,ActorClass,ActorFilterFromInput,ActorFilterInputSource,SelectLandscapeHits,bGetReferenceToActorHit,bGetReferenceToPhysicalMaterial,] rayhit.out=[Out,] sampler.in=[Surface,Bounding Shape,Execution Dependency,Overrides,PointsPerSquaredMeter,PointExtents,Looseness,bUnbounded,bApplyDensityToPoints,PointSteepness,bKeepZeroDensityPoints,Seed,] spawner.in=[In,Execution Dependency,Overrides,TargetActor,bAllowMergeDifferentDataInSameInstancedComponents,Seed,]
+LogCookBody: Display: PCG placed 1972 instances (591692 triangles) in 0.19s
+LogCookBody: Display: saved /home/baadc0de/Development/orrery-onebody/out-a/Body_2.umap: ok (6024567 bytes) in 0.04s
+Ensure condition failed: !bInitialized [File:./Runtime/Engine/Private/Subsystems/WorldSubsystem.cpp] [Line: 118] 
+cookbody-linux.sh: line 13: 1410131 Segmentation fault         (core dumped) env -u WAYLAND_DISPLAY -u DISPLAY "$UE/Engine/Binaries/Linux/UnrealEditor-Cmd" "$PROJ/OneBodyCook.uproject" -run=CookBody $ARGS -out="$OUT" -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoLogTimes > "$LOG" 2>&1
+cookbody-linux.sh: line 17: bc: command not found
+exit: 139 wall:  s log: /home/baadc0de/Development/orrery-onebody/out-b/cook-1788631861.log
+LogCookBody: Display: CookBody seed=1 body=2 out=/home/baadc0de/Development/orrery-onebody/out-b size=256m spacing=1.00m density=0.030/m2 nanite=1
+LogCookBody: Display: intermediate FMeshData: 66049 verts, 131072 tris in 0.02s
+LogCookBody: Display: transformers (StaticMesh+Nanite, Collision, OrreryExport) in 0.26s + 0.07s async static mesh/Nanite build
+LogCookBody: Display: section static mesh MeshPartitionStaticMesh_0: nanite=1, LODs=1, LOD0 tris=26213
+LogCookBody: Display: PCG pins: input.out=[In,] output.in=[Out,] rayhit.in=[Execution Dependency,Overrides,ShapeType,BoxHalfExtent,SphereRadius,CapsuleRadius,CapsuleHalfHeight,ShapeRotation,bOverrideDefaultParams,RayOrigin,RayDirection,RayLength,bIgnoreBackfaceHits,bGetImpact,bGetImpactPoint,bGetImpactNormal,bGetReflection,bGetDistance,bGetLocalImpactPoint,bGetReferenceToRenderMaterial,bGetReferenceToStaticMesh,bGetFaceIndex,bGetUVCoords,bGetElementIndex,bGetSectionIndex,bApplyMetadataFromLandscape,bUseRenderMaterialIndex,RenderMaterialIndex,bGetRenderMaterialIndex,UVChannel,bIgnorePCGHits,bIgnoreSelfHits,CollisionChannel,bTraceComplex,ActorTagFilter,ActorTagsList,ActorClassFilter,ActorClass,ActorFilterFromInput,ActorFilterInputSource,SelectLandscapeHits,bGetReferenceToActorHit,bGetReferenceToPhysicalMaterial,] rayhit.out=[Out,] sampler.in=[Surface,Bounding Shape,Execution Dependency,Overrides,PointsPerSquaredMeter,PointExtents,Looseness,bUnbounded,bApplyDensityToPoints,PointSteepness,bKeepZeroDensityPoints,Seed,] spawner.in=[In,Execution Dependency,Overrides,TargetActor,bAllowMergeDifferentDataInSameInstancedComponents,Seed,]
+LogCookBody: Display: PCG placed 1972 instances (591692 triangles) in 0.18s
+LogCookBody: Display: saved /home/baadc0de/Development/orrery-onebody/out-b/Body_2.umap: ok (6024567 bytes) in 0.03s
+Ensure condition failed: !bInitialized [File:./Runtime/Engine/Private/Subsystems/WorldSubsystem.cpp] [Line: 118] 
+cookbody-linux.sh: line 13: 1410296 Segmentation fault         (core dumped) env -u WAYLAND_DISPLAY -u DISPLAY "$UE/Engine/Binaries/Linux/UnrealEditor-Cmd" "$PROJ/OneBodyCook.uproject" -run=CookBody $ARGS -out="$OUT" -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoLogTimes > "$LOG" 2>&1
+cookbody-linux.sh: line 17: bc: command not found
+exit: 139 wall:  s log: /home/baadc0de/Development/orrery-onebody/out-c/cook-1788631876.log
+LogCookBody: Display: CookBody seed=1 body=2 out=/home/baadc0de/Development/orrery-onebody/out-c size=256m spacing=1.00m density=0.030/m2 nanite=1
+LogCookBody: Display: intermediate FMeshData: 66049 verts, 131072 tris in 0.02s
+LogCookBody: Display: transformers (StaticMesh+Nanite, Collision, OrreryExport) in 0.25s + 0.07s async static mesh/Nanite build
+LogCookBody: Display: section static mesh MeshPartitionStaticMesh_0: nanite=1, LODs=1, LOD0 tris=26213
+LogCookBody: Display: PCG pins: input.out=[In,] output.in=[Out,] rayhit.in=[Execution Dependency,Overrides,ShapeType,BoxHalfExtent,SphereRadius,CapsuleRadius,CapsuleHalfHeight,ShapeRotation,bOverrideDefaultParams,RayOrigin,RayDirection,RayLength,bIgnoreBackfaceHits,bGetImpact,bGetImpactPoint,bGetImpactNormal,bGetReflection,bGetDistance,bGetLocalImpactPoint,bGetReferenceToRenderMaterial,bGetReferenceToStaticMesh,bGetFaceIndex,bGetUVCoords,bGetElementIndex,bGetSectionIndex,bApplyMetadataFromLandscape,bUseRenderMaterialIndex,RenderMaterialIndex,bGetRenderMaterialIndex,UVChannel,bIgnorePCGHits,bIgnoreSelfHits,CollisionChannel,bTraceComplex,ActorTagFilter,ActorTagsList,ActorClassFilter,ActorClass,ActorFilterFromInput,ActorFilterInputSource,SelectLandscapeHits,bGetReferenceToActorHit,bGetReferenceToPhysicalMaterial,] rayhit.out=[Out,] sampler.in=[Surface,Bounding Shape,Execution Dependency,Overrides,PointsPerSquaredMeter,PointExtents,Looseness,bUnbounded,bApplyDensityToPoints,PointSteepness,bKeepZeroDensityPoints,Seed,] spawner.in=[In,Execution Dependency,Overrides,TargetActor,bAllowMergeDifferentDataInSameInstancedComponents,Seed,]
+LogCookBody: Display: PCG placed 1972 instances (591692 triangles) in 0.18s
+LogCookBody: Display: deterministic guids: rewrote 11 actor guids from the seed
+LogCookBody: Display: saved /home/baadc0de/Development/orrery-onebody/out-c/Body_2.umap: ok (6024567 bytes) in 0.03s
+Ensure condition failed: !bInitialized [File:./Runtime/Engine/Private/Subsystems/WorldSubsystem.cpp] [Line: 118] 
+cookbody-linux.sh: line 13: 1410444 Segmentation fault         (core dumped) env -u WAYLAND_DISPLAY -u DISPLAY "$UE/Engine/Binaries/Linux/UnrealEditor-Cmd" "$PROJ/OneBodyCook.uproject" -run=CookBody $ARGS -out="$OUT" -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoLogTimes > "$LOG" 2>&1
+cookbody-linux.sh: line 17: bc: command not found
+exit: 139 wall:  s log: /home/baadc0de/Development/orrery-onebody/out-d/cook-1788631891.log
+LogCookBody: Display: CookBody seed=1 body=2 out=/home/baadc0de/Development/orrery-onebody/out-d size=256m spacing=1.00m density=0.030/m2 nanite=1
+LogCookBody: Display: intermediate FMeshData: 66049 verts, 131072 tris in 0.02s
+LogCookBody: Display: transformers (StaticMesh+Nanite, Collision, OrreryExport) in 0.28s + 0.07s async static mesh/Nanite build
+LogCookBody: Display: section static mesh MeshPartitionStaticMesh_0: nanite=1, LODs=1, LOD0 tris=26213
+LogCookBody: Display: PCG pins: input.out=[In,] output.in=[Out,] rayhit.in=[Execution Dependency,Overrides,ShapeType,BoxHalfExtent,SphereRadius,CapsuleRadius,CapsuleHalfHeight,ShapeRotation,bOverrideDefaultParams,RayOrigin,RayDirection,RayLength,bIgnoreBackfaceHits,bGetImpact,bGetImpactPoint,bGetImpactNormal,bGetReflection,bGetDistance,bGetLocalImpactPoint,bGetReferenceToRenderMaterial,bGetReferenceToStaticMesh,bGetFaceIndex,bGetUVCoords,bGetElementIndex,bGetSectionIndex,bApplyMetadataFromLandscape,bUseRenderMaterialIndex,RenderMaterialIndex,bGetRenderMaterialIndex,UVChannel,bIgnorePCGHits,bIgnoreSelfHits,CollisionChannel,bTraceComplex,ActorTagFilter,ActorTagsList,ActorClassFilter,ActorClass,ActorFilterFromInput,ActorFilterInputSource,SelectLandscapeHits,bGetReferenceToActorHit,bGetReferenceToPhysicalMaterial,] rayhit.out=[Out,] sampler.in=[Surface,Bounding Shape,Execution Dependency,Overrides,PointsPerSquaredMeter,PointExtents,Looseness,bUnbounded,bApplyDensityToPoints,PointSteepness,bKeepZeroDensityPoints,Seed,] spawner.in=[In,Execution Dependency,Overrides,TargetActor,bAllowMergeDifferentDataInSameInstancedComponents,Seed,]
+LogCookBody: Display: PCG placed 1972 instances (591692 triangles) in 0.19s
+LogCookBody: Display: deterministic guids: rewrote 11 actor guids from the seed
+LogCookBody: Display: saved /home/baadc0de/Development/orrery-onebody/out-d/Body_2.umap: ok (6024567 bytes) in 0.03s
+Ensure condition failed: !bInitialized [File:./Runtime/Engine/Private/Subsystems/WorldSubsystem.cpp] [Line: 118] 
+--- editor-save diff a/b (no flag)
+== Body_2.umap: 6024567 / 6024567 bytes, sha1 DIFFER (8eae6756b41c / bc542d761aa7), 4161 differing bytes in 599 runs
+  run @      24..43       ( 20 B)  a=0000000084945aa81e46a41f4bd31b6a8db040559466c3c085c10000  b=0000000043ce0e8da801ef99dd1e2fcd5741252d20c6254185c10000
+  run @     519..545      ( 27 B)  a=2100000035354346414541463234303138413543463737444342313332433042443235  b=2100000038303045314432334638444546453837324342303535434642423642363446
+Traceback (most recent call last):
+  File "/home/baadc0de/Development/orrery-onebody/diff-per-file.py", line 60, in <module>
+    main()
+    ~~~~^^
+  File "/home/baadc0de/Development/orrery-onebody/diff-per-file.py", line 57, in main
+    print('      nearby ASCII: ' + '; '.join(f'@{p} "{s[:48]}"' for p, s in names[:6]))
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
+Exception ignored while flushing sys.stdout:
+BrokenPipeError: [Errno 32] Broken pipe
+--- editor-save diff c/d (-deterministicguids as committed)
+== Body_2.umap: 6024567 / 6024567 bytes, sha1 DIFFER (1061eaeb5300 / 59dcde9ed128), 3996 differing bytes in 583 runs
+  run @      24..43       ( 20 B)  a=00000000b0417d304649dc02458c72fa110784069a335f1785c10000  b=000000009cb560a80b715892af3c92a5c7184e2ae6aa80d085c10000
+  run @     519..543      ( 25 B)  a=210000004434383845313635383843323934384439363042364632344546373845  b=210000003444323033333544303335313343373446433943323434423546424132
+Traceback (most recent call last):
+  File "/home/baadc0de/Development/orrery-onebody/diff-per-file.py", line 60, in <module>
+    main()
+    ~~~~^^
+  File "/home/baadc0de/Development/orrery-onebody/diff-per-file.py", line 57, in main
+    print('      nearby ASCII: ' + '; '.join(f'@{p} "{s[:48]}"' for p, s in names[:6]))
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
+Exception ignored while flushing sys.stdout:
+BrokenPipeError: [Errno 32] Broken pipe
+--- ruleset halves a/b
+== body-2.hf.collision: 1483568 / 1483568 bytes, sha1 EQUAL (a35f09b76724 / a35f09b76724), 0 differing bytes in 0 runs
+== body-2.tri.collision: 19821904 / 19821904 bytes, sha1 EQUAL (2e56de7293cf / 2e56de7293cf), 0 differing bytes in 0 runs
+== body-2.vox.collision: 2736210 / 2736210 bytes, sha1 EQUAL (79bc2c2fa529 / 79bc2c2fa529), 0 differing bytes in 0 runs

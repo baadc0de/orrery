@@ -1,0 +1,73 @@
+cook-linux.sh: line 21: bc: command not found
+cook same-a (Body_2, Linux) rc=0 wall= s
+LogCook: Display: Cooked packages 0 Packages Remain 449 Total 449
+LogCook: Display: Cooked packages 412 Packages Remain 93 Total 505
+LogCook: Display: Cooked packages 505 Packages Remain 0 Total 505
+LogCook: Display: Cook by the book total time in tick 2.849434s total time 5.153268
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=5
+total 4016
+-rw-r--r-- 1 baadc0de baadc0de 4082109 Sep  5 20:13 Body_2.uexp
+-rw-r--r-- 1 baadc0de baadc0de   27073 Sep  5 20:13 Body_2.umap
+cook-linux.sh: line 21: bc: command not found
+cook same-b (Body_2, Linux) rc=0 wall= s
+LogCook: Display: Cooked packages 0 Packages Remain 449 Total 449
+LogCook: Display: Cooked packages 505 Packages Remain 0 Total 505
+LogCook: Display: Cook by the book total time in tick 1.087993s total time 2.370451
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+LogCookStats: Display:     ShadersCompiled=0
+total 4016
+-rw-r--r-- 1 baadc0de baadc0de 4082109 Sep  5 20:13 Body_2.uexp
+-rw-r--r-- 1 baadc0de baadc0de   27073 Sep  5 20:13 Body_2.umap
+--- cooked diff same-a vs same-b
+== Body_2.uexp: 4082109 / 4082109 bytes, sha1 DIFFER (db6b68b89af8 / 2c4867e629ef), 275 differing bytes in 31 runs
+  run @      56..56       (  1 B)  a=c472a0016373701d43  b=c472a0019f73e7580c
+      nearby ASCII: @44 "Scatter"
+  run @      58..67       ( 10 B)  a=a0016373701d43f9f9a50a960e5b00000000  b=a0019f73e7580cb45fa1a361ae8800000000
+      nearby ASCII: @44 "Scatter"
+  run @     120..123      (  4 B)  a=c472a001e87ec819b0b81ab8  b=c472a0016f717258b0f527a6
+      nearby ASCII: @44 "Scatter"
+  run @     125..131      (  7 B)  a=7ec819b0b81ab81b74096701000000  b=717258b0f527a6c70e0a0101000000
+      nearby ASCII: @44 "Scatter"
+  run @ 2890056..2890067  ( 12 B)  a=c472a001367b681d683930832dc1664701000000  b=c472a0013873e358c7f3b4b1398d2e7d01000000
+  run @ 2890259..2890265  (  7 B)  a=c472a0015d74e118a671f98f811c14  b=c472a001a87b8f5763c6c28f6a110f
+      nearby ASCII: @2890212 "PersistentLevel.MeshPartition_0"; @2890317 "PersistentLevel.MeshPartition_0"
+  run @ 2890267..2890270  (  4 B)  a=a671f98f811c14923d000000  b=63c6c28f6a110f633d000000
+      nearby ASCII: @2890212 "PersistentLevel.MeshPartition_0"; @2890317 "PersistentLevel.MeshPartition_0"
+  run @ 2890416..2890425  ( 10 B)  a=c472a0017d77e21873b9549d269696de0000  b=c472a001757f8f577e22abad628496e10000
+      nearby ASCII: @2890320 "sistentLevel.MeshPartition_0"; @2890388 "CompiledSection_Default"
+  run @ 2890427..2890427  (  1 B)  a=9d269696de00000000  b=ad628496e100000000
+      nearby ASCII: @2890331 "l.MeshPartition_0"; @2890388 "CompiledSection_Default"
+  run @ 2890465..2890468  (  4 B)  a=020a0301dc169b3200070112  b=020a0301ba15435900070112
+      nearby ASCII: @2890388 "CompiledSection_Default"
+  run @ 2890726..2890737  ( 12 B)  a=02b905d1bca5251b38566e52f1d61fb3c472a001  b=02b905d1769dfc9cb09bc5b1a00cafb0c472a001
+      nearby ASCII: @2890743 "uL yv5"
+  run @ 2890742..2890753  ( 12 B)  a=c472a001a4754c20797635a25375b7c401000000  b=c472a001ab748c5b185ea093d4e5fb4601000000
+      nearby ASCII: @2890743 "uL yv5"
+  run @ 2946747..2946750  (  4 B)  a=020a0301b4cac508000701e1  b=020a030109247c0e000701e1
+  run @ 2947008..2947019  ( 12 B)  a=02b905d1fdd00a5dbd0bd2a7e5b0a50bc472a001  b=02b905d124b60c37ebe4dfa06c231cd2c472a001
+  run @ 2947024..2947035  ( 12 B)  a=c472a001f8724c20a04022aabe27cdf101000000  b=c472a00193758c5b0d5148aef2910e6301000000
+  run @ 3060245..3060248  (  4 B)  a=020a0301bd81c70e000701e1  b=020a03019f5c0f7e000701e1
+  run @ 3060506..3060517  ( 12 B)  a=02b905d1600f8c0223d821169e1c9e23c472a001  b=02b905d18e78972ea5a31698c53c1ec7c472a001
+  run @ 3060522..3060533  ( 12 B)  a=c472a0017a7c4c201aad6caf2b26395e01000000  b=c472a0011b7d8c5b6dcff1ae9a2af9cc01000000
+  run @ 3117679..3117682  (  4 B)  a=020a03014fdf7e200007011d  b=020a0301efdd0e1d0007011d
+      nearby ASCII: @3117710 "}A8=s@"
+  run @ 3117940..3117951  ( 12 B)  a=02b905d12df54d46bbd7c8364fa838d5c472a001  b=02b905d11693ae0a82287ef16a227ee3c472a001
+  run @ 3117956..3117962  (  7 B)  a=c472a00140794c2082199c9a35e5f5  b=c472a001a4718c5b697ef79a23e4ce
+  run @ 3117964..3117967  (  4 B)  a=82199c9a35e5f50e01000000  b=697ef79a23e4ce0a01000000
+  run @ 3144258..3144269  ( 12 B)  a=c472a00146719f189b5a51b2c3e223008e000000  b=c472a001627e4e570fb0de8b32732ca48e000000
+      nearby ASCII: @3144310 "unreal"; @3144325 "/Engine/Maps/Entry"
+  run @ 3144610..3144621  ( 12 B)  a=c472a0012271a118d3fe5c82b522475600000000  b=c472a00165705057051c15bc025d350200000000
+  run @ 3144941..3144952  ( 12 B)  a=02b905d1c307d5c35a910014bc509adcc472a001  b=02b905d19d7261496499c1b0c4e28130c472a001
+  run @ 3144957..3144968  ( 12 B)  a=c472a001017f4c20054b3d883432328501000000  b=c472a00124738c5be9c70daace19692501000000
+  run @ 3548354..3548365  ( 12 B)  a=c472a001987f701d8e527dae9ef251f200000000  b=c472a0018a7de758069f3bb5f3199e7d00000000
+  run @ 3550327..3550338  ( 12 B)  a=c472a0011a72681dd867668093e5379900000000  b=c472a0010c7fe358ac5e519466a5e34900000000
+  run @ 4081955..4081966  ( 12 B)  a=02b905d1e8134cbce3944f18575b90b6c472a001  b=02b905d17000179c1f5d50c444cde8a9c472a001
+  run @ 4081971..4081982  ( 12 B)  a=c472a001a3794c208185e4800063cdf501000000  b=c472a0014c7a8c5bfcd9268d77fc8ede01000000
+  run @ 4082077..4082088  ( 12 B)  a=c472a00193709f183673db97a1f3d98300000000  b=c472a001517b4e57e60cc08d92c864d300000000
+== Body_2.umap: 27073 / 27073 bytes, sha1 DIFFER (b0429c5d931e / f809bf0531ae), 20 differing bytes in 1 runs
+  run @      24..43       ( 20 B)  a=000000002f91e48470399e955e3a9181492b56c8665a190fc1690000  b=00000000457c457c5ad7e71fcca2ef3a0ca8efa934248453c1690000
+      nearby ASCII: @56 "/Game/Bodies/Body_2"
+diff exit: 1

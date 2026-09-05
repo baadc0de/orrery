@@ -1,0 +1,4 @@
+exit: 139 wall: 15.7 s log: /home/baadc0de/Development/orrery-onebody/out-s2/cook-1788632517.log
+LogCookBody: Display: canonical guids: 11 actors, 6 LOD map-build ids on 8 static mesh components, 4 ISM instancing seeds, 1 static meshes, 2 body setups, 1 level build-data id rewritten from the seed / content
+== Body_2.umap: 6024567 / 6042998 bytes, sha1 DIFFER (afb7f678fdef / abf034099cd6), 4455448 differing bytes in 663061 runs, 18431 bytes of length difference
+content_key seed2: E9447D667EC63A828148837742EF9EA7 (seed1: B506B9D289963689B7E6F3AAD9673CFC); instances 1976 (seed1: 1972)

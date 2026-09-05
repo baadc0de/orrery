@@ -1,0 +1,163 @@
+{
+	"seed": "2",
+	"body": 2,
+	"engine": "5.8.2-56702186+++UE5+Release-5.8",
+	"platform": "Linux",
+	"size_m": 256,
+	"spacing_m": 1,
+	"density_per_m2": 0.029999999329447746,
+	"nanite": true,
+	"unreal_collision_simplified": false,
+	"canonical_guids":
+	{
+		"actors": 11,
+		"static_mesh_components": 8,
+		"lod_map_build_ids": 6,
+		"ism_instancing_seeds": 4,
+		"static_meshes": 1,
+		"body_setups": 2,
+		"content_key": "E9447D667EC63A828148837742EF9EA7",
+		"enabled": true,
+		"seconds": 0.00012562400661408901
+	},
+	"noise":
+	{
+		"layer_0":
+		{
+			"intensity_cm": 2054.258021783779,
+			"wavelength_cm": 7816.4167891368015,
+			"rotation_deg": 327.2567136714157,
+			"octaves": 5,
+			"mode": "Standard"
+		},
+		"layer_1":
+		{
+			"intensity_cm": 393.06491337541286,
+			"wavelength_cm": 1106.3064023258082,
+			"rotation_deg": 210.3417352747519,
+			"octaves": 3,
+			"mode": "Ridge"
+		}
+	},
+	"intermediate_verts": 66049,
+	"intermediate_tris": 131072,
+	"intermediate_hash_mm": "4bdab2e2ce137e8e",
+	"export_saw_same_meshdata_pointer_as_static_mesh_and_collision": true,
+	"unreal_collision":
+	{
+		"component_0":
+		{
+			"verts": 66049,
+			"tris": 131072,
+			"hash_mm": "cb30e4a350bca36e",
+			"vertices_compared": 66049,
+			"max_vertex_deviation_mm": 0.0012142140030846349,
+			"vertices_that_round_to_a_different_mm": 12,
+			"same_triangle_list_as_intermediate": true
+		}
+	},
+	"scatter":
+	{
+		"ism_0":
+		{
+			"mesh": "/Engine/BasicShapes/Cube.Cube",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 889,
+			"lod0_tris": 48,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 1,
+			"simple_spheres": 0,
+			"simple_convex": 0
+		},
+		"ism_1":
+		{
+			"mesh": "/Engine/BasicShapes/Cylinder.Cylinder",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 406,
+			"lod0_tris": 512,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 0,
+			"simple_spheres": 0,
+			"simple_convex": 1
+		},
+		"ism_2":
+		{
+			"mesh": "/Engine/BasicShapes/Cone.Cone",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 452,
+			"lod0_tris": 284,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 0,
+			"simple_spheres": 0,
+			"simple_convex": 4
+		},
+		"ism_3":
+		{
+			"mesh": "/Engine/BasicShapes/Sphere.Sphere",
+			"component_class": "InstancedStaticMeshComponent",
+			"instances": 229,
+			"lod0_tris": 960,
+			"collision_profile": "BlockAll",
+			"collision_enabled": "QueryAndPhysics",
+			"mesh_collision_trace_flag": "CTF_UseDefault",
+			"simple_boxes": 0,
+			"simple_spheres": 1,
+			"simple_convex": 0
+		}
+	},
+	"instances": 1976,
+	"instance_tris": 598752,
+	"bounds":
+	{
+		"min_x_mm": -1144,
+		"min_y_mm": -1385,
+		"min_z_mm": -12961,
+		"max_x_mm": 257616,
+		"max_y_mm": 257569,
+		"max_z_mm": 24684
+	},
+	"timing":
+	{
+		"modifiers_to_meshdata_s": 0.022472584969364107,
+		"transformers_s": 1.1566140889772214,
+		"pcg_s": 0.34047953097615391,
+		"save_s": 0.034166149969678372,
+		"commandlet_main_s": 2.4610348719870672
+	},
+	"representations":
+	{
+		"tri":
+		{
+			"path": "/home/baadc0de/Development/orrery-onebody/out-s2/body-2.tri.collision",
+			"seconds": 0.1323802990373224,
+			"bytes": 19985760,
+			"ok": true
+		},
+		"heightfield":
+		{
+			"path": "/home/baadc0de/Development/orrery-onebody/out-s2/body-2.hf.collision",
+			"seconds": 0.33176571200601757,
+			"bytes": 1484404,
+			"ok": true
+		},
+		"voxel":
+		{
+			"path": "/home/baadc0de/Development/orrery-onebody/out-s2/body-2.vox.collision",
+			"seconds": 0.35776925703976303,
+			"bytes": 2749924,
+			"ok": true
+		}
+	},
+	"unreal":
+	{
+		"map": "/home/baadc0de/Development/orrery-onebody/out-s2/Body_2.umap",
+		"bytes": 6042998,
+		"package": "/OneBodyOut/Body_2"
+	}
+}
