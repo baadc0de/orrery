@@ -87,6 +87,12 @@ impl From<HostError> for OrreryHostResult {
             | HostError::MalformedSnapshot
             | HostError::SnapshotRulesetMismatch => Self::MalformedInput,
             HostError::BufferTooLarge => Self::RecordTooLarge,
+            // No exported function calls `SimulationHost::seat_at`, so this
+            // arm is unreached today; it exists only so this match stays
+            // exhaustive over `HostError`. `MalformedInput` is the nearest
+            // existing code if that ever changes: the call is refused and
+            // nothing is applied, same as the other arms mapped here.
+            HostError::HostAlreadyActive => Self::MalformedInput,
         }
     }
 }
