@@ -38,7 +38,7 @@ Prefer replace over drop. Give an overall 0..1 fidelity score (1 = a modeller wo
 parts = [{"text": prompt}, {"text": "CONCEPT:"}, img(a.concept)]
 for r in a.renders: parts += [{"text": f"RENDER-{os.path.basename(r)}:"}, img(r)]
 for r in a.id_renders: parts += [{"text": f"ID-{os.path.basename(r)} (legend: {json.dumps(legend)}):"}, img(r)]
-body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json", "responseSchema": SCHEMA, "maxOutputTokens": 8000}}
+body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json", "responseSchema": SCHEMA, "maxOutputTokens": 24000}}
 url = f"https://aiplatform.googleapis.com/v1/projects/{a.project}/locations/global/publishers/google/models/{a.model}:generateContent"
 req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"})
 with urllib.request.urlopen(req, timeout=300) as r: resp = json.loads(r.read())

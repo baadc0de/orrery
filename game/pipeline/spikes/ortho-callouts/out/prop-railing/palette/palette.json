@@ -1,0 +1,165 @@
+{
+ "parts": [
+  {
+   "id": 1,
+   "name": "mech_module_010",
+   "kind": "insert",
+   "desc": "pipe with end bracket",
+   "dims_native": [
+    0.2224,
+    1.7189,
+    0.22
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/01.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/mech/mech_module_010.blend",
+   "below": 0.0395
+  },
+  {
+   "id": 2,
+   "name": "cables_Greeble_Cables_Pack1.016",
+   "kind": "insert",
+   "desc": "pipe bundle with brackets",
+   "dims_native": [
+    0.451,
+    6.1986,
+    0.7479
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/02.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/cables/cables_Greeble_Cables_Pack1.016.blend",
+   "below": 0.043
+  },
+  {
+   "id": 3,
+   "name": "cables_Greeble_Cables_Pack1.005",
+   "kind": "insert",
+   "desc": "strip frame with reinforced ends",
+   "dims_native": [
+    5.1791,
+    0.7665,
+    0.8916
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/03.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/cables/cables_Greeble_Cables_Pack1.005.blend",
+   "below": 0.0784
+  },
+  {
+   "id": 4,
+   "name": "ship-a_Detail_34",
+   "kind": "insert",
+   "desc": "flat plate with reinforced ends",
+   "dims_native": [
+    21.8642,
+    5.9032,
+    1.8131
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/04.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/ship-a/ship-a_Detail_34.blend",
+   "below": 0.0
+  },
+  {
+   "id": 5,
+   "name": "ship-a_Detail_95",
+   "kind": "insert",
+   "desc": "bracket with mounting points",
+   "dims_native": [
+    16.0434,
+    4.4,
+    1.6852
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/05.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/ship-a/ship-a_Detail_95.blend",
+   "below": 0.0
+  },
+  {
+   "id": 6,
+   "name": "ship-a_Detail_96",
+   "kind": "insert",
+   "desc": "housing with grille",
+   "dims_native": [
+    16.0434,
+    4.4,
+    1.6852
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/06.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/ship-a/ship-a_Detail_96.blend",
+   "below": -0.0
+  },
+  {
+   "id": 7,
+   "name": "cables_Greeble_Cables_Pack1.036",
+   "kind": "insert",
+   "desc": "dual parallel pipes with curved ends",
+   "dims_native": [
+    0.7189,
+    5.242,
+    0.6931
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/07.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/cables/cables_Greeble_Cables_Pack1.036.blend",
+   "below": 0.178
+  },
+  {
+   "id": 8,
+   "name": "mech_module_046",
+   "kind": "insert",
+   "desc": "U-shaped bracket",
+   "dims_native": [
+    0.061,
+    0.0118,
+    0.0225
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/08.png",
+   "blend": "/home/baadc0de/assets/kitops/Orrery_Masterfolder/mech/mech_module_046.blend",
+   "below": 0.0051
+  },
+  {
+   "id": 9,
+   "name": "tube",
+   "kind": "prim",
+   "desc": "straight tube, 1 m long, 0.05 m diameter",
+   "dims_native": [
+    0.05,
+    1.0,
+    0.05
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/09.png"
+  },
+  {
+   "id": 10,
+   "name": "bar",
+   "kind": "prim",
+   "desc": "square bar, 1 m long, 0.05 m section",
+   "dims_native": [
+    0.05,
+    1.0,
+    0.05
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/10.png"
+  },
+  {
+   "id": 11,
+   "name": "plate",
+   "kind": "prim",
+   "desc": "flat plate 1 x 0.5 m, 0.02 m thick",
+   "dims_native": [
+    1.0,
+    0.5,
+    0.02
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/11.png"
+  },
+  {
+   "id": 12,
+   "name": "box",
+   "kind": "prim",
+   "desc": "box 0.5 x 0.3 x 0.3 m",
+   "dims_native": [
+    0.5,
+    0.3,
+    0.3
+   ],
+   "png": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/12.png"
+  }
+ ],
+ "sheet": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette/palette-sheet.png"
+}

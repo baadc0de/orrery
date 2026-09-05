@@ -139,3 +139,17 @@ Six passes with four changes at once, scored on a blended metric (half the criti
 - **Negative: corrective smoothing of the hull** melts it into a blob with holes and breaks the boolean. The hull quality has to come from upstream (a finer remesh or the retopo mesh), not from smoothing.
 
 What would move the score next, in order: a better mount hull (the retopo mesh, or the TRELLIS mesh at size/300 instead of size/170); a critic ensemble (two calls, verdicts intersected) to cut the noise; letting the critic see the subassembly sheets; primitives parameterised from the sheets.
+
+## Inverted flow: constructible concepts from an input palette (2026-09-05, evening)
+
+Owner steering: learn on something simple, the other way round. Give the concept artist a **palette of parts** as input, ask for a simple prop built only from those, then reconstruct it. Scripts in `kits/prop/`: `palette.py` (8 library INSERTs + 4 straight primitives, numbered sheet), `concept.py` (constructible concept with palette-number callouts, then a **build list** in metres), `assemble.py` (free-space placement, canonical part frames), `critique.py` and `iterate.py`.
+
+First prop: a deck railing section. The concept came back constructible and annotated on the first try (posts from the strip frame, handrail from the dual pipes, mid rail from the tube, brackets, grille housings, diagonal braces from the pipe-with-bracket). Scores 0.75, 0.71, 0.8, 0.6 over four passes; the best pass plus two owner corrections reads as the concept.
+
+**What this simple case taught, that the ship hid:**
+- *Orientation semantics must be axis-based, not Euler.* The first build list rotated the handrail "about y" to lay it along x, which does nothing. Every part is now re-expressed in a canonical frame (longest extent +y, thinnest +z) and the build list says `along` (world axis of the long extent), `spin_deg` about it and `tilt_deg` in the xz plane. After that, the build list placed 18 parts into a recognisable railing at the first assembly.
+- *The critic's edits land when the actions are geometric.* Move by delta, spin, tilt, scale, swap, remove, add: each pass's requested edits were visible in the next render (handrail spun flat, braces tilted, housings moved outside the posts).
+- *The critic still misreads chirality.* It flipped the handrail's curl the wrong way and put the brace V at the bottom; the owner caught both in one look. Human critique is recorded in the build list (`human_critique`) as a stage of its own, per G12's provenance rule.
+- *Pro-model thinking eats the output budget.* An 8 k output cap truncated the critic's JSON at 800 characters; 24 k with the finish reason logged fixed it.
+
+Next on this track: a ladder and a crate from the same palette, then a palette drawn from one purchased kit only, then the same loop with the subassembly sheets of the escort as "concepts" (which closes the circle back to the ship).
