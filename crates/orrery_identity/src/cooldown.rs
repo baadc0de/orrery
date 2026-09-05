@@ -591,28 +591,38 @@ mod tests {
     /// #1083, the earned half — the case the memo's naive Option 2 would have
     /// released and #884 exists to refuse.
     ///
-    /// Three major findings: one on day zero, two on day 23. By day 23 the
-    /// first has decayed to 0.961, so the total is 6.961 — cooldown, not ban,
-    /// which matters because #1059 makes a ban durable and it would never
-    /// reach this rule. Reversing the *old* finding leaves the two fresh ones
-    /// at exactly 6.0 when re-scored at the entry instant: at or above `C`, so
-    /// the cooldown was earned by findings nobody reversed and its floor
-    /// stands. The account then serves the full fourteen days even though its
-    /// live score is below `Q` well before them.
+    /// Three major findings: one on day zero, one on day 23, one on day 30.
+    /// By day 30 the first has decayed to 0.680 and the second to 2.122, so
+    /// the total is 5.802 — cooldown, not ban, which matters because #1059
+    /// makes a ban durable and it would never reach this rule. Reversing the
+    /// *day-zero* finding leaves 5.122 when re-scored at the entry instant: at
+    /// or above `C`, so the cooldown was earned by findings nobody reversed
+    /// and its floor stands. The account then serves the full fourteen days
+    /// even though its live score is below `Q` three days before them.
+    ///
+    /// The shape changed in #1091 — it was two findings on day 23, entering at
+    /// 6.961 — because that ledger no longer reaches `S < Q` inside its dwell
+    /// once the appeal cancels its finding honestly. It used to, but only on
+    /// the over-credit this issue removed: the pair carried -2.229 at day 30
+    /// and that, not decay, was what crossed `Q`. Two surviving majors filed
+    /// together fall under `Q` exactly one half-life later, which is the dwell
+    /// itself, so the floor had nothing left to refuse. Staggering the two
+    /// survivors keeps the release band genuinely satisfied inside the dwell,
+    /// which is the only arrangement in which this rule is observable at all.
     #[tokio::test]
     async fn an_earned_cooldown_keeps_its_floor_after_one_finding_is_reversed() {
         let thresholds = StandingThresholds::default();
-        let entered_at_ms = 23 * DAY_MS;
+        let entered_at_ms = 30 * DAY_MS;
         let old = major_tagged(0, 1);
-        let fresh_one = major_tagged(entered_at_ms, 2);
-        let fresh_two = major_tagged(entered_at_ms, 3);
-        let filed = vec![old.clone(), fresh_one.clone(), fresh_two.clone()];
+        let mid = major_tagged(23 * DAY_MS, 2);
+        let fresh = major_tagged(entered_at_ms, 3);
+        let filed = vec![old.clone(), mid.clone(), fresh.clone()];
         let rows = MutableStrikeRows::new(filed.clone());
         let (standing, store, now) = fixture(rows.clone()).await;
 
         now.store(entered_at_ms, Ordering::SeqCst);
         let at_entry = crate::score_rows(&filed, entered_at_ms).live_milli;
-        assert_eq!(at_entry, 6_961, "0.961 decayed + 3.0 + 3.0");
+        assert_eq!(at_entry, 5_802, "0.680 decayed + 2.122 decayed + 3.0");
         assert!(
             at_entry >= thresholds.cooldown_milli && at_entry < thresholds.ban_milli,
             "cooldown, not ban: a ban is durable under #1059 and never reaches the dwell"
@@ -628,29 +638,27 @@ mod tests {
             .expect("entered");
         assert_eq!(entry.entered_at_ms, entered_at_ms);
 
-        // Day 24: the day-zero finding is reversed.
-        rows.replace(vec![
-            old.clone(),
-            fresh_one,
-            fresh_two,
-            appeal_of(&old, 24 * DAY_MS),
-        ]);
+        // Day 31: the day-zero finding is reversed.
+        rows.replace(vec![old.clone(), mid, fresh, appeal_of(&old, 31 * DAY_MS)]);
         let rescore = crate::ExonerationRescore::from_rows(&rows.snapshot());
         assert_eq!(rescore.live_reversals(), 1);
         assert_eq!(
             rescore.score_at(entered_at_ms).live_milli,
-            2 * i64::from(MAJOR_STRIKE_WEIGHT_MILLI),
-            "6.0 at the entry instant on the findings that survive"
+            5_122,
+            "2.122 + 3.0 at the entry instant on the findings that survive"
         );
+        assert!(rescore.score_at(entered_at_ms).live_milli >= thresholds.cooldown_milli);
         assert!(!rescore.voids_dwell(thresholds, entered_at_ms));
 
-        // Day 30. `S < Q` already holds — the appeal's negative weight sees to
-        // that — and the dwell has seven days left. Under the naive rule the
-        // account would be admitted here.
-        now.store(30 * DAY_MS, Ordering::SeqCst);
+        // Day 41. `S < Q` already holds — by decay of the two survivors, the
+        // reversed pair contributing exactly nothing (#1091) — and the dwell
+        // has three days left. Under the naive rule the account would be
+        // admitted here.
+        now.store(41 * DAY_MS, Ordering::SeqCst);
+        let at_day_41 = crate::score_rows(&rows.snapshot(), 41 * DAY_MS).live_milli;
+        assert_eq!(at_day_41, 2_972, "1.231 + 1.741, and the pair nets zero");
         assert!(
-            crate::score_rows(&rows.snapshot(), 30 * DAY_MS).live_milli
-                < thresholds.quarantine_milli,
+            at_day_41 < thresholds.quarantine_milli,
             "the release band is satisfied; only the floor is refusing"
         );
         assert_eq!(
