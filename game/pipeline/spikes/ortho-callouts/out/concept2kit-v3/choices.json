@@ -1,0 +1,92 @@
+{
+ "nose_rcs_cluster": {
+  "ranked": [],
+  "note": "procedural box"
+ },
+ "main_thruster_nozzle": {
+  "ranked": [],
+  "note": "procedural nozzle"
+ },
+ "spine_conduits": {
+  "ranked": [],
+  "note": "procedural pipe_run"
+ },
+ "accent_stripe": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "hull_number_decal": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "tail_crest_decal": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "rear_landing_skid": {
+  "ranked": [],
+  "note": "procedural skid"
+ },
+ "under_wing_pylons": {
+  "ranked": [
+   "ship-a_Detail_49",
+   "ship-a_Detail_51",
+   "ship-a_Detail_31",
+   "ship-b_Detail_29",
+   "ship-a_Detail_240",
+   "ship-a_Detail_114",
+   "ship-a_Detail_155",
+   "mech_module_037"
+  ],
+  "reason": "Candidate 6 best matches the elongated, angular silhouette and sleek weapon pylon proportions of the concept art.",
+  "shortlist_reason": "These parts feature the blocky, angular, and streamlined pod-like silhouettes matching the sleek weapon pylon concept.",
+  "pool": 72,
+  "model": "gemini-3.5-flash",
+  "crop": true,
+  "ref": "sheet"
+ },
+ "ventral_gun_bay": {
+  "ranked": [
+   "ship-b_Detail_108",
+   "ship-b_Detail_99",
+   "ship-b_Detail_101",
+   "ship-a_Detail_84",
+   "ship-b_Detail_193",
+   "ship-b_Detail_170",
+   "ship-b_Detail_124",
+   "ship-b_Detail_213"
+  ],
+  "reason": "Candidate 3 best matches the rectangular, low-profile box shape of the gun bay without being overly bulky.",
+  "shortlist_reason": "Flatter, rectangular panels and shallow boxes matching the low-profile ventral gun bay requirement.",
+  "pool": 72,
+  "model": "gemini-3.5-flash",
+  "crop": true,
+  "ref": "sheet"
+ },
+ "dark_wing_panels": {
+  "ranked": [],
+  "note": "paint zone, no part"
+ },
+ "front_landing_skid": {
+  "ranked": [],
+  "note": "procedural skid"
+ },
+ "wingtip_pods": {
+  "ranked": [
+   "ship-b_Detail_118",
+   "ship-b_Detail_126",
+   "ship-b_Detail_119",
+   "ship-b_Detail_116",
+   "ship-b_Detail_122",
+   "ship-b_Detail_129",
+   "ship-b_Detail_113",
+   "ship-b_Detail_127"
+  ],
+  "reason": "Candidate 3 best matches the multi-cylinder thruster pod silhouette on the wingtips, followed by other elongated cylindrical options.",
+  "shortlist_reason": "These parts represent cylindrical, pod-like thruster components matching the wingtip thrusters in the concept.",
+  "pool": 72,
+  "model": "gemini-3.5-flash",
+  "crop": false,
+  "ref": null
+ }
+}

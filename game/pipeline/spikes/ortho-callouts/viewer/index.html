@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Escort E-07</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--ground:#16181c;--panel:#23262c;--line:#3a3e46;--text:#d6d9de;--muted:#9a9ea6;--hull:#8a8f94;--accent:#d9772b;--live:#7fd4ff;
+  --display:"Barlow Condensed","Arial Narrow",Arial,sans-serif;--mono:"IBM Plex Mono","SFMono-Regular",Consolas,monospace}
+html,body{margin:0;height:100%;background:var(--ground);color:var(--text);font:14px/1.4 var(--mono);overflow:hidden}
+canvas{display:block}
+#hud{position:fixed;left:16px;top:16px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);padding:12px 14px;max-width:360px}
+#hud h1{margin:0;font:600 30px/1 var(--display);letter-spacing:.02em;color:#fff;text-wrap:balance}
+#hud .role{margin:4px 0 10px;font:500 13px/1.2 var(--display);letter-spacing:.12em;text-transform:uppercase;color:var(--hull)}
+#stats{color:var(--muted);font-variant-numeric:tabular-nums;font-size:12.5px}
+#stats b{color:var(--text);font-weight:500}
+.ctl{display:flex;gap:6px;margin-top:10px}
+button{background:transparent;color:var(--text);border:1px solid var(--line);padding:5px 10px;font:500 13px/1 var(--display);letter-spacing:.08em;text-transform:uppercase;cursor:pointer}
+button:hover,button:focus-visible{border-color:var(--accent);outline:none}
+button[aria-pressed="true"]{color:var(--accent);border-color:var(--accent)}
+#prov{position:fixed;left:0;right:0;bottom:0;display:flex;flex-wrap:wrap;gap:0 28px;padding:8px 16px;background:var(--panel);border-top:1px solid var(--line);font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+#prov span b{color:var(--text);font-weight:500}
+#bar{position:fixed;left:0;right:0;top:0;height:2px;background:var(--accent);transform-origin:left;transform:scaleX(0);transition:transform .2s}
+#live{color:var(--live)}
+@media (prefers-reduced-motion:reduce){#bar{transition:none}}
+</style></head><body>
+<div id="bar"></div>
+<div id="hud">
+  <h1>Escort E-07</h1>
+  <div class="role">Light escort craft · mothership faction</div>
+  <div id="stats">decoding mesh…</div>
+  <div class="ctl"><button id="turn" aria-pressed="false">Turntable</button><button id="wire" aria-pressed="false">Wireframe</button><button id="reset">Reset view</button><button id="swap" aria-pressed="false">Retopo 24.8k</button><button id="kit" aria-pressed="false">Kitbash zones</button></div>
+</div>
+<div id="prov">
+  <span>model <b>TRELLIS.2-4B</b> (MIT)</span><span>encoder <b>DINOv3 ViT-L/16</b> (Meta licence)</span><span>concept <b>Nano Banana Pro</b></span>
+  <span>seed <b>7</b></span><span>generate <b>86.7 s</b></span><span>TRELLIS.2 high-poly <b>191,640 tris</b> &nbsp;|&nbsp; retopo <b>24,842 tris</b> &nbsp;|&nbsp; kitbash <b>13 placements, 31k tris</b>: coarse hull, program in metres with anchors, parts chosen against subassembly sheets, procedural skids/nozzles/pipes, critic loop best 0.75</span><span id="live">renderer: WebGL</span>
+</div>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping; document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x16181c);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+const camera = new THREE.PerspectiveCamera(42, innerWidth/innerHeight, 0.01, 100);
+const controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
+const key = new THREE.DirectionalLight(0xfff2e0, 2.2); key.position.set(2,3,2); scene.add(key);
+const fill = new THREE.DirectionalLight(0xbfd4ff, 0.7); fill.position.set(-3,1,-1); scene.add(fill);
+let model, home, turning = false, wire = false, models = {};
+document.getElementById('bar').style.transform = 'scaleX(.5)';
+const press = (id, fn) => { const b = document.getElementById(id); b.onclick = () => { const v = fn(); if (v !== undefined) b.setAttribute('aria-pressed', v); }; };
+const loader = new GLTFLoader();
+function normalize(obj) {
+  const box = new THREE.Box3().setFromObject(obj), size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
+  const d = Math.max(size.x, size.y, size.z) || 1; obj.position.sub(c); obj.scale.setScalar(2 / d); obj.position.multiplyScalar(2 / d); return size;
+}
+function loadModel(file, first) { loader.load(file, g => {
+  if (model) scene.remove(model);
+  model = g.scene; const size = normalize(model); models[file] = model; scene.add(model);
+  if (wire) model.traverse(o => { if (o.isMesh) o.material.wireframe = true; });
+  document.getElementById('stats').innerHTML = `${file.replace('.glb','')} · bbox <b>${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)}</b> (source units)<br>drag to orbit · wheel to zoom · right-drag to pan`;
+  if (!first) return;
+  camera.position.set(2.8, 1.5, 3.2); controls.target.set(0,0,0); home = camera.position.clone();
+  const bar = document.getElementById('bar'); if (bar) { bar.style.transform = 'scaleX(1)'; setTimeout(() => bar.remove(), 500); }
+}, x => { const bar = document.getElementById('bar'); if (bar && x.total) bar.style.transform = `scaleX(${x.loaded/x.total})`; }, e => { document.getElementById('stats').textContent = 'Could not load the mesh: ' + e; }); }
+loadModel('escort.glb', true);
+let retopo = false; let current = 'escort.glb';
+function show(file) { current = file; if (models[file]) { scene.remove(model); model = models[file]; scene.add(model); } else loadModel(file, false); }
+press('swap', () => { retopo = !retopo; document.getElementById('kit').setAttribute('aria-pressed', 'false'); show(retopo ? 'escort-retopo.glb' : 'escort.glb'); return retopo; });
+press('kit', () => { const on = current !== 'escort-kitbash-v4.glb'; retopo = false; document.getElementById('swap').setAttribute('aria-pressed', 'false'); show(on ? 'escort-kitbash-v4.glb' : 'escort.glb'); return on; });
+press('turn', () => turning = !turning);
+press('wire', () => { wire = !wire; model && model.traverse(o => { if (o.isMesh) o.material.wireframe = wire; }); return wire; });
+press('reset', () => { if (home) { camera.position.copy(home); controls.target.set(0,0,0); } });
+addEventListener('resize', () => { camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+renderer.setAnimationLoop(() => { if (turning && model && !reduce) model.rotation.y += 0.004; controls.update(); renderer.render(scene, camera); });
+</script></body></html>

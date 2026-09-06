@@ -1,0 +1,305 @@
+{
+ "asset": "escort E-07",
+ "blockout": {
+  "hull": [
+   2.2,
+   7.0,
+   2.0,
+   [
+    0,
+    -0.5,
+    1.2
+   ]
+  ],
+  "nose": [
+   1.6,
+   2.0,
+   1.4,
+   [
+    0,
+    3.6,
+    1.0
+   ]
+  ],
+  "wing_r": [
+   2.0,
+   3.0,
+   0.25,
+   [
+    2.0,
+    -1.5,
+    1.1
+   ]
+  ],
+  "fin": [
+   0.15,
+   1.6,
+   1.4,
+   [
+    0,
+    -3.2,
+    2.9
+   ]
+  ],
+  "thruster_r": {
+   "cyl": [
+    0.55,
+    1.2,
+    [
+     0.7,
+     -4.4,
+     1.3
+    ]
+   ]
+  },
+  "rcs_r": {
+   "cyl": [
+    0.25,
+    0.9,
+    [
+     3.1,
+     -1.5,
+     1.1
+    ]
+   ]
+  },
+  "skid_f": [
+   1.6,
+   0.8,
+   0.3,
+   [
+    0,
+    2.0,
+    0.15
+   ]
+  ],
+  "skid_r": [
+   2.0,
+   0.8,
+   0.3,
+   [
+    0,
+    -2.5,
+    0.15
+   ]
+  ]
+ },
+ "zones": [
+  {
+   "name": "spine_run_l",
+   "type": "connect",
+   "tags": [
+    "conduit",
+    "pipe",
+    "cable"
+   ],
+   "from": [
+    -0.45,
+    3.2,
+    2.22
+   ],
+   "to": [
+    -0.45,
+    -3.3,
+    2.22
+   ],
+   "up": [
+    0,
+    0,
+    1
+   ],
+   "scale": [
+    0.9,
+    1.1
+   ],
+   "note": "exposed conduit run along the spine, socketed at both ends (brief)"
+  },
+  {
+   "name": "spine_run_r",
+   "type": "connect",
+   "tags": [
+    "conduit",
+    "pipe",
+    "cable"
+   ],
+   "from": [
+    0.45,
+    3.2,
+    2.22
+   ],
+   "to": [
+    0.45,
+    -3.3,
+    2.22
+   ],
+   "up": [
+    0,
+    0,
+    1
+   ],
+   "scale": [
+    0.9,
+    1.1
+   ]
+  },
+  {
+   "name": "flank_panels",
+   "target": "hull",
+   "face": "side",
+   "tags": [
+    "hull-panel",
+    "plate",
+    "hatch"
+   ],
+   "count": 3,
+   "along": "y",
+   "scale": [
+    0.55,
+    0.7
+   ],
+   "spacing": 0.15,
+   "note": "riveted plating, painted"
+  },
+  {
+   "name": "flank_vents",
+   "target": "hull",
+   "face": "side",
+   "tags": [
+    "vent",
+    "grille"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.35,
+    0.45
+   ],
+   "spacing": 0.0,
+   "offset": [
+    0.0,
+    -1.8
+   ]
+  },
+  {
+   "name": "nose_rcs",
+   "target": "nose",
+   "face": "front",
+   "tags": [
+    "nozzle",
+    "thruster",
+    "block",
+    "cylinder"
+   ],
+   "count": 1,
+   "along": "x",
+   "scale": [
+    0.5,
+    0.6
+   ],
+   "spacing": 0.0,
+   "note": "RCS cluster at the nose"
+  },
+  {
+   "name": "wing_ribs",
+   "target": "wing_r",
+   "face": "top",
+   "tags": [
+    "strip",
+    "rib",
+    "frame"
+   ],
+   "count": 2,
+   "along": "x",
+   "scale": [
+    0.6,
+    0.8
+   ],
+   "spacing": 0.2
+  },
+  {
+   "name": "wing_pylon",
+   "target": "wing_r",
+   "face": "bottom",
+   "tags": [
+    "pylon",
+    "bracket",
+    "strut",
+    "block"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.4,
+    0.5
+   ],
+   "spacing": 0.0,
+   "note": "empty under-wing pylon"
+  },
+  {
+   "name": "fin_crest",
+   "target": "fin",
+   "face": "side",
+   "tags": [
+    "plate",
+    "sensor",
+    "light"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.4,
+    0.5
+   ],
+   "spacing": 0.0
+  },
+  {
+   "name": "belly_bay",
+   "target": "hull",
+   "face": "bottom",
+   "tags": [
+    "hatch",
+    "hull-panel",
+    "gun",
+    "turret"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.5,
+    0.6
+   ],
+   "spacing": 0.0,
+   "note": "ventral gun bay"
+  },
+  {
+   "name": "flank_feed",
+   "type": "connect",
+   "tags": [
+    "cable",
+    "conduit"
+   ],
+   "from": [
+    1.12,
+    1.5,
+    1.9
+   ],
+   "to": [
+    1.12,
+    -2.5,
+    0.6
+   ],
+   "up": [
+    1,
+    0,
+    0
+   ],
+   "scale": [
+    0.8,
+    1.0
+   ],
+   "note": "diagonal feed line down the flank"
+  }
+ ],
+ "mirror": "x",
+ "decals": "after mirror, separate layer"
+}

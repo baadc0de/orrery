@@ -1,0 +1,38 @@
+{
+  "stage": "constructible-concept",
+  "prop": "deck safety railing section with two posts, a top handrail, a mid rail and a kick plate",
+  "size": "about 2 m long and 1.1 m high",
+  "prompt": "You are a concept artist for a utilitarian, panelled, riveted spacecraft. The attached image is a PALETTE of numbered kitbash parts: 1 = pipe with end bracket; 2 = pipe bundle with brackets; 3 = strip frame with reinforced ends; 4 = flat plate with reinforced ends; 5 = bracket with mounting points; 6 = housing with grille; 7 = dual parallel pipes with curved ends; 8 = U-shaped bracket; 9 = straight tube, 1 m long, 0.05 m diameter; 10 = square bar, 1 m long, 0.05 m section; 11 = flat plate 1 x 0.5 m, 0.02 m thick; 12 = box 0.5 x 0.3 x 0.3 m. Design a deck safety railing section with two posts, a top handrail, a mid rail and a kick plate, about 2 m long and 1.1 m high, built ONLY from these parts (any part may be repeated, scaled and rotated; nothing else may be invented). Draw it as a clean front-left 3/4 concept on a flat light-grey background, untextured grey with the concept's dark polymer and bare-metal accents, and add small numbered callouts (leader line + the palette number) on every element so a modeller can see which palette part it is. No other text.",
+  "palette_sha256": "e742a7bb3851ce107e79eff36685cec8f2d2142bb0488ad869b493c2d91d74d6",
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "BK6bavOnGerJmPUP0dHU4QI",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 866,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 3374,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 560
+      },
+      {
+        "modality": "TEXT",
+        "tokenCount": 306
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 1388
+  },
+  "output": "concept.png",
+  "output_sha256": "008f981e7eba58e2cc1e403dcef249eeaead1a042bf6714f2dbc152dad0adbd1",
+  "model_text": "",
+  "generated_at": "2026-09-05T05:52:33Z"
+}
