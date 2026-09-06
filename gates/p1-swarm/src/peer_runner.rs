@@ -215,6 +215,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
     let mut consecutive_empty_seconds = 0u64;
     let mut meta_frames = 0u64;
     let mut roster_updates = 0u64;
+    let mut interest_crossings_reported = 0u64;
     let mut accepted_from: BTreeMap<usize, u64> = BTreeMap::new();
     let mut uplink_sequence = 0u64;
     rt.block_on(async move {
@@ -233,7 +234,19 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                 bot.publish(tick);
             }
             bot.update();
-            bot.sample();
+            // **#1132.** This used to be `bot.sample()`, which is
+            // `sample_with_interest_crossing(false, 0.0)`: the swept margin
+            // was never computed for a human seat and the ordered crossing was
+            // discarded by a `let _ =`. The runner now always emits it; the
+            // host applies it only when `--swept-interest-margin` is on, so the
+            // flag stays one host-side decision rather than two that can
+            // disagree.
+            if let Some(frame) = sample_for_uplink(&mut bot) {
+                interest_crossings_reported += 1;
+                if remote_link.uplink.send(frame).await.is_err() {
+                    bail!("the uplink queue closed; the host is gone");
+                }
+            }
 
             // Outbound: whatever the send path queued goes onto the wire addressed
             // by recipient slot. The stall profile never applies here — an
@@ -293,7 +306,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                     // Live evidence, rate-limited: a tester's session log says
                     // "you are a ghost" while it is happening, rather than
                     // only in a report nobody reads until afterwards.
-                    if consecutive_empty_seconds % EMPTY_AUDIENCE_WARN_S == 0 {
+                    if consecutive_empty_seconds.is_multiple_of(EMPTY_AUDIENCE_WARN_S) {
                         eprintln!(
                             "gates/p1-swarm: external peer slot {index} has replicated to nobody \
                              for {consecutive_empty_seconds} seconds; its island roster covers \
@@ -444,6 +457,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
             "gates/p1-swarm: external peer slot {index} accepted {} of {inbound_total} inbound \
              frames from seats {}; {meta_frames} meta frames, {roster_updates} roster updates, \
              {witness_ring_updates} witness-ring updates ({witness_ring_size} links installed), \
+             {interest_crossings_reported} interest crossings reported, \
              {empty_audience_seconds} of {audience_seconds} seconds replicating to nobody; \
              goodbye sent",
             accepted_from.values().sum::<u64>(),
@@ -454,6 +468,43 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                 .join(","),
         );
         Ok(())
+    })
+}
+
+/// The runner's sample step: advance this seat's bookkeeping and, when it just
+/// committed to a new interest cell, the Meta-lane frame that says so.
+///
+/// **This is the seam #1132 was missing.** Split out of the tick loop so the
+/// emission can be asserted without a socket: the loop itself is a tokio task
+/// against a live host, and the property under test — a *human* seat emits the
+/// ordered crossing with a swept coverage the host could not have derived from
+/// a cell id — is a property of this function alone.
+///
+/// The margin is always computed here rather than behind the runner's own copy
+/// of the flag. The peer is the only party that knows its offset inside the
+/// cell and its velocity, so it is the only party that *can* compute the set;
+/// what to do with it is the host's decision, made once in
+/// `Swarm::apply_interest_crossings` against `SwarmConfig::swept_interest_margin`.
+pub(crate) fn sample_for_uplink(bot: &mut Bot) -> Option<crate::exterior::Frame> {
+    let crossing =
+        bot.sample_with_interest_crossing(true, crate::swarm::INTEREST_REFRESH_PERIOD_S)?;
+    Some(crate::exterior::Frame {
+        peer: u32::MAX,
+        lane: crate::exterior::Lane::Meta,
+        payload: crate::exterior::InterestCrossingReport {
+            tick: crossing.tick.0,
+            own_seq: crossing.seq.own_seq,
+            auth_seq: crossing.seq.auth_seq,
+            from: crossing.from.to_bits(),
+            to: crossing.to.to_bits(),
+            covered_cells: crossing
+                .covered_cells
+                .iter()
+                .copied()
+                .map(CellId::to_bits)
+                .collect(),
+        }
+        .encode(),
     })
 }
 
@@ -616,6 +667,141 @@ mod tests {
     /// The criterion's population: thirty-two bots and one human seat.
     const BOTS: usize = 32;
     const HUMAN_SLOT: usize = BOTS;
+
+    /// The seat under test: one human slot, built exactly as [`run`] builds it.
+    fn human_seat_bot() -> Bot {
+        let mut universe = [0u8; 32];
+        universe[0..8].copy_from_slice(&7u64.to_le_bytes());
+        let mut bot = Bot::new(BotSpec {
+            index: HUMAN_SLOT,
+            count: BOTS + 1,
+            seed: UniverseSeed(universe),
+            cell_edge_m: campaign_cell_edge_m(),
+            witnessing: false,
+            cheat: None,
+            enforcing: false,
+        });
+        bot.profile = crate::profile::Profile::Cruise;
+        bot
+    }
+
+    /// Put the seat one metre inside the positive-x face of its committed cell,
+    /// moving out through it, and let the real hysteresis commit the crossing.
+    ///
+    /// This is the condition the flag exists to catch, stated in metres: at
+    /// v18's 480 m/s ceiling a craft clears the 460.8 m one-body AOI guarantee
+    /// in 0.96 s, inside one 1 Hz refresh, so the seat's roster must be
+    /// corrected at the commitment rather than at the next bulk report.
+    fn cross_the_positive_x_face(bot: &mut Bot) {
+        let cell = bot.cell().expect("a fresh seat is committed");
+        let (coords, _) = cell.coords();
+        let edge = f64::from(campaign_cell_edge_m());
+        let mut craft = bot.craft().clone();
+        craft.pos = orrery_core::QPos::from_metres(
+            f64::from(coords.x) * edge + edge - 1.0,
+            f64::from(coords.y) * edge + edge / 2.0,
+            f64::from(coords.z) * edge + edge / 2.0,
+        );
+        craft.vel = orrery_core::QVel::from_metres_per_sec(480.0, 0.0, 0.0);
+        bot.replace_craft_for_test(craft);
+        bot.move_local_player_for_test(glam::Vec3::new(
+            coords.x as f32 + 1.4,
+            coords.y as f32 + 0.5,
+            coords.z as f32 + 0.5,
+        ));
+        bot.update();
+    }
+
+    /// #1132. The runner's sample step must emit the ordered crossing, with the
+    /// swept coverage only the seat itself can compute.
+    ///
+    /// **What the old code did**, asserted here rather than described: the
+    /// runner called `Bot::sample`, whose entire body was
+    /// `let _ = self.sample_with_interest_crossing(false, 0.0)`. The `false`
+    /// made the swept margin unreachable — the `if swept_interest_margin` arm
+    /// that builds the event was never taken — and the `let _ =` discarded what
+    /// would have come out of it anyway. So under the exact condition below, a
+    /// human seat committing to a new cell at the interceptor ceiling, the host
+    /// learned nothing until the next bare 1 Hz cell report.
+    #[test]
+    fn the_runners_sample_step_emits_a_swept_crossing_the_old_one_discarded() {
+        let mut bot = human_seat_bot();
+        let from = bot.cell().expect("a fresh seat is committed");
+        cross_the_positive_x_face(&mut bot);
+
+        // The path the runner used to take, on this very state.
+        let mut old = human_seat_bot();
+        cross_the_positive_x_face(&mut old);
+        assert!(
+            old.sample_with_interest_crossing(false, 0.0).is_none(),
+            "`Bot::sample`'s hard-coded false is the defect: the seat committed \
+             to a new cell and the flag's own arm was never entered"
+        );
+
+        let frame = sample_for_uplink(&mut bot).expect("a committed crossing emits its report");
+        assert_eq!(frame.lane, crate::exterior::Lane::Meta);
+        assert_eq!(
+            frame.peer,
+            u32::MAX,
+            "Meta frames are not addressed by slot"
+        );
+        let report = crate::exterior::InterestCrossingReport::decode(&frame.payload)
+            .expect("the runner emits the crossing record, not a bare cell report");
+        assert_eq!(
+            report.from,
+            from.to_bits(),
+            "the crossing names the cell left"
+        );
+        assert_ne!(report.to, from.to_bits(), "and the cell committed to");
+        assert_eq!(
+            report.auth_seq, 1,
+            "a seat's first crossing starts its authority order at one, which is \
+             the host's fence for accepting it at all"
+        );
+
+        // The swept half: strictly wider than the 27-cell neighbourhood, and
+        // wider by cells the host could not have derived from the cell id it
+        // is sent in the 1 Hz report.
+        let to = CellId::from_bits(report.to).expect("the crossing carries a real cell");
+        let baseline = to.neighbors27();
+        let covered: Vec<CellId> = report
+            .covered_cells
+            .iter()
+            .map(|bits| CellId::from_bits(*bits).expect("declared coverage is real cells"))
+            .collect();
+        assert!(
+            baseline.iter().all(|cell| covered.contains(cell)),
+            "the margin may widen the baseline AOI but never narrow it"
+        );
+        assert!(
+            covered.len() > baseline.len(),
+            "a seat crossing a face at 480 m/s must declare the cells it can \
+             reach before the next refresh, not just the ones it stands among"
+        );
+    }
+
+    /// The record survives the wire it is put on.
+    #[test]
+    fn the_crossing_report_round_trips_through_its_meta_encoding() {
+        let mut bot = human_seat_bot();
+        cross_the_positive_x_face(&mut bot);
+        let frame = sample_for_uplink(&mut bot).expect("a committed crossing emits its report");
+        let decoded = crate::exterior::InterestCrossingReport::decode(&frame.payload)
+            .expect("the record decodes");
+        assert_eq!(
+            decoded.encode(),
+            frame.payload,
+            "encode ∘ decode is identity"
+        );
+        assert!(
+            crate::exterior::IslandRoster::decode(&frame.payload).is_none(),
+            "0xa4 must not be mistaken for the roster record sharing this lane"
+        );
+        assert!(
+            crate::exterior::HearsayContacts::decode(&frame.payload).is_none(),
+            "nor for the hearsay fold"
+        );
+    }
 
     fn manifest_for(subject: usize) -> StartManifest {
         let active = (0..=BOTS)

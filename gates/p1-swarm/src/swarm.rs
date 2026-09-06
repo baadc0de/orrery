@@ -27,7 +27,8 @@ use crate::bot::{AudienceChange, Bot, BotSpec, TICK_HZ};
 use crate::delta_stats::{DeltaStats, DeltaStatsReport};
 use crate::exterior::{
     unix_millis_now, ActiveSeat, Frame, HearsayContact, HearsayContacts, HearsaySource,
-    IslandRoster, Lane, RosterSeat, StartManifest, UplinkAck, UplinkDatagram, UplinkOutcome,
+    InterestCrossingReport, IslandRoster, Lane, RosterSeat, StartManifest, UplinkAck,
+    UplinkDatagram, UplinkOutcome,
 };
 
 use crate::router::{Impairment, Router, RouterCounters};
@@ -381,7 +382,12 @@ struct AppliedInterestCrossing {
     committed_cell: CellId,
 }
 /// The coordinator's bulk interest refresh remains 1 Hz (#653/#692).
-const INTEREST_REFRESH_PERIOD_S: f64 = 1.0;
+///
+/// `pub(crate)` because the external peer runner has to sweep against the same
+/// period the host does: a human seat computing its margin against a different
+/// refresh would declare coverage the host's roster cadence does not match
+/// (#1132).
+pub(crate) const INTEREST_REFRESH_PERIOD_S: f64 = 1.0;
 
 /// The harness's modified clients: which cheat, and how many peers run it.
 ///
@@ -947,6 +953,24 @@ pub struct ExteriorReport {
     /// cell in about sixteen seconds, which is longer than every real-peer
     /// fixture in the tree ran before #1128.
     pub reported_cells: usize,
+    /// Ordered interest crossings this seat reported that the host applied.
+    ///
+    /// **The number that says the swept margin fired for a human (#1132).**
+    /// Before the fix it was structurally zero: the external runner called
+    /// `Bot::sample`, which hard-codes the flag off and discards the crossing,
+    /// so a human seat's new cell reached the host only in the bare 1 Hz cell
+    /// report — the reactive tail #653 bought the flag to close. A live hour
+    /// with `--swept-interest-margin` and a roaming human must show this
+    /// non-zero, and `reported_cells` above says whether the seat moved enough
+    /// for that to mean anything.
+    pub interest_crossings_applied: u64,
+    /// Of those, ones refused for not chaining after the host's ordered fence.
+    ///
+    /// Must be zero on a healthy run. Non-zero says a human seat's crossings
+    /// arrived out of order or replayed; it is reported rather than fatal
+    /// because the author is another process (see
+    /// `Swarm::apply_interest_crossings`).
+    pub interest_crossings_refused: u64,
     /// State-channel packets this seat authored that reached a recipient.
     ///
     /// **Read it as a rate, not as a liveness flag.** Measured over the same
@@ -1275,6 +1299,27 @@ pub struct LinkReport {
     /// rather than failed: the row is read at report time, after the window
     /// has closed.
     pub misaddressed: u64,
+    /// Stream messages carried end to end.
+    ///
+    /// The denominator the two below are unreadable without: "eleven thousand
+    /// retransmissions" is a number, and "eleven thousand over four hundred
+    /// thousand messages" is a rate (#1133).
+    pub stream_delivered: u64,
+    /// Retransmissions stream messages needed before they landed.
+    ///
+    /// Not losses — every one of these still arrived. It is what reliability
+    /// cost in round trips, which is what the repair path lives or dies by.
+    pub stream_retransmits: u64,
+    /// Ticks stream messages spent queued behind an earlier message on the
+    /// same shared stream: the head-of-line tax.
+    ///
+    /// **Read it beside "the link drains".** `Router::max_delivery_delay_ticks`
+    /// deliberately excludes this — a queue behind an earlier message is not a
+    /// delay the impairment model imposed on the packet itself — so a run that
+    /// ends with packets still in flight fails that clause with the one number
+    /// that explains why sitting in a counter nobody printed. It is printed
+    /// now, and named in the failure detail itself.
+    pub stream_head_of_line_ticks: u64,
 }
 
 impl From<RouterCounters> for LinkReport {
@@ -1285,6 +1330,9 @@ impl From<RouterCounters> for LinkReport {
             delayed: counters.delayed,
             bytes: counters.bytes,
             misaddressed: counters.misaddressed,
+            stream_delivered: counters.stream_delivered,
+            stream_retransmits: counters.stream_retransmits,
+            stream_head_of_line_ticks: counters.stream_head_of_line_ticks,
         }
     }
 }
@@ -1693,8 +1741,13 @@ pub struct Swarm {
     interest_margin_stats: Option<InterestMarginStats>,
     /// A21's opt-in observer; it never feeds recipient selection.
     presence_stats: Option<PresenceStats>,
-    /// Ordered crossing fence per stable bot seat.
-    applied_interest_crossings: Vec<Option<AppliedInterestCrossing>>,
+    /// Ordered crossing fence per stable seat, bots and human seats alike.
+    ///
+    /// Keyed rather than indexed since #1132. It used to be a `Vec` sized by
+    /// `SwarmConfig::peers`, which is the *bot* count: a human seat is
+    /// numbered at or above it, so the first crossing a human ever emitted
+    /// would have indexed past the end. A map has no size to get wrong.
+    applied_interest_crossings: BTreeMap<usize, AppliedInterestCrossing>,
     /// Replication messages admitted by the meter, split by A19 wire kind.
     admitted_keyframes: u64,
     admitted_deltas: u64,
@@ -1788,6 +1841,37 @@ pub struct ExteriorSlot {
     /// Deliveries handed down to this seat, counted by the seat that sent
     /// them. Human-to-human traffic is the entry #1129 says is always absent.
     deliveries_from: BTreeMap<usize, u64>,
+    /// Ordered interest crossings this seat reported and the host has not yet
+    /// applied, oldest first (#1132).
+    pending_crossings: Vec<InterestCellCrossing>,
+    /// The swept coverage of the seat's last *accepted* crossing, and the cell
+    /// it was swept from.
+    ///
+    /// Written by `Swarm::apply_interest_crossings` rather than at decode, so
+    /// a crossing the host's fence refused never reaches the roster the rest
+    /// of the island reads. The cell is kept beside the list so the
+    /// declaration can be *checked* rather than trusted: coverage swept from a
+    /// cell the seat has since left is stale, and
+    /// `Swarm::active_interest_coverage` falls back to the plain 27-cell
+    /// neighbourhood rather than publish it.
+    declared_coverage: Option<DeclaredCoverage>,
+    /// Crossings this seat reported that the host accepted and applied.
+    interest_crossings_applied: u64,
+    /// Crossings refused for not chaining after the host's ordered fence.
+    interest_crossings_refused: u64,
+}
+
+/// One human seat's declared swept interest coverage, with the cell it was
+/// swept from.
+///
+/// A named pair rather than a bare tuple: the cell is the *validity condition*
+/// for the list, not a second list, and nothing at the use site would say so.
+#[derive(Debug, Clone)]
+struct DeclaredCoverage {
+    /// The committed cell the sweep started from.
+    swept_from: CellId,
+    /// The cells the seat declared interest in.
+    cells: Vec<CellId>,
 }
 
 /// One crewed-roster snapshot retained by the hearsay fold.
@@ -1958,6 +2042,8 @@ impl ExteriorSlot {
             witness_anchored: self.witness_anchored,
             session_id: self.session_id.clone(),
             reported_cells: self.reported_cells.len(),
+            interest_crossings_applied: self.interest_crossings_applied,
+            interest_crossings_refused: self.interest_crossings_refused,
             state_deliveries: self.state_deliveries,
             last_state_delivery_tick: self.last_state_delivery_tick,
             deliveries_from_seats: self
@@ -2106,8 +2192,17 @@ impl ExteriorSlot {
             match frame.lane {
                 Lane::Meta => {
                     // One u64: the sender's current interest cell, raw bits.
+                    // The length check is the discriminator and stays first:
+                    // the bare cell report is exactly eight bytes and every
+                    // tagged record on this lane is longer.
                     if let Ok(raw) = <[u8; 8]>::try_from(frame.payload.as_ref()) {
                         self.set_cell_from_bits(u64::from_le_bytes(raw), tick);
+                        continue;
+                    }
+                    // The ordered crossing (#1132), which is what the bare
+                    // report above is the 1 Hz repair path for.
+                    if let Some(report) = InterestCrossingReport::decode(&frame.payload) {
+                        self.record_interest_crossing(&report, tick);
                     }
                     continue;
                 }
@@ -2165,6 +2260,43 @@ impl ExteriorSlot {
     /// The cell this peer last reported, for roster broadcasts.
     fn cell(&self) -> CellId {
         self.cell
+    }
+
+    /// Records one Meta-lane interest crossing, refusing malformed cells.
+    ///
+    /// The crossing also *is* a cell report: it names the cell the seat
+    /// committed to, at the tick it committed, which is strictly fresher than
+    /// waiting for the next bare eight-byte report. Applying it here is what
+    /// removes the reactive tail #653 was bought to close for a human seat.
+    fn record_interest_crossing(&mut self, report: &InterestCrossingReport, fact_tick: u64) {
+        let (Some(from), Some(to)) = (CellId::from_bits(report.from), CellId::from_bits(report.to))
+        else {
+            return;
+        };
+        let covered: Vec<CellId> = report
+            .covered_cells
+            .iter()
+            .filter_map(|bits| CellId::from_bits(*bits))
+            .collect();
+        if covered.len() != report.covered_cells.len() || covered.is_empty() {
+            return;
+        }
+        // The cell fact lands here, unconditionally, exactly as the bare
+        // eight-byte report's does: it is the seat's claim about where it is,
+        // and this record is strictly fresher than waiting a second for the
+        // next one. The *coverage* is held back until the fence accepts the
+        // crossing, in `Swarm::apply_interest_crossings`.
+        self.set_cell_from_bits(report.to, fact_tick);
+        self.pending_crossings.push(InterestCellCrossing {
+            tick: Tick::new(report.tick),
+            seq: SeqPair {
+                own_seq: report.own_seq,
+                auth_seq: report.auth_seq,
+            },
+            from,
+            to,
+            covered_cells: covered,
+        });
     }
 
     /// Records a raw meta-lane cell report, refusing encodings that are not
@@ -2302,7 +2434,7 @@ impl Swarm {
                 .swept_interest_margin
                 .then(InterestMarginStats::default),
             presence_stats: config.presence_stats.then(PresenceStats::default),
-            applied_interest_crossings: vec![None; config.peers],
+            applied_interest_crossings: BTreeMap::new(),
             admitted_keyframes: 0,
             admitted_deltas: 0,
             exteriors: BTreeMap::new(),
@@ -2456,6 +2588,10 @@ impl Swarm {
                 state_deliveries: 0,
                 last_state_delivery_tick: None,
                 deliveries_from: BTreeMap::new(),
+                pending_crossings: Vec::new(),
+                declared_coverage: None,
+                interest_crossings_applied: 0,
+                interest_crossings_refused: 0,
             },
         );
     }
@@ -2628,6 +2764,28 @@ impl Swarm {
         }
     }
 
+    /// Ordered crossings the human seats reported since the last drain.
+    ///
+    /// Separate from the bots' collection because an exterior's frames only
+    /// enter the host at `collect_sends`, which runs after the bot loop that
+    /// gathers theirs. Same tick either way, which is the property that
+    /// matters: the correction lands before the next send window rather than
+    /// at the next 1 Hz refresh, which is the sixty-tick tail #653 bought the
+    /// flag to close (#1132).
+    fn drain_exterior_interest_crossings(&mut self) -> Vec<HostInterestCrossing> {
+        let mut events = Vec::new();
+        for exterior in self.exteriors.values_mut() {
+            let node = exterior.node;
+            events.extend(
+                exterior
+                    .pending_crossings
+                    .drain(..)
+                    .map(|crossing| HostInterestCrossing { node, crossing }),
+            );
+        }
+        events
+    }
+
     /// Apply immediate crossing coverage to the membership every sender reads.
     ///
     /// This is the host half of #653/#692. The swept set pages likely cells in
@@ -2635,24 +2793,53 @@ impl Swarm {
     /// bulk repairs. Applying the event directly to `IslandMembership` is what
     /// lets `broadcast_state`'s existing audience diff offer a cached keyframe
     /// on the next send tick, with no additional presence-keyframe policy.
+    ///
+    /// **Gated here, and only here (#1132).** The flag is a host-side
+    /// measurement decision, so the external runner reports its crossings
+    /// unconditionally and this is the one place that decides whether they
+    /// count. A runner carrying its own copy of the flag would be a second
+    /// place for the two to disagree, which is the shape all four of
+    /// #1128-#1132 have.
     fn apply_interest_crossings(&mut self, events: Vec<HostInterestCrossing>) {
+        if !self.config.swept_interest_margin {
+            return;
+        }
         for event in events {
-            let index = *self
-                .index_of
-                .get(&event.node)
-                .expect("a crossing authority has one stable host seat");
-            if let Some(applied) = self.applied_interest_crossings[index] {
-                assert!(
+            let Some(index) = self.index_of.get(&event.node).copied() else {
+                // A seat the host no longer knows: a human that departed
+                // between reporting and this drain. Not fatal, and not silent
+                // either — `misaddressed` is the counter for traffic naming a
+                // seat the swarm cannot seat.
+                self.router.counters.misaddressed += 1;
+                continue;
+            };
+            let chained = match self.applied_interest_crossings.get(&index) {
+                Some(applied) => {
                     event.crossing.seq.supersedes(applied.seq)
                         && event.crossing.tick > applied.tick
-                        && event.crossing.from == applied.committed_cell,
-                    "interest crossing for seat {index} did not chain after the host's ordered fence: previous {applied:?}, offered {:?}",
+                        && event.crossing.from == applied.committed_cell
+                }
+                None => event.crossing.seq.auth_seq == 1,
+            };
+            if !chained {
+                // **Refused, not asserted, when the author is a human seat.**
+                // A bot's crossing is produced in this process by the same
+                // loop that consumes it, so a break in the chain there is a
+                // harness invariant and must stop the run. A human's arrives
+                // over the Meta lane from another process: an assert would let
+                // a malformed or replayed frame from a client take down a live
+                // campaign host, which is exactly what
+                // `Bot::apply_interest_crossing`'s own doc comment refuses to
+                // do.
+                if let Some(exterior) = self.exteriors.get_mut(&index) {
+                    exterior.interest_crossings_refused += 1;
+                    continue;
+                }
+                panic!(
+                    "interest crossing for bot seat {index} did not chain after the host's \
+                     ordered fence: previous {:?}, offered {:?}",
+                    self.applied_interest_crossings.get(&index),
                     event.crossing,
-                );
-            } else {
-                assert_eq!(
-                    event.crossing.seq.auth_seq, 1,
-                    "a seat's first emitted crossing must start its authority order at one"
                 );
             }
 
@@ -2661,11 +2848,24 @@ impl Swarm {
                     bot.apply_interest_crossing(event.node, &event.crossing);
                 }
             }
-            self.applied_interest_crossings[index] = Some(AppliedInterestCrossing {
-                seq: event.crossing.seq,
-                tick: event.crossing.tick,
-                committed_cell: event.crossing.to,
-            });
+            if let Some(exterior) = self.exteriors.get_mut(&index) {
+                exterior.interest_crossings_applied += 1;
+                // The predictive half, kept for the 1 Hz publish to everyone
+                // the reactive event above did not reach: the other human
+                // seats, whose rosters arrive as `IslandRoster` frames.
+                exterior.declared_coverage = Some(DeclaredCoverage {
+                    swept_from: event.crossing.to,
+                    cells: event.crossing.covered_cells.clone(),
+                });
+            }
+            self.applied_interest_crossings.insert(
+                index,
+                AppliedInterestCrossing {
+                    seq: event.crossing.seq,
+                    tick: event.crossing.tick,
+                    committed_cell: event.crossing.to,
+                },
+            );
         }
     }
 
@@ -2815,7 +3015,21 @@ impl Swarm {
             coverage.push((bot.node, cells));
         }
         for exterior in self.exteriors.values() {
-            let cells = exterior.cell().neighbors27();
+            // **The predictive half, for a human seat (#1132).** This arm was
+            // unconditionally `neighbors27()`, so with the flag on every bot
+            // swept and every human did not: the seat the flag was bought for
+            // declared the plain neighbourhood and was paged in reactively
+            // like any other. The host cannot sweep on its behalf — the sweep
+            // needs the seat's offset inside the cell and its velocity, and
+            // the host holds a cell id — so it publishes the coverage the seat
+            // itself declared with its last crossing, and only while that
+            // declaration is still swept from the cell the seat is in.
+            let declared = swept
+                .then_some(exterior.declared_coverage.as_ref())
+                .flatten()
+                .filter(|declared| declared.swept_from == exterior.cell())
+                .map(|declared| declared.cells.clone());
+            let cells = declared.unwrap_or_else(|| exterior.cell().neighbors27());
             if let Some(stats) = &mut self.interest_margin_stats {
                 stats.observe(cells.len());
             }
@@ -3432,6 +3646,11 @@ impl Swarm {
         mark = std::time::Instant::now();
         self.collect_delivered_inputs(tick);
         self.collect_sends(tick);
+        // The human half of the same event. `collect_sends` is what pumps an
+        // exterior's uplink, so this is the earliest point in the tick at
+        // which a human seat's crossing exists at all (#1132).
+        let exterior_crossings = self.drain_exterior_interest_crossings();
+        self.apply_interest_crossings(exterior_crossings);
         phase[4] += mark.elapsed().as_nanos();
         mark = std::time::Instant::now();
         self.deliver(tick);
@@ -4507,6 +4726,41 @@ impl SwarmReport {
                     ),
                 });
             }
+            // **#1132's clause.** The flag is bought for exactly one thing —
+            // a human cannot be shot by someone their roster has not heard of
+            // yet — and for the whole of its life it fired only for bots. A
+            // run that turns it on, seats a human, and moves that human out of
+            // the cell it spawned in must show the host applying that seat's
+            // ordered crossings; zero means the margin is off for the one
+            // participant it was bought for, however healthy every swarm-wide
+            // number looks.
+            //
+            // `reported_cells > 1` is the anti-vacuity guard, and it is the
+            // reason the old fixtures could not have caught this: a seat that
+            // never left its spawn cell has no crossing to emit, and at the
+            // campaign's 512 m edge and 32 m/s cruise that takes about sixteen
+            // seconds — longer than every real-peer fixture in the tree ran.
+            if self.identity.swept_interest_margin
+                && external.reported_cells > 1
+                && external.interest_crossings_applied == 0
+            {
+                failures.push(CriterionFailure {
+                    clause: "the swept interest margin fires for a human seat",
+                    detail: format!(
+                        "slot {} reported {} distinct interest cells with                          --swept-interest-margin on, and the host applied none of its ordered                          crossings; every bot's roster learned this seat's new cell from the 1 Hz                          bulk report, which is the reactive tail the flag exists to close",
+                        external.index, external.reported_cells,
+                    ),
+                });
+            }
+            if external.interest_crossings_refused > 0 {
+                failures.push(CriterionFailure {
+                    clause: "the swept interest margin fires for a human seat",
+                    detail: format!(
+                        "slot {} had {} of its ordered crossings refused for not chaining after                          the host's fence; the seat's coverage is then whatever the last accepted                          crossing said, which is not where it is",
+                        external.index, external.interest_crossings_refused,
+                    ),
+                });
+            }
             let clean_close = external.connected || external.said_goodbye;
             if !clean_close {
                 failures.push(CriterionFailure {
@@ -4656,11 +4910,22 @@ impl SwarmReport {
             });
         }
         if self.stranded_in_flight > 0 {
+            // The head-of-line tax rides in the detail rather than in a line
+            // of its own, because this is the one failure it explains: it is
+            // excluded from `Router::max_delivery_delay_ticks` by design, so a
+            // horizon computed from that number cannot see it, and a stranded
+            // message on a shared stream is queued behind an earlier one for
+            // exactly this many ticks (#1133).
             failures.push(CriterionFailure {
                 clause: "the link drains",
                 detail: format!(
-                    "{} packets still in flight when the run ended",
-                    self.stranded_in_flight
+                    "{} packets still in flight when the run ended; shared streams charged \
+                     {} ticks of head-of-line blocking over {} delivered stream messages \
+                     ({} retransmissions), which the drain horizon excludes by design",
+                    self.stranded_in_flight,
+                    self.link.stream_head_of_line_ticks,
+                    self.link.stream_delivered,
+                    self.link.stream_retransmits,
                 ),
             });
         }
@@ -5523,6 +5788,351 @@ mod tests {
         );
     }
 
+    /// A two-bot island with one human seat, the swept margin on or off.
+    fn human_seat_swarm(swept: bool) -> (Swarm, crate::exterior::RemoteLink) {
+        use crate::bot::{bot_key, campaign_cell_edge_m};
+        use crate::exterior::link_pair;
+
+        const ISLAND_SEATS: usize = 3;
+        const HUMAN: usize = 2;
+        let mut swarm = Swarm::new_for_island(
+            SwarmConfig {
+                peers: 2,
+                cell_edge_m: campaign_cell_edge_m(),
+                campaign: true,
+                witnessing: false,
+                swept_interest_margin: swept,
+                ..SwarmConfig::default()
+            },
+            ISLAND_SEATS,
+        );
+        let (host_link, remote) = link_pair();
+        swarm = swarm.with_external_at(
+            HUMAN,
+            ISLAND_SEATS,
+            bot_key(HUMAN).public(),
+            None,
+            host_link,
+        );
+        swarm.form_island();
+        (swarm, remote)
+    }
+
+    /// A crossing the seat could plausibly emit: one cell along +x, declaring
+    /// the swept set — the plain neighbourhood plus a cell two faces out that
+    /// only a velocity could have justified.
+    fn human_crossing(
+        from: CellId,
+    ) -> (
+        crate::exterior::InterestCrossingReport,
+        CellId,
+        CellId,
+        Vec<CellId>,
+    ) {
+        let (coords, level) = from.coords();
+        let to = CellId::from_coords(coords + glam::IVec3::X, level).expect("adjacent cell");
+        let reach =
+            CellId::from_coords(coords + 3 * glam::IVec3::X, level).expect("a cell two faces out");
+        assert!(
+            !to.neighbors27().contains(&reach),
+            "the fixture's reached cell must be outside the plain neighbourhood, \
+             or the test cannot tell the swept half from the bulk refresh"
+        );
+        let mut covered = to.neighbors27();
+        covered.push(reach);
+        let report = crate::exterior::InterestCrossingReport {
+            tick: 30,
+            own_seq: 1,
+            auth_seq: 1,
+            from: from.to_bits(),
+            to: to.to_bits(),
+            covered_cells: covered.iter().copied().map(CellId::to_bits).collect(),
+        };
+        (report, to, reach, covered)
+    }
+
+    fn send_meta(remote: &crate::exterior::RemoteLink, payload: Bytes) {
+        remote
+            .uplink
+            .try_send(Frame {
+                peer: u32::MAX,
+                lane: Lane::Meta,
+                payload,
+            })
+            .expect("the host queue accepts a meta frame");
+    }
+
+    /// **#1132's headline.** The swept interest margin must fire for a *human*
+    /// seat: the seat the flag was bought for, in the condition it exists to
+    /// catch — a boundary commitment inside one 1 Hz refresh period.
+    ///
+    /// The old code could not reach this state at all. The external runner
+    /// called `Bot::sample`, whose whole body was
+    /// `let _ = self.sample_with_interest_crossing(false, 0.0)`, so the flag's
+    /// own arm was never entered for a human seat and nothing was emitted; the
+    /// host had no Meta-lane grammar to carry a crossing in even if it had
+    /// been; and `active_interest_coverage` handed every exterior a plain
+    /// `neighbors27()` whatever the flag said. What the host did instead is
+    /// asserted below, in `the_bare_cell_report_is_all_the_old_path_ever_sent`:
+    /// it waited for the next bare eight-byte cell report and installed the
+    /// plain neighbourhood of wherever the seat had got to — the reactive tail,
+    /// and no margin at all.
+    #[test]
+    fn a_human_seats_swept_crossing_corrects_every_bots_roster_in_the_tick_it_arrives() {
+        let (mut swarm, remote) = human_seat_swarm(true);
+        let human = swarm.exteriors[&2].node;
+        let spawn = swarm.exteriors[&2].cell();
+        assert_eq!(
+            swarm.bots[0].island_coverage_of(human),
+            Some(spawn.neighbors27()),
+            "a freshly formed island gives the human seat the plain neighbourhood"
+        );
+
+        let (report, to, reach, covered) = human_crossing(spawn);
+        send_meta(&remote, report.encode());
+        swarm.tick_once(30, 3, &mut [0u128; 6]);
+
+        for bot in &swarm.bots {
+            let installed = bot
+                .island_coverage_of(human)
+                .expect("every bot carries the human seat");
+            assert_eq!(
+                installed, covered,
+                "the crossing must install the coverage the seat declared, in the \
+                 tick it arrived, rather than wait for the 1 Hz bulk refresh"
+            );
+            assert!(
+                installed.contains(&reach),
+                "including the cell the seat can reach before the next refresh — \
+                 the whole of what --swept-interest-margin buys, and the cell a \
+                 craft would otherwise shoot from unannounced"
+            );
+        }
+        assert_eq!(
+            swarm.exteriors[&2].cell(),
+            to,
+            "the crossing is also the freshest cell report there is"
+        );
+        assert_eq!(
+            swarm.exteriors[&2].report().interest_crossings_applied,
+            1,
+            "and the seat's own report row says the margin fired for it"
+        );
+        assert_eq!(swarm.exteriors[&2].report().interest_crossings_refused, 0);
+
+        // The predictive half, published to everyone else on the next refresh.
+        let coverage = swarm.active_interest_coverage();
+        let published = coverage
+            .iter()
+            .find(|(node, _)| *node == human)
+            .map(|(_, cells)| cells.clone())
+            .expect("the human seat is in the published coverage");
+        assert_eq!(
+            published, covered,
+            "the host cannot sweep on a human's behalf — it holds a cell id, not \
+             an offset and a velocity — so it publishes what the seat declared"
+        );
+    }
+
+    /// What the host did instead, before #1132: nothing, until the next second.
+    #[test]
+    fn the_bare_cell_report_is_all_the_old_path_ever_sent() {
+        let (mut swarm, remote) = human_seat_swarm(true);
+        let human = swarm.exteriors[&2].node;
+        let spawn = swarm.exteriors[&2].cell();
+        let (_, to, reach, _) = human_crossing(spawn);
+
+        // The eight-byte cell report the runner sends once a simulated second,
+        // which was the host's only news of a human seat's movement.
+        send_meta(&remote, Bytes::copy_from_slice(&to.to_bits().to_le_bytes()));
+        swarm.tick_once(30, 3, &mut [0u128; 6]);
+        assert_eq!(
+            swarm.bots[0].island_coverage_of(human),
+            Some(spawn.neighbors27()),
+            "a bare cell report moves no roster in the tick it arrives"
+        );
+        assert_eq!(
+            swarm.exteriors[&2].report().interest_crossings_applied,
+            0,
+            "and it is not a crossing, so nothing fires"
+        );
+
+        // It takes the 1 Hz bulk refresh, and what that installs is the plain
+        // neighbourhood: the seat is covered where it stands, never where it
+        // can get to.
+        swarm.refresh_rosters(59);
+        let installed = swarm.bots[0]
+            .island_coverage_of(human)
+            .expect("every bot carries the human seat");
+        assert_eq!(installed, to.neighbors27());
+        assert!(
+            !installed.contains(&reach),
+            "the reactive tail in one assertion: the margin the flag was bought \
+             for is absent from a human seat's coverage entirely"
+        );
+    }
+
+    /// The flag stays one decision. With it off, a reported crossing changes
+    /// nothing — the runner reports unconditionally because only it can compute
+    /// the set, and the host is the single place that decides whether to use it.
+    #[test]
+    fn a_reported_crossing_is_inert_when_the_margin_is_off() {
+        let (mut swarm, remote) = human_seat_swarm(false);
+        let human = swarm.exteriors[&2].node;
+        let spawn = swarm.exteriors[&2].cell();
+        let (report, to, _, _) = human_crossing(spawn);
+
+        send_meta(&remote, report.encode());
+        swarm.tick_once(30, 3, &mut [0u128; 6]);
+        assert_eq!(
+            swarm.bots[0].island_coverage_of(human),
+            Some(spawn.neighbors27()),
+            "flags-off behaviour is byte-for-byte what it was"
+        );
+        assert_eq!(swarm.exteriors[&2].report().interest_crossings_applied, 0);
+        swarm.refresh_rosters(59);
+        assert_eq!(
+            swarm.bots[0].island_coverage_of(human),
+            Some(to.neighbors27()),
+            "and the bulk refresh still publishes the plain neighbourhood"
+        );
+    }
+
+    /// A human's crossings arrive from another process. One that does not chain
+    /// after the host's fence is refused and counted, never asserted on: an
+    /// assert here is a client that can stop a live campaign host.
+    #[test]
+    fn an_unchained_human_crossing_is_refused_rather_than_fatal() {
+        use crate::bot::bot_key;
+
+        let (mut swarm, remote) = human_seat_swarm(true);
+        let spawn = swarm.exteriors[&2].cell();
+        let (mut report, _, _, _) = human_crossing(spawn);
+        report.auth_seq = 9;
+
+        send_meta(&remote, report.encode());
+        swarm.tick_once(30, 3, &mut [0u128; 6]);
+        let row = swarm.exteriors[&2].report();
+        assert_eq!(row.interest_crossings_applied, 0);
+        assert_eq!(
+            row.interest_crossings_refused, 1,
+            "a first crossing that does not start the authority order at one is \
+             refused, and the refusal is a number somebody can read"
+        );
+
+        // And the coverage it declared never reaches the roster: a refused
+        // crossing must not be able to widen — or narrow — what the island
+        // believes this seat is interested in.
+        let cell = swarm.exteriors[&2].cell();
+        let coverage = swarm.active_interest_coverage();
+        let human = bot_key(2).public();
+        assert_eq!(
+            coverage
+                .iter()
+                .find(|(node, _)| *node == human)
+                .map(|(_, cells)| cells.clone()),
+            Some(cell.neighbors27()),
+            "a refused declaration falls back to the plain neighbourhood"
+        );
+    }
+
+    /// The clause reads the counter. A run that turns the flag on, seats a
+    /// human and moves it must show the margin firing for that seat.
+    #[test]
+    fn a_human_seat_that_roamed_without_a_single_crossing_fails_its_own_clause() {
+        let mut report = passing();
+        report.identity.swept_interest_margin = true;
+        let mut seat = anchored_seat(7, 0);
+        seat.reported_cells = 8;
+        seat.interest_crossings_applied = 0;
+        report.external = vec![seat];
+
+        let failure = report
+            .against_criterion(STRICT)
+            .into_iter()
+            .find(|failure| failure.clause == "the swept interest margin fires for a human seat")
+            .expect("a roaming human seat with no applied crossing is #1132 exactly");
+        assert!(
+            failure
+                .detail
+                .contains("reported 8 distinct interest cells"),
+            "the failure must name the roam that makes it non-vacuous: {}",
+            failure.detail
+        );
+    }
+
+    #[test]
+    fn a_human_seat_whose_crossings_landed_passes_the_margin_clause() {
+        let mut report = passing();
+        report.identity.swept_interest_margin = true;
+        let mut seat = anchored_seat(7, 0);
+        seat.reported_cells = 8;
+        seat.interest_crossings_applied = 7;
+        report.external = vec![seat];
+        assert!(
+            !clauses(&report, STRICT).contains(&"the swept interest margin fires for a human seat"),
+            "seven crossings over eight cells is the flag working"
+        );
+
+        // And a seat that never left its spawn cell has no crossing to emit, so
+        // the clause must not fire on it either.
+        let mut still = anchored_seat(7, 0);
+        still.reported_cells = 1;
+        still.interest_crossings_applied = 0;
+        report.external = vec![still];
+        assert!(
+            !clauses(&report, STRICT).contains(&"the swept interest margin fires for a human seat"),
+            "a seat that never crossed a boundary is no evidence either way"
+        );
+    }
+
+    /// **#1133.** The three stream counters reach the report, and the one that
+    /// explains a failed drain is named in that failure's own detail.
+    #[test]
+    fn the_stream_counters_reach_the_report_and_the_drain_failure_reads_them() {
+        let counters = RouterCounters {
+            delivered: 10,
+            dropped: 1,
+            stream_delivered: 400_000,
+            stream_retransmits: 11_000,
+            stream_head_of_line_ticks: 913,
+            delayed: 2,
+            misaddressed: 0,
+            bytes: 64,
+        };
+        let link: LinkReport = counters.into();
+        assert_eq!(link.stream_delivered, 400_000);
+        assert_eq!(link.stream_retransmits, 11_000);
+        assert_eq!(link.stream_head_of_line_ticks, 913);
+
+        let mut report = passing();
+        report.link = link;
+        report.stranded_in_flight = 3;
+        let failure = report
+            .against_criterion(STRICT)
+            .into_iter()
+            .find(|failure| failure.clause == "the link drains")
+            .expect("stranded packets fail the drain clause");
+        assert!(
+            failure
+                .detail
+                .contains("913 ticks of head-of-line blocking"),
+            "the head-of-line tax is excluded from the drain horizon by design, \
+             so the failure it explains must carry it: {}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("400000 delivered stream messages"),
+            "with the denominator that makes it a rate: {}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("11000 retransmissions"),
+            "and the round trips reliability cost: {}",
+            failure.detail
+        );
+    }
+
     fn hearsay_test_swarm(
         bot_seats: usize,
         exterior_seats: &[usize],
@@ -6056,6 +6666,9 @@ mod tests {
                 delayed: 0,
                 bytes: 0,
                 misaddressed: 0,
+                stream_delivered: 0,
+                stream_retransmits: 0,
+                stream_head_of_line_ticks: 0,
             },
             late_join: Some(LateJoinReport {
                 neighbourhood: 27,
@@ -6160,6 +6773,8 @@ mod tests {
             witness_anchored: true,
             session_id: None,
             reported_cells: 8,
+            interest_crossings_applied: 7,
+            interest_crossings_refused: 0,
             state_deliveries: 72_000,
             last_state_delivery_tick: Some(3_600 * 60 - 1),
             deliveries_from_seats: Vec::new(),

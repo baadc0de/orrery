@@ -1594,11 +1594,6 @@ impl Bot {
         self.app.update();
     }
 
-    /// Record what changed this tick without enabling host crossing emission.
-    pub fn sample(&mut self) {
-        let _ = self.sample_with_interest_crossing(false, 0.0);
-    }
-
     /// Record what changed this tick and emit an ordered interest crossing.
     ///
     /// The feature flag deliberately gates both #653 mechanisms in the harness:
@@ -1852,6 +1847,24 @@ impl Bot {
             regime: TopologyRegime::Mesh,
             source: IslandSource::Coordinator,
         };
+    }
+
+    #[cfg(test)]
+    /// The interest coverage this sender currently believes `node` declares.
+    ///
+    /// The exact list `broadcast_state` gates its audience on, so a test can
+    /// assert what a *sender* would do with a crossing rather than that the
+    /// crossing was merely accepted. `None` means the roster does not carry
+    /// that seat at all.
+    #[must_use]
+    pub fn island_coverage_of(&self, node: NodeId) -> Option<Vec<CellId>> {
+        self.app
+            .world()
+            .resource::<IslandMembership>()
+            .peers
+            .iter()
+            .find(|entry| entry.node == node)
+            .map(|entry| entry.cells.clone())
     }
 
     /// Apply one coordinator-ordered crossing to the roster this sender reads.

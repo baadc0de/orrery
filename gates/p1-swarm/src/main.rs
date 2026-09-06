@@ -1853,6 +1853,21 @@ fn main() -> Result<()> {
         report.link.delivered,
         report.link.dropped,
     );
+    // The reliable lane, printed even at zero, for the same reason the fault
+    // counters below are: all three of these were incremented on every run
+    // since they landed and read by nothing outside `router.rs`'s own unit
+    // tests (#1133). The head-of-line tax is the costly one — it is excluded
+    // from the drain horizon by design (`Router::max_delivery_delay_ticks`),
+    // so it is the single number that explains a failed "the link drains"
+    // clause, and it was being thrown away at the very last tick of the runs
+    // that needed it.
+    eprintln!(
+        "gates/p1-swarm: stream lane — {} messages delivered, {} retransmissions, {} ticks of \
+         head-of-line blocking on shared streams",
+        report.link.stream_delivered,
+        report.link.stream_retransmits,
+        report.link.stream_head_of_line_ticks,
+    );
     // The fault counters, printed even at zero. A counter that is incremented
     // but never surfaced is worse than no counter, because it creates the
     // impression the condition is monitored — which is how `no_session` hid a
@@ -2157,6 +2172,10 @@ fn self_test() -> Result<()> {
         "an unmodified swarm files no report at all",
         "every witness can sign what it raises",
         "the link drains",
+        // #1132: the one clause that reads a *human* seat's interest
+        // crossings. Bots emitted them from the day the flag landed; the seat
+        // the flag was bought for emitted none.
+        "the swept interest margin fires for a human seat",
         "the late joiner starts with no retained replicas",
         "the late-join check is not vacuous",
         "interest churn absorbed without visible proxy pops",
@@ -2475,7 +2494,7 @@ mod start_join_tests {
         /// Every eviction notice sent, in the words the peer would read.
         evictions: Arc<Mutex<Vec<(usize, String)>>>,
         /// The `StartV1` each peer was handed at `Accept`, in bind order.
-        accepted: Arc<Mutex<Vec<(usize, Option<exterior::StartManifest>)>>>,
+        accepted: Arc<Mutex<Vec<AcceptedSeat>>>,
         /// Remote ends of the bound links, kept alive so the corrected roster
         /// the host republishes is readable rather than dropped on the floor.
         remotes: Arc<Mutex<Vec<(usize, exterior::RemoteLink)>>>,
@@ -2502,7 +2521,10 @@ mod start_join_tests {
             self.accepted
                 .lock()
                 .expect("accepted lock")
-                .push((self.slot, manifest));
+                .push(AcceptedSeat {
+                    slot: self.slot,
+                    manifest,
+                });
             if let Some(reason) = self.failure {
                 bail!("connection lost: {reason}");
             }
@@ -2553,8 +2575,22 @@ mod start_join_tests {
     /// published reissue deadline is an equality and not a window (#1001).
     const SWEPT_AT: u64 = 1_756_900_000;
 
+    /// One `Accept` the fake join recorded: which seat, and the `StartV1` it
+    /// was handed.
+    ///
+    /// Named rather than a bare pair. `clippy::type_complexity` on the two
+    /// `Arc<Mutex<Vec<..>>>` fields it lives in was the symptom (#1140); the
+    /// cause is that nothing at a use site could say which half of the pair
+    /// was the slot.
+    struct AcceptedSeat {
+        /// The seat that was accepted.
+        slot: usize,
+        /// The membership manifest it was handed, when it was handed one.
+        manifest: Option<exterior::StartManifest>,
+    }
+
     struct StartHarness {
-        accepted: Arc<Mutex<Vec<(usize, Option<exterior::StartManifest>)>>>,
+        accepted: Arc<Mutex<Vec<AcceptedSeat>>>,
         remotes: Arc<Mutex<Vec<(usize, exterior::RemoteLink)>>>,
         beats: Arc<Mutex<Vec<(usize, u16, u16)>>>,
         evictions: Arc<Mutex<Vec<(usize, String)>>>,
@@ -2658,8 +2694,8 @@ mod start_join_tests {
                 .lock()
                 .expect("accepted lock")
                 .iter()
-                .find(|(seat, _)| *seat == slot)
-                .and_then(|(_, manifest)| manifest.as_ref())
+                .find(|accepted| accepted.slot == slot)
+                .and_then(|accepted| accepted.manifest.as_ref())
                 .expect("the peer was handed a StartV1")
                 .active
                 .iter()
