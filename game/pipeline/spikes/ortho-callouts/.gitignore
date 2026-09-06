@@ -14,3 +14,4 @@ out/**/owner*/
 out/**/crops/
 out/**/sheets/
 out/**/*.raw.txt
+out/**/zones.pass[0-9]*.json
