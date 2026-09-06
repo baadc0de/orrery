@@ -523,6 +523,106 @@ impl IslandRoster {
     }
 }
 
+/// One human seat's ordered interest-cell crossing, reported on the Meta lane.
+///
+/// **Why this record exists (#1132).** `--swept-interest-margin` turns on both
+/// halves of #653 — the predictive swept set that covers where a craft can
+/// reach before the next 1 Hz refresh, and the ordered crossing event that
+/// corrects the roster at the hysteresis commitment rather than at that
+/// refresh. Both halves were wired for bots only. The external runner called
+/// `Bot::sample`, which hard-codes the flag off and drops the crossing on the
+/// floor, and the host had no Meta-lane grammar to carry one in even if it had
+/// not — so for the one participant the flag was bought for, a human seat, the
+/// host learned a new cell only from the bare eight-byte cell report a second
+/// later. This is the wire form of that event.
+///
+/// **What travels.** The crossing's own order (`own_seq`/`auth_seq`), the tick
+/// it committed at, the cell it left, the cell it entered, and the coverage the
+/// seat declares from the new cell — the peer's own
+/// `Bot::swept_interest_cells`, because only the peer knows its offset inside
+/// the cell and its velocity. The host cannot recompute this from a cell id.
+///
+/// Encoding: `[tag 0xa4][tick u64][own_seq u32][auth_seq u32][from u64][to u64]`
+/// `[cell count u16][cell u64 ...]`, all little-endian.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterestCrossingReport {
+    /// Subject tick the crossing committed at.
+    pub tick: u64,
+    /// The author's own sequence for the crossing.
+    pub own_seq: u32,
+    /// The author's authority-tenure order, starting at one.
+    pub auth_seq: u32,
+    /// Raw bits of the cell the seat left.
+    pub from: u64,
+    /// Raw bits of the cell the seat committed to.
+    pub to: u64,
+    /// Raw `CellId` bits of the coverage the seat declares from `to`.
+    pub covered_cells: Vec<u64>,
+}
+
+impl InterestCrossingReport {
+    /// Meta payload discriminator, distinct from the ACK (`0xa1`), hearsay
+    /// (`0xa2`) and roster (`0xa3`) tags.
+    const TAG: u8 = 0xa4;
+    const HEADER_BYTES: usize = 35;
+
+    /// Encodes this crossing for an exterior-to-host Meta-lane [`Frame`].
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let mut out = BytesMut::with_capacity(Self::HEADER_BYTES + 8 * self.covered_cells.len());
+        out.put_u8(Self::TAG);
+        out.put_u64_le(self.tick);
+        out.put_u32_le(self.own_seq);
+        out.put_u32_le(self.auth_seq);
+        out.put_u64_le(self.from);
+        out.put_u64_le(self.to);
+        out.put_u16_le(u16::try_from(self.covered_cells.len()).expect("coverage fits u16"));
+        for cell in &self.covered_cells {
+            out.put_u64_le(*cell);
+        }
+        out.freeze()
+    }
+
+    /// Decodes only the crossing member of the Meta lane grammar.
+    ///
+    /// Trailing bytes are refused for the same reason [`IslandRoster::decode`]
+    /// refuses them: a truncated coverage list installed as a whole one is a
+    /// silently narrowed audience, which is the failure the record exists to
+    /// end rather than to cause.
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let [tag, tail @ ..] = payload else {
+            return None;
+        };
+        if *tag != Self::TAG || tail.len() < Self::HEADER_BYTES - 1 {
+            return None;
+        }
+        let tick = u64::from_le_bytes(tail[..8].try_into().expect("eight bytes read"));
+        let own_seq = u32::from_le_bytes(tail[8..12].try_into().expect("four bytes read"));
+        let auth_seq = u32::from_le_bytes(tail[12..16].try_into().expect("four bytes read"));
+        let from = u64::from_le_bytes(tail[16..24].try_into().expect("eight bytes read"));
+        let to = u64::from_le_bytes(tail[24..32].try_into().expect("eight bytes read"));
+        let count = usize::from(u16::from_le_bytes(
+            tail[32..34].try_into().expect("two bytes read"),
+        ));
+        let rest = &tail[34..];
+        if rest.len() != 8 * count {
+            return None;
+        }
+        Some(Self {
+            tick,
+            own_seq,
+            auth_seq,
+            from,
+            to,
+            covered_cells: rest
+                .chunks_exact(8)
+                .map(|bits| u64::from_le_bytes(bits.try_into().expect("eight bytes read")))
+                .collect(),
+        })
+    }
+}
+
 /// Wire error: the byte stream can no longer be trusted to resync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameError;
