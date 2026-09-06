@@ -368,6 +368,130 @@ impl HearsayContacts {
     }
 }
 
+/// One seat's published interest coverage inside an [`IslandRoster`].
+///
+/// `cells` is that seat's declared coverage in raw `CellId` bits — the same
+/// list `IslandMembership` holds host-side, transmitted rather than
+/// re-derived, so the external peer's audience gate reads the coordinator's
+/// answer instead of a second implementation of it (#1128).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterSeat {
+    /// The island seat this coverage belongs to.
+    pub slot: u16,
+    /// That seat's transport identity, so the remote can address it without
+    /// deriving a key from a slot number it only assumed was a bot's.
+    pub node: [u8; 32],
+    /// Raw `CellId` bits the seat declares interest in.
+    pub cells: Vec<u64>,
+}
+
+/// The coordinator's live roster for one external seat, on the Meta lane.
+///
+/// **Why this record exists.** An external peer gates its sends on the cells
+/// its island-mates declare, exactly as a bot does. A bot's copy is rebuilt
+/// every second by `Swarm::refresh_rosters`; the external peer's was installed
+/// once at join from spawn poses and never refreshed, so its audience emptied
+/// the moment it left the cell it spawned in — about sixteen seconds of cruise
+/// — and it stopped replicating for the rest of the session (#1128). This is
+/// the host half of that refresh: the same `refresh_rosters` that feeds the
+/// bots publishes it, so there is one mechanism rather than two.
+///
+/// **What it may carry.** Only the seats whose declared interest already
+/// covers the recipient's committed cell — which is exactly the audience the
+/// recipient's own sends may address. A roster of every seat's cell would be a
+/// wallhack channel and would undo what the hearsay fold
+/// ([`HearsayContacts`]) is careful about.
+///
+/// Encoding: `[tag 0xa3][tick u64][seat count u16]` then, per seat,
+/// `[slot u16][node 32][cell count u16][cell u64 ...]`, all little-endian.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IslandRoster {
+    /// Host tick the roster was folded at.
+    pub tick: u64,
+    /// The recipient's audience: one entry per covering seat.
+    pub seats: Vec<RosterSeat>,
+}
+
+impl IslandRoster {
+    /// Meta payload discriminator, distinct from the ACK (`0xa1`) and hearsay
+    /// (`0xa2`) tags.
+    const TAG: u8 = 0xa3;
+    const HEADER_BYTES: usize = 11;
+    const SEAT_HEADER_BYTES: usize = 36;
+
+    /// Encodes this roster for a host-to-exterior Meta-lane [`Frame`].
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let seats = u16::try_from(self.seats.len()).expect("island seats fit u16");
+        let cells: usize = self.seats.iter().map(|seat| seat.cells.len()).sum();
+        let mut out = BytesMut::with_capacity(
+            Self::HEADER_BYTES + Self::SEAT_HEADER_BYTES * self.seats.len() + 8 * cells,
+        );
+        out.put_u8(Self::TAG);
+        out.put_u64_le(self.tick);
+        out.put_u16_le(seats);
+        for seat in &self.seats {
+            out.put_u16_le(seat.slot);
+            out.put_slice(&seat.node);
+            out.put_u16_le(u16::try_from(seat.cells.len()).expect("coverage fits u16"));
+            for cell in &seat.cells {
+                out.put_u64_le(*cell);
+            }
+        }
+        out.freeze()
+    }
+
+    /// Decodes only the roster member of the Meta lane grammar.
+    ///
+    /// Every length is checked against what remains, and trailing bytes are
+    /// refused: a roster that decoded as a plausible prefix of a longer record
+    /// would install a truncated audience, which is the failure this record
+    /// exists to end.
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let [tag, tail @ ..] = payload else {
+            return None;
+        };
+        if *tag != Self::TAG || tail.len() < 10 {
+            return None;
+        }
+        let tick = u64::from_le_bytes(tail[..8].try_into().expect("eight bytes read"));
+        let count = usize::from(u16::from_le_bytes(
+            tail[8..10].try_into().expect("two bytes read"),
+        ));
+        let mut rest = &tail[10..];
+        let mut seats = Vec::with_capacity(count);
+        for _ in 0..count {
+            if rest.len() < Self::SEAT_HEADER_BYTES {
+                return None;
+            }
+            let slot = u16::from_le_bytes(rest[..2].try_into().expect("two bytes read"));
+            let node: [u8; 32] = rest[2..34].try_into().expect("thirty-two bytes read");
+            let cells = usize::from(u16::from_le_bytes(
+                rest[34..36].try_into().expect("two bytes read"),
+            ));
+            rest = &rest[Self::SEAT_HEADER_BYTES..];
+            if rest.len() < 8 * cells {
+                return None;
+            }
+            let (covered, remainder) = rest.split_at(8 * cells);
+            rest = remainder;
+            seats.push(RosterSeat {
+                slot,
+                node,
+                cells: covered
+                    .chunks_exact(8)
+                    .map(|bits| u64::from_le_bytes(bits.try_into().expect("eight bytes read")))
+                    .collect(),
+            });
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+        Some(Self { tick, seats })
+    }
+}
+
 /// Wire error: the byte stream can no longer be trusted to resync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameError;
@@ -1646,5 +1770,58 @@ mod tests {
         };
         assert_eq!(AnchorFrame::decode(&anchor.encode()), Ok(anchor.clone()));
         assert!(AnchorFrame::decode(&[0, 0]).is_err(), "truncation refused");
+    }
+
+    /// The roster is the record the human seat's audience is built from, so a
+    /// truncated or over-long one must be refused rather than installed: a
+    /// half-decoded roster is a half-empty audience, which is #1128 again with
+    /// a different cause.
+    #[test]
+    fn island_rosters_round_trip_and_refuse_anything_short_of_exact() {
+        let roster = IslandRoster {
+            tick: 4_242,
+            seats: vec![
+                RosterSeat {
+                    slot: 0,
+                    node: [0x11; 32],
+                    cells: vec![7, 8, 9],
+                },
+                RosterSeat {
+                    slot: 5,
+                    node: [0x22; 32],
+                    cells: vec![],
+                },
+            ],
+        };
+        let encoded = roster.encode();
+        assert_eq!(IslandRoster::decode(&encoded), Some(roster));
+
+        assert_eq!(
+            IslandRoster::decode(&encoded[..encoded.len() - 1]),
+            None,
+            "a roster missing its last cell is refused, not read as a shorter one"
+        );
+        let mut over_long = encoded.to_vec();
+        over_long.push(0);
+        assert_eq!(
+            IslandRoster::decode(&over_long),
+            None,
+            "trailing bytes mean this is not the record it claims to be"
+        );
+        assert_eq!(
+            IslandRoster::decode(
+                &UplinkAck {
+                    sequence: 3,
+                    outcome: UplinkOutcome::Delivered,
+                }
+                .encode()
+            ),
+            None,
+            "the ack tag is not a roster"
+        );
+        assert!(
+            UplinkAck::decode(&encoded).is_none() && HearsayContacts::decode(&encoded).is_none(),
+            "and the roster tag is neither of the two records that share the lane"
+        );
     }
 }
