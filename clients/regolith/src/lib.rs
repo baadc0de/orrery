@@ -205,6 +205,7 @@ pub struct OverlayOpen;
 #[derive(Debug, Default, Resource)]
 struct MetricWindow {
     intents: u64,
+    /// Idle ticks over the whole offline session, never reset (#1126).
     idle_ticks: u64,
     /// Entities the most recent driven tick advanced by simulation.
     ///
@@ -1426,10 +1427,13 @@ fn drive_core(
             if let Err(error) = sink.append_orders(&packet, SessionScope::Local) {
                 error!("cannot append Regolith order packet: {error}");
             }
+            // Cumulative, not the trailing streak: the same field on the
+            // campaign path is a session total (#1126), and both feed the one
+            // `idle_minutes` the overlay and the JSONL stream read. Resetting
+            // on input told an offline player who had been away for eight
+            // minutes that they had never been idle.
             if controls == Controls::default() {
                 window.idle_ticks = window.idle_ticks.saturating_add(1);
-            } else {
-                window.idle_ticks = 0;
             }
             for order in local.bot.bot_orders(tick) {
                 local.host.submit_input(OPPONENT, order);

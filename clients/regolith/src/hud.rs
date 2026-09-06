@@ -2252,15 +2252,21 @@ mod tests {
         body(&mut app, THEM, 200.0, 0.0);
         app.add_systems(Update, sync_lock_reticle);
 
+        // The target is the player's own, clicked: a human seat no longer
+        // inherits the pilot's tick-scheduled lock (#1121), so a test that
+        // left `lock_target` empty was exercising the hazard rather than the
+        // ring. Clicking the adjacent craft is what the pilot's combat row
+        // would have chosen anyway, so the flight below is unchanged.
         let held = crate::intent::Controls {
             fire: true,
             thrust: true,
+            lock_target: Some(THEM),
             ..crate::intent::Controls::default()
         };
         let mut pending = std::collections::BTreeMap::<PersistId, Vec<_>>::new();
         for raw in 0..40u64 {
-            // Ticks 0..179 are the pilot table's combat row, where the target
-            // selector picks the adjacent craft rather than a rock lineage.
+            // Ticks 0..179 are the pilot table's combat row; the seat's own
+            // clicked target is the same adjacent craft.
             let tick = Tick::new(raw);
             let mut delivered = std::collections::BTreeMap::<PersistId, Vec<_>>::new();
             for (entity, mut orders) in [

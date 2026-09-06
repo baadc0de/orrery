@@ -110,7 +110,12 @@ pub struct OverlayMetrics {
     pub session_record_path: PathBuf,
     /// Minutes accepted by the campaign ledger.
     pub banked_minutes: f64,
-    /// Minutes without player input.
+    /// Minutes without player input, over the whole session.
+    ///
+    /// A running total on both the campaign and the offline path, not the
+    /// trailing streak (#1126): a figure that reset on the next keypress told
+    /// the overlay and the JSONL stream that a player who had been away for
+    /// eight minutes had never been idle.
     pub idle_minutes: f64,
     /// Whether the idle banking allowance has been exhausted.
     ///

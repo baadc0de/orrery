@@ -78,13 +78,14 @@ impl IntentPipeline {
 
     /// Produce keyboard-selected orders from the bot pilot's exact profile.
     ///
-    /// This deliberately starts with [`Game::honest_inputs`]. The skin only
-    /// gates acceleration/trigger and chooses the sign of the pilot's yaw;
-    /// acceleration, yaw magnitude, elevation, target choice, order shape and
-    /// encoding remain owned by the headless game path.
+    /// This deliberately starts with [`Game::honest_inputs`]. The skin gates
+    /// acceleration/trigger, chooses the sign of the pilot's yaw, and drops
+    /// the three orders the pilot authors from its own tick schedule rather
+    /// than from an input — elevation (#940), `Grab` (#568) and `Lock`
+    /// (#1121); acceleration, yaw magnitude, order shape and encoding remain
+    /// owned by the headless game path.
     #[must_use]
     pub fn human_orders(&self, tick: Tick, controls: Controls) -> Vec<Order> {
-        let mut saw_lock = false;
         let mut orders: Vec<_> = self
             .bot_orders(tick)
             .into_iter()
@@ -134,16 +135,35 @@ impl IntentPipeline {
                 // unbidden, at a target no input of theirs selected (#568).
                 // A human craft grabs only from `controls.grab`, below.
                 Order::Grab { .. } => None,
-                Order::Lock { target } => {
-                    saw_lock = true;
-                    Some(Order::Lock {
-                        target: controls.lock_target.unwrap_or(target),
-                    })
-                }
+                // Same hazard, same remedy, one arm down (#1121). The pilot's
+                // `Order::Lock` target is a pure function of *tick*
+                // (`pilot::honest_orders`, via `scenario_at`), and a quarter
+                // of that schedule is `PilotScenario::Combat`, whose target is
+                // the *adjacent seat id* — a real neighbouring craft. Passing
+                // it through when the player had selected nothing had the
+                // reticle churn through targets they never picked and, with
+                // the trigger held, put shots on a craft they never chose.
+                //
+                // "Nothing selected" is not a corner case: it is the state
+                // from the first joined tick until the first successful click,
+                // and it is re-entered on every lock refusal
+                // (`crate::clear_refused_selection`) and on every click that
+                // misses (`crate::select_clicked_body` assigns
+                // `nearest_clicked`, which is `None` outside `CLICK_RADIUS_PX`).
+                // Dropping the pilot's lock unconditionally is what makes the
+                // hazard unreachable whichever way that miss-deselects
+                // question is decided: with no selection there is no lock, so
+                // re-entering the empty state costs nothing.
+                //
+                // A human lock is authored below, from `controls.lock_target`
+                // alone, and inserted at the pilot's own position — before
+                // `Order::Fire`, which is where `honest_orders` pushes it —
+                // so a *selected* seat's order sequence is unchanged.
+                Order::Lock { .. } => None,
                 other => Some(other),
             })
             .collect();
-        if let Some(target) = controls.lock_target.filter(|_| !saw_lock) {
+        if let Some(target) = controls.lock_target {
             let before_fire = orders
                 .iter()
                 .position(|order| matches!(order, Order::Fire))
@@ -211,21 +231,24 @@ mod tests {
     }
 
     /// A fully-held seat rides the bot's own order shape and encoder, order
-    /// for order and byte for byte — with the two axes the skin gates
-    /// normalised out. Elevation is zero for a human craft (#940) and the
-    /// pilot's scheduled `Grab` never reaches one (#568); everything else,
-    /// including acceleration, yaw magnitude, target choice, order sequence
+    /// for order and byte for byte — with the axes the skin gates normalised
+    /// out. Elevation is zero for a human craft (#940), the pilot's scheduled
+    /// `Grab` never reaches one (#568) and neither does its scheduled `Lock`
+    /// (#1121), which the seat re-authors at its own selected target;
+    /// everything else, including acceleration, yaw magnitude, order sequence
     /// and encoding, must still come from the headless path unchanged.
     #[test]
     fn human_full_controls_match_bot_order_bytes() {
         let pipeline = pipeline();
         let tick = Tick::new(1_000_123);
+        let chosen = PersistId::new(0x9c1);
         let human = pipeline.human_packet(
             tick,
             Controls {
                 right: true,
                 thrust: true,
                 fire: true,
+                lock_target: Some(chosen),
                 ..Controls::default()
             },
         );
@@ -250,6 +273,9 @@ mod tests {
                     pitch_urad: 0,
                 }),
                 Order::Grab { .. } => None,
+                // The seat's own target, at the pilot's own position in the
+                // sequence: the order path is unchanged, only its target.
+                Order::Lock { .. } => Some(Order::Lock { target: chosen }),
                 other => Some(other),
             })
             .collect();
@@ -486,6 +512,133 @@ mod tests {
                     .iter()
                     .any(|order| matches!(order, Order::Grab { .. })),
                 "tick {raw_tick} emitted a grab from no intent"
+            );
+        }
+    }
+
+    /// #1121: with nothing selected the seat uplinked `Order::Lock` at the
+    /// headless pilot's *tick-scheduled* target, every tick.
+    ///
+    /// The old arm was `target: controls.lock_target.unwrap_or(target)`, so
+    /// `None` fell through to the pilot's own choice. This walks more than one
+    /// full turn of the four-scenario schedule and asserts the empty seat
+    /// uplinks no lock at all — and, so the assertion cannot be inert, proves
+    /// the pilot did schedule a lock on every one of those ticks, and names
+    /// what the old code would have sent on the `Combat` quarter: the adjacent
+    /// seat id, a real neighbouring craft.
+    #[test]
+    fn an_unselected_seat_uplinks_no_lock_at_all() {
+        use orrery_games::regolith::pilot::{scenario_at, PilotScenario};
+
+        let pipeline = pipeline();
+        let mut scheduled = 0u32;
+        let mut at_a_neighbouring_seat = 0u32;
+        // Every control shape a seat can hold *without* a selection: the
+        // hazard is the empty `lock_target`, not the keyboard.
+        let shapes = [
+            Controls::default(),
+            Controls {
+                thrust: true,
+                ..Controls::default()
+            },
+            Controls {
+                left: true,
+                thrust: true,
+                fire: true,
+                ..Controls::default()
+            },
+            Controls {
+                right: true,
+                thrust: true,
+                fire: true,
+                grab: Some(PersistId::new(0x91cc)),
+                ..Controls::default()
+            },
+        ];
+        for raw_tick in 0..(4 * 180 + 37) {
+            let tick = Tick::new(raw_tick);
+            let pilot_target =
+                pipeline
+                    .bot_orders(tick)
+                    .into_iter()
+                    .find_map(|order| match order {
+                        Order::Lock { target } => Some(target),
+                        _ => None,
+                    });
+            let Some(pilot_target) = pilot_target else {
+                panic!("fixture is inert: the pilot scheduled no lock on tick {raw_tick}");
+            };
+            scheduled += 1;
+            if scenario_at(tick) == PilotScenario::Combat {
+                // `combat_target` is the adjacent seat id, which is what makes
+                // this a shot at a craft rather than at a rock.
+                assert_eq!(
+                    pilot_target,
+                    PersistId::new(pipeline.entity.0 + 1),
+                    "tick {raw_tick}: the combat target moved off the neighbouring seat"
+                );
+                at_a_neighbouring_seat += 1;
+            }
+            for controls in shapes {
+                let orders = pipeline.human_orders(tick, controls);
+                assert!(
+                    !orders
+                        .iter()
+                        .any(|order| matches!(order, Order::Lock { .. })),
+                    "tick {raw_tick}: an unselected seat uplinked a lock. The \
+                     pilot had scheduled {pilot_target:?}, and the old code \
+                     sent exactly that."
+                );
+            }
+        }
+        assert!(
+            scheduled > 4 * 180,
+            "fixture is inert: the pilot scheduled only {scheduled} locks"
+        );
+        assert!(
+            at_a_neighbouring_seat > 0,
+            "fixture is inert: the schedule never reached `Combat`, so it \
+             never pointed at a real neighbouring seat"
+        );
+    }
+
+    /// A refusal and a missed click both land the seat back on `None`
+    /// (`crate::clear_refused_selection`, `crate::select_clicked_body`). That
+    /// re-entry must be inert, whichever way the design call about whether a
+    /// miss should deselect is decided.
+    #[test]
+    fn dropping_a_selection_leaves_the_seat_silent_rather_than_re_armed() {
+        let pipeline = pipeline();
+        let clicked = PersistId::new(0x442);
+        for raw_tick in 700..760 {
+            let tick = Tick::new(raw_tick);
+            let held = pipeline.human_orders(
+                tick,
+                Controls {
+                    fire: true,
+                    lock_target: Some(clicked),
+                    ..Controls::default()
+                },
+            );
+            assert_eq!(
+                held.iter()
+                    .filter(|order| matches!(order, Order::Lock { target } if *target == clicked))
+                    .count(),
+                1
+            );
+            // ... and the tick after the refusal clears it.
+            let dropped = pipeline.human_orders(
+                tick,
+                Controls {
+                    fire: true,
+                    ..Controls::default()
+                },
+            );
+            assert!(
+                !dropped
+                    .iter()
+                    .any(|order| matches!(order, Order::Lock { .. })),
+                "tick {raw_tick}: clearing the selection re-armed the pilot's target"
             );
         }
     }

@@ -345,7 +345,19 @@ pub struct SessionRecord {
     pub observed_jitter_p50_ms: u64,
     /// Measured jitter p99.
     pub observed_jitter_p99_ms: u64,
-    /// Total seconds with no local intents.
+    /// Seconds with no local intents in *this increment's* span.
+    ///
+    /// Idle time accumulates for the whole seat and each row reports the part
+    /// of it that its own `since_tick..until_tick` span added, the way
+    /// `banked_minutes` does, so the seat's total is the sum of its rows and
+    /// nothing is counted twice.
+    ///
+    /// This used to be the *trailing idle streak* — `idle_ticks` was reset to
+    /// zero on every active tick — so a tester who was away for eight minutes
+    /// mid-session and then flew for thirty seconds shipped a row asserting
+    /// `afk_seconds: 0` (#1126). Only a seat that mixes activity can tell the
+    /// two apart, which is why the uniformly-`Active`/uniformly-`Idle` seats
+    /// missed it.
     pub afk_seconds: u64,
     /// Whether the session exhausted its 600-second idle banking allowance.
     pub afk_capped: bool,
@@ -401,7 +413,11 @@ pub struct LiveProgress {
     pub connected_minutes: f64,
     /// Minutes currently eligible to bank.
     pub banked_minutes: f64,
-    /// Minutes with no local input.
+    /// Minutes with no local input, over the whole session so far.
+    ///
+    /// Cumulative like `connected_minutes` and `banked_minutes` beside it, not
+    /// the trailing streak (#1126): a HUD that reset to zero the moment the
+    /// player touched a key told them they had never been idle.
     pub idle_minutes: f64,
     /// Whether the 600-second idle banking allowance is exhausted.
     pub afk_capped: bool,
@@ -444,6 +460,7 @@ pub struct CampaignSession {
     measurement: ImpairmentMeasurement,
     connected_ticks: u64,
     banked_ticks: u64,
+    /// Idle ticks over the whole session, never reset (#1126).
     idle_ticks: u64,
     idle_banked_ticks: u64,
     afk_capped: bool,
@@ -451,6 +468,11 @@ pub struct CampaignSession {
     emitted_ticks: u64,
     /// Bankable ticks already covered by an emitted increment.
     emitted_banked_ticks: u64,
+    /// Idle *seconds* already reported by an emitted increment (#1126).
+    ///
+    /// Seconds and not ticks so that the rows of one seat sum exactly to the
+    /// seat's own truncated total, rather than each losing its own remainder.
+    emitted_afk_seconds: u64,
     /// How many increments this seat has already emitted.
     emitted_increments: u32,
     /// Where the transport counters stood when the last increment closed.
@@ -490,6 +512,7 @@ impl CampaignSession {
             afk_capped: false,
             emitted_ticks: 0,
             emitted_banked_ticks: 0,
+            emitted_afk_seconds: 0,
             emitted_increments: 0,
             emitted_mark: MeasurementMark::START,
         }
@@ -501,7 +524,10 @@ impl CampaignSession {
     pub fn observe_tick(&mut self, activity: PlayerActivity) {
         self.connected_ticks = self.connected_ticks.saturating_add(1);
         if activity == PlayerActivity::Active {
-            self.idle_ticks = 0;
+            // `idle_ticks` is a session total and is deliberately *not* reset
+            // here (#1126). Resetting it made the reported figure the trailing
+            // streak, so idling in the middle of a session and then flying
+            // reported less idle time than the session had.
             self.banked_ticks = self.banked_ticks.saturating_add(1);
             return;
         }
@@ -650,6 +676,12 @@ impl CampaignSession {
         let wall_start = std::mem::replace(&mut self.increment_wall_start, wall_end.clone());
         self.emitted_ticks = self.connected_ticks;
         self.emitted_banked_ticks = self.banked_ticks;
+        // The seat's idle seconds so far, less what earlier rows already
+        // reported: each row carries its own span's share and the seat's rows
+        // sum to its total (#1126).
+        let afk_total_seconds = self.idle_ticks / u64::from(TICK_HZ);
+        let afk_seconds = afk_total_seconds.saturating_sub(self.emitted_afk_seconds);
+        self.emitted_afk_seconds = afk_total_seconds;
         self.emitted_increments = self.emitted_increments.saturating_add(1);
         self.emitted_mark = self.measurement.mark();
         // A measured rate never lands exactly on its configured one, so an
@@ -699,7 +731,7 @@ impl CampaignSession {
             observed_loss_pct,
             observed_jitter_p50_ms,
             observed_jitter_p99_ms,
-            afk_seconds: self.idle_ticks / u64::from(TICK_HZ),
+            afk_seconds,
             afk_capped: self.afk_capped,
             impairment_mismatch: mismatch,
             measurement_node: String::new(),
@@ -1212,6 +1244,121 @@ mod tests {
         let capped = idle_run.progress();
         assert!(capped.afk_capped, "600 s cap then overflow trips the flag");
         assert_eq!(capped.banked_minutes, 10.0);
+    }
+
+    /// #1126: `afk_seconds` reported the *trailing idle streak*, so a tester
+    /// who was away in the middle of a session and then flew shipped a row
+    /// asserting far less idle time than the session had — zero, if they were
+    /// flying when it closed.
+    ///
+    /// The existing seats fly uniformly `Active` or uniformly `Idle`, where a
+    /// trailing streak and a session total are the same number. This one
+    /// mixes them, which is the only shape that can tell them apart, and
+    /// checks the live HUD figure with it.
+    #[test]
+    fn a_session_that_idles_then_flies_then_idles_reports_the_sum() {
+        let hz = u64::from(TICK_HZ);
+        let mut mixed = session();
+        // Eight minutes away, thirty seconds of flying, then two more away:
+        // the ordinary shape of a playtest, and the shape of the issue.
+        let first_idle_s = 8 * 60;
+        let active_s = 30;
+        let last_idle_s = 2 * 60;
+        for _ in 0..(first_idle_s * hz) {
+            mixed.observe_tick(PlayerActivity::Idle);
+        }
+        assert_eq!(
+            mixed.progress().idle_minutes,
+            first_idle_s as f64 / 60.0,
+            "the HUD lost the streak it was in the middle of"
+        );
+        for _ in 0..(active_s * hz) {
+            mixed.observe_tick(PlayerActivity::Active);
+        }
+        assert_eq!(
+            mixed.progress().idle_minutes,
+            first_idle_s as f64 / 60.0,
+            "flying again told the HUD the player had never been idle"
+        );
+        for _ in 0..(last_idle_s * hz) {
+            mixed.observe_tick(PlayerActivity::Idle);
+        }
+
+        let record = finish(&mut mixed);
+        assert_eq!(
+            record.afk_seconds,
+            first_idle_s + last_idle_s,
+            "the row reported the trailing streak, not the session's idle time"
+        );
+        assert_ne!(
+            record.afk_seconds, last_idle_s,
+            "this is the number the old code shipped"
+        );
+        assert_eq!(
+            mixed.progress().idle_minutes,
+            (first_idle_s + last_idle_s) as f64 / 60.0
+        );
+
+        // And the closing case from the issue: idle in the middle, flying at
+        // the moment the row is minted, which used to report exactly zero.
+        let mut then_flew = session();
+        for _ in 0..(first_idle_s * hz) {
+            then_flew.observe_tick(PlayerActivity::Idle);
+        }
+        for _ in 0..(active_s * hz) {
+            then_flew.observe_tick(PlayerActivity::Active);
+        }
+        let record = finish(&mut then_flew);
+        assert_eq!(
+            record.afk_seconds, first_idle_s,
+            "a seat flying when the row closed reported `afk_seconds: 0`"
+        );
+    }
+
+    /// A seat's rows partition its idle time the way they partition its
+    /// banked time: each row carries its own span's share, and the rows sum
+    /// to the session total rather than repeating it (#1126, #1048).
+    #[test]
+    fn the_idle_seconds_of_one_seat_sum_to_the_seat() {
+        let hz = u64::from(TICK_HZ);
+        let mut seat = session();
+        let mut rows = Vec::new();
+        // Three increment-length blocks, each half idle and half flown, so no
+        // block's idle time sits at its own trailing edge.
+        let block_s = (INCREMENT_MINUTES as u64) * 60;
+        for _ in 0..3 {
+            for _ in 0..(block_s / 2 * hz) {
+                seat.observe_tick(PlayerActivity::Idle);
+            }
+            for _ in 0..(block_s / 2 * hz) {
+                seat.observe_tick(PlayerActivity::Active);
+            }
+            if seat.increment_due() {
+                rows.push(seat.finish_increment(
+                    "2026-09-06T12:00:00Z".into(),
+                    "aarch64-apple-darwin".into(),
+                    "deadbeef".into(),
+                    "pipeline".into(),
+                    false,
+                ));
+            }
+        }
+        rows.push(Some(finish(&mut seat)));
+        let reported: Vec<u64> = rows
+            .into_iter()
+            .flatten()
+            .map(|row| row.afk_seconds)
+            .collect();
+        assert!(
+            reported.len() > 2,
+            "fixture is inert: the seat wrote {} rows, so nothing was partitioned",
+            reported.len()
+        );
+        assert_eq!(
+            reported.iter().sum::<u64>(),
+            3 * block_s / 2,
+            "the seat's rows do not sum to its idle time: {reported:?}"
+        );
     }
 
     #[test]
