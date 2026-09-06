@@ -1621,3 +1621,76 @@ fn a_watch_whose_first_frame_is_lost_repairs_rather_than_going_blind() {
     );
     assert!(ledger_balances(&witness));
 }
+
+/// Coverage cannot audit its own denominator, and `watches_dark` is what can
+/// (#1130).
+///
+/// Two witnesses are armed against the same subject, and the subject streams to
+/// only one of them — which is exactly what happened when the human seat chose
+/// its witness set by NodeId order while the host armed watches by slot order.
+/// The aggregation here is the swarm report's own: judged ticks over shown
+/// ticks, summed across peers.
+///
+/// The reading is the finding. The fed witness judges everything it is shown,
+/// so the sum reads **1.0** — perfect coverage — while half the armed
+/// population observed nothing whatsoever. `watches_unanchored` reads zero too,
+/// because it filters on having been shown something. Neither figure is wrong
+/// about what it measures; both are silent about what went missing, because
+/// what went missing left no trace in either term.
+#[test]
+fn coverage_reads_one_over_a_population_half_of_which_was_shown_nothing() {
+    let mut authority = Authority::new(1);
+    let mut fed = watching(WitnessConfig::default(), &mut authority);
+    // Armed against the same subject at the same anchor, and then never
+    // addressed. This is a dark watch: not a degraded one, not one that lost
+    // frames to impairment — one the subject never sent to.
+    let mut dark = Witness::new(WitnessConfig::default(), SEED, || Kinematic);
+    watch_also(&mut dark, &mut authority);
+
+    stream(&mut fed, &mut authority, 20);
+
+    let fed_counters = fed.counters();
+    let dark_counters = dark.counters();
+
+    // The report's arithmetic, over the two peers.
+    let judged = fed_counters.judged_ticks + dark_counters.judged_ticks;
+    let shown = fed_counters.shown_ticks + dark_counters.shown_ticks;
+    assert!(
+        shown > 0,
+        "the fed witness was shown its subject's timeline"
+    );
+    let coverage = judged as f64 / shown as f64;
+    assert!(
+        (coverage - 1.0).abs() < f64::EPSILON,
+        "coverage reads {coverage}, not 1.0 — this test is about a report that was perfect on \
+         its own terms"
+    );
+    assert_eq!(
+        fed_counters.watches_unanchored + dark_counters.watches_unanchored,
+        0,
+        "and no watch was shown frames it could not fold, so the other coverage figure is \
+         silent too"
+    );
+
+    // What was actually true, and the only figure in the set that says it.
+    assert_eq!(
+        dark_counters.shown_ticks, 0,
+        "the dark watch was shown nothing at all, which is why it moves neither term"
+    );
+    assert_eq!(dark_counters.watches_dark, 1);
+    assert_eq!(dark_counters.watches_armed, 1);
+    assert_eq!(
+        fed_counters.watches_dark, 0,
+        "a watch that was fed is not dark"
+    );
+    assert_eq!(
+        fed_counters.watches_dark + dark_counters.watches_dark,
+        1,
+        "one of the two armed watches spent the run blind, and 100% coverage did not notice"
+    );
+    assert_eq!(
+        fed_counters.watches_armed + dark_counters.watches_armed,
+        2,
+        "the denominator coverage does not have"
+    );
+}
