@@ -109,9 +109,19 @@ def main() -> int:
         p.error("--session is required")
 
     session_dir = a.sessions_dir / a.session
+    # Every increment of the seat, not just its first (#1119). A seat longer
+    # than the client's five-minute cadence uploads one body per increment,
+    # filed as `client-records.increment-<n>.jsonl` beside increment zero's
+    # unsuffixed file. Reading only the unsuffixed one would say a
+    # sixty-minute session banked five minutes, which is the very bug this
+    # naming exists to end.
     records = session_dir / "client-records.jsonl"
-    if records.exists():
-        rows = [json.loads(line) for line in records.read_text().splitlines() if line.strip()]
+    increments = sorted(session_dir.glob("client-records.increment-*.jsonl"),
+                        key=lambda p: int(p.name.split("increment-")[1].split(".")[0]))
+    if records.exists() or increments:
+        rows = [json.loads(line)
+                for path in ([records] if records.exists() else []) + increments
+                for line in path.read_text().splitlines() if line.strip()]
         for row in rows:
             print(f"session {row.get('session_id', a.session)}: actor={row.get('actor')} "
                   f"client_rev={str(row.get('client_rev'))[:8]} "

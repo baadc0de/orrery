@@ -2071,6 +2071,382 @@ mod tests {
         (format!("http://{address}"), received)
     }
 
+    /// One POST an increment-aware test service took.
+    ///
+    /// A named row rather than a bare tuple: a path and a body are both
+    /// `String`, and the whole point of the #1119 assertions is *which* of the
+    /// two a given increment went to.
+    #[derive(Clone, Debug)]
+    struct CapturedPost {
+        path: String,
+        body: String,
+    }
+
+    /// A standing service that records every POST and refuses chosen paths.
+    ///
+    /// The multi-increment shape needs three things the one-shot servers above
+    /// cannot give: it must survive more than one request, it must say which
+    /// *path* each body went to -- that is the whole of #1119 -- and it must be
+    /// able to fail one specific increment while taking the next, which is the
+    /// #1118 evidence-loss scenario.
+    fn increment_test_service(
+        refused_paths: &[String],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<CapturedPost>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test service");
+        let address = listener.local_addr().expect("test service address");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&seen);
+        let refused: std::collections::BTreeSet<String> = refused_paths.iter().cloned().collect();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let body_end = loop {
+                    let Ok(count) = stream.read(&mut buffer) else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..body_end]).expect("ASCII headers");
+                let path = headers
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim())
+                        })
+                    })
+                    .expect("content length")
+                    .parse::<usize>()
+                    .expect("numeric content length");
+                while request.len() < body_end + length {
+                    let Ok(count) = stream.read(&mut buffer) else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let body = String::from_utf8_lossy(&request[body_end..]).into_owned();
+                // Refused paths are recorded too: a test needs to see that the
+                // failed body was attempted at the address it belongs to.
+                let refuse = refused.contains(&path);
+                captured
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedPost { path, body });
+                let status = if refuse {
+                    "503 Service Unavailable"
+                } else {
+                    "204 No Content"
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// Bank `increments` six-minute increments of one seat and queue each body.
+    ///
+    /// Six minutes rather than five so every increment clears
+    /// [`crate::session::INCREMENT_MINUTES`] with room to spare; the point is
+    /// to cross the cadence several times, which is the only way a
+    /// second-and-later body exists at all.
+    fn queue_a_long_seat(queue: &UploadQueue, session_id: &str, increments: u64) {
+        let mut session = crate::session::CampaignSession::new(
+            session_id.to_owned(),
+            "2026-09-06T12:00:00Z".to_owned(),
+            crate::session::Actor::Human,
+            ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+        );
+        for index in 0..increments {
+            for _ in 0..6 * 60 * u64::from(orrery_core::TICK_HZ) {
+                session.observe_tick(crate::session::PlayerActivity::Active);
+            }
+            let record = session
+                .finish_increment(
+                    format!("2026-09-06T12:{:02}:00Z", (index + 1) * 6),
+                    "aarch64-apple-darwin".to_owned(),
+                    BUILD_REV.to_owned(),
+                    "unavailable-client-side".to_owned(),
+                    index + 1 == increments,
+                )
+                .expect("a six-minute increment covers a non-empty span");
+            queue_finished_session(queue, &record).expect("the increment queues");
+        }
+    }
+
+    /// The address every increment of a seat is posted to.
+    ///
+    /// Spelled out here rather than deferred to [`upload_path`]: an assertion
+    /// that asks the code under test what it expects agrees with it by
+    /// construction, and this is the exact claim -- the wire path per
+    /// increment -- that #1119 is about.
+    fn expected_paths(session_id: &str, increments: u64) -> Vec<String> {
+        (0..increments)
+            .map(|index| {
+                if index == 0 {
+                    format!("/v1/sessions/{session_id}/upload")
+                } else {
+                    format!("/v1/sessions/{session_id}/increments/{index}/upload")
+                }
+            })
+            .collect()
+    }
+
+    /// #1119. A seat longer than five minutes must bank *all* of itself.
+    ///
+    /// Since #1048 a seat banks an increment every
+    /// [`crate::session::INCREMENT_MINUTES`], and the client posts each one as
+    /// its own body -- but every body went to `/v1/sessions/{id}/upload`, built
+    /// from the session id rather than the upload key. The service stores one
+    /// pair of files per session id and refuses any second body whose bytes
+    /// differ with `409 conflict`, so a 60-minute playtest banked its first
+    /// five minutes and nothing else, on that launch and on every later one.
+    ///
+    /// Five increments, not two: the bug is a cadence, and a fixture that
+    /// crosses one boundary cannot tell a fix from an accident. This is the
+    /// end-to-end observation `each_increment_of_one_seat_queues_its_own_body`
+    /// could not make -- it points the queue at a dead port and asserts
+    /// structure. Here the bodies are posted at a service that answers, and
+    /// what is asserted is the address each one arrived at.
+    #[test]
+    fn every_increment_of_a_long_seat_is_posted_to_its_own_address_and_acknowledged() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06b05-f941-7000-8000-000000001119";
+        let (origin, seen) = increment_test_service(&[]);
+        let queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&queue, session_id, 5);
+
+        let state_path = upload_state_path(&telemetry_path);
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the sweep thread finishes");
+
+        let posts = seen.lock().expect("capture lock").clone();
+        let addresses = expected_paths(session_id, 5);
+        let mut paths: Vec<String> = posts.iter().map(|post| post.path.clone()).collect();
+        paths.sort();
+        let mut wanted = addresses.clone();
+        wanted.sort();
+        assert_eq!(
+            paths, wanted,
+            "a thirty-minute seat must post five increments, each at its own address"
+        );
+        // Distinctly addressed *and* distinct evidence: five identical bodies
+        // at five addresses would satisfy the paths and bank one increment.
+        let bodies: std::collections::BTreeSet<&str> =
+            posts.iter().map(|post| post.body.as_str()).collect();
+        assert_eq!(
+            bodies.len(),
+            5,
+            "five increments posted fewer than five distinct bodies"
+        );
+        for (index, address) in addresses.iter().enumerate() {
+            assert!(
+                posts.iter().any(|post| &post.path == address
+                    && post.body.contains(&format!("\"index\":{index}"))),
+                "no body naming increment {index} arrived at {address}"
+            );
+        }
+
+        // Each acknowledged against its own key -- #1118's half of the seam.
+        let state = read_upload_state(&state_path);
+        assert_eq!(state.sessions.len(), 5, "uploads.json lost an increment");
+        for index in 0..5 {
+            let key = upload_key(session_id, index);
+            assert!(
+                state
+                    .sessions
+                    .get(&key)
+                    .is_some_and(|entry| entry.acknowledged),
+                "increment {index} was not acknowledged under its own key {key}"
+            );
+        }
+
+        // A relaunch re-posts nothing: the acknowledgements are what stop the
+        // unbounded re-upload half of #1118.
+        seen.lock().expect("capture lock").clear();
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the second sweep finishes");
+        assert!(
+            seen.lock().expect("capture lock").is_empty(),
+            "a relaunch re-posted evidence the service had already acknowledged"
+        );
+    }
+
+    /// #1118's evidence loss, stated as the scenario that loses it.
+    ///
+    /// Increment zero's POST fails and increment one's succeeds. Keyed on the
+    /// session id, increment one's success wrote `acknowledged` onto
+    /// *increment zero's* entry -- `upload_key(id, 0) == id` -- so five
+    /// minutes of measured, signed evidence was marked delivered without ever
+    /// having been sent, and was never retried and never logged.
+    #[test]
+    fn a_landed_increment_never_acknowledges_the_increment_that_failed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06b05-f941-7000-8000-000000001118";
+        let addresses = expected_paths(session_id, 2);
+        let zero = addresses[0].clone();
+        let one = addresses[1].clone();
+        let (origin, seen) = increment_test_service(&[zero.clone()]);
+        let queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&queue, session_id, 2);
+
+        let state_path = upload_state_path(&telemetry_path);
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the sweep thread finishes");
+
+        let attempted: Vec<String> = seen
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|post| post.path.clone())
+            .collect();
+        assert!(
+            attempted.contains(&zero) && attempted.contains(&one),
+            "both increments must be attempted; only one was: {attempted:?}"
+        );
+
+        let state = read_upload_state(&state_path);
+        assert!(
+            state
+                .sessions
+                .get(&upload_key(session_id, 1))
+                .is_some_and(|entry| entry.acknowledged),
+            "increment one landed and must be acknowledged"
+        );
+        assert!(
+            !state
+                .sessions
+                .get(&upload_key(session_id, 0))
+                .expect("increment zero is still named")
+                .acknowledged,
+            "increment one's success marked increment zero delivered; those five signed minutes \
+             would never be retried (#1118)"
+        );
+
+        // And the retry actually happens: a launch against a service that is
+        // no longer refusing sends increment zero, and only increment zero.
+        let (recovered_origin, recovered) = increment_test_service(&[]);
+        // The entry remembers the origin it was queued against, so point the
+        // failed body at the service that is answering now.
+        let mut state = read_upload_state(&state_path);
+        for entry in state.sessions.values_mut() {
+            entry.origin = recovered_origin.clone();
+        }
+        write_upload_state(&state_path, &state).expect("rewrite the retry state");
+        retry_pending_uploads(&telemetry_path, &recovered_origin)
+            .join()
+            .expect("the recovery sweep finishes");
+        let resent: Vec<String> = recovered
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|post| post.path.clone())
+            .collect();
+        assert_eq!(
+            resent,
+            vec![zero],
+            "the next launch must resend the increment that failed, and nothing else"
+        );
+        assert!(
+            read_upload_state(&state_path)
+                .sessions
+                .get(&upload_key(session_id, 0))
+                .is_some_and(|entry| entry.acknowledged),
+            "the resent increment zero is acknowledged"
+        );
+    }
+
+    /// An acknowledgement #1118 could have stolen is re-armed exactly once.
+    ///
+    /// A state file written by the broken client cannot say whether increment
+    /// zero's `acknowledged` was earned or was written by increment one's
+    /// success. The repair re-sends it -- free when the service already holds
+    /// it, five recovered minutes when it does not -- and then records that it
+    /// has run, because a repair at every launch is the unbounded re-upload
+    /// this same issue is about.
+    #[test]
+    fn an_acknowledgement_the_old_bug_could_have_stolen_is_resent_once() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06b05-f941-7000-8000-00000000dead";
+        let (origin, seen) = increment_test_service(&[]);
+        let queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&queue, session_id, 2);
+
+        // Exactly what the broken client left behind: increment one is still
+        // owed, and increment zero claims an acknowledgement it may never have
+        // earned.
+        let state_path = upload_state_path(&telemetry_path);
+        let mut state = read_upload_state(&state_path);
+        state
+            .sessions
+            .get_mut(session_id)
+            .expect("increment zero is named")
+            .acknowledged = true;
+        state.increment_acks_repaired = false;
+        write_upload_state(&state_path, &state).expect("write the broken state");
+
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the repairing sweep finishes");
+        let mut paths: Vec<String> = seen
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|post| post.path.clone())
+            .collect();
+        paths.sort();
+        let mut wanted = expected_paths(session_id, 2);
+        wanted.sort();
+        assert_eq!(
+            paths, wanted,
+            "the repair must resend the increment zero whose acknowledgement is in doubt"
+        );
+
+        seen.lock().expect("capture lock").clear();
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the second sweep finishes");
+        assert!(
+            seen.lock().expect("capture lock").is_empty(),
+            "the repair ran twice; that is the unbounded re-upload it exists to end"
+        );
+    }
+
     /// A multi-shot upload service that answers `status` to every POST.
     fn upload_test_service(
         status: &str,
