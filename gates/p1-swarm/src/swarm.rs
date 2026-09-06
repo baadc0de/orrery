@@ -26,8 +26,8 @@ use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{AudienceChange, Bot, BotSpec, TICK_HZ};
 use crate::delta_stats::{DeltaStats, DeltaStatsReport};
 use crate::exterior::{
-    unix_millis_now, ActiveSeat, Frame, HearsayContact, HearsayContacts, HearsaySource, Lane,
-    StartManifest, UplinkAck, UplinkDatagram, UplinkOutcome,
+    unix_millis_now, ActiveSeat, Frame, HearsayContact, HearsayContacts, HearsaySource,
+    IslandRoster, Lane, RosterSeat, StartManifest, UplinkAck, UplinkDatagram, UplinkOutcome,
 };
 
 use crate::router::{Impairment, Router, RouterCounters};
@@ -787,6 +787,19 @@ pub struct RunIdentity {
     pub commit: &'static str,
 }
 
+/// Frames one external seat received from one other seat.
+///
+/// A named record rather than a `(slot, frames)` pair: this is read by the
+/// two-human regression, and a report reader must not have to know which half
+/// of a tuple is which.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeatDeliveries {
+    /// The seat that sent them.
+    pub slot: usize,
+    /// How many frames of its traffic were queued to this seat.
+    pub frames: u64,
+}
+
 /// What the host observed about the external peer over one run (#385).
 #[derive(Debug, Clone, Serialize)]
 pub struct ExteriorReport {
@@ -896,6 +909,33 @@ pub struct ExteriorReport {
     /// `connected`, because neither of those can say that frames were dropped
     /// on the way down.
     pub close: &'static str,
+    /// How many distinct interest cells this seat reported over the run.
+    ///
+    /// One means the craft never left the cell it spawned in, and a run like
+    /// that is no evidence about [`Self::last_state_delivery_tick`] at all: at
+    /// the campaign's 512 m edge and 32 m/s cruise a seat clears its spawn
+    /// cell in about sixteen seconds, which is longer than every real-peer
+    /// fixture in the tree ran before #1128.
+    pub reported_cells: usize,
+    /// State-channel packets this seat authored that reached a recipient.
+    ///
+    /// **Read it as a rate, not as a liveness flag.** Measured over the same
+    /// 60-second campaign join, with four bots: 2,847 with the seat's roster
+    /// frozen at its spawn cell and 4,645 with it tracking the craft. The
+    /// floor is not zero even when the seat's replication audience is empty
+    /// for 48 of those 60 seconds, because repair and heartbeat traffic is
+    /// addressed to linked peers rather than to the audience — which is
+    /// exactly why #1128 could not be seen from the host at all, and why the
+    /// runner counts its own audience and says so in its closing line.
+    pub state_deliveries: u64,
+    /// The last host tick one of those was delivered; `null` if none ever was.
+    pub last_state_delivery_tick: Option<u64>,
+    /// Frames delivered down to this seat, by the seat that authored them.
+    ///
+    /// No human seat among them is #1129's shape: with the runner filtering
+    /// inbound frames on the *bot* count, nothing from a second human seat was
+    /// ever accepted, in either direction.
+    pub deliveries_from_seats: Vec<SeatDeliveries>,
 }
 
 /// What one directed link carried, for #572 §6.1's per-leg impairment band.
@@ -1689,6 +1729,26 @@ pub struct ExteriorSlot {
     /// True once the runner's clean end-of-run marker arrived. Shared with
     /// the bridge's reader task, which is what sees the marker first.
     pub goodbye: Arc<std::sync::atomic::AtomicBool>,
+    /// Every distinct cell this seat has reported over the run.
+    ///
+    /// A run whose external peer never left the cell it spawned in cannot say
+    /// anything about #1128, so the count is reported: it is what makes the
+    /// replication clause below non-vacuous rather than merely green.
+    reported_cells: BTreeSet<CellId>,
+    /// State-channel packets this seat authored that the router delivered to
+    /// somebody, and the last tick one did.
+    ///
+    /// The host's own view of "the human is still replicating". #1128 was
+    /// invisible for as long as it was because nothing here counted it: the
+    /// seat kept sending witness claims and cell reports at the same
+    /// `uplink_frames` the report shows, while its replication audience was
+    /// empty and no state packet had been addressed to anyone for minutes.
+    state_deliveries: u64,
+    /// Last host tick a state packet authored by this seat was delivered.
+    last_state_delivery_tick: Option<u64>,
+    /// Deliveries handed down to this seat, counted by the seat that sent
+    /// them. Human-to-human traffic is the entry #1129 says is always absent.
+    deliveries_from: BTreeMap<usize, u64>,
 }
 
 /// One crewed-roster snapshot retained by the hearsay fold.
@@ -1855,6 +1915,17 @@ impl ExteriorSlot {
             said_goodbye,
             witness_anchored: self.witness_anchored,
             session_id: self.session_id.clone(),
+            reported_cells: self.reported_cells.len(),
+            state_deliveries: self.state_deliveries,
+            last_state_delivery_tick: self.last_state_delivery_tick,
+            deliveries_from_seats: self
+                .deliveries_from
+                .iter()
+                .map(|(slot, frames)| SeatDeliveries {
+                    slot: *slot,
+                    frames: *frames,
+                })
+                .collect(),
             close: Self::close_reason(
                 self.connected_ticks,
                 self.downlink_dropped,
@@ -2060,6 +2131,7 @@ impl ExteriorSlot {
         if let Some(cell) = CellId::from_bits(raw) {
             self.cell = cell;
             self.cell_fact_tick = fact_tick;
+            self.reported_cells.insert(cell);
         }
     }
 }
@@ -2338,6 +2410,10 @@ impl Swarm {
                 downlink_dropped: 0,
                 downlink_after_close: 0,
                 goodbye: goodbye_flag,
+                reported_cells: BTreeSet::from([cell]),
+                state_deliveries: 0,
+                last_state_delivery_tick: None,
+                deliveries_from: BTreeMap::new(),
             },
         );
     }
@@ -2459,8 +2535,55 @@ impl Swarm {
             }
             bot.set_island(others);
         }
+        // The external seats read the same fold, over the wire. Before #1128
+        // this loop stopped at `self.bots`, and the human path kept the roster
+        // it derived from spawn poses at join for the whole session.
+        self.publish_exterior_rosters(tick, &coverage);
         self.replace_shot_interest_scope(&roster);
         capture
+    }
+
+    /// Send each external seat the audience its sends may address.
+    ///
+    /// The bot half of the refresh above writes `IslandMembership` straight
+    /// into a `Bot`; an external seat's copy lives in another process, so the
+    /// same fold is published on the Meta lane as an
+    /// [`IslandRoster`](crate::exterior::IslandRoster) instead. One fold, two
+    /// deliveries — which is the point: the divergent second roster the
+    /// external runner built for itself is what #1128 was.
+    ///
+    /// **Only covering seats travel.** A seat is included when its declared
+    /// interest already contains the recipient's committed cell, which is
+    /// exactly the predicate `Bot::broadcast_state` applies to pick an
+    /// audience. Publishing every seat's cell instead would hand a client the
+    /// position of craft it cannot see, which is what the hearsay fold
+    /// (`fold_hearsay_contacts`) exists to avoid handing it.
+    fn publish_exterior_rosters(&mut self, tick: u64, coverage: &[(NodeId, Vec<CellId>)]) {
+        if self.exteriors.is_empty() {
+            return;
+        }
+        let index_of = &self.index_of;
+        for exterior in self.exteriors.values_mut() {
+            let cell = exterior.cell;
+            let node = exterior.node;
+            let seats = coverage
+                .iter()
+                .filter(|entry| entry.0 != node && entry.1.contains(&cell))
+                .filter_map(|entry| {
+                    let slot = u16::try_from(*index_of.get(&entry.0)?).ok()?;
+                    Some(RosterSeat {
+                        slot,
+                        node: *entry.0.as_bytes(),
+                        cells: entry.1.iter().copied().map(CellId::to_bits).collect(),
+                    })
+                })
+                .collect();
+            exterior.queue_downlink(Frame {
+                peer: u32::MAX,
+                lane: Lane::Meta,
+                payload: IslandRoster { tick, seats }.encode(),
+            });
+        }
     }
 
     /// Apply immediate crossing coverage to the membership every sender reads.
@@ -2783,12 +2906,26 @@ impl Swarm {
     /// Hand every due packet to its recipient's buffer, on the lane it came in on.
     fn deliver(&mut self, tick: u64) {
         for delivery in self.router.deliver_due(tick) {
+            let from = self
+                .index_of
+                .get(&delivery.from)
+                .copied()
+                .unwrap_or(usize::MAX);
+            // An external seat's *replication* is counted here, where the
+            // router says a packet it authored actually reached somebody.
+            // Nowhere else could: `uplink_frames` counts what arrived at the
+            // host, and a seat with an empty audience still fills that with
+            // claims and cell reports while replicating to nobody (#1128).
+            if orrery_protocol::channels::untag(&delivery.payload)
+                .is_some_and(|(channel, _)| channel == orrery_protocol::channels::Channel::State)
+            {
+                if let Some(sender) = self.exteriors.get_mut(&from) {
+                    sender.state_deliveries += 1;
+                    sender.last_state_delivery_tick = Some(tick);
+                }
+            }
             if let Some(exterior) = self.exteriors.get_mut(&delivery.to) {
-                let from = self
-                    .index_of
-                    .get(&delivery.from)
-                    .copied()
-                    .unwrap_or(usize::MAX);
+                *exterior.deliveries_from.entry(from).or_default() += 1;
                 exterior.deliver_from(from, delivery.stream, delivery.payload);
                 continue;
             }
@@ -4447,15 +4584,21 @@ mod tests {
     use super::*;
     use orrery_games::regolith::{archetype::Archetype, CAMPAIGN_CELL_EDGE_M};
 
+    /// The next membership manifest on the downlink, skipping the rest of the
+    /// Meta grammar.
+    ///
+    /// The lane multiplexes: acknowledgements, hearsay folds, island rosters
+    /// and manifests all ride it, discriminated by tag. A reader that assumed
+    /// the head of the queue was a manifest was reading position, not content.
     fn next_membership(remote: &crate::exterior::RemoteLink) -> StartManifest {
-        let frame = remote
-            .downlink
-            .lock()
-            .expect("downlink lock")
-            .try_recv()
-            .expect("membership manifest queued");
-        assert_eq!(frame.lane, Lane::Meta);
-        serde_json::from_slice(&frame.payload).expect("Meta frame is a membership manifest")
+        let mut queue = remote.downlink.lock().expect("downlink lock");
+        while let Ok(frame) = queue.try_recv() {
+            assert_eq!(frame.lane, Lane::Meta);
+            if let Ok(manifest) = serde_json::from_slice(&frame.payload) {
+                return manifest;
+            }
+        }
+        panic!("no membership manifest was queued");
     }
 
     /// A scratch feed path for a test that reads what admission would read.
@@ -5303,6 +5446,22 @@ mod tests {
         }
     }
 
+    /// The first hearsay fold in whatever the downlink currently holds, if any.
+    ///
+    /// The Meta lane carries acknowledgements, island rosters and membership
+    /// manifests beside the folds, so a reader that took the head of the queue
+    /// was testing queue position rather than the record it wanted.
+    fn next_hearsay(remote: &crate::exterior::RemoteLink) -> Option<HearsayContacts> {
+        let mut queue = remote.downlink.lock().expect("downlink lock");
+        while let Ok(frame) = queue.try_recv() {
+            if let Some(contacts) = HearsayContacts::decode(&frame.payload) {
+                assert_eq!(frame.lane, Lane::Meta);
+                return Some(contacts);
+            }
+        }
+        None
+    }
+
     fn receive_hearsay(remote: &crate::exterior::RemoteLink) -> HearsayContacts {
         loop {
             let frame = remote
@@ -5458,9 +5617,7 @@ mod tests {
         let first_fold_tick = HEARSAY_FOLD_TICKS - 1;
         let _ = swarm.refresh_rosters(first_fold_tick);
         for (_, remote) in &remotes {
-            if let Ok(frame) = remote.downlink.lock().expect("downlink lock").try_recv() {
-                let record = HearsayContacts::decode(&frame.payload)
-                    .expect("a Meta downlink at the fold boundary is hearsay");
+            if let Some(record) = next_hearsay(remote) {
                 assert_old_enough(record, first_fold_tick);
             }
         }
@@ -5487,16 +5644,7 @@ mod tests {
             }
             let records = remotes
                 .iter()
-                .filter(|(_, remote)| {
-                    remote
-                        .downlink
-                        .lock()
-                        .expect("downlink lock")
-                        .try_recv()
-                        .ok()
-                        .and_then(|frame| HearsayContacts::decode(&frame.payload))
-                        .is_some()
-                })
+                .filter(|(_, remote)| next_hearsay(remote).is_some())
                 .count();
             (capture, records)
         }

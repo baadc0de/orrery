@@ -274,6 +274,16 @@ async fn write_stream_frame(send: &mut SendStream, frame: &Frame) -> Result<()> 
 /// Routes one inbound combat-lane frame: meta goes to its own channel so the
 /// swarm can update rosters, everything else is traffic. A meta frame with a
 /// body that is not one cell encoding is dropped, not guessed at.
+///
+/// **The two sides are not symmetric, and that asymmetry was a defect.** Only
+/// the host side is given a `meta_tx`, because only it has a second consumer
+/// for the one record it expects there — the remote's cell report. Until #1129
+/// the remote side, holding `None`, fell into the same arm and *dropped every
+/// meta frame on the floor*: the host's uplink acknowledgements, its hearsay
+/// folds, its live membership manifests and its island rosters, none of which
+/// the client ever saw. A `None` here now means "this side has no side
+/// channel", not "this side does not want the lane": the frame travels with
+/// the rest of the traffic and the reader classifies it by tag.
 async fn route_inbound(
     frame: Frame,
     uplink_tx: &tokio::sync::mpsc::Sender<Frame>,
@@ -289,7 +299,7 @@ async fn route_inbound(
         );
     }
     match frame.lane {
-        Lane::Meta => {
+        Lane::Meta if meta_tx.is_some() => {
             if let (Some(meta_tx), Ok(raw)) = (meta_tx, <[u8; 8]>::try_from(frame.payload.as_ref()))
             {
                 // A dropped future is an unsent frame: every send in the

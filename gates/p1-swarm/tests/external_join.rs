@@ -961,3 +961,404 @@ fn transport_departure_releases_the_seat_in_observed_time() {
         );
     }
 }
+
+/// Reads the runner's own end-of-run account of what it accepted.
+///
+/// The host's report cannot answer #1129: the host *delivered* every frame it
+/// is asked about, and the runner threw them away after they arrived. This is
+/// the only place the client's side of that is written down.
+fn runner_summary(path: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .rev()
+        .find(|line| line.contains("accepted"))
+        .unwrap_or_else(|| panic!("the runner never summarised its run: {}", path.display()))
+        .to_owned()
+}
+
+/// Frames the summary line says arrived from one seat, `0` when it names none.
+fn accepted_from(summary: &str, slot: usize) -> u64 {
+    let Some((_, seats)) = summary.split_once("from seats ") else {
+        return 0;
+    };
+    let seats = seats.split(';').next().unwrap_or_default();
+    seats
+        .split(',')
+        .filter_map(|entry| entry.split_once(':'))
+        .find(|(seat, _)| seat.trim() == slot.to_string())
+        .and_then(|(_, frames)| frames.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The number after `label` in the runner's summary line.
+fn summary_count(summary: &str, label: &str) -> u64 {
+    summary
+        .split_whitespace()
+        .zip(summary.split_whitespace().skip(1))
+        .find(|(_, next)| next.trim_end_matches(',') == label)
+        .and_then(|(count, _)| count.parse().ok())
+        .unwrap_or_else(|| panic!("the summary does not count {label}: {summary}"))
+}
+
+/// Seconds the runner spent replicating to nobody, from its summary line.
+fn empty_audience_seconds(summary: &str) -> u64 {
+    let tail = summary
+        .split_once("roster updates, ")
+        .map(|(_, tail)| tail)
+        .unwrap_or_else(|| panic!("the summary does not count its audience: {summary}"));
+    tail.split_whitespace()
+        .next()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("the summary's audience count did not parse: {summary}"))
+}
+
+/// #1128: a human seat must still be replicating minutes after it leaves the
+/// cell it spawned in.
+///
+/// **Why a minute and not eight seconds.** At the campaign's 512 m cell edge
+/// and the pilot's 32 m/s cruise the craft clears its spawn cell in about
+/// sixteen seconds. Every real-peer fixture in this file ran for eight, which
+/// is why a defect that made the seat a permanent ghost twenty seconds in
+/// survived: inside one cell the frozen spawn roster and a live one are the
+/// same roster. Measured on this leg's parameters: 1,648 uplink frames by 20 s
+/// and 2,928 by 60 s before the fix — 32.0 frames per second over the
+/// intervening forty, the witness-lane floor — against 2,148 and 4,779 after.
+///
+/// **What is asserted, and why it is the runner's line rather than the
+/// report.** The failing shape is the seat's *replication audience*, and only
+/// the seat can see it: the host keeps routing the seat's repair and heartbeat
+/// traffic to every linked bot whatever the audience is, so `state_deliveries`
+/// falls by a third rather than to zero and no host-side counter separates the
+/// two cases. The runner counts the audience of its own craft once a second
+/// and reports it. Re-measured with the roster refresh disabled and everything
+/// else in place: **48 of 60 seconds replicating to nobody**, against 0 of 60
+/// with it. The cell count is the anti-vacuity half — a run that never crossed
+/// a boundary is no evidence at all, and is what would let this test pass on
+/// the broken code by accident.
+#[test]
+#[ignore = "two real processes for a minute of wall clock; run via scripts/p1-swarm-gate.sh or --ignored"]
+fn an_external_peer_keeps_replicating_after_it_leaves_its_spawn_cell() {
+    const SECONDS: u64 = 60;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("p1-cruise-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let report_path = dir.join("report.json");
+    let listening_path = dir.join("listening.txt");
+    let host_err_path = dir.join("host.err");
+    let runner_err_path = dir.join("runner.err");
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve exterior port");
+    let external_bind = reservation.local_addr().expect("reserved exterior address");
+    drop(reservation);
+
+    let mut host = Command::new(bin())
+        .args([
+            "--peers",
+            "4",
+            "--seconds",
+            &SECONDS.to_string(),
+            "--min-cells",
+            "1",
+            "--seed",
+            "7",
+            "--impaired",
+            "--witness",
+            "--external-peer",
+            "--join-timeout-secs",
+            "60",
+            "--json",
+        ])
+        .arg(&report_path)
+        .arg("--listening-file")
+        .arg(&listening_path)
+        .arg("--external-bind")
+        .arg(external_bind.to_string())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&host_err_path).expect("host err file"))
+        .spawn()
+        .expect("host process starts");
+    let (host_node, host_direct) = wait_for_listening(&listening_path);
+
+    let mut remote = Command::new(bin())
+        .args([
+            "--external",
+            "--peers",
+            "4",
+            "--seconds",
+            &SECONDS.to_string(),
+            "--seed",
+            "7",
+            "--witness",
+            "--host-node",
+            &host_node,
+            "--host-direct",
+            &host_direct,
+        ])
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&runner_err_path).expect("runner err file"))
+        .spawn()
+        .expect("external runner starts");
+
+    let deadline = std::time::Instant::now() + PROCESS_TIMEOUT + Duration::from_secs(SECONDS);
+    loop {
+        let done = host.try_wait().is_ok_and(|s| s.is_some())
+            && remote.try_wait().is_ok_and(|s| s.is_some());
+        if done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pair did not finish a {SECONDS}-second run in time"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let host_status = host.wait().expect("host wait");
+    let remote_status = remote.wait().expect("runner wait");
+    if !host_status.success() {
+        eprintln!(
+            "{}",
+            std::fs::read_to_string(&host_err_path).unwrap_or_default()
+        );
+    }
+    assert!(
+        remote_status.success(),
+        "the external runner did not survive"
+    );
+    assert!(
+        host_status.success(),
+        "the host's criterion did not hold over a minute-long join; its own words are above"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report written"))
+            .expect("report parses");
+    let external = report["external"]
+        .as_array()
+        .and_then(|seats| seats.first())
+        .expect("the report names the external seat")
+        .clone();
+
+    let reported_cells = external["reported_cells"].as_u64().expect("cells reported");
+    assert!(
+        reported_cells > 1,
+        "the craft never left the cell it spawned in over {SECONDS} seconds, so this run says \
+         nothing about #1128: {reported_cells} cell reported"
+    );
+    let deliveries = external["state_deliveries"].as_u64().expect("deliveries");
+    assert!(
+        deliveries > 1_200,
+        "{deliveries} state deliveries over {SECONDS} seconds is below the rate one recipient \
+         at the 20 Hz send cadence would produce for the run's second half alone"
+    );
+    let summary = runner_summary(&runner_err_path);
+    assert!(
+        summary_count(&summary, "roster") > 0,
+        "the runner applied no host roster at all, so whatever it replicated to it chose on \
+         its own: {summary}"
+    );
+    let empty = empty_audience_seconds(&summary);
+    assert!(
+        empty <= 2,
+        "the seat replicated to nobody for {empty} of {SECONDS} seconds. Its roster froze and \
+         its send audience emptied when it crossed out of its spawn cell — it is a ghost to \
+         every other craft while its own screen looks normal (#1128): {summary}"
+    );
+}
+
+/// #1129: two human seats must see each other, and must hear the host.
+///
+/// The tree's only other two-human test runs for one second and asserts seat
+/// bookkeeping — which seat id each runner was granted — so it passed for as
+/// long as the seats were mutually invisible. This one runs long enough to
+/// cross a cell boundary and asserts the traffic itself, in both directions
+/// and at both ends: the host must have delivered each human's frames to the
+/// other, and each runner must say it accepted them.
+///
+/// Both ends are necessary. The host's report showed every frame delivered
+/// while the defect was live, because they were — the runner then discarded
+/// them, filtering inbound frames on the *bot* count. A test that read only
+/// the host's report would have stayed green.
+#[test]
+#[ignore = "three real processes for most of a minute; run via scripts/p1-swarm-gate.sh or --ignored"]
+fn two_human_seats_exchange_frames_and_read_the_meta_lane() {
+    const SECONDS: u64 = 40;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("p1-two-humans-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let report_path = dir.join("report.json");
+    let listening_path = dir.join("listening.txt");
+    let active_seats_path = dir.join("active-seats.json");
+    let journal_path = dir.join("slots.json");
+    let host_err_path = dir.join("host.err");
+    let issuer = iroh_base::SecretKey::from_bytes(&[0x5b; 32]);
+    let key_id = 594;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_millis() as u64;
+    let sessions = [
+        (4usize, "018f8f4e-5c90-7abc-8123-000000000404"),
+        (5usize, "018f8f4e-5c90-7abc-8123-000000000405"),
+    ];
+    let rows = sessions
+        .iter()
+        .map(|(slot, session)| {
+            serde_json::json!({
+                "attempt_id": "attempt-two-humans",
+                "slot": slot,
+                "session_id": session,
+                "node": slot_key(*slot).public().to_string(),
+                "expires_at": now_ms / 1_000 + 300,
+            })
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        &journal_path,
+        serde_json::to_vec(&rows).expect("journal serializes"),
+    )
+    .expect("journal written");
+
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve exterior port");
+    let external_bind = reservation.local_addr().expect("reserved exterior address");
+    drop(reservation);
+    let mut host = Command::new(bin())
+        .args([
+            "--peers",
+            "4",
+            "--external-slots",
+            "2",
+            "--lobby-seconds",
+            "20",
+            "--seconds",
+            &SECONDS.to_string(),
+            "--min-cells",
+            "1",
+            "--seed",
+            "7",
+            "--impaired",
+            "--external-peer",
+            "--report-only",
+            "--attempt-id",
+            "attempt-two-humans",
+            "--issuer-key",
+            &format!("{key_id}:{}", issuer.public()),
+            "--json",
+        ])
+        .arg(&report_path)
+        .arg("--reservation-journal")
+        .arg(&journal_path)
+        .arg("--listening-file")
+        .arg(&listening_path)
+        .arg("--active-seats-file")
+        .arg(&active_seats_path)
+        .arg("--external-bind")
+        .arg(external_bind.to_string())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&host_err_path).expect("host err file"))
+        .spawn()
+        .expect("host process starts");
+    let (host_node, host_direct) = wait_for_listening(&listening_path);
+
+    let mut remotes = Vec::new();
+    for (slot, session) in sessions {
+        let err_path = dir.join(format!("runner-{slot}.err"));
+        remotes.push((
+            slot,
+            err_path.clone(),
+            Command::new(bin())
+                .args([
+                    "--external",
+                    "--peers",
+                    "4",
+                    "--external-slots",
+                    "2",
+                    "--slot",
+                    &slot.to_string(),
+                    "--seconds",
+                    &SECONDS.to_string(),
+                    "--seed",
+                    "7",
+                    "--host-node",
+                    &host_node,
+                    "--host-direct",
+                    &host_direct,
+                    "--session-id",
+                    session,
+                    "--session-token",
+                    &token_hex(&issuer, key_id, slot, now_ms),
+                ])
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&err_path).expect("runner err file"))
+                .spawn()
+                .expect("external runner starts"),
+        ));
+    }
+    for (slot, _, remote) in &mut remotes {
+        assert!(
+            remote.wait().expect("runner wait").success(),
+            "the runner on seat {slot} did not survive its own run"
+        );
+    }
+    let host_status = host.wait().expect("host wait");
+    if !host_status.success() {
+        eprintln!(
+            "{}",
+            std::fs::read_to_string(&host_err_path).unwrap_or_default()
+        );
+    }
+    assert!(host_status.success(), "the two-human host failed");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report written"))
+            .expect("report parses");
+    let seats = report["external"].as_array().expect("external seats");
+    assert_eq!(seats.len(), 2, "both human seats must appear in the report");
+
+    for seat in seats {
+        let index = seat["index"].as_u64().expect("seat index") as usize;
+        let other = if index == 4 { 5 } else { 4 };
+        let from_other = seat["deliveries_from_seats"]
+            .as_array()
+            .expect("per-seat deliveries")
+            .iter()
+            .find(|row| row["slot"].as_u64() == Some(other as u64))
+            .and_then(|row| row["frames"].as_u64())
+            .unwrap_or(0);
+        assert!(
+            from_other > 0,
+            "the host delivered nothing from seat {other} to seat {index} over {SECONDS} \
+             seconds: the two humans are not on the same island as far as routing is concerned"
+        );
+    }
+
+    for (slot, err_path, _) in &remotes {
+        let other = if *slot == 4 { 5 } else { 4 };
+        let summary = runner_summary(err_path);
+        assert!(
+            accepted_from(&summary, other) > 0,
+            "seat {slot} accepted no frame at all from seat {other}; the other human is \
+             invisible to it for the whole session (#1129): {summary}"
+        );
+        assert!(
+            summary_count(&summary, "meta") > 0,
+            "seat {slot} read not one Meta frame: every host acknowledgement, hearsay fold, \
+             membership manifest and island roster was discarded before it was classified \
+             (#1129): {summary}"
+        );
+        assert!(
+            summary_count(&summary, "roster") > 0,
+            "seat {slot} applied no host roster: {summary}"
+        );
+        let empty = empty_audience_seconds(&summary);
+        assert!(
+            empty <= 2,
+            "seat {slot} replicated to nobody for {empty} of {SECONDS} seconds (#1128 on a \
+             human seat): {summary}"
+        );
+    }
+}
