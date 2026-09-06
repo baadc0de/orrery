@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import errno
+import gc
 import fcntl
 import http.client
 import ipaddress
@@ -751,13 +753,31 @@ class Admission:
                         current = self._always_on_attempt(c)
                         if current is None or current["attempt_id"] != attempt["attempt_id"]:
                             raise Refusal(503, "host_failed", "The attempt restarted while reserving your seat — try again shortly.")
-                        self._write_slots(c, slots)
+                        # The join log is appended *before* the reservation is
+                        # committed (#1152).  These two writes are not one
+                        # transaction and cannot be made into one, so the only
+                        # choice is which way they fail, and the two directions
+                        # are not symmetric:
+                        #
+                        #   slot row, no join row -> the seat is burned and the
+                        #     account is minted, but `known_session` cannot see
+                        #     the session, so every evidence upload it ever
+                        #     makes is refused `404 unknown_session`, forever.
+                        #   join row, no slot row -> nothing is reserved, the
+                        #     volunteer is refused and retries into a clean
+                        #     journal, and the orphan line costs one known
+                        #     session id that never uploads anything.
+                        #
+                        # The second is a spare line in an append-only audit
+                        # log.  The first is unrecoverable evidence loss, so
+                        # the durable commit goes last.
                         self.append_join(c, {"when": int(time.time()), "campaign": ident, "nickname": nickname,
                                              "account": int(account), "session_id": sid, "node": node, "slot": slot,
                                              "attempt_id": attempt["attempt_id"]})
+                        self._write_slots(c, slots)
                     except Refusal:
                         raise
-                    except (RuntimeError, KeyError, ValueError) as e:
+                    except (OSError, RuntimeError, KeyError, ValueError) as e:
                         logging.exception("admission subprocess/log failed: %s", e)
                         raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
                 else:
@@ -786,11 +806,20 @@ class Admission:
                     # arriving.  Somebody dialling this second is arriving.
                     reclaiming = membership.reclaimable(sid, int(time.time()))
                     existing["expires_at"] = int(time.time()) + ARRIVAL_LEASE_SECONDS
-                    self._write_slots(c, slots)
-                    self.append_join(c, {"when": int(time.time()), "campaign": ident,
-                                         "nickname": nickname, "account": int(account),
-                                         "session_id": sid, "node": node, "slot": slot,
-                                         "attempt_id": attempt["attempt_id"], "reissued": True})
+                    try:
+                        # Log first, commit second, for the reason spelled out
+                        # on the mint path above (#1152).  This branch had no
+                        # `except` of its own at all, so an `ENOSPC` or `EIO`
+                        # here escaped `join` as a bare `OSError` and reached
+                        # the handler, which answered nothing.
+                        self.append_join(c, {"when": int(time.time()), "campaign": ident,
+                                             "nickname": nickname, "account": int(account),
+                                             "session_id": sid, "node": node, "slot": slot,
+                                             "attempt_id": attempt["attempt_id"], "reissued": True})
+                        self._write_slots(c, slots)
+                    except (OSError, RuntimeError, KeyError, ValueError) as e:
+                        logging.exception("admission could not reissue seat %s on %s: %s", slot, ident, e)
+                        raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
                     logging.info("campaign %s: reissued seat %s to the transport identity that "
                                  "holds it (session %s, host has published the release: %s)",
                                  ident, slot, sid, reclaiming)
@@ -822,7 +851,10 @@ class Admission:
                 # holds: the account was minted one line earlier.
                 signed = self.output([self.invite, "session-token", "--issuer-credential", str(self.issuer), "--account", account, "--node", node, "--assume-standing-good"])
                 self.append_join(c, {"when": int(time.time()), "campaign": ident, "nickname": nickname, "account": int(account), "session_id": sid, "node": node})
-            except (RuntimeError, KeyError, ValueError) as e:
+            # `append_join` raises a bare `OSError` on a full or failing disk
+            # and this tuple did not name it (#1152), so the exception escaped
+            # the request handler and the socket closed with no HTTP status.
+            except (OSError, RuntimeError, KeyError, ValueError) as e:
                 logging.exception("admission subprocess/log failed: %s", e)
                 raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
             session_dir = self.state / "sessions" / sid; session_dir.mkdir(parents=True, exist_ok=True)
@@ -833,9 +865,32 @@ class Admission:
             # "cannot write the exterior listening file" — an admission that
             # looks like a host failure but is a missing directory. Found by
             # standing the service up on a real box (#488).
-            command = [self.ssh, "-i", str(self.ssh_key), f"orrery@{c.host}",
-                       "mkdir", "-p", remote, "&&", self.swarm, "--external-peer", "--external-bind", self.harness_bind(c), "--peers", str(c.peers), "--seconds", str(c.seconds), "--min-cells", "1", "--impaired", "--witness", "--stamp-wall-clock", "--json", f"{remote}/raw.json", "--listening-file", f"{remote}/listening.txt", "--require-session", sid, "--issuer-key", f"{signed['issuer_key_id']}:{signed['issuer_public_key']}"]
-            if c.client_rev: command += ["--require-client-rev", c.client_rev]
+            # Everything after `orrery@host` is re-parsed by a shell (#1155).
+            # `ssh` joins its command arguments with spaces and hands the
+            # result to the remote login shell -- which is the only reason the
+            # literal `&&` in the middle of this line works at all.  The local
+            # `Popen` is a list with no `shell=True`, so nothing is re-parsed
+            # here; the remote end is where a value with a space splits into
+            # two arguments and a value with a `;` or a backtick runs as
+            # `orrery` on the campaign host.
+            #
+            # The only operator-controlled value on the line is `c.client_rev`,
+            # read from `campaigns.conf` -- a root-owned file that no request
+            # path writes and that the plan calls "the only file a human
+            # edits".  So this is a robustness fix, not a security one: the
+            # exposure needs the operator to attack their own host.  What it
+            # actually costs today is silent: a `client_rev` with a stray space
+            # starts the harness pinned to the wrong build, or not at all, and
+            # the operator sees `host_failed` with nothing pointing at the
+            # config.
+            #
+            # `&&` is shell syntax and must stay unquoted; every other element
+            # is data.  `shlex.quote` leaves a well-formed value untouched, so
+            # the wire form of a correct configuration does not change.
+            remote_argv = ["mkdir", "-p", remote, "&&", self.swarm, "--external-peer", "--external-bind", self.harness_bind(c), "--peers", str(c.peers), "--seconds", str(c.seconds), "--min-cells", "1", "--impaired", "--witness", "--stamp-wall-clock", "--json", f"{remote}/raw.json", "--listening-file", f"{remote}/listening.txt", "--require-session", sid, "--issuer-key", f"{signed['issuer_key_id']}:{signed['issuer_public_key']}"]
+            if c.client_rev: remote_argv += ["--require-client-rev", c.client_rev]
+            command = [self.ssh, "-i", str(self.ssh_key), f"orrery@{c.host}"] + [
+                word if word == "&&" else shlex.quote(word) for word in remote_argv]
             try: child = subprocess.Popen(command, text=True)
             except OSError as e: raise Refusal(503, "host_failed", "The host could not start your session — tell the operator, nothing you did was wrong.") from e
             listening = self._wait_listening(c, remote, session_dir, child)
@@ -852,8 +907,33 @@ class Admission:
             return {"join": {"host_node": host_node, "slot": c.peers, "session_id": sid, "session_token": signed["session_token"]}, "host_direct": host_direct, "account": int(account), "nickname": display_label(nickname), "expires_in_s": 3600, "configured": configured_impairment(c)}
         finally:
             # The flock stays held by the child/reaper, not the request.  It is released there.
+            #
+            # Pop by *identity*, not by key (#1146).  `self.locks.pop(ident)`
+            # removes whatever object is under the key, which need not be this
+            # request's lock.  `flock(2)` locks belong to the open file
+            # description and every request gets its own `open()` at the top of
+            # this method, so no request can release another's by closing its
+            # own fd -- but the dict entry is the incumbent lock's only
+            # long-lived reference.  Popping it drops the refcount to zero once
+            # the incumbent's frame returns, CPython closes the file, and the
+            # flock goes with it mid-session.
+            #
+            # The window is bounded but real, and it is not a "409 during a
+            # run": the guard below is false for a genuinely running session,
+            # because `self.children[ident]` is set before this method returns.
+            # The hole is between `self.locks[ident] = lock` and that
+            # assignment, which spans two `orrery-invite` subprocesses, a
+            # `Popen` and `_wait_listening` -- seconds.  A second join landing
+            # inside it is refused `campaign_busy`, still sees `ident not in
+            # self.children`, and used to pop the incumbent's lock.  Two joins
+            # a second apart is how a tester double-clicking Join produces it.
+            #
+            # Same "keyed by the wrong thing" shape as #1118.  Closing this
+            # request's own `lock` is always right and always harmless: in the
+            # 409 path it is already closed, and `close()` is idempotent.
             if ident not in self.children:
-                self.locks.pop(ident, None)
+                if self.locks.get(ident) is lock:
+                    del self.locks[ident]
                 lock.close()
 
     @staticmethod
@@ -1024,10 +1104,34 @@ class Admission:
 
     @staticmethod
     def atomic_bytes(path: Path, data: bytes) -> None:
-        temp = path.with_name(path.name + ".tmp")
-        with temp.open("wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
-        os.replace(temp, path)
-        fd = os.open(path.parent, os.O_DIRECTORY); os.fsync(fd); os.close(fd)
+        """Write `data` to `path` atomically, through a temp name nobody else can hold.
+
+        The temp name used to be a *fixed* `<name>.tmp` (#1153), which is safe
+        only on a serial server, and this one is not: `main` runs a
+        `ThreadingHTTPServer`, so two requests writing the same target run this
+        concurrently.  Two `write`s and two `fsync`s interleaving into one
+        shared file, followed by two `os.replace`s, bank a *spliced* record --
+        the first half of one body and the second half of another -- which
+        #1119's conflict check then treats as the canonical evidence, because
+        it compares against whatever is stored.  Failing would be fine; banking
+        a wrong artifact is the #1051/#1053 shape.
+
+        `mkstemp` in the target's own directory gives a name unique per call
+        and keeps the rename on one filesystem.  The explicit `chmod` restores
+        the 0644 the old `open("wb")` produced under the service umask --
+        `mkstemp` creates 0600, and the evidence directory is read by operator
+        tooling (`p4-ledger.sh`), not only by this service.
+        """
+        fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(fd, "wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
+            os.chmod(temp, 0o644)
+            os.replace(temp, path)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+        dir_fd = os.open(path.parent, os.O_DIRECTORY); os.fsync(dir_fd); os.close(dir_fd)
 
     def upload(self, sid: str, body: bytes, increment: int = 0) -> None:
         """Store one increment of one session's client evidence, and say so out loud when it is refused."""
@@ -1080,14 +1184,32 @@ class Admission:
         suffix = "" if increment == 0 else f".increment-{increment}"
         target = self.state / "sessions" / sid; target.mkdir(parents=True, exist_ok=True)
         files = {target / f"client-records{suffix}.jsonl": ("\n".join(json.dumps(r, separators=(",", ":")) for r in records) + ("\n" if records else "")).encode(), target / f"telemetry{suffix}.jsonl": telemetry.encode()}
-        # Still a conflict, but per increment: two *different* bodies claiming
-        # the same increment of the same seat cannot both be that increment's
-        # evidence. An identical re-send is not a conflict and never was --
-        # which is what makes the client's retry, and its #1118 repair, free.
-        for path, data in files.items():
-            if path.exists() and path.read_bytes() != data: raise Refusal(409, "conflict", "A different upload already exists for this session increment.")
-        for path, data in files.items():
-            if not path.exists(): self.atomic_bytes(path, data)
+        # The check and the write are one transaction, and the server is
+        # threaded (#1153).  Without this lock two concurrent posts of
+        # *differing* bodies for the same session and increment both pass the
+        # `exists()` test below -- neither file is there yet -- and both go on
+        # to write, so the conflict that exists to refuse exactly this is never
+        # seen and a spliced or arbitrary body is banked silently.  That is not
+        # hypothetical for this client: the retry sweep and the exit-path flush
+        # both call `send_pending` with no mutual exclusion between them
+        # (`clients/regolith/src/admission.rs:1671-1680`, `:1785-1803`).
+        #
+        # An `flock` on a per-seat file, taken through this method's own
+        # `open()`, so it serialises threads in this process and any second
+        # process reading the same state directory.  It is per seat rather than
+        # per campaign because uploads are addressed by session and know no
+        # campaign, and holding it across the writes below makes no other
+        # seat's upload wait.
+        with (target / ".upload.lock").open("a+") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            # Still a conflict, but per increment: two *different* bodies claiming
+            # the same increment of the same seat cannot both be that increment's
+            # evidence. An identical re-send is not a conflict and never was --
+            # which is what makes the client's retry, and its #1118 repair, free.
+            for path, data in files.items():
+                if path.exists() and path.read_bytes() != data: raise Refusal(409, "conflict", "A different upload already exists for this session increment.")
+            for path, data in files.items():
+                if not path.exists(): self.atomic_bytes(path, data)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1098,8 +1220,59 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def failure(self, e: Refusal) -> None: self.send_json(e.status, {"error": e.error, "detail": e.detail, **e.extra})
     def read_json(self) -> tuple[dict[str, Any], bytes]:
-        size = int(self.headers.get("Content-Length", "0")); body = self.rfile.read(size)
+        """Read the request body, refusing an over-large one before a byte of it (#1153).
+
+        This used to be `self.rfile.read(int(Content-Length))` with no cap, and
+        `MAX_UPLOAD_BYTES` was checked afterwards in `_store_upload`.  So a
+        declared `Content-Length` of 4 GB was allocated and read into memory
+        *before* it was refused, on a threaded server, once per connection.
+        nginx normally caps this upstream -- but #1002 exists precisely because
+        the proxy's limit cannot be assumed, and the service is reachable
+        directly during a campaign stand-up.
+
+        The declared length is refused first, then the body is read in bounded
+        chunks rather than one sized `read`, so a client that declares a length
+        and then stalls holds one chunk, not the whole declaration.  A refusal
+        here closes the connection: the unread body would otherwise be parsed
+        as the next request on a keep-alive socket.
+        """
+        raw = self.headers.get("Content-Length", "0")
+        try: size = int(raw)
+        except ValueError: raise Refusal(411, "bad_length", "The request needs a numeric Content-Length.") from None
+        if size < 0: raise Refusal(411, "bad_length", "The request needs a numeric Content-Length.")
+        if size > MAX_UPLOAD_BYTES:
+            self.close_connection = True
+            raise Refusal(413, "too_large", "The upload is too large.")
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 1024**2))
+            if not chunk:
+                self.close_connection = True
+                raise Refusal(400, "short_body", "The request body ended before its declared length.")
+            chunks.append(chunk); remaining -= len(chunk)
+        body = b"".join(chunks)
         return json.loads(body), body
+    def unexpected(self, e: BaseException) -> None:
+        """Answer an HTTP status for a failure nothing named (#1152).
+
+        `http.server` handles an escaping exception by logging a traceback and
+        closing the socket with *no response at all*.  The volunteer sees a
+        connection reset: the campaign list does not load, or the join button
+        does nothing, with no code and no sentence to act on.  That is the
+        "it's broken" report, which is the most expensive kind to receive when
+        a tester is available once or twice a day.
+
+        The reachable sources are all `OSError`: `append_join` on a full disk,
+        `statvfs` in `listing()` -- on the endpoint every client hits first --
+        and `EMFILE` from a burst against a `ThreadingHTTPServer`.  Each named
+        site now catches its own; this is the floor under all of them, so that
+        every outcome of every request is an HTTP status.
+        """
+        logging.exception("unhandled admission failure on %s %s: %s", self.command, self.path, e)
+        try: self.failure(Refusal(500, "admission_failed", "Admission failed; tell the operator."))
+        except OSError: self.close_connection = True  # the peer is already gone
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         roster = re.fullmatch(r"/v1/campaigns/([^/]+)/roster", path)
@@ -1108,6 +1281,7 @@ class Handler(BaseHTTPRequestHandler):
             elif roster: self.send_json(200, self.service.roster(unquote(roster.group(1))))
             else: raise Refusal(404, "not_found", "No such endpoint.")
         except Refusal as e: self.failure(e)
+        except Exception as e: self.unexpected(e)
     def do_POST(self) -> None:
         path = urlparse(self.path).path; match = re.fullmatch(r"/v1/campaigns/([^/]+)/join", path)
         upload = re.fullmatch(r"/v1/sessions/([^/]+)/upload", path)
@@ -1125,6 +1299,7 @@ class Handler(BaseHTTPRequestHandler):
             else: raise Refusal(404, "not_found", "No such endpoint.")
         except Refusal as e: self.failure(e)
         except (ValueError, json.JSONDecodeError): self.failure(Refusal(422, "bad_request", "The request is not valid JSON."))
+        except Exception as e: self.unexpected(e)
 
 
 def main() -> None:
@@ -2107,6 +2282,277 @@ class AdmissionTests(unittest.TestCase):
         raw.write_text('{"external":[],"witnessing":true,"identity":{"target":"x","commit":"0000000000000000000000000000000000000000"}}')
         records.write_text('{"session_id":"018f8f4e-5c90-7abc-8123-0000000000ab","actor":"human","platform_triple":"x","impairment_mismatch":false,"configured_impairment_profile":{"loss_pct":0,"jitter_p50_ms":0,"jitter_p99_ms":0},"observed_loss_pct":0,"observed_jitter_p50_ms":0,"observed_jitter_p99_ms":0}\n')
         self.assertNotEqual(subprocess.run([str(script), "assemble", str(raw), str(records), sid, str(Path(self.tmp.name) / "out.json")], env={**os.environ, "P4_PIPELINE_ID": "test"}).returncode, 0)
+
+    # --- Hunt 2 remainder: #1146, #1152, #1153, #1155 -------------------------
+
+    def serving(self) -> tuple[ThreadingHTTPServer, str, threading.Thread]:
+        """The real threaded server on loopback, so a test can post concurrently.
+
+        The suite otherwise calls the service methods directly, which is why
+        neither #1146 nor #1153 nor #1152 was reachable from it: none of the
+        three is a property of a single call.  This is the missing fixture the
+        hunt asked for -- "concurrency in `admission.py` ... the server is
+        genuinely threaded and #1146 and #1153 are both what that costs".
+        """
+        Handler.service = self.service
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server, f"127.0.0.1:{server.server_address[1]}", thread
+
+    @staticmethod
+    def post(origin: str, path: str, body: bytes, *, declared: int | None = None,
+             send_body: bool = True, timeout: float = 10.0) -> tuple[int, bytes]:
+        """One POST, with the declared length and the sent body under the test's control."""
+        conn = http.client.HTTPConnection(origin, timeout=timeout)
+        try:
+            conn.putrequest("POST", path)
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", str(len(body) if declared is None else declared))
+            conn.putheader("Connection", "close")
+            conn.endheaders(message_body=body if send_body else b"")
+            response = conn.getresponse()
+            return response.status, response.read()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get(origin: str, path: str, timeout: float = 10.0) -> tuple[int, bytes]:
+        conn = http.client.HTTPConnection(origin, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"Connection": "close"})
+            response = conn.getresponse()
+            return response.status, response.read()
+        finally:
+            conn.close()
+
+    def test_a_join_refused_inside_the_startup_window_keeps_the_incumbents_flock(self) -> None:
+        # #1146.  The `finally` popped `self.locks[ident]` by *key*, not by
+        # identity, so a second join refused `campaign_busy` removed the
+        # incumbent's entry.  `lock.close()` is not the mechanism and never was
+        # -- `flock(2)` locks belong to the open file description and every
+        # request gets its own `open()`, so closing one fd cannot release
+        # another's.  What the pop removes is the incumbent lock's only
+        # long-lived reference: once the incumbent's `join` frame returns,
+        # CPython closes the file and the flock goes with it, mid-session.  A
+        # third join could then take the campaign flock and start a second
+        # harness on the same UDP port.
+        #
+        # The trigger is a bounded race, not a standing property.  The guard is
+        # `ident not in self.children`, and a genuinely running session has
+        # `self.children[ident]` set -- so the hole is only the window between
+        # `self.locks[ident] = lock` and that assignment, which spans two
+        # `orrery-invite` subprocesses, a `Popen` and `_wait_listening`.  This
+        # test parks the incumbent inside exactly that window.
+        window, resume, admitted = threading.Event(), threading.Event(), []
+        real_wait = self.service._wait_listening
+
+        def parked(*args: Any, **kwargs: Any) -> str:
+            window.set()
+            self.assertTrue(resume.wait(10), "the test never released the parked join")
+            return real_wait(*args, **kwargs)
+
+        self.service._wait_listening = parked  # type: ignore[method-assign]
+        incumbent = threading.Thread(target=lambda: admitted.append(self.service.join("test", self.request())))
+        incumbent.start()
+        self.addCleanup(incumbent.join)
+        self.addCleanup(resume.set)
+        self.assertTrue(window.wait(10), "the incumbent join never reached the startup window")
+
+        # Deliberately no local reference to the lock object: holding one would
+        # keep it alive and hide the very refcount bug under test.
+        self.assertIn("test", self.service.locks)
+        self.assertNotIn("test", self.service.children, "the incumbent must still be inside the window")
+
+        with self.assertRaises(Refusal) as refused:
+            self.service.join("test", self.request())
+        self.assertEqual((refused.exception.status, refused.exception.error), (409, "campaign_busy"))
+        self.assertIn("test", self.service.locks,
+                      "the refused join popped the incumbent's lock out of the map (#1146)")
+
+        resume.set()
+        incumbent.join(10)
+        self.assertFalse(incumbent.is_alive())
+        self.assertEqual(len(admitted), 1, "the incumbent join did not complete")
+        self.assertIn("test", self.service.children)
+        gc.collect()
+
+        # The consequence that costs the session: with the entry popped, the
+        # incumbent's file object is unreferenced the moment its frame returns,
+        # so the campaign flock is free and a third join takes it.
+        with (self.state / "test" / "lock").open("a+") as probe:
+            with self.assertRaises(BlockingIOError,
+                                   msg="the running session's campaign flock was released (#1146)"):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_an_unexpected_failure_still_answers_an_http_status(self) -> None:
+        # #1152.  `do_GET`/`do_POST` caught only `Refusal`, so anything else --
+        # every reachable one an `OSError` -- escaped into `http.server`, which
+        # logs a traceback and closes the socket with *no response*.  The
+        # volunteer gets a connection reset on the endpoint every client hits
+        # first, with no code and no sentence: the "it's broken" report.
+        _, origin, _ = self.serving()
+
+        def no_statvfs(_: Any) -> Any:
+            raise OSError(errno.EIO, "the state filesystem is gone")
+
+        self.service.statvfs = no_statvfs  # type: ignore[method-assign]
+        with self.assertLogs(level=logging.ERROR):
+            status, body = self.get(origin, "/v1/campaigns")
+        self.assertEqual(status, 500, "an unexpected failure closed the socket with no HTTP status (#1152)")
+        self.assertEqual(json.loads(body)["error"], "admission_failed")
+
+    def test_a_failed_join_log_does_not_leave_a_committed_seat_behind(self) -> None:
+        # #1152, the second half.  `_write_slots` durably committed the
+        # reservation *before* `append_join` ran, and `append_join` raises a
+        # bare `OSError` -- which the surrounding `except` tuple did not name.
+        # An `ENOSPC` or `EIO` on the join log therefore left the row on disk
+        # and the account minted for a volunteer whose socket was dropped with
+        # no status; and because `known_session` reads `joins.jsonl`, that
+        # seat's evidence uploads would have been refused `404` forever.
+        attempt = self.enable_always_on()
+        self.publish_seats(attempt)
+
+        def no_log(*_: Any, **__: Any) -> None:
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        self.service.append_join = no_log  # type: ignore[method-assign]
+        with self.assertLogs(level=logging.ERROR), self.assertRaises(Refusal) as refused:
+            self.service.join("test", self.request())
+        # A status, not a bare OSError escaping into the handler.
+        self.assertEqual((refused.exception.status, refused.exception.error), (500, "admission_failed"))
+        # And nothing was committed, so the seat is still free for the retry.
+        slots = self.state / "test" / "slots.json"
+        self.assertEqual([] if not slots.exists() else json.loads(slots.read_text()), [],
+                         "the reservation was committed although its join row was never written (#1152)")
+        self.assertEqual(self.service.roster("test")["roster"][self.service.campaigns()[0]["test"].peers]["state"], "empty")
+
+    def test_concurrent_atomic_writes_never_bank_a_spliced_body(self) -> None:
+        # #1153, the evidence-integrity half.  `atomic_bytes` wrote through a
+        # *fixed* `<name>.tmp`, which is safe only on a serial server -- and
+        # `main` runs a `ThreadingHTTPServer`.  Two writers interleaving into
+        # one shared temp file bank the first half of one body and the second
+        # half of another, and #1119's conflict check then treats that spliced
+        # record as the canonical evidence, because it compares against
+        # whatever is stored.  Failing would be acceptable; banking a wrong
+        # artifact is not.
+        target = self.state / "sessions" / "splice"; target.mkdir(parents=True)
+        path = target / "client-records.jsonl"
+        bodies = [bytes([65 + n]) * (256 * 1024 + n) for n in range(8)]
+        gate = threading.Barrier(len(bodies))
+        failures: list[BaseException] = []
+
+        def write(data: bytes) -> None:
+            try:
+                gate.wait(10)
+                self.service.atomic_bytes(path, data)
+            except BaseException as error:  # noqa: BLE001 - reported below
+                failures.append(error)
+
+        writers = [threading.Thread(target=write, args=(data,)) for data in bodies]
+        for writer in writers: writer.start()
+        for writer in writers: writer.join(30)
+        self.assertEqual(failures, [])
+        self.assertIn(path.read_bytes(), bodies,
+                      "a concurrent write banked bytes that no client ever sent (#1153)")
+        self.assertEqual(sorted(p.name for p in target.iterdir() if p.name.endswith(".tmp")), [],
+                         "a temp file was left behind")
+
+    def test_two_concurrent_uploads_of_one_increment_cannot_both_be_banked(self) -> None:
+        # #1153.  `_store_upload` does check-then-write with no lock, on a
+        # threaded server.  Two posts of *differing* bodies for the same
+        # session and increment both pass `path.exists()` -- neither file is
+        # there yet -- and both go on to write, so the `409 conflict` that
+        # exists to refuse exactly this is never reached and one body is
+        # silently overwritten or spliced.  This is not hypothetical for the
+        # shipped client: the retry sweep and the exit-path flush both call
+        # `send_pending` with no mutual exclusion between them
+        # (`clients/regolith/src/admission.rs:1671-1680`, `:1785-1803`).
+        #
+        # The posts are made over a real socket against a real
+        # `ThreadingHTTPServer`, released together by a barrier, and repeated
+        # across several increments -- a sequential test cannot see any of this.
+        _, origin, _ = self.serving()
+        sid = self.service.join("test", self.request())["join"]["session_id"]
+
+        # Half a megabyte per body, so the check-then-write window is a real
+        # one: the losing writer has to be still inside it when the winner
+        # arrives, and a four-kilobyte body is over before the second request
+        # is parsed.  Sixteen rounds, because a race that needs one interleave
+        # is not proven by one attempt.
+        span = 512 * 1024
+
+        def body(mark: str, index: int) -> bytes:
+            return json.dumps({"records": [{"session_id": sid, "increment": {"index": index}}],
+                               "telemetry_jsonl": mark * span}).encode()
+
+        for index in range(1, 17):
+            gate = threading.Barrier(2)
+            answers: list[tuple[int, bytes]] = []
+
+            def send(mark: str, index: int = index, gate: threading.Barrier = gate) -> None:
+                gate.wait(10)
+                answers.append(self.post(origin, f"/v1/sessions/{sid}/increments/{index}/upload",
+                                         body(mark, index)))
+
+            racers = [threading.Thread(target=send, args=(mark,)) for mark in ("a", "b")]
+            for racer in racers: racer.start()
+            for racer in racers: racer.join(30)
+            self.assertEqual(len(answers), 2)
+            self.assertEqual(sorted(status for status, _ in answers), [204, 409],
+                             f"increment {index}: both differing bodies were accepted (#1153)")
+            banked = (self.state / "sessions" / sid / f"telemetry.increment-{index}.jsonl").read_bytes()
+            self.assertIn(banked, (b"a" * span, b"b" * span),
+                          f"increment {index}: the banked evidence is neither body that was posted (#1153)")
+
+    def test_an_over_large_declared_body_is_refused_before_it_is_read(self) -> None:
+        # #1153, the second half.  `read_json` did
+        # `self.rfile.read(int(Content-Length))` with no cap, and
+        # `MAX_UPLOAD_BYTES` was only checked afterwards in `_store_upload`, so
+        # a declared 4 GB was buffered into memory before it was refused.  The
+        # proof that it is refused *before* the read is that nothing is sent:
+        # a server that reads first would block until the timeout.
+        _, origin, _ = self.serving()
+        status, body = self.post(origin, "/v1/sessions/018f8f4e-5c90-7abc-8123-0000000000ab/upload",
+                                 b"", declared=4 * 1024**3, send_body=False, timeout=10)
+        self.assertEqual(status, 413, "an over-large declared body was read before it was capped (#1153)")
+        self.assertEqual(json.loads(body)["error"], "too_large")
+        # A body within the cap is still read whole, so the bounded loop did
+        # not break the ordinary path.
+        sid = self.service.join("test", self.request())["join"]["session_id"]
+        payload = json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "x" * (2 * 1024**2)}).encode()
+        self.assertGreater(len(payload), 1024**2, "the body must span more than one read chunk")
+        status, _ = self.post(origin, f"/v1/sessions/{sid}/upload", payload)
+        self.assertEqual(status, 204)
+        self.assertEqual(len((self.state / "sessions" / sid / "telemetry.jsonl").read_bytes()), 2 * 1024**2)
+
+    def test_a_config_value_cannot_split_or_inject_on_the_campaign_host(self) -> None:
+        # #1155.  `ssh` joins its command arguments with spaces and hands the
+        # result to the remote *login shell* -- which is the only reason the
+        # literal `&&` on that line works.  Nothing was quoted, so a
+        # `client_rev` from `campaigns.conf` containing a space split into two
+        # arguments and one containing `;` or a backtick ran as `orrery` on the
+        # campaign host.
+        #
+        # `campaigns.conf` is root-owned and operator-written -- no request
+        # path writes it -- so this is a robustness fix and not an exposure:
+        # what it costs in practice is a harness silently pinned to the wrong
+        # build, reported to the operator as `host_failed`.
+        revision = "rev; touch /tmp/orrery-1155-pwned"
+        self.control.write_text(self.control.read_text().replace("client_rev = rev", f"client_rev = {revision}"))
+        self.service.join("test", {**self.request(), "client_rev": revision})
+        fields = shlex.split(self.recorded_harness_command())
+        self.assertIn("--require-client-rev", fields)
+        self.assertEqual(fields[fields.index("--require-client-rev") + 1], revision,
+                         "the config value split into several remote arguments (#1155)")
+        self.assertNotIn("touch", fields, "the config value reached the remote shell as syntax (#1155)")
+        # `&&` must stay unquoted: it is the one element on the line that is
+        # shell syntax rather than data.
+        self.assertIn("&&", fields)
+        self.assertLess(fields.index("mkdir"), fields.index("&&"))
 
 
 if __name__ == "__main__": main()
