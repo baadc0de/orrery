@@ -539,10 +539,7 @@ fn poll_worker(
                 telemetry_start,
             ));
             *session = ActiveSession::Campaign(Box::new(runtime));
-            commands.insert_resource(UploadManager {
-                origin: settings.origin.clone(),
-                state_path: upload_state_path(&settings.telemetry_path),
-            });
+            commands.insert_resource(UploadManager::for_telemetry(&settings.telemetry_path));
             for root in &roots {
                 commands.entity(root).despawn();
             }
@@ -1146,19 +1143,23 @@ pub fn write_join_artifact(telemetry_path: &Path, join: &JoinObject) -> std::io:
     Ok(path)
 }
 
-/// Upload destination retained after a service-created join.
+/// The `uploads.json` a joined session's bodies are owed from.
+///
+/// It used to carry the service origin as well, which nothing reads any more:
+/// an entry in `uploads.json` records the origin it was queued for, so every
+/// body already knows where it goes, and the only thing that ever asked the
+/// manager was the second queueing #1125 removed. A field kept for its name
+/// reads as evidence the code is using it.
 #[derive(Resource)]
 pub struct UploadManager {
-    origin: String,
     state_path: PathBuf,
 }
 
 impl UploadManager {
-    /// Build the uploader for a session joined through `origin`.
+    /// Build the uploader for a session recording beside `telemetry_path`.
     #[must_use]
-    pub fn for_origin(origin: String, telemetry_path: &Path) -> Self {
+    pub fn for_telemetry(telemetry_path: &Path) -> Self {
         Self {
-            origin,
             state_path: upload_state_path(telemetry_path),
         }
     }
@@ -1197,9 +1198,8 @@ pub fn origin_of_roster_url(roster_url: &str) -> Option<String> {
 
 #[cfg(test)]
 impl UploadManager {
-    pub(crate) fn for_test(origin: String, telemetry_path: &Path) -> Self {
+    pub(crate) fn for_test(telemetry_path: &Path) -> Self {
         Self {
-            origin,
             state_path: upload_state_path(telemetry_path),
         }
     }
@@ -1331,19 +1331,38 @@ pub struct UploadQueue {
     origin: String,
     state_path: PathBuf,
     telemetry_path: PathBuf,
-    telemetry_start: u64,
+    /// The stream offset the *next* body's telemetry starts at (#1125).
+    ///
+    /// A cursor and not a fixed offset. It used to be the seat's start for
+    /// every body, so increment `k` embedded increments `0..=k`: the bytes a
+    /// session uploaded grew quadratically in its length, and past about
+    /// ninety minutes of campaign play the final body exceeded the service's
+    /// 64 MiB cap and was refused `413 too_large` -- so the evidence a long
+    /// session was banking stopped landing exactly when there was most of it.
+    ///
+    /// The address half of this is #1119's: each increment posts to
+    /// `/v1/sessions/{id}/increments/{n}/upload` and is acknowledged under its
+    /// own key. This is the body half, and it makes the two agree -- the
+    /// telemetry under the increment's name is the telemetry of that
+    /// increment. The spans of one seat partition its ticks
+    /// (`crate::session::SeatIncrement`) and the cursor partitions the stream
+    /// the same way: disjoint, abutting, and summing to the seat.
+    telemetry_next: u64,
 }
 
 impl UploadQueue {
-    /// Queue rows for `origin`, taking this session's telemetry from
+    /// Queue rows for `origin`, taking the first body's telemetry from
     /// `telemetry_start` -- see [`crate::telemetry::JsonlTelemetry::session_start`].
+    ///
+    /// Every body after it starts where the one before it ended; see
+    /// [`Self::telemetry_next`].
     #[must_use]
     pub fn new(origin: String, telemetry_path: &Path, telemetry_start: u64) -> Self {
         Self {
             origin,
             state_path: upload_state_path(telemetry_path),
             telemetry_path: telemetry_path.to_owned(),
-            telemetry_start,
+            telemetry_next: telemetry_start,
         }
     }
 }
@@ -1379,7 +1398,7 @@ impl PendingUpload {
 /// always named by `uploads.json`. Nothing here talks to the network: a
 /// queued upload is a promise the next launch can keep on its own.
 pub fn queue_finished_session(
-    queue: &UploadQueue,
+    queue: &mut UploadQueue,
     record: &SessionRecord,
 ) -> Result<PendingUpload, String> {
     // One of the three places a `proton-debug` build refuses (#1060). This is
@@ -1397,18 +1416,31 @@ pub fn queue_finished_session(
     // record is the evidence; refusing to queue it because the JSONL beside
     // it could not be read is how a measured session goes missing, which is
     // the whole failure this function exists to end.
-    let telemetry = read_session_telemetry(&queue.telemetry_path, queue.telemetry_start)
-        .unwrap_or_else(|error| {
+    let span = read_session_telemetry(&queue.telemetry_path, queue.telemetry_next).unwrap_or_else(
+        |error| {
             eprintln!(
                 "regolith: cannot read telemetry {} ({error}); the row is queued without it",
                 queue.telemetry_path.display()
             );
-            String::new()
-        });
+            // The cursor stays where it was. Bytes this call could not read
+            // are not this increment's loss to take: the next body starts at
+            // the same offset and carries them instead.
+            TelemetrySpan {
+                jsonl: String::new(),
+                end: queue.telemetry_next,
+            }
+        },
+    );
     let row =
         serde_json::to_value(record).map_err(|error| format!("cannot serialize row: {error}"))?;
-    let upload = build_upload_body(vec![row], telemetry)?;
-    persist_and_register(&queue.state_path, &queue.origin, &upload)
+    let upload = build_upload_body(vec![row], span.jsonl)?;
+    let pending = persist_and_register(&queue.state_path, &queue.origin, &upload)?;
+    // Advanced only once the body is on disk and named by `uploads.json`.
+    // A queueing that failed sent nothing, so its bytes are still owed, and
+    // moving the cursor past them would be #735 in miniature -- telemetry
+    // silently dropped on the floor between two increments.
+    queue.telemetry_next = span.end;
+    Ok(pending)
 }
 
 /// Put the body on disk and name it in `uploads.json` as unacknowledged.
@@ -1628,49 +1660,65 @@ fn sweep_unregistered_records(state_path: &Path, records_path: &Path, origin: &s
     }
 }
 
-/// Persist an exact upload body, attempt it, and leave a visible retry artifact on failure.
+/// Attempt every body this seat owes, and leave a visible retry artifact on failure.
 ///
-/// `telemetry_start` is the byte offset this session's rows begin at, from
-/// [`crate::telemetry::JsonlTelemetry::session_start`]. Only the bytes from
-/// there on are uploaded: the record describes one session, so a stream
-/// spanning every session the binary ever played is not its evidence, and it
-/// grows without bound until the service refuses the body (#735). The player's
-/// own file is left whole.
+/// This used to re-queue the closing row itself first, on the stated grounds
+/// that repeating the mint's work was idempotent. It stopped being idempotent
+/// the moment a body carried its own span rather than the whole session
+/// (#1125): the queue that mints holds the cursor, and a second queue built
+/// here from the seat's start would rewrite the tail's body with every byte
+/// the seat ever wrote -- which is the very shape the cursor exists to end.
 ///
-/// The queueing half of this is normally already done by the mint (see
-/// [`UploadQueue`]); repeating it here is idempotent and costs one rewrite of
-/// identical bytes. What this adds is the immediate attempt.
+/// Nothing is lost by dropping it. Since #1051 the call that mints a row
+/// queues its upload, on every teardown path including a `Drop` during a panic
+/// unwind, and the two are installed together: `UploadManager` and
+/// `UploadQueue` are both conditioned on the same resolved origin, at the
+/// lobby's join gate (`join_gate_system`) and at the headless build site
+/// (`crate::RegolithPlugin::build`). A row that reached this function has a
+/// body on disk and an entry in `uploads.json`. What this adds, and all it
+/// ever added, is the immediate attempt.
 pub fn upload_finished_session(
     manager: &UploadManager,
     record: &SessionRecord,
     record_path: &Path,
-    telemetry_path: &Path,
-    telemetry_start: u64,
 ) {
-    let queue = UploadQueue::new(manager.origin.clone(), telemetry_path, telemetry_start);
-    let pending = match queue_finished_session(&queue, record) {
-        Ok(pending) => pending,
-        Err(error) => {
-            error!(
-                "campaign upload not attempted: {error}; records remain at {}",
-                record_path.display()
-            );
-            return;
-        }
-    };
     // This session's bodies only. Exit is not the moment to spend a 45-second
     // request timeout on each *older* body as well; those are the next
     // launch's job, and a quit does not wait to be finished with.
     //
-    // Bodies, plural, since #1048. The tail this call just queued is one of
+    // Bodies, plural, since #1048. The tail the mint just queued is one of
     // several the seat owes: the increments banked while it was flying are on
     // disk and named by `uploads.json`, and sending only the tail would leave
     // most of a normally-exiting long session waiting for a launch that may
     // not come. The set is bounded by this seat's own increments, and
     // `send_pending` skips anything already acknowledged.
-    for owed in
-        pending_uploads_for_session(&read_upload_state(&manager.state_path), &pending.session_id)
-    {
+    let state = read_upload_state(&manager.state_path);
+    let owed = pending_uploads_for_session(&state, &record.session_id);
+    if owed.is_empty() {
+        // Two opposite facts, and `uploads.json` is what separates them. A
+        // seat with entries and nothing owed has already landed; a seat with
+        // no entry at all is the #1051 shape -- a signed row on the
+        // volunteer's disk that nothing is going to send -- and the mint is
+        // the side that failed, so say so where a log will show it.
+        if state
+            .sessions
+            .values()
+            .any(|entry| entry.session_id.as_deref() == Some(record.session_id.as_str()))
+        {
+            info!(
+                "campaign session {} has already been acknowledged in full",
+                record.session_id
+            );
+        } else {
+            error!(
+                "campaign session {} was never queued for upload; the row is on disk at {}                  and the next launch will sweep it",
+                record.session_id,
+                record_path.display()
+            );
+        }
+        return;
+    }
+    for owed in owed {
         if send_pending(&manager.state_path, &owed) {
             info!(
                 "campaign session {} uploaded ({})",
@@ -1680,21 +1728,37 @@ pub fn upload_finished_session(
     }
 }
 
-/// Read the telemetry this session appended, from `start` to end of file.
+/// The slice of the telemetry stream one upload body carries, and where it
+/// ends.
+///
+/// A named row rather than a bare tuple: the end offset is what the queue's
+/// cursor becomes, and a body paired with the wrong one either repeats a
+/// span or skips it.
+struct TelemetrySpan {
+    jsonl: String,
+    /// The offset one past the last byte read, which the next body starts at.
+    end: u64,
+}
+
+/// Read one body's slice of the telemetry stream, from `start` to end of file.
 ///
 /// A `start` beyond the file's end means the player rotated or replaced the
 /// stream under us; the honest answer then is the whole of what is there
 /// rather than a silent nothing.
-fn read_session_telemetry(path: &Path, start: u64) -> std::io::Result<String> {
+fn read_session_telemetry(path: &Path, start: u64) -> std::io::Result<TelemetrySpan> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
-    if start <= length {
+    let from = if start <= length {
         file.seek(SeekFrom::Start(start))?;
-    }
-    let mut telemetry = String::new();
-    file.read_to_string(&mut telemetry)?;
-    Ok(telemetry)
+        start
+    } else {
+        0
+    };
+    let mut jsonl = String::new();
+    file.read_to_string(&mut jsonl)?;
+    let end = from.saturating_add(jsonl.len() as u64);
+    Ok(TelemetrySpan { jsonl, end })
 }
 
 struct UploadBody {
@@ -2092,6 +2156,25 @@ mod tests {
     fn increment_test_service(
         refused_paths: &[String],
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<CapturedPost>>>) {
+        increment_test_service_capped(refused_paths, usize::MAX)
+    }
+
+    /// The service's own ceiling on one body, from `scripts/admission.py:35`.
+    ///
+    /// `_store_upload` refuses anything above it with `413 too_large`
+    /// (`scripts/admission.py:949`), and #1002 made the service prove at
+    /// startup that a body of exactly this size reaches it through the proxy.
+    /// Spelled here because the client has no other copy of it: the point of
+    /// #1125's test is that a real session's bodies stay under a number the
+    /// client never gets to choose.
+    const SERVICE_MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+    /// As [`increment_test_service`], and refusing a body over
+    /// `max_body_bytes` with `413` the way the service does.
+    fn increment_test_service_capped(
+        refused_paths: &[String],
+        max_body_bytes: usize,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<CapturedPost>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test service");
         let address = listener.local_addr().expect("test service address");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2148,11 +2231,14 @@ mod tests {
                 // Refused paths are recorded too: a test needs to see that the
                 // failed body was attempted at the address it belongs to.
                 let refuse = refused.contains(&path);
+                let too_large = body.len() > max_body_bytes;
                 captured
                     .lock()
                     .expect("capture lock")
                     .push(CapturedPost { path, body });
-                let status = if refuse {
+                let status = if too_large {
+                    "413 Payload Too Large"
+                } else if refuse {
                     "503 Service Unavailable"
                 } else {
                     "204 No Content"
@@ -2172,7 +2258,7 @@ mod tests {
     /// [`crate::session::INCREMENT_MINUTES`] with room to spare; the point is
     /// to cross the cadence several times, which is the only way a
     /// second-and-later body exists at all.
-    fn queue_a_long_seat(queue: &UploadQueue, session_id: &str, increments: u64) {
+    fn queue_a_long_seat(queue: &mut UploadQueue, session_id: &str, increments: u64) {
         let mut session = crate::session::CampaignSession::new(
             session_id.to_owned(),
             "2026-09-06T12:00:00Z".to_owned(),
@@ -2198,6 +2284,200 @@ mod tests {
                 .expect("a six-minute increment covers a non-empty span");
             queue_finished_session(queue, &record).expect("the increment queues");
         }
+    }
+
+    /// One `orders` row of the shape the driven-tick path appends, in bytes.
+    ///
+    /// Written through [`crate::telemetry::JsonlTelemetry::append_orders`]
+    /// itself rather than hand-rolled, so the size the rest of this test
+    /// reasons about is the client's own and not an estimate of it. The three
+    /// orders are the campaign's per-tick set — Thrust, Lock, Fire — at the
+    /// codec widths #1125 quoted (13, 9 and 1 bytes), which JSON carries as
+    /// arrays of numbers.
+    fn one_orders_row(increment: u64) -> Vec<u8> {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("row.jsonl");
+        let packet = crate::intent::OrderPacket {
+            // The tick names the increment that wrote the row, which is how
+            // the assertion below tells one increment's telemetry from
+            // another's.
+            tick: increment,
+            entity: 4_398_046_511_105,
+            orders: vec![vec![0x51; 13], vec![0x27; 9], vec![0x01]],
+        };
+        {
+            let mut sink =
+                crate::telemetry::JsonlTelemetry::open(&path).expect("open telemetry stream");
+            sink.append_orders(&packet, crate::telemetry::SessionScope::Campaign)
+                .expect("append one orders row");
+        }
+        std::fs::read(&path).expect("read the row back")
+    }
+
+    /// Append one increment's worth of driven-tick telemetry to the stream.
+    fn append_increment_telemetry(path: &Path, increment: u64, rows: u64) {
+        use std::io::Write as _;
+        let row = one_orders_row(increment);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open telemetry stream for append");
+        let mut writer = std::io::BufWriter::new(file);
+        for _ in 0..rows {
+            writer.write_all(&row).expect("append a telemetry row");
+        }
+        writer.flush().expect("flush telemetry");
+    }
+
+    /// #1125. A session past the service's size cap must still bank, and each
+    /// body must carry its own increment's telemetry and no earlier one's.
+    ///
+    /// `UploadQueue` held a fixed `telemetry_start` — the offset the seat's
+    /// rows began at — and `queue_finished_session` read from it to end of
+    /// file for *every* body. Increment `k`'s body therefore embedded
+    /// increments `0..=k`: total uploaded bytes grew quadratically in session
+    /// length, and past roughly ninety minutes of campaign play the last body
+    /// crossed `MAX_UPLOAD_BYTES` (`scripts/admission.py:35`) and the service
+    /// refused it `413 too_large` — so the session's later evidence stopped
+    /// landing exactly where there was most of it.
+    ///
+    /// A one-increment fixture cannot see this: "the whole session so far" and
+    /// "this increment" are the same bytes. So this flies two hours at the
+    /// stream's real rate — one `orders` row per driven tick at `TICK_HZ`,
+    /// through the client's own writer — against a service that enforces the
+    /// real ceiling.
+    #[test]
+    fn a_two_hour_seat_banks_every_increment_under_the_services_size_cap() {
+        const INCREMENT_MINUTES: u64 = 6;
+        const INCREMENTS: u64 = 20;
+        let rows_per_increment = INCREMENT_MINUTES * 60 * u64::from(orrery_core::TICK_HZ);
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        let session_id = "01a06b05-f941-7000-8000-000000001125";
+        let (origin, seen) = increment_test_service_capped(&[], SERVICE_MAX_UPLOAD_BYTES);
+        let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+
+        let mut session = crate::session::CampaignSession::new(
+            session_id.to_owned(),
+            "2026-09-06T12:00:00Z".to_owned(),
+            crate::session::Actor::Human,
+            ConfiguredImpairment {
+                loss_pct: 0.0,
+                jitter_p50_ms: 0,
+                jitter_p99_ms: 0,
+            },
+        );
+        for increment in 0..INCREMENTS {
+            for _ in 0..rows_per_increment {
+                session.observe_tick(crate::session::PlayerActivity::Active);
+            }
+            // The stream the ticks wrote, appended before the row that closes
+            // the increment is minted — the order the driven-tick path uses.
+            append_increment_telemetry(&telemetry_path, increment, rows_per_increment);
+            let record = session
+                .finish_increment(
+                    format!(
+                        "2026-09-06T{:02}:{:02}:00Z",
+                        12 + (increment + 1) / 10,
+                        ((increment + 1) * 6) % 60
+                    ),
+                    "aarch64-apple-darwin".to_owned(),
+                    BUILD_REV.to_owned(),
+                    "unavailable-client-side".to_owned(),
+                    increment + 1 == INCREMENTS,
+                )
+                .expect("a six-minute increment covers a non-empty span");
+            queue_finished_session(&mut queue, &record).expect("the increment queues");
+        }
+
+        let stream_bytes = std::fs::metadata(&telemetry_path)
+            .expect("the stream exists")
+            .len();
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the sweep thread finishes");
+
+        let posts = seen.lock().expect("capture lock").clone();
+        let mut paths: Vec<String> = posts.iter().map(|post| post.path.clone()).collect();
+        paths.sort();
+        let mut wanted = expected_paths(session_id, INCREMENTS);
+        wanted.sort();
+        assert_eq!(
+            paths, wanted,
+            "a two-hour seat must post all {INCREMENTS} of its increments"
+        );
+
+        // Every body landed. Under the old shape the last one was 71 MB
+        // against a 64 MiB ceiling and came back 413, and the state file kept
+        // it unacknowledged for a relaunch that would fail the same way.
+        let state = read_upload_state(&upload_state_path(&telemetry_path));
+        for key in state.sessions.keys() {
+            assert!(
+                state.sessions[key].acknowledged,
+                "{key} was not acknowledged: a two-hour session's evidence must land (#1125)"
+            );
+        }
+
+        let mut uploaded_rows = 0_u64;
+        let mut uploaded_bytes = 0_u64;
+        let mut largest = 0_usize;
+        for post in &posts {
+            largest = largest.max(post.body.len());
+            uploaded_bytes = uploaded_bytes.saturating_add(post.body.len() as u64);
+            let body: serde_json::Value = serde_json::from_str(&post.body).expect("a body is JSON");
+            let index = post
+                .path
+                .split("/increments/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .and_then(|index| index.parse::<u64>().ok())
+                .unwrap_or(0);
+            let telemetry = body["telemetry_jsonl"]
+                .as_str()
+                .expect("telemetry travels as text");
+            for line in telemetry.lines() {
+                let row: serde_json::Value =
+                    serde_json::from_str(line).expect("a telemetry row is JSON");
+                assert_eq!(
+                    row["packet"]["tick"].as_u64(),
+                    Some(index),
+                    "increment {index} uploaded a row written by increment {}: a body \
+                     must carry its own span and no increment already sent (#1125)",
+                    row["packet"]["tick"]
+                );
+                uploaded_rows += 1;
+            }
+        }
+        // Disjoint *and* complete: the spans of one seat partition its ticks
+        // (`crate::session::SeatIncrement`), so the bodies must reconstruct
+        // the stream rather than merely avoid repeating it.
+        assert_eq!(
+            uploaded_rows,
+            rows_per_increment * INCREMENTS,
+            "the increments' telemetry must sum to the seat's stream"
+        );
+        assert!(
+            largest < SERVICE_MAX_UPLOAD_BYTES,
+            "the largest body was {largest} bytes against the service's \
+             {SERVICE_MAX_UPLOAD_BYTES}-byte ceiling (#1125)"
+        );
+        // Linear, not quadratic. Re-reading from the seat's start would have
+        // uploaded the stream (INCREMENTS + 1) / 2 = 10.5 times over; carrying
+        // its own span uploads it once, plus each body's record and JSON
+        // escaping.
+        println!(
+            "#1125 two-hour seat: stream {stream_bytes} B, {} bodies, {uploaded_bytes} B uploaded \
+             ({:.2}x the stream), largest body {largest} B",
+            posts.len(),
+            uploaded_bytes as f64 / stream_bytes as f64
+        );
+        assert!(
+            uploaded_bytes < stream_bytes.saturating_mul(3),
+            "a session uploaded {uploaded_bytes} bytes for a {stream_bytes}-byte stream: \
+             the bytes a session uploads must be linear in its length (#1125)"
+        );
     }
 
     /// The address every increment of a seat is posted to.
@@ -2241,8 +2521,8 @@ mod tests {
         std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
         let session_id = "01a06b05-f941-7000-8000-000000001119";
         let (origin, seen) = increment_test_service(&[]);
-        let queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
-        queue_a_long_seat(&queue, session_id, 5);
+        let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&mut queue, session_id, 5);
 
         let state_path = upload_state_path(&telemetry_path);
         retry_pending_uploads(&telemetry_path, &origin)
@@ -2319,8 +2599,8 @@ mod tests {
         let zero = addresses[0].clone();
         let one = addresses[1].clone();
         let (origin, seen) = increment_test_service(&[zero.clone()]);
-        let queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
-        queue_a_long_seat(&queue, session_id, 2);
+        let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&mut queue, session_id, 2);
 
         let state_path = upload_state_path(&telemetry_path);
         retry_pending_uploads(&telemetry_path, &origin)
@@ -2404,8 +2684,8 @@ mod tests {
         std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
         let session_id = "01a06b05-f941-7000-8000-00000000dead";
         let (origin, seen) = increment_test_service(&[]);
-        let queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
-        queue_a_long_seat(&queue, session_id, 2);
+        let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&mut queue, session_id, 2);
 
         // Exactly what the broken client left behind: increment one is still
         // owed, and increment zero claims an acknowledgement it may never have
@@ -2627,7 +2907,7 @@ mod tests {
         std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
         // A port nothing is listening on: a queue that reached the network
         // would fail here rather than return.
-        let queue = UploadQueue::new("http://127.0.0.1:1".to_owned(), &telemetry_path, 0);
+        let mut queue = UploadQueue::new("http://127.0.0.1:1".to_owned(), &telemetry_path, 0);
         let record = crate::session::CampaignSession::new(
             "01a06b05-f941-7000-8000-0000000000ff".to_owned(),
             "2026-09-04T12:00:00Z".to_owned(),
@@ -2644,7 +2924,7 @@ mod tests {
             BUILD_REV.to_owned(),
             "unavailable-client-side".to_owned(),
         );
-        let pending = queue_finished_session(&queue, &record).expect("the row queues");
+        let pending = queue_finished_session(&mut queue, &record).expect("the row queues");
         assert!(pending.body_path().exists(), "the body is on disk");
         let state = read_upload_state(&upload_state_path(&telemetry_path));
         let entry = state
@@ -2667,7 +2947,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp dir");
         let telemetry_path = directory.path().join("telemetry.jsonl");
         std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
-        let queue = UploadQueue::new("http://127.0.0.1:1".to_owned(), &telemetry_path, 0);
+        let mut queue = UploadQueue::new("http://127.0.0.1:1".to_owned(), &telemetry_path, 0);
         let mut session = crate::session::CampaignSession::new(
             "01a06b05-f941-7000-8000-000000001048".to_owned(),
             "2026-09-05T12:00:00Z".to_owned(),
@@ -2692,7 +2972,8 @@ mod tests {
                     index == 2,
                 )
                 .expect("a six-minute increment covers a non-empty span");
-            let pending = queue_finished_session(&queue, &record).expect("the increment queues");
+            let pending =
+                queue_finished_session(&mut queue, &record).expect("the increment queues");
             assert!(pending.body_path().exists(), "the body is on disk");
             bodies.push(pending.body_path().to_owned());
         }

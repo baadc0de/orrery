@@ -837,9 +837,12 @@ impl Plugin for RegolithSkinPlugin {
         // session directories and not one uploaded record (#711). The origin
         // comes from the roster URL this session actually joined through, the
         // same single source the lobby path uses.
-        if let Some(origin) = origin {
-            app.insert_resource(admission::UploadManager::for_origin(
-                origin,
+        // Conditioned on that same origin the runtime's queue is, and it must
+        // stay that way: since #1125 the manager only *attempts* what the mint
+        // queued, so one installed without a queue beside it has nothing to
+        // send.
+        if origin.is_some() {
+            app.insert_resource(admission::UploadManager::for_telemetry(
                 &self.telemetry_path,
             ));
         }
@@ -3112,7 +3115,6 @@ fn write_campaign_record_on_exit(
     mut exited: MessageReader<AppExit>,
     mut session: ResMut<ActiveSession>,
     metrics: Res<OverlayMetrics>,
-    sink: Res<JsonlTelemetry>,
     upload: Option<Res<admission::UploadManager>>,
     mut reported: Local<bool>,
 ) {
@@ -3204,14 +3206,12 @@ fn write_campaign_record_on_exit(
         // send.
         campaign::RecordDisposition::Persisted
         | campaign::RecordDisposition::PersistedBelowFloor => match &upload {
+            // The bodies are already on disk, each carrying its own span
+            // of the stream (#1125); what is left is the attempt.
             Some(upload) => admission::upload_finished_session(
                 upload,
                 &record,
                 &campaign_record_path(&metrics.session_record_path),
-                &metrics.session_record_path,
-                // Only this run's rows. The stream is append-only
-                // across every session the binary played (#735).
-                sink.session_start(),
             ),
             // This arm used to be an `if let` with no `else`, and it is the
             // one branch in this function that said nothing at all: a
@@ -4118,14 +4118,19 @@ mod tests {
         };
         let mut runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
         runtime.set_record_path(campaign_record_path(&telemetry_path));
+        // The queue the mint uses, exactly as both production sites install
+        // it: since #1125 `upload_finished_session` sends what the mint
+        // queued rather than queueing a second copy of its own.
+        runtime.set_upload_queue(admission::UploadQueue::new(
+            endpoint.origin.clone(),
+            &telemetry_path,
+            sink.session_start(),
+        ));
         let mut app = App::new();
         app.insert_resource(ActiveSession::Campaign(Box::new(runtime)))
             .insert_resource(OverlayMetrics::new(telemetry_path.clone()))
             .insert_resource(sink)
-            .insert_resource(admission::UploadManager::for_test(
-                endpoint.origin.clone(),
-                &telemetry_path,
-            ));
+            .insert_resource(admission::UploadManager::for_test(&telemetry_path));
         install_campaign_finalization(&mut app);
         app.add_systems(Update, finish_campaign.after(CampaignFinalization));
         app.update();
@@ -4200,14 +4205,17 @@ mod tests {
             };
             let mut runtime = campaign::CampaignRuntime::finished_for_test(config, SEED);
             runtime.set_record_path(campaign_record_path(&telemetry_path));
+            // As above: the mint owns the queue and the cursor (#1125).
+            runtime.set_upload_queue(admission::UploadQueue::new(
+                endpoint.origin.clone(),
+                &telemetry_path,
+                sink.session_start(),
+            ));
             let mut app = App::new();
             app.insert_resource(ActiveSession::Campaign(Box::new(runtime)))
                 .insert_resource(OverlayMetrics::new(telemetry_path.clone()))
                 .insert_resource(sink)
-                .insert_resource(admission::UploadManager::for_test(
-                    endpoint.origin.clone(),
-                    &telemetry_path,
-                ));
+                .insert_resource(admission::UploadManager::for_test(&telemetry_path));
             install_campaign_finalization(&mut app);
             app.add_systems(Update, finish_campaign.after(CampaignFinalization));
             app.update();
