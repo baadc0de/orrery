@@ -196,6 +196,19 @@ const BLOOM_CADENCE_SECS: i64 = BLOOM_CADENCE_TICKS as i64 / TICK_HZ as i64;
 /// bloom announcements to put one island-width between themselves and it.
 /// #955's measurement was a comparable distance crossed in three seconds; this
 /// is the same distance turned back into a decision.
+///
+/// **This is the number that makes the world unbounded, and every range
+/// assumption elsewhere in the ruleset has to answer to it.** A pilot holding
+/// the throttle outward against a fully-ramped tether keeps this speed for as
+/// long as they hold it — the tether costs them speed, never distance — so
+/// there is no furthest position a craft can occupy, only a furthest one it
+/// can reach *by some deadline*. #1120 is what that costs when a type forgets
+/// it: the trail's signed 16-bit metre put its deadline at 32,768 m, which is
+/// 983 s at this speed, and an honest pilot crossed it in 16.2 minutes.
+/// [`TrailPoint`](state::TrailPoint) is now 32-bit metres, whose deadline is
+/// 745 days at this speed and is stated in its own documentation. Anything
+/// added here that quantizes a position owes the same arithmetic, recorded
+/// next to this constant.
 pub const TETHER_ESCAPE_SPEED_MMS: i64 = ISLAND_BOUNDARY_MM * 2 / BLOOM_CADENCE_SECS;
 
 /// Total drag a fully tethered craft flies against, per-mille per second.
@@ -398,6 +411,24 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
         / 1_000.0
 }
 
+/// Regolith v26's rules identity: v25's rules with a trail coordinate that the
+/// v25 tether cannot overrun (#1120).
+///
+/// [`TrailPoint`](state::TrailPoint) was signed 16-bit metres, sized against a
+/// 1 km island edge that stopped bounding anything when v25 made the tether a
+/// restoring drag rather than a wall. A craft that passed ±32,767 m — 16.2
+/// minutes of held outward throttle, and three of the `island` scenario's
+/// eight honest bot pilots inside an hour — dropped every subsequent trail
+/// sample and latched `Craft::arithmetic_overflowed`, a deviation signal, in
+/// canonical hashed state. The coordinate is now 32-bit metres, whose own
+/// deadline is 745 days of unbroken outward flight rather than sixteen
+/// minutes, so no session reaches it and the trail keeps recording.
+///
+/// It moves canonical craft bytes — a full trail is 49 bytes rather than 25 —
+/// so it moves every Regolith state golden and the version with them. A v25
+/// peer must be refused rather than admitted into a session where it would
+/// decode the trail section at the wrong width.
+///
 /// Regolith v24's rules identity: v23's canonical behaviour under protocol v7,
 /// with the remaining `regolith.craft` module executed as native ECS
 /// components and systems alongside `regolith.world`.
@@ -435,7 +466,7 @@ pub fn campaign_engagement_budget_m(cell_edge_m: f64) -> f64 {
 /// together, and admission must refuse a v24 peer rather than let one enter a
 /// session where held throttle means something different.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 25,
+    version: 26,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 

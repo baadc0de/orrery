@@ -475,8 +475,8 @@ fn every_weapons_reach_fits_inside_the_campaign_aoi_guarantee() {
 }
 
 #[test]
-fn v24_ecs_craft_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 25);
+fn v26_ecs_craft_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 26);
     assert_eq!(
         PITCH_LIMIT_URAD, 1_570_796,
         "a quarter turn either side of level, on the micro-radian lattice"
@@ -588,7 +588,7 @@ fn thrust_accumulates_delta_velocity_instead_of_replacing_velocity() {
 }
 
 #[test]
-fn craft_trail_is_quantized_bounded_hashed_and_costs_25_bytes_when_full() {
+fn craft_trail_is_quantized_bounded_hashed_and_costs_49_bytes_when_full() {
     let entity = PersistId::new(1);
     let mut craft = craft_at(0);
     craft.vel = QVel {
@@ -627,7 +627,7 @@ fn craft_trail_is_quantized_bounded_hashed_and_costs_25_bytes_when_full() {
     assert_eq!(
         encoded.len(),
         132 + TRAIL_MAX_ENCODED_BYTES,
-        "a full four-point trail must add exactly {TRAIL_MAX_ENCODED_BYTES} canonical bytes to the 132-byte v17 craft"
+        "a full four-point trail must add exactly {TRAIL_MAX_ENCODED_BYTES} canonical bytes to the 132-byte craft base"
     );
     assert_eq!(Craft::decode(&encoded), Ok(craft.clone()));
 
@@ -641,7 +641,7 @@ fn craft_trail_is_quantized_bounded_hashed_and_costs_25_bytes_when_full() {
 }
 
 #[test]
-fn trail_quantization_is_integer_and_out_of_range_sets_the_hashed_overflow_flag() {
+fn trail_quantization_is_integer_and_the_old_16_bit_cliff_is_now_an_ordinary_position() {
     let entity = PersistId::new(1);
     let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x1A; 32]));
     executor.insert(
@@ -674,6 +674,12 @@ fn trail_quantization_is_integer_and_out_of_range_sets_the_hashed_overflow_flag(
         "trail positions must snap integer millimetres to whole metres, half away from zero"
     );
 
+    // The position that used to be unrepresentable. Under the pre-#1120
+    // signed 16-bit metre this teleport was the *only* test of the overflow
+    // path, and it asserted a latched flag and an empty trail — correct for a
+    // coordinate the type could not hold, and silent about the fact that the
+    // v25 tether lets a pilot fly here in sixteen minutes. It is an ordinary
+    // position now, and nothing about it is exceptional.
     let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x1B; 32]));
     executor.insert(
         entity,
@@ -696,12 +702,86 @@ fn trail_quantization_is_integer_and_out_of_range_sets_the_hashed_overflow_flag(
         panic!("craft remains a craft")
     };
     assert!(
-        craft.arithmetic_overflowed,
-        "a trail coordinate beyond signed 16-bit metres must set the canonical arithmetic-overflow flag"
+        !craft.arithmetic_overflowed,
+        "a position one metre past the retired 16-bit cap is reachable under the tether and must not set a deviation flag"
+    );
+    assert_eq!(
+        craft.trail.points().collect::<Vec<_>>(),
+        [orrery_games::regolith::state::TrailPoint {
+            x_m: i32::from(i16::MAX) + 1,
+            y_m: 0,
+            z_m: 0,
+        }],
+        "the trail must record the position the craft actually holds"
+    );
+}
+
+/// #1120: the tether permits held outward throttle forever, so the trail has
+/// to keep recording forever.
+///
+/// One interceptor at full thrust, no yaw — the flight the #1120 hunt
+/// measured. Against the retired signed 16-bit metre this run latched
+/// `arithmetic_overflowed` at tick 58,452 (974.2 s, 16.2 minutes) at 32,772 m
+/// and froze the trail four points behind it for the rest of the session. It
+/// is not a contrived flight: the `island` scenario's own honest bot pilots
+/// reach the same cliff, the first at relative tick 116,075, three of eight
+/// inside an hour. Twenty minutes here is 40 km, well past it, and every
+/// assertion below is one that failed before the fix.
+#[test]
+fn a_pilot_holding_the_throttle_outward_past_the_old_16_bit_cap_keeps_recording() {
+    const TICKS: u64 = 72_000;
+    let entity = PersistId::new(1);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x1C; 32]));
+    executor.insert(entity, RegolithState::Craft(craft_at(0)));
+    let thrust = Order::Thrust {
+        accel_mmss: Archetype::Interceptor.limits().max_accel_mmss as i32,
+        yaw_urad: 0,
+        pitch_urad: 0,
+    };
+    for tick in 1..=TICKS {
+        executor
+            .step_entity(entity, Tick::new(tick), core::slice::from_ref(&thrust))
+            .expect("craft exists");
+    }
+    let Some(RegolithState::Craft(craft)) = executor.state(entity) else {
+        panic!("craft remains a craft")
+    };
+
+    let far_m = craft.pos.x / 1_000;
+    assert!(
+        far_m > i64::from(i16::MAX),
+        "{TICKS} ticks of held outward throttle must carry the craft past the retired 16-bit cap; reached {far_m} m"
     );
     assert!(
-        craft.trail.is_empty(),
-        "an unrepresentable trail coordinate must not be clamped into hashed state"
+        craft.vel.x >= TETHER_ESCAPE_SPEED_MMS - 1_000,
+        "the tether must still leave the escape speed intact at {far_m} m; got {} mm/s",
+        craft.vel.x
+    );
+    assert!(
+        !craft.arithmetic_overflowed,
+        "flying a direction the tether permits must not latch a deviation flag (it latched at tick 58,452 before #1120)"
+    );
+    let points = craft.trail.points().collect::<Vec<_>>();
+    assert_eq!(
+        points.len(),
+        TRAIL_CAPACITY,
+        "the trail must still be full {far_m} m out: {points:?}"
+    );
+    assert!(
+        points.windows(2).all(|pair| pair[0].x_m < pair[1].x_m),
+        "the trail must still be advancing, oldest-first, behind a +x craft: {points:?}"
+    );
+    let newest = points[TRAIL_CAPACITY - 1];
+    assert!(
+        i64::from(newest.x_m) > i64::from(i16::MAX),
+        "the newest sample must be the craft's own position, not a point frozen 32 km behind it: {newest:?}"
+    );
+    // The newest sample is at most one 12-tick interval old, so it trails the
+    // craft by that interval's travel and by nothing else.
+    let lag_m = far_m - i64::from(newest.x_m);
+    assert!(
+        (0..=8).contains(&lag_m),
+        "the newest sample must lag the craft by one sample interval at most; lagged {lag_m} m"
     );
 }
 
@@ -3345,7 +3425,7 @@ fn the_tether_is_inert_inside_the_island() {
 /// The tether's numbers are derived, and the derivation is the pin.
 #[test]
 fn v25_tether_constants_are_derived_from_the_island_and_the_bloom_cadence() {
-    assert_eq!(REGOLITH_RULESET.version, 25);
+    assert_eq!(REGOLITH_RULESET.version, 26);
     assert_eq!(
         TETHER_BAND_MM as f64,
         CAMPAIGN_CELL_EDGE_M * 1_000.0,
