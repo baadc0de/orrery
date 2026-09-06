@@ -1311,7 +1311,10 @@ pub fn target_title(view: &CombatView) -> String {
     match (view.target, view.rock_target, view.lock.target) {
         (Some(target), _, _) => format!("{} | #{}", target.chassis_name(), target.entity.0),
         (_, Some(target), _) => format!("{} | #{}", target.tier_name(), target.entity.0),
-        (None, None, Some(id)) => format!("#{:#x} | no window here", id.0),
+        // `{:x}`, not `{:#x}`: the alternate form already emits `0x`, so the
+        // `#` prefix that matches the two decimal arms above rendered as
+        // `#0xa1000015b50002`.
+        (None, None, Some(id)) => format!("#{:x} | no window here", id.0),
         (None, None, None) => "-".to_owned(),
     }
 }

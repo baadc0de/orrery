@@ -159,7 +159,10 @@ pub fn caption(view: &ReachView) -> String {
             GRAB_RADIUS_MM / 1_000
         ),
         Some(reach) => format!(
-            "PICKUP {} m  ·  reach {} m",
+            // ASCII only: this client loads no font asset, so a non-ASCII
+            // separator draws as a box. The rule is asserted for the anchor
+            // and the legend (`anchor.rs`, `legend.rs`) and now here.
+            "PICKUP {} m  |  reach {} m",
             reach.range_mm / 1_000,
             GRAB_RADIUS_MM / 1_000
         ),
@@ -350,5 +353,23 @@ mod tests {
         assert!(caption(&near).contains("IN REACH"));
         let far = ReachView::read(&executor(0, &[(PersistId::new(9), pickup_at(400_000))]), ME);
         assert!(caption(&far).contains("400 m"));
+    }
+
+    /// The rule `anchor.rs` and `legend.rs` each assert for their own lines,
+    /// applied to this module's: no font asset is loaded, so a non-ASCII
+    /// character draws as a box. The out-of-reach caption carried a U+00B7
+    /// middle dot, which is the branch a pickup in view but out of reach
+    /// shows — the common one.
+    #[test]
+    fn every_caption_is_ascii_because_no_font_asset_is_loaded() {
+        let views = [
+            ReachView::default(),
+            ReachView::read(&executor(0, &[(PersistId::new(9), pickup_at(10_000))]), ME),
+            ReachView::read(&executor(0, &[(PersistId::new(9), pickup_at(400_000))]), ME),
+        ];
+        for view in &views {
+            let line = caption(view);
+            assert!(line.is_ascii(), "non-ASCII renders as a box: {line:?}");
+        }
     }
 }
