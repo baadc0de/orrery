@@ -597,6 +597,18 @@ pub struct PeerReport {
     /// whole timeline or none of it, so this times the run length is the
     /// deficit, to the tick.
     pub watches_unanchored: u64,
+    /// Watches armed on this peer that were never shown a single frame.
+    ///
+    /// Zero is the expected value in a witnessing run: this swarm's watch lists
+    /// are the reciprocal of its witness sets, both built by
+    /// [`witness_recipients`], so every armed watch has a stream addressed to
+    /// it by construction. A nonzero value means the two disagreed (#1130).
+    /// Each one is charged its subject's whole run in `observation_coverage`,
+    /// which is the only place the deficit can be seen — see
+    /// [`orrery_witness::witness::WitnessCounters::watches_dark`].
+    pub watches_dark: u64,
+    /// Watches armed on this peer, dark or not.
+    pub watches_armed: u64,
     /// Frames it could not chain because a repair was outstanding.
     pub frames_deferred: u64,
     /// Of those, ones dropped because the subject's deferral buffer was full.
@@ -805,6 +817,24 @@ pub struct SeatDeliveries {
 pub struct ExteriorReport {
     /// The swarm slot the external peer occupied.
     pub index: usize,
+    /// Host-side watches armed against this seat's authored log.
+    ///
+    /// Filled in at report assembly rather than by `ExteriorSlot::report`,
+    /// which cannot see the bots. Zero for a seat that shipped no anchor: a
+    /// rendered client authors no witness log (#387), no watch is armed against
+    /// it, and `witness_anchored` already says its hour is not independently
+    /// witnessed.
+    pub witness_watches_armed: usize,
+    /// Of those, ones that were shown no frame of this seat's log at all.
+    ///
+    /// **The figure a swarm-wide average hides (#1130).** The witness set this
+    /// seat streamed to was chosen by NodeId order while the host armed watches
+    /// by slot order, so at thirty-two seats five of these seven saw nothing —
+    /// and five out of the island's two hundred and thirty-one armed watches is
+    /// two per cent, which moves no swarm-wide figure at all. Read against this
+    /// seat's own seven it is five sevenths of the only hour in the run that
+    /// cost a volunteer anything.
+    pub witness_watches_dark: usize,
     /// QUIC-authenticated transport identity admitted for this slot.
     pub node: NodeId,
     /// Whether the runner's clean end-of-run marker arrived.
@@ -1137,6 +1167,15 @@ pub struct SwarmReport {
     pub total_frames_rejected_unanchored: u64,
     /// Watches across the swarm that were shown frames and never folded one.
     pub total_watches_unanchored: u64,
+    /// Watches across the swarm that were armed and shown nothing at all.
+    ///
+    /// Each is a subject's whole timeline unobserved, and each is charged as
+    /// such in `observation_coverage` — which before #1130 counted only what a
+    /// witness *was* shown, and so could read 1.0 over a population most of
+    /// which had been shown nothing.
+    pub total_watches_dark: u64,
+    /// Watches armed across the swarm, dark or not.
+    pub total_watches_armed: u64,
     /// Frames set aside across the swarm because a repair was outstanding.
     pub total_frames_deferred: u64,
     /// Claim comparisons correctly declined while catching up.
@@ -1900,6 +1939,9 @@ impl ExteriorSlot {
         ExteriorReport {
             index: self.index,
             node: self.node,
+            // Both filled in by `Swarm::report`, which can see the watchers.
+            witness_watches_armed: 0,
+            witness_watches_dark: 0,
             connected,
             connected_ticks: self.connected_ticks,
             connected_since_unix_millis: self.accepted_at_unix_millis,
@@ -3723,6 +3765,8 @@ impl Swarm {
                     frames_rejected: witness.frames_rejected,
                     frames_rejected_unanchored: witness.frames_rejected_unanchored,
                     watches_unanchored: witness.watches_unanchored,
+                    watches_dark: witness.watches_dark,
+                    watches_armed: witness.watches_armed,
                     frames_deferred: witness.frames_deferred,
                     deferrals_overflowed: witness.deferrals_overflowed,
                     deferrals_pruned: witness.deferrals_pruned,
@@ -3937,6 +3981,20 @@ impl Swarm {
                     .cloned()
                     .chain(self.exteriors.values().map(ExteriorSlot::report))
                     .collect::<Vec<_>>();
+                // Per seat, against the watchers actually armed on it. The
+                // pair travels together: "three dark" means nothing without
+                // "of seven", and a seat with none armed is not a defect.
+                for seat in &mut external {
+                    let entity = PersistId::new(seat.index as u64 + 1);
+                    let armed = self
+                        .bots
+                        .iter()
+                        .filter(|bot| bot.watches(entity))
+                        .collect::<Vec<_>>();
+                    seat.witness_watches_armed = armed.len();
+                    seat.witness_watches_dark =
+                        armed.iter().filter(|bot| bot.watch_is_dark(entity)).count();
+                }
                 external.sort_by_key(|seat| seat.index);
                 external
             },
@@ -3996,6 +4054,8 @@ impl Swarm {
                 .map(|p| p.frames_rejected_unanchored)
                 .sum(),
             total_watches_unanchored: per_peer.iter().map(|p| p.watches_unanchored).sum(),
+            total_watches_dark: per_peer.iter().map(|p| p.watches_dark).sum(),
+            total_watches_armed: per_peer.iter().map(|p| p.watches_armed).sum(),
             total_frames_deferred: per_peer.iter().map(|p| p.frames_deferred).sum(),
             total_judgements_deferred: per_peer.iter().map(|p| p.judgements_deferred).sum(),
             total_deferrals_overflowed: per_peer.iter().map(|p| p.deferrals_overflowed).sum(),
@@ -4020,14 +4080,46 @@ impl Swarm {
             observation_coverage: {
                 let judged: u64 = per_peer.iter().map(|p| p.judged_ticks).sum();
                 let shown: u64 = per_peer.iter().map(|p| p.shown_ticks).sum();
+                let dark: u64 = per_peer.iter().map(|p| p.watches_dark).sum();
                 // Shown, not judged-plus-abandoned. A witness that stops
                 // judging also stops abandoning, so measuring against its own
                 // abandonments scores a watch that died at 100% — which is the
                 // reading this clause exists to refuse.
-                if shown == 0 {
+                //
+                // ── And not shown alone, either (#1130) ─────────────────────
+                //
+                // That correction fixed one self-reference and left another.
+                // *Shown* is still a term the missing watches do not appear in:
+                // a watch that was armed and then addressed by nobody adds zero
+                // to the numerator and zero to the denominator, so the ratio
+                // does not move and the report prints a number measured over a
+                // population it does not name. At the criterion's thirty-two
+                // seats, five of a human seat's seven armed watches were dark
+                // and this read **1.0**.
+                //
+                // So the denominator is what the run *should* have shown: every
+                // tick that was shown, plus, for each dark watch, its subject's
+                // whole timeline — which is the run, because a dark watch
+                // observed none of it. That is the same unit
+                // `watches_unanchored` is documented in ("this times the run
+                // length is the deficit, to the tick"); the two ways a watch can
+                // lose its subject's whole run now cost the same.
+                //
+                // Charged here rather than refused by a clause of its own on
+                // purpose. A clause reading "any dark watch fails the attempt"
+                // is a hair trigger on the blast radius #963 and #1092 are
+                // about: a seat that binds and departs before authoring leaves
+                // a permanently dark watch on every bot armed against it (there
+                // is no unwatch path), and one such seat would void every other
+                // volunteer's hour in the attempt. Charged proportionally, that
+                // seat costs a fraction of a percent and the five-of-seven case
+                // costs about fifteen points — under the 95% floor, refused,
+                // and refused *by the figure that was lying*.
+                let owed = shown.saturating_add(dark.saturating_mul(ticks));
+                if owed == 0 {
                     0.0
                 } else {
-                    judged as f64 / shown as f64
+                    judged as f64 / owed as f64
                 }
             },
             replication_bytes: lanes.replication_bytes,
@@ -4352,14 +4444,18 @@ impl SwarmReport {
             failures.push(CriterionFailure {
                 clause: "the witness keeps watching for the whole run",
                 detail: format!(
-                    "{:.1}% of the timeline shown to a witness was judged ({} of {} ticks, \
-                     {} abandoned across {} re-anchors); below {:.0}% a false-positive count \
-                     of zero says more about the witness than about the swarm",
+                    "{:.1}% of the timeline a witness was owed was judged ({} of {} ticks \
+                     shown, {} abandoned across {} re-anchors, and {} of {} armed watches shown \
+                     nothing at all — each charged its subject's whole run); below {:.0}% a \
+                     false-positive count of zero says more about the witness than about the \
+                     swarm",
                     self.observation_coverage * 100.0,
                     self.total_judged_ticks,
                     self.total_shown_ticks,
                     self.total_unjudged_ticks,
                     self.total_reanchors,
+                    self.total_watches_dark,
+                    self.total_watches_armed,
                     MIN_COVERAGE * 100.0,
                 ),
             });
@@ -4369,6 +4465,48 @@ impl SwarmReport {
         // would otherwise bank its player-hour while measuring nothing — the
         // exact shape #375 exists to refuse.
         for external in &self.external {
+            // A seat banked as independently witnessed, whose witnesses saw
+            // nothing (#1130).
+            //
+            // Scoped to the exterior seats on purpose, and it is the scoping
+            // that makes this both correct and safe. Correct, because the
+            // damage is *concentrated*: the defect was one seat streaming to
+            // the wrong seven, which is five dark watches out of an island's
+            // two hundred and thirty-one — two per cent swarm-wide, and five
+            // sevenths of the only hour in the run a volunteer paid for. No
+            // average over the whole island can see that, so this reads the
+            // seat's own watches against the seat's own claim. Safe, because
+            // it fires only on a seat that shipped an anchor (so watches were
+            // armed against it) *and* authored frames (so there was something
+            // to be shown). A seat that binds and departs before authoring
+            // leaves dark watches behind — there is no unwatch path — and must
+            // not void the rest of the attempt for it; that is #963's blast
+            // radius and #1092 weighed it explicitly.
+            //
+            // A rendered client is untouched: it authors no witness log
+            // (#387), nothing is armed against it, `witness_watches_armed` is
+            // zero and `witness_anchored` already says its hour is not
+            // independently witnessed.
+            if self.witnessing
+                && external.witness_anchored
+                && external.uplink_frames > 0
+                && external.witness_watches_dark > 0
+            {
+                failures.push(CriterionFailure {
+                    clause: "an anchored external seat is shown to its own witnesses",
+                    detail: format!(
+                        "slot {} shipped a witness anchor and authored {} uplink frames, but {} \
+                         of the {} watches armed against it were shown no frame of its log at \
+                         all; its hour banks as independently witnessed and {} of its watchers \
+                         observed none of it",
+                        external.index,
+                        external.uplink_frames,
+                        external.witness_watches_dark,
+                        external.witness_watches_armed,
+                        external.witness_watches_dark,
+                    ),
+                });
+            }
             let clean_close = external.connected || external.said_goodbye;
             if !clean_close {
                 failures.push(CriterionFailure {
@@ -5887,6 +6025,8 @@ mod tests {
             total_frames_rejected: 0,
             total_frames_rejected_unanchored: 0,
             total_watches_unanchored: 0,
+            total_watches_dark: 0,
+            total_watches_armed: 224,
             total_frames_deferred: 0,
             total_judgements_deferred: 0,
             total_deferrals_overflowed: 0,
@@ -5997,6 +6137,36 @@ mod tests {
     }
 
     /// Clauses `report` raises, by name.
+    /// An exterior seat that shipped a witness anchor, authored a full hour of
+    /// frames, closed cleanly, and had `armed` watches of which `dark` saw
+    /// nothing.
+    fn anchored_seat(armed: usize, dark: usize) -> ExteriorReport {
+        ExteriorReport {
+            index: 32,
+            node: crate::bot::bot_key(32).public(),
+            witness_watches_armed: armed,
+            witness_watches_dark: dark,
+            said_goodbye: true,
+            connected: true,
+            connected_ticks: 3_600 * 60,
+            connected_since_unix_millis: None,
+            connected_until_unix_millis: None,
+            uplink_frames: 72_000,
+            uplink_delivered: 72_000,
+            uplink_dropped: 0,
+            downlink_frames: 72_000,
+            downlink_dropped: 0,
+            downlink_after_close: 0,
+            witness_anchored: true,
+            session_id: None,
+            reported_cells: 8,
+            state_deliveries: 72_000,
+            last_state_delivery_tick: Some(3_600 * 60 - 1),
+            deliveries_from_seats: Vec::new(),
+            close: "goodbye",
+        }
+    }
+
     fn clauses(report: &SwarmReport, criterion: Criterion) -> Vec<&'static str> {
         report
             .against_criterion(criterion)
@@ -6246,6 +6416,114 @@ mod tests {
         report.link.dropped = 0;
         report.observation_coverage = 1.0;
         assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    /// The report that lied, refused — and the arithmetic of why no swarm-wide
+    /// figure could have refused it (#1130).
+    ///
+    /// The run this is about printed `observation_coverage 1.0`,
+    /// `watches_unanchored 0`, `total_gaps 0`, `false_positives 0`, and banked.
+    /// What was true is that five of the human seat's seven armed watches had
+    /// been shown no frame of its log at all.
+    ///
+    /// Charging those five their subject's whole run — which is what the
+    /// coverage denominator now does — moves the swarm-wide figure from 1.0 to
+    /// about 0.978, because five dark watches out of a thirty-three-seat
+    /// island's two hundred and thirty-one *is* two per cent. That is above the
+    /// 95% floor, and it is the honest number: swarm-wide, the swarm was
+    /// witnessed. The concentration is the finding, and only the seat's own
+    /// count carries it.
+    #[test]
+    fn a_seat_whose_own_witnesses_saw_nothing_is_refused() {
+        const TICKS: u64 = 3_600 * 60;
+        // 33 seats, seven watches each, one simulated hour apiece.
+        let shown = 231 * TICKS;
+        let swarm_wide = shown as f64 / (shown + 5 * TICKS) as f64;
+        assert!(
+            swarm_wide > 0.95,
+            "five dark watches in a 231-watch island is two per cent, and no swarm-wide floor \
+             can see it: the corrected coverage is still {swarm_wide}"
+        );
+
+        let mut report = passing();
+        report.identity.impairment = Impairment::default();
+        report.total_gaps = 0;
+        report.link.dropped = 0;
+        report.observation_coverage = swarm_wide;
+        report.total_watches_armed = 231;
+        report.total_watches_dark = 5;
+        report.external = vec![anchored_seat(7, 5)];
+        assert_eq!(
+            clauses(&report, STRICT),
+            vec!["an anchored external seat is shown to its own witnesses"],
+            "the seat's hour banks as independently witnessed while five sevenths of its \
+             witnesses observed none of it, and that is what must refuse it"
+        );
+    }
+
+    /// The same seat, fed the seats the host armed: nothing to refuse.
+    #[test]
+    fn a_seat_shown_to_every_watch_armed_against_it_passes() {
+        let mut report = passing();
+        report.identity.impairment = Impairment::default();
+        report.total_gaps = 0;
+        report.link.dropped = 0;
+        report.observation_coverage = 1.0;
+        report.total_watches_armed = 231;
+        report.total_watches_dark = 0;
+        report.external = vec![anchored_seat(7, 0)];
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    /// A seat that shipped no anchor is not judged by this clause.
+    ///
+    /// The rendered client authors no witness log (#387): nothing is armed
+    /// against it, and `witness_anchored: false` already states that its hour
+    /// is not independently witnessed. Manufacturing a failure out of that
+    /// would refuse every campaign session the client hosts.
+    #[test]
+    fn an_unanchored_seat_is_not_judged_on_watches_nobody_armed() {
+        let mut report = passing();
+        report.identity.impairment = Impairment::default();
+        report.total_gaps = 0;
+        report.link.dropped = 0;
+        report.observation_coverage = 1.0;
+        let mut seat = anchored_seat(0, 0);
+        seat.witness_anchored = false;
+        report.external = vec![seat];
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    /// A seat that authored nothing leaves dark watches and must not void the
+    /// attempt for everyone else.
+    ///
+    /// There is no unwatch path, so a seat that binds and departs before
+    /// authoring leaves a permanently dark watch on every bot armed against it.
+    /// Refusing the whole attempt for that is #963's blast radius, and #1092
+    /// weighed exactly this exposure: it would cost every *other* volunteer in
+    /// the attempt their hour.
+    #[test]
+    fn a_seat_that_authored_nothing_does_not_void_everyone_elses_hour() {
+        let mut report = passing();
+        report.identity.impairment = Impairment::default();
+        report.total_gaps = 0;
+        report.link.dropped = 0;
+        report.observation_coverage = 1.0;
+        let mut seat = anchored_seat(7, 7);
+        seat.uplink_frames = 0;
+        report.external = vec![seat];
+        // A silent seat is already refused by the traffic clause, which is
+        // right and is not this clause's business. What must not happen is a
+        // *second* refusal attributing the silence to the witness: the watches
+        // are dark because there was nothing to show them, not because it was
+        // shown to the wrong peers.
+        assert!(
+            !clauses(&report, STRICT)
+                .contains(&"an anchored external seat is shown to its own witnesses"),
+            "a seat that authored nothing has nothing to have shown; it must not be judged on \
+             watches that were dark for want of a subject: {:?}",
+            clauses(&report, STRICT)
+        );
     }
 
     #[test]

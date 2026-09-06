@@ -2641,6 +2641,29 @@ impl Bot {
             .map_or(0, |c| c.repairs_unservable)
     }
 
+    /// Whether this peer holds a watch on `entity` at all.
+    #[must_use]
+    pub fn watches(&self, entity: PersistId) -> bool {
+        self.app
+            .world()
+            .get_resource::<WitnessState<Regolith>>()
+            .is_some_and(|state| state.0.watches(entity))
+    }
+
+    /// Whether this peer holds a watch on `entity` that has seen no frame.
+    ///
+    /// Per subject, because the swarm-wide count averages the concentrated
+    /// case away — see `Witness::watch_is_dark` (#1130). `false` when this peer
+    /// does not watch the entity at all: not watching is not the same as
+    /// watching blind, and only the second is a defect.
+    #[must_use]
+    pub fn watch_is_dark(&self, entity: PersistId) -> bool {
+        self.app
+            .world()
+            .get_resource::<WitnessState<Regolith>>()
+            .is_some_and(|state| state.0.watch_is_dark(entity))
+    }
+
     /// This peer's witness counters, or zeroes if it witnesses nobody.
     #[must_use]
     pub fn witness_counters(&self) -> orrery_witness::WitnessCounters {

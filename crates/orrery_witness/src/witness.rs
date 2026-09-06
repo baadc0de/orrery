@@ -180,6 +180,36 @@ pub struct WitnessCounters {
     /// blind, and it is the unit the coverage deficit actually comes in — a
     /// watch either judges its subject's whole timeline or none of it.
     pub watches_unanchored: u64,
+    /// Watches that were armed and never shown a single frame.
+    ///
+    /// Not accumulated: a level, filled in by [`Witness::counters`].
+    ///
+    /// # Why this exists, and why coverage could not have caught it (#1130)
+    ///
+    /// Observation coverage is judged ticks over **shown** ticks. Both of its
+    /// terms are conditioned on the subject's frames arriving, so a watch that
+    /// is shown nothing at all contributes zero to the numerator *and* zero to
+    /// the denominator and moves the ratio not at all.
+    /// [`Self::watches_unanchored`] cannot see it either: it filters on
+    /// `newest_seen.is_some()`, which is precisely the condition a dark watch
+    /// fails. So an island in which five of every seven armed watches were fed
+    /// nothing reported coverage 1.0 — not a coverage *shortfall* but a false
+    /// statement, and the report held no figure anywhere that could contradict
+    /// it.
+    ///
+    /// A metric cannot audit its own denominator. This one comes from the other
+    /// side: the count of watches, which is what was *armed*, against the
+    /// traffic, which is what was *observed*. In a run whose witness sets are
+    /// the reciprocal of its watch lists — which is what
+    /// `swarm::witness_recipients` builds — a nonzero value here is a
+    /// contradiction between the two, and the banked evidence is worth less
+    /// than the report claims by exactly this many whole subject timelines.
+    pub watches_dark: u64,
+    /// Watches armed on this witness, dark or not.
+    ///
+    /// The denominator [`Self::watches_dark`] is read against, so a reader
+    /// never has to reconstruct it from the roster.
+    pub watches_armed: u64,
     /// Frames still held behind an open hole when the counters were read.
     ///
     /// Not accumulated: filled in by [`Witness::counters`] from the buffer's
@@ -564,6 +594,12 @@ impl<R: Ruleset> Witness<R> {
                 .values()
                 .filter(|watched| watched.newest_seen.is_some() && watched.folded_through.is_none())
                 .count() as u64,
+            watches_dark: self
+                .watched
+                .values()
+                .filter(|watched| watched.newest_seen.is_none())
+                .count() as u64,
+            watches_armed: self.watched.len() as u64,
             ..self.counters
         }
     }
@@ -722,6 +758,21 @@ impl<R: Ruleset> Witness<R> {
     #[must_use]
     pub fn watches(&self, entity: PersistId) -> bool {
         self.watched.contains_key(&entity)
+    }
+
+    /// Whether this witness holds a watch on `entity` that has seen nothing.
+    ///
+    /// The per-subject form of [`WitnessCounters::watches_dark`], and the one a
+    /// harness needs: a swarm-wide dark count averages a concentrated failure
+    /// away. Five dark watches out of a thirty-three-seat island's two hundred
+    /// and thirty-one is two per cent of the population and *all seven
+    /// sevenths* of one subject's — and when that subject is the human seat,
+    /// the two per cent is the entire reason the run exists (#1130).
+    #[must_use]
+    pub fn watch_is_dark(&self, entity: PersistId) -> bool {
+        self.watched
+            .get(&entity)
+            .is_some_and(|watched| watched.newest_seen.is_none())
     }
 
     /// Ingest a frame as it arrived on the wire, with its full head pairs.

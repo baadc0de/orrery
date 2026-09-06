@@ -178,6 +178,36 @@ pub fn run(run: &ExternalRun) -> Result<()> {
     let send_every = (TICK_HZ / 20).max(1);
     let tick_duration = Duration::from_nanos(1_000_000_000 / TICK_HZ);
 
+    // The ring the host accepted this seat into, installed before the first
+    // authored frame leaves — the frames published on tick zero must already be
+    // addressed to the peers the host armed against this seat (#1130).
+    let mut witness_ring_updates = 0u64;
+    let mut witness_ring_size = 0usize;
+    if run.witnessing {
+        match &remote_link.manifest {
+            Some(manifest) => {
+                witness_ring_size =
+                    apply_witness_ring(&mut bot, manifest, &mut slot_of, &mut node_of);
+                witness_ring_updates += 1;
+                eprintln!(
+                    "gates/p1-swarm: external peer slot {index} witnesses host-chosen seats \
+                     {:?} ({witness_ring_size} links)",
+                    manifest.witness_recipients,
+                );
+            }
+            None => {
+                // Unconditional: with no ring the witness plugin falls back to
+                // NodeId byte order, which is #1130 exactly. Say so rather than
+                // bank an hour whose witnesses were chosen by key material.
+                eprintln!(
+                    "gates/p1-swarm: external peer slot {index} was accepted without a start \
+                     manifest; it has no host-chosen witness ring and will fall back to NodeId \
+                     order, which the host does not arm against (#1130)"
+                );
+            }
+        }
+    }
+
     let own_entity = bot.entity();
     let mut inbound_total = 0usize;
     let mut audience_seconds = 0u64;
@@ -305,6 +335,34 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                     if let Some(roster) = crate::exterior::IslandRoster::decode(&frame.payload) {
                         roster_updates += 1;
                         apply_roster(&mut bot, &roster, &mut slot_of, &mut node_of);
+                        continue;
+                    }
+                    // Live membership: the host republishes `StartV1` on this
+                    // lane whenever the roster changes
+                    // (`Swarm::publish_live_manifests_for`), and it carries the
+                    // recomputed witness ring. Reinstalling it here is what
+                    // keeps the seat's stream and the host's arming in step
+                    // across joins and releases, rather than only at accept.
+                    //
+                    // Discriminated by shape, not by a new tag: the binary
+                    // records own `0xa1`-`0xa3` and this one is JSON, so a
+                    // leading `{` cannot collide with any of them.
+                    if run.witnessing && frame.payload.first() == Some(&b'{') {
+                        if let Ok(manifest) =
+                            serde_json::from_slice::<crate::exterior::StartManifest>(&frame.payload)
+                        {
+                            let size =
+                                apply_witness_ring(&mut bot, &manifest, &mut slot_of, &mut node_of);
+                            if size != witness_ring_size {
+                                eprintln!(
+                                    "gates/p1-swarm: external peer slot {index} witness ring \
+                                     changed to seats {:?} ({size} links) at membership tick {}",
+                                    manifest.witness_recipients, manifest.tick,
+                                );
+                                witness_ring_size = size;
+                            }
+                            witness_ring_updates += 1;
+                        }
                     }
                     continue;
                 }
@@ -385,6 +443,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
         eprintln!(
             "gates/p1-swarm: external peer slot {index} accepted {} of {inbound_total} inbound \
              frames from seats {}; {meta_frames} meta frames, {roster_updates} roster updates, \
+             {witness_ring_updates} witness-ring updates ({witness_ring_size} links installed), \
              {empty_audience_seconds} of {audience_seconds} seconds replicating to nobody; \
              goodbye sent",
             accepted_from.values().sum::<u64>(),
@@ -400,6 +459,108 @@ pub fn run(run: &ExternalRun) -> Result<()> {
 
 fn recipient_slot(slot_of: &BTreeMap<NodeId, usize>, node: NodeId) -> u32 {
     u32::try_from(slot_of.get(&node).copied().unwrap_or(usize::MAX)).unwrap_or(u32::MAX)
+}
+
+/// The transport identities of this seat's host-chosen witness ring.
+///
+/// Split from [`apply_witness_ring`] so the resolution — the part that decides
+/// *who* is streamed to — can be checked against
+/// [`crate::swarm::witness_recipients`] without standing a `Bot` up.
+///
+/// Order is the manifest's, which is the host's ring order, not the map's:
+/// `witness_links` truncates at `MAX_WITNESS_LINKS`, so a reordering here would
+/// silently choose a different subset if the ring were ever longer than the
+/// link budget.
+fn witness_ring_members(manifest: &crate::exterior::StartManifest) -> Vec<NodeId> {
+    let node_by_slot: BTreeMap<usize, NodeId> = manifest
+        .active
+        .iter()
+        .filter_map(|seat| {
+            seat.node
+                .parse::<NodeId>()
+                .ok()
+                .map(|node| (seat.slot, node))
+        })
+        .collect();
+    manifest
+        .witness_recipients
+        .iter()
+        .filter_map(|slot| node_by_slot.get(slot).copied())
+        .collect()
+}
+
+/// Install the host's witness ring for this seat, in place of a guess.
+///
+/// # What the witness set is a sample of, and why the host owns it (#1130)
+///
+/// A witness set is not "some peers": it is one side of a **reciprocal ring**.
+/// `Swarm::seed_witnesses` and `Swarm::refresh_live_witnesses` assign peer *i*
+/// the next [`MAX_WITNESS_LINKS`](orrery_witness::plugin::MAX_WITNESS_LINKS)
+/// slots around the frozen active-seat ring, and then arm *exactly those* peers
+/// as watchers of *i*. The set a peer streams to and the set the host arms
+/// against it are therefore the same list, computed once by
+/// `swarm::witness_recipients`, and the whole evidentiary value of the
+/// arrangement is that they agree: a watch is armed because a stream is coming,
+/// and a stream is sent because a watch is waiting.
+///
+/// The runner sent no such list. Nothing here ever called `set_witness_set`, so
+/// `orrery_witness::plugin::witness_links` took its documented fallback — the
+/// first seven island peers **in NodeId byte order**, from whatever
+/// `IslandMembership` currently held. NodeId order is a function of key
+/// material nobody coordinates, and after #1128 that membership is the
+/// once-a-second *audience* roster, so the fallback also moved as the seat
+/// flew. Neither has any relation to the host's slot ring. At eight seats the
+/// two lists overlapped six of seven and looked correct; at the criterion's
+/// thirty-two they overlapped **two of seven**, and the other five armed
+/// watches were shown nothing for the whole hour.
+///
+/// So the host's list is the right one, and not merely by fiat: it is the list
+/// the host **armed watches from**. A seat that chose its own would be choosing
+/// who watches it, which is the one thing a witnessed subject must not do.
+///
+/// The ring travels in the accept and again in every live `StartV1` membership
+/// frame, so it is reinstalled on every membership change for the same reason
+/// the host recomputes it there — the ring's members change when the roster
+/// does.
+fn apply_witness_ring(
+    bot: &mut Bot,
+    manifest: &crate::exterior::StartManifest,
+    slot_of: &mut BTreeMap<NodeId, usize>,
+    node_of: &mut BTreeMap<usize, NodeId>,
+) -> usize {
+    for seat in &manifest.active {
+        let Ok(node) = seat.node.parse::<NodeId>() else {
+            continue;
+        };
+        // The manifest is also the authoritative slot/identity map, and the
+        // seats it names include humans the audience roster may not cover.
+        slot_of.insert(node, seat.slot);
+        node_of.insert(seat.slot, node);
+    }
+    let members = witness_ring_members(manifest);
+    if members.len() != manifest.witness_recipients.len() {
+        // Loud, because the alternative is a quietly short ring: every slot the
+        // host armed a watch from and this seat cannot address is a watch that
+        // will be shown nothing, which is the whole of #1130.
+        eprintln!(
+            "gates/p1-swarm: witness ring names {} seats but only {} resolve to an identity; \
+             the unresolved ones are armed host-side and will be shown nothing",
+            manifest.witness_recipients.len(),
+            members.len(),
+        );
+    }
+    // An empty ring is *not* installed: `witness_links` reads empty as "use the
+    // fallback", so writing one back would reinstate the defect rather than
+    // clear it. A membership with nobody to witness this seat is a real state
+    // (a lone seat), and the fallback over an empty island is also empty.
+    let installed = members.len();
+    if !members.is_empty() {
+        for node in &members {
+            bot.link(*node, 1_200);
+        }
+        bot.set_witness_set(members);
+    }
+    installed
 }
 
 /// Install the coordinator's roster in place of whatever this seat believed.
@@ -442,4 +603,159 @@ fn apply_roster(
         });
     }
     bot.set_island(peers);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exterior::{ActiveSeat, StartManifest};
+    use crate::swarm::witness_recipients;
+    use orrery_net::island::IslandMembership;
+    use orrery_witness::plugin::{witness_links, WitnessSet, MAX_WITNESS_LINKS};
+
+    /// The criterion's population: thirty-two bots and one human seat.
+    const BOTS: usize = 32;
+    const HUMAN_SLOT: usize = BOTS;
+
+    fn manifest_for(subject: usize) -> StartManifest {
+        let active = (0..=BOTS)
+            .map(|slot| ActiveSeat {
+                slot,
+                node: bot_key(slot).public().to_string(),
+                entity: slot as u64 + 1,
+            })
+            .collect::<Vec<_>>();
+        let active_slots = active.iter().map(|seat| seat.slot).collect::<Vec<_>>();
+        StartManifest {
+            attempt_id: "witness-ring-test".to_owned(),
+            seed: 7,
+            tick: 0,
+            island_seats: u16::try_from(BOTS + 1).expect("the test population fits u16"),
+            witness_recipients: witness_recipients(&active_slots, subject),
+            active,
+            duration_ticks: 60 * TICK_HZ,
+        }
+    }
+
+    /// The island the seat's witness plugin would fall back over: every other
+    /// seat, in whatever order the roster was built.
+    fn island_of_everyone_else(subject: usize, seats: usize) -> IslandMembership {
+        IslandMembership {
+            peers: (0..=seats)
+                .filter(|slot| *slot != subject)
+                .map(|slot| PeerEntry {
+                    node: bot_key(slot).public(),
+                    cells: Vec::new(),
+                })
+                .collect(),
+            ..IslandMembership::default()
+        }
+    }
+
+    fn slots_of(nodes: &[NodeId], seats: usize) -> Vec<usize> {
+        let by_node: BTreeMap<NodeId, usize> = (0..=seats)
+            .map(|slot| (bot_key(slot).public(), slot))
+            .collect();
+        nodes
+            .iter()
+            .map(|node| *by_node.get(node).expect("a seat of this island"))
+            .collect()
+    }
+
+    /// The defect, stated as an inequality (#1130).
+    ///
+    /// This is what the old code fails. Nothing gave the runner a
+    /// [`WitnessSet`], so `witness_links` took its NodeId-order fallback and
+    /// the human seat streamed its authored log to the seven lowest **NodeIds**
+    /// of the island, while the host armed the next seven **slots** after it.
+    /// Both lists are computed here from the real functions, so the numbers are
+    /// the code's rather than the issue's. Measured, at thirty-two bots and one
+    /// human seat: the host armed slots `[0, 1, 2, 3, 4, 5, 6]` and the seat
+    /// streamed to `[1, 18, 13, 22, 27, 30, 2]` — an overlap of **two**, so
+    /// **five of seven armed watches were shown nothing at all**, for the whole
+    /// hour, while the report printed `observation_coverage 1.0`.
+    #[test]
+    fn nodeid_order_and_slot_order_name_different_seats_at_the_criterion_population() {
+        let manifest = manifest_for(HUMAN_SLOT);
+        let armed = manifest.witness_recipients.clone();
+        assert_eq!(
+            armed.len(),
+            MAX_WITNESS_LINKS,
+            "the host arms seven watches against a seat at this population"
+        );
+
+        let fallback = witness_links(
+            &WitnessSet::default(),
+            &island_of_everyone_else(HUMAN_SLOT, BOTS),
+        );
+        let streamed = slots_of(&fallback, BOTS);
+
+        let overlap = streamed.iter().filter(|slot| armed.contains(slot)).count();
+        // An armed slot the seat does not stream to is a watch shown nothing at
+        // all — not a degraded watch, a dark one.
+        let dark = armed.iter().filter(|slot| !streamed.contains(slot)).count();
+        assert_eq!(
+            dark + overlap,
+            MAX_WITNESS_LINKS,
+            "every armed watch is either fed or dark"
+        );
+        assert!(
+            dark >= 4,
+            "the NodeId-order fallback left {dark} of {MAX_WITNESS_LINKS} armed watches dark; \
+             armed {armed:?}, streamed {streamed:?}"
+        );
+    }
+
+    /// The fix, stated as an equality.
+    ///
+    /// The seat streams to exactly the seats the host armed against it — not a
+    /// superset, not the same set in another order, and not a set this process
+    /// chose. A witnessed subject does not pick its own witnesses.
+    #[test]
+    fn the_installed_ring_is_exactly_what_the_host_armed() {
+        for subject in [HUMAN_SLOT, 0, BOTS / 2] {
+            let manifest = manifest_for(subject);
+            let installed = slots_of(&witness_ring_members(&manifest), BOTS);
+            assert_eq!(
+                installed, manifest.witness_recipients,
+                "slot {subject}: the ring installed from the manifest must be the host's own \
+                 list, in the host's own order"
+            );
+        }
+    }
+
+    /// At eight seats the two orders nearly agree, which is why every fixture
+    /// in this gate ran green while the criterion's own population did not.
+    ///
+    /// Measured: armed `[0, 1, 2, 3, 4, 5, 6]` against streamed
+    /// `[1, 2, 0, 3, 5, 6, 7]` — six of seven, one dark. Worth stating exactly,
+    /// because eight bots and one human seat is the population
+    /// `scripts/p4-campaign-session.sh` documents for a volunteer session: the
+    /// defect was never invisible there, only *small*, and one seventh of a
+    /// human hour's witnesses is still a seventh.
+    ///
+    /// The gate's own exterior leg is smaller still and genuinely cannot see
+    /// it: `gates/p1-swarm/tests/external_join.rs` runs `--peers 4`, where five
+    /// active slots make the ring `min(7, 4) = 4` — every other seat — so both
+    /// orders name the same set and the overlap is exact.
+    #[test]
+    fn the_gates_own_fixture_population_cannot_tell_the_two_orders_apart() {
+        let small = 8usize;
+        let active_slots = (0..=small).collect::<Vec<_>>();
+        let armed = witness_recipients(&active_slots, small);
+        let streamed = slots_of(
+            &witness_links(
+                &WitnessSet::default(),
+                &island_of_everyone_else(small, small),
+            ),
+            small,
+        );
+        let overlap = streamed.iter().filter(|slot| armed.contains(slot)).count();
+        assert!(
+            overlap + 1 >= armed.len(),
+            "at eight seats the orders were expected to be nearly indistinguishable, which is \
+             the reason this defect survived every fixture: armed {armed:?}, streamed \
+             {streamed:?}"
+        );
+    }
 }

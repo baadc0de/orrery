@@ -2015,6 +2015,16 @@ fn main() -> Result<()> {
             report.total_frames_rejected,
             report.total_frames_rejected_unanchored,
         );
+        // Printed immediately under the coverage line, because it is what the
+        // coverage line's denominator now contains (#1130). Until this figure
+        // existed a dark watch moved neither term of that ratio, so a report
+        // could say 100% over a population that was mostly not observed and
+        // nothing anywhere in it disagreed.
+        eprintln!(
+            "gates/p1-swarm: {} of {} armed watches were shown nothing at all, each charged its \
+             subject's whole run in the coverage above",
+            report.total_watches_dark, report.total_watches_armed,
+        );
         // Coverage is one minus what is in flight through repair, so the line
         // above is only half a finding without this one: it says how much was
         // missed, and this says where it went. A deficit that cannot be spent

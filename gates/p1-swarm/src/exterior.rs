@@ -67,8 +67,39 @@ use std::sync::{Arc, Mutex};
 /// Bots link at MTU 1_200 (`Bot::link`), but witness log frames and repair
 /// control travel whole on the stream lane, so the cap is generous rather than
 /// MTU-bound. It exists to bound a hostile or desynced length field, not to
-/// police the senders, who never approach it.
-pub const MAX_FRAME_BYTES: u32 = 64 * 1_024;
+/// police the senders.
+///
+/// # It used to police one sender, silently (#1131)
+///
+/// This was `64 * 1_024`, and its doc claimed the senders "never approach it".
+/// That was untrue of exactly one sender, the one this bridge exists to carry:
+/// a witness repair response. [`repair_response_budget`] sizes an answer at one
+/// upload window's allowance — 125_000 bytes at the criterion's 1 Mbps, already
+/// about twice the old cap — floored at one MTU and ceilinged at
+/// [`control_payload_budget`], which is `MAX_STREAM_MESSAGE_LEN - 1`, one byte
+/// under a mebibyte. So the legal maximum on the lane this bridge relays was
+/// **sixteen times** what the bridge would carry, and the frame that reached it
+/// grew with how long a chain gap had been open: reached by duration, not by
+/// load.
+///
+/// The bound is now the lane's own, taken from the same constant rather than
+/// written down a second time, and the assertion below is what keeps the two
+/// from drifting apart again. Both were opened together; neither can move
+/// alone.
+///
+/// [`repair_response_budget`]: orrery_witness::plugin::repair_response_budget
+/// [`control_payload_budget`]: orrery_net::peer_link::control_payload_budget
+pub const MAX_FRAME_BYTES: u32 = 1_024 * 1_024;
+
+// The mismatch #1131 was, refused at compile time. A repair response sized
+// against the control lane's ceiling must fit one bridge frame whole: this
+// bridge does not fragment, and the arms that would drop the frame are now
+// loud (`bridge::pump_writer`, `bridge::pump_ordered_reader_to`) but still
+// fatal to the link.
+const _: () = assert!(
+    MAX_FRAME_BYTES as usize >= orrery_net::peer_link::control_payload_budget(),
+    "the exterior bridge must carry the largest frame the witness control lane may emit"
+);
 
 /// Why QUIC declared an exterior connection closed.
 ///
@@ -602,6 +633,16 @@ pub struct RemoteLink {
     /// The real connection, retained so graceful shutdown can send
     /// `CONNECTION_CLOSE` instead of relying on runtime destruction.
     pub connection: Option<iroh::endpoint::Connection>,
+    /// The membership the host accepted this seat into, when it sent one.
+    ///
+    /// **This used to be dropped on the floor (#1130).** `remote_join` matched
+    /// the accept as `JoinReply::Accept { index, manifest: _ }`, so the one
+    /// authoritative statement of who witnesses this seat —
+    /// [`StartManifest::witness_recipients`], computed by the same
+    /// `witness_recipients` the host arms its watches from — never reached the
+    /// runner. `None` is the bare nine-byte compatibility accept, and the
+    /// runner says so out loud rather than silently guessing a witness set.
+    pub manifest: Option<StartManifest>,
 }
 
 impl RemoteLink {
@@ -672,6 +713,7 @@ pub fn link_pair_accepted_at(accepted_at_unix_millis: u64) -> (HostLink, RemoteL
             // this channel would only exist for a symmetry nobody uses.
             connected,
             connection: None,
+            manifest: None,
         },
     )
 }

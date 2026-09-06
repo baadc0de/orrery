@@ -481,12 +481,19 @@ impl PendingJoin {
         pump_ordered_reader_to(
             "host",
             Arc::clone(&goodbye),
+            Arc::clone(&connected),
             self.connection.clone(),
             uplink_recv,
             uplink_tx,
             Some(meta_tx),
         );
-        pump_writer("host", self.connection, downlink_send, downlink_rx);
+        pump_writer(
+            "host",
+            Arc::clone(&connected),
+            self.connection,
+            downlink_send,
+            downlink_rx,
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok((
@@ -667,16 +674,21 @@ pub async fn remote_join(
     // `LobbyWait` at it meanwhile (#994). Each beat resets the per-message
     // read timeout, so waiting out a lobby is bounded by silence rather than
     // by how long the lobby takes.
+    // Retained, not discarded (#1130): the accept carries this seat's
+    // host-chosen witness ring, and dropping it here is what left the runner
+    // computing its own from NodeId byte order.
+    let accepted_manifest;
     loop {
         let reply_bytes = read_message(&mut recv).await?;
         match JoinReply::decode(&reply_bytes).map_err(|reason| anyhow::anyhow!("{reason}"))? {
             JoinReply::Accept {
                 index: assigned,
-                manifest: _,
+                manifest,
             } => {
                 if assigned != index {
                     bail!("the host assigned slot {assigned}; this peer derived {index}");
                 }
+                accepted_manifest = manifest;
                 break;
             }
             JoinReply::Reject { reason } => bail!("the host refused the join: {reason}"),
@@ -732,18 +744,26 @@ pub async fn remote_join(
     pump_ordered_reader_to(
         "remote",
         Arc::clone(&goodbye),
+        Arc::clone(&connected),
         connection.clone(),
         downlink_recv,
         inbound_tx,
         None,
     );
-    pump_writer("remote", connection.clone(), uplink_send, outbound_rx);
+    pump_writer(
+        "remote",
+        Arc::clone(&connected),
+        connection.clone(),
+        uplink_send,
+        outbound_rx,
+    );
 
     Ok(RemoteLink {
         downlink: std::sync::Mutex::new(inbound_rx),
         uplink: outbound_tx,
         connected,
         connection: Some(connection),
+        manifest: accepted_manifest,
     })
 }
 
@@ -785,10 +805,23 @@ fn watch_connection(
 /// Frame reader over the ordered stream: everything arriving is routed by
 /// lane. A mid-frame end or a bad length ends the connection — after a desync
 /// there are no frame boundaries left to find.
+///
+/// # A read fault is a dead link, and says so (#1131)
+///
+/// This loop was `while let Ok(Some(frame)) = read_stream_frame(..).await`,
+/// which folded the two ways it can stop into one: `Ok(None)` is a clean end at
+/// a frame boundary, and `Err` is a desync — an unknown lane byte, or a length
+/// past [`MAX_FRAME_BYTES`](crate::exterior::MAX_FRAME_BYTES). They are the
+/// same shape to a `while let`, so a bridge that had lost frame alignment
+/// simply stopped delivering, printed nothing, and left `connected` true — the
+/// seat went on banking minutes on a link with no downlink. The two arms are
+/// separated here: the fault prints unconditionally and marks the link dead, so
+/// the criterion's clean-close clause fails the attempt instead of banking it.
 #[allow(clippy::too_many_arguments)]
 fn pump_ordered_reader_to(
     side: &'static str,
     goodbye: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     connection: Connection,
     mut recv: RecvStream,
     uplink_tx: tokio::sync::mpsc::Sender<Frame>,
@@ -809,7 +842,23 @@ fn pump_ordered_reader_to(
                 recv.id()
             );
         }
-        while let Ok(Some(frame)) = read_stream_frame(&mut recv).await {
+        loop {
+            let frame = match read_stream_frame(&mut recv).await {
+                Ok(Some(frame)) => frame,
+                // Clean end at a frame boundary. The transport watcher owns the
+                // liveness verdict for this case; nothing is wrong here.
+                Ok(None) => break,
+                Err(error) => {
+                    // Unconditional. #1051 and #1105 were both an error arm
+                    // behind a debug flag, and so was this one.
+                    eprintln!(
+                        "gates/p1-swarm: bridge[{side}][{pid}]: READ FAILED, link is down: \
+                         {error}"
+                    );
+                    mark_dead(&connected);
+                    break;
+                }
+            };
             // The runner's clean end-of-run marker: a meta frame whose whole
             // payload is one 0xFF byte. Nothing else may look like this.
             if frame.lane == Lane::Meta && frame.payload.as_ref() == [0xFFu8] {
@@ -829,8 +878,18 @@ fn pump_ordered_reader_to(
 
 /// The writer every side runs: takes its outbound queue and writes each frame
 /// onto the stream in whatever order the queue holds.
+///
+/// # A write fault is a dead link, and says so (#1131)
+///
+/// The failure arm used to `break` with the error printed only under
+/// `P1_SWARM_BRIDGE_DEBUG`. After the break every later frame landed in
+/// `downlink_after_close`, which `Swarm` reads as a *disconnect artefact rather
+/// than a fault* — so the one counter that moved was the one trained to be
+/// ignored, and `connected` stayed true. The arm is unconditional now and marks
+/// the link dead, which is what turns a dead downlink into a refused attempt.
 fn pump_writer(
     side: &'static str,
+    connected: Arc<AtomicBool>,
     connection: Connection,
     mut shared_send: SendStream,
     outbound_rx: tokio::sync::mpsc::Receiver<Frame>,
@@ -864,9 +923,14 @@ fn pump_writer(
                     }
                 }
                 Err(error) => {
-                    if debug {
-                        eprintln!("bridge[{}]: WRITE FAILED: {error}", pid);
-                    }
+                    eprintln!(
+                        "gates/p1-swarm: bridge[{side}][{pid}]: WRITE FAILED on lane {:?} peer \
+                         {} ({} payload bytes), link is down: {error}",
+                        frame.lane,
+                        frame.peer,
+                        frame.payload.len(),
+                    );
+                    mark_dead(&connected);
                     break;
                 }
             }
@@ -1063,6 +1127,179 @@ mod tests {
             matches!(&up1, f if f.lane == Lane::Datagram && f.peer == 0),
             "first uplink frame routed: {up1:?}"
         );
+    }
+
+    /// A witness repair, the size the control lane may actually make one, over
+    /// the real bridge (#1131).
+    ///
+    /// The frame this pushes is `repair_response_budget` at the criterion's
+    /// 1 Mbps upload allowance — 125_000 bytes, the ordinary size of an answer
+    /// to a chain gap a couple of seconds old. The old `MAX_FRAME_BYTES` was
+    /// 65_536, so this frame was refused by `encode_frame` at the writer, the
+    /// pump broke its loop with the error printed only under a debug
+    /// environment variable, and every later frame for that seat's whole
+    /// session went into the closed queue — while `connected` stayed true and
+    /// the seat went on banking minutes against a downlink that had stopped.
+    ///
+    /// The assertion is deliberately the whole round trip rather than the
+    /// constant: a cap that permits the frame but a reader that refuses it
+    /// would be the same outage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repair_sized_frame_crosses_the_bridge_whole() {
+        let repair_bytes = orrery_witness::plugin::repair_response_budget(&criterion_budget());
+        assert!(
+            repair_bytes > 64 * 1_024,
+            "this test is about a frame the old 64 KiB cap refused; the budget is now \
+             {repair_bytes} bytes"
+        );
+        assert!(
+            repair_bytes <= MAX_FRAME_BYTES as usize,
+            "a legal repair must fit one bridge frame: {repair_bytes} against {MAX_FRAME_BYTES}"
+        );
+
+        let slot = 3usize;
+        let (host_link, remote_link, _keep) = loopback_pair(slot).await;
+
+        // The shape of the traffic that reaches this: a control-lane repair
+        // answer travelling host-to-seat on the stream lane, whole.
+        let payload = bytes::Bytes::from(vec![0x5Au8; repair_bytes]);
+        host_link
+            .downlink
+            .send(Frame {
+                peer: 0,
+                lane: Lane::StreamShared,
+                payload: payload.clone(),
+            })
+            .await
+            .expect("downlink queue accepts");
+
+        let mut arrived = None;
+        for _ in 0..100 {
+            let attempt = {
+                let mut r = remote_link.downlink.lock().expect("downlink lock");
+                r.try_recv()
+            };
+            if let Ok(frame) = attempt {
+                // The announce beacon is an empty Meta frame; skip past it.
+                if frame.lane == Lane::StreamShared {
+                    arrived = Some(frame);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let arrived = arrived.expect("the repair-sized frame crossed the bridge");
+        assert_eq!(
+            arrived.payload.len(),
+            repair_bytes,
+            "the repair arrived whole, not truncated"
+        );
+        assert_eq!(arrived.payload, payload, "and byte-identical");
+        assert!(
+            remote_link
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "carrying a legal repair does not disturb the link"
+        );
+    }
+
+    /// A frame the bridge cannot carry takes the link down, loudly (#1131).
+    ///
+    /// With the cap at the control lane's own ceiling nothing legal reaches
+    /// this, so what is pinned here is the *arm*: a write that fails must not
+    /// leave a live-looking link behind. Before this change it did — the error
+    /// was printed only under `P1_SWARM_BRIDGE_DEBUG`, `connected` stayed true,
+    /// and `connected_ticks` kept incrementing over a downlink that had stopped
+    /// forever. That combination is what makes a silent drop bankable, and it
+    /// is the combination this refuses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unwritable_frame_marks_the_link_down_instead_of_dropping_it_quietly() {
+        let slot = 4usize;
+        let (host_link, _remote_link, _keep) = loopback_pair(slot).await;
+        assert!(
+            host_link
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the link starts up"
+        );
+
+        host_link
+            .downlink
+            .send(Frame {
+                peer: 0,
+                lane: Lane::StreamShared,
+                payload: bytes::Bytes::from(vec![0u8; MAX_FRAME_BYTES as usize + 1]),
+            })
+            .await
+            .expect("the queue accepts it; the writer is where it fails");
+
+        let mut down = false;
+        for _ in 0..100 {
+            if !host_link
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                down = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            down,
+            "a frame the writer refused must mark the link down; a silent drop with connected \
+             still true is what #1131 was"
+        );
+    }
+
+    /// The criterion's upload allowance, which is what sizes a repair answer:
+    /// 1 Mbps over a one-second window, which is this type's own default and
+    /// the number `SwarmReport::identity.upload_budget_bits` carries.
+    fn criterion_budget() -> orrery_net::budget::UploadBudget {
+        orrery_net::budget::UploadBudget::default()
+    }
+
+    /// The whole bridge over loopback, ready for traffic.
+    ///
+    /// The returned endpoints must outlive the links: dropping the last
+    /// `Endpoint` handle closes every connection under them, which is the
+    /// joined-but-deaf slot #385 spent an afternoon on.
+    async fn loopback_pair(slot: usize) -> (HostLink, RemoteLink, (Endpoint, Endpoint)) {
+        let expected = bot_key(slot).public();
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot), None).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+
+        let host_task = {
+            let host_ep = host_ep.clone();
+            tokio::spawn(async move {
+                host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    true,
+                    &crate::exterior::Admission::open(),
+                )
+                .await
+            })
+        };
+        let remote_link = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &JoinRequest::plain("test".into()),
+            slot,
+            Some(valid_anchor(slot, &bot_key(slot))),
+        )
+        .await
+        .expect("remote join completes");
+        let (host_link, _anchor, _remote) = host_task
+            .await
+            .expect("host task")
+            .expect("the join is accepted");
+        (host_link, remote_link, (host_ep, remote_ep))
     }
 
     /// The socket accept and `with_external` call are the production seating
