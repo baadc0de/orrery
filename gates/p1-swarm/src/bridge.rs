@@ -44,7 +44,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use iroh::endpoint::{Connection, ConnectionError, QuicTransportConfig, RecvStream, SendStream};
+use iroh::endpoint::{
+    Connection, ConnectionError, Incoming, QuicTransportConfig, RecvStream, SendStream,
+};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use orrery_core::CoreCodec;
 use orrery_games::regolith::state::RegolithState;
@@ -62,6 +64,17 @@ pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/5";
 
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many join handshakes the host runs at once behind one accept loop.
+///
+/// The loop that feeds them is what must never block: `endpoint.accept()` has
+/// to keep being polled or a *dial* fails, which a client reports as an
+/// unreachable host rather than as a refusal (#1144). Sixteen is a cap on how
+/// much a flood of silent diallers can allocate, not a throughput target — a
+/// live island seats a handful of humans. When all sixteen are occupied the
+/// accept loop does pause, but every occupant is bounded by
+/// [`HANDSHAKE_READ_TIMEOUT`], so the pause is bounded too.
+const MAX_CONCURRENT_HANDSHAKES: usize = 16;
 
 /// Connection-wide QUIC inactivity allowed before a vanished exterior closes.
 ///
@@ -460,11 +473,16 @@ impl PendingJoin {
         announce(&mut downlink_send)
             .await
             .context("downlink announce failed")?;
-        let uplink_recv = self
-            .connection
-            .accept_uni()
-            .await
-            .context("uplink stream never arrived")?;
+        // The second unbounded stream wait #1144 found. This one is reached
+        // only after a seat has been accepted, but the bind step is
+        // deliberately serial (see `JoinAcceptor`), so an accepted peer that
+        // then opens no uplink would hold the seating queue exactly the way
+        // the silent dialler held the accept loop.
+        let uplink_recv =
+            tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, self.connection.accept_uni())
+                .await
+                .context("uplink stream never arrived before the handshake deadline")?
+                .context("uplink stream never arrived")?;
 
         let connected = Arc::new(AtomicBool::new(true));
         let (uplink_tx, uplink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
@@ -524,15 +542,33 @@ pub async fn host_prepare(
         .accept()
         .await
         .context("exterior endpoint closed while waiting for the join")?;
+    host_prepare_incoming(incoming, expected, admission).await
+}
+
+/// The handshake half of [`host_prepare`], on a connection already accepted.
+///
+/// Split out so the accept loop can keep polling `endpoint.accept()` while
+/// this runs — see [`JoinAcceptor`] — and so every wait inside it is bounded.
+pub async fn host_prepare_incoming(
+    incoming: Incoming,
+    expected: Option<(usize, NodeId)>,
+    admission: &crate::exterior::Admission,
+) -> Result<PendingJoin> {
     let connection = incoming
         .accept()
         .context("join failed to start")?
         .await
         .context("join handshake failed")?;
     let remote = connection.remote_id();
-    let (mut send, mut recv) = connection
-        .accept_bi()
+    // Bounded for the same reason the reads below are, and it is the wait
+    // that most needed it (#1144): a peer that completes the QUIC handshake
+    // and opens no stream is *working*, not idle, so iroh's keep-alive means
+    // `EXTERIOR_MAX_IDLE_TIMEOUT` never fires on it. Before this timeout the
+    // wait was unbounded and the host held the attempt for the life of the
+    // process.
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, connection.accept_bi())
         .await
+        .context("the handshake stream never arrived")?
         .context("no handshake stream arrived")?;
     let request_bytes = read_message(&mut recv).await?;
     let request =
@@ -593,6 +629,90 @@ pub async fn host_prepare(
         index,
         session_id: request.session_id,
     })
+}
+
+/// A join accept loop that never stops polling `endpoint.accept()`.
+///
+/// # Why this exists rather than a timeout alone
+///
+/// #1144 measured two distinct failures from one silent dialler. A timeout on
+/// the handshake (added above) fixes the first: the attempt is no longer held
+/// forever. It does not fix the second. While *any* handshake is in flight on
+/// a serial `host_prepare` loop, `endpoint.accept()` is not polled at all, so
+/// the next volunteer's **dial** fails at the transport layer — which the
+/// client reports identically to the host being down, with no refusal named
+/// anywhere. A ten-second timeout would turn a permanent blackout into a
+/// ten-second one for every waiting joiner, which is still a blackout.
+///
+/// So the loop is split in two. This task owns the endpoint and does exactly
+/// one thing that can block: `accept()`. Each `Incoming` is handed to its own
+/// task, and only the *completed* [`PendingJoin`]s (and the named refusals)
+/// come back down the channel, in the order they finished. A stuck handshake
+/// now costs its own connection and nothing else.
+///
+/// # What stays serial, deliberately
+///
+/// Everything downstream of this: the caller drains one prepared join at a
+/// time and does its seat bookkeeping — `seat_lobby_arrival`,
+/// `reserve_live_join`, `PendingJoin::finish` — without concurrency. That is
+/// what makes "slot already bound" a decidable question with a single answer,
+/// and `finish` is where the lobby freeze and the `StartV1` roster are
+/// ordered. Only the *authentication* of a stranger, which is the part a
+/// stranger controls the timing of, runs concurrently.
+pub struct JoinAcceptor {
+    prepared: tokio::sync::mpsc::Receiver<Result<PendingJoin>>,
+    accept_loop: tokio::task::JoinHandle<()>,
+}
+
+impl JoinAcceptor {
+    /// Start accepting on `endpoint` until the acceptor is dropped.
+    pub fn new(
+        endpoint: Endpoint,
+        expected: Option<(usize, NodeId)>,
+        admission: crate::exterior::Admission,
+    ) -> Self {
+        let (prepared_tx, prepared) = tokio::sync::mpsc::channel(MAX_CONCURRENT_HANDSHAKES);
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        let accept_loop = tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                // Taken before the spawn so a flood cannot allocate without
+                // bound; released when the handshake resolves.
+                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                    break;
+                };
+                let prepared_tx = prepared_tx.clone();
+                let admission = admission.clone();
+                tokio::spawn(async move {
+                    let outcome = host_prepare_incoming(incoming, expected, &admission).await;
+                    // A closed channel means the acceptor is gone; the
+                    // connection drops with it.
+                    let _ = prepared_tx.send(outcome).await;
+                    drop(permit);
+                });
+            }
+        });
+        Self {
+            prepared,
+            accept_loop,
+        }
+    }
+
+    /// The next finished handshake, accepted or refused by name.
+    ///
+    /// `None` once the endpoint has closed and every in-flight handshake has
+    /// resolved — the caller's loop must end rather than spin.
+    pub async fn next(&mut self) -> Option<Result<PendingJoin>> {
+        self.prepared.recv().await
+    }
+}
+
+impl Drop for JoinAcceptor {
+    fn drop(&mut self) {
+        // The lobby hands the endpoint to the run when it closes; stop
+        // accepting on it first. Same abandonment the held accept future had
+        // when it was dropped, minus the wait.
+        self.accept_loop.abort();
+    }
 }
 
 /// Host side: accepts the exterior peer's connection and runs the handshake.
@@ -944,6 +1064,140 @@ mod tests {
     use crate::bot::{bot_key, host_key};
     use crate::exterior::{Frame, JoinRequest, Lane};
     use orrery_games::{Game, Regolith};
+
+    fn loopback_address(endpoint: &Endpoint) -> EndpointAddr {
+        let socket = endpoint.bound_sockets()[0];
+        HostAddress {
+            node: endpoint.id(),
+            direct: vec![socket],
+        }
+        .to_addr(Some(socket))
+    }
+
+    /// #1144, the half a timeout fixes: a peer that completes the QUIC
+    /// handshake and opens no stream must be refused, not held.
+    ///
+    /// Before the bound on `accept_bi`, this attempt stayed pending for the
+    /// life of the process — measured at 40 s by the hunt and at 15 s here —
+    /// because iroh's keep-alive means a silent connection is never an idle
+    /// one, so `EXTERIOR_MAX_IDLE_TIMEOUT` could never rescue it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_dialler_is_refused_at_the_handshake_deadline() {
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let address = loopback_address(&host_ep);
+        let host = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let outcome = host_prepare(&host_ep, None, &crate::exterior::Admission::open()).await;
+            (started.elapsed(), outcome.is_err())
+        });
+
+        let quiet_ep = bind(iroh_base::SecretKey::from_bytes(&[0xC1; 32]), None)
+            .await
+            .expect("quiet endpoint");
+        let _quiet = quiet_ep
+            .connect(address, EXTERIOR_ALPN)
+            .await
+            .expect("silent dialler connects");
+
+        let (elapsed, refused) = tokio::time::timeout(Duration::from_secs(30), host)
+            .await
+            .expect("the handshake must not outlive its deadline")
+            .expect("host task");
+        assert!(refused, "a stream that never arrives is not a join");
+        assert!(
+            elapsed >= HANDSHAKE_READ_TIMEOUT && elapsed < HANDSHAKE_READ_TIMEOUT * 2,
+            "the refusal must land at the handshake deadline, not before or long after: {elapsed:?}"
+        );
+    }
+
+    /// #1144, the half only concurrency fixes, and the one the hunt measured
+    /// as session-fatal: a silent dialler standing in front of a good seat.
+    ///
+    /// The assertion is that the **second seat completes**, not merely that
+    /// the first is dropped. On the serial `host_prepare` loop this failed at
+    /// the *dial* — `endpoint.accept()` was never polled while the wedged
+    /// handshake ran, so the volunteer's client reported an unreachable host
+    /// with no refusal named anywhere. Measured on the old code: the good
+    /// seat's dial gave up after 10.0 s having reached nothing. The seat must
+    /// also not merely survive the stall but be unaware of it, so the elapsed
+    /// bound below is well inside a single handshake deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_dialler_does_not_delay_the_seat_behind_it() {
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let address = loopback_address(&host_ep);
+        let seat = 4usize;
+        let host = tokio::spawn(async move {
+            let mut acceptor = JoinAcceptor::new(
+                host_ep.clone(),
+                Some((seat, bot_key(seat).public())),
+                crate::exterior::Admission::open(),
+            );
+            let mut refusals = 0usize;
+            loop {
+                match acceptor.next().await {
+                    Some(Ok(prepared)) => {
+                        let index = prepared.index();
+                        // The endpoint and the seated link both ride back
+                        // out: dropping either here closes the connection the
+                        // joining side is still finishing on.
+                        let seated = prepared.finish(None, false).await.ok();
+                        return (host_ep, index, seated, refusals);
+                    }
+                    Some(Err(_)) => refusals += 1,
+                    None => panic!("the acceptor ended before any seat arrived"),
+                }
+            }
+        });
+
+        // The obstruction goes in first and is given time to be accepted, so
+        // the good seat is genuinely behind it.
+        let quiet_ep = bind(iroh_base::SecretKey::from_bytes(&[0xC2; 32]), None)
+            .await
+            .expect("quiet endpoint");
+        let _quiet = quiet_ep
+            .connect(address.clone(), EXTERIOR_ALPN)
+            .await
+            .expect("silent dialler connects");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let seat_ep = bind(bot_key(seat), None).await.expect("seat endpoint");
+        let started = std::time::Instant::now();
+        let joined = tokio::time::timeout(
+            Duration::from_secs(30),
+            remote_join(
+                &seat_ep,
+                address,
+                &JoinRequest::plain("behind-the-stall".into()),
+                seat,
+                None,
+            ),
+        )
+        .await
+        .expect("the second seat's dial must not time out behind a silent dialler")
+        .expect("the second seat must complete its join behind a silent dialler");
+        let elapsed = started.elapsed();
+        let _keep_link = joined;
+
+        let (_host_ep, index, seated, refusals) =
+            tokio::time::timeout(Duration::from_secs(10), host)
+                .await
+                .expect("the host must have seated the second seat")
+                .expect("host task");
+        assert_eq!(index, seat, "the seat behind the stall is the one seated");
+        assert!(
+            seated.is_some(),
+            "the seat behind the stall is bound, not just accepted"
+        );
+        assert_eq!(
+            refusals, 0,
+            "the stall must still be in flight, not yet timed out, when the good seat lands"
+        );
+        assert!(
+            elapsed < HANDSHAKE_READ_TIMEOUT,
+            "a joiner behind a stalled handshake must not wait on it at all, let alone for a \
+             whole handshake deadline: {elapsed:?}"
+        );
+    }
 
     fn valid_anchor(slot: usize, key: &iroh_base::SecretKey) -> AnchorFrame {
         let entity = PersistId::new(slot as u64 + 1);
