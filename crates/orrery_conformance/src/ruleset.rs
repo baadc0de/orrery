@@ -62,7 +62,16 @@ pub const REFERENCE_RULESET: RulesetId = RulesetId {
     // as versions 5, 6 and 7. Nothing derives a draw from them — the
     // fingerprint names a universe, it does not seed one — so the rules and
     // every canonical chain are untouched; identity-only again.
-    version: 8,
+    //
+    // Version 9: `Ruleset::OVERFLOW_IS_CANONICAL` (#626 stage S0) landed in
+    // `orrery_core`'s ruleset module, which is in this crate's source closure.
+    // It is a declaration, not a rule: `Reference` declares `false` and no
+    // canonical operation reads it. The chains are byte-identical across the
+    // bump -- verified by diffing the emitted report against the previous
+    // golden, where only `ruleset_digest` moved and every `cases` entry
+    // compared equal -- so identity-only again, by the same rule as versions
+    // 5 through 8.
+    version: 9,
     digest: crate::ruleset_digest::RULESET_DIGEST,
 };
 
@@ -253,6 +262,7 @@ impl CoreCodec for Outcome {
 pub struct Reference;
 
 impl Ruleset for Reference {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Body;
     type CoreInput = Command;
     type CoreEvent = Outcome;

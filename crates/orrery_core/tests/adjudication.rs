@@ -100,6 +100,7 @@ const RULESET: RulesetId = RulesetId {
 };
 
 impl Ruleset for Kinematic {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Body;
     type CoreInput = Thrust;
     type CoreEvent = Nothing;
@@ -127,6 +128,7 @@ impl Ruleset for Kinematic {
 }
 
 impl Ruleset for Peeking {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Body;
     type CoreInput = Thrust;
     type CoreEvent = Nothing;
@@ -507,6 +509,7 @@ fn a_bundle_for_another_rules_build_is_undecidable_not_a_strike() {
     // (D11 retains three builds; older bundles simply cannot be judged).
     struct OtherBuild;
     impl Ruleset for OtherBuild {
+        const OVERFLOW_IS_CANONICAL: bool = false;
         type CoreState = Body;
         type CoreInput = Thrust;
         type CoreEvent = Nothing;

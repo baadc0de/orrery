@@ -223,6 +223,7 @@ impl CoreCodec for SyntheticEvent {
 pub struct Synthetic;
 
 impl Ruleset for Synthetic {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = SyntheticState;
     type CoreInput = SyntheticInput;
     type CoreEvent = SyntheticEvent;

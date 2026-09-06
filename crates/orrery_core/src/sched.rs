@@ -358,6 +358,7 @@ mod tests {
     struct Scribe;
 
     impl Ruleset for Scribe {
+        const OVERFLOW_IS_CANONICAL: bool = false;
         type CoreState = Trace;
         type CoreInput = Trace;
         type CoreEvent = Trace;

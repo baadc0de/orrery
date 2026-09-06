@@ -600,6 +600,21 @@ makes it more than a preference:
 > which one wins"* — because a `flagged_*` helper depends on it. Under (B)
 > that dependency does not arise; (f)(4) remains reserved to the owner and
 > is not amended here.
+>
+> **Built 2026-09-05 (#626 stage S0).** The declaration exists in code as
+> `Ruleset::OVERFLOW_IS_CANONICAL`
+> (`crates/orrery_core/src/ruleset.rs`, declared between `CoreEvent` and
+> `id`), an associated `const bool` **with no default body**. Removing it
+> from a ruleset is `E0046`, not a silent `false` — which is the condition
+> the owner attached to choosing (B). Regolith declares `true`, Skirmish
+> `false`, and every other in-tree `impl Ruleset` (fixtures and test
+> rulesets) declares `false`. The obligation the `true` declaration incurs
+> is asserted by
+> `regolith::state::overflow_canonicity::declaring_overflow_canonical_puts_the_flag_inside_the_state_hash`
+> (`crates/orrery_games/src/regolith/state.rs`), which hashes a `Craft` and a
+> `Rock` with the flag clear and set and requires the hashes to differ —
+> dropping the byte from either `CoreCodec::encode` kills it. This builds
+> the amendment; it does not amend it, and (f)(4) is still open.
 
  3. **Occurrence reaches witnessed state, or the flag is theater.** This is
    the part that needs care. A flag is only evidence if it is part of the

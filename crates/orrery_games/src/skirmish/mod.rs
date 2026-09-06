@@ -360,6 +360,7 @@ impl Skirmish {
 }
 
 impl Ruleset for Skirmish {
+    const OVERFLOW_IS_CANONICAL: bool = false;
     type CoreState = Craft;
     type CoreInput = Order;
     type CoreEvent = Outcome;

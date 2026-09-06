@@ -1030,3 +1030,72 @@ impl BloomDirector {
         }
     }
 }
+
+#[cfg(test)]
+mod overflow_canonicity {
+    use super::{Craft, RegolithState, Rock, RockTier};
+    use crate::regolith::{archetype::Archetype, Regolith};
+    use orrery_core::{state_hash, QPos, QVel, Ruleset};
+
+    /// D43 (f)(3), as amended 2026-08-31 (#628): a ruleset that declares
+    /// overflow canonical must carry occurrence inside `bytes(e, t)`, and
+    /// therefore inside `hash(e, t)`.
+    ///
+    /// Regolith declares `true`, so this test is the obligation that
+    /// declaration incurs. Without it the flag could be set, encoded nowhere,
+    /// and prove nothing: two hosts would disagree about occurrence while
+    /// `hash(e, t)` still matched — the exact failure the clause names.
+    ///
+    /// This asserts the hash, not the encoder: a codec change that dropped
+    /// the byte would keep `arithmetic_overflowed` compiling and readable and
+    /// still kill this test.
+    #[test]
+    fn declaring_overflow_canonical_puts_the_flag_inside_the_state_hash() {
+        // Compile-time: if the declaration is flipped to `false` the field and
+        // its encoding must go with it, and this test must be deleted rather
+        // than relaxed. A `const` block so the contradiction is a build
+        // failure rather than a test failure.
+        const {
+            assert!(
+                Regolith::OVERFLOW_IS_CANONICAL,
+                "Regolith carries `arithmetic_overflowed` in canonical state"
+            );
+        }
+
+        let mut craft = Craft::spawned(Archetype::Interceptor, QPos::default(), 0);
+        let clean = state_hash(&RegolithState::Craft(craft.clone()));
+        craft.arithmetic_overflowed = true;
+        assert_ne!(
+            clean,
+            state_hash(&RegolithState::Craft(craft)),
+            "a craft's overflow flag is outside hash(e, t): occurrence would not \
+             reach witnessed state and the flag would be theater (D43 (f)(3))"
+        );
+
+        let mut rock = Rock::spawned(RockTier::Large, 0, QPos::default(), QVel::default());
+        let clean = state_hash(&RegolithState::Rock(rock.clone()));
+        rock.arithmetic_overflowed = true;
+        assert_ne!(
+            clean,
+            state_hash(&RegolithState::Rock(rock)),
+            "a rock's overflow flag is outside hash(e, t): occurrence would not \
+             reach witnessed state and the flag would be theater (D43 (f)(3))"
+        );
+    }
+
+    /// The other half of the amendment: a ruleset that declares `false` makes
+    /// a positive statement, and Skirmish is the in-tree instance of it.
+    ///
+    /// Vacuity guard for the test above — if `OVERFLOW_IS_CANONICAL` were
+    /// silently defaulted rather than declared per ruleset, both rulesets
+    /// would read the same and one of these two assertions would fail.
+    #[test]
+    fn skirmish_declares_overflow_not_canonical() {
+        const {
+            assert!(
+                !crate::skirmish::Skirmish::OVERFLOW_IS_CANONICAL,
+                "Skirmish is the in-tree instance of the `false` declaration"
+            );
+        }
+    }
+}

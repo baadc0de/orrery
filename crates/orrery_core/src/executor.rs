@@ -898,6 +898,7 @@ mod tests {
     pub(crate) struct Kinematic;
 
     impl Ruleset for Kinematic {
+        const OVERFLOW_IS_CANONICAL: bool = false;
         type CoreState = Body;
         type CoreInput = Nudge;
         type CoreEvent = ();
@@ -1089,6 +1090,7 @@ mod tests {
     }
 
     impl Ruleset for Materializer {
+        const OVERFLOW_IS_CANONICAL: bool = false;
         type CoreState = Body;
         type CoreInput = Nudge;
         type CoreEvent = SpawnBatch;
@@ -1302,6 +1304,7 @@ mod tests {
         // cannot claim to be an entity it is not.
         struct Introspect;
         impl Ruleset for Introspect {
+            const OVERFLOW_IS_CANONICAL: bool = false;
             type CoreState = Body;
             type CoreInput = Nudge;
             type CoreEvent = ();
@@ -1342,6 +1345,7 @@ mod tests {
         // only one of them recorded in the log.
         struct SelfPeek;
         impl Ruleset for SelfPeek {
+            const OVERFLOW_IS_CANONICAL: bool = false;
             type CoreState = Body;
             type CoreInput = Nudge;
             type CoreEvent = ();
@@ -1380,6 +1384,7 @@ mod tests {
     fn neighbour_reads_are_reported_for_the_log() {
         struct Peeker;
         impl Ruleset for Peeker {
+            const OVERFLOW_IS_CANONICAL: bool = false;
             type CoreState = Body;
             type CoreInput = Nudge;
             type CoreEvent = ();
@@ -1423,6 +1428,7 @@ mod tests {
     fn executor_hides_neighbor_observations_older_than_ruleset_cap() {
         struct FreshnessPeeker;
         impl Ruleset for FreshnessPeeker {
+            const OVERFLOW_IS_CANONICAL: bool = false;
             type CoreState = Body;
             type CoreInput = Nudge;
             type CoreEvent = ();
@@ -1495,6 +1501,7 @@ mod tests {
     fn a_neighbor_stamped_after_the_readers_tick_is_refused() {
         struct FreshnessPeeker;
         impl Ruleset for FreshnessPeeker {
+            const OVERFLOW_IS_CANONICAL: bool = false;
             type CoreState = Body;
             type CoreInput = Nudge;
             type CoreEvent = ();
@@ -1564,6 +1571,7 @@ mod tests {
         /// position into `rolls`, which nothing else in this ruleset writes.
         struct Copier;
         impl Ruleset for Copier {
+            const OVERFLOW_IS_CANONICAL: bool = false;
             type CoreState = Body;
             type CoreInput = Nudge;
             type CoreEvent = ();
