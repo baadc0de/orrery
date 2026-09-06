@@ -2229,7 +2229,7 @@ impl CampaignRuntime {
     /// `AppExit`; both used to sign a row and discard it, because the only
     /// writer was a Bevy system reading the return value (#947). Nothing
     /// downstream can now lose what this call measured.
-    fn persist_and_queue(&self, record: &SessionRecord) -> RecordDisposition {
+    fn persist_and_queue(&mut self, record: &SessionRecord) -> RecordDisposition {
         // A closing row of a seat that already banked increments is the tail,
         // and a tail below the floor is the ordinary case rather than a failed
         // seating: the volunteer must not be told they lost the session.
@@ -2301,7 +2301,7 @@ impl CampaignRuntime {
                     // become visible. `p4-ledger.sh` is the side that refuses
                     // to *bank* it (#1053). A client that quietly declined to
                     // send it would be #1051 again, one disposition over.
-                    match &self.upload_queue {
+                    match &mut self.upload_queue {
                         Some(queue) => {
                             match crate::admission::queue_finished_session(queue, record) {
                                 Ok(pending) => bevy::log::info!(

@@ -87,7 +87,115 @@ impl ConfiguredImpairment {
 pub struct ImpairmentMeasurement {
     sent: u64,
     dropped: u64,
-    jitter_ms: Vec<u64>,
+    /// Every jitter sample of the seat so far, for the live F3/JSONL readouts.
+    jitter_seat: JitterHistogram,
+    /// The jitter samples since the last increment closed, which is the only
+    /// window a signed row ever reports over — see [`ImpairmentMeasurement::increment_percentile`].
+    jitter_increment: JitterHistogram,
+}
+
+/// Jitter samples at or above this many milliseconds share one bucket (#1123).
+///
+/// A deviation is a whole number of milliseconds, so a bucket per millisecond
+/// is *exact* below the cap rather than an approximation: the percentile a
+/// histogram returns is the same integer a sorted vector returned.
+///
+/// Four seconds is far above anything this measurement is read for. The
+/// campaign injects a spike of about 100 ms
+/// ([`ConfiguredImpairment::from_spike`]) and a downlink whose inter-arrival
+/// interval deviates by four seconds has stopped being a link. A percentile
+/// that lands in the over bucket is reported *as* the cap, which overstates
+/// the deviation rather than understating it — and a shortfall is the only
+/// direction `impairment_mismatch` reads (see [`JITTER_TOLERANCE_MS`]), so the
+/// clamp cannot invent a disagreement that did not happen.
+const JITTER_CAP_MS: usize = 4096;
+
+/// Jitter samples counted by whole millisecond, in memory that does not grow.
+///
+/// The accumulator this replaces was a `Vec<u64>` that was pushed to once per
+/// decoded replication body, never trimmed, and cloned and sorted **twice a
+/// second** for the F3 pane and the JSONL stream (#1123). At the measured
+/// ~300 bodies/s for a six-seat cohort that is 1.08M samples and 7.75 ms of
+/// sort per second after an hour, against a 16.7 ms frame budget — a hitch
+/// that is not there when a tester starts flying, arrives partway through, and
+/// gets worse.
+///
+/// Counting is the right shape and not merely a cheaper one. Nothing ever
+/// reads an individual sample: the two readers are quantiles
+/// ([`ImpairmentMeasurement::percentile`] for the live readouts,
+/// [`ImpairmentMeasurement::increment_percentile`] for the signed row) and a
+/// count. So the samples are kept the way they are read — as a distribution —
+/// and both the memory and the per-readout cost become constant in session
+/// length, with the answer unchanged.
+#[derive(Debug, Clone)]
+struct JitterHistogram {
+    /// `counts[ms]` is how many samples measured exactly `ms` milliseconds.
+    ///
+    /// A boxed slice of fixed length, allocated once: the one allocation this
+    /// type ever makes, and it never grows.
+    counts: Box<[u32]>,
+    /// Samples counted, the buckets and the over-cap tail alike.
+    ///
+    /// Counted rather than derived, and it is what makes the over-cap tail
+    /// need no bucket of its own: `total` exceeding what the buckets hold is
+    /// exactly the condition [`Self::percentile`] walks off the end under.
+    total: u64,
+}
+
+impl Default for JitterHistogram {
+    fn default() -> Self {
+        Self {
+            counts: vec![0; JITTER_CAP_MS].into_boxed_slice(),
+            total: 0,
+        }
+    }
+}
+
+impl JitterHistogram {
+    /// Count one sample. Constant time, and no allocation after the first.
+    fn observe(&mut self, jitter_ms: u64) {
+        self.total = self.total.saturating_add(1);
+        match usize::try_from(jitter_ms) {
+            Ok(bucket) if bucket < JITTER_CAP_MS => {
+                self.counts[bucket] = self.counts[bucket].saturating_add(1);
+            }
+            // At or above the cap: counted in `total` and in no bucket, which
+            // is what leaves the walk in `percentile` to fall off the end.
+            _ => {}
+        }
+    }
+
+    /// Forget every sample counted so far.
+    fn reset(&mut self) {
+        self.counts.fill(0);
+        self.total = 0;
+    }
+
+    /// The `numerator`th percentile, by the index rule the sorted vector used.
+    ///
+    /// That rule was `values[ceil(len * numerator / 100) - 1]` over the sorted
+    /// samples, and this walks the buckets to the same position, so every
+    /// figure a record or an overlay ever carried is unchanged.
+    fn percentile(&self, numerator: usize) -> u64 {
+        if self.total == 0 {
+            return 0;
+        }
+        let index = self
+            .total
+            .saturating_mul(numerator as u64)
+            .div_ceil(100)
+            .saturating_sub(1);
+        let mut seen = 0_u64;
+        for (bucket, count) in self.counts.iter().enumerate() {
+            seen = seen.saturating_add(u64::from(*count));
+            if seen > index {
+                return bucket as u64;
+            }
+        }
+        // The index fell in the over bucket: at or above the cap, reported as
+        // the cap. See [`JITTER_CAP_MS`] for why that direction is the safe one.
+        JITTER_CAP_MS as u64
+    }
 }
 
 /// Packets a session must have accounted for before its measured impairment is
@@ -197,7 +305,7 @@ impl ImpairmentMeasurement {
     pub fn observe(&mut self, dropped: bool, jitter_ms: u64) {
         self.sent = self.sent.saturating_add(1);
         self.dropped = self.dropped.saturating_add(u64::from(dropped));
-        self.jitter_ms.push(jitter_ms);
+        self.count_jitter(jitter_ms);
     }
 
     /// Record one downlink arrival that closed a gap of `missing` broadcasts.
@@ -215,7 +323,7 @@ impl ImpairmentMeasurement {
         self.sent = self.sent.saturating_add(arrivals);
         self.dropped = self.dropped.saturating_add(missing);
         if let Some(deviation_ms) = deviation_ms {
-            self.jitter_ms.push(deviation_ms);
+            self.count_jitter(deviation_ms);
         }
     }
 
@@ -234,17 +342,35 @@ impl ImpairmentMeasurement {
         self.loss_pct_since(&MeasurementMark::START)
     }
 
-    fn percentile(&self, numerator: usize) -> u64 {
-        self.percentile_since(&MeasurementMark::START, numerator)
+    /// Count one jitter sample into both windows.
+    ///
+    /// Two histograms rather than one plus a snapshot: the seat's window is
+    /// never reset and the increment's is reset at every boundary, and each is
+    /// read by exactly one of the two callers.
+    fn count_jitter(&mut self, jitter_ms: u64) {
+        self.jitter_seat.observe(jitter_ms);
+        self.jitter_increment.observe(jitter_ms);
     }
 
-    /// Where the counters stand right now, so a later increment can report
-    /// what happened *after* this point rather than since the session began.
-    fn mark(&self) -> MeasurementMark {
+    /// Jitter percentile over every sample of the seat, for the live readouts.
+    fn percentile(&self, numerator: usize) -> u64 {
+        self.jitter_seat.percentile(numerator)
+    }
+
+    /// Close the current increment's window and say where the counters stand.
+    ///
+    /// A later increment reports what happened *after* this point rather than
+    /// since the session began. The loss counters are additive, so the mark
+    /// carries them and an interval's rate is a difference; the jitter window
+    /// is a distribution and cannot be differenced from two totals, so it is
+    /// emptied here instead. There is only ever one open increment — the mark
+    /// has exactly one holder, `CampaignSession::emitted_mark`, and it only
+    /// ever moves forward — so emptying is the whole of the bookkeeping.
+    fn close_increment(&mut self) -> MeasurementMark {
+        self.jitter_increment.reset();
         MeasurementMark {
             sent: self.sent,
             dropped: self.dropped,
-            jitter_samples: self.jitter_ms.len(),
         }
     }
 
@@ -263,16 +389,10 @@ impl ImpairmentMeasurement {
         }
     }
 
-    /// Jitter percentile over the samples pushed since `mark`.
-    fn percentile_since(&self, mark: &MeasurementMark, numerator: usize) -> u64 {
-        let samples = self.jitter_ms.get(mark.jitter_samples..).unwrap_or(&[]);
-        if samples.is_empty() {
-            return 0;
-        }
-        let mut values = samples.to_vec();
-        values.sort_unstable();
-        let index = (values.len() * numerator).div_ceil(100).saturating_sub(1);
-        values[index]
+    /// Jitter percentile over the samples counted since the last increment
+    /// closed, which is the span the row being minted covers.
+    fn increment_percentile(&self, numerator: usize) -> u64 {
+        self.jitter_increment.percentile(numerator)
     }
 
     /// Observations recorded since `mark`, for the sample-count suppression
@@ -284,14 +404,19 @@ impl ImpairmentMeasurement {
 
 /// Where [`ImpairmentMeasurement`]'s counters stood at an increment boundary.
 ///
-/// A named row rather than a bare tuple: three counters of two different
-/// meanings, and transposing `sent` with `dropped` would report a loss rate of
-/// one hundred percent on a clean link.
+/// A named row rather than a bare tuple: two counters of different meanings,
+/// and transposing `sent` with `dropped` would report a loss rate of one
+/// hundred percent on a clean link.
+///
+/// The jitter sample count used to sit here as an index into the accumulator
+/// vector, which is what made every increment's percentile a re-slice of a
+/// stream that only ever grew (#1123). The window is now emptied by
+/// [`ImpairmentMeasurement::close_increment`] instead, so the mark carries
+/// only what can honestly be differenced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MeasurementMark {
     sent: u64,
     dropped: u64,
-    jitter_samples: usize,
 }
 
 impl MeasurementMark {
@@ -299,7 +424,6 @@ impl MeasurementMark {
     const START: Self = Self {
         sent: 0,
         dropped: 0,
-        jitter_samples: 0,
     };
 }
 
@@ -664,8 +788,8 @@ impl CampaignSession {
         }
         let mark = self.emitted_mark;
         let observed_loss_pct = self.measurement.loss_pct_since(&mark);
-        let observed_jitter_p50_ms = self.measurement.percentile_since(&mark, 50);
-        let observed_jitter_p99_ms = self.measurement.percentile_since(&mark, 99);
+        let observed_jitter_p50_ms = self.measurement.increment_percentile(50);
+        let observed_jitter_p99_ms = self.measurement.increment_percentile(99);
         let banked_ticks = self.banked_ticks.saturating_sub(self.emitted_banked_ticks);
         let increment = SeatIncrement {
             index: self.emitted_increments,
@@ -683,7 +807,7 @@ impl CampaignSession {
         let afk_seconds = afk_total_seconds.saturating_sub(self.emitted_afk_seconds);
         self.emitted_afk_seconds = afk_total_seconds;
         self.emitted_increments = self.emitted_increments.saturating_add(1);
-        self.emitted_mark = self.measurement.mark();
+        self.emitted_mark = self.measurement.close_increment();
         // A measured rate never lands exactly on its configured one, so an
         // exact comparison flagged every session ever recorded -- including a
         // seventeen-millisecond one whose 15.6% "loss" was four dropped
@@ -1464,5 +1588,204 @@ mod tests {
         key.public()
             .verify(&signed, &iroh_base::Signature::from_bytes(&signature))
             .expect("client signature verifies");
+    }
+
+    /// One plausible jitter deviation in milliseconds, from a cheap LCG.
+    ///
+    /// A distribution rather than a constant: a histogram and a sorted vector
+    /// agree trivially when every sample is the same number, and the whole
+    /// claim of #1123's fix is that they agree over a real spread. Mostly a
+    /// few milliseconds of the player's own path, a tail around the 100 ms
+    /// spike the campaign injects, and a rare stall.
+    fn sample_deviation_ms(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let draw = (*state >> 33) % 1000;
+        match draw {
+            0..=899 => draw % 24,
+            900..=989 => 90 + draw % 40,
+            _ => 300 + draw % 700,
+        }
+    }
+
+    /// The p50/p99 pass `stream_metrics` makes once a second, timed.
+    ///
+    /// Both percentiles, because the 1 Hz timer calls both
+    /// (`crate::lib`'s `stream_metrics`) and the defect was two full copies
+    /// and two full sorts. Repeated so a single scheduling hiccup cannot be
+    /// the measurement.
+    fn one_second_readout_cost(session: &CampaignSession) -> std::time::Duration {
+        const PASSES: u32 = 32;
+        let started = std::time::Instant::now();
+        let mut sink = 0_u64;
+        for _ in 0..PASSES {
+            sink = sink
+                .wrapping_add(session.observed_jitter_p50_ms())
+                .wrapping_add(session.observed_jitter_p99_ms());
+        }
+        let elapsed = started.elapsed();
+        assert!(sink < u64::MAX, "the readout is not optimized away");
+        elapsed / PASSES
+    }
+
+    /// #1123. The once-a-second overlay pass must cost the same at one hour as
+    /// at one minute.
+    ///
+    /// The accumulator was a `Vec<u64>` pushed to once per decoded replication
+    /// body and never trimmed, and `percentile` cloned and sorted the whole of
+    /// it — twice a second, once for the F3 pane and once for the JSONL row.
+    /// The hunt measured 0.15 ms at one minute and 7.75 ms at one hour, on a
+    /// 16.7 ms frame budget: a hitch that is not there when a tester starts
+    /// flying and gets worse for as long as they keep flying.
+    ///
+    /// A few-minute fixture cannot see this, which is why it survived. So this
+    /// runs an hour of arrivals at the rate the hunt sized — ~300 bodies/s for
+    /// a six-seat cohort — and asserts the *shape*: the readout at one hour is
+    /// not materially dearer than at one minute. The ratio is what is asserted
+    /// rather than an absolute figure, because the absolute figure is the
+    /// box's and a debug build's; a linear-in-session-length cost fails it by
+    /// a factor of fifty.
+    #[test]
+    fn the_live_jitter_readout_costs_the_same_after_an_hour_as_after_a_minute() {
+        const BODIES_PER_SECOND: u64 = 300;
+        let mut session = session();
+        let mut state = 0x1123_u64;
+        let fill = |session: &mut CampaignSession, seconds: u64, state: &mut u64| {
+            for _ in 0..seconds * BODIES_PER_SECOND {
+                session.observe_arrival(0, Some(sample_deviation_ms(state)));
+            }
+        };
+
+        fill(&mut session, 60, &mut state);
+        let after_a_minute = one_second_readout_cost(&session);
+        fill(&mut session, 59 * 60, &mut state);
+        let after_an_hour = one_second_readout_cost(&session);
+
+        println!(
+            "#1123 p50+p99 pass: 1 min = {:?}, 60 min = {:?} ({:.2}x)",
+            after_a_minute,
+            after_an_hour,
+            after_an_hour.as_secs_f64() / after_a_minute.as_secs_f64().max(f64::EPSILON)
+        );
+        assert!(
+            after_an_hour <= after_a_minute * 4,
+            "the 1 Hz jitter readout must not grow with session length (#1123): \
+             {after_a_minute:?} after a minute, {after_an_hour:?} after an hour"
+        );
+        // And an absolute ceiling, so a uniformly slow box cannot pass the
+        // ratio by being slow at both ends. Two walks of a fixed bucket array
+        // are microseconds; a sorted million samples is milliseconds.
+        assert!(
+            after_an_hour < std::time::Duration::from_micros(500),
+            "an hour-long session's 1 Hz readout took {after_an_hour:?} (#1123)"
+        );
+    }
+
+    /// #1123. The counted percentile is the sorted one, not an approximation.
+    ///
+    /// The samples are whole milliseconds, so a bucket per millisecond loses
+    /// nothing below the cap. This holds the histogram against the exact
+    /// computation the `Vec<u64>` did — clone, `sort_unstable`, index
+    /// `ceil(len * numerator / 100) - 1` — over a spread that includes the
+    /// stall tail. Both percentiles the client reads, and both windows: the
+    /// seat-wide readout and the per-increment figure the ledger recomputes
+    /// `impairment_mismatch` from.
+    #[test]
+    fn the_counted_jitter_percentile_equals_the_sorted_one() {
+        fn sorted_percentile(samples: &[u64], numerator: usize) -> u64 {
+            if samples.is_empty() {
+                return 0;
+            }
+            let mut values = samples.to_vec();
+            values.sort_unstable();
+            values[(values.len() * numerator).div_ceil(100).saturating_sub(1)]
+        }
+
+        let mut state = 0x5eed_u64;
+        let mut session = session();
+        let mut samples = Vec::new();
+        for _ in 0..40_000 {
+            let deviation_ms = sample_deviation_ms(&mut state);
+            samples.push(deviation_ms);
+            session.observe_arrival(0, Some(deviation_ms));
+        }
+        assert_eq!(
+            session.observed_jitter_p50_ms(),
+            sorted_percentile(&samples, 50),
+            "the seat-wide median must be the sorted median"
+        );
+        assert_eq!(
+            session.observed_jitter_p99_ms(),
+            sorted_percentile(&samples, 99),
+            "the seat-wide p99 must be the sorted p99"
+        );
+
+        // The increment window: a second span of samples, and the row minted
+        // for it must report that span's own percentiles and nothing of the
+        // first span's.
+        for _ in 0..(u64::from(TICK_HZ) * 60 * 6) {
+            session.observe_tick(PlayerActivity::Active);
+        }
+        let mut span = Vec::new();
+        for _ in 0..30_000 {
+            let deviation_ms = sample_deviation_ms(&mut state);
+            span.push(deviation_ms);
+            session.observe_arrival(0, Some(deviation_ms));
+        }
+        let row = session
+            .finish_increment(
+                "2026-09-06T12:06:00Z".into(),
+                "linux".into(),
+                "rev".into(),
+                "unavailable-client-side".into(),
+                false,
+            )
+            .expect("a six-minute increment covers a non-empty span");
+        assert_eq!(
+            row.observed_jitter_p50_ms,
+            sorted_percentile(&span, 50),
+            "an increment reports the median of its own span (#1048)"
+        );
+        assert_eq!(
+            row.observed_jitter_p99_ms,
+            sorted_percentile(&span, 99),
+            "an increment reports the p99 of its own span (#1048)"
+        );
+    }
+
+    /// #1123. A session's jitter accounting must not grow on the heap.
+    ///
+    /// The cost the tester feels is the sort, but the vector's other half was
+    /// 8.6 MB of resident samples at one hour and 17.3 MB at two — for a
+    /// distribution nothing ever reads a single element of. Two fixed bucket
+    /// arrays hold the same answer, so the accounting a seat carries is the
+    /// same size after two hours as after two seconds.
+    #[test]
+    fn a_two_hour_session_holds_no_more_jitter_state_than_a_two_second_one() {
+        let mut state = 0xdead_u64;
+        let mut brief = session();
+        for _ in 0..600 {
+            brief.observe_arrival(0, Some(sample_deviation_ms(&mut state)));
+        }
+        let mut long = session();
+        for _ in 0..(300 * 60 * 120) {
+            long.observe_arrival(0, Some(sample_deviation_ms(&mut state)));
+        }
+        assert_eq!(
+            jitter_bytes(&brief),
+            jitter_bytes(&long),
+            "the jitter accumulator must not grow with session length (#1123)"
+        );
+    }
+
+    /// Bytes the session's jitter accounting occupies, heap included.
+    ///
+    /// `size_of` alone would have passed the old code too — a `Vec`'s three
+    /// words never change size — so what is measured is the buffer behind it.
+    fn jitter_bytes(session: &CampaignSession) -> usize {
+        std::mem::size_of::<JitterHistogram>() * 2
+            + session.measurement.jitter_seat.counts.len() * std::mem::size_of::<u32>()
+            + session.measurement.jitter_increment.counts.len() * std::mem::size_of::<u32>()
     }
 }
