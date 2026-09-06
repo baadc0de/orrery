@@ -1416,11 +1416,33 @@ fn send_pending(state_path: &Path, pending: &PendingUpload) -> bool {
     match result {
         Ok(()) => {
             // Re-read rather than mutate a copy: the acknowledgement is
-            // written per session, so a process that dies mid-flush keeps
+            // written per body, so a process that dies mid-flush keeps
             // every acknowledgement it had already earned.
+            //
+            // Keyed by the *upload key*, not the session id. `uploads.json`
+            // has been keyed by upload key since #1048, and a seat longer
+            // than `INCREMENT_MINUTES` owes several bodies under one session
+            // id. Looking the entry up by session id found increment zero's
+            // row for every increment of the seat: increment one onward was
+            // never marked acknowledged and was re-posted at every later
+            // launch, and a seat whose increment zero had failed had that
+            // failure overwritten by increment one's success, so increment
+            // zero's evidence was dropped and never retried.
             let mut state = read_upload_state(state_path);
-            if let Some(entry) = state.sessions.get_mut(&pending.session_id) {
+            if let Some(entry) = state.sessions.get_mut(&pending.upload_key) {
                 entry.acknowledged = true;
+            } else {
+                // An entry always exists: `send_pending` is only reached
+                // through `pending_uploads`, which reads it out of this file.
+                // Saying so is the difference between a lost acknowledgement
+                // and a silent one (#1051).
+                eprintln!(
+                    "regolith: campaign session {} uploaded but {} names no entry for {}; \
+                     it will be posted again next launch",
+                    pending.session_id,
+                    state_path.display(),
+                    pending.upload_key
+                );
             }
             if let Err(error) = write_upload_state(state_path, &state) {
                 eprintln!(
@@ -1911,6 +1933,109 @@ mod tests {
             .expect("respond to client");
         });
         (format!("http://{address}"), received)
+    }
+
+    /// A multi-shot upload service that answers `status` to every POST.
+    fn upload_test_service(
+        status: &str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test service");
+        let address = listener.local_addr().expect("test service address");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&seen);
+        let status = status.to_owned();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let body_end = loop {
+                    let Ok(count) = stream.read(&mut buffer) else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..body_end]).expect("ASCII headers");
+                let line = headers.lines().next().unwrap_or_default().to_owned();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim())
+                        })
+                    })
+                    .expect("content length")
+                    .parse::<usize>()
+                    .expect("numeric content length");
+                while request.len() < body_end + length {
+                    let Ok(count) = stream.read(&mut buffer) else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                captured.lock().expect("capture lock").push(line);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// Every increment after a seat's first must record its own acknowledgement.
+    #[test]
+    fn a_banked_increment_records_its_own_acknowledgement() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"banked_minutes\":5.0}\n").expect("write telemetry");
+        let session_id = "01a06b05-52e9-7000-8000-00000000beef";
+        // A seat longer than INCREMENT_MINUTES banks increment 0, then 1.
+        std::fs::write(
+            crate::campaign_record_path(&telemetry_path),
+            format!(
+                "{{\"session_id\":\"{session_id}\",\"increment\":{{\"index\":0}}}}\n\
+                 {{\"session_id\":\"{session_id}\",\"increment\":{{\"index\":1}}}}\n"
+            ),
+        )
+        .expect("write the minted rows");
+        let state_path = upload_state_path(&telemetry_path);
+
+        let (origin, seen) = upload_test_service("204 No Content");
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the sweep thread finishes");
+
+        let posted = seen.lock().expect("capture lock").len();
+        assert_eq!(posted, 2, "both increments are posted on the first launch");
+
+        let state = read_upload_state(&state_path);
+        let first = state
+            .sessions
+            .get(session_id)
+            .expect("increment zero is named");
+        assert!(first.acknowledged, "increment zero is acknowledged");
+        let second = state
+            .sessions
+            .get(&format!("{session_id}.increment-1"))
+            .expect("increment one is named");
+        assert!(
+            second.acknowledged,
+            "a 204 means the service holds increment one too; a later launch must not resend it"
+        );
     }
 
     /// A minted row that `uploads.json` never heard of is sent on the next launch.
