@@ -1158,12 +1158,44 @@ async fn finish_start_joins<J: StartJoin>(
     Ok(finished)
 }
 
+/// One bound seat's corrected `StartV1` and the downlink still owed copies.
+struct OwedStartRoster {
+    /// Admission-authoritative seat, for the log line if the link is gone.
+    slot: usize,
+    /// The bound seat's downlink, cloned so the repeats outlive `finished`.
+    downlink: tokio::sync::mpsc::Sender<exterior::Frame>,
+    /// The corrected manifest, serialized once and re-sent verbatim.
+    payload: bytes::Bytes,
+}
+
 /// Re-send the corrected `StartV1` to seats bound before a peer was dropped.
 ///
-/// Same lane and same JSON as `Swarm::publish_live_manifests_for`; the client
-/// adopts it through the live-membership path it already has. Only the seats
-/// bound *before* the first drop hold a stale roster, but re-sending to all of
-/// them is idempotent and cheaper than tracking which.
+/// Same lane, same JSON, and — since #1156 — the same *repetition* as
+/// `Swarm::publish_live_manifests_for`: [`swarm::DEFERRED_MANIFEST_PUBLISHES`]
+/// copies, [`swarm::DEFERRED_MANIFEST_SPACING`] apart. The client adopts each
+/// through the live-membership path it already has, and
+/// `CampaignSession::adopt_live_membership` accepts a repeat of the manifest
+/// it already holds (it refuses only a *lower* tick), so the copies are free.
+///
+/// Sending this once was the defect. The doc comment already named
+/// `publish_live_manifests_for` as the thing being copied, and that publisher
+/// sends five copies for a stated reason — "a joiner that is still finishing
+/// its handshake when the first copy goes out still gets one it can read".
+/// The correction inherited the lane and the payload and not the repetition,
+/// while aiming at seats that are *by construction* mid-handshake: every one
+/// of them was inside `StartJoin::finish` moments earlier. A single loss then
+/// costs the seat its `witness_recipients` for the whole run — the frozen
+/// witness ring is carried only on the manifest and is the one thing
+/// `refresh_rosters`' per-tick `IslandRoster` does not replace — which is
+/// #1130's armed-but-dark watches reached by a different door.
+///
+/// Only the seats bound *before* the first drop hold a stale roster, but
+/// re-sending to all of them is idempotent and cheaper than tracking which.
+///
+/// The first copy goes out inline, so a seat already reading Meta is corrected
+/// before the run starts; the rest are spawned onto the runtime the run holds,
+/// because making every volunteer's session start four seconds later to
+/// correct a rare drop is a worse trade than the drop.
 async fn republish_start_roster(
     finished: &[(JoinedSeat, Option<String>)],
     manifests: Option<&BTreeMap<usize, exterior::StartManifest>>,
@@ -1171,22 +1203,58 @@ async fn republish_start_roster(
     let Some(by_slot) = manifests else {
         return;
     };
-    for ((link, _, _, slot), _) in finished {
-        let Some(manifest) = by_slot.get(slot) else {
-            continue;
-        };
+    let mut owed = finished
+        .iter()
+        .filter_map(|((link, _, _, slot), _)| {
+            by_slot.get(slot).map(|manifest| OwedStartRoster {
+                slot: *slot,
+                downlink: link.downlink.clone(),
+                payload: bytes::Bytes::from(
+                    serde_json::to_vec(manifest).expect("StartV1 serializes"),
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    if owed.is_empty() {
+        return;
+    }
+    send_start_roster_copy(&mut owed, 1).await;
+    if owed.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for copy in 2..=swarm::DEFERRED_MANIFEST_PUBLISHES {
+            tokio::time::sleep(swarm::DEFERRED_MANIFEST_SPACING).await;
+            send_start_roster_copy(&mut owed, copy).await;
+            if owed.is_empty() {
+                return;
+            }
+        }
+    });
+}
+
+/// Push one copy of the correction to every seat still owed one, dropping the
+/// seats whose downlink has gone so a dead link is named once, not five times.
+async fn send_start_roster_copy(owed: &mut Vec<OwedStartRoster>, copy: u8) {
+    let mut alive = Vec::with_capacity(owed.len());
+    for seat in owed.drain(..) {
         let frame = exterior::Frame {
             peer: u32::MAX,
             lane: exterior::Lane::Meta,
-            payload: bytes::Bytes::from(serde_json::to_vec(manifest).expect("StartV1 serializes")),
+            payload: seat.payload.clone(),
         };
-        if link.downlink.send(frame).await.is_err() {
+        if seat.downlink.send(frame).await.is_err() {
             eprintln!(
-                "gates/p1-swarm: seat {slot} could not be sent the corrected start roster; its \
-                 downlink is already gone"
+                "gates/p1-swarm: seat {} could not be sent the corrected start roster (copy \
+                 {copy} of {}); its downlink is already gone",
+                seat.slot,
+                swarm::DEFERRED_MANIFEST_PUBLISHES
             );
+        } else {
+            alive.push(seat);
         }
     }
+    *owed = alive;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2738,6 +2806,26 @@ mod start_join_tests {
             }
             latest
         }
+
+        /// Every membership frame queued to a bound seat since the last drain,
+        /// oldest first — one entry per copy, so a test can count repeats and
+        /// their spacing rather than only reading the last one through.
+        fn drain_republished_rosters(&self, slot: usize) -> Vec<Vec<usize>> {
+            let remotes = self.remotes.lock().expect("remotes lock");
+            let (_, remote) = remotes
+                .iter()
+                .find(|(seat, _)| *seat == slot)
+                .expect("the seat bound");
+            let mut downlink = remote.downlink.lock().expect("downlink lock");
+            let mut copies = Vec::new();
+            while let Ok(frame) = downlink.try_recv() {
+                assert_eq!(frame.lane, exterior::Lane::Meta);
+                let manifest: exterior::StartManifest =
+                    serde_json::from_slice(&frame.payload).expect("a StartV1 on the Meta lane");
+                copies.push(manifest.active.iter().map(|seat| seat.slot).collect());
+            }
+            copies
+        }
     }
 
     fn roster() -> StartRoster<'static> {
@@ -3045,6 +3133,147 @@ mod start_join_tests {
             harness.republished_slots(7),
             Some(vec![0, 1, 2, 3, 4, 5, 7]),
             "the correction goes to every bound seat, idempotently"
+        );
+    }
+
+    /// #1156. The correction is aimed at seats that are still finishing their
+    /// own handshakes, so it must survive their not reading the first copies.
+    ///
+    /// Virtual time (`start_paused`), so the four one-second gaps cost the
+    /// suite nothing and the *spacing* is asserted rather than assumed: each
+    /// advance of one second must yield exactly one more copy.
+    ///
+    /// Before the fix this test failed on its second assertion — one copy was
+    /// sent, inline, and a seat deaf for even one second kept a roster naming
+    /// a peer that never joined, and with it a frozen `witness_recipients`
+    /// that `refresh_rosters` never repairs.
+    #[tokio::test(start_paused = true)]
+    async fn the_corrected_start_roster_is_repeated_like_the_live_path() {
+        let harness = StartHarness::new();
+        let pending = vec![
+            harness.peer(5, None),
+            harness.peer(6, Some("timed out")),
+            harness.peer(7, None),
+        ];
+
+        let finished = finish_start_joins(pending, &roster(), Some(&harness.membership), SWEPT_AT)
+            .await
+            .expect("one stale peer must not take the attempt down");
+        assert_eq!(finished.len(), 2);
+        let corrected = vec![0, 1, 2, 3, 4, 5, 7];
+
+        // Copy one is inline: a seat already reading Meta is corrected before
+        // the run starts, exactly as it was before this fix.
+        assert_eq!(
+            harness.drain_republished_rosters(5),
+            vec![corrected.clone()],
+            "the first copy must not wait for the timer"
+        );
+        assert_eq!(
+            harness.drain_republished_rosters(7),
+            vec![corrected.clone()]
+        );
+
+        let mut delivered = 1u8;
+        while delivered < swarm::DEFERRED_MANIFEST_PUBLISHES {
+            // A hair past the publisher's own deadline: two timers due at the
+            // same virtual instant wake in an unspecified order, and this
+            // assertion is about which second a copy lands in, not that race.
+            tokio::time::sleep(
+                swarm::DEFERRED_MANIFEST_SPACING + std::time::Duration::from_millis(1),
+            )
+            .await;
+            for seat in [5, 7] {
+                assert_eq!(
+                    harness.drain_republished_rosters(seat),
+                    vec![corrected.clone()],
+                    "exactly one further copy per second is owed to seat {seat}"
+                );
+            }
+            delivered += 1;
+        }
+        assert_eq!(
+            delivered,
+            swarm::DEFERRED_MANIFEST_PUBLISHES,
+            "the correction matches the live path's repetition"
+        );
+
+        // Bounded, not a standing broadcast: the run's own membership traffic
+        // takes over from here.
+        tokio::time::sleep(swarm::DEFERRED_MANIFEST_SPACING * 5).await;
+        assert!(
+            harness.drain_republished_rosters(5).is_empty(),
+            "the repetition stops after its budget"
+        );
+    }
+
+    /// The property the repetition exists for, stated as a loss: whichever of
+    /// the copies a seat misses, a corrected roster is still readable.
+    ///
+    /// Five sends one second apart tolerate any four losses — equivalently, a
+    /// seat deaf for the four seconds after the drop. Under an independent
+    /// per-frame loss probability `p` the correction is lost with probability
+    /// `p^5`: a link losing half its frames fails this 3% of the time instead
+    /// of 50%. The old one-shot send tolerated zero losses, and the seat it
+    /// was aimed at was mid-handshake by construction.
+    #[tokio::test(start_paused = true)]
+    async fn a_seat_that_misses_copies_still_gets_the_corrected_witness_ring() {
+        let harness = StartHarness::new();
+        let pending = vec![
+            harness.peer(5, None),
+            harness.peer(6, Some("timed out")),
+            harness.peer(7, None),
+        ];
+        finish_start_joins(pending, &roster(), Some(&harness.membership), SWEPT_AT)
+            .await
+            .expect("one stale peer must not take the attempt down");
+
+        // Let the whole correction play out, then read it as the seat would.
+        tokio::time::sleep(
+            swarm::DEFERRED_MANIFEST_SPACING * u32::from(swarm::DEFERRED_MANIFEST_PUBLISHES + 1),
+        )
+        .await;
+        let copies = harness.drain_republished_rosters(5);
+        let corrected = vec![0, 1, 2, 3, 4, 5, 7];
+
+        for lost in 0..copies.len() {
+            assert_eq!(
+                copies.get(lost),
+                Some(&corrected),
+                "a seat that lost the first {lost} copies must still read a corrected roster"
+            );
+        }
+        assert_eq!(
+            copies.len(),
+            usize::from(swarm::DEFERRED_MANIFEST_PUBLISHES),
+            "so the tolerated loss is {} consecutive frames",
+            swarm::DEFERRED_MANIFEST_PUBLISHES - 1
+        );
+
+        // The ring is the thing that does not recover on its own: the per-tick
+        // `IslandRoster` replaces the roster wholesale but carries no
+        // `witness_recipients`, so this frame is the seat's only correction.
+        let manifests = roster()
+            .manifests(&[
+                ConnectedSeat {
+                    slot: 5,
+                    node: bot::bot_key(5).public(),
+                },
+                ConnectedSeat {
+                    slot: 7,
+                    node: bot::bot_key(7).public(),
+                },
+            ])
+            .expect("the corrected roster builds")
+            .expect("an attempt-bound run sends manifests");
+        assert_eq!(
+            manifests[&5].witness_recipients,
+            swarm::witness_recipients(&corrected, 5),
+            "the corrected manifest names the corrected ring"
+        );
+        assert!(
+            !manifests[&5].witness_recipients.contains(&6),
+            "and the dropped seat is not in it"
         );
     }
 

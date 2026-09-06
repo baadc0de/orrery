@@ -767,6 +767,67 @@ fn verify_join_anchor(
     Ok(())
 }
 
+/// Send this seat's join anchor: two length-prefixed messages mirroring the
+/// host's reads, claim first, then the state it commits to. An absent log is
+/// the explicit empty pair, preserving the unanchored compatibility path.
+///
+/// The two writes were discarded with `let _ =` (#1157) — the only discarded
+/// results in a `remote_join` that propagates everything else, dial through
+/// uplink announce. What they would have said is a `quinn` write failure:
+/// `Stopped` when the host is not reading this stream, `ConnectionLost` or
+/// `ClosedStream` when the connection went away underneath it. (The one
+/// non-transport arm, `write_message`'s `u32::try_from` on the body length,
+/// cannot fire: an anchor is a claim and a canonical state, orders of
+/// magnitude below 4 GiB.) Nothing else was going unwritten — no file, no
+/// log, no POST — but the message itself was.
+///
+/// # Why only the anchored half propagates
+///
+/// #1157 proposed `?` on both, and said the compatibility path was
+/// unaffected. Measured, it is not: `?` on both turns every **non-witnessing**
+/// join into a failure. A host that does not witness never reads this pair —
+/// `PendingJoin::finish` skips straight past both `read_message` calls and
+/// drops its `RecvStream`, which is a `STOP_SENDING` the client's write then
+/// reports as "sending stopped by peer". The two seats behind
+/// `token_admission_seats_the_presented_node_not_the_public_slot_key` and
+/// `a_silent_dialler_does_not_delay_the_seat_behind_it` are exactly that, and
+/// they both refused to join until this was narrowed.
+///
+/// So the empty pair stays best-effort: it carries no evidence, and on the
+/// runs that send it the intended reader may not exist at all. An anchor
+/// propagates, because there the message is the seat's whole claim to be
+/// seated and the host *will* read it.
+///
+/// # What the anchored failure cost before
+///
+/// Worth stating precisely, because #1157 filed it as "runs the whole session
+/// as a seat nobody can see" and against the real bridge it is not quite
+/// that. `PendingJoin::finish` reads both messages and `verify_join_anchor`
+/// refuses a truncated or absent one, so the host abandons the join and hands
+/// the seat back — while the client fell through to `open_uni` on a connection
+/// that was still healthy (the host stopped the *stream*, not the connection)
+/// and waited in `accept_uni` for a downlink the host had already decided not
+/// to open. It hangs there until the host drops the connection, then fails
+/// naming `downlink stream never arrived`: the one part of the handshake that
+/// was working. The seat is lost either way; what the discarded result cost
+/// was the cause, and it sent the operator to the wrong half of the
+/// handshake. A client that cannot deliver its anchor should fail its own
+/// join, immediately and in its own words.
+async fn write_join_anchor(send: &mut SendStream, anchor: Option<&AnchorFrame>) -> Result<()> {
+    let Some(anchor) = anchor else {
+        let _ = write_message(send, &[]).await;
+        let _ = write_message(send, &[]).await;
+        return Ok(());
+    };
+    write_message(send, &anchor.claim_json)
+        .await
+        .context("could not send the witness join anchor claim")?;
+    write_message(send, &anchor.state)
+        .await
+        .context("could not send the witness join anchor state")?;
+    Ok(())
+}
+
 /// Remote side: dials the host and runs the client half of the handshake.
 ///
 /// Returns the mirror queues. The assigned slot comes back verified against
@@ -818,14 +879,7 @@ pub async fn remote_join(
             JoinReply::LobbyWait { .. } => {}
         }
     }
-    // Two length-prefixed messages, mirroring the host's reads: claim first,
-    // then the state it commits to. An absent log is the explicit empty pair,
-    // preserving the unanchored compatibility path.
-    let (claim, state) = anchor.as_ref().map_or((&[][..], &[][..]), |anchor| {
-        (anchor.claim_json.as_slice(), anchor.state.as_slice())
-    });
-    let _ = write_message(&mut send, claim).await;
-    let _ = write_message(&mut send, state).await;
+    write_join_anchor(&mut send, anchor.as_ref()).await?;
 
     // Data path mirrors the host's: uplink on a uni stream this side opens
     // and announces, downlink on the uni stream the host opened and
@@ -1827,6 +1881,209 @@ mod tests {
             .expect("host task")
             .expect("host accepts token-bound identity");
         assert_eq!(admitted_node, client_key.public());
+    }
+
+    /// #1157. A join whose anchor cannot be delivered must fail on the client
+    /// too, not run a whole session as a seat the host gave back.
+    ///
+    /// The failure is staged the way the live one arrives: the host accepts,
+    /// then stops reading the handshake stream, so the client's write is met
+    /// with `STOP_SENDING` while the *connection* stays open. That is the case
+    /// the discarded results hid — the connection being fine is exactly why
+    /// `open_uni` below then succeeded and the client sailed on. A closed
+    /// connection would have failed at `open_uni` anyway and told nobody the
+    /// real reason.
+    ///
+    /// The anchor state is padded well past the stream's flow-control window
+    /// so the write is still in flight when `STOP_SENDING` arrives one
+    /// loopback RTT later; a few hundred bytes would sit in the send buffer
+    /// and the test would race.
+    ///
+    /// Before the fix this returned `Ok` and the assertion below had nothing
+    /// to read, which is the whole shape of the defect: `let _ =` leaves
+    /// nothing to assert on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_whose_anchor_cannot_be_written_is_refused_on_both_sides() {
+        let slot = 4usize;
+        let expected = bot_key(slot).public();
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot), None).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+
+        let host_task = {
+            let host_ep = host_ep.clone();
+            tokio::spawn(async move {
+                let pending = host_prepare(
+                    &host_ep,
+                    Some((slot, expected)),
+                    &crate::exterior::Admission::open(),
+                )
+                .await
+                .expect("the host prepares the join");
+                let PendingJoin {
+                    connection,
+                    mut send,
+                    mut recv,
+                    ..
+                } = pending;
+                write_message(
+                    &mut send,
+                    &JoinReply::Accept {
+                        index: slot,
+                        manifest: None,
+                    }
+                    .encode(),
+                )
+                .await
+                .expect("the accept goes out");
+                // The host then refuses the anchor reads outright. Held open
+                // so the connection outlives the client's write attempt.
+                recv.stop(7u32.into()).expect("stop the handshake stream");
+                (host_ep, connection)
+            })
+        };
+
+        let mut anchor = valid_anchor(slot, &bot_key(slot));
+        anchor.state.resize(8 * 1024 * 1024, 0);
+        // Bounded so a regression fails this test instead of hanging it: with
+        // the results discarded the client sails past the refusal, opens its
+        // uplink onto a connection that is still perfectly healthy, and then
+        // blocks in `accept_uni` forever on a downlink the host — which has
+        // already abandoned the join — will never open.
+        let joined = tokio::time::timeout(
+            Duration::from_secs(20),
+            remote_join(
+                &remote_ep,
+                HostAddress {
+                    node: host_ep.id(),
+                    direct: vec![socket],
+                }
+                .to_addr(Some(socket)),
+                &JoinRequest::plain("test".into()),
+                slot,
+                Some(anchor),
+            ),
+        )
+        .await
+        .expect(
+            "the client must reach a verdict on its own join rather than wait on a host that \
+             has already given the seat back",
+        );
+
+        let error = format!(
+            "{:#}",
+            joined.err().expect(
+                "a client that cannot deliver its anchor must fail its join, not fly a seat \
+                 the host refused"
+            )
+        );
+        assert!(
+            error.contains("witness join anchor"),
+            "the failure must name the anchor rather than be misattributed to the stream \
+             opened after it, got: {error}"
+        );
+        let (_host_ep_back, _connection) = host_task.await.expect("host task");
+    }
+
+    /// The other half of #1157, and the reason the fix is not `?` on both
+    /// writes: a host that does not witness never reads this pair. It drops
+    /// its `RecvStream` instead, and the `STOP_SENDING` that produces is a
+    /// normal end to a normal join — not a failure to report.
+    ///
+    /// Pinned by name because propagating it is a plausible tidy-up that
+    /// refuses every non-witnessing seat, which is how it was found here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_witnessing_host_never_reads_the_pair_and_the_join_still_succeeds() {
+        let slot = 3usize;
+        let expected = bot_key(slot).public();
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot), None).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+
+        let host_task = {
+            let host_ep = host_ep.clone();
+            tokio::spawn(async move {
+                let joined = host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    // The whole point: this run does not witness.
+                    false,
+                    &crate::exterior::Admission::open(),
+                )
+                .await;
+                (host_ep, joined)
+            })
+        };
+        let remote_keep = remote_ep.clone();
+        let _link = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &JoinRequest::plain("test".into()),
+            slot,
+            None,
+        )
+        .await
+        .expect("a non-witnessing join must not be refused by its own unread anchor write");
+        let _keep = remote_keep;
+        let (_host_ep_back, joined) = host_task.await.expect("host task");
+        let (_link, anchor, _remote) = joined.expect("the host seats the non-witnessing peer");
+        assert!(
+            anchor.is_none(),
+            "a non-witnessing run has no anchor to read"
+        );
+    }
+
+    /// The compatibility path the fix must not disturb: a witnessing host and
+    /// a client with no log write the explicit empty pair, and that is a
+    /// success the host reads back as "no anchor".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unanchored_join_still_writes_the_explicit_empty_pair() {
+        let slot = 2usize;
+        let expected = bot_key(slot).public();
+        let host_ep = bind(host_key(), None).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot), None).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+
+        let host_task = {
+            let host_ep = host_ep.clone();
+            tokio::spawn(async move {
+                let joined = host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    true,
+                    &crate::exterior::Admission::open(),
+                )
+                .await;
+                (host_ep, joined)
+            })
+        };
+        let remote_keep = remote_ep.clone();
+        let _link = remote_join(
+            &remote_ep,
+            HostAddress {
+                node: host_ep.id(),
+                direct: vec![socket],
+            }
+            .to_addr(Some(socket)),
+            &JoinRequest::plain("test".into()),
+            slot,
+            None,
+        )
+        .await
+        .expect("an unanchored join is still a join");
+        let _keep = remote_keep;
+        let (_host_ep_back, joined) = host_task.await.expect("host task");
+        let (_link, anchor, _remote) = joined.expect("the host seats the unanchored peer");
+        assert!(
+            anchor.is_none(),
+            "the empty pair reads back as no anchor, not as a malformed one"
+        );
     }
 
     /// The admission verdict is wired to the accept, not merely computable:
