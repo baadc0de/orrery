@@ -1815,7 +1815,21 @@ impl CampaignRuntime {
                                         at,
                                     );
                                 }
-                                self.host.install_state(entity, state);
+                                // #1112: stamped at the *client's* ingest
+                                // tick, not the authority's `at`. The
+                                // staleness bound is checked against this
+                                // reader's clock (`orrery_core`'s
+                                // `tick.checked_sub(observed_tick)`), and
+                                // `at` counts in the authority's; an
+                                // authority even one tick ahead of this
+                                // client would stamp the replica into the
+                                // reader's future, where `checked_sub`
+                                // underflows and the read is refused
+                                // outright. `at` is a measurement of the
+                                // sender and already has its home in
+                                // `ReplicaFreshness::last_authoritative_tick`
+                                // just above.
+                                self.host.install_state_observed(entity, state, tick);
                                 // The duel view follows the first remote
                                 // craft that arrives, and stays with it.
                                 if entity != self.entity && self.focus.is_none() {
@@ -1858,7 +1872,14 @@ impl CampaignRuntime {
                                             delta.tick,
                                         );
                                     }
-                                    self.host.install_state(delta.entity, state);
+                                    // The same stamp, for the same reason,
+                                    // as the keyframe arm above: the client's
+                                    // ingest tick. `delta.tick` is an
+                                    // authority tick — it anchors the patch
+                                    // (`delta_is_anchored`) and measures the
+                                    // authoritative gap, and it is never
+                                    // comparable to this reader's clock.
+                                    self.host.install_state_observed(delta.entity, state, tick);
                                     if delta.entity != self.entity && self.focus.is_none() {
                                         self.focus = Some(delta.entity);
                                     }
@@ -2399,13 +2420,19 @@ impl CampaignRuntime {
     /// Install one replicated peer exactly as the downlink keyframe arm does.
     ///
     /// The two lines that matter are copied from `advance`'s `Lane::Datagram`
-    /// keyframe branch and must stay copied: the executor insert, and the
-    /// first-write-wins `focus` latch. A test that seeded `focus` by hand
+    /// keyframe branch and must stay copied: the stamped executor insert, and
+    /// the first-write-wins `focus` latch. A test that seeded `focus` by hand
     /// could not tell the difference between "the client draws every peer"
     /// and "the client draws the peer the test happened to point at".
+    ///
+    /// The stamp is `self.tick` — the driver's mirror of the host clock, which
+    /// is the exact value `advance` holds when it drains the downlink
+    /// (`debug_assert_eq!(tick, self.tick)`), so this helper ages a replica
+    /// the way the ingest leg does rather than pinning it at tick zero
+    /// (#1112).
     #[cfg(test)]
     pub(crate) fn install_replica_for_test(&mut self, entity: PersistId, state: RegolithState) {
-        self.host.install_state(entity, state);
+        self.host.install_state_observed(entity, state, self.tick);
         if entity != self.entity && self.focus.is_none() {
             self.focus = Some(entity);
         }
@@ -3234,6 +3261,250 @@ mod tests {
         );
     }
 
+    /// #1112: both ingest arms stamp a replica at the *client's* ingest tick,
+    /// so a read far past the staleness bound still returns real state.
+    ///
+    /// Regolith's bound is one second — `MAX_NEIGHBOR_STALENESS_TICKS`, 60
+    /// ticks — and this drives the real `accept_frame` at tick 5_000. Under
+    /// the unstamped install both arms used to make (`Executor::insert`'s
+    /// implicit `Tick::new(0)`) the observation stamp was zero, which is
+    /// 4_940 ticks past the bound, so `orrery_core`'s freshness test failed
+    /// and every neighbour record named the reading tick and carried
+    /// `state: None`. In live play that is every session past its first
+    /// second: a craft has never seen another craft through this path.
+    ///
+    /// Three assertions, deliberately separate so a regression names which
+    /// half moved: the stamp the seam holds after ingest, the bytes a read of
+    /// it returns at the next tick, and — because stamping must change what a
+    /// read *returns* and not whether the body advances — that the replica is
+    /// still byte-frozen across that step.
+    ///
+    /// The keyframe and delta arms are driven in turn over the same wire
+    /// encoder the client broadcasts with, so neither arm can pass on a
+    /// hand-built payload the receiver would never see.
+    #[test]
+    fn a_replica_ingested_past_the_staleness_bound_is_read_as_real_state() {
+        use orrery_games::regolith::MAX_NEIGHBOR_STALENESS_TICKS;
+
+        /// The client's own clock when the keyframe lands.
+        const INGEST_TICK: u64 = 5_000;
+        /// The tick the *authority* stamped that broadcast with. Deliberately
+        /// ahead of the client: a client running behind its host is the
+        /// ordinary case, and it is the case that decides the design question
+        /// this test pins. `orrery_core` measures staleness as
+        /// `reading_tick - observed_tick` with a *checked* subtraction, so a
+        /// replica stamped with an authority tick from the reader's future
+        /// underflows and is refused outright — trading tick zero's
+        /// always-stale read for a skew-dependent one. The authority tick is a
+        /// measurement of the sender and lives in
+        /// `ReplicaFreshness::last_authoritative_tick`; the observation stamp
+        /// has to be in the reader's clock.
+        const AUTHORITY_TICK: u64 = 5_400;
+        /// The authority tick the delta arm's patch is stamped with, likewise
+        /// ahead of the client clock that will ingest it.
+        const AUTHORITY_DELTA_FROM: u64 = 5_500;
+        assert!(
+            INGEST_TICK > MAX_NEIGHBOR_STALENESS_TICKS,
+            "the whole point is a stamp of zero being outside the bound"
+        );
+        assert!(
+            AUTHORITY_TICK > INGEST_TICK,
+            "the authority must lead the client, or this proves nothing about which clock \
+             the stamp is taken from"
+        );
+
+        let mut runtime = CampaignRuntime::launch(
+            undecodable_test_config("stamp-past-the-bound"),
+            UniverseSeed([0xC1; 32]),
+        );
+        runtime.join_for_test();
+        let own = runtime.entity();
+        let remote = PersistId::new(77);
+
+        // Seat both clocks where a real session would be after 83 seconds.
+        runtime.tick = Tick::new(INGEST_TICK);
+        runtime
+            .host
+            .seat_at(Tick::new(INGEST_TICK))
+            .expect("nothing has been queued or stepped");
+
+        // The sender's side: a craft a metre from this client's, so the
+        // collision claim the read verifies is a plausible one.
+        let RegolithState::Craft(own_craft) = runtime
+            .host
+            .backend()
+            .state(own)
+            .expect("launch installed this client's craft")
+            .clone()
+        else {
+            panic!("a spawned craft is a craft");
+        };
+        let game = Regolith::honest();
+        let mut sender = Executor::new(game, UniverseSeed([0xC2; 32]));
+        let neighbour = {
+            let RegolithState::Craft(mut craft) = game.spawn(remote, 2) else {
+                panic!("a spawned craft is a craft");
+            };
+            craft.pos = orrery_core::QPos {
+                x: own_craft.pos.x + 1_000,
+                y: own_craft.pos.y,
+                z: own_craft.pos.z,
+            };
+            RegolithState::Craft(craft)
+        };
+        sender.insert(remote, neighbour.clone());
+        let cell = CellId::from_bits(7).expect("a cell");
+        let mut keyframe = None;
+        let mut send_index = 0;
+
+        // ── The keyframe arm ──────────────────────────────────────────────
+        let wire = encode_state_broadcast(
+            &sender,
+            remote,
+            cell,
+            AUTHORITY_TICK,
+            &mut keyframe,
+            &mut send_index,
+        )
+        .expect("the first broadcast is a keyframe");
+        // `encode_state_broadcast` already carries the outer State tag the
+        // transport adds, so this is the wire byte-for-byte.
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: wire,
+            },
+            Tick::new(INGEST_TICK),
+        );
+        assert_eq!(
+            runtime.host.state_bytes(remote),
+            Some(neighbour.to_canonical()),
+            "the keyframe arm installed the decoded replica"
+        );
+        assert_eq!(
+            runtime.host.observed_tick(remote),
+            Some(Tick::new(INGEST_TICK)),
+            "the keyframe arm stamps at the client's ingest tick — not at zero, and not at \
+             the envelope's authority tick {AUTHORITY_TICK}"
+        );
+        assert_read_is_fresh(&mut runtime, own, remote, Tick::new(INGEST_TICK));
+
+        // ── The delta arm ─────────────────────────────────────────────────
+        // Nudge the sender and drive its scheduler until it emits a delta
+        // rather than the next scheduled keyframe.
+        let moved = {
+            let RegolithState::Craft(mut craft) = neighbour.clone() else {
+                panic!("a spawned craft is a craft");
+            };
+            craft.pos.y += 250;
+            RegolithState::Craft(craft)
+        };
+        sender.insert(remote, moved.clone());
+        let mut delta_wire = None;
+        for at in AUTHORITY_DELTA_FROM..AUTHORITY_DELTA_FROM + 32 {
+            let Some(wire) =
+                encode_state_broadcast(&sender, remote, cell, at, &mut keyframe, &mut send_index)
+            else {
+                continue;
+            };
+            let (_, envelope) =
+                orrery_protocol::channels::untag(&wire).expect("the outer State tag");
+            // The receiver's own discrimination: not a keyframe means the
+            // delta arm is the one that will take it.
+            let is_delta =
+                decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(envelope).is_none();
+            if is_delta {
+                delta_wire = Some((at, wire));
+                break;
+            }
+        }
+        let (authority_delta_tick, wire) =
+            delta_wire.expect("the sender's scheduler emits a delta");
+        // The client's clock has moved one tick — `assert_read_is_fresh`
+        // stepped it — while the authority's is hundreds ahead. Ingest under
+        // the client's, which is the only clock the staleness test speaks.
+        let delta_ingest_tick = runtime.host.next_tick();
+        assert!(
+            authority_delta_tick > delta_ingest_tick.0,
+            "the delta's authority tick must lead the client's clock for this to discriminate"
+        );
+        runtime.tick = delta_ingest_tick;
+        runtime.accept_frame(
+            net::Frame {
+                peer: 2,
+                lane: Lane::Datagram,
+                payload: wire,
+            },
+            delta_ingest_tick,
+        );
+        assert_eq!(
+            runtime.host.state_bytes(remote),
+            Some(moved.to_canonical()),
+            "the delta arm patched the replica onto the keyframe it names"
+        );
+        assert_eq!(
+            runtime.host.observed_tick(remote),
+            Some(delta_ingest_tick),
+            "the delta arm stamps at the client's ingest tick too — not at `delta.tick` \
+             ({authority_delta_tick}), which counts in the authority's clock and would put \
+             the observation in the reader's future"
+        );
+        assert_read_is_fresh(&mut runtime, own, remote, delta_ingest_tick);
+    }
+
+    /// Step this client's craft once, reading `remote`, and require the record
+    /// the witness column would fold to carry the replica's real bytes at
+    /// `stamp` — and the replica itself to be unmoved by the step.
+    ///
+    /// The read is forced by naming `remote` in a `Collide` order, which is
+    /// how Regolith reads a neighbour at all (`visibility::verify_claims`
+    /// reads only what an input claimed).
+    fn assert_read_is_fresh(
+        runtime: &mut CampaignRuntime,
+        own: PersistId,
+        remote: PersistId,
+        stamp: Tick,
+    ) {
+        let frozen = runtime
+            .host
+            .state_bytes(remote)
+            .expect("the replica is installed");
+        let tick = runtime.host.next_tick();
+        runtime
+            .host
+            .submit_input(own, Order::Collide { other: remote });
+        let mut participant = CampaignTick::default();
+        let report = runtime.host.step_predicted(
+            TickCount::new(1),
+            &PredictionSet::just(own),
+            &mut participant,
+        );
+        runtime.host.clear_events();
+        let read = report
+            .neighbor_frames
+            .iter()
+            .flat_map(|stepped| stepped.frames.iter())
+            .find(|frame| frame.neighbor == remote)
+            .unwrap_or_else(|| panic!("the step at {tick:?} never read {remote:?}"));
+        assert_eq!(
+            read.observed_tick, stamp,
+            "the record must name the tick the replica was ingested at, not the reading tick"
+        );
+        assert_eq!(
+            read.state,
+            Some(frozen.clone()),
+            "a read inside the bound carries the replica's bytes; `None` here is the #1112 \
+             defect — a record naming a neighbour and carrying nothing"
+        );
+        assert_eq!(
+            runtime.host.state_bytes(remote),
+            Some(frozen),
+            "stamping changes what a read returns, not whether the replica advances: it is \
+             still frozen between refreshes"
+        );
+    }
+
     /// Bytes as the host's `exterior::HearsayContacts::encode` lays them out.
     fn hearsay_wire(fold_tick: u64, seat: u8) -> Vec<u8> {
         let mut out = vec![0xa2, 0x01];
@@ -3446,19 +3717,23 @@ mod tests {
 
     /// How the ingest leg stamps a replica it installs.
     ///
-    /// The two cases are not a preference: `advance`'s keyframe and delta arms
-    /// both call the unstamped install (`self.host.install_state(entity,
-    /// state)`, the exact shape `Executor::insert` had), so a shipped replica
-    /// is observed at tick zero and every read of it is past Regolith's
-    /// 60-tick staleness bound. The stamped case is the same run with the
-    /// refresh tick carried, and it is here to show what the seam does with a
-    /// stamp when there is one: carries it, unchanged, into the record the
-    /// witness log folds.
+    /// The two cases are not a preference. [`Self::AtRefresh`] is what
+    /// `advance`'s keyframe and delta arms do since #1112: install at the
+    /// client's ingest tick, so the neighbour record carries the refresh
+    /// stamp and real read bytes. [`Self::Unstamped`] is the shape both arms
+    /// had before it — `Executor::insert`'s implicit tick zero — under which
+    /// every read past tick 60 is outside Regolith's staleness bound and the
+    /// record carries nothing. It is kept because the convergence criterion
+    /// this detector exists for is *behavioural identity between the deleted
+    /// loop and the seam*, and that must hold for either stamping policy: a
+    /// column that only agreed on the stamped path would not have proven the
+    /// seam faithful, only that one input happened to match.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ReplicaStamp {
-        /// Installed verbatim with no observation tick, as this client ships.
-        AsShipped,
-        /// Installed carrying the tick the authority observed it at.
+        /// Installed with no observation tick, as both arms did before #1112.
+        Unstamped,
+        /// Installed carrying the tick the ingest leg refreshed it at, as this
+        /// client ships since #1112.
         AtRefresh,
     }
 
@@ -3586,7 +3861,7 @@ mod tests {
             // Installing is the only way a replica's bytes ever change.
             if offset.is_multiple_of(REFRESH_EVERY) {
                 match stamp {
-                    ReplicaStamp::AsShipped => {
+                    ReplicaStamp::Unstamped => {
                         executor.insert(remote, replica.clone());
                         host.install_state(remote, replica.clone());
                     }
@@ -3743,7 +4018,7 @@ mod tests {
                     continue;
                 }
                 match stamp {
-                    ReplicaStamp::AsShipped => {
+                    ReplicaStamp::Unstamped => {
                         assert_eq!(
                             frame.observed_tick, tick,
                             "an unstamped replica is past the staleness bound, so its record \
@@ -3784,7 +4059,7 @@ mod tests {
         assert!(frames_cut > 0, "the witness log cut no frame to compare");
         assert!(sealed_deliveries > 0, "no delivered input was ever sealed");
         match stamp {
-            ReplicaStamp::AsShipped => assert!(stale_reads > 0, "the replica was never read"),
+            ReplicaStamp::Unstamped => assert!(stale_reads > 0, "the replica was never read"),
             ReplicaStamp::AtRefresh => assert!(fresh_reads > 0, "the replica was never read"),
         }
         assert_ne!(
@@ -3796,14 +4071,16 @@ mod tests {
         );
     }
 
-    /// The client as it ships: an unstamped replica, frozen between refreshes.
+    /// The pre-#1112 shape: an unstamped replica, frozen between refreshes,
+    /// read past the staleness bound. Retained because the seam must
+    /// reproduce the deleted loop under either stamping policy.
     #[test]
     fn the_converged_campaign_tick_reproduces_the_hand_rolled_loop() {
-        campaign_convergence_run(ReplicaStamp::AsShipped);
+        campaign_convergence_run(ReplicaStamp::Unstamped);
     }
 
-    /// The same detector with the replica carrying the tick its authority
-    /// observed it at, so each neighbour record is a real read.
+    /// The client as it ships: the replica carries the tick the ingest leg
+    /// refreshed it at, so each neighbour record is a real read.
     #[test]
     fn a_refreshed_replicas_stamp_survives_the_seam_into_the_witness_column() {
         campaign_convergence_run(ReplicaStamp::AtRefresh);
