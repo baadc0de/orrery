@@ -31,6 +31,10 @@
 # Usage:
 #   sudo ORRERY_INVITE_BIN=<built orrery-invite> \
 #        ./scripts/deploy-web-tier.sh            install all four files, reload what changed
+#   sudo ORRERY_INVITE_BIN=<built orrery-invite> ORRERY_ADMISSION_UPGRADE=1 \
+#        ./scripts/deploy-web-tier.sh            ...and ship a NEW admission.py over the
+#                                                host's, which the drift gate otherwise
+#                                                refuses (see ADMISSION_UPGRADE below)
 #   ./scripts/deploy-web-tier.sh --self-test     per-commit checks: no root, no host,
 #                                                no nginx, no network, no build
 #
@@ -93,6 +97,31 @@ INVITE_DST=$BIN_DIR/orrery-invite
 # is no path to default to and none is guessed: an unset value refuses the
 # install the way an unfilled ORRERY_PLACEHOLDER refuses the config files.
 INVITE_SRC=${ORRERY_INVITE_BIN:-}
+
+# The operator's statement that the tracked admission.py is a NEW VERSION
+# rather than a host hand-edit the repo has not caught up with.
+#
+# The drift rule below was written for the 2026-09-03 recording, where the
+# host was the truth and the repo was the copy: any host script differing
+# from the tracked one was assumed to carry a hand-edit worth more than
+# whatever the repo said, so the install refused. Correct then, and it made
+# admission.py *undeployable* -- every genuine change to the service is a
+# difference from the host by definition, so the installer refused every
+# upgrade it existed to perform. #1119 was the first time that mattered: a
+# client fix was ready and the service half could not be shipped by the one
+# script that is allowed to ship it.
+#
+# The two cases are genuinely indistinguishable from the bytes alone -- a
+# hand-edit and a new version both just differ -- so this asks. Setting it
+# does not skip anything: the diff is still printed for the record, the
+# pair's flag gate still runs, and the stage/rename/restart/verify
+# transaction is unchanged. It only answers the question the installer
+# cannot answer for itself.
+#
+# It is not a ORRERY_WEB_TIER_* variable and must never become one: those
+# mark a sandbox run, and reading an operator-set variable as a sandbox
+# marker is #1067 exactly (see the SANDBOX list below).
+ADMISSION_UPGRADE=${ORRERY_ADMISSION_UPGRADE:-0}
 
 # Any ORRERY_WEB_TIER_* override means --self-test is driving: skip
 # everything beyond the plain file work -- no nginx, no root check.
@@ -353,18 +382,41 @@ commit_staged() {  # commit_staged <dst> <label>
 }
 
 # Epoch seconds at which the service's main process started, per systemd,
-# or empty when there is no such process (never started, dead, or the
-# property unavailable). ExecMainStartTimestampUSec is asked for rather
-# than the human-readable timestamp because it needs no locale, no
-# timezone, and no date(1) round-trip to compare against a file's mtime.
+# or empty when there is no such process (never started, or dead).
+#
+# Two properties, because neither is universal. ExecMainStartTimestampUSec
+# is preferred where it exists -- it needs no locale, no timezone and no
+# date(1) round-trip -- but systemd 259 (the campaigns host, Ubuntu
+# 259.5-0ubuntu3.4) does not expose it: `systemctl show -p` prints NOTHING
+# and exits 0 for a property it does not know, so the reading came back
+# empty on a perfectly healthy service. The caller reads empty as "no
+# running main process", so every real deploy on that host died claiming
+# the box office was DOWN while it was serving 200s -- fail-closed, and
+# therefore never a false success, but it made the pair transaction
+# impossible to complete and pointed the operator at an outage that was not
+# happening (#1119).
+#
+# So: fall back to the human-readable ExecMainStartTimestamp, which every
+# systemd in play does emit, parsed by date(1). It carries an explicit zone
+# ("Sun 2026-09-06 14:18:07 CEST"), so the round-trip is exact rather than
+# locale-dependent; an unset property is the empty string there too, and
+# date(1) refuses it, which keeps "no main process" distinguishable from
+# "property unknown to this systemd".
 service_main_start_epoch() {
     local raw
-    raw=$("$SYSTEMCTL" show "$SERVICE_NAME" -p ExecMainStartTimestampUSec 2>/dev/null) || return 0
+    raw=$("$SYSTEMCTL" show "$SERVICE_NAME" -p ExecMainStartTimestampUSec 2>/dev/null) || raw=
     raw=${raw##*=}
     raw=${raw//[[:space:]]/}
-    [[ $raw =~ ^[0-9]+$ ]] || return 0
-    (( raw > 0 )) || return 0
-    echo $(( raw / 1000000 ))
+    if [[ $raw =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+        echo $(( raw / 1000000 ))
+        return 0
+    fi
+    raw=$("$SYSTEMCTL" show "$SERVICE_NAME" -p ExecMainStartTimestamp 2>/dev/null) || return 0
+    raw=${raw#*=}
+    # systemd prints an empty value for a service with no main process, and
+    # the literal "n/a" for one that has never started.
+    [[ -n ${raw//[[:space:]]/} && $raw != *n/a* ]] || return 0
+    date -d "$raw" +%s 2>/dev/null || return 0
 }
 
 # Prove the *running service* is the pair that was just installed, not just
@@ -452,9 +504,17 @@ install_pair() {  # install_pair <unit_changed>
     # upgrade; it always differs from tracked by definition, so its diff is
     # printed for the record and the upgrade proceeds.
     if [[ $host_adm == new ]] && ! cmp -s "$ADMISSION_DST" "$ADMISSION_PY"; then
-        note "admission.py: the host file differs from the tracked one; refusing to clobber it. The diff (host -> tracked):"
+        # Either the host carries a hand-edit the repo has not caught up
+        # with, or the repo carries a new version of the service. Only the
+        # operator knows which; see ORRERY_ADMISSION_UPGRADE above. The diff
+        # is printed either way, because it is the record of what changed on
+        # the box office in both cases.
+        note "admission.py: the host file differs from the tracked one. The diff (host -> tracked):"
         diff -u "$ADMISSION_DST" "$ADMISSION_PY" >&2 || true
-        die "admission.py: reconcile first -- bring the host's version into scripts/admission.py and commit it, or fix the repo copy -- then re-run"
+        if [[ $ADMISSION_UPGRADE != 1 ]]; then
+            die "admission.py: refusing to clobber the host copy. If the host carries a hand-edit, bring it into scripts/admission.py and commit it, then re-run. If the tracked copy is a NEW VERSION to ship, say so: re-run with ORRERY_ADMISSION_UPGRADE=1."
+        fi
+        note "admission.py: ORRERY_ADMISSION_UPGRADE=1 -- installing the tracked copy as a new version of the service (host sha256 $(sha256_of "$ADMISSION_DST"), tracked $(sha256_of "$ADMISSION_PY"))"
     fi
     if [[ $host_adm == old ]]; then
         note "admission.py: the host copy predates --assume-standing-good; the paired upgrade replaces it. The diff (host -> tracked), for the record:"
@@ -473,8 +533,15 @@ install_pair() {  # install_pair <unit_changed>
         note "orrery-invite: the host binary is a different post-#1014 build (host sha256 $(sha256_of "$INVITE_DST"), supplied $(sha256_of "$INVITE_SRC")); both accept the flag, so the supplied build replaces it. Point ORRERY_INVITE_BIN at the build you intend."
     fi
 
+    # "Nothing to do" is a *byte* question, not a flag question. This used to
+    # read `if [[ $host_adm == new ]]`, which called every post-#1014 host
+    # script up to date whatever it contained -- harmless only because the
+    # drift gate above refused such a run before it could get here. With an
+    # upgrade able to pass that gate, a flag-only test would stage nothing,
+    # restart nothing, and print "both halves already installed; unchanged"
+    # over an unshipped fix: the #1067 shape, in the other direction.
     local adm_changes=1 inv_changes=1
-    if [[ $host_adm == new ]]; then adm_changes=0; fi
+    if [[ $host_adm == new ]] && cmp -s "$ADMISSION_DST" "$ADMISSION_PY"; then adm_changes=0; fi
     if [[ $host_inv == new ]] && cmp -s "$INVITE_DST" "$INVITE_SRC"; then inv_changes=0; fi
     if (( ! adm_changes && ! inv_changes )); then
         note "pair: both halves already installed; unchanged"
@@ -870,7 +937,33 @@ FAKE
         || die "self-test: the admission.py refusal did not print the diff"
     grep -q "a hand-edit the repo has never seen" "$drift/admission.py" \
         || die "self-test: the admission.py refusal clobbered the host file"
+    grep -q "ORRERY_ADMISSION_UPGRADE=1" <<<"$out" \
+        || die "self-test: the admission.py refusal does not say how to ship a new version, so the only script allowed to deploy the service cannot deploy a change to it"
     note "self-test: a drifted host admission.py is refused with a diff and left untouched"
+
+    # ...and the same host, told the tracked copy is a new version, ships it
+    # (#1119). Without this the drift gate makes admission.py undeployable:
+    # every genuine change to the service differs from the host by
+    # definition, so the refusal above fired on exactly the runs the
+    # installer exists to perform.
+    out=$(ORRERY_ADMISSION_UPGRADE=1 sandbox_install "$fakes/invite-new" "$drift" 2>&1) \
+        || die "self-test: ORRERY_ADMISSION_UPGRADE=1 did not ship a new admission.py"
+    cmp -s "$drift/admission.py" "$ADMISSION_PY" \
+        || die "self-test: ORRERY_ADMISSION_UPGRADE=1 left the host's old admission.py in place"
+    grep -q "installing the tracked copy as a new version" <<<"$out" \
+        || die "self-test: the upgrade did not say it was replacing the host script"
+    grep -q "both halves already installed; unchanged" <<<"$out" \
+        && die "self-test: the upgrade reported the host unchanged while shipping a new script -- the restart would have been skipped over an unshipped fix (#1067)"
+    note "self-test: ORRERY_ADMISSION_UPGRADE=1 ships a new admission.py over a differing host copy"
+
+    # And it is not a blanket override: with the tracked and host copies
+    # already identical there is nothing to ship, and the run must still be
+    # the no-op it is without the flag.
+    out=$(ORRERY_ADMISSION_UPGRADE=1 sandbox_install "$fakes/invite-new" "$drift" 2>&1) \
+        || die "self-test: re-running the upgrade failed"
+    grep -q "both halves already installed; unchanged" <<<"$out" \
+        || die "self-test: an upgrade run with nothing to ship is not a no-op"
+    note "self-test: an upgrade run with both halves already current stays a no-op"
 
     # The live host's current cell, old/old, upgrades to the new pair in one
     # transaction, with the replaced script's diff printed for the record.
@@ -902,19 +995,43 @@ FAKE
     # single fact the installer's verification reads; `restart` moves it to
     # now, `show` reports it. Seeding the file in the past is a service
     # that started before the install, exactly as on the live host.
-    service_fake() {  # service_fake <path> <state-file> <restart-behaviour>
+    # Stand-in systemctl for --self-test. State: the main process's start
+    # time in epoch microseconds, the one fact
+    # verify_service_runs_installed_pair reads back through 'show'.
+    #
+    # `dialect` is which property this systemd knows, and it is a parameter
+    # because the two in play disagree. "usec" is the older shape. "human"
+    # is systemd 259 on the campaigns host, which does NOT know
+    # ExecMainStartTimestampUSec and prints nothing for it -- the shape that
+    # made every real deploy report a false outage. A stand-in that only
+    # ever spoke "usec" is why the self-test could not see that.
+    service_fake() {  # service_fake <path> <state-file> <restart-behaviour> [usec|human]
         cat > "$1" <<FAKE
 #!/bin/sh
-# Stand-in systemctl for --self-test. State: the main process's start time
-# in epoch microseconds, the one fact verify_service_runs_installed_pair
-# reads back through 'show'.
 state=$2
+dialect=${4:-usec}
 case "\$1" in
     restart)
         $3
         ;;
     show)
-        printf 'ExecMainStartTimestampUSec=%s\\n' "\$(cat "\$state" 2>/dev/null || echo 0)"
+        usec=\$(cat "\$state" 2>/dev/null || echo 0)
+        case "\$*" in
+            *ExecMainStartTimestampUSec*)
+                # systemd 259 knows no such property: it prints nothing and
+                # exits 0, which is the whole point of the "human" dialect.
+                [ "\$dialect" = usec ] && printf 'ExecMainStartTimestampUSec=%s\\n' "\$usec"
+                ;;
+            *ExecMainStartTimestamp*)
+                if [ "\$dialect" = human ]; then
+                    if [ "\$usec" -gt 0 ] 2>/dev/null; then
+                        printf 'ExecMainStartTimestamp=%s\\n' "\$(date -d "@\$(( usec / 1000000 ))" '+%a %Y-%m-%d %H:%M:%S %Z')"
+                    else
+                        printf 'ExecMainStartTimestamp=\\n'
+                    fi
+                fi
+                ;;
+        esac
         ;;
 esac
 exit 0
@@ -940,6 +1057,46 @@ FAKE
         die "self-test: the stand-in service was not restarted after the install"
     fi
     note "self-test: installing the pair over a running service restarts it and verifies the process was replaced"
+
+    # (i-b) the same install against systemd 259, which does not know
+    #       ExecMainStartTimestampUSec. This is the campaigns host. The
+    #       verification used to read that one property, get the empty
+    #       string systemd prints for a property it does not know, and
+    #       declare the box office DOWN over a service that had restarted
+    #       cleanly and was serving -- so the pair transaction could never
+    #       be completed there, and the operator was sent after an outage
+    #       that was not happening (#1119).
+    local live259=$tmp/live259-bin live259_state=$tmp/live259-state
+    mkdir -p "$live259"
+    cp "$adm_old" "$live259/admission.py"
+    cp "$fakes/invite-old" "$live259/orrery-invite"
+    printf '%s000000\n' "$(( $(date +%s) - 3600 ))" > "$live259_state"
+    service_fake "$fakes/systemctl-259" "$live259_state" 'date +%s000000 > "$state"' human
+    out=$(sandbox_install "$fakes/invite-new" "$live259" "$fakes/systemctl-259" 2>&1) \
+        || die "self-test: installing the pair on a systemd that lacks ExecMainStartTimestampUSec failed; the campaigns host cannot be deployed to"
+    grep -q "verified the running service was replaced" <<<"$out" \
+        || die "self-test: a healthy restart on systemd 259 was not verified"
+    grep -q "the box office is DOWN" <<<"$out" \
+        && die "self-test: a healthy restart on systemd 259 was reported as an outage"
+    note "self-test: a systemd that exposes only ExecMainStartTimestamp still verifies the restart"
+
+    # (i-c) and the guard still bites on that dialect: a restart that does
+    #       nothing must fail there too, or the fallback has bought
+    #       deployability by disarming #1067's check.
+    local stale259=$tmp/stale259-bin stale259_state=$tmp/stale259-state
+    mkdir -p "$stale259"
+    cp "$adm_old" "$stale259/admission.py"
+    cp "$fakes/invite-old" "$stale259/orrery-invite"
+    printf '%s000000\n' "$(( $(date +%s) - 3600 ))" > "$stale259_state"
+    service_fake "$fakes/systemctl-259-stale" "$stale259_state" ':' human
+    status=0
+    out=$(sandbox_install "$fakes/invite-new" "$stale259" "$fakes/systemctl-259-stale" 2>&1) || status=$?
+    if (( status == 0 )); then
+        die "self-test: on systemd 259 a restart that did not replace the process was reported as a successful install (#1067)"
+    fi
+    grep -q "the host now runs the new pair" <<<"$out" \
+        && die "self-test: on systemd 259 the installer claimed the host runs the new pair over a stale process (#1067)"
+    note "self-test: the #1067 guard still bites on a systemd that exposes only ExecMainStartTimestamp"
 
     # (ii) #1067 itself: the restart silently does nothing, so the process
     #      still predates the installed script. The installer must fail

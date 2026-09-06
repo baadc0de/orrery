@@ -918,19 +918,33 @@ class Admission:
         os.replace(temp, path)
         fd = os.open(path.parent, os.O_DIRECTORY); os.fsync(fd); os.close(fd)
 
-    def upload(self, sid: str, body: bytes) -> None:
-        """Store one session's client evidence, and say so out loud when it is refused."""
-        try: self._store_upload(sid, body)
+    def upload(self, sid: str, body: bytes, increment: int = 0) -> None:
+        """Store one increment of one session's client evidence, and say so out loud when it is refused."""
+        try: self._store_upload(sid, body, increment)
         except Refusal as e:
             # A refused upload is a session that went unrecorded, and the only
             # other report of it is a line in the player's own log. Admission
             # is the one party that can see it at all, so it says so here
             # (#735); silence here is indistinguishable from a player who
             # never played, which is the blind spot #711 existed to close.
-            logging.error("upload refused for session %s: %d %s (%d bytes)", sid, e.status, e.error, len(body))
+            logging.error("upload refused for session %s increment %d: %d %s (%d bytes)", sid, increment, e.status, e.error, len(body))
             raise
 
-    def _store_upload(self, sid: str, body: bytes) -> None:
+    @staticmethod
+    def increment_of(row: Any) -> int:
+        """The increment index a client row carries, or zero for a row without one.
+
+        A row written before #1048 has no `increment` object and is a whole
+        seat, which is increment zero of a seat of one -- the same reading the
+        client's `increment_index_of` takes and the same one `p4-ledger.sh`
+        takes.
+        """
+        increment = row.get("increment")
+        if not isinstance(increment, dict): return 0
+        index = increment.get("index")
+        return index if isinstance(index, int) and not isinstance(index, bool) else 0
+
+    def _store_upload(self, sid: str, body: bytes, increment: int = 0) -> None:
         if not self.known_session(sid): raise Refusal(404, "unknown_session", "That session is not known to this service.")
         if len(body) > MAX_UPLOAD_BYTES: raise Refusal(413, "too_large", "The upload is too large.")
         try: payload = json.loads(body)
@@ -939,10 +953,28 @@ class Admission:
         if not isinstance(records, list) or any(not isinstance(r, dict) or r.get("session_id") != sid for r in records): raise Refusal(422, "wrong_session", "Every uploaded row must name this session.")
         telemetry = payload.get("telemetry_jsonl")
         if not isinstance(telemetry, str): raise Refusal(422, "bad_upload", "Telemetry must be text.")
+        # Every row of one body is one increment of one seat, and the URL says
+        # which (#1119). Before this, a seat longer than the client's
+        # five-minute cadence posted each of its increments to the *same* path
+        # and every one after the first was refused 409 as a conflicting
+        # re-upload of the seat -- so a 60-minute session banked five minutes,
+        # on that launch and on every later one.
+        if any(self.increment_of(r) != increment for r in records): raise Refusal(422, "wrong_increment", "Every uploaded row must name this seat increment.")
+        # Increment zero keeps the unsuffixed names, so everything already
+        # banked stays exactly where it is and every reader of a session
+        # directory keeps working unchanged; the increments after it sit
+        # beside it in the same seat's directory. The seat is still one
+        # directory: `sessions/<sid>` is where the host's `raw.json` and
+        # listening file live, and an increment is not a session.
+        suffix = "" if increment == 0 else f".increment-{increment}"
         target = self.state / "sessions" / sid; target.mkdir(parents=True, exist_ok=True)
-        files = {target / "client-records.jsonl": ("\n".join(json.dumps(r, separators=(",", ":")) for r in records) + ("\n" if records else "")).encode(), target / "telemetry.jsonl": telemetry.encode()}
+        files = {target / f"client-records{suffix}.jsonl": ("\n".join(json.dumps(r, separators=(",", ":")) for r in records) + ("\n" if records else "")).encode(), target / f"telemetry{suffix}.jsonl": telemetry.encode()}
+        # Still a conflict, but per increment: two *different* bodies claiming
+        # the same increment of the same seat cannot both be that increment's
+        # evidence. An identical re-send is not a conflict and never was --
+        # which is what makes the client's retry, and its #1118 repair, free.
         for path, data in files.items():
-            if path.exists() and path.read_bytes() != data: raise Refusal(409, "conflict", "A different upload already exists for this session.")
+            if path.exists() and path.read_bytes() != data: raise Refusal(409, "conflict", "A different upload already exists for this session increment.")
         for path, data in files.items():
             if not path.exists(): self.atomic_bytes(path, data)
 
@@ -968,10 +1000,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path; match = re.fullmatch(r"/v1/campaigns/([^/]+)/join", path)
         upload = re.fullmatch(r"/v1/sessions/([^/]+)/upload", path)
+        # One increment of a seat, addressed as itself (#1119). Increment zero
+        # keeps the unsuffixed route above so a client that predates this
+        # service build banks its first increment exactly as it does today,
+        # and the two halves of the seam can be deployed in either order.
+        increment = re.fullmatch(r"/v1/sessions/([^/]+)/increments/(\d{1,9})/upload", path)
         try:
             if match: self.send_json(200, self.service.join(unquote(match.group(1)), self.read_json()[0]))
             elif upload:
                 _, body = self.read_json(); self.service.upload(unquote(upload.group(1)), body); self.send_json(204)
+            elif increment:
+                _, body = self.read_json(); self.service.upload(unquote(increment.group(1)), body, int(increment.group(2))); self.send_json(204)
             else: raise Refusal(404, "not_found", "No such endpoint.")
         except Refusal as e: self.failure(e)
         except (ValueError, json.JSONDecodeError): self.failure(Refusal(422, "bad_request", "The request is not valid JSON."))
@@ -1659,6 +1698,73 @@ class AdmissionTests(unittest.TestCase):
         sid = self.service.join("test", self.request())["join"]["session_id"]; one = json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "one"}).encode(); self.service.upload(sid, one)
         with self.assertRaises(Refusal) as x: self.service.upload(sid, json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "two"}).encode())
         self.assertEqual(x.exception.status, 409); self.assertEqual((self.state / "sessions" / sid / "telemetry.jsonl").read_text(), "one")
+
+    def test_a_seat_longer_than_the_increment_cadence_stores_every_increment(self) -> None:
+        # #1119. A 60-minute session mints twelve signed rows, one per
+        # five-minute increment. Every one of them used to be posted to
+        # `/v1/sessions/<sid>/upload`, where the second and every later body
+        # differed from the first and was refused `409 conflict` -- so a long
+        # playtest banked its first five minutes and nothing else, forever.
+        #
+        # Twelve increments, not two: one boundary proves nothing about a
+        # cadence, and the seat that actually gets flown is an hour long.
+        sid = self.service.join("test", self.request())["join"]["session_id"]
+        def increment(index: int) -> bytes:
+            return json.dumps({"records": [{"session_id": sid, "banked_minutes": 5.0,
+                                            "increment": {"index": index, "since_tick": index * 18000,
+                                                          "until_tick": (index + 1) * 18000,
+                                                          "final_increment": index == 11}}],
+                               "telemetry_jsonl": f"increment {index}\n"}).encode()
+        for index in range(12):
+            self.service.upload(sid, increment(index), index)
+        seat = self.state / "sessions" / sid
+        # Increment zero keeps the unsuffixed names, so nothing already banked
+        # moved and every existing reader of a session directory still works.
+        self.assertEqual((seat / "telemetry.jsonl").read_text(), "increment 0\n")
+        for index in range(1, 12):
+            self.assertEqual((seat / f"telemetry.increment-{index}.jsonl").read_text(), f"increment {index}\n",
+                             f"increment {index} of the seat is not stored as its own evidence")
+            self.assertIn(f'"index":{index}', (seat / f"client-records.increment-{index}.jsonl").read_text())
+        # The whole hour is on disk, as twelve distinct signed rows.
+        self.assertEqual(len(sorted(seat.glob("client-records*.jsonl"))), 12)
+        # And a retry of any of them is free: identical bytes are not a
+        # conflict, which is what lets the client re-send without fear.
+        self.service.upload(sid, increment(7), 7)
+
+    def test_an_increment_may_not_be_filed_under_another_increments_address(self) -> None:
+        # The address and the row must agree, for the same reason
+        # `wrong_session` exists: a row filed under the wrong increment is
+        # evidence in the wrong place, and the ledger dedupes increments by
+        # their span, so a misfiled one is a span attributed twice or not at
+        # all. Nothing upstream of here would say so.
+        sid = self.service.join("test", self.request())["join"]["session_id"]
+        row = json.dumps({"records": [{"session_id": sid, "increment": {"index": 2, "since_tick": 36000, "until_tick": 54000}}],
+                          "telemetry_jsonl": "x"}).encode()
+        with self.assertRaises(Refusal) as x: self.service.upload(sid, row, 3)
+        self.assertEqual((x.exception.status, x.exception.error), (422, "wrong_increment"))
+        self.assertFalse((self.state / "sessions" / sid / "client-records.increment-3.jsonl").exists())
+        # A row with no `increment` object at all is a whole seat, which is
+        # increment zero -- so it may not be filed under a later increment.
+        whole = json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "x"}).encode()
+        with self.assertRaises(Refusal) as x: self.service.upload(sid, whole, 1)
+        self.assertEqual(x.exception.error, "wrong_increment")
+        self.service.upload(sid, whole, 0)
+
+    def test_the_increment_route_addresses_the_increment_the_url_names(self) -> None:
+        # The client builds `/v1/sessions/<sid>/increments/<n>/upload` for
+        # every increment after the first (#1119). If this route is not
+        # matched the body 404s as an unknown endpoint, which is the whole
+        # seam between the two halves of the fix.
+        matched = re.fullmatch(r"/v1/sessions/([^/]+)/increments/(\d{1,9})/upload",
+                               "/v1/sessions/018f8f4e-5c90-7abc-8123-0000000000ab/increments/7/upload")
+        self.assertIsNotNone(matched)
+        assert matched is not None
+        self.assertEqual((matched.group(1), int(matched.group(2))), ("018f8f4e-5c90-7abc-8123-0000000000ab", 7))
+        # And increment zero keeps the route it has always had, so a client
+        # older than this service build still banks its first increment.
+        self.assertIsNotNone(re.fullmatch(r"/v1/sessions/([^/]+)/upload",
+                                          "/v1/sessions/018f8f4e-5c90-7abc-8123-0000000000ab/upload"))
+
     def test_a_row_naming_another_session_refuses_422_at_the_service(self) -> None:
         # The `wrong_session` guard was unpinned: removing it left all twelve
         # tests green, because the only cross-session coverage exercised
