@@ -416,13 +416,37 @@ class Admission:
             logging.error("always-on host returned an invalid attempt record for %s", campaign.ident)
             return None
 
-    def _read_slots(self, campaign: Campaign) -> list[dict[str, Any]]:
+    def _read_slots(self, campaign: Campaign) -> list[dict[str, Any]] | None:
+        """The reservation journal, or `None` when it could not be read (#1150).
+
+        A missing file is a real, empty journal: nobody has reserved a seat on
+        this campaign yet, and answering `[]` is correct.  Every other failure
+        -- `EIO`, `EACCES`, `EMFILE` from a burst of threaded requests, a torn
+        or truncated document -- is *not* an empty journal, and answering `[]`
+        for one is the dangerous direction: the caller draws every seat free
+        and the next join durably rewrites the file with a single row, taking
+        out every live reservation on the campaign at once.
+
+        So this reads like `_published_standing_host_membership` and not like
+        the old version of itself: a feed it cannot trust says nothing, says so
+        in the log, and the callers turn that into `restarting` / `503
+        host_failed` rather than into an empty seat map.  Nothing may write
+        over state it could not read.
+        """
         path = self.state / campaign.ident / "slots.json"
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-            return value if isinstance(value, list) and all(isinstance(row, dict) for row in value) else []
-        except (OSError, json.JSONDecodeError):
+        except FileNotFoundError:
             return []
+        except (OSError, json.JSONDecodeError) as error:
+            logging.error("campaign %s: reservation journal %s is unreadable (%s); "
+                          "refusing to treat it as empty", campaign.ident, path, error)
+            return None
+        if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+            logging.error("campaign %s: reservation journal %s is not a list of rows; "
+                          "refusing to treat it as empty", campaign.ident, path)
+            return None
+        return value
 
     def _write_slots(self, campaign: Campaign, slots: list[dict[str, Any]]) -> None:
         self.atomic_bytes(self.state / campaign.ident / "slots.json",
@@ -513,7 +537,10 @@ class Admission:
         if membership is None:
             return None
         now = int(time.time())
-        generation = [row for row in self._read_slots(campaign)
+        rows = self._read_slots(campaign)
+        if rows is None:
+            return None
+        generation = [row for row in rows
                       if row.get("attempt_id") == attempt["attempt_id"]]
         current = [row for row in generation
                    if not membership.spent(row.get("session_id"), now)
@@ -538,6 +565,8 @@ class Admission:
         # Counted from the same definition the roster renders, so the listing
         # can never answer `full` while the roster draws an empty seat (#713).
         slots = self._occupied_human_seats(campaign, attempt)
+        if slots is None:
+            return "restarting", 0
         free = campaign.humans - len(slots)
         # A standing host reopens empty lobby windows without respawning. Its
         # supervisor advances `started` at the same boundary, but this clause
@@ -552,7 +581,7 @@ class Admission:
         return "lobby", max(free, 0)
 
     def _occupied_human_seats(self, campaign: Campaign, attempt: dict[str, Any] | None
-                             ) -> dict[int, SeatOccupancy]:
+                             ) -> dict[int, SeatOccupancy] | None:
         """The one definition of a taken human seat, for counting and rendering.
 
         A seat is taken when the host says it is bound, or when an unexpired
@@ -565,6 +594,11 @@ class Admission:
         the lobby showed free seats while admission answered `full` (#713).
         """
         rows = self._read_slots(campaign)
+        if rows is None:
+            # An unreadable journal is not an empty one (#1150): every seat
+            # would draw free and the listing would advertise the campaign
+            # wide open.  Say "I do not know" and let the caller fail closed.
+            return None
         try:
             bound = self._published_standing_host_membership(campaign)
         except FileNotFoundError:
@@ -612,6 +646,11 @@ class Admission:
     def session_roster(self, campaign: Campaign, attempt: dict[str, Any] | None) -> list[dict[str, Any]]:
         """Return every configured seat; a reservation is not a liveness claim."""
         occupied = self._occupied_human_seats(campaign, attempt)
+        # An unreadable journal (#1150) leaves the human seats unlabelled and
+        # drawn `empty`, which is the documented "it does not know" answer for
+        # this sideband and costs nothing: joinability travels beside it in
+        # `phase`, which the same read has already turned into `restarting`.
+        occupied = occupied if occupied is not None else {}
         roster: list[dict[str, Any]] = []
         for slot in range(campaign.peers):
             suffix = f"-{slot + 1}"
@@ -723,23 +762,38 @@ class Admission:
                         raise Refusal(500, "admission_failed", "Admission failed; tell the operator.") from e
                 else:
                     account, sid = existing["account"], existing["session_id"]
-                    if membership.reclaimable(sid, int(time.time())):
-                        # The redial of a volunteer whose lobby connection
-                        # lapsed. Nothing is minted: the same session, the same
-                        # account and the same seat come back, and the only new
-                        # thing is a freshly signed token for the same node.
-                        # The row does get a fresh arrival lease, because the
-                        # host's journal refuses an expired one and this
-                        # volunteer is arriving exactly as a first-time joiner
-                        # is.
-                        existing["expires_at"] = int(time.time()) + ARRIVAL_LEASE_SECONDS
-                        self._write_slots(c, slots)
-                        self.append_join(c, {"when": int(time.time()), "campaign": ident,
-                                             "nickname": nickname, "account": int(account),
-                                             "session_id": sid, "node": node, "slot": slot,
-                                             "attempt_id": attempt["attempt_id"], "reissued": True})
-                        logging.info("campaign %s: reissued seat %s to the transport identity that "
-                                     "lost it (session %s)", ident, slot, sid)
+                    # The redial of a volunteer whose connection lapsed. Nothing
+                    # is minted: the same session, the same account and the same
+                    # seat come back, and the only new thing is a freshly signed
+                    # token for the same node.
+                    #
+                    # The row gets a fresh arrival lease on *every* reissue, not
+                    # only on the reclaimable one (#1147).  The host's journal
+                    # refuses an expired row outright
+                    # (`gates/p1-swarm/src/exterior.rs:927`,
+                    # `reservation_journal_stale`), and a reconnect inside the
+                    # ~12 s before the host publishes `released_at` used to be
+                    # handed back exactly that: the same seat, with a lease
+                    # nothing had touched since the original join 45 s or an hour
+                    # ago.  That is the moment the client tells the volunteer to
+                    # rejoin *now* (`crates/orrery_net/src/net.rs:751`), so it was
+                    # the one moment the advice could not work.
+                    #
+                    # Refreshing it here is not a way to hold a seat longer than
+                    # the lease allows: the row is found by the transport
+                    # identity that owns it and by nothing else, and a lease is
+                    # exactly the promise that a seat is held for somebody who is
+                    # arriving.  Somebody dialling this second is arriving.
+                    reclaiming = membership.reclaimable(sid, int(time.time()))
+                    existing["expires_at"] = int(time.time()) + ARRIVAL_LEASE_SECONDS
+                    self._write_slots(c, slots)
+                    self.append_join(c, {"when": int(time.time()), "campaign": ident,
+                                         "nickname": nickname, "account": int(account),
+                                         "session_id": sid, "node": node, "slot": slot,
+                                         "attempt_id": attempt["attempt_id"], "reissued": True})
+                    logging.info("campaign %s: reissued seat %s to the transport identity that "
+                                 "holds it (session %s, host has published the release: %s)",
+                                 ident, slot, sid, reclaiming)
                 try:
                     # `--assume-standing-good` is mandatory since #1014: the
                     # offline mint reads no standing ledger, so it refuses
@@ -895,20 +949,77 @@ class Admission:
             child.wait()
         for reaper in list(self.reapers): reaper.join()
 
+    @staticmethod
+    def _session_ids_in(joins: Path) -> tuple[list[str], int]:
+        """Every session id in one append-only join log, and how many lines were skipped.
+
+        `joins.jsonl` is an append-ordered audit log, so a damaged line is a
+        damaged *line* and never a reason to stop reading the file (#1151).
+        The old reader put the whole scan inside one `try`, and `any()` is
+        lazy, so the first `JSONDecodeError` escaped the generator and ended
+        the file at the bad line -- making every session admitted *after* it
+        permanently unknown and refusing all of their evidence uploads with
+        `404 unknown_session`, forever.
+
+        The realistic way to get a truncated line is a full disk, and this
+        service is deliberately built to keep appending here below
+        `MINT_FLOOR_BYTES` (see
+        `test_an_admitted_session_still_uploads_below_the_floor`), so the
+        trigger is a condition the design already expects to meet.
+
+        A line that parses but is not an object (`null`, a bare number) is
+        skipped the same way: `.get`/`[]` on one raises `AttributeError` or
+        `TypeError`, neither of which the old `except` tuples named, so it
+        propagated out of the request handler entirely.
+        """
+        skipped = 0
+        ids: list[str] = []
+        for number, line in enumerate(joins.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                session = row["session_id"]
+                if not isinstance(session, str):
+                    raise TypeError("session_id is not a string")
+            except (json.JSONDecodeError, KeyError, AttributeError, TypeError, ValueError):
+                skipped += 1
+                if skipped == 1:
+                    logging.warning("join log %s: line %d is unreadable and was skipped; the rest "
+                                    "of the file is still being read (#1151)", joins, number)
+                continue
+            ids.append(session)
+        if skipped:
+            logging.warning("join log %s: %d unreadable line(s) skipped in total", joins, skipped)
+        return ids, skipped
+
     def known_session(self, sid: str) -> bool:
         if not SESSION.fullmatch(sid): return False
         for joins in self.state.glob("*/joins.jsonl"):
             try:
-                if any(json.loads(line).get("session_id") == sid for line in joins.read_text().splitlines()): return True
-            except (OSError, json.JSONDecodeError): continue
+                ids, _ = self._session_ids_in(joins)
+            except OSError as error:
+                # The file itself is unreadable, which is not evidence that this
+                # session is unknown -- so say so rather than letting silence
+                # stand in for an answer, and keep looking in the other
+                # campaigns' logs.
+                logging.error("join log %s could not be read (%s); it cannot answer for session %s",
+                              joins, error, sid)
+                continue
+            if sid in ids: return True
         return False
 
     def campaign_can_stand_down(self, ident: str) -> bool:
         """The campaign teardown gate: no admitted report may be left remote-only."""
         joins = self.state / ident / "joins.jsonl"
         if not joins.exists(): return True
-        try: ids = [json.loads(line)["session_id"] for line in joins.read_text().splitlines()]
-        except (OSError, json.JSONDecodeError, KeyError): return False
+        # This gate fails *closed* where `known_session` skips: a line it cannot
+        # read may name a session whose report is still remote-only, and the
+        # cost of standing down over one is an unrecoverable loss of evidence,
+        # while the cost of refusing is that an operator looks at the log.
+        try: ids, skipped = self._session_ids_in(joins)
+        except OSError: return False
+        if skipped: return False
         return all((self.state / "sessions" / sid / "raw.json").is_file() for sid in ids)
 
     @staticmethod
@@ -1672,6 +1783,129 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(Refusal) as caught:
             self.service.join("test", self.request())
         self.assertEqual((caught.exception.status, caught.exception.error), (503, "host_failed"))
+
+    def test_an_unreadable_reservation_journal_is_not_an_empty_one(self) -> None:
+        # #1150. `slots.json` is admission's own authoritative reservation
+        # journal and it used to be the one feed in this file that failed open:
+        # any `OSError` or a torn document read as "no seats reserved", the
+        # listing advertised the campaign wide open, and the next join
+        # durably rewrote the file with a single row -- taking out every live
+        # reservation on the campaign at once.  The suite only ever removed the
+        # file or wrote valid JSON into it, so nothing caught it.
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        self.publish_seats(attempt, active=(first["join"]["slot"],))
+        journal = self.state / "test" / "slots.json"
+        intact = journal.read_text()
+        journal.write_text(intact[:len(intact) // 2])  # a short write, as a full disk makes
+
+        listing = self.service.listing()["campaigns"][0]
+        self.assertEqual((listing["state"], listing["phase"], listing["slots_free"]),
+                         ("restarting", "restarting", 0),
+                         "a journal we could not read must never advertise free seats")
+
+        stranger = self.request(); stranger.update({"nickname": "lin", "node": "b" * 64})
+        with self.assertRaises(Refusal) as caught:
+            self.service.join("test", stranger)
+        self.assertEqual((caught.exception.status, caught.exception.error), (503, "host_failed"),
+                         "the same posture the host-membership feed already takes")
+        self.assertEqual(journal.read_text(), intact[:len(intact) // 2],
+                         "nothing may write over state it could not read")
+
+    def test_a_reservation_journal_that_cannot_be_opened_refuses_rather_than_empties(self) -> None:
+        # The other half of #1150: not a torn document but a failed `read` --
+        # `EMFILE` from a burst against the threaded server, `EIO`, `EACCES`.
+        # `OSError` is the whole family and all of it used to become `[]`.
+        attempt = self.enable_always_on()
+        self.service.join("test", self.request())
+        journal = self.state / "test" / "slots.json"
+        journal.unlink(); journal.mkdir()  # any OSError that is not FileNotFoundError
+        self.assertIsNone(self.service._read_slots(self.service.campaigns()[0]["test"]))
+        self.assertEqual(self.service._campaign_phase(self.service.campaigns()[0]["test"], attempt)[0],
+                         "restarting")
+
+    def test_a_missing_reservation_journal_is_still_an_empty_one(self) -> None:
+        # And the fail-closed posture must not swallow the legitimate empty
+        # case: a campaign nobody has joined has no `slots.json` at all, and
+        # that is a real answer of "no seats reserved", not a read failure.
+        attempt = self.enable_always_on()
+        self.assertFalse((self.state / "test" / "slots.json").exists())
+        listing = self.service.listing()["campaigns"][0]
+        self.assertEqual((listing["phase"], listing["slots_free"]), ("lobby", 4))
+        self.assertEqual(self.service.join("test", self.request())["join"]["slot"], 4)
+        self.assertEqual(attempt["attempt_id"], "test-attempt")
+
+    def test_one_damaged_join_line_does_not_hide_the_sessions_after_it(self) -> None:
+        # #1151. `joins.jsonl` is append-ordered and the whole scan used to sit
+        # inside one `try`; `any()` is lazy, so the first `JSONDecodeError`
+        # escaped the generator and ended the file *at the bad line*.  Every
+        # session admitted afterwards was permanently unknown and every one of
+        # their evidence uploads was refused `404 unknown_session` forever --
+        # a cohort, not a seat.  A full disk truncating the last line is the
+        # realistic way in, and this service deliberately keeps appending here
+        # below `MINT_FLOOR_BYTES`.
+        self.enable_always_on()
+        early = self.service.join("test", self.request())["join"]["session_id"]
+        joins = self.state / "test" / "joins.jsonl"
+        with joins.open("a", encoding="utf-8") as f:
+            f.write('{"when":123,"session_id":"018f8f4e-5c90-7abc-81')  # a short write
+            f.write("\n")
+        later = self.request(); later.update({"nickname": "lin", "node": "b" * 64})
+        late = self.service.join("test", later)["join"]["session_id"]
+
+        self.assertTrue(self.service.known_session(early), "the session before the damage")
+        self.assertTrue(self.service.known_session(late),
+                        "one damaged line must cost one line, not the rest of the file")
+        body = json.dumps({"records": [{"session_id": late}], "telemetry_jsonl": "x"}).encode()
+        self.service.upload(late, body)  # would have raised 404 unknown_session
+
+    def test_a_join_line_that_is_not_an_object_is_skipped_not_raised(self) -> None:
+        # The narrower hole on the same lines: a line that is valid JSON but
+        # not an object raises `AttributeError`/`TypeError` from the member
+        # access, and neither was in either `except` tuple -- so it propagated
+        # out of the request handler entirely rather than being refused.
+        self.enable_always_on()
+        sid = self.service.join("test", self.request())["join"]["session_id"]
+        joins = self.state / "test" / "joins.jsonl"
+        with joins.open("a", encoding="utf-8") as f:
+            f.write("null\n7\n[]\n\n")
+        self.assertTrue(self.service.known_session(sid))
+        self.assertFalse(self.service.known_session("018f8f4e-5c90-7abc-8123-0000000000aa"))
+        # The teardown gate reads the same log, and it fails *closed*: a line
+        # it cannot read may name a session whose report is still remote-only.
+        self.assertFalse(self.service.campaign_can_stand_down("test"),
+                         "a damaged join log is not permission to stand a campaign down")
+
+    def test_a_reconnect_before_the_host_publishes_the_release_gets_a_live_lease(self) -> None:
+        # #1147. The client tells the volunteer, in as many words, to rejoin
+        # now; for the ~12 s before the host publishes `released_at` the row is
+        # still held, so the reissue came back with the lease from the original
+        # join -- long expired on any session older than 45 s.  The host then
+        # refuses it `reservation_journal_stale`, which is a handshake error
+        # the client does not retry, so "rejoin now" was the one thing that
+        # could not work.  Measured at 12.1 s of hard lockout end to end.
+        attempt = self.enable_always_on()
+        first = self.service.join("test", self.request())
+        slot, session = first["join"]["slot"], first["join"]["session_id"]
+        # The host holds the seat -- bound, and with no release published.
+        self.publish_seats(attempt, active=(slot,), running=True)
+        self.expire_every_reservation()
+
+        again = self.service.join("test", self.request())
+        self.assertEqual((again["join"]["session_id"], again["join"]["slot"]), (session, slot),
+                         "the same identity gets its own seat back, as it always did")
+        rows = json.loads((self.state / "test" / "slots.json").read_text())
+        self.assertEqual([row["session_id"] for row in rows], [session])
+        self.assertGreater(rows[0]["expires_at"], int(time.time()),
+                           "the host's journal refuses an expired row, so the reconnect "
+                           "the client advises must be handed a live lease")
+
+        # The same again for a seat the host still has only in the lobby.
+        self.publish_seats(attempt, pending=(slot,), running=False)
+        self.expire_every_reservation()
+        self.service.join("test", self.request())
+        rows = json.loads((self.state / "test" / "slots.json").read_text())
+        self.assertGreater(rows[0]["expires_at"], int(time.time()))
 
     def test_the_roster_forgets_a_session_when_it_ends(self) -> None:
         # A label that outlives its session names a player who is not there.
