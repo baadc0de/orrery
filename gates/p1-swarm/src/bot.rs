@@ -1498,13 +1498,14 @@ impl Bot {
     /// Re-seat both hosts' clocks on `at`, if they are not already there.
     ///
     /// [`Self::step_core`] is handed its tick by the harness around it, and a
-    /// host fixes its first tick at construction. A host that has never
-    /// stepped is entirely described by its population and its stamps, so
-    /// re-seating is: build a host at `at` and re-install what the old one
-    /// held, byte for byte and stamp for stamp. Nothing else can be in flight
-    /// — this driver submits, steps and drains its events inside one
-    /// `step_core` call, so no input is ever queued and no event ever left
-    /// undrained across one.
+    /// host fixes its first tick at construction. [`SimulationHost::seat_at`]
+    /// moves the clock in place: a host that has never stepped is entirely
+    /// described by its population and its stamps, so building one at `at`
+    /// differs from the standing host in nothing but the clock — and seating
+    /// changes exactly that. Nothing else can be in flight — this driver
+    /// submits, steps and drains its events inside one `step_core` call, so
+    /// no input is ever queued and no event ever left undrained across one —
+    /// which is the whole of `seat_at`'s precondition.
     ///
     /// In a swarm run this fires once, on tick zero. It exists because a test
     /// may start a fresh bot at an arbitrary tick, which the executor this
@@ -1519,12 +1520,13 @@ impl Bot {
             );
             return;
         }
-        let rules = self
-            .tamper
-            .map_or_else(Regolith::honest, Regolith::cheating);
-        self.host = reseat(&self.host, rules, self.seed, at);
-        if let Some(shadow) = &self.honest_shadow {
-            self.honest_shadow = Some(reseat(shadow, Regolith::honest(), self.seed, at));
+        self.host
+            .seat_at(at)
+            .expect("a host this driver never stepped or queued into seats");
+        if let Some(shadow) = &mut self.honest_shadow {
+            shadow
+                .seat_at(at)
+                .expect("the shadow steps nothing the modified column does not");
         }
     }
 
@@ -2903,27 +2905,6 @@ fn new_host(
         rules,
         BotAdapter(rules),
     )
-}
-
-/// Copy `held`'s population, stamp for stamp, into a fresh host clocked at
-/// `first_tick`.
-///
-/// See [`Bot::seat_hosts_at`] for why a driver handed its tick from outside
-/// needs this at all.
-fn reseat(
-    held: &SimulationHost<Regolith, BotAdapter>,
-    rules: Regolith,
-    seed: UniverseSeed,
-    first_tick: Tick,
-) -> SimulationHost<Regolith, BotAdapter> {
-    let mut seated = new_host(rules, seed, first_tick);
-    for entity in held.backend().entities().copied().collect::<Vec<_>>() {
-        let observed = held.observed_tick(entity).unwrap_or_else(|| Tick::new(0));
-        if let Some(state) = held.backend().state(entity) {
-            seated.install_state_observed(entity, state.clone(), observed);
-        }
-    }
-    seated
 }
 
 /// One delivery this tick's step produced, addressed and waiting for a route.
