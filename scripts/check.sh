@@ -2,10 +2,11 @@
 # One definition of the per-commit checks, runnable locally and by CI.
 #
 #   ./scripts/check.sh              every lane, in CI's order
-#   ./scripts/check.sh fmt          rustfmt over all twelve workspaces
-#   ./scripts/check.sh clippy       both feature sets, -D warnings, plus the
-#                                   Windows cross-check (skipped, with a NOTE,
-#                                   when the gnu target is not installed)
+#   ./scripts/check.sh fmt          rustfmt over all thirteen workspaces
+#   ./scripts/check.sh clippy       -D warnings over the root's four feature
+#                                   sets and then every other workspace, plus
+#                                   the Windows cross-check (skipped, with a
+#                                   NOTE, when the gnu target is not installed)
 #   ./scripts/check.sh gates        static gates, harness self-tests, tool tests
 #   ./scripts/check.sh test         the root workspace's test suite
 #   ./scripts/check.sh doctor       delegate to dev-cache.sh: is the cache wired up?
@@ -282,6 +283,37 @@ lane_clippy() {
     run cargo clippy -p orrery_persistd --all-targets --no-deps \
         --no-default-features --features journal-fjall,chain-grpc \
         -- -D warnings
+
+    # #1140: the other twelve workspaces. Everything above runs from the
+    # repository root, and `--workspace` means "this workspace" — so until this
+    # loop the eight gate tools, the two benches and the client testers run
+    # were linted by nothing. The `check` and `test` roles build and test their
+    # workspace; neither lints it, and a lint no gate runs produces no signal,
+    # which is how findings sat in `gates/p1-swarm` — a PIPELINE_TREES member
+    # producing P4 campaign evidence — through the gates that merged them.
+    # Wiring this up surfaced seven across the twelve: one each in
+    # `gates/p0-nat-test` and `gates/p1-swarm`, five in `clients/regolith`,
+    # and none anywhere else.
+    #
+    # A loop over the table rather than a fourth role. Whether a crate has
+    # tests is what `check` and `test` encode, and it has nothing to do with
+    # whether the crate should be clippy-clean: every workspace is linted, so
+    # the role stays a statement about tests and this stage needs no new
+    # column to keep in sync. It also keeps the CI contract intact — the
+    # `clippy` job is still `scripts/check.sh clippy` and nothing else.
+    #
+    # `--no-deps` for the same reason as the root command, and doing more work
+    # here: these workspaces path-depend on `crates/*`, which the root command
+    # already lints, and reach `vendor/` transitively through them. Without it
+    # this stage would lint upstream code the root run deliberately excludes.
+    # No `--exclude` is needed — the three vendored crates are members of the
+    # *root* workspace, so `--workspace` here never selects them.
+    local dir
+    for dir in $(ws_dirs); do
+        [[ $dir == . ]] && continue
+        run_in "$dir" cargo clippy --workspace --all-targets --no-deps \
+            -- -D warnings
+    done
 
     # #1020's owner decision (2026-09-03): the Windows cross-check. Everything
     # above compiles Linux code only, and `#[cfg(windows)]` code compiled
@@ -880,6 +912,22 @@ self_test() {
         <(sed -n '/^lane_clippy() {/,/^}/p' "$0") \
         || die 'self-test: the clippy lane no longer carries the Windows cross-check'
     note 'self-test: the Windows cross-check is wired into the clippy lane'
+
+    # #1140: the lint has to reach every workspace, not only the root one.
+    # Functional and two-source, like the bounded-test clause below: one side
+    # is the commands the lane would actually issue, the other is the table.
+    # A structural grep for the loop's own text would pass on a loop whose
+    # body had stopped running clippy, which is the failure being fixed —
+    # a workspace a lane visits for some other purpose reads as covered.
+    local clippy_listed ws_where ws_dir
+    clippy_listed="$(DRY_RUN=1 lane_clippy 2>&1)"
+    for ws_dir in $(ws_dirs); do
+        ws_where="$ws_dir"
+        [[ $ws_where == . ]] && ws_where='(root)'
+        grep -Fq " $ws_where \$ cargo clippy " <<<"$clippy_listed" \
+            || die "self-test: the clippy lane never lints '$ws_dir' (#1140)"
+    done
+    note "self-test: the clippy lane lints all $(ws_dirs | wc -l) workspaces"
 
     # Functional, not structural: exercise the guarded stage with a command
     # that cannot finish inside the bound, then require both timeout's status

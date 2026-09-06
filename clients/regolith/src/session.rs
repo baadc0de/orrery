@@ -1000,10 +1000,16 @@ mod tests {
     /// total.
     #[test]
     fn every_banked_increment_is_a_measurement_on_its_own() {
-        assert!(
-            INCREMENT_MINUTES > MIN_MEASURED_MINUTES,
-            "the cadence must sit above the floor, or an increment is not a measurement"
-        );
+        // The premise of the case, not its result -- see the note on the
+        // same shape in `campaign.rs`. `const { assert!(..) }` would turn a
+        // broken premise into a compile error instead of this named failure.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                INCREMENT_MINUTES > MIN_MEASURED_MINUTES,
+                "the cadence must sit above the floor, or an increment is not a measurement"
+            );
+        }
         let rows = fly_and_close(17);
         for row in rows.iter().take(rows.len() - 1) {
             assert!(

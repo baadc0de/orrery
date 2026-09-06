@@ -1972,7 +1972,7 @@ mod tests {
 
         let error = format!(
             "{:#}",
-            joined.err().expect(
+            joined.expect_err(
                 "a client that cannot deliver its anchor must fail its join, not fly a seat \
                  the host refused"
             )

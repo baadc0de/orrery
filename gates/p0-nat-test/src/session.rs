@@ -196,8 +196,7 @@ async fn mesh_task(
     let mut shutdown_txs = Vec::new();
 
     // Dial everyone after us in the roster (peer index = their position).
-    for j in (self_index + 1)..roster.len() {
-        let target = roster[j];
+    for (j, &target) in roster.iter().enumerate().skip(self_index + 1) {
         let events = events.clone();
         let options = options.clone();
         let endpoint = endpoint.clone();
