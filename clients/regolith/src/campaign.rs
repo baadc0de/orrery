@@ -3840,10 +3840,15 @@ mod tests {
         whole_population.install_state(own, game.spawn(own, 0));
         whole_population.install_state(remote, replica.clone());
 
+        // A human seat no longer inherits the pilot's tick-scheduled lock
+        // (#1121); it locks what the player clicked. This fixture's player
+        // clicks the one other craft, which is what the pilot's combat row
+        // had been choosing for it, so the flight below is unchanged.
         let controls = Controls {
             right: true,
             thrust: true,
             fire: true,
+            lock_target: Some(remote),
             ..Controls::default()
         };
         let mut steps = 0_usize;

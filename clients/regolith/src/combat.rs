@@ -1698,9 +1698,14 @@ mod tests {
         let my_pipeline = crate::intent::IntentPipeline::new(seed, me, 0, vec![them]);
         let their_pipeline = crate::intent::IntentPipeline::new(seed, them, 1, vec![me]);
 
+        // A human seat no longer inherits the pilot's tick-scheduled lock
+        // (#1121); it locks what the player clicked. This fixture's player
+        // clicks the one other craft, which is what the pilot's combat row
+        // had been choosing for it, so the flight below is unchanged.
         let held = crate::intent::Controls {
             fire: true,
             thrust: true,
+            lock_target: Some(them),
             ..crate::intent::Controls::default()
         };
         use orrery_games::regolith::order::Order;

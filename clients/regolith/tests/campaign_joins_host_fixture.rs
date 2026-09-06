@@ -1308,7 +1308,12 @@ fn a_client_joins_measures_and_applies_replicated_state() {
         runtime.accumulator().progress().idle_minutes > 0.0,
         "120 ticks with no control held must accrue idle time, not bank as play"
     );
-    // And input resumes accrual, so idling is a measurement and not a latch.
+    // And input resumes banking without erasing what the seat was away for.
+    // `idle_minutes` is the session total, not the trailing streak (#1126):
+    // resetting it on the next keypress is what let a tester who idled in the
+    // middle of a session ship a row asserting `afk_seconds: 0`.
+    let accrued = runtime.accumulator().progress().idle_minutes;
+    let banked_before = runtime.accumulator().progress().banked_minutes;
     let _ = runtime.advance(
         Controls {
             thrust: true,
@@ -1316,10 +1321,14 @@ fn a_client_joins_measures_and_applies_replicated_state() {
         },
         &mut sink,
     );
+    let after = runtime.accumulator().progress();
     assert_eq!(
-        runtime.accumulator().progress().idle_minutes,
-        0.0,
-        "a keypress ends the idle run"
+        after.idle_minutes, accrued,
+        "a keypress must stop the idle run, not erase the time already away"
+    );
+    assert!(
+        after.banked_minutes > banked_before,
+        "a keypress must resume banking: idling is a measurement, not a latch"
     );
 
     // Let every outstanding datagram reach its settled decision.
