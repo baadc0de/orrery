@@ -1191,8 +1191,7 @@ async fn republish_start_roster(
 
 #[allow(clippy::too_many_arguments)]
 async fn accept_live_join(
-    endpoint: &iroh::Endpoint,
-    admission: &exterior::Admission,
+    prepared: bridge::PendingJoin,
     membership: &Arc<Mutex<swarm::LiveMembership>>,
     joined_tx: &mpsc::Sender<swarm::JoinedExternal>,
     seed: u64,
@@ -1201,7 +1200,6 @@ async fn accept_live_join(
     island_seats: usize,
     witnessing: bool,
 ) -> Result<()> {
-    let prepared = bridge::host_prepare(endpoint, None, admission).await?;
     let slot = prepared.index();
     let node = prepared.remote();
     let Some(session_id) = prepared.session_id().map(ToOwned::to_owned) else {
@@ -1533,31 +1531,36 @@ fn main() -> Result<()> {
             let mut pending = Vec::new();
             let fixed_legacy_seat =
                 (!standing).then(|| (config.peers, bot::bot_key(config.peers).public()));
+            // One acceptor for the whole lobby phase. It keeps
+            // `endpoint.accept()` polled while handshakes run, so a peer that
+            // connects and then says nothing costs only its own connection
+            // instead of every later dial (#1144). What comes out of it is
+            // already authenticated; the seat bookkeeping below stays serial.
+            let mut acceptor =
+                bridge::JoinAcceptor::new(endpoint.clone(), fixed_legacy_seat, admission.clone());
             // A standing empty host waits indefinitely (#592). The initial
             // cohort delay begins only after the first authenticated arrival.
             loop {
-                let prepared = if standing {
-                    match bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission).await {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            eprintln!("gates/p1-swarm: refused pending join: {error:#}");
-                            continue;
-                        }
-                    }
+                let arrival = if standing {
+                    acceptor.next().await
                 } else {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(args.join_timeout_secs.max(1)),
-                        bridge::host_prepare(&endpoint, fixed_legacy_seat, &admission),
+                        acceptor.next(),
                     )
                     .await
                     {
-                        Ok(Ok(prepared)) => prepared,
-                        Ok(Err(error)) => {
-                            eprintln!("gates/p1-swarm: refused pending join: {error:#}");
-                            continue;
-                        }
+                        Ok(arrival) => arrival,
                         Err(_) => bail!("the lobby closed without an admitted human"),
                     }
+                };
+                let prepared = match arrival {
+                    Some(Ok(prepared)) => prepared,
+                    Some(Err(error)) => {
+                        eprintln!("gates/p1-swarm: refused pending join: {error:#}");
+                        continue;
+                    }
+                    None => bail!("the exterior endpoint closed before any human was admitted"),
                 };
                 if prepared.index() < config.peers || prepared.index() >= island_seats {
                     let reason =
@@ -1589,16 +1592,13 @@ fn main() -> Result<()> {
             // The seats already in `pending` wait here for as long as the
             // lobby takes to fill — minutes, live — so this loop is also the
             // only place that can keep them alive and watched (#994). The
-            // accept future is held across ticks rather than recreated: a
-            // `select!` that dropped it every two seconds would abandon
-            // whichever handshake happened to be in flight.
+            // `select!` used to hold a bare `host_prepare` future across
+            // ticks, because dropping it every two seconds would have
+            // abandoned whichever handshake was in flight. The acceptor owns
+            // the handshakes now, and `next()` is a cancel-safe channel read,
+            // so the heartbeat arm abandons nothing (#1144).
             let mut heartbeat = tokio::time::interval(bridge::LOBBY_HEARTBEAT_INTERVAL);
             heartbeat.tick().await;
-            let mut accept = Box::pin(bridge::host_prepare(
-                &endpoint,
-                fixed_legacy_seat,
-                &admission,
-            ));
             while pending.len() < args.external_slots {
                 let mut arrived = None;
                 let mut lobby_closed = false;
@@ -1606,7 +1606,7 @@ fn main() -> Result<()> {
                     biased;
                     () = tokio::time::sleep_until(deadline) => lobby_closed = true,
                     _ = heartbeat.tick() => {}
-                    result = accept.as_mut() => arrived = Some(result),
+                    result = acceptor.next() => arrived = Some(result),
                 }
                 if lobby_closed {
                     break;
@@ -1621,16 +1621,17 @@ fn main() -> Result<()> {
                     .await?;
                     continue;
                 };
-                accept = Box::pin(bridge::host_prepare(
-                    &endpoint,
-                    fixed_legacy_seat,
-                    &admission,
-                ));
                 let prepared = match result {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
+                    Some(Ok(prepared)) => prepared,
+                    Some(Err(error)) => {
                         eprintln!("gates/p1-swarm: refused pending join: {error:#}");
                         continue;
+                    }
+                    None => {
+                        eprintln!(
+                            "gates/p1-swarm: the exterior endpoint closed while the lobby filled"
+                        );
+                        break;
                     }
                 };
                 if prepared.index() < config.peers || prepared.index() >= island_seats {
@@ -1659,9 +1660,10 @@ fn main() -> Result<()> {
                 pending.push(prepared);
             }
 
-            // The unfinished accept borrows the endpoint the run is about to
-            // take ownership of; the lobby is closed, so let it go.
-            drop(accept);
+            // The acceptor accepts on a clone of the endpoint the run is about
+            // to take ownership of, and the live loop opens its own; the lobby
+            // is closed, so stop this one before it competes.
+            drop(acceptor);
 
             if pending.is_empty() {
                 bail!(
@@ -1705,10 +1707,22 @@ fn main() -> Result<()> {
                 let accept_admission = admission.clone();
                 let accept_membership = Arc::clone(&membership);
                 tokio::spawn(async move {
-                    loop {
+                    // The rejoin door a disconnected tester comes back
+                    // through. Same acceptor, same reason: a silent dialler
+                    // here used to make every later rejoin's dial fail as if
+                    // the host had gone (#1144).
+                    let mut acceptor =
+                        bridge::JoinAcceptor::new(accept_endpoint, None, accept_admission);
+                    while let Some(arrival) = acceptor.next().await {
+                        let prepared = match arrival {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                eprintln!("gates/p1-swarm: refused live join: {error:#}");
+                                continue;
+                            }
+                        };
                         if let Err(error) = accept_live_join(
-                            &accept_endpoint,
-                            &accept_admission,
+                            prepared,
                             &accept_membership,
                             &joined_tx,
                             config.seed,
@@ -1722,6 +1736,9 @@ fn main() -> Result<()> {
                             eprintln!("gates/p1-swarm: refused live join: {error:#}");
                         }
                     }
+                    eprintln!(
+                        "gates/p1-swarm: the exterior endpoint closed; live rejoins are over"
+                    );
                 });
                 Some((joined_rx, membership))
             } else {
