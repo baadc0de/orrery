@@ -3303,15 +3303,25 @@ mod tests {
         /// The authority tick the delta arm's patch is stamped with, likewise
         /// ahead of the client clock that will ingest it.
         const AUTHORITY_DELTA_FROM: u64 = 5_500;
-        assert!(
-            INGEST_TICK > MAX_NEIGHBOR_STALENESS_TICKS,
-            "the whole point is a stamp of zero being outside the bound"
-        );
-        assert!(
-            AUTHORITY_TICK > INGEST_TICK,
-            "the authority must lead the client, or this proves nothing about which clock \
-             the stamp is taken from"
-        );
+        // These two assert the *premise* of the test, not its result: they
+        // are here so that editing a constant above out from under the case
+        // fails with the sentence that explains what the case proves, rather
+        // than leaving a test that passes while asserting nothing. Clippy
+        // wants `const { assert!(..) }`; that would move the failure from a
+        // named test failure to a compile error in this module, which is a
+        // different diagnostic for the reader these lines are written for.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                INGEST_TICK > MAX_NEIGHBOR_STALENESS_TICKS,
+                "the whole point is a stamp of zero being outside the bound"
+            );
+            assert!(
+                AUTHORITY_TICK > INGEST_TICK,
+                "the authority must lead the client, or this proves nothing about which clock \
+                 the stamp is taken from"
+            );
+        }
 
         let mut runtime = CampaignRuntime::launch(
             undecodable_test_config("stamp-past-the-bound"),

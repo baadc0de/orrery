@@ -5577,10 +5577,19 @@ mod bankable_tests {
         // or `cargo test` picks up -- a stray `RUSTFLAGS`, a `[build]` entry
         // in a committed cargo config -- this is the assertion that says so
         // rather than a Proton binary quietly reaching a volunteer.
-        assert!(
-            super::BANKABLE,
-            "this build cannot bank -- it was compiled with `--cfg proton_debug`, \
-             which is a Proton/Wine debugging build and not shippable (#1060)"
-        );
+        // Deliberately a runtime assertion and not clippy's suggested
+        // `const { assert!(..) }`: `BANKABLE` is `!cfg!(proton_debug)`, so the
+        // const form would make a `--cfg proton_debug` build of this crate's
+        // tests fail to *compile*, with rustc naming a const block. #1060
+        // wants the opposite -- the suite builds and one named test says why
+        // the binary cannot bank.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                super::BANKABLE,
+                "this build cannot bank -- it was compiled with `--cfg proton_debug`, \
+                 which is a Proton/Wine debugging build and not shippable (#1060)"
+            );
+        }
     }
 }

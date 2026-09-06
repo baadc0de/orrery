@@ -84,6 +84,10 @@ declares its own `[workspace]` table, so it reaches none of *them* — three red
 CIs in one week came from that blind spot. The inventory, which is also
 `scripts/check.sh`'s lane table:
 
+Every row is rustfmt-checked by `fmt` and clippied at `-D warnings` by
+`clippy`, whatever its role. The column below is what a lane does with it
+*besides* that — which is exactly what the role encodes, and nothing else.
+
 | Workspace | Role in the lanes |
 |---|---|
 | `.` (root, 20 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other |
@@ -103,6 +107,56 @@ CIs in one week came from that blind spot. The inventory, which is also
 The eight standalone test suites, and the four tools checked without tests, are the work
 that would go unrun if the `gates` lane stopped visiting them. Do not hand-copy
 test totals here: `./scripts/check.sh --list` is the executable inventory.
+
+**`clippy` is where this bit the second time (#1140).** The lane never left the
+repository root, and `--workspace` means "this workspace", so for as long as the
+table existed the role column was the whole story: `check` builds its workspace,
+`test` tests it, and *neither lints it*. Twelve workspaces — the eight gate
+tools, the two benches and `clients/regolith`, the client testers run — were
+linted by nothing, and a lint no gate runs produces no signal, so every lane
+that touched them ran `check.sh`, saw it pass, and reasonably concluded the
+crate was clean. `gates/p1-swarm`, which produces the P4 campaign evidence,
+carried findings through the gates that merged them. The `clippy` lane now ends
+its root commands and then loops the table, running `cargo clippy --workspace
+--all-targets --no-deps -- -D warnings` in each of the other twelve.
+
+What it costs, measured on one developer box (2026-09-06) and not a promise:
+4 s added to the `clippy` lane against warm per-workspace `target/`
+directories, and 148 s for all twelve cold, because each workspace has its own
+`target/` and builds its own dependency graph — `clients/regolith` and
+`gates/p1-swarm` pull Bevy. CI caches nothing for these directories today, so
+CI pays closer to the cold figure than the warm one.
+
+The backlog that first run surfaced was seven findings, not the flood the issue
+braced for: one `needless_range_loop` in `gates/p0-nat-test`, one `err_expect`
+in `gates/p1-swarm`, five in `clients/regolith` (one
+`cloned_ref_to_slice_refs`, four `assertions_on_constants`), and nothing at all
+in the other nine. Six were mechanical and are fixed; the four
+`assertions_on_constants` sites are `#[allow]`ed with a reason, because they
+assert a test's *premise* and clippy's `const { assert!(..) }` would turn a
+broken premise into a compile error rather than the named test failure each was
+written to produce — most sharply for `bankable_by_default`, where `BANKABLE`
+is `!cfg!(proton_debug)` and #1060 wants a `--cfg proton_debug` test suite to
+build and then say why the binary cannot bank.
+
+It is a loop over the table rather than a fourth role, and that is the point:
+whether a crate has tests has nothing to do with whether it should be
+clippy-clean, so making the lint universal keeps `check`/`test` a statement
+about tests alone and leaves no new column to fall out of sync. The CI contract
+is unchanged — the `clippy` job is still `scripts/check.sh clippy` and nothing
+else, so the local gate and the workflow still say the same thing. `--no-deps`
+does more work here than at the root: these workspaces path-depend on
+`crates/*` and reach `vendor/` through them, and without it the stage would
+lint the upstream code the root run's `--exclude` set deliberately spares. No
+`--exclude` is needed, because the three vendored crates are members of the
+*root* workspace and `--workspace` in a gate tool never selects them.
+
+`--self-test` holds this too, functionally rather than structurally: it reads
+the commands the lane would issue (`DRY_RUN=1 lane_clippy`) and requires a
+`cargo clippy` line for every directory in the table. A grep for the loop's own
+text would pass on a loop whose body had stopped running clippy, which is the
+shape of the original defect — a workspace a lane visits for some other purpose
+reading as covered.
 
 `--self-test` compares that table against the filesystem — every directory
 whose `Cargo.toml` declares `[workspace]` must appear in it — so a fourteenth

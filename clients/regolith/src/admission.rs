@@ -3085,7 +3085,7 @@ mod tests {
         let addresses = expected_paths(session_id, 2);
         let zero = addresses[0].clone();
         let one = addresses[1].clone();
-        let (origin, seen) = increment_test_service(&[zero.clone()]);
+        let (origin, seen) = increment_test_service(std::slice::from_ref(&zero));
         let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
         queue_a_long_seat(&mut queue, session_id, 2);
 
