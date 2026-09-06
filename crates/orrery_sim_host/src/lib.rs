@@ -665,6 +665,32 @@ pub struct StepReport {
     /// letting a driver that steps through the host silently log fewer records
     /// than the same driver stepping the executor directly.
     pub neighbor_frames: Vec<SteppedNeighbors>,
+    /// Entities born inside this call, in the same canonical execution order,
+    /// each named with the entity whose event materialized it.
+    ///
+    /// The backend installs a materialization itself — an entity here is
+    /// already in the host and already carries its `tick + 1` stamp — so this
+    /// is not an instruction to install anything. It is the only way a driver
+    /// can learn that a new authority *appeared*, which a driver that keeps
+    /// its own book of what it authors has to know. A driver stepping the
+    /// executor directly read `TickOutcome::materialized`, per emitter; the
+    /// seam carries the same list, per emitter, rather than making a converged
+    /// driver diff the population and guess who produced what.
+    pub materialized: Vec<MaterializedEntity>,
+}
+
+/// One entity a step materialized, with the emitter that produced it.
+///
+/// A named record, not a `(PersistId, PersistId)` pair: both halves are
+/// entity ids and a driver that swaps them adopts the wrong authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterializedEntity {
+    /// The entity whose emitted event described this materialization.
+    pub source: PersistId,
+    /// The tick it was materialized on. Its state carries `tick + 1`.
+    pub tick: Tick,
+    /// The entity that was installed.
+    pub entity: PersistId,
 }
 
 /// The neighbour reads one entity performed on one executed tick.
@@ -1242,6 +1268,7 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
         let first_tick = self.next_tick;
         let mut state_hashes = Vec::new();
         let mut neighbor_frames = Vec::new();
+        let mut materialized = Vec::new();
 
         for _ in 0..ticks.get() {
             let tick = self.next_tick;
@@ -1322,6 +1349,13 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
                         frames: outcome.neighbor_frames,
                     });
                 }
+                materialized.extend(outcome.materialized.into_iter().map(|born| {
+                    MaterializedEntity {
+                        source: entity,
+                        tick,
+                        entity: born,
+                    }
+                }));
                 for event in outcome.events {
                     if let Some(delivery) = self.adapter.deliver(&event) {
                         if let Some(delivery) = participant.route(entity, delivery) {
@@ -1372,6 +1406,7 @@ impl<R: Ruleset, A: RulesetAdapter<R>, B: TickBackend<R>> SimulationHost<R, A, B
             next_tick: self.next_tick,
             state_hashes,
             neighbor_frames,
+            materialized,
         }
     }
 
