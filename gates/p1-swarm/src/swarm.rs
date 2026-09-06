@@ -363,7 +363,18 @@ struct HostInterestCrossing {
 ///
 /// One second apart, so a joiner that is still finishing its handshake when the
 /// first copy goes out still gets one it can read.
-const DEFERRED_MANIFEST_PUBLISHES: u8 = 5;
+///
+/// Shared with the start path's correction (`republish_start_roster`, #1156),
+/// which is the same problem — a membership frame aimed at seats that are by
+/// construction still mid-handshake — and used to send exactly one copy.
+pub(crate) const DEFERRED_MANIFEST_PUBLISHES: u8 = 5;
+
+/// The gap between two copies of an owed membership frame.
+///
+/// The deferred publisher below counts it in ticks (`next_tick + TICK_HZ`)
+/// because it lives inside the tick loop; the start-path correction runs
+/// before the loop exists and counts the same second on the wall clock.
+pub(crate) const DEFERRED_MANIFEST_SPACING: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A newly bound seat's own membership, still owed to it.
 #[derive(Debug, Clone, Copy)]
