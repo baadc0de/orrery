@@ -1214,6 +1214,15 @@ impl UploadManager {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct UploadState {
     sessions: BTreeMap<String, UploadEntry>,
+    /// Whether this file has had the #1118 acknowledgement repair applied.
+    ///
+    /// Defaulted false for a file written before the repair existed, which is
+    /// exactly the population that needs it. See
+    /// [`repair_stolen_acknowledgements`]: without the flag the repair would
+    /// re-open the same entries at every launch, which is the unbounded
+    /// re-upload half of #1118 wearing the fix's clothes.
+    #[serde(default)]
+    increment_acks_repaired: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1240,6 +1249,46 @@ fn upload_key(session_id: &str, increment_index: u64) -> String {
         session_id.to_owned()
     } else {
         format!("{session_id}.increment-{increment_index}")
+    }
+}
+
+/// The increment an entry read back from `uploads.json` names.
+///
+/// [`upload_key`] is the only thing that has ever recorded which increment a
+/// queued body is, so it is the only thing that can be asked. Parsing the key
+/// rather than storing the index a second time keeps one source of truth: a
+/// stored index could disagree with the key it sits under, and the key is
+/// what the map, the body's filename and the skip-if-acknowledged guard all
+/// already use.
+fn increment_index_of_key(upload_key: &str, session_id: &str) -> u64 {
+    upload_key
+        .strip_prefix(session_id)
+        .and_then(|rest| rest.strip_prefix(".increment-"))
+        .and_then(|index| index.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Where one increment's body is POSTed, relative to the service origin.
+///
+/// The address is the *increment*, not the seat (#1119). Every increment of a
+/// long seat used to go to `/v1/sessions/{id}/upload`, where the service
+/// stores one pair of files per session id and refuses any second body whose
+/// bytes differ with `409 conflict` -- so a session longer than
+/// [`crate::session::INCREMENT_MINUTES`] banked its first five minutes and
+/// nothing else, on that launch and on every later one.
+///
+/// Increment zero keeps the old path, exactly as [`upload_key`] keeps the
+/// bare session id for it. That is not tidiness: it means a client carrying
+/// this fix against a service that has not been updated yet still banks its
+/// first increment as it does today, and the increments after it are refused
+/// `404` and stay queued for a later launch, rather than the whole seat
+/// failing on an unrouted path. The two halves of the seam can be deployed in
+/// either order without losing evidence.
+fn upload_path(session_id: &str, increment_index: u64) -> String {
+    if increment_index == 0 {
+        format!("v1/sessions/{session_id}/upload")
+    } else {
+        format!("v1/sessions/{session_id}/increments/{increment_index}/upload")
     }
 }
 
@@ -1308,6 +1357,9 @@ impl UploadQueue {
 pub struct PendingUpload {
     session_id: String,
     upload_key: String,
+    /// Which increment of the seat this body is, which is half of its address
+    /// at the service (#1119) -- see [`upload_path`].
+    increment_index: u64,
     origin: String,
     body_path: PathBuf,
 }
@@ -1393,6 +1445,7 @@ fn persist_and_register(
     Ok(PendingUpload {
         session_id: upload.session_id.clone(),
         upload_key: upload.upload_key.clone(),
+        increment_index: upload.increment_index,
         origin: origin.to_owned(),
         body_path,
     })
@@ -1412,7 +1465,14 @@ fn send_pending(state_path: &Path, pending: &PendingUpload) -> bool {
     }
     let result = std::fs::read(&pending.body_path)
         .map_err(|error| error.to_string())
-        .and_then(|body| post_upload(&pending.origin, &pending.session_id, &body));
+        .and_then(|body| {
+            post_upload(
+                &pending.origin,
+                &pending.session_id,
+                pending.increment_index,
+                &body,
+            )
+        });
     match result {
         Ok(()) => {
             // Re-read rather than mutate a copy: the acknowledgement is
@@ -1469,14 +1529,18 @@ fn pending_uploads(state: &UploadState) -> Vec<PendingUpload> {
         .sessions
         .iter()
         .filter(|(_, entry)| !entry.acknowledged)
-        .map(|(upload_key, entry)| PendingUpload {
-            session_id: entry
+        .map(|(upload_key, entry)| {
+            let session_id = entry
                 .session_id
                 .clone()
-                .unwrap_or_else(|| upload_key.clone()),
-            upload_key: upload_key.clone(),
-            origin: entry.origin.clone(),
-            body_path: entry.body_path.clone(),
+                .unwrap_or_else(|| upload_key.clone());
+            PendingUpload {
+                increment_index: increment_index_of_key(upload_key, &session_id),
+                session_id,
+                upload_key: upload_key.clone(),
+                origin: entry.origin.clone(),
+                body_path: entry.body_path.clone(),
+            }
         })
         .collect()
 }
@@ -1636,6 +1700,7 @@ fn read_session_telemetry(path: &Path, start: u64) -> std::io::Result<String> {
 struct UploadBody {
     session_id: String,
     upload_key: String,
+    increment_index: u64,
     body: Vec<u8>,
 }
 
@@ -1672,13 +1737,20 @@ fn build_upload_body(
     Ok(UploadBody {
         session_id: session_id.to_owned(),
         upload_key: upload_key(session_id, increment_index),
+        increment_index,
         body,
     })
 }
 
-fn post_upload(origin: &str, session_id: &str, body: &[u8]) -> Result<(), String> {
+fn post_upload(
+    origin: &str,
+    session_id: &str,
+    increment_index: u64,
+    body: &[u8],
+) -> Result<(), String> {
+    let path = upload_path(session_id, increment_index);
     let response = client()?
-        .post(format!("{origin}/v1/sessions/{session_id}/upload"))
+        .post(format!("{}/{path}", origin.trim_end_matches('/')))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body.to_vec())
         .send()
@@ -1724,9 +1796,73 @@ pub fn retry_pending_uploads(telemetry_path: &Path, origin: &str) -> std::thread
     let records_path = crate::campaign_record_path(telemetry_path);
     let origin = origin.to_owned();
     std::thread::spawn(move || {
+        repair_stolen_acknowledgements(&state_path);
         sweep_unregistered_records(&state_path, &records_path, &origin);
         flush_pending(&state_path);
     })
+}
+
+/// Re-open every acknowledgement #1118 could have stolen, once per file.
+///
+/// While the acknowledgement was keyed on the session id, a successful POST
+/// of increment *n* >= 1 marked *increment zero's* entry acknowledged. So on
+/// an installation that played a long seat, an increment-zero entry saying
+/// `acknowledged` may be saying it about a body the service never took, and
+/// nothing on disk distinguishes the two cases.
+///
+/// The affected population is exactly: an entry keyed by a bare session id
+/// whose file still has a sibling under `<id>.increment-n`. Those are re-armed
+/// so the sweep sends them again. A re-send of a body the service already
+/// holds is free -- the bytes are identical, so admission stores nothing and
+/// answers 204 -- while a re-send of one it never got is the five minutes of
+/// signed evidence #1118 was dropping.
+///
+/// Once, and then never again: [`UploadState::increment_acks_repaired`] is
+/// set in the same write, because a repair that ran at every launch would be
+/// the unbounded re-upload this same issue is about.
+fn repair_stolen_acknowledgements(state_path: &Path) {
+    let mut state = read_upload_state(state_path);
+    if state.increment_acks_repaired {
+        return;
+    }
+    let seats_with_increments: std::collections::BTreeSet<String> = state
+        .sessions
+        .iter()
+        .filter(|(upload_key, entry)| {
+            let session_id = entry.session_id.as_deref().unwrap_or(upload_key.as_str());
+            increment_index_of_key(upload_key, session_id) > 0
+        })
+        .map(|(upload_key, entry)| {
+            entry
+                .session_id
+                .clone()
+                .unwrap_or_else(|| upload_key.clone())
+        })
+        .collect();
+    let mut reopened = Vec::new();
+    for session_id in &seats_with_increments {
+        let Some(entry) = state.sessions.get_mut(session_id) else {
+            continue;
+        };
+        // A body that is no longer on disk cannot be re-sent, and re-arming it
+        // would only leave a pending entry that fails at every launch.
+        if !entry.acknowledged || !entry.body_path.exists() {
+            continue;
+        }
+        entry.acknowledged = false;
+        reopened.push(session_id.clone());
+    }
+    state.increment_acks_repaired = true;
+    if let Err(error) = write_upload_state(state_path, &state) {
+        eprintln!("regolith: cannot record the #1118 upload repair: {error}");
+        return;
+    }
+    for session_id in reopened {
+        eprintln!(
+            "regolith: campaign session {session_id} increment 0 may have been marked delivered \
+             by a later increment's upload (#1118); sending it again"
+        );
+    }
 }
 
 fn read_upload_state(path: &Path) -> UploadState {
