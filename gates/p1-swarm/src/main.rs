@@ -842,8 +842,8 @@ fn record_live_binding(
     );
     if let Err(error) = live.publish() {
         live.active.remove(&slot);
-        if let Some(reclaim) = reclaimed {
-            live.released_sessions.insert(session_id, reclaim);
+        if let Some(release) = reclaimed {
+            live.released_sessions.insert(session_id, release);
         }
         return Err(error).context("republish active seats after bind");
     }
@@ -3024,7 +3024,9 @@ mod start_join_tests {
             "the seat goes back through the one release path, so admission reopens it (#954)"
         );
         assert_eq!(
-            live.released_sessions.get("session-6").copied(),
+            live.released_sessions
+                .get("session-6")
+                .map(|release| release.reclaim),
             Some(swarm::SeatReclaim::LostAt {
                 released_at_s: SWEPT_AT
             }),
@@ -3105,7 +3107,9 @@ mod start_join_tests {
             "the dropped seat's session is released, so admission reopens the seat"
         );
         assert_eq!(
-            live.released_sessions.get("session-6").copied(),
+            live.released_sessions
+                .get("session-6")
+                .map(|release| release.reclaim),
             Some(swarm::SeatReclaim::LostAt {
                 released_at_s: SWEPT_AT
             }),

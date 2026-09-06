@@ -93,6 +93,20 @@ impl SeatReclaim {
     }
 }
 
+/// One session's release: the seat it gave back, and what its reservation is
+/// still worth to admission.
+///
+/// The slot is not published — nothing downstream reads it — and it is not
+/// bookkeeping for its own sake. It is what bounds
+/// [`LiveMembership::released_sessions`]: see that field's doc comment for the
+/// argument that a later release from the same seat proves every earlier one
+/// unreferenced (#1154).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeatRelease {
+    pub(crate) slot: usize,
+    pub(crate) reclaim: SeatReclaim,
+}
+
 /// The wall-clock life of one attempt's run, as the host itself knows it.
 ///
 /// This exists because #1053: nothing on the host had an opinion about *when*
@@ -202,7 +216,34 @@ pub(crate) struct LiveMembership {
     /// [`Self::rebind_released`] leaves this map: a seat the transport is
     /// holding must never read as released, or admission counts it free and
     /// double-books it.
-    pub(crate) released_sessions: BTreeMap<String, SeatReclaim>,
+    ///
+    /// This is a *negative annotation on admission's reservation journal*, not
+    /// an audit trail and not release idempotence: every reader
+    /// (`scripts/admission.py:519`, `:605`, `:613`, `:624`) consults it only to
+    /// answer "does this journal row still hold its seat?", and admission
+    /// deletes the row outright once the answer is no (`spent`,
+    /// `scripts/admission.py:303`). An entry naming a session with no row left
+    /// is therefore worth nothing to anybody.
+    ///
+    /// That is what bounds it at one entry per human seat (#1154). Admission
+    /// allocates a slot only when no surviving row in this generation holds it
+    /// (`scripts/admission.py:697-699`), so a *later* release from slot `n`
+    /// proves that some reservation for slot `n` was granted after the earlier
+    /// release, which in turn proves the earlier session's row had already been
+    /// pruned. [`Self::release_seat`] therefore drops the seat's previous
+    /// occupant on the way in, and the map holds only the newest release per
+    /// seat — the only one any reader can still consult. Nothing here is a
+    /// timer: the host still holds no opinion about admission's reissue policy
+    /// (see [`SeatReclaim`]), and the newest release keeps its `released_at`
+    /// for exactly as long as it did before.
+    ///
+    /// Dropping an entry is the conservative direction in any case. Release
+    /// removes the seat from `active` and `pending` in the same call, so the
+    /// two roster clauses that veto on this set cannot fire for it; what a
+    /// missing entry would cost is a dead row keeping its own seat until its
+    /// arrival lease runs out, which holds a seat rather than double-booking
+    /// one (#1016).
+    pub(crate) released_sessions: BTreeMap<String, SeatRelease>,
     pub(crate) tick: u64,
     /// The generation's wall-clock life. Replaces the old `running: bool`:
     /// the published feed still carries `running`, but the host now also
@@ -231,7 +272,9 @@ impl LiveMembership {
             "released_at": self
                 .released_sessions
                 .iter()
-                .filter_map(|(session, reclaim)| Some((session.clone(), reclaim.lost_at()?)))
+                .filter_map(|(session, release)| {
+                    Some((session.clone(), release.reclaim.lost_at()?))
+                })
                 .collect::<BTreeMap<_, _>>(),
             "running": self.window.is_running(),
             // Wired, not decorative: `scripts/p1-swarm-always-on.py` drops
@@ -241,14 +284,30 @@ impl LiveMembership {
             "window_closed": self.window.is_closed(),
             "window_ends_at": self.window.ends_at_s(),
         }))?;
+        // Write-then-rename, and deliberately *no* `sync_all` (#1154).
+        //
+        // What this file needs is atomic visibility to two processes on this
+        // machine — `scripts/admission.py` and `scripts/p1-swarm-always-on.py`
+        // — and `rename` gives that on its own: a reader either sees the whole
+        // previous generation-bound feed or the whole new one, never a torn
+        // one, because it reads through the same page cache this wrote into.
+        //
+        // What it does not need is crash durability, and that is what the two
+        // `sync_all` calls were buying. This feed is generation-bound and
+        // written to be thrown away: the supervisor unlinks it before spawning
+        // every child (`scripts/p1-swarm-always-on.py:267`), so a copy that
+        // survives a power cut is deleted unread, and a copy that does not
+        // survive one is deleted anyway. Neither reader has any use for the
+        // membership of a host process that no longer exists.
+        //
+        // The cost was not small and it was not off the hot path. On the
+        // standing host's XFS root the pair of fsyncs is ~5.5 ms, paid inside
+        // `Swarm::process_live_membership` with the membership lock held —
+        // about two hundred times the whole rest of the publication, and
+        // constant in the size of the feed rather than proportional to it.
         let temporary = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        std::fs::File::create(&temporary)?.write_all(&bytes)?;
         std::fs::rename(&temporary, path)?;
-        if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
         Ok(())
     }
 
@@ -328,8 +387,17 @@ impl LiveMembership {
             );
         }
         self.pending.remove(&slot);
+        // This release supersedes whatever this seat was released as before:
+        // admission could only have granted the reservation that has now ended
+        // by finding the seat free of surviving rows, so the earlier session's
+        // row is provably gone and its entry names nothing (#1154). Evicting it
+        // here is what keeps the map — and the feed, and admission's re-parse
+        // of it on every join — at one entry per human seat instead of one per
+        // join-and-leave cycle the host has ever seen.
         self.released_sessions
-            .insert(session_id.to_owned(), reclaim);
+            .retain(|_, release| release.slot != slot);
+        self.released_sessions
+            .insert(session_id.to_owned(), SeatRelease { slot, reclaim });
         self.publish()?;
         Ok(released)
     }
@@ -341,7 +409,7 @@ impl LiveMembership {
     /// happens: admission treats a released session's seat as free, so a
     /// volunteer who redialled inside the grace would otherwise be flying a
     /// seat admission was still offering to somebody else.
-    pub(crate) fn rebind_released(&mut self, session_id: &str) -> Option<SeatReclaim> {
+    pub(crate) fn rebind_released(&mut self, session_id: &str) -> Option<SeatRelease> {
         self.released_sessions.remove(session_id)
     }
 }
@@ -5229,6 +5297,117 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&directory).expect("temp dir cleanup");
+    }
+
+    /// #1154. `released_sessions` used to be insert-only: `rebind_released` is
+    /// the only removal and it fires solely when that exact session binds
+    /// again, so every volunteer who left and did not come back — the ordinary
+    /// case — stayed in the map for the life of the generation. A standing host
+    /// keeps one generation across many lobby windows
+    /// (`scripts/p1-swarm-always-on.py:320-324` advances the lease clock
+    /// without changing generation), so the map grew with every join-and-leave
+    /// cycle the host had ever seen, and each entry was re-serialised into
+    /// `active-seats.json` on every publication — a publication that happens
+    /// inside the tick loop with the membership lock held.
+    ///
+    /// The bound is the seat, not a timer: a later release from slot `n` proves
+    /// admission granted a reservation for slot `n` after the earlier release,
+    /// which it does only when no surviving row holds that seat, so the earlier
+    /// session's row is provably already pruned.
+    ///
+    /// Two hundred cycles over four seats, which the old code answered with two
+    /// hundred entries and a 7 KB feed.
+    #[test]
+    fn a_seat_released_again_forgets_the_session_that_left_it_before() {
+        let path = feed_path("released-bound");
+        let seats = 4_usize;
+        let mut membership = LiveMembership {
+            attempt_id: "attempt-1154".to_owned(),
+            active: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            released_sessions: BTreeMap::new(),
+            tick: 0,
+            window: AttemptWindow::Running {
+                ends_at_s: u64::MAX,
+            },
+            path: Some(path.clone()),
+        };
+        let session = |index: usize| format!("0199a4b7-0000-7000-8000-{index:012x}");
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).expect("feed written"))
+                .expect("feed parses")
+        };
+
+        for index in 0..200 {
+            let slot = 4 + index % seats;
+            membership.active.insert(
+                slot,
+                LiveSeatBinding {
+                    node: crate::bot::bot_key(slot).public(),
+                    session_id: session(index),
+                },
+            );
+            membership.publish().expect("publishing a bind");
+            membership
+                .release_seat(
+                    slot,
+                    &session(index),
+                    SeatReclaim::LostAt {
+                        released_at_s: 1_757_000_000 + index as u64,
+                    },
+                )
+                .expect("publishing a release");
+        }
+
+        assert_eq!(
+            membership.released_sessions.len(),
+            seats,
+            "the map is bounded by the seats it annotates, not by the number of \
+             join-and-leave cycles this generation has seen"
+        );
+        let published = read();
+        assert_eq!(
+            published["released_sessions"]
+                .as_array()
+                .expect("released_sessions is a list")
+                .len(),
+            seats,
+            "and so is the feed admission re-parses on every join"
+        );
+
+        // The newest release per seat is the only one any reader can still
+        // consult, and it survives whole — reclaim window included.
+        for slot in 4..4 + seats {
+            let newest = (0..200)
+                .rev()
+                .find(|index| 4 + index % seats == slot)
+                .expect("every seat was released");
+            assert_eq!(
+                membership.released_sessions.get(&session(newest)).copied(),
+                Some(SeatRelease {
+                    slot,
+                    reclaim: SeatReclaim::LostAt {
+                        released_at_s: 1_757_000_000 + newest as u64,
+                    },
+                }),
+                "seat {slot} keeps its latest release, so #1001's reissue window is \
+                 unchanged for the volunteer who actually just left it"
+            );
+            assert_eq!(
+                published["released_at"][session(newest)],
+                serde_json::json!(1_757_000_000u64 + newest as u64),
+                "and publishes the second admission times that window from"
+            );
+            assert!(
+                !membership
+                    .released_sessions
+                    .contains_key(&session(newest - seats)),
+                "while the volunteer who left seat {slot} before them is gone: admission \
+                 could not have re-let the seat without first pruning their row"
+            );
+        }
+
+        std::fs::remove_dir_all(path.parent().expect("feed directory")).expect("cleanup");
     }
 
     #[test]
