@@ -20,6 +20,22 @@ use crate::session::{ConfiguredImpairment, SessionRecord, CONSENT_NOTICE};
 use crate::{ActiveSession, BUILD_REV, DEFAULT_ADMISSION_URL};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+/// The whole exit path's upload budget, across every body a seat owes.
+///
+/// A quit is not the moment to spend [`REQUEST_TIMEOUT`] per body on the main
+/// thread. Since #1048 a seat owes one body per five-minute increment, so an
+/// hour-long seat against an origin that has gone away spent 13 x 45 s = ~9m45s
+/// in a frozen window, which a tester reports as a crash (#1145). The exit
+/// attempt has always been a courtesy -- every body is durable on disk and
+/// swept at the next launch (#1051) -- so it is bounded here and the rest is
+/// the next launch's job, exactly as older bodies already were.
+const EXIT_UPLOAD_BUDGET: Duration = Duration::from_secs(5);
+/// How many launches a `404 unknown_session` is re-attempted before retiring.
+///
+/// A 404 is the one refusal the client cannot classify from the status alone,
+/// so it is bounded rather than called permanent or transient. See
+/// [`UploadRefusal::Unknown`].
+const UNKNOWN_SESSION_ATTEMPTS: u32 = 5;
 const PANEL: Color = Color::srgb(0.035, 0.05, 0.075);
 const ROW: Color = Color::srgb(0.08, 0.11, 0.16);
 const ACTIVE: Color = Color::srgb(0.10, 0.35, 0.48);
@@ -336,15 +352,15 @@ fn start_join(
     *task.0.lock().expect("admission task lock") = Some(receiver);
 }
 
-fn client() -> Result<reqwest::blocking::Client, String> {
+fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|error| error.to_string())
 }
 
 fn get_campaigns(url: &str) -> Result<CampaignsResponse, String> {
-    let response = client()?
+    let response = client(REQUEST_TIMEOUT)?
         .get(url)
         .send()
         .map_err(|error| error.to_string())?;
@@ -360,7 +376,7 @@ fn post_join_detailed(
     nickname: &str,
     node: &str,
 ) -> Result<JoinResponse, AdmissionRefusal> {
-    let response = client()
+    let response = client(REQUEST_TIMEOUT)
         .map_err(|detail| AdmissionRefusal {
             code: None,
             detail,
@@ -530,9 +546,23 @@ fn poll_worker(
             // can persist evidence nothing will send (#1051). The session
             // starts now, so its telemetry starts at the current end of the
             // stream -- the same offset `JsonlTelemetry` took when it opened.
-            let telemetry_start = std::fs::metadata(&settings.telemetry_path)
-                .map(|telemetry| telemetry.len())
-                .unwrap_or_default();
+            // Absent is a first launch and starts at zero. Any other stat
+            // failure also has to start somewhere, and zero is the safe end --
+            // a span that repeats bytes is recoverable, one that skips them is
+            // not -- but it re-opens #735's whole-history upload, so it is
+            // said rather than defaulted silently (#1148).
+            let telemetry_start = match std::fs::metadata(&settings.telemetry_path) {
+                Ok(telemetry) => telemetry.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => {
+                    error!(
+                        "cannot measure {}: {error}; this session's evidence will carry the \
+                         telemetry stream from its beginning",
+                        settings.telemetry_path.display()
+                    );
+                    0
+                }
+            };
             runtime.set_upload_queue(UploadQueue::new(
                 settings.origin.clone(),
                 &settings.telemetry_path,
@@ -1236,6 +1266,119 @@ struct UploadEntry {
     /// session ids; [`pending_uploads`] falls back to the key there.
     #[serde(default)]
     session_id: Option<String>,
+    /// How many times this body has been POSTed and refused.
+    ///
+    /// Only [`UploadRefusal::Unknown`] is bounded by it, but every refusal
+    /// counts: a body attempted twenty times and still called "transient" is a
+    /// fact an operator reading `uploads.json` should be able to see (#1149).
+    #[serde(default)]
+    attempts: u32,
+    /// Why this body will never be sent again, once something says so.
+    ///
+    /// A tombstone, not a deletion. `uploads.json` is also what stops
+    /// [`sweep_unregistered_records`] re-queuing a row from
+    /// `campaign-records.jsonl`, so an entry that is simply removed comes
+    /// straight back at the next launch. The body itself is deliberately left
+    /// on disk and named in the log: retiring is the client giving up on
+    /// sending a body, not the client destroying a volunteer's signed
+    /// evidence.
+    #[serde(default)]
+    retired: Option<String>,
+}
+
+/// Why one POST did not deliver a body, and what that means for the next one.
+///
+/// Before #1149 there was one arm: every refusal, from a TCP reset to a `413`,
+/// came back as an opaque string meaning "not sent yet, try again next
+/// launch". So a body the service will refuse forever was re-POSTed at every
+/// launch for the life of the installation, on a 45-second-timeout blocking
+/// client.
+#[derive(Debug)]
+enum UploadRefusal {
+    /// Not delivered *yet*. Transport failures, timeouts, `5xx`, `429`, `408`.
+    ///
+    /// Never retired. A volunteer's evidence outlives an outage, and the cost
+    /// of holding it is one POST per launch, not per second:
+    /// [`retry_pending_uploads`] is one-shot.
+    Transient(String),
+    /// The service already holds this increment, under bytes that are not ours.
+    ///
+    /// `409` only ever means *differing* bytes for a stored increment (the
+    /// conflict arm `scripts/admission.py` grew in #1119); identical bytes
+    /// answer `204`. So the increment is banked and this body is not the copy
+    /// of it that was banked -- re-POSTing can only earn the same `409`.
+    Banked(String),
+    /// The service will refuse these bytes at this address however often it is
+    /// asked: `413` (over the service's upload cap, and a body does not
+    /// shrink), `422 wrong_increment` (the increment is baked into both the
+    /// body and the address), `403`, and every other `4xx` that is not `404`,
+    /// `408` or `429`.
+    Permanent(String),
+    /// `404 unknown_session`, which is neither, and is therefore bounded.
+    ///
+    /// It looks permanent -- a session the service never admitted will never
+    /// be admitted -- but two live causes make it spurious. #1151: one
+    /// malformed line in `joins.jsonl` makes the service `404` *every* session
+    /// admitted after it, cohort-wide and repairable. And the #1135 seam: a
+    /// client posting per-increment addresses to a service that predates them
+    /// is `404`ed on every increment after the first, which [`upload_path`]
+    /// documents as deliberately survivable in either deployment order. Both
+    /// are fixed by a deployment, on a scale of days, so the first `404` must
+    /// not retire a body -- and the hundredth must not keep it.
+    /// [`UNKNOWN_SESSION_ATTEMPTS`] launches is the compromise.
+    Unknown(String),
+}
+
+impl UploadRefusal {
+    /// The detail line, whatever the classification.
+    fn detail(&self) -> &str {
+        match self {
+            Self::Transient(detail)
+            | Self::Banked(detail)
+            | Self::Permanent(detail)
+            | Self::Unknown(detail) => detail,
+        }
+    }
+
+    /// How this refusal reads in a log line.
+    fn posture(&self) -> &'static str {
+        match self {
+            Self::Transient(_) => "transient",
+            Self::Banked(_) => "already banked",
+            Self::Permanent(_) => "permanently refused",
+            Self::Unknown(_) => "refused as unknown",
+        }
+    }
+
+    /// Why this body is retired now, or `None` to leave it queued.
+    fn retirement(&self, attempts: u32) -> Option<String> {
+        match self {
+            Self::Transient(_) => None,
+            Self::Banked(detail) => Some(format!(
+                "the service already holds this increment: {detail}"
+            )),
+            Self::Permanent(detail) => Some(format!("permanently refused: {detail}")),
+            Self::Unknown(detail) => (attempts >= UNKNOWN_SESSION_ATTEMPTS)
+                .then(|| format!("refused as unknown {attempts} times: {detail}")),
+        }
+    }
+}
+
+/// Read one HTTP answer as a refusal.
+fn classify_upload_refusal(status: reqwest::StatusCode, detail: String) -> UploadRefusal {
+    use reqwest::StatusCode as Code;
+    match status {
+        Code::CONFLICT => UploadRefusal::Banked(detail),
+        Code::NOT_FOUND => UploadRefusal::Unknown(detail),
+        Code::REQUEST_TIMEOUT | Code::TOO_MANY_REQUESTS => UploadRefusal::Transient(detail),
+        _ if status.is_server_error() => UploadRefusal::Transient(detail),
+        _ if status.is_client_error() => UploadRefusal::Permanent(detail),
+        // A `2xx` that is not `204`, or a `3xx` the redirect policy did not
+        // follow: the service is answering, but not with the acknowledgement
+        // this client understands. Retrying costs one POST a launch, and a
+        // build that understands the answer may yet arrive.
+        _ => UploadRefusal::Transient(detail),
+    }
 }
 
 /// What `uploads.json` files one body under.
@@ -1453,15 +1596,26 @@ fn persist_and_register(
     let body_path = directory.join(format!("upload-{}.json", upload.upload_key));
     durable_write(&body_path, &upload.body)
         .map_err(|error| format!("cannot preserve {}: {error}", body_path.display()))?;
-    let mut state = read_upload_state(state_path);
-    let already_sent = state
+    // An unreadable state file must not be defaulted to an empty one here:
+    // registering into a fresh map would durably erase every acknowledgement
+    // and every tombstone the install has (#1148). The body is already on
+    // disk, and `recover_orphaned_bodies` re-registers it at the next launch.
+    let mut state = read_upload_state(state_path).map_err(|error| {
+        format!(
+            "cannot register {} because the upload state is unreadable: {error}",
+            body_path.display()
+        )
+    })?;
+    let already_settled = state
         .sessions
         .get(&upload.upload_key)
-        .is_some_and(|entry| entry.acknowledged);
+        .is_some_and(|entry| entry.acknowledged || entry.retired.is_some());
     // Never walk an acknowledgement back. A row can be queued twice -- once by
     // the mint, once by the exit path that follows it -- and the second must
-    // not re-open a session the service has already taken.
-    if !already_sent {
+    // not re-open a session the service has already taken. A retirement is
+    // settled for the same reason: re-queuing a body the service has refused
+    // for good is the forever-retry #1149 is about.
+    if !already_settled {
         state.sessions.insert(
             upload.upload_key.clone(),
             UploadEntry {
@@ -1469,6 +1623,8 @@ fn persist_and_register(
                 body_path: body_path.clone(),
                 acknowledged: false,
                 session_id: Some(upload.session_id.clone()),
+                attempts: 0,
+                retired: None,
             },
         );
         write_upload_state(state_path, &state)
@@ -1487,22 +1643,43 @@ fn persist_and_register(
 ///
 /// Returns whether this call is what delivered it. An entry the state file
 /// already calls acknowledged is not posted again.
-fn send_pending(state_path: &Path, pending: &PendingUpload) -> bool {
-    if read_upload_state(state_path)
+fn send_pending(state_path: &Path, pending: &PendingUpload, timeout: Duration) -> bool {
+    // An unreadable state file stops the POST rather than defaulting to an
+    // empty map: this call would otherwise re-send bodies the service already
+    // holds and then write an acknowledgement into a map that has forgotten
+    // every other one (#1148).
+    let state = match read_upload_state(state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "regolith: campaign session {} not sent: {error}; the body is at {} and nothing \
+                 has been overwritten",
+                pending.session_id,
+                pending.body_path.display()
+            );
+            return false;
+        }
+    };
+    if state
         .sessions
         .get(&pending.upload_key)
-        .is_some_and(|entry| entry.acknowledged)
+        .is_some_and(|entry| entry.acknowledged || entry.retired.is_some())
     {
         return false;
     }
     let result = std::fs::read(&pending.body_path)
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            // The body is gone and cannot be reconstructed, so no number of
+            // launches will change the answer.
+            UploadRefusal::Permanent(format!("{}: {error}", pending.body_path.display()))
+        })
         .and_then(|body| {
             post_upload(
                 &pending.origin,
                 &pending.session_id,
                 pending.increment_index,
                 &body,
+                timeout,
             )
         });
     match result {
@@ -1520,7 +1697,19 @@ fn send_pending(state_path: &Path, pending: &PendingUpload) -> bool {
             // launch, and a seat whose increment zero had failed had that
             // failure overwritten by increment one's success, so increment
             // zero's evidence was dropped and never retried.
-            let mut state = read_upload_state(state_path);
+            let mut state = match read_upload_state(state_path) {
+                Ok(state) => state,
+                Err(error) => {
+                    eprintln!(
+                        "regolith: campaign session {} uploaded but the acknowledgement cannot be \
+                         recorded: {error}; nothing has been overwritten and the body at {} will \
+                         be posted again",
+                        pending.session_id,
+                        pending.body_path.display()
+                    );
+                    return true;
+                }
+            };
             if let Some(entry) = state.sessions.get_mut(&pending.upload_key) {
                 entry.acknowledged = true;
             } else {
@@ -1544,14 +1733,71 @@ fn send_pending(state_path: &Path, pending: &PendingUpload) -> bool {
             }
             true
         }
-        Err(error) => {
-            eprintln!(
-                "regolith: campaign session {} upload failed: {error}; it will retry next launch, and the volunteer can send {}",
-                pending.session_id,
-                pending.body_path.display()
-            );
+        Err(refusal) => {
+            record_refusal(state_path, pending, &refusal);
             false
         }
+    }
+}
+
+/// Count one refusal against a body, and retire it if that is what it means.
+///
+/// Everything about a refusal that outlives this launch is written here, and
+/// it is the only place a body stops being owed. A retirement is durable
+/// because the alternative -- deciding again from scratch at the next launch
+/// -- is exactly the forever-retry #1149 is about.
+fn record_refusal(state_path: &Path, pending: &PendingUpload, refusal: &UploadRefusal) {
+    let mut state = match read_upload_state(state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "regolith: campaign session {} upload failed ({}: {}) and the attempt cannot be \
+                 recorded: {error}",
+                pending.session_id,
+                refusal.posture(),
+                refusal.detail()
+            );
+            return;
+        }
+    };
+    let Some(entry) = state.sessions.get_mut(&pending.upload_key) else {
+        eprintln!(
+            "regolith: campaign session {} upload failed ({}: {}) and {} names no entry for {}",
+            pending.session_id,
+            refusal.posture(),
+            refusal.detail(),
+            state_path.display(),
+            pending.upload_key
+        );
+        return;
+    };
+    entry.attempts = entry.attempts.saturating_add(1);
+    let retirement = refusal.retirement(entry.attempts);
+    let attempts = entry.attempts;
+    entry.retired.clone_from(&retirement);
+    if let Err(error) = write_upload_state(state_path, &state) {
+        eprintln!(
+            "regolith: campaign session {} upload failed and the attempt could not be saved: {error}",
+            pending.session_id
+        );
+        return;
+    }
+    match retirement {
+        Some(reason) => eprintln!(
+            "regolith: campaign session {} increment {} will not be sent again after {attempts} \
+             attempt(s): {reason}; the body is kept at {} and can be sent by hand",
+            pending.session_id,
+            pending.increment_index,
+            pending.body_path.display()
+        ),
+        None => eprintln!(
+            "regolith: campaign session {} upload failed ({}: {}), attempt {attempts}; it will \
+             retry next launch, and the volunteer can send {}",
+            pending.session_id,
+            refusal.posture(),
+            refusal.detail(),
+            pending.body_path.display()
+        ),
     }
 }
 
@@ -1560,7 +1806,10 @@ fn pending_uploads(state: &UploadState) -> Vec<PendingUpload> {
     state
         .sessions
         .iter()
-        .filter(|(_, entry)| !entry.acknowledged)
+        // A retired entry is still named -- that is what keeps
+        // `sweep_unregistered_records` from queuing its row again -- but it is
+        // no longer owed (#1149).
+        .filter(|(_, entry)| !entry.acknowledged && entry.retired.is_none())
         .map(|(upload_key, entry)| {
             let session_id = entry
                 .session_id
@@ -1592,9 +1841,19 @@ fn pending_uploads_for_session(state: &UploadState, session_id: &str) -> Vec<Pen
 }
 
 /// Attempt every unacknowledged body, in this thread.
+///
+/// This runs on the launch sweep's own background thread, so it takes the full
+/// [`REQUEST_TIMEOUT`]; the exit path is the one that is budgeted (#1145).
 fn flush_pending(state_path: &Path) {
-    for pending in pending_uploads(&read_upload_state(state_path)) {
-        if send_pending(state_path, &pending) {
+    let state = match read_upload_state(state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("regolith: nothing can be flushed: {error}");
+            return;
+        }
+    };
+    for pending in pending_uploads(&state) {
+        if send_pending(state_path, &pending, REQUEST_TIMEOUT) {
             eprintln!("regolith: campaign session {} uploaded", pending.session_id);
         }
     }
@@ -1617,7 +1876,19 @@ fn sweep_unregistered_records(state_path: &Path, records_path: &Path, origin: &s
     let Ok(records) = std::fs::read_to_string(records_path) else {
         return;
     };
-    let state = read_upload_state(state_path);
+    // Sweeping against a state file that could not be read would re-queue --
+    // and re-POST -- every row of every session the install has ever played
+    // (#1148). There is nothing to sweep until the read works.
+    let state = match read_upload_state(state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "regolith: {} cannot be swept for unqueued rows: {error}",
+                records_path.display()
+            );
+            return;
+        }
+    };
     let mut queued = std::collections::BTreeSet::new();
     for line in records.lines() {
         let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -1692,7 +1963,19 @@ pub fn upload_finished_session(
     // most of a normally-exiting long session waiting for a launch that may
     // not come. The set is bounded by this seat's own increments, and
     // `send_pending` skips anything already acknowledged.
-    let state = read_upload_state(&manager.state_path);
+    let state = match read_upload_state(&manager.state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            // Loud, and nothing written. The bodies are on disk and the next
+            // launch quarantines the damaged file and recovers them (#1148).
+            error!(
+                "campaign session {} cannot be uploaded now: {error}; its evidence is on disk \
+                 and the next launch will recover it",
+                record.session_id
+            );
+            return;
+        }
+    };
     let owed = pending_uploads_for_session(&state, &record.session_id);
     if owed.is_empty() {
         // Two opposite facts, and `uploads.json` is what separates them. A
@@ -1718,13 +2001,39 @@ pub fn upload_finished_session(
         }
         return;
     }
+    // Budgeted, because this runs on the render thread (#1145). The systems
+    // that reach here live in `Last` (`crate::write_campaign_record_on_exit`),
+    // so every second spent below is a second of frozen, undrawn window. An
+    // hour-long seat owes ~13 bodies, and against an origin that has gone away
+    // each one used to take the full 45-second `REQUEST_TIMEOUT`: ~9m45s of a
+    // window a tester reasonably reports as a crash, in exactly the case the
+    // retry path exists to survive.
+    //
+    // Nothing is lost by stopping early. Every body is durable on disk, named
+    // by `uploads.json`, and swept by the next launch's background thread,
+    // which still takes the full timeout because nobody is waiting on it.
+    let deadline = Instant::now() + EXIT_UPLOAD_BUDGET;
+    let mut deferred = 0_usize;
     for owed in owed {
-        if send_pending(&manager.state_path, &owed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            deferred += 1;
+            continue;
+        }
+        if send_pending(&manager.state_path, &owed, remaining) {
             info!(
                 "campaign session {} uploaded ({})",
                 owed.session_id, owed.upload_key
             );
         }
+    }
+    if deferred > 0 {
+        info!(
+            "campaign session {} has {deferred} body(ies) left after this quit's {}s upload \
+             budget; they are on disk and the next launch sends them",
+            record.session_id,
+            EXIT_UPLOAD_BUDGET.as_secs()
+        );
     }
 }
 
@@ -1806,29 +2115,39 @@ fn build_upload_body(
     })
 }
 
+/// POST one body and classify the answer (#1149).
+///
+/// The status used to be read once, formatted into a string, and thrown away,
+/// so a `413` and a dropped packet were the same fact to every caller.
 fn post_upload(
     origin: &str,
     session_id: &str,
     increment_index: u64,
     body: &[u8],
-) -> Result<(), String> {
+    timeout: Duration,
+) -> Result<(), UploadRefusal> {
     let path = upload_path(session_id, increment_index);
-    let response = client()?
+    let response = client(timeout)
+        .map_err(UploadRefusal::Transient)?
         .post(format!("{}/{path}", origin.trim_end_matches('/')))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body.to_vec())
         .send()
-        .map_err(|error| error.to_string())?;
+        // A transport failure is the definition of transient: no service
+        // formed an opinion about these bytes at all.
+        .map_err(|error| UploadRefusal::Transient(error.to_string()))?;
     if response.status() == reqwest::StatusCode::NO_CONTENT {
-        Ok(())
-    } else {
-        let status = response.status();
-        let detail = response
-            .json::<ErrorResponse>()
-            .map(|body| body.detail.unwrap_or_else(|| format!("HTTP {status}")))
-            .unwrap_or_else(|_| format!("HTTP {status}"));
-        Err(detail)
+        return Ok(());
     }
+    let status = response.status();
+    let detail = response
+        .json::<ErrorResponse>()
+        .map(|body| body.detail.unwrap_or_else(|| format!("HTTP {status}")))
+        .unwrap_or_else(|_| format!("HTTP {status}"));
+    Err(classify_upload_refusal(
+        status,
+        format!("HTTP {status}: {detail}"),
+    ))
 }
 
 /// Sweep and retry every unsent session's evidence, in the background.
@@ -1860,10 +2179,145 @@ pub fn retry_pending_uploads(telemetry_path: &Path, origin: &str) -> std::thread
     let records_path = crate::campaign_record_path(telemetry_path);
     let origin = origin.to_owned();
     std::thread::spawn(move || {
+        // Order matters. The quarantine is what turns an unreadable file into
+        // an absent one, and only then may anything else write; the recovery
+        // is what puts the bodies back into the map the quarantine emptied,
+        // with the telemetry they were minted with -- which the record sweep
+        // below cannot do, because the JSONL stream carries no session id.
+        quarantine_damaged_state(&state_path);
+        recover_orphaned_bodies(&state_path, &origin);
         repair_stolen_acknowledgements(&state_path);
         sweep_unregistered_records(&state_path, &records_path, &origin);
         flush_pending(&state_path);
     })
+}
+
+/// Move an unreadable `uploads.json` aside, loudly, so a launch can proceed.
+///
+/// The alternative to moving it is a client that refuses every upload for the
+/// life of the installation, which is a different way to lose the same
+/// evidence. The alternative to moving it *aside* is overwriting it, which is
+/// #1148 itself. So it is renamed, kept, and named in the log, and
+/// [`recover_orphaned_bodies`] then rebuilds the map from the bodies on disk.
+fn quarantine_damaged_state(state_path: &Path) {
+    let Err(error) = read_upload_state(state_path) else {
+        return;
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let aside = state_path.with_extension(format!("damaged-{stamp}.json"));
+    match std::fs::rename(state_path, &aside) {
+        Ok(()) => eprintln!(
+            "regolith: {error}; it has been moved to {} and the queued evidence on disk will be \
+             registered again -- no acknowledgement has been overwritten",
+            aside.display()
+        ),
+        Err(rename) => eprintln!(
+            "regolith: {error}; and it cannot be moved aside ({rename}). No evidence will be \
+             uploaded or overwritten until {} is repaired or removed by hand",
+            state_path.display()
+        ),
+    }
+}
+
+/// Register every `upload-*.json` body that no entry names.
+///
+/// The bodies are the evidence; `uploads.json` is only the index of them. Two
+/// things leave a body with no entry: a crash between [`durable_write`] and
+/// the registration in [`persist_and_register`], and a quarantine. Rebuilding
+/// from the body preserves the telemetry span it was minted with, which
+/// [`sweep_unregistered_records`] cannot -- that path re-mints from the record
+/// row alone and says so.
+///
+/// A retired or acknowledged entry keeps its key, so its body is not orphaned
+/// and is not resurrected here.
+fn recover_orphaned_bodies(state_path: &Path, origin: &str) {
+    let directory = state_path.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut state = match read_upload_state(state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("regolith: queued evidence cannot be recovered: {error}");
+            return;
+        }
+    };
+    let mut recovered = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(upload_key) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("upload-"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if state.sessions.contains_key(&upload_key) {
+            continue;
+        }
+        // The body names its own session; the key alone cannot, because a
+        // session id is itself a key and carries no separator (#1048).
+        let session_id = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|body| {
+                body.get("records")?
+                    .as_array()?
+                    .first()?
+                    .get("session_id")?
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        let Some(session_id) = session_id.filter(|session_id| !session_id.is_empty()) else {
+            eprintln!(
+                "regolith: {} is a queued upload body naming no session; it cannot be sent and \
+                 is left in place",
+                path.display()
+            );
+            continue;
+        };
+        state.sessions.insert(
+            upload_key.clone(),
+            UploadEntry {
+                origin: origin.to_owned(),
+                body_path: path.clone(),
+                acknowledged: false,
+                session_id: Some(session_id.clone()),
+                attempts: 0,
+                retired: None,
+            },
+        );
+        recovered.push(RecoveredBody {
+            upload_key,
+            session_id,
+        });
+    }
+    if recovered.is_empty() {
+        return;
+    }
+    if let Err(error) = write_upload_state(state_path, &state) {
+        eprintln!("regolith: recovered evidence cannot be recorded: {error}");
+        return;
+    }
+    for body in recovered {
+        eprintln!(
+            "regolith: campaign session {} has a queued body ({}) that {} did not name; it is \
+             queued again against {origin}",
+            body.session_id,
+            body.upload_key,
+            state_path.display()
+        );
+    }
+}
+
+/// One body put back into `uploads.json` by [`recover_orphaned_bodies`].
+struct RecoveredBody {
+    upload_key: String,
+    session_id: String,
 }
 
 /// Re-open every acknowledgement #1118 could have stolen, once per file.
@@ -1885,7 +2339,13 @@ pub fn retry_pending_uploads(telemetry_path: &Path, origin: &str) -> std::thread
 /// set in the same write, because a repair that ran at every launch would be
 /// the unbounded re-upload this same issue is about.
 fn repair_stolen_acknowledgements(state_path: &Path) {
-    let mut state = read_upload_state(state_path);
+    let mut state = match read_upload_state(state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("regolith: the #1118 upload repair cannot run: {error}");
+            return;
+        }
+    };
     if state.increment_acks_repaired {
         return;
     }
@@ -1929,11 +2389,28 @@ fn repair_stolen_acknowledgements(state_path: &Path) {
     }
 }
 
-fn read_upload_state(path: &Path) -> UploadState {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// Read `uploads.json`, distinguishing *absent* from *unreadable* (#1148).
+///
+/// This used to be two `.ok()`s and an `unwrap_or_default()`, so a truncated
+/// file, a short read, or a schema this build no longer parses all became an
+/// **empty** `UploadState` -- indistinguishable from a first launch. The next
+/// `write_upload_state` then durably committed that emptiness, orphaning every
+/// `upload-*.json` body on disk with nothing left to name it, and saying
+/// nothing.
+///
+/// Absent is a legitimate first launch and defaults. Everything else is an
+/// error every caller has to decide about, and the one rule they all follow is
+/// **never write state derived from a failed read**.
+fn read_upload_state(path: &Path) -> Result<UploadState, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UploadState::default())
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))
 }
 
 fn write_upload_state(path: &Path, state: &UploadState) -> std::io::Result<()> {
@@ -2258,7 +2735,13 @@ mod tests {
     /// [`crate::session::INCREMENT_MINUTES`] with room to spare; the point is
     /// to cross the cadence several times, which is the only way a
     /// second-and-later body exists at all.
-    fn queue_a_long_seat(queue: &mut UploadQueue, session_id: &str, increments: u64) {
+    ///
+    /// Returns the seat's closing row, which is what the exit path is handed.
+    fn queue_a_long_seat(
+        queue: &mut UploadQueue,
+        session_id: &str,
+        increments: u64,
+    ) -> SessionRecord {
         let mut session = crate::session::CampaignSession::new(
             session_id.to_owned(),
             "2026-09-06T12:00:00Z".to_owned(),
@@ -2269,6 +2752,7 @@ mod tests {
                 jitter_p99_ms: 0,
             },
         );
+        let mut last = None;
         for index in 0..increments {
             for _ in 0..6 * 60 * u64::from(orrery_core::TICK_HZ) {
                 session.observe_tick(crate::session::PlayerActivity::Active);
@@ -2283,7 +2767,9 @@ mod tests {
                 )
                 .expect("a six-minute increment covers a non-empty span");
             queue_finished_session(queue, &record).expect("the increment queues");
+            last = Some(record);
         }
+        last.expect("a seat banks at least one increment")
     }
 
     /// One `orders` row of the shape the driven-tick path appends, in bytes.
@@ -2412,7 +2898,8 @@ mod tests {
         // Every body landed. Under the old shape the last one was 71 MB
         // against a 64 MiB ceiling and came back 413, and the state file kept
         // it unacknowledged for a relaunch that would fail the same way.
-        let state = read_upload_state(&upload_state_path(&telemetry_path));
+        let state =
+            read_upload_state(&upload_state_path(&telemetry_path)).expect("read the upload state");
         for key in state.sessions.keys() {
             assert!(
                 state.sessions[key].acknowledged,
@@ -2557,7 +3044,7 @@ mod tests {
         }
 
         // Each acknowledged against its own key -- #1118's half of the seam.
-        let state = read_upload_state(&state_path);
+        let state = read_upload_state(&state_path).expect("read the upload state");
         assert_eq!(state.sessions.len(), 5, "uploads.json lost an increment");
         for index in 0..5 {
             let key = upload_key(session_id, index);
@@ -2618,7 +3105,7 @@ mod tests {
             "both increments must be attempted; only one was: {attempted:?}"
         );
 
-        let state = read_upload_state(&state_path);
+        let state = read_upload_state(&state_path).expect("read the upload state");
         assert!(
             state
                 .sessions
@@ -2641,7 +3128,7 @@ mod tests {
         let (recovered_origin, recovered) = increment_test_service(&[]);
         // The entry remembers the origin it was queued against, so point the
         // failed body at the service that is answering now.
-        let mut state = read_upload_state(&state_path);
+        let mut state = read_upload_state(&state_path).expect("read the upload state");
         for entry in state.sessions.values_mut() {
             entry.origin = recovered_origin.clone();
         }
@@ -2662,6 +3149,7 @@ mod tests {
         );
         assert!(
             read_upload_state(&state_path)
+                .expect("read the upload state")
                 .sessions
                 .get(&upload_key(session_id, 0))
                 .is_some_and(|entry| entry.acknowledged),
@@ -2691,7 +3179,7 @@ mod tests {
         // owed, and increment zero claims an acknowledgement it may never have
         // earned.
         let state_path = upload_state_path(&telemetry_path);
-        let mut state = read_upload_state(&state_path);
+        let mut state = read_upload_state(&state_path).expect("read the upload state");
         state
             .sessions
             .get_mut(session_id)
@@ -2814,7 +3302,7 @@ mod tests {
         let posted = seen.lock().expect("capture lock").len();
         assert_eq!(posted, 2, "both increments are posted on the first launch");
 
-        let state = read_upload_state(&state_path);
+        let state = read_upload_state(&state_path).expect("read the upload state");
         let first = state
             .sessions
             .get(session_id)
@@ -2879,7 +3367,7 @@ mod tests {
             "the posted body must carry the recorded row verbatim: {request}"
         );
 
-        let state = read_upload_state(&state_path);
+        let state = read_upload_state(&state_path).expect("read the upload state");
         let entry = state
             .sessions
             .get(session_id)
@@ -2926,7 +3414,8 @@ mod tests {
         );
         let pending = queue_finished_session(&mut queue, &record).expect("the row queues");
         assert!(pending.body_path().exists(), "the body is on disk");
-        let state = read_upload_state(&upload_state_path(&telemetry_path));
+        let state =
+            read_upload_state(&upload_state_path(&telemetry_path)).expect("read the upload state");
         let entry = state
             .sessions
             .get(&record.session_id)
@@ -2985,7 +3474,8 @@ mod tests {
             3,
             "three increments wrote fewer than three distinct bodies"
         );
-        let state = read_upload_state(&upload_state_path(&telemetry_path));
+        let state =
+            read_upload_state(&upload_state_path(&telemetry_path)).expect("read the upload state");
         assert_eq!(
             state.sessions.len(),
             3,
@@ -3190,5 +3680,347 @@ mod tests {
         assert!(!request.recv().expect("captured join request").is_empty());
         assert_eq!(refusal.code.as_deref(), Some("client_rev_mismatch"));
         assert_eq!(refusal.detail, "download the current build");
+    }
+
+    /// A damaged `uploads.json` is an error, not an empty map (#1148).
+    ///
+    /// The old read was `read().ok().and_then(from_slice ... .ok()).
+    /// unwrap_or_default()`, so damaged bytes and a first launch were the same
+    /// value. This test holds both readings side by side: the exact expression
+    /// the old code used, which answers "nothing is queued", and the current
+    /// one, which answers "this file cannot be read". Everything else in
+    /// #1148 -- the acknowledgements erased, the next write committing the
+    /// erasure, the bodies orphaned -- follows from that one collapse.
+    #[test]
+    fn a_damaged_upload_state_is_an_error_and_not_an_empty_map() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06b05-1148-7000-8000-0000000000aa";
+        let (origin, _seen) = increment_test_service(&[]);
+        let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&mut queue, session_id, 2);
+        let state_path = upload_state_path(&telemetry_path);
+
+        // A file that was written and then truncated mid-write: the exact
+        // shape a power cut or a full disk leaves.
+        let good = std::fs::read(&state_path).expect("the state file exists");
+        std::fs::write(&state_path, &good[..good.len() / 2]).expect("truncate the state file");
+
+        let old_reading: UploadState = std::fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        assert!(
+            old_reading.sessions.is_empty(),
+            "the old read must be shown losing the queue; if it does not, this test proves nothing"
+        );
+        assert_eq!(
+            pending_uploads(&old_reading).len(),
+            0,
+            "under the old read this install owed nothing, and the next write said so durably"
+        );
+
+        let error = read_upload_state(&state_path).expect_err("a truncated file cannot be read");
+        assert!(
+            error.contains("uploads.json"),
+            "the failure must name the file it is about: {error}"
+        );
+
+        // And nothing writes through the failure. `send_pending` is the hot
+        // path that used to re-read, re-post and re-write on every body.
+        let pending = PendingUpload {
+            session_id: session_id.to_owned(),
+            upload_key: upload_key(session_id, 0),
+            increment_index: 0,
+            origin,
+            body_path: directory.path().join(format!("upload-{session_id}.json")),
+        };
+        assert!(
+            !send_pending(&state_path, &pending, Duration::from_secs(1)),
+            "an unreadable state file must stop the send, not default around it"
+        );
+        assert_eq!(
+            std::fs::read(&state_path).expect("the damaged file is still there"),
+            good[..good.len() / 2],
+            "the damaged file must not be overwritten: that write is what makes the loss permanent"
+        );
+    }
+
+    /// The queued evidence survives a damaged `uploads.json` (#1148).
+    ///
+    /// The bodies are the evidence and `uploads.json` is only an index of
+    /// them, so losing the index must cost a log line and not a volunteer's
+    /// signed minutes. The launch sweep moves the damaged file aside and
+    /// rebuilds the index from the `upload-*.json` bodies, which is what keeps
+    /// each body's own telemetry span (#1125) -- the record sweep cannot,
+    /// because the JSONL stream carries no session id.
+    #[test]
+    fn queued_evidence_survives_a_damaged_upload_state() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06b05-1148-7000-8000-0000000000bb";
+        // Queued and never sent, which is the population that can be lost.
+        let (dead_origin, _dead) = increment_test_service(&[]);
+        let mut queue = UploadQueue::new(dead_origin, &telemetry_path, 0);
+        queue_a_long_seat(&mut queue, session_id, 2);
+        let state_path = upload_state_path(&telemetry_path);
+        let bodies: Vec<PathBuf> = pending_uploads(
+            &read_upload_state(&state_path).expect("the state file is readable while intact"),
+        )
+        .into_iter()
+        .map(|pending| pending.body_path)
+        .collect();
+        assert_eq!(bodies.len(), 2, "a two-increment seat queues two bodies");
+
+        std::fs::write(&state_path, b"{\"sessions\": {\"01a0").expect("damage the state file");
+
+        let (origin, seen) = increment_test_service(&[]);
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the recovering sweep finishes");
+
+        let mut posted: Vec<String> = seen
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|post| post.path.clone())
+            .collect();
+        posted.sort();
+        let mut wanted = expected_paths(session_id, 2);
+        wanted.sort();
+        assert_eq!(
+            posted, wanted,
+            "both queued bodies must reach the service after the index was damaged"
+        );
+        let state = read_upload_state(&state_path).expect("the rebuilt state file is readable");
+        assert!(
+            state.sessions.values().all(|entry| entry.acknowledged),
+            "the rebuilt index must carry the acknowledgements the resend earned"
+        );
+        let damaged: Vec<PathBuf> = std::fs::read_dir(directory.path())
+            .expect("read the state directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("damaged-"))
+            })
+            .collect();
+        assert_eq!(
+            damaged.len(),
+            1,
+            "the damaged file must be kept aside rather than overwritten: {damaged:?}"
+        );
+        for body in bodies {
+            assert!(
+                body.exists(),
+                "{} was unlinked; the bodies are the evidence",
+                body.display()
+            );
+        }
+    }
+
+    /// A permanent refusal is retired; a transient one is not (#1149).
+    ///
+    /// `413` is the clearest permanent answer the service has: the body is
+    /// over the upload cap and a body does not shrink. `503` is the clearest
+    /// transient one. Before this, `post_upload` discarded the status and both
+    /// were the string "not sent yet", so the `413` body was re-POSTed at
+    /// every launch for the life of the installation.
+    #[test]
+    fn a_permanent_refusal_is_retired_and_a_transient_one_is_not() {
+        for answer in ["413 Payload Too Large", "503 Service Unavailable"] {
+            let permanent = answer.starts_with("413");
+            let directory = tempfile::tempdir().expect("temp dir");
+            let telemetry_path = directory.path().join("telemetry.jsonl");
+            std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+            let session_id = "01a06b05-1149-7000-8000-0000000000cc";
+            let (origin, seen) = upload_test_service(answer);
+            let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+            queue_a_long_seat(&mut queue, session_id, 1);
+
+            for _ in 0..3 {
+                retry_pending_uploads(&telemetry_path, &origin)
+                    .join()
+                    .expect("the sweep finishes");
+            }
+
+            let posted = seen.lock().expect("capture lock").len();
+            let state = read_upload_state(&upload_state_path(&telemetry_path))
+                .expect("read the upload state");
+            let entry = state
+                .sessions
+                .get(&upload_key(session_id, 0))
+                .expect("the body is still named");
+            if permanent {
+                assert_eq!(
+                    posted, 1,
+                    "a permanently refused body must be attempted once, not at every launch"
+                );
+                assert!(
+                    entry.retired.is_some(),
+                    "a {answer} body must be retired, and the reason recorded"
+                );
+                assert!(
+                    entry.body_path.exists(),
+                    "retiring gives up on sending the body, not on keeping it"
+                );
+            } else {
+                assert_eq!(
+                    posted, 3,
+                    "a transient refusal must be retried every launch"
+                );
+                assert!(
+                    entry.retired.is_none(),
+                    "a {answer} body must stay queued: an outage is not a refusal"
+                );
+                assert_eq!(entry.attempts, 3, "every attempt is counted and durable");
+            }
+        }
+    }
+
+    /// A `404` is bounded rather than called permanent or transient (#1149).
+    ///
+    /// The status looks terminal, and for a session the service never admitted
+    /// it is. But two live causes make it spurious for a session that *was*
+    /// admitted: #1151, where one malformed line in the service's `joins.jsonl`
+    /// `404`s every session after it, and the #1135 seam, where a client
+    /// posting per-increment addresses to an older service is `404`ed on every
+    /// increment past the first. Both are repaired by a deployment, so the
+    /// first `404` must not retire the evidence -- and the hundredth must not
+    /// keep re-POSTing it.
+    #[test]
+    fn a_body_refused_as_unknown_is_retried_a_bounded_number_of_times() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06b05-1149-7000-8000-0000000000dd";
+        let (origin, seen) = upload_test_service("404 Not Found");
+        let mut queue = UploadQueue::new(origin.clone(), &telemetry_path, 0);
+        queue_a_long_seat(&mut queue, session_id, 1);
+        let state_path = upload_state_path(&telemetry_path);
+        let key = upload_key(session_id, 0);
+
+        retry_pending_uploads(&telemetry_path, &origin)
+            .join()
+            .expect("the first sweep finishes");
+        assert!(
+            read_upload_state(&state_path)
+                .expect("read the upload state")
+                .sessions
+                .get(&key)
+                .is_some_and(|entry| entry.retired.is_none()),
+            "one 404 must not retire a body: the service may be the side that is wrong"
+        );
+
+        // Enough launches to pass the bound, and then some.
+        for _ in 1..UNKNOWN_SESSION_ATTEMPTS + 3 {
+            retry_pending_uploads(&telemetry_path, &origin)
+                .join()
+                .expect("a later sweep finishes");
+        }
+
+        assert_eq!(
+            seen.lock().expect("capture lock").len(),
+            UNKNOWN_SESSION_ATTEMPTS as usize,
+            "a body refused as unknown must stop being POSTed once the bound is spent"
+        );
+        let state = read_upload_state(&state_path).expect("read the upload state");
+        let entry = state.sessions.get(&key).expect("the body is still named");
+        assert!(
+            entry
+                .retired
+                .as_ref()
+                .is_some_and(|reason| reason.contains("unknown")),
+            "the retirement must say what it was: {:?}",
+            entry.retired
+        );
+        assert!(
+            entry.body_path.exists(),
+            "the volunteer's evidence stays on disk and can be sent by hand"
+        );
+    }
+
+    /// A service that takes the connection and never answers.
+    ///
+    /// This is the link that dropped, from the client's side: the TCP
+    /// handshake still completes (a NAT that has forgotten the flow, a host
+    /// that is up but wedged), so nothing fails fast and the client waits out
+    /// its whole request timeout. A refused connection would not exercise
+    /// #1145 at all.
+    fn stalling_test_service() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test service");
+        let address = listener.local_addr().expect("test service address");
+        std::thread::spawn(move || {
+            // The streams are parked, not dropped: dropping one closes the
+            // connection and the client would see an answer of sorts.
+            let mut parked = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                parked.push(stream);
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// Quitting after a link drop returns promptly (#1145).
+    ///
+    /// The exit path runs in `Last`, on the render thread, so every second it
+    /// spends is a frozen window. It used to POST each of the seat's bodies at
+    /// the full 45-second `REQUEST_TIMEOUT`: for the three-increment seat
+    /// below that is 135 s, and for the hour-long seat the arithmetic in #1145
+    /// is about, 13 x 45 s = ~9m45s. The budget makes the whole exit path cost
+    /// [`EXIT_UPLOAD_BUDGET`], and the bodies it did not reach stay queued for
+    /// the next launch exactly as older bodies always did.
+    #[test]
+    fn quitting_after_a_link_drop_returns_promptly() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let telemetry_path = directory.path().join("telemetry.jsonl");
+        std::fs::write(&telemetry_path, b"{\"row\":1}\n").expect("write telemetry stream");
+        let session_id = "01a06b05-1145-7000-8000-0000000000ee";
+        let origin = stalling_test_service();
+        let mut queue = UploadQueue::new(origin, &telemetry_path, 0);
+        let record = queue_a_long_seat(&mut queue, session_id, 3);
+        let state_path = upload_state_path(&telemetry_path);
+        assert_eq!(
+            pending_uploads_for_session(
+                &read_upload_state(&state_path).expect("read the upload state"),
+                session_id
+            )
+            .len(),
+            3,
+            "the seat owes three bodies, each of which used to cost REQUEST_TIMEOUT"
+        );
+
+        let manager = UploadManager::for_test(&telemetry_path);
+        let started = Instant::now();
+        upload_finished_session(
+            &manager,
+            &record,
+            &crate::campaign_record_path(&telemetry_path),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < EXIT_UPLOAD_BUDGET * 2,
+            "quitting took {elapsed:?}; the old path took 3 x {REQUEST_TIMEOUT:?} against this \
+             same unanswering origin, and a one-hour seat took ~9m45s"
+        );
+        // And the evidence is untouched by the deadline: a timeout is
+        // transport, which is transient, so nothing is retired and every body
+        // is still owed.
+        let state = read_upload_state(&state_path).expect("read the upload state");
+        assert_eq!(
+            pending_uploads_for_session(&state, session_id).len(),
+            3,
+            "a budgeted quit must defer bodies, never drop them"
+        );
+        assert!(
+            state.sessions.values().all(|entry| entry.retired.is_none()),
+            "a stalled origin is transient; retiring on it would lose the volunteer's evidence"
+        );
     }
 }
