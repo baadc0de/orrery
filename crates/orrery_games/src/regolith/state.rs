@@ -61,21 +61,54 @@ pub const TRAIL_SAMPLE_TICKS: u8 = 12;
 /// Trail-position lattice, in millimetres per encoded metre.
 pub const TRAIL_QUANTUM_MM: i64 = 1_000;
 /// Maximum canonical bytes added to a craft by its full trail.
-pub const TRAIL_MAX_ENCODED_BYTES: usize = 1 + TRAIL_CAPACITY * 3 * core::mem::size_of::<i16>();
+pub const TRAIL_MAX_ENCODED_BYTES: usize = 1 + TRAIL_CAPACITY * 3 * core::mem::size_of::<i32>();
 
 /// One whole-metre, grid-relative trail position.
 ///
-/// Regolith's furthest campaign content is below 3 km and its reflecting
-/// island edge is 1 km, so signed 16-bit metres leave more than a tenfold
-/// range margin while halving each coordinate compared with an `i32` point.
+/// **A range here is a deadline, not a boundary.** #955's tether is a
+/// restoring drag and not a wall, and it is sized so a fully tethered craft
+/// still holds [`TETHER_ESCAPE_SPEED_MMS`](crate::regolith::TETHER_ESCAPE_SPEED_MMS)
+/// — 33.333 m/s — outward for as long as the pilot holds the throttle. There
+/// is therefore no furthest position a craft can occupy, only a furthest one
+/// it can reach in a given time, and every coordinate that quantizes a
+/// position has to be sized against the clock rather than against the island.
+///
+/// This was signed 16-bit metres until #1120, on the written grounds that
+/// campaign content below 3 km against a 1 km island edge left "more than a
+/// tenfold range margin" — a justification the tether falsified without
+/// anyone revisiting it. Its real deadline was 32,768 m at 33.333 m/s, and
+/// what that cost is measured: one interceptor at full outward thrust crosses
+/// it at tick 58,452, **16.2 minutes**, after which every 5 Hz sample is
+/// dropped and [`Craft::arithmetic_overflowed`] — a deviation signal in
+/// canonical hashed state — is latched for the rest of the session. It is not
+/// a contrived flight; three of the `island` scenario's eight honest bot
+/// pilots latch inside an hour, the first at relative tick 116,075.
+///
+/// 32 bits move the deadline to ±2,147,483 km: **745 days** of unbroken
+/// outward flight at the tether's escape speed, or 51.8 days at the
+/// interceptor's 480 m/s chassis ceiling, against sessions measured in hours.
+/// That is a cliff no session can reach, which is what the retired one was
+/// wrongly believed to be — so the arithmetic is stated here rather than
+/// asserted, and anything that raises either speed has to come back to this
+/// line.
+///
+/// 64 bits would state no deadline at all and were tried first. They cost too
+/// much on the wire to keep: the sender emits a delta only while the patch
+/// beats a compressed keyframe, and a keyframe compresses to roughly 60
+/// bytes, so four points of 24 bytes push the trail's own churn past it and
+/// the update is dropped rather than sent — `p1-swarm`'s
+/// `a_delta_stream_reconstructs_the_same_replica_states_as_the_snapshot_stream`
+/// measures exactly that and fails. Four points of 12 bytes stay inside it.
+/// The trail costs 12 canonical bytes per point rather than 6
+/// ([`TRAIL_MAX_ENCODED_BYTES`]: 49 for a full trail rather than 25).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrailPoint {
     /// Whole metres along x.
-    pub x_m: i16,
+    pub x_m: i32,
     /// Whole metres along y.
-    pub y_m: i16,
+    pub y_m: i32,
     /// Whole metres along z.
-    pub z_m: i16,
+    pub z_m: i32,
 }
 
 impl TrailPoint {
@@ -133,16 +166,15 @@ impl Trail {
     }
 
     pub(crate) fn advance(&mut self, pos: QPos, overflowed: &mut bool) {
-        let Some(next_phase) = self.sample_phase.checked_add(1) else {
-            *overflowed = true;
-            self.sample_phase = 0;
-            return;
-        };
-        if next_phase < TRAIL_SAMPLE_TICKS {
-            self.sample_phase = next_phase;
+        // The phase is canonically confined to `0..TRAIL_SAMPLE_TICKS`:
+        // `Default` starts it at zero and `decode` refuses anything larger.
+        // The remainder is what keeps it there, so the add cannot carry — the
+        // `checked_add` this replaced could only ever report an overflow that
+        // the type system had already ruled out.
+        self.sample_phase = (self.sample_phase + 1) % TRAIL_SAMPLE_TICKS;
+        if self.sample_phase != 0 {
             return;
         }
-        self.sample_phase = 0;
         let Some(point) = TrailPoint::from_pos(pos, overflowed) else {
             return;
         };
@@ -156,7 +188,7 @@ impl Trail {
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
-        // Four points need three length bits; a phase in 0..12 needs four.
+        // Four points need three length bits; a phase in `0..12` needs four.
         out.push((self.sample_phase << 3) | self.len);
         for point in self.points() {
             out.extend_from_slice(&point.x_m.to_le_bytes());
@@ -174,7 +206,7 @@ impl Trail {
         if usize::from(len) > TRAIL_CAPACITY || sample_phase >= TRAIL_SAMPLE_TICKS {
             return Err(CodecError("regolith trail: invalid length or sample phase"));
         }
-        let expected = 1 + usize::from(len) * 3 * core::mem::size_of::<i16>();
+        let expected = 1 + usize::from(len) * 3 * core::mem::size_of::<i32>();
         if bytes.len() != expected {
             return Err(CodecError("regolith trail: wrong length"));
         }
@@ -183,27 +215,33 @@ impl Trail {
             sample_phase,
             ..Self::default()
         };
-        for (index, chunk) in bytes[1..].chunks_exact(6).enumerate() {
+        for (index, chunk) in bytes[1..].chunks_exact(12).enumerate() {
+            let axis =
+                |offset: usize| i32::from_le_bytes(chunk[offset..offset + 4].try_into().unwrap());
             trail.points[index] = TrailPoint {
-                x_m: i16::from_le_bytes([chunk[0], chunk[1]]),
-                y_m: i16::from_le_bytes([chunk[2], chunk[3]]),
-                z_m: i16::from_le_bytes([chunk[4], chunk[5]]),
+                x_m: axis(0),
+                y_m: axis(4),
+                z_m: axis(8),
             };
         }
         Ok(trail)
     }
 }
 
-fn quantize_trail_axis(mm: i64, overflowed: &mut bool) -> Option<i16> {
+/// Snap one millimetre axis to whole metres, half away from zero.
+///
+/// The rounding itself cannot fail: `mm` is bounded by `i64`, so `whole` is at
+/// most `i64::MAX / TRAIL_QUANTUM_MM` in magnitude and an adjustment of one
+/// cannot carry past that. Only the narrowing can, and only 2,147,483 km out
+/// — see [`TrailPoint`] for why that is a deadline no session reaches, and
+/// why it is still reported rather than clamped: a clamped coordinate would
+/// put a position the craft never held into hashed state.
+fn quantize_trail_axis(mm: i64, overflowed: &mut bool) -> Option<i32> {
     let whole = mm / TRAIL_QUANTUM_MM;
     let remainder = mm % TRAIL_QUANTUM_MM;
     let adjustment = i64::from(remainder >= TRAIL_QUANTUM_MM / 2)
         - i64::from(remainder <= -(TRAIL_QUANTUM_MM / 2));
-    let Some(rounded) = whole.checked_add(adjustment) else {
-        *overflowed = true;
-        return None;
-    };
-    i16::try_from(rounded).ok().or_else(|| {
+    i32::try_from(whole + adjustment).ok().or_else(|| {
         *overflowed = true;
         None
     })
