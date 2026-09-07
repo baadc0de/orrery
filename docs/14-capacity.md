@@ -1399,6 +1399,13 @@ craft encodes to 158 payload bytes; full output adds 12 bytes of stable-id and
 length framing, for 170 bytes/entity. The canonical encoder and output buffer
 do perform their real heap allocations, and those are inside the timings.
 
+The byte counts above were measured at ruleset v25. #1120 widened
+`TrailPoint`'s metre from 16 to 32 bits — the 16-bit one latched a false
+overflow after sixteen minutes of outward flight the tether permits — so a
+re-run on v26 or later encodes 24 bytes more per craft, 182 payload and 194
+bytes/entity. The timings above were not re-taken; nothing about the shape of
+the workload changed, only the width of four points in it.
+
 ### 12.3 One canonical tick and full output
 
 Times are milliseconds. Parentheses are the range of the five run medians.

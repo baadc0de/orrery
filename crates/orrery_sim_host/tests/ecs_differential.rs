@@ -129,9 +129,16 @@ const WITHIN_TICK_VISIBILITY_SCENARIO: Scenario = Scenario {
 /// under live within-tick visibility, which is the semantics the fixture
 /// exists to detect; adopting snapshot isolation moves it, and a chain that
 /// had *not* moved would mean the detector had stopped detecting.
+///
+/// **Regenerated again at ruleset v26 (#1120)**, where the craft's trail
+/// coordinate widened from 16-bit to 32-bit metres. That changes canonical
+/// craft bytes and therefore every per-tick state hash, which is a D-1 move
+/// and nothing else: the D-2 outcome chain below is byte-identical across the
+/// same regeneration, so no event, delivery or visibility semantic moved with
+/// it.
 const WITHIN_TICK_VISIBILITY_CHAIN: [u8; 32] = [
-    236, 169, 106, 131, 119, 68, 147, 242, 220, 40, 178, 56, 148, 155, 157, 164, 199, 54, 93, 12,
-    240, 26, 244, 251, 205, 5, 168, 38, 195, 229, 84, 74,
+    5, 43, 2, 128, 59, 144, 35, 41, 177, 188, 183, 140, 51, 19, 121, 17, 114, 40, 170, 74, 225,
+    226, 95, 175, 117, 154, 236, 157, 196, 14, 196, 40,
 ];
 
 /// D-2 baseline for [`WITHIN_TICK_VISIBILITY_SCENARIO`]. Regenerated for #758,
