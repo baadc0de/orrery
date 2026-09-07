@@ -223,9 +223,10 @@ pub const SCENARIOS: &[Scenario] = &[
 /// battery's per-game tables is fixture work in a digest tree, not this
 /// change's.
 ///
-/// 900 ticks so the seeded director's early bloom (`next_bloom_tick` well
-/// inside the window) seeds a batch, its rocks live and are shot, and the
-/// pickups they drop both get grabbed and time out.
+/// 900 ticks so the seeded director's early bloom (its clock starts one
+/// cadence short of the deadline, so the bloom lands sixty ticks in) seeds a
+/// batch, its rocks live and are shot, and the pickups they drop both get
+/// grabbed and time out.
 pub const WORLD_SCENARIO: Scenario = Scenario {
     name: "world",
     entities: 4,

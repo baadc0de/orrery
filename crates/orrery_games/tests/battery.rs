@@ -121,6 +121,13 @@ game_test!(honest_play_raises_no_stage_one_flag, NoFalsePositives, {
     // the replication rate, two of them with loss, so a check that assumed
     // adjacent samples fails here rather than against a player whose only
     // offence was a lossy link.
+    //
+    // Note what this corpus does *not* reach, so its greenness is not read as
+    // wider than it is: every member of SCENARIOS declares `world_entities: 0`
+    // (asserted in `world_scenario.rs`), so no rock, pickup or bloom director
+    // is ever sampled here. That domain's false-positive coverage is
+    // `world_scenario.rs::honest_world_play_raises_no_stage_one_flag`, and
+    // until #1124 it did not exist anywhere.
     for scenario in SCENARIOS {
         let honest = play(G::honest(), scenario);
         assert!(

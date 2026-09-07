@@ -1840,20 +1840,34 @@ impl Game for Regolith {
     }
 }
 
+/// How far into a scenario the seeded director's first bloom lands.
+///
+/// The stock director waits a whole [`BLOOM_CADENCE_TICKS`] — sixty seconds,
+/// longer than any scenario in the corpus runs — so a stock seed would leave
+/// the bloom, split, materialization and pickup paths unstepped and the
+/// scenario would only look like it covered the module.
+const WORLD_SEED_FIRST_BLOOM_TICK: u64 = 60;
+
 /// One world-owned seed for a scenario slot: the island's bloom director at
 /// slot 0, a pickup at slot 1, then rocks around the player spawn ring.
 ///
-/// The director's `next_bloom_tick` is deliberately far below
-/// [`BLOOM_CADENCE_TICKS`]: the stock director waits sixty seconds, which is
-/// longer than any scenario in the corpus runs, so a stock seed would leave
-/// the bloom, split, materialization and pickup paths unstepped and the
-/// scenario would only look like it covered the module. Everything else is
-/// stock, and every value is a pure function of `slot`.
+/// The director's first bloom is pulled forward to
+/// [`WORLD_SEED_FIRST_BLOOM_TICK`] by starting its **clock** that far short of
+/// the cadence, rather than by moving `next_bloom_tick` off the cadence. The
+/// distinction is the whole of #1124: `regolith/value-range` requires a
+/// director's `next_bloom_tick` to be a multiple of [`BLOOM_CADENCE_TICKS`]
+/// and strictly ahead of its clock, and production keeps that — `spawned()`
+/// seeds one whole cadence and `world::seed_bloom` only ever adds another.
+/// A fixture that seeded `next_bloom_tick: 60` was in violation on every
+/// sample of every tick, which is why this scenario could never be handed to
+/// the battery's false-positive check. Bloom timing is unchanged: the clock
+/// still reaches the cadence sixty ticks in. Everything else is stock, and
+/// every value is a pure function of `slot`.
 fn world_seed(slot: u64) -> RegolithState {
     if slot == 0 {
         return RegolithState::BloomDirector(BloomDirector {
-            clock_tick: 0,
-            next_bloom_tick: 60,
+            clock_tick: BLOOM_CADENCE_TICKS - WORLD_SEED_FIRST_BLOOM_TICK,
+            next_bloom_tick: BLOOM_CADENCE_TICKS,
             ..BloomDirector::spawned()
         });
     }
