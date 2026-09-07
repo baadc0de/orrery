@@ -1,0 +1,43 @@
+{
+  "stage": "subassembly-sheet",
+  "zone": "spine_conduits",
+  "feature": "Exposed conduit runs",
+  "size_m": 4.0,
+  "prompt": "Image 1 is the concept painting of a 9 m spacecraft; image 2 is a crop around the feature. Isolate ONE subassembly of it: Exposed conduit runs (conduit, pipe, cable), about 4.0 m across. Draw a clean production callout sheet of ONLY that subassembly, with no hull around it: three views at identical scale on a flat light-grey background: front-left 3/4 view large on the left, side view and front view smaller on the right, each with a small view label. Keep the exact design language of the concept (utilitarian military spacecraft hardware: panelled, riveted, warm-grey painted steel with dark polymer panels and bare-aluminium fasteners, safety-orange only where the concept has it); show its mounting face where it meets the hull as a flat base. No other text, no dimensions, no people, no background scenery.",
+  "references": [
+    "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+    "2cfde062b7814e16f4acda9b65b29d9ec908f10b11621ee66499a4e4dc693e8a"
+  ],
+  "concept": "escort-pro-concept.png",
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "RJ6bauuYA7y-vdIPzsvu4Qc",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 1307,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 2728,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      },
+      {
+        "modality": "TEXT",
+        "tokenCount": 187
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 301
+  },
+  "output": "spine_conduits.png",
+  "output_sha256": "04a444a15f4b8eac702263f11b791e157bd33aee614b7e4abcb96a7e5cf9b662",
+  "model_text": "",
+  "generated_at": "2026-09-05T04:45:12Z"
+}

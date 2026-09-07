@@ -1,0 +1,774 @@
+{
+ "prop": "deck safety railing section with two posts, a top handrail, a mid rail and a kick plate",
+ "placed": [
+  {
+   "i": 0,
+   "k": 0,
+   "name": "left_post_base_plate",
+   "part": 4,
+   "part_name": "ship-a_Detail_34",
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.01
+   ],
+   "run_pos_m": [
+    -0.9,
+    0.0,
+    0.01
+   ],
+   "count": 1,
+   "along": "y",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.3,
+   "bbox_min": [
+    -0.941,
+    -0.15,
+    -0.002
+   ],
+   "bbox_max": [
+    -0.859,
+    0.15,
+    0.022
+   ]
+  },
+  {
+   "i": 1,
+   "k": 0,
+   "name": "right_post_base_plate",
+   "part": 4,
+   "part_name": "ship-a_Detail_34",
+   "pos_m": [
+    0.9,
+    0.0,
+    0.01
+   ],
+   "run_pos_m": [
+    0.9,
+    0.0,
+    0.01
+   ],
+   "count": 1,
+   "along": "y",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.3,
+   "bbox_min": [
+    0.859,
+    -0.15,
+    -0.002
+   ],
+   "bbox_max": [
+    0.941,
+    0.15,
+    0.022
+   ]
+  },
+  {
+   "i": 2,
+   "k": 0,
+   "name": "left_post_lower",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.45
+   ],
+   "run_pos_m": [
+    -0.9,
+    0.0,
+    0.45
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.9,
+   "bbox_min": [
+    -0.977,
+    -0.067,
+    -0.0
+   ],
+   "bbox_max": [
+    -0.823,
+    0.067,
+    0.9
+   ]
+  },
+  {
+   "i": 3,
+   "k": 0,
+   "name": "right_post_lower",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    0.9,
+    0.0,
+    0.45
+   ],
+   "run_pos_m": [
+    0.9,
+    0.0,
+    0.45
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.9,
+   "bbox_min": [
+    0.823,
+    -0.067,
+    -0.0
+   ],
+   "bbox_max": [
+    0.977,
+    0.067,
+    0.9
+   ]
+  },
+  {
+   "i": 4,
+   "k": 0,
+   "name": "left_post_housing",
+   "part": 6,
+   "part_name": "ship-a_Detail_96",
+   "pos_m": [
+    -0.9,
+    -0.14,
+    0.25
+   ],
+   "run_pos_m": [
+    -0.9,
+    -0.14,
+    0.25
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 180,
+   "tilt_deg": 0,
+   "size_m": 0.35,
+   "bbox_min": [
+    -0.948,
+    -0.158,
+    0.075
+   ],
+   "bbox_max": [
+    -0.852,
+    -0.122,
+    0.425
+   ]
+  },
+  {
+   "i": 5,
+   "k": 0,
+   "name": "right_post_housing",
+   "part": 6,
+   "part_name": "ship-a_Detail_96",
+   "pos_m": [
+    0.9,
+    -0.14,
+    0.25
+   ],
+   "run_pos_m": [
+    0.9,
+    -0.14,
+    0.25
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 180.0,
+   "tilt_deg": 0,
+   "size_m": 0.35,
+   "bbox_min": [
+    0.852,
+    -0.158,
+    0.075
+   ],
+   "bbox_max": [
+    0.948,
+    -0.122,
+    0.425
+   ]
+  },
+  {
+   "i": 6,
+   "k": 0,
+   "name": "left_post_mid_bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.55
+   ],
+   "run_pos_m": [
+    -0.9,
+    0.0,
+    0.55
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    -0.921,
+    -0.008,
+    0.475
+   ],
+   "bbox_max": [
+    -0.879,
+    0.008,
+    0.625
+   ]
+  },
+  {
+   "i": 7,
+   "k": 0,
+   "name": "right_post_mid_bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    0.9,
+    0.0,
+    0.55
+   ],
+   "run_pos_m": [
+    0.9,
+    0.0,
+    0.55
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    0.879,
+    -0.008,
+    0.475
+   ],
+   "bbox_max": [
+    0.921,
+    0.008,
+    0.625
+   ]
+  },
+  {
+   "i": 8,
+   "k": 0,
+   "name": "left_post_upper",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.6
+   ],
+   "run_pos_m": [
+    -0.9,
+    0.0,
+    0.6
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.9,
+   "bbox_min": [
+    -0.977,
+    -0.067,
+    0.15
+   ],
+   "bbox_max": [
+    -0.823,
+    0.067,
+    1.05
+   ]
+  },
+  {
+   "i": 9,
+   "k": 0,
+   "name": "right_post_upper",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    0.9,
+    0.0,
+    0.6
+   ],
+   "run_pos_m": [
+    0.9,
+    0.0,
+    0.6
+   ],
+   "count": 1,
+   "along": "z",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.9,
+   "bbox_min": [
+    0.823,
+    -0.067,
+    0.15
+   ],
+   "bbox_max": [
+    0.977,
+    0.067,
+    1.05
+   ]
+  },
+  {
+   "i": 10,
+   "k": 0,
+   "name": "left_post_top_bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    -0.9,
+    0.0,
+    1.05
+   ],
+   "run_pos_m": [
+    -0.9,
+    0.0,
+    1.05
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    -0.975,
+    -0.021,
+    1.042
+   ],
+   "bbox_max": [
+    -0.825,
+    0.021,
+    1.058
+   ]
+  },
+  {
+   "i": 11,
+   "k": 0,
+   "name": "right_post_top_bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    0.9,
+    0.0,
+    1.05
+   ],
+   "run_pos_m": [
+    0.9,
+    0.0,
+    1.05
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    0.825,
+    -0.021,
+    1.042
+   ],
+   "bbox_max": [
+    0.975,
+    0.021,
+    1.058
+   ]
+  },
+  {
+   "i": 12,
+   "k": 0,
+   "name": "top_handrail",
+   "part": 7,
+   "part_name": "cables_Greeble_Cables_Pack1.036",
+   "pos_m": [
+    0.0,
+    0.0,
+    1.05
+   ],
+   "run_pos_m": [
+    0.0,
+    0.0,
+    1.05
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": -90,
+   "tilt_deg": 0,
+   "size_m": 2.0,
+   "bbox_min": [
+    -1.0,
+    -0.132,
+    0.913
+   ],
+   "bbox_max": [
+    1.0,
+    0.132,
+    1.187
+   ]
+  },
+  {
+   "i": 13,
+   "k": 0,
+   "name": "kick_plate",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    -0.45,
+    0.0,
+    0.15
+   ],
+   "run_pos_m": [
+    0.0,
+    0.0,
+    0.15
+   ],
+   "count": 2,
+   "along": "x",
+   "spin_deg": 90.0,
+   "tilt_deg": 0,
+   "size_m": 0.9,
+   "bbox_min": [
+    -0.9,
+    -0.067,
+    0.073
+   ],
+   "bbox_max": [
+    0.0,
+    0.067,
+    0.227
+   ]
+  },
+  {
+   "i": 13,
+   "k": 1,
+   "name": "kick_plate",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    0.45,
+    -0.0,
+    0.15
+   ],
+   "run_pos_m": [
+    0.0,
+    0.0,
+    0.15
+   ],
+   "count": 2,
+   "along": "x",
+   "spin_deg": 90.0,
+   "tilt_deg": 0,
+   "size_m": 0.9,
+   "bbox_min": [
+    -0.0,
+    -0.067,
+    0.073
+   ],
+   "bbox_max": [
+    0.9,
+    0.067,
+    0.227
+   ]
+  },
+  {
+   "i": 14,
+   "k": 0,
+   "name": "mid_rail_left",
+   "part": 9,
+   "part_name": "tube",
+   "pos_m": [
+    -0.45,
+    0.0,
+    0.55
+   ],
+   "run_pos_m": [
+    -0.45,
+    0.0,
+    0.55
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.8,
+   "bbox_min": [
+    -0.85,
+    -0.02,
+    0.53
+   ],
+   "bbox_max": [
+    -0.05,
+    0.02,
+    0.57
+   ]
+  },
+  {
+   "i": 15,
+   "k": 0,
+   "name": "mid_rail_right",
+   "part": 9,
+   "part_name": "tube",
+   "pos_m": [
+    0.45,
+    0.0,
+    0.55
+   ],
+   "run_pos_m": [
+    0.45,
+    0.0,
+    0.55
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.8,
+   "bbox_min": [
+    0.05,
+    -0.02,
+    0.53
+   ],
+   "bbox_max": [
+    0.85,
+    0.02,
+    0.57
+   ]
+  },
+  {
+   "i": 16,
+   "k": 0,
+   "name": "mid_rail_center_bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    0.0,
+    0.0,
+    0.55
+   ],
+   "run_pos_m": [
+    0.0,
+    0.0,
+    0.55
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": 0.0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    -0.075,
+    -0.021,
+    0.542
+   ],
+   "bbox_max": [
+    0.075,
+    0.021,
+    0.558
+   ]
+  },
+  {
+   "i": 17,
+   "k": 0,
+   "name": "diagonal_brace_left",
+   "part": 1,
+   "part_name": "mech_module_010",
+   "pos_m": [
+    -0.202,
+    0.0,
+    0.446
+   ],
+   "run_pos_m": [
+    -0.4,
+    0.0,
+    0.34
+   ],
+   "count": 2,
+   "along": "x",
+   "spin_deg": 90.0,
+   "tilt_deg": -151.9,
+   "size_m": 0.45,
+   "bbox_min": [
+    -0.414,
+    -0.029,
+    0.314
+   ],
+   "bbox_max": [
+    0.011,
+    0.029,
+    0.578
+   ]
+  },
+  {
+   "i": 17,
+   "k": 1,
+   "name": "diagonal_brace_left",
+   "part": 1,
+   "part_name": "mech_module_010",
+   "pos_m": [
+    -0.598,
+    -0.0,
+    0.234
+   ],
+   "run_pos_m": [
+    -0.4,
+    0.0,
+    0.34
+   ],
+   "count": 2,
+   "along": "x",
+   "spin_deg": 90.0,
+   "tilt_deg": -151.9,
+   "size_m": 0.45,
+   "bbox_min": [
+    -0.811,
+    -0.029,
+    0.102
+   ],
+   "bbox_max": [
+    -0.386,
+    0.029,
+    0.366
+   ]
+  },
+  {
+   "i": 18,
+   "k": 0,
+   "name": "diagonal_brace_right",
+   "part": 1,
+   "part_name": "mech_module_010",
+   "pos_m": [
+    0.202,
+    0.0,
+    0.446
+   ],
+   "run_pos_m": [
+    0.4,
+    0.0,
+    0.34
+   ],
+   "count": 2,
+   "along": "x",
+   "spin_deg": 90.0,
+   "tilt_deg": -28.1,
+   "size_m": 0.45,
+   "bbox_min": [
+    -0.011,
+    -0.029,
+    0.314
+   ],
+   "bbox_max": [
+    0.414,
+    0.029,
+    0.578
+   ]
+  },
+  {
+   "i": 18,
+   "k": 1,
+   "name": "diagonal_brace_right",
+   "part": 1,
+   "part_name": "mech_module_010",
+   "pos_m": [
+    0.598,
+    -0.0,
+    0.234
+   ],
+   "run_pos_m": [
+    0.4,
+    0.0,
+    0.34
+   ],
+   "count": 2,
+   "along": "x",
+   "spin_deg": 90.0,
+   "tilt_deg": -28.1,
+   "size_m": 0.45,
+   "bbox_min": [
+    0.386,
+    -0.029,
+    0.102
+   ],
+   "bbox_max": [
+    0.811,
+    0.029,
+    0.366
+   ]
+  },
+  {
+   "i": 19,
+   "k": 0,
+   "name": "left_mid_rail_post_bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    -0.78,
+    0.0,
+    0.55
+   ],
+   "run_pos_m": [
+    -0.78,
+    0.0,
+    0.55
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    -0.855,
+    -0.021,
+    0.542
+   ],
+   "bbox_max": [
+    -0.705,
+    0.021,
+    0.558
+   ]
+  },
+  {
+   "i": 20,
+   "k": 0,
+   "name": "right_mid_rail_post_bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    0.78,
+    0.0,
+    0.55
+   ],
+   "run_pos_m": [
+    0.78,
+    0.0,
+    0.55
+   ],
+   "count": 1,
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    0.705,
+    -0.021,
+    0.542
+   ],
+   "bbox_max": [
+    0.855,
+    0.021,
+    0.558
+   ]
+  }
+ ],
+ "tris": 54960
+}

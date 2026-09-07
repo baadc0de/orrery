@@ -1,0 +1,323 @@
+{
+ "asset": "mothership_light_escort",
+ "zones": [
+  {
+   "name": "nose_rcs_cluster",
+   "type": "surface",
+   "region": "nose.fore.outer",
+   "tags": [
+    "thruster",
+    "block",
+    "greeble-cluster"
+   ],
+   "count": 1,
+   "scale": [
+    0.3,
+    0.5
+   ],
+   "size_m": 0.8,
+   "kind": "part",
+   "concept_feature": "Nose RCS clusters",
+   "along": "x",
+   "why": "Visible reaction-control thruster clusters at the nose for flip-and-burn maneuvers."
+  },
+  {
+   "name": "wingtip_rcs_cluster",
+   "type": "surface",
+   "region": "flank.aft.outer",
+   "tags": [
+    "thruster",
+    "cylinder",
+    "greeble-cluster"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.2
+   ],
+   "size_m": 1.47,
+   "kind": "part",
+   "concept_feature": "Wingtip RCS clusters",
+   "along": "y",
+   "why": "Rubberised dark polymer RCS clusters mounted on the wingtips."
+  },
+  {
+   "name": "main_thruster_nozzle",
+   "type": "surface",
+   "region": "tail.aft.outer",
+   "tags": [
+    "nozzle",
+    "thruster"
+   ],
+   "count": 1,
+   "scale": [
+    0.6,
+    0.8
+   ],
+   "size_m": 1.5,
+   "kind": "part",
+   "concept_feature": "Main thruster interiors",
+   "along": "y",
+   "why": "Twin rear thrusters with emissive interiors and gimbals."
+  },
+  {
+   "name": "spine_conduits",
+   "type": "connect",
+   "region": "top.fore.inner",
+   "tags": [
+    "conduit",
+    "pipe",
+    "cable"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.3
+   ],
+   "size_m": 4.5,
+   "kind": "part",
+   "concept_feature": "Exposed conduit runs",
+   "along": "y",
+   "region_to": "top.aft.inner",
+   "why": "Utilitarian exposed conduit runs along the spine of the craft."
+  },
+  {
+   "name": "accent_stripe",
+   "type": "surface",
+   "region": "flank.fore.outer",
+   "tags": [
+    "strip"
+   ],
+   "count": 1,
+   "scale": [
+    0.8,
+    1.0
+   ],
+   "size_m": 5.0,
+   "kind": "paint",
+   "concept_feature": "Accent stripe",
+   "along": "y",
+   "why": "Safety orange accent stripe running along both flanks."
+  },
+  {
+   "name": "hull_number_decal",
+   "type": "surface",
+   "region": "flank.fore.outer",
+   "tags": [
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.2,
+    0.3
+   ],
+   "size_m": 1.2,
+   "kind": "paint",
+   "concept_feature": "Hull number stencil",
+   "along": "y",
+   "why": "Hull number stencil 'E-07' painted on the left flank."
+  },
+  {
+   "name": "tail_crest_decal",
+   "type": "surface",
+   "region": "top.aft.outer",
+   "tags": [
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.2
+   ],
+   "size_m": 0.8,
+   "kind": "paint",
+   "concept_feature": "Mothership crest placeholder",
+   "along": "y",
+   "why": "Mothership crest placeholder circle on the tail fin."
+  },
+  {
+   "name": "front_landing_skid",
+   "type": "surface",
+   "region": "belly.fore.outer",
+   "tags": [
+    "landing-gear",
+    "strut"
+   ],
+   "count": 1,
+   "scale": [
+    0.3,
+    0.5
+   ],
+   "size_m": 1.5,
+   "kind": "part",
+   "concept_feature": "Landing skids",
+   "along": "y",
+   "why": "Retractable landing skids supporting the front of the craft."
+  },
+  {
+   "name": "rear_landing_skid",
+   "type": "surface",
+   "region": "belly.aft.outer",
+   "tags": [
+    "landing-gear",
+    "strut"
+   ],
+   "count": 1,
+   "scale": [
+    0.2,
+    0.4
+   ],
+   "size_m": 1.8,
+   "kind": "part",
+   "concept_feature": "Landing skids",
+   "along": "y",
+   "why": "Rear retractable landing skids."
+  },
+  {
+   "name": "under_wing_pylons",
+   "type": "surface",
+   "region": "belly.aft.outer",
+   "tags": [
+    "pylon"
+   ],
+   "count": 2,
+   "scale": [
+    0.1,
+    0.2
+   ],
+   "size_m": 1.0,
+   "kind": "part",
+   "concept_feature": "Under-wing pylons",
+   "along": "y",
+   "why": "Two empty under-wing pylons for ordnance."
+  },
+  {
+   "name": "ventral_gun_bay",
+   "type": "surface",
+   "region": "belly.fore.inner",
+   "tags": [
+    "gun",
+    "box"
+   ],
+   "count": 1,
+   "scale": [
+    0.5,
+    0.7
+   ],
+   "size_m": 2.0,
+   "kind": "part",
+   "concept_feature": "Ventral gun bay",
+   "along": "y",
+   "why": "Ventral gun bay located on the centerline belly."
+  },
+  {
+   "name": "canopy_hinge",
+   "type": "surface",
+   "region": "top.fore.inner",
+   "tags": [
+    "bracket"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.2
+   ],
+   "size_m": 0.4,
+   "kind": "part",
+   "concept_feature": "Canopy hinge",
+   "along": "x",
+   "why": "Hinge mechanism for the narrow armoured slit canopy."
+  },
+  {
+   "name": "dark_wing_panels",
+   "type": "surface",
+   "region": "top.aft.outer",
+   "tags": [
+    "hull-panel",
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.4,
+    0.6
+   ],
+   "size_m": 2.5,
+   "kind": "paint",
+   "concept_feature": "Dark panels",
+   "along": "y",
+   "why": "Dark rubberised polymer panels on the wings."
+  }
+ ],
+ "mirror": "x",
+ "hull": "hull.glb",
+ "provenance": {
+  "model": "gemini-3.1-pro-preview",
+  "prompt_sha16": "f3af684a18440267",
+  "concept_sha16": "c14786030c86c754",
+  "callout_sha16": "09cfa4da08e19271",
+  "usage": {
+   "promptTokenCount": 3941,
+   "candidatesTokenCount": 1923,
+   "totalTokenCount": 11162,
+   "trafficType": "ON_DEMAND",
+   "promptTokensDetails": [
+    {
+     "modality": "TEXT",
+     "tokenCount": 1772
+    },
+    {
+     "modality": "IMAGE",
+     "tokenCount": 2169
+    }
+   ],
+   "candidatesTokensDetails": [
+    {
+     "modality": "TEXT",
+     "tokenCount": 1923
+    }
+   ],
+   "thoughtsTokenCount": 5298
+  },
+  "generated_at": "2026-09-04T22:45:24Z",
+  "unknown_regions": []
+ },
+ "critiques": [
+  {
+   "score": 0.75,
+   "overall": "The blockout captures the general shape and proportions of the concept well, but several key details are missing, misaligned, or incorrectly counted. The landing gear and thruster clusters need adjustment to match the concept's specific configuration.",
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "count",
+     "why": "The concept features two distinct RCS clusters on the front corners of the nose, but they are currently missing or placed as a single hidden unit.",
+     "count": 2
+    },
+    {
+     "zone": "wingtip_rcs_cluster",
+     "action": "scale",
+     "why": "The wingtip thruster clusters are much larger and more prominent in the concept art.",
+     "scale_factor": 1.5
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "count",
+     "why": "The concept has two rear landing skids, whereas the render shows a single central strut.",
+     "count": 2
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "count",
+     "why": "There should be two distinct main thruster nozzles at the rear to populate both engine nacelles.",
+     "count": 2
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png"
+   ],
+   "at": "2026-09-04T22:48:26Z"
+  }
+ ]
+}

@@ -1,0 +1,17 @@
+out/**/*.png
+out/**/*.glb
+out/**/*.blend
+out/**/*.blend1
+out/*.png
+out/proxy/*
+viewer/*.glb
+# per-pass working records, scratch runs and logs stay local; the committed records are zones/build/choices/assembly and best/
+out/**/pass[0-9]*-*.json
+out/**/*.log
+out/**/p5/
+out/**/primtest/
+out/**/owner*/
+out/**/crops/
+out/**/sheets/
+out/**/*.raw.txt
+out/**/zones.pass[0-9]*.json

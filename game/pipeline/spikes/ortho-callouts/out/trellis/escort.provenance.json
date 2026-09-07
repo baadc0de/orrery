@@ -1,0 +1,21 @@
+{
+  "stage": "model",
+  "track": "local",
+  "model": "microsoft/TRELLIS.2-4B",
+  "license": "mit",
+  "seed": 7,
+  "input": "escort-pro-concept.png",
+  "input_sha256": "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+  "rembg": true,
+  "decimation_target": 200000,
+  "texture_size": 2048,
+  "output": "escort.glb",
+  "output_sha256": "8b7019f0c7ada2aa844d421387856a81f22d37032ca2acdd3a90bfa88eacda8d",
+  "output_bytes": 18254000,
+  "seconds": {
+    "load": 82.0,
+    "generate": 86.7,
+    "export": 14.6
+  },
+  "generated_at": "2026-09-04T20:10:27Z"
+}

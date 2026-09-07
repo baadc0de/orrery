@@ -1,0 +1,172 @@
+{
+ "seed": 7,
+ "zones": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/concept2kit/zones.json",
+ "choices": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/concept2kit/choices.json",
+ "placements": [
+  {
+   "zone": "spine_conduits",
+   "insert": "cables_Greeble_Cables_Pack1.009",
+   "kit": "cgtrader/greeble-cables-pack1",
+   "from": "top.fore.inner",
+   "to": "top.aft.inner",
+   "attach": "sockets"
+  },
+  {
+   "zone": "main_thrusters",
+   "insert": "ship-b_Detail_117",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "tail.aft.outer",
+   "pos": [
+    0.437,
+    -2.849,
+    0.061
+   ],
+   "scale": 0.3975,
+   "attach": "surface"
+  },
+  {
+   "zone": "wingtip_rcs",
+   "insert": "ship-b_Detail_119",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "top.aft.outer",
+   "pos": [
+    0.058,
+    -1.701,
+    0.38
+   ],
+   "scale": 0.1521,
+   "attach": "surface"
+  },
+  {
+   "zone": "nose_rcs",
+   "insert": "ship-b_Detail_05",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "flank.fore.outer",
+   "pos": [
+    1.333,
+    2.027,
+    0.495
+   ],
+   "scale": 0.0804,
+   "attach": "surface"
+  },
+  {
+   "zone": "ventral_gun_bay",
+   "insert": "ship-a_Detail_96",
+   "kit": "cgtrader/spaceship-kitbash-350-a",
+   "region": "belly.mid.outer",
+   "pos": [
+    -0.096,
+    0.084,
+    0.627
+   ],
+   "scale": 0.0184,
+   "attach": "surface"
+  },
+  {
+   "zone": "under_wing_pylons",
+   "insert": "ship-a_Detail_222",
+   "kit": "cgtrader/spaceship-kitbash-350-a",
+   "region": "belly.aft.outer",
+   "pos": [
+    -0.586,
+    -1.855,
+    -0.558
+   ],
+   "scale": 0.0373,
+   "attach": "surface"
+  },
+  {
+   "zone": "under_wing_pylons",
+   "insert": "ship-b_Detail_130",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "belly.aft.outer",
+   "pos": [
+    0.586,
+    -1.855,
+    -0.572
+   ],
+   "scale": 0.0308,
+   "attach": "surface"
+  },
+  {
+   "zone": "landing_skids_aft",
+   "insert": "mech_module_069",
+   "kit": "cgtrader/military-weapon-module-pack",
+   "region": "belly.aft.outer",
+   "pos": [
+    0.058,
+    -1.701,
+    -0.58
+   ],
+   "scale": 13.7636,
+   "attach": "surface"
+  },
+  {
+   "zone": "dark_wing_panels",
+   "insert": "ship-b_Detail_246",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "top.aft.outer",
+   "pos": [
+    -1.486,
+    -1.758,
+    0.139
+   ],
+   "scale": 0.0793,
+   "attach": "surface"
+  },
+  {
+   "zone": "dark_wing_panels",
+   "insert": "ship-b_Detail_234",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "top.aft.outer",
+   "pos": [
+    1.486,
+    -1.758,
+    0.139
+   ],
+   "scale": 0.0421,
+   "attach": "surface"
+  },
+  {
+   "zone": "accent_stripe",
+   "insert": "ship-a_Detail_164",
+   "kit": "cgtrader/spaceship-kitbash-350-a",
+   "region": "flank.fore.outer",
+   "pos": [
+    1.307,
+    2.021,
+    0.469
+   ],
+   "scale": 0.1101,
+   "attach": "surface"
+  },
+  {
+   "zone": "hull_number_decal",
+   "insert": "ship-b_Detail_293",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "flank.fore.outer",
+   "pos": [
+    1.291,
+    2.017,
+    0.454
+   ],
+   "scale": 0.0329,
+   "attach": "surface"
+  },
+  {
+   "zone": "wing_root_vents",
+   "insert": "ship-b_Detail_111",
+   "kit": "cgtrader/spaceship-kitbash-350-b",
+   "region": "flank.mid.outer",
+   "pos": [
+    1.5,
+    -0.057,
+    0.265
+   ],
+   "scale": 0.0429,
+   "attach": "surface"
+  }
+ ],
+ "tris": 57796
+}

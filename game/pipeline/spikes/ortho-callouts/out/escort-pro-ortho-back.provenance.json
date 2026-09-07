@@ -1,0 +1,39 @@
+{
+  "brief_path": "brief-escort.md",
+  "brief_sha256": "952658a9831cb212a2116cf00062b12144946403cb8d0c8a3f0620af82f74d53",
+  "references": [],
+  "stage": "ortho-back",
+  "prompt": "Using the attached concept image as the single source of truth for this exact object, draw the SAME object as a strict orthographic view. VIEW: REAR ELEVATION: the camera sits directly behind the object at mid-height, looking forward along the long axis; the thruster nozzles face the viewer; wings appear as thin horizontal edges; the top of the object is NOT visible. Requirements: orthographic projection, zero perspective distortion, flat camera, object centred and filling ~80% of the frame, plain flat mid-grey background (#7f7f7f), soft even lighting, no shadows on the ground, no text, no labels, no extra objects. Keep every part, proportion, material and colour identical to the concept.",
+  "input_sha256": "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "rhSbarfQHvChz_IPlL6J2Ao",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 711,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 2145,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 151
+      },
+      {
+        "modality": "IMAGE",
+        "tokenCount": 560
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 314
+  },
+  "output": "escort-pro-ortho-back.png",
+  "output_sha256": "2dd89279bea9c5d38589639fcd472486aaddb972b3de3d6ba15b6424c8d21647",
+  "model_text": "",
+  "generated_at": "2026-09-04T18:58:11Z"
+}

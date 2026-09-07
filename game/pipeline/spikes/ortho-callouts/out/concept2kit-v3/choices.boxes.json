@@ -1,0 +1,92 @@
+{
+ "nose_rcs_cluster": {
+  "zone": "nose_rcs_cluster",
+  "box_2d": [
+   583,
+   137,
+   814,
+   255
+  ],
+  "visible": true
+ },
+ "wingtip_rcs_cluster": {
+  "zone": "wingtip_rcs_cluster",
+  "box_2d": [
+   222,
+   300,
+   325,
+   393
+  ],
+  "visible": true
+ },
+ "main_thruster_nozzle": {
+  "zone": "main_thruster_nozzle",
+  "box_2d": [
+   193,
+   609,
+   264,
+   684
+  ],
+  "visible": true
+ },
+ "spine_conduits": {
+  "zone": "spine_conduits",
+  "box_2d": [
+   244,
+   391,
+   497,
+   644
+  ],
+  "visible": true
+ },
+ "front_landing_skid": {
+  "zone": "front_landing_skid",
+  "box_2d": [
+   735,
+   287,
+   838,
+   416
+  ],
+  "visible": true
+ },
+ "rear_landing_skid": {
+  "zone": "rear_landing_skid",
+  "box_2d": [
+   630,
+   589,
+   738,
+   703
+  ],
+  "visible": true
+ },
+ "under_wing_pylons": {
+  "zone": "under_wing_pylons",
+  "box_2d": [
+   623,
+   612,
+   718,
+   759
+  ],
+  "visible": true
+ },
+ "ventral_gun_bay": {
+  "zone": "ventral_gun_bay",
+  "box_2d": [
+   646,
+   450,
+   698,
+   509
+  ],
+  "visible": true
+ },
+ "canopy_hinge": {
+  "zone": "canopy_hinge",
+  "box_2d": [
+   463,
+   368,
+   505,
+   407
+  ],
+  "visible": true
+ }
+}

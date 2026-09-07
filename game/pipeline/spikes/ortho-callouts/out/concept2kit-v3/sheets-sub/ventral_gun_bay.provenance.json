@@ -1,0 +1,43 @@
+{
+  "stage": "subassembly-sheet",
+  "zone": "ventral_gun_bay",
+  "feature": "Ventral gun bay",
+  "size_m": 2.0,
+  "prompt": "Image 1 is the concept painting of a 9 m spacecraft; image 2 is a crop around the feature. Isolate ONE subassembly of it: Ventral gun bay (gun, box), about 2.0 m across. Draw a clean production callout sheet of ONLY that subassembly, with no hull around it: three views at identical scale on a flat light-grey background: front-left 3/4 view large on the left, side view and front view smaller on the right, each with a small view label. Keep the exact design language of the concept (utilitarian military spacecraft hardware: panelled, riveted, warm-grey painted steel with dark polymer panels and bare-aluminium fasteners, safety-orange only where the concept has it); show its mounting face where it meets the hull as a flat base. No other text, no dimensions, no people, no background scenery.",
+  "references": [
+    "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+    "8cbcd13104ea48ae21983531d6eb3da1cf20d2f509e0fd42fcfc2b832f434f0a"
+  ],
+  "concept": "escort-pro-concept.png",
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "gp6bauHOOZn6xN8PuYDAMQ",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 1305,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 2700,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      },
+      {
+        "modality": "TEXT",
+        "tokenCount": 185
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 275
+  },
+  "output": "ventral_gun_bay.png",
+  "output_sha256": "3affc7a9a855d925eb483b649385838169a2b781145454216b347e74d4fc368a",
+  "model_text": "",
+  "generated_at": "2026-09-05T04:46:17Z"
+}

@@ -1,0 +1,160 @@
+{
+  "stage": "ortho-top",
+  "track": "local",
+  "model": "black-forest-labs/FLUX.2-klein-4B via Comfy-Org repack",
+  "license": "apache-2.0",
+  "runner": "ComfyUI",
+  "graph": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "flux-2-klein-4b.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "2": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen_3_4b.safetensors",
+        "type": "flux2",
+        "device": "default"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "flux2-vae.safetensors"
+      }
+    },
+    "4": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "escort-pro-concept.png"
+      }
+    },
+    "5": {
+      "class_type": "ImageScaleToTotalPixels",
+      "inputs": {
+        "image": [
+          "4",
+          0
+        ],
+        "upscale_method": "lanczos",
+        "megapixels": 1.0,
+        "resolution_steps": 16
+      }
+    },
+    "6": {
+      "class_type": "VAEEncode",
+      "inputs": {
+        "pixels": [
+          "5",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "7": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "text": "Using the reference image as the single source of truth for this exact object, draw the SAME object as a strict orthographic view. VIEW: TOP PLAN: camera directly above looking straight down; nose points up the page. Orthographic projection, zero perspective, flat camera, object centred filling ~80% of the frame, plain flat mid-grey background, soft even lighting, no ground shadow, no text, no labels, no extra objects. Keep every part, proportion, material and colour identical."
+      }
+    },
+    "8": {
+      "class_type": "ReferenceLatent",
+      "inputs": {
+        "conditioning": [
+          "7",
+          0
+        ],
+        "latent": [
+          "6",
+          0
+        ]
+      }
+    },
+    "9": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "text": ""
+      }
+    },
+    "10": {
+      "class_type": "EmptyFlux2LatentImage",
+      "inputs": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+      }
+    },
+    "11": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "positive": [
+          "8",
+          0
+        ],
+        "negative": [
+          "9",
+          0
+        ],
+        "latent_image": [
+          "10",
+          0
+        ],
+        "seed": 7,
+        "steps": 4,
+        "cfg": 1.0,
+        "sampler_name": "euler",
+        "scheduler": "simple",
+        "denoise": 1.0
+      }
+    },
+    "12": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "11",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "13": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "12",
+          0
+        ],
+        "filename_prefix": "escort-local-ortho-top"
+      }
+    }
+  },
+  "seed": 7,
+  "steps": 4,
+  "cfg": 1.0,
+  "input_sha256": "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+  "output": "escort-local-ortho-top.png",
+  "output_sha256": "2677fabcdd4cac24a8363f454f30574096baa2668836271c74d3a9057bbd3b89",
+  "seconds": 3.0,
+  "generated_at": "2026-09-04T19:34:16Z"
+}

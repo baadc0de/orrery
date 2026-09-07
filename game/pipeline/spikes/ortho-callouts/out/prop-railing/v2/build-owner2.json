@@ -1,0 +1,788 @@
+{
+ "part_sizes": [
+  {
+   "part": 1,
+   "size_m": 0.45
+  },
+  {
+   "part": 3,
+   "size_m": 0.9
+  },
+  {
+   "part": 4,
+   "size_m": 0.3
+  },
+  {
+   "part": 5,
+   "size_m": 0.15
+  },
+  {
+   "part": 6,
+   "size_m": 0.35
+  },
+  {
+   "part": 7,
+   "size_m": 2.0
+  },
+  {
+   "part": 9,
+   "size_m": 0.8
+  }
+ ],
+ "items": [
+  {
+   "name": "left_post_base_plate",
+   "part": 4,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.01
+   ],
+   "along": "y",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Left post floor mounting plate",
+   "locked": [
+    "along"
+   ]
+  },
+  {
+   "name": "right_post_base_plate",
+   "part": 4,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.01
+   ],
+   "along": "y",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Right post floor mounting plate",
+   "locked": [
+    "along"
+   ]
+  },
+  {
+   "name": "left_post_lower",
+   "part": 3,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.45
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Lower section of the left vertical post"
+  },
+  {
+   "name": "right_post_lower",
+   "part": 3,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.45
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Lower section of the right vertical post"
+  },
+  {
+   "name": "left_post_housing",
+   "part": 6,
+   "pos_m": [
+    -0.9,
+    -0.14,
+    0.25
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Decorative housing on the lower left post",
+   "locked": [
+    "pos_m"
+   ]
+  },
+  {
+   "name": "right_post_housing",
+   "part": 6,
+   "pos_m": [
+    0.9,
+    -0.14,
+    0.25
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 180.0,
+   "why": "Decorative housing on the lower right post",
+   "locked": [
+    "pos_m"
+   ]
+  },
+  {
+   "name": "left_post_mid_bracket",
+   "part": 5,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.55
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket on left post supporting the mid rail"
+  },
+  {
+   "name": "right_post_mid_bracket",
+   "part": 5,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.55
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket on right post supporting the mid rail"
+  },
+  {
+   "name": "left_post_upper",
+   "part": 3,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.6
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Upper section of the left vertical post"
+  },
+  {
+   "name": "right_post_upper",
+   "part": 3,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.6
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Upper section of the right vertical post"
+  },
+  {
+   "name": "left_post_top_bracket",
+   "part": 5,
+   "pos_m": [
+    -0.9,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket connecting left post to top handrail"
+  },
+  {
+   "name": "right_post_top_bracket",
+   "part": 5,
+   "pos_m": [
+    0.9,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket connecting right post to top handrail"
+  },
+  {
+   "name": "top_handrail",
+   "part": 7,
+   "pos_m": [
+    0.0,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": -90,
+   "why": "Top handrail spanning between and extending past the posts",
+   "locked": [
+    "along",
+    "spin_deg"
+   ]
+  },
+  {
+   "name": "kick_plate",
+   "part": 3,
+   "pos_m": [
+    0.0,
+    0.0,
+    0.15
+   ],
+   "along": "x",
+   "count": 2,
+   "spin_deg": 90.0,
+   "why": "Two strip frames aligned horizontally at the bottom to form the kick plate"
+  },
+  {
+   "name": "mid_rail_left",
+   "part": 9,
+   "pos_m": [
+    -0.45,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Left half of the mid rail tube"
+  },
+  {
+   "name": "mid_rail_right",
+   "part": 9,
+   "pos_m": [
+    0.45,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Right half of the mid rail tube"
+  },
+  {
+   "name": "mid_rail_center_bracket",
+   "part": 5,
+   "pos_m": [
+    0.0,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Center bracket joining the two mid rail tubes"
+  },
+  {
+   "name": "diagonal_brace_left",
+   "part": 1,
+   "pos_m": [
+    -0.4,
+    0.0,
+    0.35
+   ],
+   "along": "x",
+   "count": 2,
+   "spin_deg": 90.0,
+   "tilt_deg": -151.9,
+   "why": "Diagonal brace pipe from bottom left to center bracket",
+   "locked": [
+    "count"
+   ]
+  },
+  {
+   "name": "diagonal_brace_right",
+   "part": 1,
+   "pos_m": [
+    0.4,
+    0.0,
+    0.35
+   ],
+   "along": "x",
+   "count": 2,
+   "spin_deg": 90.0,
+   "tilt_deg": -28.1,
+   "why": "Diagonal brace pipe from bottom right to center bracket",
+   "locked": [
+    "count"
+   ]
+  },
+  {
+   "name": "left_mid_rail_post_bracket",
+   "part": 5,
+   "pos_m": [
+    -0.78,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "count": 1,
+   "locked": [
+    "pos_m",
+    "along",
+    "part"
+   ]
+  },
+  {
+   "name": "right_mid_rail_post_bracket",
+   "part": 5,
+   "pos_m": [
+    0.78,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "count": 1,
+   "locked": [
+    "pos_m",
+    "along",
+    "part"
+   ]
+  }
+ ],
+ "frame_note": "The safety railing is centered on x=0, with posts at x=-0.9m and x=0.9m, standing 1.1m tall.",
+ "prop": "deck safety railing section with two posts, a top handrail, a mid rail and a kick plate",
+ "size": "about 2 m long and 1.1 m high",
+ "palette": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette",
+ "concept": "spikes/ortho-callouts/out/prop-railing/v2/concept.png",
+ "model": "gemini-3.5-flash",
+ "critiques": [
+  {
+   "score": 0.6,
+   "overall": "The reconstruction has several major errors: the upper posts extend above the top handrail, the top handrail pipes are side-by-side instead of vertical, the diagonal braces cross over the mid rail instead of connecting to the center bracket, and the side housings are hidden inside the posts.",
+   "per_item": [
+    {
+     "i": 0,
+     "verdict": "good"
+    },
+    {
+     "i": 1,
+     "verdict": "good"
+    },
+    {
+     "i": 2,
+     "verdict": "good"
+    },
+    {
+     "i": 3,
+     "verdict": "good"
+    },
+    {
+     "i": 4,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 5,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 6,
+     "verdict": "good"
+    },
+    {
+     "i": 7,
+     "verdict": "good"
+    },
+    {
+     "i": 8,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 9,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 10,
+     "verdict": "good"
+    },
+    {
+     "i": 11,
+     "verdict": "good"
+    },
+    {
+     "i": 12,
+     "verdict": "wrong_orientation"
+    },
+    {
+     "i": 13,
+     "verdict": "good"
+    },
+    {
+     "i": 14,
+     "verdict": "good"
+    },
+    {
+     "i": 15,
+     "verdict": "good"
+    },
+    {
+     "i": 16,
+     "verdict": "good"
+    },
+    {
+     "i": 17,
+     "verdict": "wrong_orientation"
+    },
+    {
+     "i": 18,
+     "verdict": "wrong_orientation"
+    }
+   ],
+   "adjust": [
+    {
+     "action": "move",
+     "why": "The upper post extends above the top handrail; it needs to be moved down to end exactly at the top bracket.",
+     "i": 8,
+     "pos_m": [
+      -0.9,
+      0.0,
+      0.85
+     ],
+     "size_m": 0.9,
+     "spin_deg": 0.0,
+     "tilt_deg": 0.0
+    },
+    {
+     "action": "move",
+     "why": "The upper post extends above the top handrail; it needs to be moved down to end exactly at the top bracket.",
+     "i": 9,
+     "pos_m": [
+      0.9,
+      0.0,
+      0.85
+     ],
+     "size_m": 0.9,
+     "spin_deg": 0.0,
+     "tilt_deg": 0.0
+    },
+    {
+     "action": "spin",
+     "why": "The top handrail pipes should be stacked vertically, not placed side-by-side.",
+     "i": 12,
+     "spin_deg": 90.0
+    },
+    {
+     "action": "tilt",
+     "why": "The diagonal brace is tilted too much and crosses the mid rail; it should connect exactly to the center bracket.",
+     "i": 17,
+     "tilt_deg": 28.1
+    },
+    {
+     "action": "tilt",
+     "why": "The diagonal brace is tilted too much and crosses the mid rail; it should connect exactly to the center bracket.",
+     "i": 18,
+     "tilt_deg": -28.1
+    },
+    {
+     "action": "move",
+     "why": "The housing is hidden inside the post; it needs to be moved outwards to the left side.",
+     "i": 4,
+     "pos_m": [
+      -0.9,
+      0.0,
+      0.45
+     ],
+     "size_m": 0.35,
+     "spin_deg": 0.0,
+     "tilt_deg": 0.0
+    },
+    {
+     "action": "move",
+     "why": "The housing is hidden inside the post; it needs to be moved outwards to the right side.",
+     "i": 5,
+     "pos_m": [
+      0.9,
+      0.0,
+      0.45
+     ],
+     "size_m": 0.35,
+     "spin_deg": 180.0,
+     "tilt_deg": 0.0
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "at": "2026-09-05T06:22:02Z"
+  },
+  {
+   "score": 0.85,
+   "overall": "The overall structure is well-assembled, but the upper posts extend too far and the top handrail is rotated sideways. Additionally, the diagonal braces need their brackets oriented correctly against the kick plate.",
+   "per_item": [
+    {
+     "i": 0,
+     "verdict": "good"
+    },
+    {
+     "i": 1,
+     "verdict": "good"
+    },
+    {
+     "i": 2,
+     "verdict": "good"
+    },
+    {
+     "i": 3,
+     "verdict": "good"
+    },
+    {
+     "i": 4,
+     "verdict": "good"
+    },
+    {
+     "i": 5,
+     "verdict": "good"
+    },
+    {
+     "i": 6,
+     "verdict": "good"
+    },
+    {
+     "i": 7,
+     "verdict": "good"
+    },
+    {
+     "i": 8,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 9,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 10,
+     "verdict": "good"
+    },
+    {
+     "i": 11,
+     "verdict": "good"
+    },
+    {
+     "i": 12,
+     "verdict": "wrong_orientation"
+    },
+    {
+     "i": 13,
+     "verdict": "good"
+    },
+    {
+     "i": 14,
+     "verdict": "good"
+    },
+    {
+     "i": 15,
+     "verdict": "good"
+    },
+    {
+     "i": 16,
+     "verdict": "good"
+    },
+    {
+     "i": 17,
+     "verdict": "wrong_orientation"
+    },
+    {
+     "i": 18,
+     "verdict": "wrong_orientation"
+    }
+   ],
+   "adjust": [
+    {
+     "action": "move",
+     "why": "Move the upper post down so it doesn't stick out above the top handrail.",
+     "i": 8,
+     "pos_m": [
+      -0.9,
+      0.0,
+      0.6
+     ],
+     "size_m": 0.9,
+     "spin_deg": 0.0,
+     "tilt_deg": 0.0
+    },
+    {
+     "action": "move",
+     "why": "Move the upper post down so it doesn't stick out above the top handrail.",
+     "i": 9,
+     "pos_m": [
+      0.9,
+      0.0,
+      0.6
+     ],
+     "size_m": 0.9,
+     "spin_deg": 0.0,
+     "tilt_deg": 0.0
+    },
+    {
+     "action": "spin",
+     "why": "Rotate the top handrail so its curved ends point downwards.",
+     "i": 12,
+     "spin_deg": 0.0
+    },
+    {
+     "action": "tilt",
+     "why": "Flip the left diagonal brace so its bracket is at the bottom left.",
+     "i": 17,
+     "tilt_deg": -151.9
+    },
+    {
+     "action": "spin",
+     "why": "Rotate the bracket to sit flat against the vertical kick plate.",
+     "i": 17,
+     "spin_deg": 90.0
+    },
+    {
+     "action": "spin",
+     "why": "Rotate the bracket to sit flat against the vertical kick plate.",
+     "i": 18,
+     "spin_deg": 90.0
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "at": "2026-09-05T06:23:43Z"
+  },
+  {
+   "score": 0.8,
+   "overall": "The overall structure is well-assembled, but the housings are embedded inside the posts and placed too high. Additionally, the upper posts extend above the top brackets, and the top handrail needs to be rotated so its curved ends point downwards.",
+   "per_item": [
+    {
+     "i": 0,
+     "verdict": "good"
+    },
+    {
+     "i": 1,
+     "verdict": "good"
+    },
+    {
+     "i": 2,
+     "verdict": "good"
+    },
+    {
+     "i": 3,
+     "verdict": "good"
+    },
+    {
+     "i": 4,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 5,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 6,
+     "verdict": "good"
+    },
+    {
+     "i": 7,
+     "verdict": "good"
+    },
+    {
+     "i": 8,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 9,
+     "verdict": "wrong_place"
+    },
+    {
+     "i": 10,
+     "verdict": "good"
+    },
+    {
+     "i": 11,
+     "verdict": "good"
+    },
+    {
+     "i": 12,
+     "verdict": "wrong_orientation"
+    },
+    {
+     "i": 13,
+     "verdict": "good"
+    },
+    {
+     "i": 14,
+     "verdict": "good"
+    },
+    {
+     "i": 15,
+     "verdict": "good"
+    },
+    {
+     "i": 16,
+     "verdict": "good"
+    },
+    {
+     "i": 17,
+     "verdict": "good"
+    },
+    {
+     "i": 18,
+     "verdict": "good"
+    }
+   ],
+   "adjust": [
+    {
+     "action": "move",
+     "why": "Move the housing to the front face of the post and lower it below the mid bracket.",
+     "i": 4,
+     "pos_m": [
+      -0.9,
+      0.085,
+      0.25
+     ]
+    },
+    {
+     "action": "move",
+     "why": "Move the housing to the front face, lower it below the mid bracket, and fix its rotation.",
+     "i": 5,
+     "pos_m": [
+      0.9,
+      0.085,
+      0.25
+     ],
+     "spin_deg": 0.0
+    },
+    {
+     "action": "move",
+     "why": "Lower the upper post so it is flush with the top bracket.",
+     "i": 8,
+     "pos_m": [
+      -0.9,
+      0.0,
+      0.6
+     ]
+    },
+    {
+     "action": "move",
+     "why": "Lower the upper post so it is flush with the top bracket.",
+     "i": 9,
+     "pos_m": [
+      0.9,
+      0.0,
+      0.6
+     ]
+    },
+    {
+     "action": "spin",
+     "why": "Spin the handrail so the dual pipes are side-by-side and the curved ends point down.",
+     "i": 12,
+     "spin_deg": 90.0
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "at": "2026-09-05T06:25:24Z"
+  }
+ ],
+ "locked_part_sizes": [
+  1
+ ],
+ "human_critique": [
+  {
+   "by": "owner",
+   "at": "2026-09-05",
+   "notes": [
+    "(7) handrail inverted: ends must face down",
+    "(1) two per V-edge, not one",
+    "(6) housings clip into the post: align their back to the post front",
+    "(4) base plates run front-back, not left-right",
+    "(5) brackets joining (9) to (3) missing on both sides"
+   ]
+  }
+ ]
+}

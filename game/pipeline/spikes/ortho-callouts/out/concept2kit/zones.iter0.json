@@ -1,0 +1,277 @@
+{
+ "asset": "mothership_light_escort",
+ "zones": [
+  {
+   "name": "spine_conduits",
+   "type": "connect",
+   "region": "top.fore.inner",
+   "tags": [
+    "conduit",
+    "pipe",
+    "cable"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.3
+   ],
+   "concept_feature": "Exposed conduit runs along the spine",
+   "region_to": "top.aft.inner",
+   "why": "Utilitarian faction style with exposed piping"
+  },
+  {
+   "name": "main_thrusters",
+   "type": "surface",
+   "region": "tail.aft.outer",
+   "tags": [
+    "nozzle",
+    "thruster"
+   ],
+   "count": 1,
+   "scale": [
+    0.6,
+    0.9
+   ],
+   "concept_feature": "Twin rear thrusters",
+   "along": "y",
+   "why": "Primary propulsion with flip-and-burn plausibility"
+  },
+  {
+   "name": "wingtip_rcs",
+   "type": "surface",
+   "region": "top.aft.outer",
+   "tags": [
+    "thruster",
+    "cylinder",
+    "block"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.2
+   ],
+   "concept_feature": "Wingtip RCS clusters",
+   "along": "y",
+   "why": "Reaction control for maneuvering"
+  },
+  {
+   "name": "nose_rcs",
+   "type": "surface",
+   "region": "nose.fore.outer",
+   "tags": [
+    "thruster",
+    "block"
+   ],
+   "count": 1,
+   "scale": [
+    0.2,
+    0.4
+   ],
+   "concept_feature": "Nose RCS clusters",
+   "along": "x",
+   "why": "Forward reaction control thrusters"
+  },
+  {
+   "name": "ventral_gun_bay",
+   "type": "surface",
+   "region": "belly.mid.outer",
+   "tags": [
+    "gun",
+    "box",
+    "hatch"
+   ],
+   "count": 1,
+   "scale": [
+    0.4,
+    0.7
+   ],
+   "concept_feature": "Ventral gun bay",
+   "along": "y",
+   "why": "Primary armament location"
+  },
+  {
+   "name": "under_wing_pylons",
+   "type": "surface",
+   "region": "belly.aft.outer",
+   "tags": [
+    "pylon",
+    "bracket"
+   ],
+   "count": 2,
+   "scale": [
+    0.1,
+    0.3
+   ],
+   "concept_feature": "Under-wing pylons (empty)",
+   "along": "y",
+   "why": "Hardpoints for ordnance"
+  },
+  {
+   "name": "landing_skids_fore",
+   "type": "surface",
+   "region": "belly.fore.outer",
+   "tags": [
+    "landing-gear",
+    "strut"
+   ],
+   "count": 1,
+   "scale": [
+    0.2,
+    0.4
+   ],
+   "concept_feature": "Landing skids",
+   "along": "y",
+   "why": "Retractable skids for landing"
+  },
+  {
+   "name": "landing_skids_aft",
+   "type": "surface",
+   "region": "belly.aft.outer",
+   "tags": [
+    "landing-gear",
+    "strut"
+   ],
+   "count": 1,
+   "scale": [
+    0.2,
+    0.4
+   ],
+   "concept_feature": "Landing skids",
+   "along": "y",
+   "why": "Retractable skids for landing"
+  },
+  {
+   "name": "dark_wing_panels",
+   "type": "surface",
+   "region": "top.aft.outer",
+   "tags": [
+    "hull-panel",
+    "plate"
+   ],
+   "count": 2,
+   "scale": [
+    0.3,
+    0.6
+   ],
+   "concept_feature": "Dark Panels",
+   "along": "x",
+   "why": "Rubberised polymer panels on wings"
+  },
+  {
+   "name": "accent_stripe",
+   "type": "surface",
+   "region": "flank.fore.outer",
+   "tags": [
+    "strip",
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.8,
+    1.0
+   ],
+   "concept_feature": "Accent Stripe",
+   "along": "y",
+   "why": "Safety orange faction marking"
+  },
+  {
+   "name": "hull_number_decal",
+   "type": "surface",
+   "region": "flank.fore.outer",
+   "tags": [
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.2,
+    0.3
+   ],
+   "concept_feature": "Hull Number 'E-07'",
+   "along": "y",
+   "why": "Identification stencil on left flank"
+  },
+  {
+   "name": "tail_fin_crest",
+   "type": "surface",
+   "region": "tail.fore.outer",
+   "tags": [
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.3,
+    0.5
+   ],
+   "concept_feature": "Mothership Crest Placeholder",
+   "along": "y",
+   "why": "Faction insignia on tail fin"
+  },
+  {
+   "name": "canopy_hinge",
+   "type": "surface",
+   "region": "top.fore.inner",
+   "tags": [
+    "bracket",
+    "misc"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.3
+   ],
+   "concept_feature": "Canopy Hinge",
+   "along": "y",
+   "why": "Mechanism for the opening canopy"
+  },
+  {
+   "name": "wing_root_vents",
+   "type": "surface",
+   "region": "flank.mid.outer",
+   "tags": [
+    "vent",
+    "grille"
+   ],
+   "count": 1,
+   "scale": [
+    0.4,
+    0.7
+   ],
+   "concept_feature": "Vents at wing root",
+   "along": "x",
+   "why": "Cooling for internal systems"
+  }
+ ],
+ "mirror": "x",
+ "hull": "hull.glb",
+ "provenance": {
+  "model": "gemini-3.1-pro-preview",
+  "prompt_sha16": "5cebd160c0873258",
+  "concept_sha16": "c14786030c86c754",
+  "callout_sha16": "09cfa4da08e19271",
+  "usage": {
+   "promptTokenCount": 3704,
+   "candidatesTokenCount": 1721,
+   "totalTokenCount": 9559,
+   "trafficType": "ON_DEMAND",
+   "promptTokensDetails": [
+    {
+     "modality": "TEXT",
+     "tokenCount": 1535
+    },
+    {
+     "modality": "IMAGE",
+     "tokenCount": 2169
+    }
+   ],
+   "candidatesTokensDetails": [
+    {
+     "modality": "TEXT",
+     "tokenCount": 1721
+    }
+   ],
+   "thoughtsTokenCount": 4134
+  },
+  "generated_at": "2026-09-04T22:12:56Z",
+  "unknown_regions": []
+ }
+}

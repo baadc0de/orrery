@@ -1,0 +1,39 @@
+{
+  "brief_path": "brief-escort.md",
+  "brief_sha256": "952658a9831cb212a2116cf00062b12144946403cb8d0c8a3f0620af82f74d53",
+  "references": [],
+  "stage": "ortho-front",
+  "prompt": "Using the attached concept image as the single source of truth for this exact object, draw the SAME object as a strict orthographic view. VIEW: FRONT ELEVATION: the camera sits directly ahead of the nose at the object's mid-height, looking straight aft along the object's long axis; the nose points at the viewer; wings appear as thin horizontal edges; the top of the object is NOT visible. Requirements: orthographic projection, zero perspective distortion, flat camera, object centred and filling ~80% of the frame, plain flat mid-grey background (#7f7f7f), soft even lighting, no shadows on the ground, no text, no labels, no extra objects. Keep every part, proportion, material and colour identical to the concept.",
+  "input_sha256": "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "mBSbasOYJ8ywxN8P1oW7iQ4",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 718,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 2145,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 560
+      },
+      {
+        "modality": "TEXT",
+        "tokenCount": 158
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 307
+  },
+  "output": "escort-pro-ortho-front.png",
+  "output_sha256": "106540943fc957312efdbac6aaa3cde7c407111c444661df469e1d6ea32ac24a",
+  "model_text": "",
+  "generated_at": "2026-09-04T18:57:49Z"
+}

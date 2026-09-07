@@ -1,0 +1,289 @@
+{
+ "part_sizes": [
+  {
+   "part": 1,
+   "size_m": 0.85
+  },
+  {
+   "part": 3,
+   "size_m": 0.9
+  },
+  {
+   "part": 4,
+   "size_m": 0.3
+  },
+  {
+   "part": 5,
+   "size_m": 0.15
+  },
+  {
+   "part": 6,
+   "size_m": 0.35
+  },
+  {
+   "part": 7,
+   "size_m": 2.0
+  },
+  {
+   "part": 9,
+   "size_m": 0.8
+  }
+ ],
+ "items": [
+  {
+   "name": "left_post_base_plate",
+   "part": 4,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.01
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Left post floor mounting plate"
+  },
+  {
+   "name": "right_post_base_plate",
+   "part": 4,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.01
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Right post floor mounting plate"
+  },
+  {
+   "name": "left_post_lower",
+   "part": 3,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.45
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Lower section of the left vertical post"
+  },
+  {
+   "name": "right_post_lower",
+   "part": 3,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.45
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Lower section of the right vertical post"
+  },
+  {
+   "name": "left_post_housing",
+   "part": 6,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.45
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Decorative housing on the lower left post"
+  },
+  {
+   "name": "right_post_housing",
+   "part": 6,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.45
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 180.0,
+   "why": "Decorative housing on the lower right post"
+  },
+  {
+   "name": "left_post_mid_bracket",
+   "part": 5,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.55
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket on left post supporting the mid rail"
+  },
+  {
+   "name": "right_post_mid_bracket",
+   "part": 5,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.55
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket on right post supporting the mid rail"
+  },
+  {
+   "name": "left_post_upper",
+   "part": 3,
+   "pos_m": [
+    -0.9,
+    0.0,
+    0.85
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Upper section of the left vertical post"
+  },
+  {
+   "name": "right_post_upper",
+   "part": 3,
+   "pos_m": [
+    0.9,
+    0.0,
+    0.85
+   ],
+   "along": "z",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Upper section of the right vertical post"
+  },
+  {
+   "name": "left_post_top_bracket",
+   "part": 5,
+   "pos_m": [
+    -0.9,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket connecting left post to top handrail"
+  },
+  {
+   "name": "right_post_top_bracket",
+   "part": 5,
+   "pos_m": [
+    0.9,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Bracket connecting right post to top handrail"
+  },
+  {
+   "name": "top_handrail",
+   "part": 7,
+   "pos_m": [
+    0.0,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Top handrail spanning between and extending past the posts"
+  },
+  {
+   "name": "kick_plate",
+   "part": 3,
+   "pos_m": [
+    0.0,
+    0.0,
+    0.15
+   ],
+   "along": "x",
+   "count": 2,
+   "spin_deg": 90.0,
+   "why": "Two strip frames aligned horizontally at the bottom to form the kick plate"
+  },
+  {
+   "name": "mid_rail_left",
+   "part": 9,
+   "pos_m": [
+    -0.45,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Left half of the mid rail tube"
+  },
+  {
+   "name": "mid_rail_right",
+   "part": 9,
+   "pos_m": [
+    0.45,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Right half of the mid rail tube"
+  },
+  {
+   "name": "mid_rail_center_bracket",
+   "part": 5,
+   "pos_m": [
+    0.0,
+    0.0,
+    0.55
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "why": "Center bracket joining the two mid rail tubes"
+  },
+  {
+   "name": "diagonal_brace_left",
+   "part": 1,
+   "pos_m": [
+    -0.4,
+    0.0,
+    0.35
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 0.0,
+   "tilt_deg": 40.0,
+   "why": "Diagonal brace pipe from bottom left to center bracket"
+  },
+  {
+   "name": "diagonal_brace_right",
+   "part": 1,
+   "pos_m": [
+    0.4,
+    0.0,
+    0.35
+   ],
+   "along": "x",
+   "count": 1,
+   "spin_deg": 180.0,
+   "tilt_deg": -40.0,
+   "why": "Diagonal brace pipe from bottom right to center bracket"
+  }
+ ],
+ "frame_note": "The safety railing is centered on x=0, with posts at x=-0.9m and x=0.9m, standing 1.1m tall.",
+ "prop": "deck safety railing section with two posts, a top handrail, a mid rail and a kick plate",
+ "size": "about 2 m long and 1.1 m high",
+ "palette": "/home/baadc0de/Development/baadc0de/orrery/game/pipeline/spikes/ortho-callouts/out/prop-railing/palette",
+ "concept": "spikes/ortho-callouts/out/prop-railing/v2/concept.png",
+ "model": "gemini-3.5-flash"
+}

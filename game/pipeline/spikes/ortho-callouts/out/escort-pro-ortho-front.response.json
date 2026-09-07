@@ -1,0 +1,33 @@
+{
+  "candidates": [
+    {
+      "finishReason": "MAX_TOKENS"
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 668,
+    "candidatesTokenCount": 13440,
+    "totalTokenCount": 15037,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 560
+      },
+      {
+        "modality": "TEXT",
+        "tokenCount": 108
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 13440
+      }
+    ],
+    "thoughtsTokenCount": 929
+  },
+  "modelVersion": "gemini-3-pro-image",
+  "createTime": "2026-09-04T18:48:52.669693Z",
+  "responseId": "lBKbav3vKMbi2fMPsv_fuQM"
+}

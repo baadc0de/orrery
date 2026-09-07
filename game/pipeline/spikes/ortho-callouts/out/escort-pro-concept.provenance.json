@@ -1,0 +1,34 @@
+{
+  "brief_path": "brief-escort.md",
+  "brief_sha256": "952658a9831cb212a2116cf00062b12144946403cb8d0c8a3f0620af82f74d53",
+  "references": [],
+  "stage": "concept",
+  "prompt": "You are a concept artist for a video game. Produce ONE concept image of the asset described in the brief. Three-quarter front view, slightly above eye level, neutral mid-grey studio background, soft even lighting, no text, no watermark, no people for scale unless the brief asks. Follow the brief's palette exactly. If reference images are attached, match their style, materials and palette.\n\nBRIEF:\n# Asset brief: mothership-faction light escort craft (\"escort\", G2.2b)\n\nClass: single-seat, non-jump-capable escort fighter carried compacted in a ship's inventory and inflated on launch (G4.16).\nRole: fleet engagement screen; expendable; nobody owns it.\nSilhouette: compact, blunt-nosed, wedge hull about 9 m long, 6 m wingspan, 2.5 m tall on skids. Twin rear thrusters with flip-and-burn plausibility (visible reaction-control thruster clusters at nose and wingtips). Canopy is a narrow armoured slit, not a bubble.\nFaction style (mothership, \"civilian-industrial navy\"): utilitarian, panelled, riveted plating, exposed conduit runs along the spine, painted not polished.\nPalette: hull #8a8f94 (warm grey), accent stripe #d9772b (safety orange) along both flanks, dark panels #2b2e33, emissive thruster interiors #7fd4ff, canopy tint #1c3f5a.\nMaterials: painted steel plating (matte, chipped edges), rubberised dark polymer on RCS clusters and skids, glossy canopy, bare aluminium on fasteners.\nHardpoints: two under-wing pylons (empty), one ventral gun bay.\nDecals: hull number stencil \"E-07\" on left flank; mothership crest placeholder circle on the tail fin.\nMoving parts: canopy hinge, thruster nozzle gimbals, landing skids retract.\nScale reference: none in frame.\n",
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "shGbaoGyBc2xmPUPpN_amAY",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 425,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 2170,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 425
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 625
+  },
+  "output": "escort-pro-concept.png",
+  "output_sha256": "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+  "model_text": "",
+  "generated_at": "2026-09-04T18:45:29Z"
+}

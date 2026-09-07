@@ -1,0 +1,431 @@
+{
+ "prop": "deck safety railing section with two posts, a top handrail, a mid rail and a kick plate",
+ "placed": [
+  {
+   "i": 0,
+   "name": "left base plate",
+   "part": 4,
+   "part_name": "ship-a_Detail_34",
+   "pos_m": [
+    -0.8,
+    0.0,
+    0.04
+   ],
+   "along": "y",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.3,
+   "bbox_min": [
+    -0.841,
+    -0.15,
+    0.028
+   ],
+   "bbox_max": [
+    -0.759,
+    0.15,
+    0.052
+   ]
+  },
+  {
+   "i": 1,
+   "name": "right base plate",
+   "part": 4,
+   "part_name": "ship-a_Detail_34",
+   "pos_m": [
+    0.8,
+    0.0,
+    0.04
+   ],
+   "along": "y",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.3,
+   "bbox_min": [
+    0.759,
+    -0.15,
+    0.028
+   ],
+   "bbox_max": [
+    0.841,
+    0.15,
+    0.052
+   ]
+  },
+  {
+   "i": 2,
+   "name": "left vertical post",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    -0.8,
+    0.0,
+    0.55
+   ],
+   "along": "z",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 1.0,
+   "bbox_min": [
+    -0.886,
+    -0.074,
+    0.05
+   ],
+   "bbox_max": [
+    -0.714,
+    0.074,
+    1.05
+   ]
+  },
+  {
+   "i": 3,
+   "name": "right vertical post",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    0.8,
+    0.0,
+    0.55
+   ],
+   "along": "z",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 1.0,
+   "bbox_min": [
+    0.714,
+    -0.074,
+    0.05
+   ],
+   "bbox_max": [
+    0.886,
+    0.074,
+    1.05
+   ]
+  },
+  {
+   "i": 4,
+   "name": "left post housing",
+   "part": 6,
+   "part_name": "ship-a_Detail_96",
+   "pos_m": [
+    -0.8,
+    -0.09,
+    0.35
+   ],
+   "along": "z",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.3,
+   "bbox_min": [
+    -0.841,
+    -0.106,
+    0.2
+   ],
+   "bbox_max": [
+    -0.759,
+    -0.074,
+    0.5
+   ]
+  },
+  {
+   "i": 5,
+   "name": "right post housing",
+   "part": 6,
+   "part_name": "ship-a_Detail_96",
+   "pos_m": [
+    0.8,
+    -0.09,
+    0.35
+   ],
+   "along": "z",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.3,
+   "bbox_min": [
+    0.759,
+    -0.106,
+    0.2
+   ],
+   "bbox_max": [
+    0.841,
+    -0.074,
+    0.5
+   ]
+  },
+  {
+   "i": 6,
+   "name": "top handrail",
+   "part": 7,
+   "part_name": "cables_Greeble_Cables_Pack1.036",
+   "pos_m": [
+    0.0,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "spin_deg": -90,
+   "tilt_deg": 0,
+   "size_m": 2.0,
+   "bbox_min": [
+    -1.0,
+    -0.132,
+    0.913
+   ],
+   "bbox_max": [
+    1.0,
+    0.132,
+    1.187
+   ]
+  },
+  {
+   "i": 7,
+   "name": "left top bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    -0.8,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    -0.875,
+    -0.021,
+    1.042
+   ],
+   "bbox_max": [
+    -0.725,
+    0.021,
+    1.058
+   ]
+  },
+  {
+   "i": 8,
+   "name": "right top bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    0.8,
+    0.0,
+    1.05
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    0.725,
+    -0.021,
+    1.042
+   ],
+   "bbox_max": [
+    0.875,
+    0.021,
+    1.058
+   ]
+  },
+  {
+   "i": 9,
+   "name": "left mid rail bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    -0.8,
+    0.0,
+    0.52
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    -0.875,
+    -0.021,
+    0.512
+   ],
+   "bbox_max": [
+    -0.725,
+    0.021,
+    0.528
+   ]
+  },
+  {
+   "i": 10,
+   "name": "right mid rail bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    0.8,
+    0.0,
+    0.52
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    0.725,
+    -0.021,
+    0.512
+   ],
+   "bbox_max": [
+    0.875,
+    0.021,
+    0.528
+   ]
+  },
+  {
+   "i": 11,
+   "name": "left mid rail tube",
+   "part": 9,
+   "part_name": "tube",
+   "pos_m": [
+    -0.4,
+    0.0,
+    0.52
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.7,
+   "bbox_min": [
+    -0.75,
+    -0.018,
+    0.502
+   ],
+   "bbox_max": [
+    -0.05,
+    0.018,
+    0.537
+   ]
+  },
+  {
+   "i": 12,
+   "name": "right mid rail tube",
+   "part": 9,
+   "part_name": "tube",
+   "pos_m": [
+    0.4,
+    0.0,
+    0.52
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.7,
+   "bbox_min": [
+    0.05,
+    -0.018,
+    0.502
+   ],
+   "bbox_max": [
+    0.75,
+    0.018,
+    0.537
+   ]
+  },
+  {
+   "i": 13,
+   "name": "center mid rail bracket",
+   "part": 5,
+   "part_name": "ship-a_Detail_95",
+   "pos_m": [
+    0.0,
+    0.0,
+    0.52
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 0,
+   "size_m": 0.15,
+   "bbox_min": [
+    -0.075,
+    -0.021,
+    0.512
+   ],
+   "bbox_max": [
+    0.075,
+    0.021,
+    0.528
+   ]
+  },
+  {
+   "i": 14,
+   "name": "bottom kick plate rail",
+   "part": 3,
+   "part_name": "cables_Greeble_Cables_Pack1.005",
+   "pos_m": [
+    0.0,
+    0.0,
+    0.15
+   ],
+   "along": "x",
+   "spin_deg": 90,
+   "tilt_deg": 0,
+   "size_m": 1.5,
+   "bbox_min": [
+    -0.75,
+    -0.111,
+    0.021
+   ],
+   "bbox_max": [
+    0.75,
+    0.111,
+    0.279
+   ]
+  },
+  {
+   "i": 15,
+   "name": "left diagonal brace",
+   "part": 1,
+   "part_name": "mech_module_010",
+   "pos_m": [
+    -0.4,
+    0.0,
+    0.33
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": 25,
+   "size_m": 0.8,
+   "bbox_min": [
+    -0.784,
+    -0.052,
+    0.115
+   ],
+   "bbox_max": [
+    -0.016,
+    0.052,
+    0.545
+   ]
+  },
+  {
+   "i": 16,
+   "name": "right diagonal brace",
+   "part": 1,
+   "part_name": "mech_module_010",
+   "pos_m": [
+    0.4,
+    0.0,
+    0.33
+   ],
+   "along": "x",
+   "spin_deg": 0,
+   "tilt_deg": -25,
+   "size_m": 0.8,
+   "bbox_min": [
+    0.016,
+    -0.052,
+    0.115
+   ],
+   "bbox_max": [
+    0.784,
+    0.052,
+    0.545
+   ]
+  }
+ ],
+ "tris": 41984
+}

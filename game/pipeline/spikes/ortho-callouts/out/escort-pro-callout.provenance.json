@@ -1,0 +1,43 @@
+{
+  "brief_path": "brief-escort.md",
+  "brief_sha256": "952658a9831cb212a2116cf00062b12144946403cb8d0c8a3f0620af82f74d53",
+  "references": [],
+  "stage": "callout",
+  "prompt": "Compose a production CALLOUT SHEET for 3D modellers from the attached images (concept, then front, side, back, top orthographic views). Layout: the four orthographic views on a grid at identical scale, the concept small in a corner. Add clear leader lines and short labels calling out: overall dimensions from the brief, main material zones (name + short PBR note), moving parts, hardpoints, emissive elements, decals. Include a palette strip with the brief's hex colours. Clean technical style, white background, legible sans-serif text. Do not redesign the object.\n\nBRIEF:\n# Asset brief: mothership-faction light escort craft (\"escort\", G2.2b)\n\nClass: single-seat, non-jump-capable escort fighter carried compacted in a ship's inventory and inflated on launch (G4.16).\nRole: fleet engagement screen; expendable; nobody owns it.\nSilhouette: compact, blunt-nosed, wedge hull about 9 m long, 6 m wingspan, 2.5 m tall on skids. Twin rear thrusters with flip-and-burn plausibility (visible reaction-control thruster clusters at nose and wingtips). Canopy is a narrow armoured slit, not a bubble.\nFaction style (mothership, \"civilian-industrial navy\"): utilitarian, panelled, riveted plating, exposed conduit runs along the spine, painted not polished.\nPalette: hull #8a8f94 (warm grey), accent stripe #d9772b (safety orange) along both flanks, dark panels #2b2e33, emissive thruster interiors #7fd4ff, canopy tint #1c3f5a.\nMaterials: painted steel plating (matte, chipped edges), rubberised dark polymer on RCS clusters and skids, glossy canopy, bare aluminium on fasteners.\nHardpoints: two under-wing pylons (empty), one ventral gun bay.\nDecals: hull number stencil \"E-07\" on left flank; mothership crest placeholder circle on the tail fin.\nMoving parts: canopy hinge, thruster nozzle gimbals, landing skids retract.\nScale reference: none in frame.\n",
+  "input_sha256": [
+    "c14786030c86c754aaae013571c94d18ae3df5a9b87892eab016e3d48106e905",
+    "106540943fc957312efdbac6aaa3cde7c407111c444661df469e1d6ea32ac24a",
+    "2dd89279bea9c5d38589639fcd472486aaddb972b3de3d6ba15b6424c8d21647"
+  ],
+  "model": "gemini-3-pro-image",
+  "location": "global",
+  "response_id": "xRSbauykHoGGz_IP7IDZsQs",
+  "model_version": "gemini-3-pro-image",
+  "usage": {
+    "promptTokenCount": 2146,
+    "candidatesTokenCount": 1120,
+    "totalTokenCount": 3614,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 466
+      },
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1680
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1120
+      }
+    ],
+    "thoughtsTokenCount": 348
+  },
+  "output": "escort-pro-callout.png",
+  "output_sha256": "09cfa4da08e192711f4f80fff93d89ebfdfac6642d900b3b688108f741679d93",
+  "model_text": "",
+  "generated_at": "2026-09-04T18:58:45Z"
+}

@@ -1,0 +1,1393 @@
+{
+ "asset": "mothership_light_escort",
+ "zones": [
+  {
+   "name": "nose_rcs_cluster",
+   "type": "surface",
+   "region": "nose.fore.outer",
+   "tags": [
+    "thruster",
+    "block",
+    "greeble-cluster"
+   ],
+   "count": 1,
+   "scale": [
+    0.3,
+    0.5
+   ],
+   "size_m": 0.8,
+   "kind": "part",
+   "concept_feature": "Nose RCS clusters",
+   "along": "x",
+   "why": "Visible reaction-control thruster clusters at the nose for flip-and-burn maneuvers.",
+   "hint": "The current part is a tiny diamond; needs to be a wide, flat block covering the nose tip to represent the 4-hole thruster cap.",
+   "exclude": [
+    "ship-a_Detail_118"
+   ],
+   "prim": "box",
+   "anchor": [
+    0.4,
+    0.85
+   ]
+  },
+  {
+   "name": "main_thruster_nozzle",
+   "type": "surface",
+   "region": "tail.aft.outer",
+   "tags": [
+    "nozzle",
+    "thruster"
+   ],
+   "count": 2,
+   "scale": [
+    0.6,
+    0.8
+   ],
+   "size_m": 0.888,
+   "kind": "part",
+   "concept_feature": "Main thruster interiors",
+   "along": "y",
+   "why": "Twin rear thrusters with emissive interiors and gimbals.",
+   "hint": "The nozzles are spiky and angled incorrectly; use a clean cylindrical nozzle pointing straight back.",
+   "prim": "nozzle",
+   "anchor": [
+    0.25,
+    -1.0
+   ]
+  },
+  {
+   "name": "spine_conduits",
+   "type": "connect",
+   "region": "top.fore.inner",
+   "tags": [
+    "conduit",
+    "pipe",
+    "cable"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.3
+   ],
+   "size_m": 4.0,
+   "kind": "part",
+   "concept_feature": "Exposed conduit runs",
+   "along": "y",
+   "region_to": "top.aft.inner",
+   "why": "Utilitarian exposed conduit runs along the spine of the craft.",
+   "exclude": [
+    "cables_Greeble_Cables_Pack1.007",
+    "cables_Greeble_Cables_Pack1.008",
+    "cables_Greeble_Cables_Pack1.009",
+    "cables_Greeble_Cables_Pack1.039",
+    "prim:pipe_run"
+   ],
+   "hint": "The current part is a tiny square. We need long, continuous pipes running along the spine of the ship.",
+   "prim": "pipe_run"
+  },
+  {
+   "name": "accent_stripe",
+   "type": "surface",
+   "region": "flank.fore.outer",
+   "tags": [
+    "strip"
+   ],
+   "count": 1,
+   "scale": [
+    0.8,
+    1.0
+   ],
+   "size_m": 5.0,
+   "kind": "paint",
+   "concept_feature": "Accent stripe",
+   "along": "y",
+   "why": "Safety orange accent stripe running along both flanks."
+  },
+  {
+   "name": "hull_number_decal",
+   "type": "surface",
+   "region": "flank.fore.outer",
+   "tags": [
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.2,
+    0.3
+   ],
+   "size_m": 1.2,
+   "kind": "paint",
+   "concept_feature": "Hull number stencil",
+   "along": "y",
+   "why": "Hull number stencil 'E-07' painted on the left flank."
+  },
+  {
+   "name": "tail_crest_decal",
+   "type": "surface",
+   "region": "top.aft.outer",
+   "tags": [
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.1,
+    0.2
+   ],
+   "size_m": 0.8,
+   "kind": "paint",
+   "concept_feature": "Mothership crest placeholder",
+   "along": "y",
+   "why": "Mothership crest placeholder circle on the tail fin."
+  },
+  {
+   "name": "rear_landing_skid",
+   "type": "surface",
+   "region": "belly.aft.outer",
+   "tags": [
+    "landing-gear",
+    "strut"
+   ],
+   "count": 2,
+   "scale": [
+    0.2,
+    0.4
+   ],
+   "size_m": 1.8,
+   "kind": "part",
+   "concept_feature": "Landing skids",
+   "along": "y",
+   "why": "Rear retractable landing skids.",
+   "hint": "The rear landing skids failed to place geometry; use a procedural skid to ensure they appear.",
+   "prim": "skid",
+   "yaw_deg": 90,
+   "anchor": [
+    0.3,
+    -0.4
+   ]
+  },
+  {
+   "name": "under_wing_pylons",
+   "type": "surface",
+   "region": "belly.aft.outer",
+   "tags": [
+    "pylon"
+   ],
+   "count": 2,
+   "scale": [
+    0.1,
+    0.2
+   ],
+   "size_m": 1.225,
+   "kind": "part",
+   "concept_feature": "Under-wing pylons",
+   "along": "y",
+   "why": "Two empty under-wing pylons for ordnance.",
+   "exclude": [
+    "gen-escort_rear_landing_skid",
+    "ship-b_Detail_54"
+   ],
+   "hint": "Currently using landing skids; needs to be a sleek weapon pylon or missile pod.",
+   "anchor": [
+    0.6,
+    -0.2
+   ]
+  },
+  {
+   "name": "ventral_gun_bay",
+   "type": "surface",
+   "region": "belly.fore.outer",
+   "tags": [
+    "gun",
+    "box"
+   ],
+   "count": 1,
+   "scale": [
+    0.5,
+    0.7
+   ],
+   "size_m": 1.0,
+   "kind": "part",
+   "concept_feature": "Ventral gun bay",
+   "along": "y",
+   "why": "Ventral gun bay located on the centerline belly.",
+   "exclude": [
+    "ship-a_Detail_96",
+    "ship-b_Detail_57"
+   ],
+   "hint": "Should be a flatter, rectangular panel or shallow box, not a massive bulky structure that blocks the landing gear.",
+   "anchor": [
+    0.0,
+    0.5
+   ]
+  },
+  {
+   "name": "dark_wing_panels",
+   "type": "surface",
+   "region": "top.aft.outer",
+   "tags": [
+    "hull-panel",
+    "plate"
+   ],
+   "count": 1,
+   "scale": [
+    0.4,
+    0.6
+   ],
+   "size_m": 2.5,
+   "kind": "paint",
+   "concept_feature": "Dark panels",
+   "along": "y",
+   "why": "Dark rubberised polymer panels on the wings."
+  },
+  {
+   "name": "front_landing_skid",
+   "type": "surface",
+   "kind": "part",
+   "region": "belly.fore.outer",
+   "tags": [
+    "landing-gear",
+    "strut"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.5,
+    0.7
+   ],
+   "size_m": 1.5,
+   "anchor": [
+    0.0,
+    0.85
+   ],
+   "prim": "skid",
+   "concept_feature": "The concept has a front landing skid under the nose.",
+   "hint": "The current part looks like a tiny vertical stick and is off-center. It needs to be a proper horizontal landing skid placed centrally under the nose.",
+   "exclude": [
+    "prim:skid"
+   ],
+   "yaw_deg": 90
+  },
+  {
+   "name": "wingtip_pods",
+   "type": "surface",
+   "kind": "part",
+   "region": "flank.mid.outer",
+   "tags": [
+    "cylinder",
+    "thruster"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.5,
+    0.7
+   ],
+   "size_m": 1.0,
+   "anchor": null,
+   "prim": null,
+   "concept_feature": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+   "hint": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing."
+  },
+  {
+   "name": "wingtip_pods",
+   "type": "surface",
+   "kind": "part",
+   "region": "flank.mid.outer",
+   "tags": [
+    "cylinder",
+    "thruster"
+   ],
+   "count": 1,
+   "along": "y",
+   "scale": [
+    0.5,
+    0.7
+   ],
+   "size_m": 1.0,
+   "anchor": null,
+   "prim": null,
+   "concept_feature": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+   "hint": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing."
+  }
+ ],
+ "mirror": "x",
+ "hull": "hull.glb",
+ "provenance": {
+  "model": "gemini-3.1-pro-preview",
+  "prompt_sha16": "f3af684a18440267",
+  "concept_sha16": "c14786030c86c754",
+  "callout_sha16": "09cfa4da08e19271",
+  "usage": {
+   "promptTokenCount": 3941,
+   "candidatesTokenCount": 1923,
+   "totalTokenCount": 11162,
+   "trafficType": "ON_DEMAND",
+   "promptTokensDetails": [
+    {
+     "modality": "TEXT",
+     "tokenCount": 1772
+    },
+    {
+     "modality": "IMAGE",
+     "tokenCount": 2169
+    }
+   ],
+   "candidatesTokensDetails": [
+    {
+     "modality": "TEXT",
+     "tokenCount": 1923
+    }
+   ],
+   "thoughtsTokenCount": 5298
+  },
+  "generated_at": "2026-09-04T22:45:24Z",
+  "unknown_regions": []
+ },
+ "critiques": [
+  {
+   "score": 0.4,
+   "overall": "The base hull captures the concept well, but the automated part placements are mostly incorrect or redundant. Several features like the landing skids and wingtip pods are already built into the hull, while other parts are placed in the wrong regions or are massively mis-scaled.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "wingtip_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "accent_stripe",
+     "present": false,
+     "verdict": "good"
+    },
+    {
+     "zone": "hull_number_decal",
+     "present": false,
+     "verdict": "good"
+    },
+    {
+     "zone": "tail_crest_decal",
+     "present": false,
+     "verdict": "good"
+    },
+    {
+     "zone": "front_landing_skid",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "canopy_hinge",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "dark_wing_panels",
+     "present": false,
+     "verdict": "good"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "Need a prominent blocky thruster cluster with visible nozzles to match the concept."
+    },
+    {
+     "zone": "wingtip_rcs_cluster",
+     "action": "drop",
+     "why": "The base hull already includes the cylindrical thruster pods on the wingtips."
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "scale",
+     "why": "The nozzle is massively oversized; scale it down to fit within the tail housing.",
+     "scale_factor": 0.5
+    },
+    {
+     "zone": "spine_conduits",
+     "action": "replace",
+     "why": "Need long, prominent pipes or cables running along the top spine."
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "drop",
+     "why": "The base hull already includes the front landing skids."
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "drop",
+     "why": "The base hull already includes the rear landing skids."
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "action": "move",
+     "why": "The gun bay was placed on the top of the nose; it needs to be moved to the ventral (belly) side.",
+     "region": "belly.fore.inner"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "action": "replace",
+     "why": "Need aerodynamic weapon pylons to hang under the wings."
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T03:52:45Z"
+  },
+  {
+   "score": 0.4,
+   "overall": "The base hull captures the concept's silhouette well, but the kitbashing pass failed significantly. Critical features like the twin engines, landing skids, and spine conduits are either missing, misplaced, or using completely inappropriate parts.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "canopy_hinge",
+     "present": false,
+     "verdict": "missing"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "Need a block with 4 forward-facing circular ports for the nose."
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "replace",
+     "why": "Need standard thruster nozzles to fit inside the twin engine nacelles, not one giant central nozzle."
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "count",
+     "why": "Concept has two main engines, one in each nacelle.",
+     "count_delta": 1
+    },
+    {
+     "zone": "spine_conduits",
+     "action": "replace",
+     "why": "Need long, continuous pipes or cables running along the spine, current part is a tiny speck."
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "replace",
+     "why": "Need long, ski-like landing skids, not a small bracket."
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "count",
+     "why": "Concept has two rear landing skids under the wings.",
+     "count_delta": 1
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "action": "move",
+     "why": "Gun bay was placed on the top of the nose; it must be on the ventral (bottom) side.",
+     "region": "belly.fore.outer"
+    },
+    {
+     "zone": "canopy_hinge",
+     "action": "drop",
+     "why": "Detail is not visible or necessary for the blockout."
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T03:54:02Z"
+  },
+  {
+   "score": 0.4,
+   "overall": "The kitbash struggles with scale and placement, missing the mark on several key features. The main thrusters were placed on the wings instead of the tail, and several parts are either microscopic or the wrong shape.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "wrong_part"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "Needs to be a large, blocky nose cap with four circular thruster ports."
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "move",
+     "why": "Main thrusters should be inside the tail engine housings, not on the wingtips.",
+     "region": "tail.aft.outer"
+    },
+    {
+     "zone": "spine_conduits",
+     "action": "scale",
+     "why": "Conduits are currently microscopic; scale them up to run prominently along the spine behind the cockpit.",
+     "size_m": 4.5
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "replace",
+     "why": "Current parts are curved arms; replace with straight, parallel landing skids."
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "action": "replace",
+     "why": "Currently reads as tiny dots; needs to be a visible rectangular box with a protruding gun barrel."
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T03:55:06Z"
+  },
+  {
+   "score": 0.6,
+   "overall": "The base hull captures the overall shape well, but most of the detailed parts are either the wrong shape or placed incorrectly. Replacing the skids and nozzles with procedural primitives and adding the missing front skid and wingtip thrusters will greatly improve the read.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "good"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "The current part is a weird shape; need a blocky part with circular indents for the RCS, placed slightly further back on the angled face.",
+     "anchor": [
+      0,
+      0.9
+     ]
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "replace",
+     "why": "The nozzles are spiky and angled incorrectly; use a clean cylindrical nozzle pointing straight back.",
+     "prim": "nozzle"
+    },
+    {
+     "zone": "spine_conduits",
+     "action": "replace",
+     "why": "The current part is just tiny dots; need long parallel pipes running along the spine.",
+     "anchor": [
+      0,
+      0.2
+     ],
+     "prim": "pipe_run",
+     "size_m": 4.0
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "replace",
+     "why": "The library part is too complex and mechanical; use a procedural ski bar for the landing skids.",
+     "prim": "skid"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "action": "move",
+     "why": "Pylons are currently placed too far inboard and aft, clipping into the skids; move them outwards under the main wings.",
+     "anchor": [
+      0.6,
+      -0.2
+     ]
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "add",
+     "why": "The concept features a front landing skid under the nose that is currently missing.",
+     "anchor": [
+      0,
+      0.5
+     ],
+     "count": 1,
+     "prim": "skid",
+     "size_m": 1.5
+    },
+    {
+     "zone": "wingtip_thrusters",
+     "action": "add",
+     "why": "The wingtip pods on the hull are just lumpy blockouts; add distinct cylindrical thrusters to cover them.",
+     "anchor": [
+      0.95,
+      -0.3
+     ],
+     "count": 2,
+     "size_m": 2.5,
+     "tags": [
+      "thruster",
+      "cylinder"
+     ]
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T04:40:08Z"
+  },
+  {
+   "score": 0.6,
+   "overall": "The blockout captures the general silhouette, but key details are missing or misaligned. The landing skids need correct orientation and a front counterpart, while the wingtips are missing their iconic thruster pods.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "wrong_orientation"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "good"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "Need a flat, rectangular block with forward-facing thruster ports, centered on the nose.",
+     "anchor": [
+      0.0,
+      0.95
+     ]
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "scale",
+     "why": "The nozzles stick out too far; scale them down so they sit better within the tail pods.",
+     "scale_factor": 0.7
+    },
+    {
+     "zone": "spine_conduits",
+     "action": "scale",
+     "why": "The conduit run needs to be longer to cover more of the upper spine.",
+     "scale_factor": 1.5
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "rotate",
+     "why": "The skids are currently oriented sideways; rotate them to run fore-to-aft.",
+     "yaw_deg": 90
+    },
+    {
+     "zone": "wingtip_thrusters",
+     "action": "add",
+     "why": "The concept features prominent triple-thruster pods on the wingtips.",
+     "anchor": [
+      0.95,
+      -0.2
+     ],
+     "count": 2,
+     "region": "flank.mid.outer",
+     "size_m": 1.5,
+     "tags": [
+      "thruster",
+      "cylinder",
+      "cluster"
+     ]
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "add",
+     "why": "The concept has a front landing skid under the nose.",
+     "count": 1,
+     "prim": "skid",
+     "region": "belly.fore.outer",
+     "size_m": 1.5,
+     "tags": [
+      "landing-gear",
+      "strut"
+     ]
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T04:44:19Z"
+  },
+  {
+   "score": 0.65,
+   "overall": "The base hull captures the overall shape well, including the built-in wingtip pods. However, several kitbashed additions are misplaced or incorrectly sized, notably the oversized ventral gun bay and the redundant wingtip thruster parts placed on the nose.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "wingtip_thrusters",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "front_landing_skid",
+     "present": true,
+     "verdict": "wrong_place"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "Needs to be a larger, distinct block covering the flat nose tip, ideally with four circular recesses."
+    },
+    {
+     "zone": "spine_conduits",
+     "action": "replace",
+     "why": "Need distinct parallel pipes running longitudinally along the sides of the raised central spine."
+    },
+    {
+     "zone": "under_wing_pylons",
+     "action": "scale",
+     "why": "Pylons are too small compared to the concept.",
+     "scale_factor": 1.5
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "action": "replace",
+     "why": "Should be a flatter, rectangular panel or shallow box, not a massive bulky structure that blocks the landing gear."
+    },
+    {
+     "zone": "wingtip_thrusters",
+     "action": "drop",
+     "why": "The base hull already contains well-defined lumps for the wingtip triple thrusters; the extra parts are redundant and currently misplaced on the nose."
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "move",
+     "why": "Move further forward under the nose to clear the ventral gun bay.",
+     "anchor": [
+      0.0,
+      0.8
+     ]
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T04:45:40Z"
+  },
+  {
+   "score": 0.4,
+   "overall": "The base hull captures the overall shape, but the kitbashed details are largely failing to match the concept. Most parts are either the wrong scale, placed incorrectly, or using inappropriate geometry that doesn't read as the intended feature.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "accent_stripe",
+     "present": false,
+     "verdict": "missing"
+    },
+    {
+     "zone": "hull_number_decal",
+     "present": false,
+     "verdict": "missing"
+    },
+    {
+     "zone": "tail_crest_decal",
+     "present": false,
+     "verdict": "missing"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "dark_wing_panels",
+     "present": false,
+     "verdict": "missing"
+    },
+    {
+     "zone": "front_landing_skid",
+     "present": true,
+     "verdict": "wrong_part"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "The current part is a tiny greeble. We need a large, dark blocky structure that covers the nose tip and features 4 circular thruster ports."
+    },
+    {
+     "zone": "spine_conduits",
+     "action": "replace",
+     "why": "The current part is a tiny square. We need long, continuous pipes running along the spine of the ship.",
+     "prim": "pipe_run",
+     "size_m": 4.0
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "move",
+     "why": "The nozzles are sticking out way too far from the back. They need to be moved forward so they are recessed into the engine pods.",
+     "anchor": [
+      0.2,
+      -0.95
+     ]
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "move",
+     "why": "The rear skids are placed too far back under the engines. They should be moved forward under the main body/wing root.",
+     "anchor": [
+      0.3,
+      -0.4
+     ]
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "replace",
+     "why": "The current part looks like a tiny vertical stick and is off-center. It needs to be a proper horizontal landing skid placed centrally under the nose.",
+     "prim": "skid",
+     "size_m": 1.5,
+     "yaw_deg": 0
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "move",
+     "why": "Ensure the front skid is perfectly centered.",
+     "anchor": [
+      0.0,
+      0.75
+     ]
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "action": "scale",
+     "why": "The gun bay box is too bulky and sticks out too much from the belly. It needs to be scaled down to look more like a recessed or flatter panel.",
+     "scale_factor": 0.5
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T04:46:47Z"
+  },
+  {
+   "score": 0.75,
+   "overall": "The assembly captures the general silhouette, but suffers from a few glaring part choice and orientation errors. Fixing the missing engine, sideways front skid, and incorrect pylons will bring it much closer to the concept.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "wrong_part"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "wrong_size"
+    },
+    {
+     "zone": "front_landing_skid",
+     "present": true,
+     "verdict": "wrong_orientation"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "replace",
+     "why": "The current part is a tiny diamond; needs to be a wide, flat block covering the nose tip to represent the 4-hole thruster cap.",
+     "prim": "box"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "count",
+     "why": "The port side nozzle is missing; needs to be a mirrored pair.",
+     "count": 2
+    },
+    {
+     "zone": "under_wing_pylons",
+     "action": "replace",
+     "why": "Currently using landing skids; needs to be a sleek weapon pylon or missile pod."
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "action": "scale",
+     "why": "The current box is too bulky and hangs down too far; scale it down to be a flatter rectangular housing.",
+     "scale_factor": 0.5
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "rotate",
+     "why": "The skid is oriented sideways; rotate it to align with the length of the hull.",
+     "yaw_deg": 90
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T04:59:41Z"
+  },
+  {
+   "score": 0.75,
+   "overall": "The core hull shape and major features are present, but several key details are misplaced. The main engine nozzles need to be recessed, the nose RCS clusters should be paired on the corners, and the belly elements are clashing.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "front_landing_skid",
+     "present": true,
+     "verdict": "wrong_place"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "move",
+     "why": "Move to the front corners of the nose and duplicate to have one on each side.",
+     "anchor": [
+      0.15,
+      0.95
+     ],
+     "count": 2
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "move",
+     "why": "Move forward to recess the nozzles inside the engine pods.",
+     "anchor": [
+      0.2,
+      -0.85
+     ]
+    },
+    {
+     "zone": "front_landing_skid",
+     "action": "move",
+     "why": "Move forward to sit under the nose and avoid clashing with the gun bay.",
+     "anchor": [
+      0.0,
+      0.85
+     ]
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "action": "move",
+     "why": "Center the gun bay on the belly.",
+     "anchor": [
+      0.0,
+      0.5
+     ]
+    },
+    {
+     "zone": "wingtip_thrusters",
+     "action": "add",
+     "why": "Add the small thruster clusters to the back of the wingtip pods.",
+     "anchor": [
+      0.95,
+      -0.4
+     ],
+     "count": 2,
+     "size_m": 0.6,
+     "tags": [
+      "thruster",
+      "nozzle"
+     ]
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T05:00:54Z"
+  },
+  {
+   "score": 0.65,
+   "overall": "The blockout captures the main shapes and proportions well, but several key details are misplaced or missing. The RCS clusters and main nozzles need repositioning, the rear landing skids failed to generate, and the prominent wingtip pods are absent.",
+   "per_zone": [
+    {
+     "zone": "nose_rcs_cluster",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "present": true,
+     "verdict": "wrong_place"
+    },
+    {
+     "zone": "spine_conduits",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "rear_landing_skid",
+     "present": false,
+     "verdict": "missing"
+    },
+    {
+     "zone": "under_wing_pylons",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "ventral_gun_bay",
+     "present": true,
+     "verdict": "good"
+    },
+    {
+     "zone": "front_landing_skid",
+     "present": true,
+     "verdict": "good"
+    }
+   ],
+   "adjust": [
+    {
+     "zone": "nose_rcs_cluster",
+     "action": "move",
+     "why": "The RCS clusters should be smaller and located on the sides of the nose, rather than sticking out of the very front.",
+     "anchor": [
+      0.4,
+      0.85
+     ],
+     "scale_factor": 0.5
+    },
+    {
+     "zone": "main_thruster_nozzle",
+     "action": "move",
+     "why": "The nozzles need to be moved to the aft face of the engine pods so they sit inside the cowlings, rather than underneath them.",
+     "anchor": [
+      0.25,
+      -1.0
+     ],
+     "scale_factor": 1.5
+    },
+    {
+     "zone": "rear_landing_skid",
+     "action": "replace",
+     "why": "The rear landing skids failed to place geometry; use a procedural skid to ensure they appear.",
+     "prim": "skid"
+    },
+    {
+     "zone": "wingtip_pods",
+     "action": "add",
+     "why": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+     "region": "flank.mid.outer",
+     "tags": [
+      "cylinder",
+      "thruster"
+     ],
+     "yaw_deg": 0
+    },
+    {
+     "zone": "wingtip_pods",
+     "action": "add",
+     "why": "The concept features prominent cylindrical thruster pods on the wingtips that are currently missing.",
+     "region": "flank.mid.outer",
+     "tags": [
+      "cylinder",
+      "thruster"
+     ],
+     "yaw_deg": 0
+    }
+   ],
+   "model": "gemini-3.1-pro-preview",
+   "renders": [
+    "render-hero.png",
+    "render-side.png",
+    "render-top.png",
+    "render-belly.png",
+    "render-hero-id.png",
+    "render-side-id.png",
+    "render-top-id.png",
+    "render-belly-id.png"
+   ],
+   "at": "2026-09-05T05:22:26Z",
+   "score_eff": 0.611
+  }
+ ]
+}

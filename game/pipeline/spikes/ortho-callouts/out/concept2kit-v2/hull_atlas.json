@@ -1,0 +1,58 @@
+{
+ "dims_m": [
+  9.529,
+  9.0,
+  3.072
+ ],
+ "tris": 14713,
+ "regions": {
+  "top.aft.outer": 48.823,
+  "belly.aft.outer": 48.184,
+  "flank.aft.outer": 33.281,
+  "top.fore.outer": 29.64,
+  "belly.fore.outer": 28.627,
+  "flank.fore.outer": 21.139,
+  "tail.aft.outer": 6.257,
+  "nose.aft.outer": 5.847,
+  "belly.fore.inner": 4.121,
+  "top.fore.inner": 3.663,
+  "belly.mid.outer": 3.433,
+  "top.mid.outer": 2.713,
+  "nose.fore.outer": 2.064,
+  "flank.mid.outer": 1.801,
+  "top.aft.inner": 1.793,
+  "belly.aft.inner": 1.764,
+  "tail.fore.outer": 1.719,
+  "nose.mid.outer": 1.088,
+  "nose.fore.inner": 1.014,
+  "tail.fore.inner": 0.871,
+  "tail.mid.outer": 0.857,
+  "flank.aft.inner": 0.727,
+  "tail.aft.inner": 0.496,
+  "nose.aft.inner": 0.365,
+  "top.mid.inner": 0.336,
+  "flank.fore.inner": 0.294,
+  "belly.mid.inner": 0.106
+ },
+ "vocabulary": {
+  "side": [
+   "top",
+   "belly",
+   "flank",
+   "nose",
+   "tail"
+  ],
+  "long": [
+   "fore",
+   "mid",
+   "aft"
+  ],
+  "lat": [
+   "inner",
+   "outer"
+  ]
+ },
+ "nose": "+Y",
+ "up": "+Z",
+ "mirror": "x"
+}
