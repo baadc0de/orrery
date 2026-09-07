@@ -437,6 +437,128 @@ number alone settles [G10.2]; #1043's own "Settles" section says so, and this
 clause agrees. N = 24 is [G11.3]'s tested baseline, so the number the spike
 takes is the slice's number.
 
+> **Amendment, 2026-09-06 (#1101). Drafted for the owner; not accepted until
+> the owner accepts it.** The clause text above is left exactly as written —
+> it records what was believed on 2026-09-04 — and this block records what is
+> true now. Nothing normative changes without acceptance.
+>
+> **1. The factual correction.** Line 419's *"no Windows report exists under
+> `docs/data/`"* and line 428's *"no green Windows run has landed since"* are
+> both false as of 2026-09-04. `docs/data/sidecar-ipc-windows-2026-09-04-n24.json`
+> landed that day in [#1076] (`4f88e1e`), from nightly run **33904310163** —
+> dispatched manually **after** run 33831743486, the failed run line 428 cites.
+> It is N = 24 at 60 Hz on Windows x86_64, `QueryPerformanceCounter`, TCP
+> loopback with `TCP_NODELAY`, 36,000 samples after 600 warmup ticks
+> (`:9`, `:12`, `:14`), every drop counter zero (`:138-151`):
+>
+> | | `ipc_added` p50 | p99 | p99.9 | max |
+> |---|---|---|---|---|
+> | Windows, N = 24, `timeBeginPeriod(1)` | **136.6 µs** | **395.1 µs** | 1,030.2 µs | 2.51 ms |
+>
+> `python3 scripts/ipc-report.py docs/data/sidecar-ipc-windows-2026-09-04-n24.json`
+> renders **SIDECAR STANDS** — p99 395.1 µs against the 1,000 µs stand band and
+> 16,700 µs (one tick) overturn anchor, p50 136.6 µs against 1,000 µs, frame
+> drop rate 0.0000 % against ≤ 0.1 %. The leg was still green in the nightly of
+> 2026-09-06 (run 34007977162). The rest of line 418's sentence stands:
+> `scripts/ipc-report.py:244-249` still refuses a verdict for any platform but
+> Windows, and `scripts/ipc-report.py:143-147` now also refuses one for any
+> report whose `measured_quantity` is not `ipc_added` (added in [#1090]).
+>
+> **2. What this does to H2 — a proposal, not a finding.** H2 is *"in-process,
+> gated on the Windows [#920] run"*, and its whole content is the gate: *"let
+> the one missing nightly report either confirm it cheaply or hand the owner
+> the fallback with a graph rather than a sentence."* The report is no longer
+> missing, and it did **neither** of those things. **SIDECAR STANDS** is not a
+> verdict about the in-process path; #920's bands ask only whether the *worst
+> reasonable* sidecar is disqualified on latency, and the answer is that it is
+> not — by 2.5× at p99 and 42× against the one-tick anchor. Nothing in it
+> confirms [G10.2], and nothing in it hands the owner the fallback.
+>
+> The consequence is that **latency has stopped discriminating between the two
+> shapes at N = 24**, which is the tested baseline [G11.3] fixes. On Windows
+> the sidecar clears the band with 2.5× headroom at p99. On Linux both shapes
+> clear it by more than an order of magnitude — sidecar p50 41.7 µs / p99
+> 70.9 µs (`docs/data/sidecar-ipc-linux-2026-09-03-n24.json`) against
+> in-process p50 20.1 µs / p99 43.7 µs
+> (`docs/data/inproc-linux-2026-09-04-n24-no-app.json`, [#1069]). And [#1109]
+> measures the Unreal side of the seam at N = 24 paced to 60 Hz: **521 ns** p50
+> for poll plus copy-out, against 25,528 ns for the same window including 24
+> actor moves — the link thread owns the socket and decodes concurrently
+> (`crates/orrery_unreal_observer/src/lib.rs:217-236`), so roughly 98 % of the
+> crossing is Unreal moving actors, work that exists
+> whichever host shape ships. Linux, `-NullRHI`; it makes no Windows claim.
+>
+> **The proposal: retire H2 and let the recommendation fall to H1.** H2 was H1
+> plus a gate; the gate has been drawn and it does not separate the options, so
+> holding in-process behind it now costs a decision and buys nothing. Under
+> this reading the recommended option becomes **H1 — in-process now, as
+> [G10.2] states** — and **H3 stays the named fallback**, but triggered by
+> [#1043]'s link and coexistence falsifiers rather than by latency, which no
+> longer argues either way at N = 24.
+>
+> The alternative, if the owner would rather honour H2's gate literally, is
+> stated so the choice is real: the revision at line 676 widened the gate to
+> *two* numbers on one graph — Windows `ipc_added` and #1043's `inproc_added`
+> — and only the first is on Windows. Honouring that literally leaves H2 open
+> on a measurement no box available to this trail can take (item 4 below).
+>
+> **3. The verdict's margin was measured against a stand-in, and the stand-in
+> was 3.1× low.** Every #920 report carries note 6 — *"the extraction contract is
+> shape-faithful, not a Bevy `App`"* (that report's `notes`, `:158`). The
+> shipped extractor (`crates/orrery/src/ipc.rs:189`, named by the sidecar's own
+> module doc at `crates/orrery_sidecar/src/lib.rs:22`) landed after the harness
+> and had never been timed. [#1100] timed it on the
+> shipped world: **3,426 ns p50 / 6,462 ns p99 at N = 24**
+> (`docs/data/extract-cost-linux-2026-09-05-n24.json:13-14`) and **16,671 ns
+> p50 at N = 128** (`…-n128.json:13`), against the harness `extract` column's
+> **1,100 ns p50 / 1,900 ns p99** in the Windows report itself (`:49-50`).
+>
+> Substituting the p50 delta (+2,326 ns) into `ipc_added` moves it **136.6 →
+> 138.9 µs** at p50 (mean 142.2 → 144.5 µs; +1.7 % either way). Carrying the
+> p99 delta (+4,562 ns) as a bound gives **399.7 µs against the 1,000 µs
+> band**. **The verdict does not move.** What moves is the slope: the real
+> extractor scales at ≈ 369 ns fixed + 127 ns/entity, about **32× steeper**
+> than the synthetic column's ≈ 3.9 ns/entity (Linux N = 24 → N = 128, 201 →
+> 611 ns). It is still linear and still inside #920's 1 µs/entity clause, and
+> at N = 128 it would add ≈ 16 µs to a p50 of 47.8 µs — but it is the term that
+> grows, and any future reading of these reports at larger N should take it
+> from the shipped extractor and not from the harness column. **Both extractor
+> figures are Linux**; substituting a Linux figure into a Windows report is an
+> approximation, and is offered as one.
+>
+> **4. What is still genuinely open, so this amendment does not overcorrect.**
+>
+> 1. **The in-process number on Windows does not exist.** [#1084] added the
+>    `inproc-ipc (windows, N=24, App prong)` nightly leg
+>    (`.github/workflows/nightly.yml:1605-1606`, [#1090]) and deliberately
+>    committed no JSON to `docs/data/`. The leg has never gone green: in run
+>    34007977162 it fails at the MSVC link (`clang: error: no such file or
+>    directory: 'kernel32.lib'`), which is the first of the two caveats #1084
+>    recorded against itself. **Neither box available to this trail is
+>    Windows**, so nothing here can be closed by a local run.
+> 2. **SIDECAR STANDS is conditional on `timeBeginPeriod(1)`.** The companion
+>    run at default timer resolution
+>    (`docs/data/sidecar-ipc-windows-2026-09-04-n24-default-resolution.json`)
+>    is indifferent at the median — p50 136.8 µs — and not at the tail: p99
+>    560.2 µs, **p99.9 14,802.2 µs**, max 115.1 ms, with a 2.68 % frame drop
+>    rate against the ≤ 0.1 % band. `ipc-report.py` renders it **OWNER'S CALL**,
+>    not STANDS. A shipped client that does not raise timer resolution is not
+>    covered by the verdict in item 1.
+> 3. **#920's scaling clause has no Windows measurement.** p99 ≤ 2 ms at
+>    N = 128 is met on Linux (384 µs) and untested on Windows — and the slope
+>    correction in part 3 above is exactly what makes extrapolating it less
+>    comfortable than it was.
+> 4. **The fork at line 696 is untouched.** [#1043] took the `App` prong on
+>    Linux; the non-`App` prong still has no spike, and [#1084]'s second
+>    caveat records that GD3's actual configuration — App prong, pool-capped,
+>    driver-connected — is measured by neither spike. Nothing in this amendment
+>    bears on it.
+> 5. **Clause (e)'s core sentence survives.** *"The in-process decision of
+>    [G10.2] rests on [game ADR-0002]'s judgement, not on the number [#920] was
+>    written to produce"* is **still true**, for a different reason than when it
+>    was written: not because the number is missing, but because the number,
+>    now taken, is about the sidecar and says it stands.
+
 ### (f) What an Unreal host may not do, restated so acceptance cannot loosen it
 
 None of this is new; it is repeated because a second host is precisely when
@@ -565,6 +687,14 @@ drift detection, and it is still the owner's.
   names *"D53 H3 / game ADR-0002's named sidecar"* as the fallback outright,
   and its coexistence falsifier hands the owner *"D53's other prong (a
   non-`App` driver) or the sidecar, with a number"*.
+
+> **Amendment, 2026-09-06 (#1101), pointer only.** H2's gate — *"the one
+> missing nightly report"* — is no longer missing: the Windows N = 24 sidecar
+> report landed 2026-09-04 and renders **SIDECAR STANDS**. Clause (e)'s
+> amendment sets out what that does and does not settle, and **proposes
+> retiring H2 in favour of H1, with H3 still the named fallback but triggered
+> by [#1043]'s falsifiers rather than by latency.** That is a proposal for the
+> owner; until it is accepted, the three options above stand as written.
 
 **What G11 did to the H-options, in one sentence:** nothing directly — the
 host shape is a process question and [G11.4] is an authoring question — but
@@ -699,6 +829,13 @@ decision; [#1042]'s rule 7 says the same, and the decision stays the owner's.
 [#1044]: https://github.com/baadc0de/orrery/issues/1044
 [#1045]: https://github.com/baadc0de/orrery/issues/1045
 [#1046]: https://github.com/baadc0de/orrery/issues/1046
+[#1069]: https://github.com/baadc0de/orrery/pull/1069
+[#1076]: https://github.com/baadc0de/orrery/pull/1076
+[#1084]: https://github.com/baadc0de/orrery/issues/1084
+[#1090]: https://github.com/baadc0de/orrery/pull/1090
+[#1100]: https://github.com/baadc0de/orrery/pull/1100
+[#1101]: https://github.com/baadc0de/orrery/issues/1101
+[#1109]: https://github.com/baadc0de/orrery/pull/1109
 [D1]: 0001-requirements.md
 [D4]: 0004-bevy-netcode-stack.md
 [D8]: 0008-prediction-rollback-interpolation.md
