@@ -239,12 +239,30 @@ pub const SKIRMISH_OUTCOMES: [(&str, [u8; 32]); 4] = [
 /// move. [`REGOLITH_WORLD_OUTCOMES`] below did not move with it — the rock,
 /// pickup and bloom-director sections this scenario exists to cover are
 /// untouched.
+///
+/// Regenerated again for #1124, at the **same** ruleset v26 — no rule changed.
+/// The scenario's seeded director used to start at `clock_tick: 0` with
+/// `next_bloom_tick: 60`, which is off the [`BLOOM_CADENCE_TICKS`] cadence and
+/// so in permanent violation of `regolith/value-range`. The fixture now buys
+/// its early bloom the other way round, starting the *clock* one cadence short
+/// of the deadline, so the same bloom lands on the same tick from a legal seed.
+///
+/// The movement is a rigid shift and nothing else, measured rather than
+/// argued: with the director's clock expressed relative to its own origin, a
+/// digest over the whole 900-tick log is **identical** on both sides of the
+/// change — same `blooms_seeded` progression, same site, same rock population,
+/// same 3,688 events — and a digest over every non-director entry is identical
+/// too. Only the director's three absolute tick fields (`clock_tick`,
+/// `next_bloom_tick`, `site_active_until`) are 3,540 higher, and they are in
+/// the canonical bytes, so both chains here move with them.
+///
+/// [`BLOOM_CADENCE_TICKS`]: crate::regolith::BLOOM_CADENCE_TICKS
 pub const REGOLITH_WORLD: [(&str, [u8; 32]); 1] = [(
     "world",
     [
-        0x78, 0x3c, 0x07, 0xfd, 0xde, 0x32, 0x8d, 0x42, 0x63, 0x7d, 0xfe, 0x23, 0xb9, 0x97, 0x08,
-        0x12, 0x65, 0xf4, 0x41, 0x20, 0x55, 0x38, 0xad, 0x71, 0xf3, 0x99, 0x22, 0x90, 0x9d, 0x99,
-        0x93, 0x0f,
+        0xfa, 0xc7, 0x12, 0x8b, 0x58, 0x1d, 0x22, 0xe5, 0xdd, 0x52, 0x3e, 0x39, 0x9c, 0x69, 0x76,
+        0x3e, 0xca, 0x1d, 0x39, 0xcf, 0x7e, 0xc8, 0x7f, 0x17, 0xb1, 0x8b, 0xdb, 0xe0, 0x4f, 0xd8,
+        0xdc, 0x87,
     ],
 )];
 
@@ -252,11 +270,17 @@ pub const REGOLITH_WORLD: [(&str, [u8; 32]); 1] = [(
 ///
 /// Regenerated at ruleset v25 (#955): the island tether damps a craft that
 /// leaves the island, and this scenario's craft do.
+///
+/// Regenerated again for #1124, for the reason given on [`REGOLITH_WORLD`] and
+/// for one field: `Outcome::BloomSeeded` carries `active_until`, an absolute
+/// director tick, so the seed's 3,540-tick shift reaches the outcome chain as
+/// well. The bloom is seeded on the same scenario tick at the same site with
+/// the same rocks; only that one timestamp differs.
 pub const REGOLITH_WORLD_OUTCOMES: [(&str, [u8; 32]); 1] = [(
     "world",
     [
-        0x14, 0x6c, 0xb0, 0xdd, 0x24, 0x1c, 0x27, 0xf7, 0xcb, 0xdc, 0x50, 0x83, 0x70, 0x1a, 0x53,
-        0x81, 0xf6, 0x31, 0x39, 0x30, 0xb0, 0xf2, 0x86, 0xb7, 0x59, 0x48, 0x75, 0x6f, 0xa0, 0xaa,
-        0x8e, 0x92,
+        0xa3, 0x18, 0x67, 0x2f, 0xac, 0x53, 0x3a, 0xc9, 0x36, 0xb1, 0xee, 0x0c, 0xb7, 0xbe, 0x8e,
+        0xea, 0x47, 0x84, 0xcb, 0x90, 0x12, 0x21, 0xae, 0x8e, 0xce, 0xe2, 0xa6, 0x9b, 0xeb, 0x06,
+        0x30, 0xef,
     ],
 )];

@@ -16,6 +16,8 @@
 //! |---|---|
 //! | the corpus does not step the world module | the premise above silently changing, leaving `WORLD_SCENARIO` redundant and unexamined |
 //! | the world scenario steps every section | a scenario named "world" that seeds a population and still never steps it |
+//! | honest world play raises no stage-1 flag | a false positive in the one domain a Regolith tester actually plays in (#1124) |
+//! | the seeded director satisfies the invariant | the fixture itself going offside, as it did in #1124, and taking the check above down with it |
 //! | the world scenario matches its goldens | an unintended change to the three sections nothing else pins |
 //! | the goldens name the scenario | a rename pointing the fixture rows at nothing |
 //! | the cross-replay leg's reach | D-4's adjudication half being credited with coverage it does not have |
@@ -24,7 +26,7 @@
 use orrery_games::diff::{collect_artifacts, Side, VersionAxes};
 use orrery_games::golden;
 use orrery_games::regolith::state::RegolithState;
-use orrery_games::regolith::{Regolith, REGOLITH_COMPOSITION};
+use orrery_games::regolith::{Regolith, BLOOM_CADENCE_TICKS, REGOLITH_COMPOSITION};
 use orrery_games::scenario::{play, Play, Scenario, SCENARIOS, WORLD_SCENARIO};
 use orrery_games::Game;
 use orrery_protocol::atrest::SchemaVersion;
@@ -132,6 +134,111 @@ fn the_world_scenario_steps_every_section_of_the_module() {
         "no rock was materialized: {} rock steps is exactly the {seeded_rocks} seeded rocks \
          drifting, so the bloom, split and materialization paths never ran",
         steps.rock
+    );
+}
+
+/// **The false-positive check, for the domain a tester actually plays in.**
+///
+/// `battery.rs`'s `honest_play_raises_no_stage_one_flag` is the measurement P4
+/// exists for in miniature, and it iterates [`SCENARIOS`] — every member of
+/// which declares `world_entities: 0`. So until #1124 the one check that asks
+/// "did honest play accuse anybody" had never seen a rock, a pickup or a bloom
+/// director: the whole domain a Regolith playtest happens in had zero
+/// false-positive coverage, and the gate was asserting a rate it had not
+/// measured there.
+///
+/// The scenario could not simply be handed to that loop, because the fixture
+/// seeding it was itself in permanent violation of `regolith/value-range` —
+/// 36,000 flags over 30 simulated minutes, every one of them the seed's own
+/// off-cadence `next_bloom_tick`. That is fixed at the fixture (see
+/// `regolith::world_seed`); this is the check that keeps it fixed.
+///
+/// Run past a *second* bloom as well as the shipped window, because the
+/// re-seed is where the cadence invariant is most easily broken: `seed_bloom`
+/// advancing `next_bloom_tick` by anything but a whole cadence would leave the
+/// short window green and fail here.
+#[test]
+fn honest_world_play_raises_no_stage_one_flag() {
+    // Long enough for the seeded director's second bloom: its clock starts one
+    // cadence short of `WORLD_SEED_FIRST_BLOOM_TICK`, so blooms land 60 ticks
+    // in and one whole cadence after that.
+    let two_blooms = Scenario {
+        name: "world-two-blooms",
+        ticks: BLOOM_CADENCE_TICKS + 400,
+        ..WORLD_SCENARIO
+    };
+    for scenario in [&WORLD_SCENARIO, &two_blooms] {
+        let played = play(Regolith::honest(), scenario);
+        assert!(
+            played.flags.is_empty(),
+            "{}: honest play in the rock/pickup/bloom domain raised {} stage-1 flags {:?}; \
+             the first is at {:?} on entity {:?}",
+            scenario.name,
+            played.flags.len(),
+            played.flagged_validators(),
+            played.flags[0].tick,
+            played.flags[0].entity,
+        );
+    }
+
+    // Non-vacuity: the longer run really did re-seed, so the clause above
+    // covered `seed_bloom`'s advance and not merely the seeded values.
+    let played = play(Regolith::honest(), &two_blooms);
+    let blooms = played
+        .log
+        .last()
+        .expect("the run logged at least one tick")
+        .entries
+        .iter()
+        .find_map(|entry| match entry.state {
+            RegolithState::BloomDirector(ref director) => Some(director.blooms_seeded),
+            _ => None,
+        })
+        .expect("the seeded director is still installed at the end of the run");
+    assert!(
+        blooms >= 2,
+        "the longer window seeded {blooms} blooms, so `seed_bloom`'s advance of \
+         `next_bloom_tick` was never exercised under the flag check"
+    );
+}
+
+/// **The fixture is on the cadence the ruleset publishes.**
+///
+/// Stated against the seed directly, so the failure names the fixture rather
+/// than arriving as an opaque wall of value-range flags the way #1124 did.
+/// `regolith/value-range` requires a director's `next_bloom_tick` to be a
+/// multiple of [`BLOOM_CADENCE_TICKS`] and strictly ahead of its clock, and
+/// production upholds it: `BloomDirector::spawned` seeds one whole cadence and
+/// `seed_bloom` only ever adds another. A scenario seed is held to the same
+/// rule, because a seed that is not is a seed no honest-play check can run on.
+#[test]
+fn the_seeded_bloom_director_satisfies_the_cadence_invariant() {
+    let game = Regolith::honest();
+    let mut seen = 0;
+    for slot in 0..WORLD_SCENARIO.world_entities {
+        let entity = PersistId::new(WORLD_SCENARIO.entities + slot + 1);
+        let Some(RegolithState::BloomDirector(director)) = game.spawn_world(entity, slot) else {
+            continue;
+        };
+        seen += 1;
+        assert_eq!(
+            director.next_bloom_tick % BLOOM_CADENCE_TICKS,
+            0,
+            "world slot {slot} seeds next_bloom_tick {} which is off the {BLOOM_CADENCE_TICKS} \
+             cadence; the value-range invariant rejects it on every tick from the first",
+            director.next_bloom_tick
+        );
+        assert!(
+            director.next_bloom_tick > director.clock_tick,
+            "world slot {slot} seeds a bloom at {} that is not ahead of its clock at {}",
+            director.next_bloom_tick,
+            director.clock_tick
+        );
+    }
+    assert_eq!(
+        seen, 1,
+        "the world population no longer seeds exactly one bloom director; \
+         this test and `world_seed`'s slot 0 have drifted apart"
     );
 }
 
