@@ -97,7 +97,7 @@ PY
 }
 
 run_checks() {
-    local campaigns releases output status=0
+    local campaigns releases_file output status=0
     printf 'MODE campaign-release-preflight control=%s repo=%s\n' "$CONTROL" "$REPO"
 
     if ! require_tool "$PYTHON_BIN" campaigns-control; then
@@ -119,22 +119,33 @@ run_checks() {
     # `gh release list --json` does not expose targetCommitish.  The REST
     # release endpoint does; --paginate --slurp retains every page as valid
     # JSON so an empty or malformed response cannot be mistaken for no work.
-    output="$("$GH_BIN" api --paginate --slurp "repos/$REPO/releases?per_page=100" 2>&1)" || status=$?
+    # The listing is written to a file and handed to python as a path, never
+    # as an argv element (#1167): the live listing (14 releases x full asset
+    # metadata) already overflows the kernel's 128 KiB per-argument limit, and
+    # every future release grows it.  The path is expanded into the trap
+    # eagerly, before it can fall out of this function's scope.
+    releases_file="$(mktemp "${TMPDIR:-/tmp}/$NAME.releases.XXXXXX")" || {
+        result UNKNOWN published-client-releases "could not create a temporary file for the release listing"
+        summary
+        return 1
+    }
+    trap "rm -f '$releases_file'" EXIT
+    output="$("$GH_BIN" api --paginate --slurp "repos/$REPO/releases?per_page=100" 2>&1 >"$releases_file")" || status=$?
     if ((status != 0)); then
         result UNKNOWN published-client-releases "GitHub release probe failed ($output)"
         summary
         return 1
     fi
-    releases=$output
 
-    output="$("$PYTHON_BIN" - "$campaigns" "$releases" 2>&1 <<'PY'
+    output="$("$PYTHON_BIN" - "$campaigns" "$releases_file" 2>&1 <<'PY'
 import json
 import re
 import sys
 
 try:
     campaigns = json.loads(sys.argv[1])
-    pages = json.loads(sys.argv[2])
+    with open(sys.argv[2], encoding="utf-8") as source:
+        pages = json.load(source)
     if not isinstance(campaigns, list) or not isinstance(pages, list):
         raise ValueError("expected JSON arrays")
     if not pages:
@@ -165,7 +176,7 @@ try:
                          and re.fullmatch(r"orrery-regolith-[a-z0-9_]+-[a-z0-9-]+\.(?:tar\.gz|zip)", asset["name"])]
         if client_assets:
             available.append((name, target.lower(), len(client_assets)))
-except (json.JSONDecodeError, ValueError, TypeError) as error:
+except (json.JSONDecodeError, ValueError, TypeError, OSError) as error:
     raise SystemExit(f"published-client-releases could not be interpreted: {error}")
 
 for campaign in campaigns:
@@ -228,6 +239,7 @@ case "${CAMPAIGN_RELEASE_PREFLIGHT_FIXTURE:-good}" in
   empty) echo "[[]]" ;;
   draft-only) echo "[[{\"name\":\"fixture-draft\",\"draft\":true,\"target_commitish\":\"11111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"assets\":[{\"name\":\"orrery-regolith-x86_64-linux.tar.gz\"}]}]]" ;;
   no-match) echo "[[{\"name\":\"fixture-release\",\"draft\":false,\"target_commitish\":\"aaaaaaaa11111111111111111111111111111111\",\"assets\":[{\"name\":\"orrery-regolith-x86_64-linux.tar.gz\"}]}]]" ;;
+  large) big=$(printf "x%.0s" {1..1048576}); printf "[[{\"name\":\"fixture-release\",\"draft\":false,\"target_commitish\":\"11111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"body\":\"%s\",\"assets\":[{\"name\":\"orrery-regolith-x86_64-linux.tar.gz\"}]}]]" "$big" ;;
   *) echo "[[{\"name\":\"fixture-release\",\"draft\":false,\"target_commitish\":\"11111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"assets\":[{\"name\":\"orrery-regolith-x86_64-linux.tar.gz\"}]}]]" ;;
 esac'
     write_control() {
@@ -254,6 +266,19 @@ esac'
 
     write_control 11111111
     st_good
+
+    # #1167: the release listing reaches python as a file, never as an argv
+    # element.  The live listing (14 releases x full asset metadata, ~149 KiB)
+    # crossed the kernel's 128 KiB per-argument limit and the script died
+    # there, while these small fixtures kept it invisible.  One mebibyte of
+    # body guarantees the old argv handoff fails E2BIG on any Linux box, so
+    # this fixture only passes when the listing travels by file.
+    write_control 11111111
+    status=0; output="$(st_run large)" || status=$?
+    ((status == 0)) || die "self-test: oversize release listing returned $status ($output)"
+    grep -Fq 'PASS client-release:fixture ' <<<"$output" \
+        || die 'self-test: oversize release listing did not pass the named client-release:fixture check'
+    ((passing += 1))
 
     # The guarded stage must fail by the campaign's own named check, then
     # recover when the matching revision is restored.
@@ -298,7 +323,7 @@ esac'
     ((mutations += 1))
     st_good
 
-    echo "$NAME: self-test passed ($passing passing fixtures: baseline + $((passing - 1)) reversions; $mutations guarded mutations: unmatched FAIL, draft-only FAIL, erroring UNKNOWN, missing-gh UNKNOWN, empty UNKNOWN)"
+    echo "$NAME: self-test passed ($passing passing fixtures: baseline + oversize-listing + $((passing - 2)) reversions; $mutations guarded mutations: unmatched FAIL, draft-only FAIL, erroring UNKNOWN, missing-gh UNKNOWN, empty UNKNOWN)"
 }
 
 die() { echo "$NAME: $*" >&2; exit 2; }
